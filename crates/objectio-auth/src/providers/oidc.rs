@@ -335,7 +335,17 @@ impl OidcProvider {
                 "Authorization code exchange failed: {} {:?}",
                 err.error, err.error_description
             );
-            Err(AuthProviderError::InvalidCredentials)
+            // Carry the provider's own message. These failures are almost
+            // always a misconfiguration the operator can fix — a wrong client
+            // secret, or a redirect URI the app registration does not list —
+            // and the provider names which. Collapsing it to
+            // `InvalidCredentials` threw that away and left the reason only in
+            // the gateway log.
+            Err(AuthProviderError::ConfigurationError(format!(
+                "{}: {}",
+                err.error,
+                err.error_description.unwrap_or_default()
+            )))
         }
     }
 

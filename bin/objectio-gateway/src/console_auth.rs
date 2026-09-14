@@ -1227,7 +1227,13 @@ pub async fn oidc_callback(
             warn!("OIDC token exchange failed: {e}");
             return Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, "/_console/?error=Token+exchange+failed")
+                .header(
+                    header::LOCATION,
+                    format!(
+                        "/_console/?error={}",
+                        urlencoding::encode(&format!("Token exchange failed: {e}"))
+                    ),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap();
         }
