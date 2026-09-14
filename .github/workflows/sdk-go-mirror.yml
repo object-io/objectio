@@ -1,0 +1,127 @@
+# Mirrors sdk/go/ to the standalone module repo object-io/objectio-go-sdk.
+#
+# Why a second repo at all:
+#   A Go module nested in a subdirectory works, but its import path carries
+#   the whole path (github.com/object-io/objectio/sdk/go) and every release
+#   tag has to be prefixed (sdk/go/v0.1.0), which is the single most common
+#   way nested modules fail to publish. A dedicated repo gives the clean
+#   import and plain v0.1.0 tags, and consumers do not clone the monorepo's
+#   history to get a dependency with no dependencies of its own.
+#
+# How to run:
+#   Automatic — every push to main that touches sdk/go/**.
+#   Manual   — Actions → "Mirror Go SDK" → "Run workflow", optionally with
+#              a `tag` (e.g. 0.1.0, no leading 'v') to cut a release.
+#
+# What it does:
+#   1. Rebuilds and tests sdk/go before publishing anything. A mirror that
+#      ships a broken module is worse than one that has not run.
+#   2. Replaces the contents of the target repo with sdk/go/ (deletions
+#      included), committing with the source SHA in the message so any file
+#      there can be traced back here.
+#   3. With `tag` given, tags the target v<tag> and pushes it.
+#
+# Required repo settings:
+#   - The target repo object-io/objectio-go-sdk must exist (it may be
+#     empty; this workflow writes its first commit).
+#   - Secret SDK_MIRROR_TOKEN: a fine-grained PAT with Contents: read+write
+#     on object-io/objectio-go-sdk. The default GITHUB_TOKEN cannot write to
+#     another repository.
+#
+# Note on tags: once proxy.golang.org has fetched a version it is immutable.
+# A tag cannot be moved to different code — cut v0.0.x while the API is
+# still moving.
+
+name: Mirror Go SDK
+
+on:
+  push:
+    branches: [main]
+    paths: ['sdk/go/**', '.github/workflows/sdk-go-mirror.yml']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release version, semver without leading v (e.g. 0.1.0). Leave empty to mirror without tagging.'
+        required: false
+        default: ''
+
+env:
+  TARGET_REPO: object-io/objectio-go-sdk
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the monorepo
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: sdk/go/go.mod
+
+      # Publishing a module that does not compile is the one failure mode
+      # that reaches users directly, so gate on it.
+      - name: Verify the module before publishing it
+        working-directory: sdk/go
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt:"; gofmt -l .; exit 1; }
+          go vet ./...
+          go build ./...
+          go test ./...
+
+      - name: Validate the release version
+        if: inputs.tag != ''
+        run: |
+          if ! [[ "${{ inputs.tag }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag '${{ inputs.tag }}' is not semver without a leading 'v'" >&2
+            exit 1
+          fi
+
+      - name: Check out the target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.SDK_MIRROR_TOKEN }}
+          path: target
+          fetch-depth: 0
+
+      - name: Sync sdk/go into it
+        run: |
+          # Delete tracked files rather than the whole directory, so .git and
+          # anything the target added outside our tree (workflows of its own,
+          # say) survive. --delete makes the mirror authoritative for content.
+          rsync -a --delete \
+            --exclude '.git/' \
+            sdk/go/ target/
+
+      - name: Commit and push
+        working-directory: target
+        run: |
+          git config user.name  "objectio-bot"
+          git config user.email "noreply@object-io.dev"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No change to mirror."
+          else
+            git commit -m "sync from object-io/objectio@${GITHUB_SHA:0:12}
+
+          Mirrored from sdk/go/. Do not edit here — open pull requests
+          against object-io/objectio."
+            git push
+          fi
+
+      - name: Tag the release
+        if: inputs.tag != ''
+        working-directory: target
+        run: |
+          if git rev-parse "v${{ inputs.tag }}" >/dev/null 2>&1; then
+            echo "v${{ inputs.tag }} already exists — refusing to move a published tag." >&2
+            exit 1
+          fi
+          git tag -a "v${{ inputs.tag }}" -m "v${{ inputs.tag }}"
+          git push origin "v${{ inputs.tag }}"
+          echo "### Published \`github.com/object-io/objectio-go-sdk@v${{ inputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "go get github.com/object-io/objectio-go-sdk@v${{ inputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

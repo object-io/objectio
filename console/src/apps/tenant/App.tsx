@@ -19,6 +19,7 @@ import { useState, useEffect } from "react";
 import { Routes, Route } from "react-router-dom";
 import Layout from "../../components/Layout";
 import Login from "../../pages/Login";
+import Signup from "../../pages/Signup";
 import Dashboard from "../../pages/Dashboard";
 import Buckets from "../../pages/Buckets";
 import BucketDetail from "../../pages/BucketDetail";
@@ -63,13 +64,19 @@ export default function TenantApp() {
 
   if (checking) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <p className="text-sm text-gray-400">Loading...</p>
+      <div className="min-h-screen bg-surface-2 flex items-center justify-center">
+        <p className="text-[13px] text-faint">Loading...</p>
       </div>
     );
   }
 
   if (!user) {
+    // Registration has its own screen: sign-in asks for an account name and
+    // then offers that account's SSO, which a brand-new organisation has no
+    // way to satisfy.
+    if (window.location.pathname.replace(/\/$/, "").endsWith("/signup")) {
+      return <Signup />;
+    }
     return <Login onLogin={handleLogin} appKind="tenant" />;
   }
 

@@ -1,38 +1,61 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Server,
-  HardDrive,
-  RefreshCw,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell as BarCell,
+  Line,
+  LineChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
+  ChevronDown,
+  ChevronRight,
   Container,
-  Search,
-  SlidersHorizontal,
-  Rows3,
+  HardDrive,
+  Layers3,
+  MoreHorizontal,
   Plus,
-  MoreVertical,
+  Search,
+  Server,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import StatusDot from "../components/StatusDot";
-import CapacityBar from "../components/CapacityBar";
-import BreadcrumbPath from "../components/BreadcrumbPath";
-import ExpandableRow from "../components/ExpandableRow";
-import Tabs from "../components/Tabs";
+import {
+  Badge,
+  Banner,
+  Button,
+  CapacityBar,
+  ChartCard,
+  Chip,
+  Input,
+  LegendDot,
+  Table,
+  Row,
+  Cell,
+  seriesColor,
+} from "../components/ui";
 import {
   nodes as nodesApi,
   hostProvider as hostProviderApi,
   type NodeInfo,
   type HostProviderInfo,
 } from "../api/client";
+import { capabilities, queryRange, type Series } from "../api/metrics";
 
 function formatBytes(b: number): string {
-  if (b === 0) return "0 B";
+  if (!b) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
-  const v = b / Math.pow(1024, i);
+  const v = b / 1024 ** i;
   return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
 function formatUptime(seconds: number): string {
-  if (!seconds) return "-";
+  if (!seconds) return "—";
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -41,83 +64,128 @@ function formatUptime(seconds: number): string {
   return `${m}m`;
 }
 
+interface TopoPath {
+  region: string;
+  zone: string;
+  datacenter: string;
+  rack: string;
+}
+
 interface Host {
   name: string;
   osds: NodeInfo[];
-  totalCapacity: number;
-  usedCapacity: number;
-  totalShards: number;
-  cpuCores: number;
-  memoryBytes: number;
-  osInfo: string;
+  total: number;
+  used: number;
+  shards: number;
   allOnline: boolean;
-  /// All OSDs report the same k8s node — use it as the rack / host label
-  /// when no explicit topology is configured upstream.
-  k8sNode: string;
+  path: TopoPath | null;
+  labels: string[];
 }
 
-/// Node & OSD Management page — expandable host rows → OSD children, with
-/// capacity, topology path, and status per row. Mirrors the layout from
-/// the product mock.
+const AXIS = { fontSize: 10, fontFamily: "var(--oio-font-mono)", fill: "var(--oio-faint)" };
+const TOOLTIP = {
+  background: "var(--oio-surface)",
+  border: "1px solid var(--oio-border-strong)",
+  borderRadius: 8,
+  fontSize: 11,
+};
+
+/// The balancer aims to keep every OSD within this band of the cluster mean;
+/// the chart draws the band so a skewed OSD is visible as out-of-band rather
+/// than merely "taller".
+const BALANCER_BAND = 10;
+
 interface Props {
   embedded?: boolean;
 }
 
 export default function Drives({ embedded = false }: Props = {}) {
   const [nodeList, setNodeList] = useState<NodeInfo[]>([]);
+  const [paths, setPaths] = useState<Map<string, TopoPath>>(new Map());
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "issues">("all");
-  const [groupByRack, setGroupByRack] = useState(false);
+  const [groupByRack, setGroupByRack] = useState(true);
   const [provider, setProvider] = useState<HostProviderInfo | null>(null);
   const [adding, setAdding] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [latency, setLatency] = useState<Series[] | null>(null);
+  const [promReady, setPromReady] = useState(false);
 
-  const load = () => {
-    setLoading(true);
+  const load = useCallback(() => {
     nodesApi
       .list()
       .then((data) => {
-        const nodes = data.nodes || [];
-        setNodeList(nodes);
-        const k8sNames = new Set(
-          nodes.map((n) => n.kubernetes_node || n.hostname || n.node_name),
-        );
-        setExpanded(k8sNames);
+        const list = data.nodes || [];
+        setNodeList(list);
+        setExpanded(new Set(list.map((n) => n.kubernetes_node || n.hostname || n.node_name)));
       })
       .catch(() => setNodeList([]))
       .finally(() => setLoading(false));
-  };
 
-  useEffect(load, []);
-  // Fetch host-provider capabilities once; used to enable/disable the
-  // Add Host / + Add OSDs buttons. Tolerant of failure (older meta /
-  // pre-Phase-2 gateways return 404 here — treat as "noop").
+    // The topology column is the failure domain the placement engine
+    // actually uses, so read it from /_admin/topology rather than guessing
+    // from the k8s node name.
+    fetch("/_admin/topology")
+      .then((r) => r.json())
+      .then((t) => {
+        const m = new Map<string, TopoPath>();
+        for (const r of t.tree ?? [])
+          for (const z of r.zones)
+            for (const d of z.datacenters)
+              for (const rk of d.racks)
+                for (const h of rk.hosts)
+                  m.set(h.host, {
+                    region: r.region,
+                    zone: z.zone,
+                    datacenter: d.datacenter,
+                    rack: rk.rack,
+                  });
+        setPaths(m);
+      })
+      .catch(() => setPaths(new Map()));
+  }, []);
+
+  useEffect(load, [load]);
+
   useEffect(() => {
     hostProviderApi
       .info()
       .then(setProvider)
       .catch(() =>
-        setProvider({
-          provider: "noop",
-          supports_add_host: false,
-          supports_reboot: false,
-        }),
+        setProvider({ provider: "noop", supports_add_host: false, supports_reboot: false })
       );
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    capabilities()
+      .then(async (c) => {
+        if (cancelled || !c.prometheus) return;
+        setPromReady(true);
+        const s = await queryRange(
+          "histogram_quantile(0.99, sum by (instance) (rate(objectio_osd_grpc_latency_seconds_bucket[5m])))",
+          3600
+        ).catch(() => [] as Series[]);
+        if (!cancelled) setLatency(s);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const addHost = async () => {
-    setActionError(null);
+    setError(null);
     setAdding(true);
     try {
       await hostProviderApi.addHosts(1);
-      // New OSD pod takes 5-15s to register; poll once after a short
-      // delay so the user sees the additional host appear without a
-      // manual refresh.
+      // A new OSD pod takes 5–15s to register; poll once so the host
+      // appears without a manual refresh.
       setTimeout(load, 8000);
     } catch (e) {
-      setActionError(e instanceof Error ? e.message : String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setAdding(false);
     }
@@ -130,337 +198,453 @@ export default function Drives({ embedded = false }: Props = {}) {
       if (!grouped.has(key)) grouped.set(key, []);
       grouped.get(key)!.push(osd);
     }
-    const out: Host[] = [];
-    for (const [name, osds] of grouped) {
-      out.push({
+    return [...grouped].map(([name, osds]) => {
+      const first = osds[0];
+      // There is no OSD tag field yet, so the labels are what the node
+      // actually reports about itself. Naming them for what they are beats
+      // an empty column.
+      const labels = [
+        first?.os_info ? first.os_info.split(" ")[0].toLowerCase() : "",
+        first?.cpu_cores ? `${first.cpu_cores}c` : "",
+        first?.memory_bytes ? formatBytes(first.memory_bytes) : "",
+      ].filter(Boolean);
+      return {
         name,
         osds,
-        totalCapacity: osds.reduce((s, n) => s + n.total_capacity, 0),
-        usedCapacity: osds.reduce((s, n) => s + n.used_capacity, 0),
-        totalShards: osds.reduce((s, n) => s + n.shard_count, 0),
-        cpuCores: osds[0]?.cpu_cores || 0,
-        memoryBytes: osds[0]?.memory_bytes || 0,
-        osInfo: osds[0]?.os_info || "",
+        total: osds.reduce((s, n) => s + n.total_capacity, 0),
+        used: osds.reduce((s, n) => s + n.used_capacity, 0),
+        shards: osds.reduce((s, n) => s + n.shard_count, 0),
         allOnline: osds.every((n) => n.online),
-        k8sNode: osds[0]?.kubernetes_node || name,
-      });
-    }
-    return out;
+        path: paths.get(name) ?? null,
+        labels,
+      };
+    });
+  }, [nodeList, paths]);
+
+  // Fill distribution across every OSD, which is the thing the balancer
+  // equalises. Sorted by name so the bars keep their position between
+  // refreshes rather than reshuffling as fill changes.
+  const fill = useMemo(() => {
+    const rows = nodeList
+      .map((n) => ({
+        name: n.pod_name || n.node_name,
+        pct: n.total_capacity > 0 ? (n.used_capacity / n.total_capacity) * 100 : 0,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const mean = rows.length ? rows.reduce((s, r) => s + r.pct, 0) / rows.length : 0;
+    const outliers = rows.filter((r) => Math.abs(r.pct - mean) > BALANCER_BAND).length;
+    return { rows, mean, outliers };
   }, [nodeList]);
 
-  const issuesCount = hosts.filter((h) => !h.allOnline).length;
+  const issues = hosts.filter((h) => !h.allOnline).length;
 
-  const visibleHosts = hosts
+  const visible = hosts
     .filter((h) =>
       query
         ? h.name.toLowerCase().includes(query.toLowerCase()) ||
           h.osds.some((o) =>
-            (o.pod_name || o.node_name).toLowerCase().includes(query.toLowerCase()),
+            (o.pod_name || o.node_name).toLowerCase().includes(query.toLowerCase())
           )
-        : true,
+        : true
     )
     .filter((h) => (filter === "issues" ? !h.allOnline : true));
 
-  const toggleExpand = (name: string) => {
+  // Rack grouping reads off the real failure domain. Hosts with no topology
+  // configured fall into one bucket rather than each becoming its own rack.
+  const racks = useMemo(() => {
+    if (!groupByRack) return null;
+    const m = new Map<string, Host[]>();
+    for (const h of visible) {
+      const key = h.path?.rack || "(no rack)";
+      if (!m.has(key)) m.set(key, []);
+      m.get(key)!.push(h);
+    }
+    return [...m].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [groupByRack, visible]);
+
+  const toggle = (name: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
       else next.add(name);
       return next;
     });
-  };
+
+  const columns = [
+    { key: "name", label: "Host / OSD" },
+    { key: "status", label: "Status", className: "w-36" },
+    { key: "topology", label: "Topology · reg / zone / dc / rack", className: "w-72" },
+    { key: "capacity", label: "Capacity", className: "w-64" },
+    { key: "labels", label: "Labels", className: "w-44" },
+    { key: "actions", label: "", className: "w-12" },
+  ];
+
+  const latencyNames = (latency ?? []).map((s) => s.labels.instance ?? "osd");
+  const latencyRows = useMemo(() => {
+    const byTime = new Map<number, Record<string, number | string>>();
+    (latency ?? []).forEach((s, i) => {
+      for (const p of s.points) {
+        const row = byTime.get(p.t) ?? {
+          t: p.t,
+          time: new Date(p.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        };
+        row[latencyNames[i]] = p.v * 1000;
+        byTime.set(p.t, row);
+      }
+    });
+    return [...byTime.values()].sort((a, b) => Number(a.t) - Number(b.t));
+  }, [latency, latencyNames]);
 
   return (
     <div className={embedded ? "" : "p-6"}>
       {!embedded && (
-      <PageHeader
-        title="Node & OSD Management"
-        description="Manage physical hosts and storage daemons across the cluster topology."
-        action={
-          <div className="flex items-center gap-2">
-            <button
-              onClick={load}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
-            >
-              <RefreshCw size={13} /> Refresh
-            </button>
-            <button
-              onClick={addHost}
-              disabled={
-                adding ||
-                !provider?.supports_add_host
-              }
+        <PageHeader
+          title="Nodes & drives"
+          description="Hosts, OSDs and the disks under them"
+          action={
+            <Button
+              variant="primary"
+              icon={<Plus size={13} />}
+              disabled={adding || !provider?.supports_add_host}
+              onClick={() => void addHost()}
               title={
                 provider?.supports_add_host
-                  ? "Scale the OSD StatefulSet by +1 (k8s)"
-                  : "Requires a host provider (k8s / linux / appliance). Set --host-provider on the gateway."
+                  ? "Scale the OSD StatefulSet by +1"
+                  : "Requires a host provider — set --host-provider on the gateway"
               }
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[12px] font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Plus size={13} /> {adding ? "Adding…" : "Add Host"}
-            </button>
-            <button
-              disabled
-              title="Per-host OSD provisioning (multiple OSDs on one host) is a later phase; Add Host covers single-OSD-per-pod today."
-              className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Plus size={13} /> Add OSDs
-            </button>
-          </div>
-        }
-      />
-      )}
-      {embedded && (
-        <div className="flex items-center justify-end gap-2 mb-3">
-          <button
-            onClick={load}
-            className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 text-gray-700 rounded-lg text-[11px] font-medium hover:bg-gray-50"
-          >
-            <RefreshCw size={12} /> Refresh
-          </button>
-          <button
-            onClick={addHost}
-            disabled={adding || !provider?.supports_add_host}
-            className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-600 text-white rounded-lg text-[11px] font-medium hover:bg-blue-700 disabled:opacity-50"
-          >
-            <Plus size={12} /> {adding ? "Adding…" : "Add Host"}
-          </button>
-        </div>
+              {adding ? "Adding…" : "Add host"}
+            </Button>
+          }
+        />
       )}
 
-      {actionError && (
-        <div className="mb-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-[12px] text-red-700">
-          {actionError}
-        </div>
+      {error && (
+        <Banner kind="err" className="mb-4">
+          {error}
+        </Banner>
       )}
 
-      {/* Controls bar — search, All / Has Issues pill, filters, group-by-rack */}
-      <div className="flex items-center gap-3 mb-4">
-        <div className="relative flex-1 max-w-xs">
-          <Search
-            size={13}
-            className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400"
-          />
-          <input
-            type="text"
+      <div className="grid lg:grid-cols-2 gap-4 mb-4">
+        <ChartCard
+          title="OSD fill distribution"
+          subtitle={
+            fill.rows.length
+              ? `percent used per OSD · balancer target ±${BALANCER_BAND}% of mean (${fill.mean.toFixed(
+                  0
+                )}%)${fill.outliers ? ` · ${fill.outliers} outside the band` : ""}`
+              : "percent used per OSD"
+          }
+        >
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={fill.rows} margin={{ top: 4, right: 4, left: -8, bottom: 0 }}>
+              <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+              <XAxis dataKey="name" tick={AXIS} tickLine={false} axisLine={false} minTickGap={24} />
+              <YAxis
+                tick={AXIS}
+                tickLine={false}
+                axisLine={false}
+                width={40}
+                domain={[0, 100]}
+                tickFormatter={(v: number) => `${v}%`}
+              />
+              <Tooltip
+                contentStyle={TOOLTIP}
+                formatter={(v) => [`${Number(v).toFixed(1)}%`, "used"]}
+                cursor={{ fill: "var(--oio-surface-2)" }}
+              />
+              <ReferenceLine
+                y={fill.mean}
+                stroke="var(--oio-muted)"
+                strokeDasharray="3 3"
+                label={{ value: "mean", position: "right", fontSize: 10, fill: "var(--oio-faint)" }}
+              />
+              <Bar dataKey="pct" isAnimationActive={false} radius={[2, 2, 0, 0]}>
+                {fill.rows.map((r) => (
+                  <BarCell
+                    key={r.name}
+                    // Out-of-band bars carry the warning colour so the skew
+                    // the balancer is working on is visible without reading
+                    // the axis.
+                    fill={
+                      Math.abs(r.pct - fill.mean) > BALANCER_BAND
+                        ? "var(--oio-warn-dot)"
+                        : seriesColor(0)
+                    }
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard
+          title="OSD write latency p99"
+          subtitle="ms · last hour"
+          legend={
+            latencyNames.length > 1 ? (
+              <div className="flex gap-3 flex-wrap">
+                {latencyNames.slice(0, 4).map((n, i) => (
+                  <LegendDot key={n} index={i} label={n} />
+                ))}
+              </div>
+            ) : undefined
+          }
+        >
+          {latencyRows.length > 0 ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={latencyRows} margin={{ top: 4, right: 4, left: -8, bottom: 0 }}>
+                <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+                <XAxis dataKey="time" tick={AXIS} tickLine={false} axisLine={false} minTickGap={40} />
+                <YAxis tick={AXIS} tickLine={false} axisLine={false} width={40} />
+                <Tooltip contentStyle={TOOLTIP} />
+                {latencyNames.slice(0, 4).map((n, i) => (
+                  <Line
+                    key={n}
+                    type="monotone"
+                    dataKey={n}
+                    stroke={seriesColor(i)}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[200px] flex flex-col items-center justify-center text-center px-6 gap-1.5">
+              <code className="font-mono text-[11px] text-text-2 bg-surface-2 px-1.5 py-px rounded-[5px]">
+                objectio_osd_grpc_latency_seconds
+              </code>
+              <p className="text-[11px] text-muted max-w-xs">
+                {promReady
+                  ? "Prometheus is configured but has no series for this — each OSD exports on its own :9201, and a single-process deployment only publishes the gateway's own metrics."
+                  : "This needs Prometheus. Per-OSD latency is a histogram on each OSD's :9201 endpoint, which a browser cannot reach."}
+              </p>
+            </div>
+          )}
+        </ChartCard>
+      </div>
+
+      <div className="flex items-center gap-3 mb-3 flex-wrap">
+        <div className="w-full sm:w-64">
+          <Input
+            icon={<Search size={13} />}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search hosts or OSDs..."
-            className="w-full pl-7 pr-2 py-1.5 border border-gray-200 rounded-lg text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+            placeholder="Search hosts or OSDs…"
           />
         </div>
-        <Tabs
-          variant="pill"
-          active={filter}
-          onChange={(k) => setFilter(k)}
-          tabs={[
-            { key: "all" as const, label: "All Nodes" },
-            { key: "issues" as const, label: "Has Issues", count: issuesCount },
-          ]}
-        />
+        <div className="inline-flex rounded-control border border-border-strong overflow-hidden">
+          {(
+            [
+              ["all", "All nodes"],
+              ["issues", `Has issues ${issues}`],
+            ] as const
+          ).map(([k, label]) => (
+            <button
+              key={k}
+              onClick={() => setFilter(k)}
+              className={`h-8 px-3 text-[12px] font-medium ${
+                filter === k ? "bg-surface-2 text-text" : "bg-surface text-muted hover:text-text"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="flex-1" />
         <button
-          disabled
-          title="Advanced filters coming soon"
-          className="flex items-center gap-1.5 px-2.5 py-1.5 border border-gray-200 text-gray-600 rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50"
-        >
-          <SlidersHorizontal size={12} /> Filters
-        </button>
-        <button
           onClick={() => setGroupByRack((v) => !v)}
-          className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded-lg text-[12px] font-medium ${
-            groupByRack
-              ? "border-blue-200 bg-blue-50 text-blue-700"
-              : "border-gray-200 text-gray-600 hover:bg-gray-50"
-          }`}
-          title="Topology grouping requires region/zone/dc/rack on the OSD — showing flat list until then"
+          className="inline-flex items-center gap-2 text-[12px] text-text-2"
         >
-          <Rows3 size={12} /> Group by Rack
+          <span
+            className={`w-8 h-[18px] rounded-full transition-colors relative ${
+              groupByRack ? "bg-accent" : "bg-border-strong"
+            }`}
+          >
+            <span
+              className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-surface transition-all ${
+                groupByRack ? "left-[16px]" : "left-[2px]"
+              }`}
+            />
+          </span>
+          Group by rack
         </button>
       </div>
 
-      {/* Table */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        {/* Header */}
-        <div className="grid grid-cols-[28px_1fr_120px_260px_220px_140px_40px] items-center gap-2 px-3 py-2 border-b border-gray-200 bg-gray-50 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-          <div />
-          <div>Host / OSD</div>
-          <div>Status</div>
-          <div>Topology (Reg/Zone/DC/Rack)</div>
-          <div>Capacity</div>
-          <div>Labels</div>
-          <div />
-        </div>
-
-        {loading ? (
-          <div className="p-8 text-center">
-            <div className="flex items-center justify-center gap-3">
-              <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
-              </div>
-              <span className="text-[12px] text-gray-400">Loading</span>
-            </div>
-          </div>
-        ) : visibleHosts.length === 0 ? (
-          <div className="p-8 text-center text-[12px] text-gray-400">
-            {hosts.length === 0 ? "No hosts registered" : "No matches"}
-          </div>
-        ) : (
-          visibleHosts.map((host) => (
-            <ExpandableRow
-              key={host.name}
-              open={expanded.has(host.name)}
-              onToggle={() => toggleExpand(host.name)}
-              header={
-                <div className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Server size={15} className="text-blue-500 shrink-0" />
-                    <div className="min-w-0">
-                      <div className="text-[13px] font-medium text-gray-900 truncate">
-                        {host.name}
-                      </div>
-                      <div className="text-[11px] text-gray-400 font-mono truncate">
-                        {host.osds[0]?.address
-                          ?.replace("http://", "")
-                          .replace(/:\d+$/, "") || host.k8sNode}
-                      </div>
-                    </div>
-                  </div>
-                  <StatusDot
-                    status={host.allOnline ? "healthy" : "error"}
-                    label={host.allOnline ? "Online" : "Degraded"}
-                  />
-                  <BreadcrumbPath
-                    segments={["—", "—", "—", host.k8sNode]}
-                  />
-                  <CapacityBar
-                    used={host.usedCapacity}
-                    total={host.totalCapacity}
-                    caption={`${host.osds.length} OSD${host.osds.length !== 1 ? "s" : ""}${issuesCount && !host.allOnline ? ` (${host.osds.filter((o) => !o.online).length} Down)` : ""}`}
-                    layout="stacked"
-                  />
-                  <div className="flex items-center gap-1 flex-wrap">
-                    {host.osInfo && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
-                        {host.osInfo.split(" ")[0].toLowerCase()}
+      <Table
+        columns={columns}
+        loading={loading}
+        empty={hosts.length === 0 ? "No hosts registered" : "No matches"}
+      >
+        {visible.length
+          ? racks
+            ? racks.flatMap(([rack, list]) => [
+                <tr key={`rack:${rack}`} className="border-t border-border bg-surface-2/60">
+                  <Cell colSpan={columns.length}>
+                    <span className="flex items-center gap-2">
+                      <Layers3 size={13} className="text-muted" />
+                      <span className="font-mono text-[12px] text-text">{rack}</span>
+                      <span className="text-[11px] text-muted">
+                        · {list.reduce((n, h) => n + h.osds.length, 0)} OSDs
                       </span>
-                    )}
-                    {host.cpuCores > 0 && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
-                        {host.cpuCores}c
-                      </span>
-                    )}
-                    {host.memoryBytes > 0 && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
-                        {formatBytes(host.memoryBytes)}
-                      </span>
-                    )}
-                  </div>
-                  <button
-                    onClick={(e) => e.stopPropagation()}
-                    className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-700 justify-self-end"
-                    title="More actions (not yet wired)"
-                  >
-                    <MoreVertical size={14} />
-                  </button>
-                </div>
-              }
-            >
-              {/* Expanded: OSD rows for this host */}
-              {host.osds.map((osd) => (
-                <OsdRow key={osd.node_id} osd={osd} />
-              ))}
-            </ExpandableRow>
-          ))
-        )}
-      </div>
+                    </span>
+                  </Cell>
+                </tr>,
+                ...list.flatMap((h) => hostRows(h, expanded, toggle)),
+              ])
+            : visible.flatMap((h) => hostRows(h, expanded, toggle))
+          : undefined}
+      </Table>
     </div>
   );
 }
 
-function OsdRow({ osd }: { osd: NodeInfo }) {
-  return (
-    <div className="border-b border-gray-100 last:border-0 pl-9">
-      <div className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2 py-2 pr-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <Container size={13} className="text-orange-500 shrink-0" />
-          <div className="min-w-0">
-            <div className="text-[12px] font-medium text-gray-800 truncate">
-              {osd.pod_name || osd.node_name}
-            </div>
-            <div className="text-[10px] text-gray-400 font-mono truncate">
-              {osd.address.replace("http://", "")}
-              {osd.version && ` · v${osd.version}`}
-            </div>
-          </div>
-        </div>
-        <StatusDot
-          status={osd.online ? "healthy" : "error"}
-          label={osd.online ? "In / Up" : "Offline"}
-        />
-        <div className="text-[11px] text-gray-400 font-mono">
-          up {formatUptime(osd.uptime_seconds)}
-        </div>
-        <CapacityBar
-          used={osd.used_capacity}
-          total={osd.total_capacity}
-          caption={`${osd.disks.length} disk${osd.disks.length !== 1 ? "s" : ""}, ${osd.shard_count.toLocaleString()} shards`}
-          layout="stacked"
-        />
-        <div className="flex items-center gap-1">
-          {osd.disks[0]?.status && (
-            <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
-              {osd.disks[0].status}
+/// One host row plus, when open, its OSD rows and each OSD's disks. Returned
+/// as a flat array because a `<tbody>` cannot hold a fragment wrapper without
+/// breaking the table's row striping.
+function hostRows(
+  host: Host,
+  expanded: Set<string>,
+  toggle: (n: string) => void
+): React.ReactElement[] {
+  const open = expanded.has(host.name);
+  const down = host.osds.filter((o) => !o.online).length;
+  const rows: React.ReactElement[] = [
+    <Row key={host.name}>
+      <Cell>
+        <span className="flex items-center gap-2">
+          <button
+            onClick={() => toggle(host.name)}
+            className="text-faint hover:text-text"
+            aria-label={open ? "Collapse" : "Expand"}
+          >
+            {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          </button>
+          <Server size={14} className="text-muted shrink-0" />
+          <span className="flex flex-col min-w-0">
+            <span className="text-[13px] font-medium text-text truncate">{host.name}</span>
+            <span className="text-[11px] text-muted truncate">
+              {host.osds.length} OSD{host.osds.length === 1 ? "" : "s"}
+              {host.shards ? ` · ${host.shards.toLocaleString()} shards` : ""}
             </span>
-          )}
-        </div>
-        <button
-          disabled
-          title="OSD management actions coming soon"
-          className="px-2 py-1 text-[11px] font-medium text-gray-400 border border-gray-200 rounded justify-self-end disabled:cursor-not-allowed"
-        >
-          Manage
-        </button>
-      </div>
+          </span>
+        </span>
+      </Cell>
+      <Cell>
+        <Badge kind={host.allOnline ? "ok" : down === host.osds.length ? "err" : "warn"}>
+          {host.allOnline ? "Healthy" : `${down} down`}
+        </Badge>
+      </Cell>
+      <Cell className="font-mono text-[11px]">
+        {host.path
+          ? `${host.path.region} / ${host.path.zone} / ${host.path.datacenter} / ${host.path.rack}`
+          : "—"}
+      </Cell>
+      <Cell>
+        <span className="flex items-center gap-2.5">
+          <CapacityBar used={host.used} total={host.total} className="flex-1 min-w-20" />
+          <span className="font-mono text-[11px] text-muted tabular-nums whitespace-nowrap">
+            {formatBytes(host.used)} / {formatBytes(host.total)}
+          </span>
+        </span>
+      </Cell>
+      <Cell>
+        <span className="flex items-center gap-1 flex-wrap">
+          {host.labels.map((l) => (
+            <Chip key={l} mono>
+              {l}
+            </Chip>
+          ))}
+        </span>
+      </Cell>
+      <Cell align="right">
+        <span className="opacity-0 group-hover:opacity-100 transition-opacity">
+          <MoreHorizontal size={13} className="text-muted inline" />
+        </span>
+      </Cell>
+    </Row>,
+  ];
 
-      {/* Disks under this OSD */}
-      {osd.disks.length > 0 && (
-        <div className="pl-6 pr-3 pb-2 space-y-1">
-          {osd.disks.map((disk) => (
-            <div
-              key={disk.disk_id}
-              className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2 text-[11px] text-gray-500"
-            >
-              <div className="flex items-center gap-2 min-w-0">
-                <HardDrive
-                  size={11}
-                  className={
-                    disk.status === "healthy" ? "text-emerald-500" : "text-red-500"
-                  }
-                />
-                <span className="font-mono truncate">
-                  {disk.path || disk.disk_id.slice(0, 8)}
-                </span>
-              </div>
-              <StatusDot
-                status={disk.status === "healthy" ? "healthy" : "error"}
-                label={disk.status}
+  if (!open) return rows;
+
+  for (const osd of host.osds) {
+    const state = osd.admin_state ?? "in";
+    rows.push(
+      <Row key={osd.node_id}>
+        <Cell>
+          <span className="flex items-center gap-2 pl-7">
+            <Container size={13} className="text-muted shrink-0" />
+            <span className="font-mono text-[12px] text-text">
+              {osd.pod_name || osd.node_name}
+            </span>
+            <span className="font-mono text-[11px] text-faint truncate">
+              {osd.disks[0]?.path ?? osd.address.replace("http://", "")}
+            </span>
+          </span>
+        </Cell>
+        <Cell>
+          <Badge kind={osd.online && state === "in" ? "ok" : osd.online ? "warn" : "err"}>
+            {osd.online ? "up" : "down"} / {state}
+          </Badge>
+        </Cell>
+        <Cell className="font-mono text-[11px] text-muted">
+          {osd.address.replace("http://", "")} · up {formatUptime(osd.uptime_seconds)}
+        </Cell>
+        <Cell>
+          <span className="flex items-center gap-2.5">
+            <CapacityBar used={osd.used_capacity} total={osd.total_capacity} className="flex-1 min-w-20" />
+            <span className="font-mono text-[11px] text-muted tabular-nums whitespace-nowrap">
+              {formatBytes(osd.used_capacity)} / {formatBytes(osd.total_capacity)}
+            </span>
+          </span>
+        </Cell>
+        <Cell className="font-mono text-[11px] text-muted">
+          {osd.shard_count.toLocaleString()} shards
+        </Cell>
+        <Cell />
+      </Row>
+    );
+
+    for (const disk of osd.disks) {
+      rows.push(
+        <Row key={disk.disk_id}>
+          <Cell>
+            <span className="flex items-center gap-2 pl-14">
+              <HardDrive
+                size={12}
+                className={disk.status === "healthy" ? "text-ok shrink-0" : "text-err shrink-0"}
               />
-              <div />
+              <span className="font-mono text-[11px] text-muted truncate">
+                {disk.path || disk.disk_id.slice(0, 8)}
+              </span>
+            </span>
+          </Cell>
+          <Cell>
+            <Badge kind={disk.status === "healthy" ? "ok" : "err"}>{disk.status}</Badge>
+          </Cell>
+          <Cell />
+          <Cell>
+            <span className="flex items-center gap-2.5">
               <CapacityBar
                 used={disk.used_capacity}
                 total={disk.total_capacity}
-                layout="inline"
-                showLabel
+                className="flex-1 min-w-20"
               />
-              <div className="tabular-nums">
-                {disk.shard_count.toLocaleString()} shards
-              </div>
-              <div />
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+              <span className="font-mono text-[11px] text-muted tabular-nums whitespace-nowrap">
+                {formatBytes(disk.used_capacity)} / {formatBytes(disk.total_capacity)}
+              </span>
+            </span>
+          </Cell>
+          <Cell className="font-mono text-[11px] text-muted">
+            {disk.shard_count.toLocaleString()} shards
+          </Cell>
+          <Cell />
+        </Row>
+      );
+    }
+  }
+
+  return rows;
 }

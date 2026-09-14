@@ -25,22 +25,22 @@ function UsageBar({ label, used, cap, formatter }: {
   const unlimited = !cap;
   const pct = unlimited ? 0 : Math.min(100, Math.round((used / cap) * 100));
   const color = unlimited
-    ? "bg-blue-400"
+    ? "bg-accent"
     : pct >= 100
-      ? "bg-red-500"
+      ? "bg-err"
       : pct >= 80
-        ? "bg-amber-500"
-        : "bg-green-500";
+        ? "bg-warn-dot"
+        : "bg-ok";
   return (
     <div className="mb-3">
       <div className="flex items-center justify-between mb-1">
-        <span className="text-[12px] font-medium text-gray-700">{label}</span>
-        <span className="text-[11px] text-gray-500 font-mono">
+        <span className="text-[12px] font-medium text-text-2">{label}</span>
+        <span className="text-[11px] text-muted font-mono">
           {formatter(used)} / {unlimited ? "unlimited" : formatter(cap)}
-          {!unlimited && <span className="ml-1.5 text-gray-400">({pct}%)</span>}
+          {!unlimited && <span className="ml-1.5 text-faint">({pct}%)</span>}
         </span>
       </div>
-      <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+      <div className="h-1.5 bg-surface-2 rounded-full overflow-hidden">
         <div
           className={`h-full ${color} transition-all`}
           style={{ width: unlimited ? "100%" : `${pct}%`, opacity: unlimited ? 0.3 : 1 }}
@@ -73,10 +73,15 @@ export default function LicensePage() {
   const [notice, setNotice] = useState("");
 
   const load = () => {
-    setError("");
+    // The previous error clears when the reload actually succeeds, rather
+    // than optimistically up front — which would also be a synchronous
+    // setState on the mount path.
     fetch("/_admin/license", { credentials: "include" })
       .then((r) => r.json())
-      .then(setLicense)
+      .then((data) => {
+        setLicense(data);
+        setError("");
+      })
       .catch((e) => setError(String(e)));
   };
   useEffect(load, []);
@@ -130,12 +135,12 @@ export default function LicensePage() {
       />
 
       {error && (
-        <div className="mb-4 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-[12px] text-red-700">
+        <div className="mb-4 px-3 py-2 rounded-lg bg-err-soft border border-err/25 text-[12px] text-err">
           {error}
         </div>
       )}
       {notice && (
-        <div className="mb-4 px-3 py-2 rounded-lg bg-green-50 border border-green-200 text-[12px] text-green-700 flex items-center gap-1.5">
+        <div className="mb-4 px-3 py-2 rounded-lg bg-ok-soft border border-ok/25 text-[12px] text-ok flex items-center gap-1.5">
           <CheckCircle2 size={13} /> {notice}
         </div>
       )}
@@ -143,7 +148,7 @@ export default function LicensePage() {
       <Card
         title={
           <div className="flex items-center gap-2">
-            <ShieldCheck size={14} className={isEnterprise ? "text-green-600" : "text-gray-400"} />
+            <ShieldCheck size={14} className={isEnterprise ? "text-ok" : "text-faint"} />
             <span>Current tier: {isEnterprise ? "Enterprise" : "Community"}</span>
           </div>
         }
@@ -152,31 +157,31 @@ export default function LicensePage() {
         {license && (
           <div className="grid grid-cols-2 gap-3 text-[12px]">
             <div>
-              <div className="text-[10px] uppercase text-gray-400 mb-0.5">Licensee</div>
-              <div className="font-medium text-gray-900">{license.licensee}</div>
+              <div className="text-[10px] uppercase text-faint mb-0.5">Licensee</div>
+              <div className="font-medium text-text">{license.licensee}</div>
             </div>
             <div>
-              <div className="text-[10px] uppercase text-gray-400 mb-0.5">Expires</div>
-              <div className="font-medium text-gray-900">{formatTs(license.expires_at)}</div>
+              <div className="text-[10px] uppercase text-faint mb-0.5">Expires</div>
+              <div className="font-medium text-text">{formatTs(license.expires_at)}</div>
             </div>
             {license.issued_at > 0 && (
               <div>
-                <div className="text-[10px] uppercase text-gray-400 mb-0.5">Issued</div>
-                <div className="font-medium text-gray-900">{formatTs(license.issued_at)}</div>
+                <div className="text-[10px] uppercase text-faint mb-0.5">Issued</div>
+                <div className="font-medium text-text">{formatTs(license.issued_at)}</div>
               </div>
             )}
           </div>
         )}
 
-        <div className="flex gap-2 mt-4 pt-3 border-t border-gray-100">
-          <label className="flex items-center gap-1 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800 cursor-pointer">
+        <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+          <label className="flex items-center gap-1 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover cursor-pointer">
             <Upload size={13} /> {uploading ? "Installing…" : "Install license file"}
             <input type="file" accept="application/json,.license,.json" onChange={onFile} className="hidden" disabled={uploading} />
           </label>
           {isEnterprise && (
             <button
               onClick={remove}
-              className="flex items-center gap-1 px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+              className="flex items-center gap-1 px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
             >
               <Trash2 size={13} /> Remove license
             </button>
@@ -186,7 +191,7 @@ export default function LicensePage() {
 
       {license && (license.limits?.max_nodes || license.limits?.max_raw_capacity_bytes) ? (
         <Card title="Capacity usage" className="mb-4">
-          <p className="text-[11px] text-gray-500 mb-3">
+          <p className="text-[11px] text-muted mb-3">
             New pools and buckets are blocked when any cap is reached (scale-up block).
             Existing data keeps serving reads and writes.
           </p>
@@ -210,20 +215,20 @@ export default function LicensePage() {
           {ALL_ENTERPRISE_FEATURES.map((f) => {
             const on = enabled.has(f);
             return (
-              <li key={f} className="flex items-center justify-between px-2.5 py-1.5 bg-gray-50 rounded-lg">
+              <li key={f} className="flex items-center justify-between px-2.5 py-1.5 bg-surface-2 rounded-lg">
                 <div className="flex items-center gap-2">
                   {on ? (
-                    <CheckCircle2 size={14} className="text-green-600" />
+                    <CheckCircle2 size={14} className="text-ok" />
                   ) : (
-                    <Lock size={14} className="text-gray-400" />
+                    <Lock size={14} className="text-faint" />
                   )}
-                  <span className={`text-[12px] ${on ? "text-gray-900" : "text-gray-500"}`}>
+                  <span className={`text-[12px] ${on ? "text-text" : "text-muted"}`}>
                     {FEATURE_LABELS[f]}
                   </span>
                 </div>
                 <span
                   className={`text-[10px] uppercase tracking-wider ${
-                    on ? "text-green-700" : "text-gray-400"
+                    on ? "text-ok" : "text-faint"
                   }`}
                 >
                   {on ? "Enabled" : "Locked"}

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { KeyRound, LogIn, Lock, User, Building2 } from "lucide-react";
-import wordmark from "../assets/brand/wordmark-light.svg";
+import { LogIn, Lock, User, Building2 } from "lucide-react";
+import mark from "../assets/brand/mark-light.svg";
+import { Button, Input, Banner } from "../components/ui";
 
 interface Props {
   onLogin: (user: string, tenant: string) => void;
@@ -59,11 +60,18 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
       setError(err);
       window.history.replaceState({}, "", window.location.pathname);
     }
+    // Tenant scoping is meaningless on the operator console — a system
+    // admin has no tenant, and a tenant session would be refused here by
+    // the audience gate anyway. Ignoring the query keeps a stray
+    // ?tenant= from applying a scope the user cannot see.
     const t = params.get("tenant");
-    if (t) {
+    if (t && tenantApp) {
       setTenantInput(t);
       lookupTenant(t);
     }
+    // Runs once on mount. `tenantApp` is derived from the bundle's own
+    // appKind prop and cannot change for the life of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Resolve the tenant's SSO config. Called on URL pre-fill and on
@@ -133,240 +141,189 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-gray-100 flex items-center justify-center p-6">
-      <div className="w-full max-w-md">
-        <div className="bg-white rounded-2xl border border-gray-200 shadow-xl shadow-gray-900/5 overflow-hidden">
-          <div className="p-7">
-            {/* Wordmark */}
-            <div className="flex flex-col items-start gap-1 mb-6">
-              <img
-                src={wordmark}
-                alt="objectio"
-                className="h-8 w-auto select-none"
-                draggable={false}
-              />
-              <span className="text-[11px] text-gray-400 uppercase tracking-[0.12em] pl-0.5">
-                Console
-              </span>
-            </div>
+    <div className="min-h-screen bg-bg flex flex-col items-center justify-center p-6 relative">
+      {/* Dotted ground from the artboard. Behind everything, and decorative. */}
+      <div
+        aria-hidden
+        className="absolute inset-0 pointer-events-none opacity-[0.35]"
+        style={{
+          backgroundImage:
+            "radial-gradient(var(--oio-border-strong) 1px, transparent 1px)",
+          backgroundSize: "22px 22px",
+        }}
+      />
 
-            <h1 className="text-[20px] font-semibold text-gray-900 mb-1">
-              Sign in
-            </h1>
-            <p className="text-[12px] text-gray-500 mb-5">
-              Enter your credentials to access the console.
+      <div className="relative w-full max-w-[400px]">
+        <div className="bg-surface border border-border rounded-dialog shadow-sm p-7">
+          <img src={mark} alt="" className="h-10 w-10 mb-5" />
+
+          <h1 className="font-display text-[24px] leading-tight font-semibold text-text">
+            Sign in to ObjectIO
+          </h1>
+          {/* The artboard also carries cluster and region here. Nothing
+              unauthenticated exposes those today, and inventing a label would
+              be worse than omitting it, so the surface name stands alone until
+              the server can say. */}
+          <p className="text-[12px] text-muted mt-1 mb-6">
+            {tenantApp ? "Console" : "Ops console"}
+          </p>
+
+          {error && (
+            <Banner kind="err" className="mb-4">
+              {error}
+            </Banner>
+          )}
+
+          {tenantApp && (
+            <p className="mb-4 text-[12px] text-muted">
+              New organisation?{" "}
+              <a
+                href="/_console/tenant/signup"
+                className="text-accent hover:opacity-80 font-medium"
+              >
+                Create an account
+              </a>
             </p>
+          )}
 
-            {error && (
-              <div className="flex items-center gap-1.5 text-[12px] text-red-600 bg-red-50 border border-red-200 px-2.5 py-1.5 rounded-lg mb-4">
-                <KeyRound size={12} />
-                {error}
+          <form onSubmit={handleLogin} className="space-y-3.5">
+            {/* Account is only meaningful on the tenant console: the operator
+                surface is system-admin only, and the tenant behind a key is
+                derived from the key itself. */}
+            {tenantApp && (
+              <div>
+                <Input
+                  label="Account"
+                  icon={<Building2 size={13} />}
+                  value={tenantInput}
+                  onChange={(e) => {
+                    setTenantInput(e.target.value);
+                    setTenantSso(null);
+                    setTenantLookupError("");
+                  }}
+                  onBlur={(e) => lookupTenant(e.target.value)}
+                  placeholder="detected from your credentials"
+                  error={tenantLookupError || undefined}
+                  hint={
+                    tenantSso
+                      ? `${tenantSso.display_name || tenantSso.tenant}${
+                          tenantSso.sso_enabled
+                            ? " \u00b7 SSO available"
+                            : " \u00b7 password-only"
+                        }`
+                      : undefined
+                  }
+                />
               </div>
             )}
 
-            <form onSubmit={handleLogin} className="space-y-3">
-              {/* Account / Tenant. On the tenant console the field is
-                  always meaningful (every login here is a tenant
-                  login); on the ops console it's optional — empty
-                  means system-admin login. */}
-              <div>
-                <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                  Account
-                  {!tenantApp && (
-                    <span className="text-gray-400 font-normal"> (optional)</span>
-                  )}
-                </label>
-                <div className="relative">
-                  <Building2
-                    size={13}
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400"
-                  />
-                  <input
-                    type="text"
-                    value={tenantInput}
-                    onChange={(e) => {
-                      setTenantInput(e.target.value);
-                      // Clear stale lookup until they tab out / submit.
-                      setTenantSso(null);
-                      setTenantLookupError("");
-                    }}
-                    onBlur={(e) => lookupTenant(e.target.value)}
-                    placeholder={
-                      tenantApp ? "your account name" : "tenant name (leave blank for system)"
-                    }
-                    autoFocus={tenantApp}
-                    className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-                {tenantLookupError && (
-                  <p className="mt-1 text-[11px] text-red-600">{tenantLookupError}</p>
-                )}
-                {tenantSso && (
-                  <p className="mt-1 text-[11px] text-gray-500">
-                    {tenantSso.display_name || tenantSso.tenant}
-                    {tenantSso.sso_enabled
-                      ? " · SSO available"
-                      : " · password-only (no SSO configured)"}
-                  </p>
-                )}
-              </div>
+            <Input
+              label="Access key"
+              icon={<User size={13} />}
+              value={accessKey}
+              onChange={(e) => setAccessKey(e.target.value)}
+              placeholder="AKIA…"
+              autoFocus
+            />
 
-              {/* Access key */}
-              <div>
-                <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                  Username
-                </label>
-                <div className="relative">
-                  <User
-                    size={13}
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400"
-                  />
-                  <input
-                    type="text"
-                    value={accessKey}
-                    onChange={(e) => setAccessKey(e.target.value)}
-                    placeholder="AKIA…"
-                    className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    autoFocus={!tenantApp}
-                  />
-                </div>
-              </div>
+            <Input
+              label="Secret key"
+              type="password"
+              icon={<Lock size={13} />}
+              value={secretKey}
+              onChange={(e) => setSecretKey(e.target.value)}
+              placeholder="Secret access key"
+            />
 
-              {/* Secret key */}
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-[11px] font-semibold text-gray-700">
-                    Password
-                  </label>
-                  <button
-                    type="button"
-                    className="text-[11px] text-blue-600 hover:text-blue-700"
-                    onClick={() =>
-                      alert(
-                        "Recovery workflow is operator-side: regenerate access keys from the CLI (objectio-cli user create-key).",
-                      )
-                    }
-                  >
-                    Forgot?
-                  </button>
-                </div>
-                <div className="relative">
-                  <Lock
-                    size={13}
-                    className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400"
-                  />
-                  <input
-                    type="password"
-                    value={secretKey}
-                    onChange={(e) => setSecretKey(e.target.value)}
-                    placeholder="Secret access key"
-                    className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-
-              <label className="inline-flex items-center gap-1.5 text-[11px] text-gray-600 mt-1">
+            <div className="flex items-center justify-between pt-0.5">
+              <label className="flex items-center gap-2 text-[12px] text-text-2 select-none">
                 <input
                   type="checkbox"
                   checked={remember}
                   onChange={(e) => setRemember(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-blue-600"
+                  className="rounded border-border-strong accent-[var(--oio-accent)]"
                 />
                 Remember connection
               </label>
-
-              <button
-                type="submit"
-                disabled={loading || !accessKey || !secretKey}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-blue-600 text-white rounded-lg text-[13px] font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+              <a
+                href="https://objectio.dev/docs/console"
+                className="text-[12px] text-accent hover:opacity-80"
               >
-                {loading ? "Connecting…" : "Connect →"}
-              </button>
-            </form>
+                Forgot?
+              </a>
+            </div>
 
-            {/* SSO. Two distinct rendering modes:
-              *   - Tenant scope active (Account input filled + lookup OK):
-              *     show ONE button for the tenant's own SSO, never the
-              *     system providers (so a tenant user can't accidentally
-              *     log into the wrong account).
-              *   - No tenant scope: show the system-wide provider list as
-              *     before.                                              */}
-            {tenantSso?.sso_enabled ? (
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={loading}
+              className="w-full"
+            >
+              {loading ? "Connecting…" : "Connect"}
+            </Button>
+          </form>
+
+          {/* SSO. A resolved tenant shows only that tenant's provider, so a
+              tenant user cannot land in the wrong account; with no tenant
+              scope the surface's own providers are offered. */}
+          {tenantSso?.sso_enabled ? (
+            <>
+              <Divider label={`Or sign in to ${tenantSso.display_name || tenantSso.tenant}`} />
+              <Button
+                variant="secondary"
+                className="w-full"
+                icon={<LogIn size={14} />}
+                onClick={() => handleSsoLogin(tenantSso.provider_name)}
+              >
+                Continue with SSO
+              </Button>
+            </>
+          ) : (
+            !tenantInput.trim() &&
+            oidcEnabled &&
+            providers.length > 0 && (
               <>
-                <div className="relative my-5">
-                  <div className="absolute inset-0 flex items-center">
-                    <div className="w-full border-t border-gray-200" />
-                  </div>
-                  <div className="relative flex justify-center text-[10px]">
-                    <span className="bg-white px-2 text-gray-400 uppercase tracking-wider">
-                      Or sign in to {tenantSso.display_name || tenantSso.tenant}
-                    </span>
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => handleSsoLogin(tenantSso.provider_name)}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-800 rounded-lg text-[13px] font-medium hover:bg-gray-100"
-                >
-                  <LogIn size={14} />
-                  Continue with SSO
-                </button>
-              </>
-            ) : (
-              !tenantInput.trim() &&
-              oidcEnabled && (
-                <>
-                  <div className="relative my-5">
-                    <div className="absolute inset-0 flex items-center">
-                      <div className="w-full border-t border-gray-200" />
-                    </div>
-                    <div className="relative flex justify-center text-[10px]">
-                      <span className="bg-white px-2 text-gray-400 uppercase tracking-wider">
-                        Or continue with
-                      </span>
-                    </div>
-                  </div>
-
-                  {providers.length <= 1 ? (
-                    <button
-                      onClick={() => handleSsoLogin(providers[0]?.name)}
-                      className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-800 rounded-lg text-[13px] font-medium hover:bg-gray-100"
+                <Divider label="Or single sign-on" />
+                <div className="space-y-2">
+                  {providers.map((p) => (
+                    <Button
+                      key={p.name}
+                      variant="secondary"
+                      className="w-full"
+                      icon={<LogIn size={14} />}
+                      onClick={() => handleSsoLogin(p.name)}
                     >
-                      <LogIn size={14} />
-                      {providers[0]?.label || "SSO / Active Directory"}
-                    </button>
-                  ) : (
-                    <div className="space-y-1.5">
-                      {providers.map((p) => (
-                        <button
-                          key={p.name}
-                          onClick={() => handleSsoLogin(p.name)}
-                          className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-gray-50 border border-gray-200 text-gray-800 rounded-lg text-[12px] font-medium hover:bg-gray-100"
-                        >
-                          <LogIn size={13} />
-                          {p.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </>
-              )
-            )}
-          </div>
+                      Continue with {p.label}
+                    </Button>
+                  ))}
+                </div>
+              </>
+            )
+          )}
         </div>
 
-        <p className="mt-4 text-[11px] text-gray-400 text-center">
+        <p className="mt-4 text-center text-[11px] text-muted">
           Need help? See the{" "}
-          <a
-            href="https://github.com/cloudomate/objectio"
-            className="text-blue-600 hover:text-blue-700"
-            target="_blank"
-            rel="noreferrer"
-          >
+          <a href="https://objectio.dev/docs" className="text-accent hover:opacity-80">
             ObjectIO docs
           </a>
-          .
         </p>
+      </div>
+    </div>
+  );
+}
+
+/// Mono caps rule used between the credential form and the SSO options.
+function Divider({ label }: { label: string }) {
+  return (
+    <div className="relative my-5">
+      <div className="absolute inset-0 flex items-center">
+        <div className="w-full border-t border-border" />
+      </div>
+      <div className="relative flex justify-center">
+        <span className="bg-surface px-2 font-mono text-[10px] uppercase tracking-[0.12em] text-faint">
+          {label}
+        </span>
       </div>
     </div>
   );

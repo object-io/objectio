@@ -1,34 +1,53 @@
 /* ==========================================================================
    OBJECTIO — Brand tokens (CSS)
-   Drop this into your site and reference the variables below.
+
+   Primitives mirror objectio-brand/assets/brand-tokens.json. The `--oio-*`
+   names are the brand's own; the `--objectio-*` names are this app's older
+   vocabulary, kept as aliases so existing rules keep resolving.
+
+   The mark is the Shard Ring: eight segments, six data + two parity (amber,
+   at 12 and 6 o'clock). Never rotate it; never recolor the parity pair.
    ========================================================================== */
 
 :root {
-  /* Brand colors ------------------------------------------------------------ */
-  --objectio-teal:        #00E0B8;   /* primary accent */
-  --objectio-teal-600:    #00B093;   /* on light bg */
-  --objectio-indigo:      #5B8CFF;   /* secondary accent */
-  --objectio-indigo-600:  #1F6AFF;   /* on light bg */
+  /* Brand primitives ------------------------------------------------------- */
+  --oio-ink:         #0c121a;
+  --oio-graphite:    #232933;
+  --oio-slate:       #677284;
+  --oio-mist:        #ccd1d9;
+  --oio-paper:       #f5f7f9;
+  --oio-data:        #249ff3;
+  --oio-data-deep:   #0077c7;
+  --oio-data-light:  #a2d4ff;
+  --oio-parity:      #fc9f30;
 
-  /* Neutrals --------------------------------------------------------------- */
-  --objectio-ink:         #0B0F14;   /* darkest surface / primary text on light */
-  --objectio-ink-raised:  #11161D;   /* cards on dark */
-  --objectio-ink-line:    #1C2430;   /* 1px lines on dark */
-  --objectio-paper:       #F7F8FB;   /* primary surface on light */
-  --objectio-paper-line:  #E3E7EF;   /* 1px lines on light */
-  --objectio-fog:         #CFD5E0;   /* muted surface */
-  --objectio-mute:        #8A95A5;   /* secondary text */
-  --objectio-snow:        #E7ECF3;   /* primary text on dark */
+  --oio-font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+  --oio-font-body:    'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --oio-font-mono:    'IBM Plex Mono', 'SF Mono', Menlo, monospace;
 
-  /* Gradients -------------------------------------------------------------- */
-  --objectio-gradient:    linear-gradient(90deg, #00E0B8 0%, #5B8CFF 100%);
-  --objectio-gradient-l:  linear-gradient(90deg, #00B093 0%, #1F6AFF 100%);
-  --objectio-bg-hero:     radial-gradient(1200px 400px at 50% 0%, #17202C 0%, #0B0F14 70%);
+  /* Aliases for the app's existing vocabulary ------------------------------ */
+  --objectio-ink:         var(--oio-ink);
+  --objectio-ink-raised:  var(--oio-graphite);
+  --objectio-ink-line:    #1b222c;
+  --objectio-paper:       var(--oio-paper);
+  --objectio-paper-line:  var(--oio-mist);
+  --objectio-fog:         var(--oio-mist);
+  --objectio-mute:        var(--oio-slate);
+  --objectio-snow:        var(--oio-paper);
+  --objectio-accent:      var(--oio-data);
+  --objectio-accent-600:  var(--oio-data-deep);
+  --objectio-parity:      var(--oio-parity);
 
-  /* Typography ------------------------------------------------------------- */
-  --objectio-font-sans:   "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
-                          Roboto, Helvetica, Arial, sans-serif;
-  --objectio-font-mono:   "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --objectio-font-sans:   var(--oio-font-body);
+  --objectio-font-display: var(--oio-font-display);
+  --objectio-font-mono:   var(--oio-font-mono);
+
+  /* Gradients. Data blue into its deep tone; parity amber is reserved for the
+     mark's two parity shards and for genuine parity/repair states, so it is
+     deliberately absent here. ---------------------------------------------- */
+  --objectio-gradient:    linear-gradient(90deg, var(--oio-data) 0%, var(--oio-data-deep) 100%);
+  --objectio-gradient-l:  linear-gradient(90deg, var(--oio-data-deep) 0%, var(--oio-ink) 100%);
+  --objectio-bg-hero:     radial-gradient(1200px 400px at 50% 0%, var(--oio-graphite) 0%, var(--oio-ink) 70%);
 
   /* Type scale (fluid-ish) ------------------------------------------------- */
   --objectio-fs-display:  clamp(48px, 6vw, 96px);
@@ -46,7 +65,7 @@
   --objectio-radius-xl:   24px;
   --objectio-shadow-1:    0 1px 2px rgba(0,0,0,.2), 0 0 0 1px rgba(255,255,255,.04) inset;
   --objectio-shadow-2:    0 8px 24px rgba(0,0,0,.35);
-  --objectio-shadow-glow: 0 0 0 2px rgba(0,224,184,.25), 0 8px 24px rgba(0,224,184,.15);
+  --objectio-shadow-glow: 0 0 0 2px rgba(36,159,243,.25), 0 8px 24px rgba(36,159,243,.15);
 
   /* Spacing (4pt scale) ---------------------------------------------------- */
   --objectio-space-1:     4px;
@@ -76,8 +95,8 @@
   display: inline-flex; align-items: center; gap: 8px;
   padding: 10px 16px;
   font: 600 14px/1 var(--objectio-font-sans);
-  color: var(--objectio-ink);
-  background: var(--objectio-teal);
+  color: var(--oio-paper);
+  background: var(--oio-data);
   border: 0;
   border-radius: var(--objectio-radius-md);
   cursor: pointer;

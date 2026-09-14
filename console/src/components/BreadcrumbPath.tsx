@@ -14,15 +14,15 @@ export default function BreadcrumbPath({
 }: Props) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 font-mono text-[11px] text-gray-500 ${className}`}
+      className={`inline-flex items-center gap-1.5 font-mono text-[11px] text-muted ${className}`}
     >
       {segments.map((s, i) => (
         <span key={i} className="inline-flex items-center gap-1.5">
-          <span className={s ? "text-gray-700" : "text-gray-300"}>
+          <span className={s ? "text-text-2" : "text-faint"}>
             {s || "—"}
           </span>
           {i < segments.length - 1 && (
-            <span className="text-gray-300">{sep}</span>
+            <span className="text-faint">{sep}</span>
           )}
         </span>
       ))}

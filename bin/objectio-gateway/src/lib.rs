@@ -17,6 +17,7 @@ pub mod license_gate;
 pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
+pub mod prom;
 pub mod s3;
 pub mod scatter_gather;
 
@@ -27,7 +28,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{StatusCode, header},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{delete, get, head, post, put},
 };
 use clap::Parser;
@@ -218,6 +219,19 @@ pub struct Args {
     /// Disable authentication (for development)
     #[arg(long, default_value_t = false)]
     pub no_auth: bool,
+
+    /// Base URL of a Prometheus that scrapes this cluster, e.g.
+    /// `http://prometheus:9090`. The console proxies range queries through the
+    /// gateway to it.
+    ///
+    /// `/metrics` is a point-in-time scrape, so a browser polling it only knows
+    /// what happened since the page opened — about five minutes. Ranges beyond
+    /// that, and any series labelled per node or per gateway, come from
+    /// Prometheus, which already scrapes the gateway, the meta nodes and the
+    /// OSDs. Leave empty to run without it: the console falls back to the live
+    /// scrape and says so.
+    #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
+    pub prometheus_url: String,
 
     /// Keep buckets that have no recorded owner accessible to any
     /// authenticated caller. Buckets created before ownership was tracked
@@ -827,6 +841,7 @@ pub async fn run(
         self_topology,
         host_provider,
         legacy_open_buckets: args.authz_legacy_open_buckets,
+        prometheus_url: args.prometheus_url.clone(),
     });
 
     // Build router
@@ -1004,6 +1019,20 @@ pub async fn run(
             "/_admin/buckets/{name}/objects",
             get(admin::admin_list_objects),
         )
+        // Object read/write for the console. The S3 path needs a SigV4
+        // signature; the console has a session cookie, so these run the same
+        // handlers behind the `/_admin/*` tenant-admin check rather than
+        // handing the browser an access key.
+        .route(
+            "/_admin/buckets/{name}/objects/{*key}",
+            get(admin::admin_get_object)
+                .put(admin::admin_put_object)
+                .delete(admin::admin_delete_object)
+                // The admin router carries no body limit, so it would
+                // otherwise inherit axum's 2 MB default and cap a console
+                // upload well below what the S3 path accepts.
+                .layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
         // KMS admin API
         .route("/_admin/kms/status", get(kms::admin_kms_status))
         .route("/_admin/kms/version", get(kms::admin_kms_version))
@@ -1024,6 +1053,12 @@ pub async fn run(
         .route("/_admin/license", get(admin::admin_get_license))
         .route("/_admin/license", put(admin::admin_put_license))
         .route("/_admin/license", delete(admin::admin_delete_license))
+        // Prometheus proxy. Sits with the other admin APIs so it inherits the
+        // same optional SigV4 layer — a console session and a signed request
+        // are both recognised. Inert when --prometheus-url is unset.
+        .route("/_admin/metrics/capabilities", get(prom::capabilities))
+        .route("/_admin/metrics/query", get(prom::query))
+        .route("/_admin/metrics/query_range", get(prom::query_range))
         .with_state(Arc::clone(&state))
         // Layer SigV4 verification that is optional — if a request carries
         // `Authorization: AWS4-HMAC-SHA256 ...`, verify it and inject
@@ -1195,7 +1230,33 @@ pub async fn run(
             .merge(unity_gated.clone())
             .nest("/delta-sharing", delta_gated.clone())
             .nest("/_admin/delta-sharing", delta_admin_gated.clone())
-            .nest_service("/_console", console_service(&legacy_console_dir))
+            // Path-mounted consoles. These are the addressable surfaces:
+            // /_console/admin is the operator console, /_console/tenant the
+            // self-service one. Each bundle is built with its own base, so the
+            // same build serves correctly here and on a dedicated listener.
+            // The bare /_console mount stays for the legacy single bundle.
+            .nest_service("/_console/admin", console_service(&ops_console_dir))
+            .nest_service("/_console/tenant", console_service(&tenant_console_dir))
+            // Self-registration entry point. A short, shareable URL that lands
+            // in the tenant bundle's signup route — the bundle is built with
+            // its own base, so it has to be reached under that base rather
+            // than mounted a second time somewhere else.
+            .route(
+                "/_console/signup",
+                get(|| async { Redirect::temporary("/_console/tenant/signup") }),
+            )
+            // `/_console` itself has no bundle — the build produces the ops and
+            // tenant bundles only — so it redirects to the operator console
+            // rather than serving a directory with no index.html, which
+            // renders as a blank page.
+            .route(
+                "/_console",
+                get(|| async { Redirect::temporary("/_console/admin/") }),
+            )
+            .route(
+                "/_console/",
+                get(|| async { Redirect::temporary("/_console/admin/") }),
+            )
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Legacy))
@@ -1253,7 +1314,17 @@ pub async fn run(
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
                 .nest("/_admin/delta-sharing", delta_admin_gated.clone())
-                .nest_service("/_console", console_service(&ops_console_dir))
+                // Same canonical path as the single-port mount, so one
+                // build serves both modes.
+                .nest_service("/_console/admin", console_service(&ops_console_dir))
+                .route(
+                    "/",
+                    get(|| async { Redirect::permanent("/_console/admin/") }),
+                )
+                .route(
+                    "/_console",
+                    get(|| async { Redirect::permanent("/_console/admin/") }),
+                )
                 .layer(Extension(ListenerKind::OpsConsole))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, ops_router, "ops console"));
@@ -1274,7 +1345,15 @@ pub async fn run(
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
                 .nest("/_admin/delta-sharing", delta_admin_gated.clone())
-                .nest_service("/_console", console_service(&tenant_console_dir))
+                .nest_service("/_console/tenant", console_service(&tenant_console_dir))
+                .route(
+                    "/",
+                    get(|| async { Redirect::permanent("/_console/tenant/") }),
+                )
+                .route(
+                    "/_console",
+                    get(|| async { Redirect::permanent("/_console/tenant/") }),
+                )
                 .layer(Extension(ListenerKind::TenantConsole))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, tenant_router, "tenant console"));

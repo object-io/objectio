@@ -4,17 +4,17 @@ interface Props {
 }
 
 const styles = {
-  healthy: "bg-green-100 text-green-800",
-  warning: "bg-yellow-100 text-yellow-800",
-  error: "bg-red-100 text-red-800",
-  unknown: "bg-gray-100 text-gray-600",
+  healthy: "bg-ok-soft text-ok",
+  warning: "bg-warn-soft text-warn",
+  error: "bg-err-soft text-err",
+  unknown: "bg-surface-2 text-text-2",
 };
 
 const dots = {
-  healthy: "bg-green-500",
-  warning: "bg-yellow-500",
-  error: "bg-red-500",
-  unknown: "bg-gray-400",
+  healthy: "bg-ok",
+  warning: "bg-warn-dot",
+  error: "bg-err",
+  unknown: "bg-faint",
 };
 
 export default function StatusBadge({ status, label }: Props) {

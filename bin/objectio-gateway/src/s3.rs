@@ -18,7 +18,10 @@ use axum::{
 };
 use base64::Engine;
 use bytes::Bytes;
-use objectio_auth::{AuthResult, policy::PolicyEvaluator};
+use objectio_auth::{
+    AuthResult,
+    policy::{BucketPolicy, PolicyEvaluator},
+};
 use objectio_common::ErasureConfig;
 use objectio_erasure::{
     ErasureCodec,
@@ -134,6 +137,9 @@ pub struct AppState {
     /// window between deploying ownership enforcement and backfilling owners
     /// on buckets created before it existed.
     pub legacy_open_buckets: bool,
+    /// Base URL of a Prometheus that scrapes this cluster. Empty = the
+    /// console falls back to scraping /metrics live.
+    pub prometheus_url: String,
 }
 
 impl AppState {
@@ -4168,6 +4174,18 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
         );
     }
 
+    // Valid JSON is not enough: a document that is not a valid *policy* parses
+    // as nothing at authorization time, and the bucket then behaves as though
+    // no policy were set — a grant that silently does nothing, visible only as
+    // a log line. Reject it here instead.
+    if let Err(e) = BucketPolicy::from_json(&policy_json) {
+        return S3Error::xml_response(
+            "MalformedPolicy",
+            &format!("The policy is not a valid bucket policy: {e}"),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
     match client
         .set_bucket_policy(SetBucketPolicyRequest {
             bucket: bucket.clone(),
@@ -7162,59 +7180,6 @@ pub struct CreateUserParams {
     pub tenant: String,
 }
 
-/// Admin user ARN - only this user can access admin endpoints
-const ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
-
-/// Check if the authenticated user is the admin user
-fn is_admin_user(auth: &AuthResult) -> bool {
-    auth.user_arn == ADMIN_USER_ARN
-}
-
-/// Return a 403 Forbidden response for non-admin users
-fn admin_forbidden_response() -> Response {
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"error":"Admin access required. Only the 'admin' user can access this endpoint."}"#,
-        ))
-        .unwrap()
-}
-
-/// Return a 401 Unauthorized response when auth is disabled
-fn admin_auth_required_response() -> Response {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"error":"Admin API requires authentication. Start gateway without --no-auth flag."}"#))
-        .unwrap()
-}
-
-/// Check if request is from admin user, returns error response if not.
-/// Accepts SigV4 auth or console session cookie.
-#[allow(clippy::result_large_err)]
-fn check_admin_access(
-    auth: Option<Extension<AuthResult>>,
-    headers: &HeaderMap,
-) -> Result<(), Response> {
-    // SigV4 auth
-    if let Some(Extension(ref auth_result)) = auth {
-        if is_admin_user(auth_result) {
-            return Ok(());
-        }
-        warn!("Admin API access denied for user: {}", auth_result.user_arn);
-        return Err(admin_forbidden_response());
-    }
-
-    // Console session cookie — login already validated credentials
-    if crate::console_auth::validate_session_from_headers(headers).is_some() {
-        return Ok(());
-    }
-
-    warn!("Admin API access attempted without authentication");
-    Err(admin_auth_required_response())
-}
-
 /// List users (GET /_admin/users)
 pub async fn admin_list_users(
     State(state): State<Arc<AppState>>,
@@ -7228,8 +7193,20 @@ pub async fn admin_list_users(
         .or_else(|| crate::console_auth::validate_session_from_headers(&headers).map(|s| s.tenant))
         .unwrap_or_default();
 
-    if let Err(response) = check_admin_access(auth, &headers) {
-        return response;
+    // This handler already filters its result to the caller's tenant — it was
+    // written for tenant admins. The gate in front of it was not: over SigV4
+    // `check_admin_access` admits only the root key, so a tenant admin could
+    // create a user and mint its keys but never list them back. Every sibling
+    // route (list/create/delete access keys, delete user) uses the
+    // tenant-aware gate; this one was the outlier.
+    if tenant.is_empty() {
+        if let Some(deny) = crate::admin::require_system_admin(&auth, &headers) {
+            return deny;
+        }
+    } else if let Some(deny) =
+        crate::admin::require_tenant_admin_access(&state, &auth, &headers, &tenant).await
+    {
+        return deny;
     }
 
     let mut client = state.meta_client.clone();
@@ -7354,10 +7331,23 @@ pub async fn admin_create_user(
         }
         Err(e) => {
             error!("Failed to create user: {}", e);
+            // Map the gRPC code rather than calling everything a 500, and
+            // send `e.message()` rather than `e` — the Display impl embeds the
+            // whole tonic Status including its MetadataMap, which put response
+            // headers and internal detail into the client's error body.
+            let status = match e.code() {
+                tonic::Code::AlreadyExists => StatusCode::CONFLICT,
+                tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+                tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                .body(Body::from(
+                    serde_json::json!({ "error": e.message() }).to_string(),
+                ))
                 .unwrap()
         }
     }

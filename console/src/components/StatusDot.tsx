@@ -5,19 +5,19 @@ interface Props {
 }
 
 const dots = {
-  healthy: "bg-emerald-500",
-  warning: "bg-amber-500",
-  error: "bg-red-500",
-  unknown: "bg-gray-400",
-  info: "bg-blue-500",
+  healthy: "bg-ok",
+  warning: "bg-warn-dot",
+  error: "bg-err",
+  unknown: "bg-faint",
+  info: "bg-accent",
 };
 
 const labelColor = {
-  healthy: "text-emerald-700",
-  warning: "text-amber-700",
-  error: "text-red-700",
-  unknown: "text-gray-500",
-  info: "text-blue-700",
+  healthy: "text-ok",
+  warning: "text-warn",
+  error: "text-err",
+  unknown: "text-muted",
+  info: "text-accent",
 };
 
 /// Colored dot + optional label. Use inline for compact status indicators

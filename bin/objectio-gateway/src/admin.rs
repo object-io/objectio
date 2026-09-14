@@ -446,6 +446,35 @@ pub fn extract_caller(
     CallerIdentity::default()
 }
 
+/// Refuse a credential that carries a bucket/prefix scope.
+///
+/// A scope is a narrowing filter on the *data* path: it can only subtract
+/// from what the identity already has. Nothing was applying it to `/_admin/*`,
+/// so a scoped key kept every admin right its user had — and since minting an
+/// access key is an admin right, a read-only key confined to one bucket could
+/// mint itself a fresh unscoped read-write one. That defeats scoping entirely
+/// the moment a key is issued from an admin's own user, which is exactly what
+/// a provisioner (a CSI driver, say) would do.
+///
+/// Admin work needs an unscoped credential. This is deliberately a flat
+/// refusal rather than a narrowing: there is no meaningful way to apply
+/// "confined to s3://ws1/" to "create a tenant".
+fn deny_scoped_credential(auth: &Option<Extension<AuthResult>>) -> Option<Response> {
+    let Some(Extension(a)) = auth else { return None };
+    let scoped = a.scope.as_ref().is_some_and(|s| !s.scope.is_empty());
+    if scoped {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                "This access key is scoped to a bucket or prefix and cannot be \
+                 used on the admin API. Use an unscoped credential.",
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 pub(crate) const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
 
 /// True iff the caller is a system-scope admin. Tenant users (tenant != "")
@@ -478,6 +507,9 @@ pub async fn require_tenant_admin_access(
     headers: &axum::http::HeaderMap,
     target_tenant: &str,
 ) -> Option<Response> {
+    if let Some(deny) = deny_scoped_credential(auth) {
+        return Some(deny);
+    }
     let caller = extract_caller(auth, headers);
     if !caller.authenticated {
         return Some((StatusCode::UNAUTHORIZED, "Authentication required").into_response());
@@ -540,6 +572,9 @@ pub fn require_admin_or_session(
     auth: &Option<Extension<AuthResult>>,
     headers: &axum::http::HeaderMap,
 ) -> Option<Response> {
+    if let Some(deny) = deny_scoped_credential(auth) {
+        return Some(deny);
+    }
     // If SigV4 auth is present, use it
     if let Some(Extension(auth_result)) = auth {
         if auth_result.user_arn.ends_with("user/admin") {
@@ -564,6 +599,9 @@ pub fn require_system_admin(
     auth: &Option<Extension<AuthResult>>,
     headers: &axum::http::HeaderMap,
 ) -> Option<Response> {
+    if let Some(deny) = deny_scoped_credential(auth) {
+        return Some(deny);
+    }
     let caller = extract_caller(auth, headers);
     if !caller.authenticated {
         return Some((StatusCode::UNAUTHORIZED, "Authentication required").into_response());
@@ -1165,10 +1203,20 @@ pub async fn admin_list_buckets(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    let tenant = extract_tenant(&auth, &headers);
+    // Like the user listing, this already scopes its query to the caller's
+    // tenant but was gated on the root key alone — so a tenant admin could
+    // create a bucket and never see it again. A provisioner that cannot list
+    // what it made cannot reconcile, which is most of what a provisioner does.
+    if tenant.is_empty() {
+        if let Some(deny) = require_system_admin(&auth, &headers) {
+            return deny;
+        }
+    } else if let Some(deny) =
+        require_tenant_admin_access(&state, &auth, &headers, &tenant).await
+    {
         return deny;
     }
-    let tenant = extract_tenant(&auth, &headers);
 
     let mut client = state.meta_client.clone();
     match client
@@ -1233,7 +1281,14 @@ pub async fn admin_create_bucket(
     match client
         .create_bucket(objectio_proto::metadata::CreateBucketRequest {
             name: name.clone(),
-            owner: "admin".to_string(),
+            // The creator, not the literal string "admin". Authorization
+            // falls back to ownership when no policy speaks, and it compares
+            // against `user_id` — so a hardcoded "admin" matched nobody and
+            // left every console-created bucket reachable only by the root
+            // key, whatever policy its tenant admin attached. The S3
+            // CreateBucket path has recorded the real creator since
+            // ownership was introduced; this one was missed.
+            owner: extract_caller(&auth, &headers).user_id,
             storage_class: "STANDARD".to_string(),
             region: String::new(),
             tenant,
@@ -1519,6 +1574,88 @@ pub async fn admin_list_objects(
         "prefix": params.prefix,
     }))
     .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminObjectParams {
+    #[serde(rename = "versionId", default)]
+    pub version_id: Option<String>,
+}
+
+/// Upload an object from the console.
+///
+/// The S3 path (`PUT /{bucket}/{key}`) is signed with SigV4, and the console
+/// holds a session cookie rather than a key pair — so without this the browser
+/// would have to be handed a live access key to put a single file. This runs
+/// the same handler behind the same tenant-admin check as the rest of
+/// `/_admin/*`, which keeps the credential where it belongs.
+///
+/// A key ending in `/` with an empty body is how the object browser makes a
+/// folder: there are no directories to create, only a zero-byte marker that
+/// makes an empty prefix visible to a delimiter listing.
+pub async fn admin_put_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    if key.is_empty() {
+        return (StatusCode::BAD_REQUEST, "object key is required").into_response();
+    }
+    crate::s3::put_object(State(state), Path((bucket, key)), auth, headers, body).await
+}
+
+/// Delete one object from the console. `?versionId=` targets a single version.
+pub async fn admin_delete_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<AdminObjectParams>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    crate::s3::delete_object(
+        State(state),
+        Path((bucket, key)),
+        auth,
+        params.version_id,
+        headers,
+    )
+    .await
+}
+
+/// Download an object from the console.
+///
+/// Forces `Content-Disposition: attachment` so a click saves the file instead
+/// of navigating the console away to render it — an HTML object would
+/// otherwise load as a page on the console's own origin.
+pub async fn admin_get_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
+    let mut resp = crate::s3::get_object(State(state), Path((bucket, key)), auth, headers).await;
+    if resp.status().is_success()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            filename.replace('"', "")
+        ))
+    {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, v);
+    }
+    resp
 }
 
 // ============================================================================
@@ -3218,5 +3355,48 @@ fn grpc_to_http(code: tonic::Code) -> u16 {
         tonic::Code::AlreadyExists => 409,
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => 403,
         _ => 500,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objectio_auth::scope::{CredentialScope, Operation};
+
+    fn auth_with(scope: Option<&str>) -> Option<Extension<AuthResult>> {
+        Some(Extension(AuthResult {
+            user_id: "u1".into(),
+            user_arn: "arn:objectio:iam::acme:user/app".into(),
+            tenant: "acme".into(),
+            scope: scope.map(|s| CredentialScope {
+                scope: s.to_string(),
+                operation: Operation::ReadWrite,
+            }),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn unscoped_credentials_reach_the_admin_api() {
+        assert!(deny_scoped_credential(&auth_with(None)).is_none());
+        assert!(deny_scoped_credential(&None).is_none());
+    }
+
+    #[test]
+    fn a_scoped_credential_is_refused() {
+        // The escalation this closes: minting an access key is an admin
+        // action, so without this a key confined to one bucket could mint
+        // itself an unscoped one and walk out of its own scope.
+        let denied = deny_scoped_credential(&auth_with(Some("s3://ws1/")));
+        assert!(denied.is_some());
+        assert_eq!(denied.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn an_empty_scope_string_is_not_a_scope() {
+        // Meta stores "no scope" as an empty string, and older records decode
+        // to `Some(CredentialScope { scope: "" })` rather than `None`. Reading
+        // that as scoped would lock every pre-existing key out of the console.
+        assert!(deny_scoped_credential(&auth_with(Some(""))).is_none());
     }
 }

@@ -1,15 +1,38 @@
 import { useEffect, useState } from "react";
 import {
-  Warehouse,
-  Table2,
-  Plus,
-  Trash2,
-  FolderOpen,
-  ChevronRight,
   ArrowLeft,
+  ChevronRight,
+  FolderOpen,
+  Plus,
+  Shield,
+  Table2,
+  Trash2,
+  Warehouse,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import { iceberg } from "../api/client";
+import { Badge, Button, Card, Chip, Input, Table, Row, Cell } from "../components/ui";
+
+/// Per-table facts the list view shows. The list endpoint returns names only,
+/// so these come from a bounded fan-out of metadata reads — a namespace with
+/// hundreds of tables should not turn opening it into hundreds of requests.
+interface TableFacts {
+  snapshots: number;
+  lastUpdatedMs: number;
+}
+const METADATA_FANOUT = 25;
+
+/// Module scope, not the component body: it reads the clock, and the hooks
+/// purity rule rightly objects to that inside a render.
+function ago(ms: number): string {
+  if (!ms) return "—";
+  const mins = Math.round((Date.now() - ms) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs} h ago`;
+  return `${Math.round(hrs / 24)} d ago`;
+}
 
 interface WarehouseInfo {
   name: string;
@@ -48,11 +71,15 @@ export default function IcebergCatalog() {
   > | null>(null);
   const [selectedTableName, setSelectedTableName] = useState("");
 
+  const [nsProps, setNsProps] = useState<Record<string, string>>({});
+  const [facts, setFacts] = useState<Record<string, TableFacts>>({});
   const [loading, setLoading] = useState(true);
 
   // Load warehouses
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
   const loadWarehouses = () => {
-    setLoading(true);
     fetch("/_admin/warehouses")
       .then((r) => r.json())
       .then((d) => setWarehouses(d.warehouses || []))
@@ -112,8 +139,36 @@ export default function IcebergCatalog() {
   const openNamespace = async (ns: string) => {
     setSelectedNs(ns);
     setView("tables");
+    setFacts({});
+    iceberg
+      .getNamespace(ns, whName)
+      .then((r) => setNsProps(r.properties || {}))
+      .catch(() => setNsProps({}));
     const r = await iceberg.listTables(ns, whName);
-    setTables(r.identifiers || []);
+    const ids = r.identifiers || [];
+    setTables(ids);
+    const got: Record<string, TableFacts> = {};
+    await Promise.all(
+      ids.slice(0, METADATA_FANOUT).map(async (t) => {
+        try {
+          const m = (await iceberg.getTable(ns, t.name, whName)) as {
+            metadata?: { snapshots?: unknown[]; "last-updated-ms"?: number };
+            snapshots?: unknown[];
+            "last-updated-ms"?: number;
+          };
+          // The REST spec nests these under `metadata`; some servers return
+          // them flat. Read both rather than showing a blank for one shape.
+          const meta = m.metadata ?? m;
+          got[t.name] = {
+            snapshots: Array.isArray(meta.snapshots) ? meta.snapshots.length : 0,
+            lastUpdatedMs: Number(meta["last-updated-ms"] ?? 0),
+          };
+        } catch {
+          /* one unreadable table should not blank the whole column */
+        }
+      })
+    );
+    setFacts(got);
   };
 
   const deleteTable = async (ns: string, name: string) => {
@@ -129,7 +184,10 @@ export default function IcebergCatalog() {
     try {
       const r = await iceberg.getTable(ns, name, whName);
       // Strip vended credentials from display — they're transient, not metadata
-      const { config: _config, ...tableMetadata } = r;
+      // Vended credentials are transient, not metadata — drop them from
+      // what we display.
+      const tableMetadata = { ...r };
+      delete (tableMetadata as { config?: unknown }).config;
       setSelectedTable(tableMetadata);
     } catch (e) {
       setSelectedTable({ error: String(e) });
@@ -169,378 +227,291 @@ export default function IcebergCatalog() {
     breadcrumb.push({ label: selectedTableName });
   }
 
+  const policyStatements = (() => {
+    const raw = nsProps.__policy;
+    if (!raw) return 0;
+    try {
+      const doc = JSON.parse(raw) as { Statement?: unknown[] };
+      return Array.isArray(doc.Statement) ? doc.Statement.length : 0;
+    } catch {
+      return 0;
+    }
+  })();
+
   return (
     <div className="p-6">
       <PageHeader
         title="Tables"
-        description="Manage warehouses, namespaces, and Iceberg tables"
+        description="Iceberg REST catalog · warehouses, namespaces, tables"
+        action={
+          view === "warehouses" ? (
+            <Button variant="primary" icon={<Plus size={13} />} onClick={() => setShowCreateWh(true)}>
+              Create warehouse
+            </Button>
+          ) : view === "namespaces" ? (
+            <Button variant="primary" icon={<Plus size={13} />} onClick={() => setShowCreateNs(true)}>
+              Create namespace
+            </Button>
+          ) : null
+        }
       />
 
-      {/* Breadcrumb */}
       {view !== "warehouses" && (
-        <div className="flex items-center gap-1 text-[12px] mb-4">
-          <button
-            onClick={goBack}
-            className="text-gray-400 hover:text-gray-600 p-0.5 mr-1"
-          >
-            <ArrowLeft size={14} />
-          </button>
-          {breadcrumb.map((b, i) => (
-            <span key={i} className="flex items-center gap-1">
-              {i > 0 && (
-                <ChevronRight size={12} className="text-gray-300" />
-              )}
-              {b.action ? (
-                <button
-                  onClick={b.action}
-                  className="text-gray-500 hover:text-blue-600"
-                >
-                  {b.label}
-                </button>
-              ) : (
-                <span className="text-gray-900 font-medium">{b.label}</span>
-              )}
-            </span>
-          ))}
+        <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+          <nav className="flex items-center gap-1.5 text-[13px] min-w-0">
+            <button onClick={goBack} className="text-faint hover:text-text p-0.5 mr-1" title="Back">
+              <ArrowLeft size={14} />
+            </button>
+            {breadcrumb.map((b, i) => (
+              <span key={i} className="flex items-center gap-1.5 min-w-0">
+                {i > 0 && <ChevronRight size={12} className="text-faint shrink-0" />}
+                {b.action ? (
+                  <button onClick={b.action} className="text-accent hover:underline truncate">
+                    {b.label}
+                  </button>
+                ) : (
+                  <span className="text-text font-medium truncate">{b.label}</span>
+                )}
+              </span>
+            ))}
+          </nav>
+          {/* Every Iceberg REST call is scoped by warehouse and the gateway
+              rejects a request without it, so the active one is shown rather
+              than left implicit. */}
+          {selectedWh && <Chip mono>warehouse={selectedWh.name}</Chip>}
         </div>
       )}
 
-      {/* Warehouses View */}
       {view === "warehouses" && (
         <>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
-              Warehouses
-            </h2>
-            <button
-              onClick={() => setShowCreateWh(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
-            >
-              <Plus size={14} /> Create Warehouse
-            </button>
-          </div>
-
           {showCreateWh && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4">
-              <div className="flex gap-2">
-                <input
-                  value={newWhName}
-                  onChange={(e) => setNewWhName(e.target.value)}
-                  placeholder="warehouse-name"
-                  className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  onKeyDown={(e) => e.key === "Enter" && createWarehouse()}
-                  autoFocus
-                />
-                <button
-                  onClick={createWarehouse}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
-                >
+            <Card title="Create warehouse" className="mb-4">
+              <div className="flex gap-2 items-end">
+                <div className="flex-1">
+                  <Input
+                    value={newWhName}
+                    onChange={(e) => setNewWhName(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && void createWarehouse()}
+                    placeholder="warehouse-name"
+                    autoFocus
+                    hint="Meta provisions a backing bucket named iceberg-<name>."
+                  />
+                </div>
+                <Button variant="primary" onClick={() => void createWarehouse()} disabled={!newWhName.trim()}>
                   Create
-                </button>
-                <button
-                  onClick={() => setShowCreateWh(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
-                >
-                  Cancel
-                </button>
+                </Button>
+                <Button onClick={() => setShowCreateWh(false)}>Cancel</Button>
               </div>
-            </div>
+            </Card>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                    Warehouse
-                  </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                    Location
-                  </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                    Bucket
-                  </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {loading ? (
-                  <tr>
-                    <td colSpan={4} className="px-4 py-8 text-center">
-                      <div className="flex items-center justify-center gap-3">
-                        <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
-                        </div>
-                        <span className="text-[12px] text-gray-400">
-                          Loading
-                        </span>
-                      </div>
-                    </td>
-                  </tr>
-                ) : warehouses.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={4}
-                      className="px-4 py-8 text-center text-[12px] text-gray-400"
-                    >
-                      No warehouses. Create one to start managing Iceberg
-                      tables.
-                    </td>
-                  </tr>
-                ) : (
-                  warehouses.map((wh) => (
-                    <tr
-                      key={wh.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
-                      onClick={() => openWarehouse(wh)}
-                    >
-                      <td className="px-4 py-2.5">
-                        <div className="flex items-center gap-2">
-                          <Warehouse size={14} className="text-indigo-500" />
-                          <span className="text-[13px] font-medium">
-                            {wh.name}
-                          </span>
-                          <ChevronRight
-                            size={14}
-                            className="ml-auto text-gray-300"
-                          />
-                        </div>
-                      </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono">
-                        {wh.location}
-                      </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono">
-                        {wh.bucket}
-                      </td>
-                      <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            deleteWarehouse(wh.name);
-                          }}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <Trash2 size={13} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-
-      {/* Namespaces View */}
-      {view === "namespaces" && (
-        <>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
-              Namespaces in {selectedWh?.name}
-            </h2>
-            <button
-              onClick={() => setShowCreateNs(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
-            >
-              <Plus size={14} /> Create Namespace
-            </button>
-          </div>
-
-          {showCreateNs && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4">
-              <div className="flex gap-2">
-                <input
-                  value={newNsName}
-                  onChange={(e) => setNewNsName(e.target.value)}
-                  placeholder="namespace_name"
-                  className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  onKeyDown={(e) => e.key === "Enter" && createNamespace()}
-                  autoFocus
-                />
-                <button
-                  onClick={createNamespace}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
-                >
-                  Create
-                </button>
-                <button
-                  onClick={() => setShowCreateNs(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                    Namespace
-                  </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100">
-                {loading ? (
-                  <tr>
-                    <td colSpan={2} className="px-4 py-8 text-center">
-                      <div className="flex items-center justify-center gap-3">
-                        <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
-                        </div>
-                        <span className="text-[12px] text-gray-400">
-                          Loading
-                        </span>
-                      </div>
-                    </td>
-                  </tr>
-                ) : namespaces.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={2}
-                      className="px-4 py-8 text-center text-[12px] text-gray-400"
-                    >
-                      No namespaces
-                    </td>
-                  </tr>
-                ) : (
-                  namespaces.map((ns) => {
-                    const name = ns.join(".");
-                    return (
-                      <tr
-                        key={name}
-                        className="hover:bg-gray-50 cursor-pointer group"
-                        onClick={() => openNamespace(name)}
-                      >
-                        <td className="px-4 py-2.5">
-                          <div className="flex items-center gap-2">
-                            <FolderOpen
-                              size={14}
-                              className="text-yellow-500"
-                            />
-                            <span className="text-[13px] font-medium">
-                              {name}
-                            </span>
-                            <ChevronRight
-                              size={14}
-                              className="ml-auto text-gray-300"
-                            />
-                          </div>
-                        </td>
-                        <td className="px-4 py-2.5 text-right">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              deleteNamespace(name);
-                            }}
-                            className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                          >
-                            <Trash2 size={13} />
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-
-      {/* Tables View */}
-      {view === "tables" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
-              <tr>
-                <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-                  Table
-                </th>
-                <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
-                  Actions
-                </th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {tables.length === 0 ? (
-                <tr>
-                  <td
-                    colSpan={2}
-                    className="px-4 py-8 text-center text-[12px] text-gray-400"
-                  >
-                    No tables in {selectedNs}
-                  </td>
-                </tr>
-              ) : (
-                tables.map((t) => (
-                  <tr
-                    key={t.name}
-                    className="hover:bg-gray-50 cursor-pointer group"
-                    onClick={() => openTable(selectedNs, t.name)}
-                  >
-                    <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-2">
-                        <Table2 size={14} className="text-emerald-500" />
-                        <span className="text-[13px] font-medium">
-                          {t.name}
-                        </span>
-                        <ChevronRight
-                          size={14}
-                          className="ml-auto text-gray-300"
-                        />
-                      </div>
-                    </td>
-                    <td className="px-4 py-2.5 text-right">
+          <Table
+            columns={[
+              { key: "wh", label: "Warehouse" },
+              { key: "location", label: "Location" },
+              { key: "bucket", label: "Bucket", className: "w-56" },
+              { key: "actions", label: "", className: "w-16" },
+            ]}
+            loading={loading}
+            empty="No warehouses. Create one to start managing Iceberg tables."
+            footer={
+              warehouses.length
+                ? `${warehouses.length} warehouse${warehouses.length === 1 ? "" : "s"}`
+                : undefined
+            }
+          >
+            {warehouses.length
+              ? warehouses.map((wh) => (
+                  <Row key={wh.name}>
+                    <Cell>
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          deleteTable(selectedNs, t.name);
-                        }}
-                        className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={() => openWarehouse(wh)}
+                        className="flex items-center gap-2 text-[13px] font-medium text-text hover:text-accent"
+                      >
+                        <Warehouse size={14} className="text-muted shrink-0" />
+                        {wh.name}
+                      </button>
+                    </Cell>
+                    <Cell className="font-mono text-[11px]">{wh.location}</Cell>
+                    <Cell className="font-mono text-[11px]">{wh.bucket}</Cell>
+                    <Cell align="right">
+                      <button
+                        onClick={() => void deleteWarehouse(wh.name)}
+                        title="Delete warehouse and its bucket"
+                        className="p-1 rounded text-muted hover:text-err hover:bg-surface-2
+                          opacity-0 group-hover:opacity-100 transition-opacity"
                       >
                         <Trash2 size={13} />
                       </button>
-                    </td>
-                  </tr>
+                    </Cell>
+                  </Row>
                 ))
-              )}
-            </tbody>
-          </table>
-        </div>
+              : undefined}
+          </Table>
+        </>
       )}
 
-      {/* Table Detail View */}
-      {view === "detail" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200">
-            <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
-              Table Metadata
-            </h3>
-          </div>
-          <div className="p-4">
-            {selectedTable ? (
-              <pre className="bg-gray-50 rounded-lg p-3 text-[11px] overflow-auto max-h-[calc(100vh-280px)] border border-gray-200 font-mono text-gray-700">
-                {JSON.stringify(selectedTable, null, 2)}
-              </pre>
-            ) : (
-              <div className="flex items-center justify-center gap-3 py-8">
-                <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                  <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+      {view === "namespaces" && (
+        <>
+          {showCreateNs && (
+            <Card title="Create namespace" className="mb-4">
+              <div className="flex gap-2 items-end">
+                <div className="flex-1">
+                  <Input
+                    value={newNsName}
+                    onChange={(e) => setNewNsName(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && void createNamespace()}
+                    placeholder="events"
+                    autoFocus
+                  />
                 </div>
-                <span className="text-[12px] text-gray-400">Loading</span>
+                <Button variant="primary" onClick={() => void createNamespace()} disabled={!newNsName.trim()}>
+                  Create
+                </Button>
+                <Button onClick={() => setShowCreateNs(false)}>Cancel</Button>
               </div>
-            )}
-          </div>
-        </div>
+            </Card>
+          )}
+
+          <Table
+            columns={[
+              { key: "ns", label: "Namespace" },
+              { key: "actions", label: "", className: "w-16" },
+            ]}
+            loading={loading}
+            empty="No namespaces"
+            footer={
+              namespaces.length
+                ? `${namespaces.length} namespace${namespaces.length === 1 ? "" : "s"} in ${selectedWh?.name}`
+                : undefined
+            }
+          >
+            {namespaces.length
+              ? namespaces.map((ns) => {
+                  const name = ns.join(".");
+                  return (
+                    <Row key={name}>
+                      <Cell>
+                        <button
+                          onClick={() => void openNamespace(name)}
+                          className="flex items-center gap-2 text-[13px] font-medium text-text hover:text-accent"
+                        >
+                          <FolderOpen size={14} className="text-muted shrink-0" />
+                          {name}
+                        </button>
+                      </Cell>
+                      <Cell align="right">
+                        <button
+                          onClick={() => void deleteNamespace(name)}
+                          title="Delete namespace"
+                          className="p-1 rounded text-muted hover:text-err hover:bg-surface-2
+                            opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </Cell>
+                    </Row>
+                  );
+                })
+              : undefined}
+          </Table>
+        </>
+      )}
+
+      {view === "tables" && (
+        <>
+          <Card title={`Namespace · ${selectedNs}`} className="mb-4">
+            <dl className="space-y-1.5 text-[12px]">
+              <div className="flex items-baseline justify-between gap-3">
+                <dt className="text-muted">Location</dt>
+                <dd className="font-mono text-text-2 truncate">
+                  {nsProps.location || `${selectedWh?.location ?? ""}/${selectedNs}`}
+                </dd>
+              </div>
+              <div className="flex items-baseline justify-between gap-3">
+                <dt className="text-muted">Policy</dt>
+                <dd className="text-text-2">
+                  {policyStatements
+                    ? `namespace policy · ${policyStatements} statement${policyStatements === 1 ? "" : "s"}`
+                    : "none — the catalog root policy applies"}
+                </dd>
+              </div>
+            </dl>
+          </Card>
+
+          <Table
+            columns={[
+              { key: "table", label: "Table" },
+              { key: "snapshots", label: "Snapshots", align: "right", className: "w-28" },
+              { key: "commit", label: "Last commit", align: "right", className: "w-36" },
+              { key: "gov", label: "Governance", className: "w-40" },
+              { key: "actions", label: "", className: "w-16" },
+            ]}
+            empty={`No tables in ${selectedNs}`}
+            footer={
+              tables.length
+                ? `${tables.length} table${tables.length === 1 ? "" : "s"} · namespace ${selectedNs}` +
+                  (tables.length > METADATA_FANOUT
+                    ? ` · snapshots and last commit read for the first ${METADATA_FANOUT}`
+                    : "")
+                : undefined
+            }
+          >
+            {tables.length
+              ? tables.map((t) => {
+                  const f = facts[t.name];
+                  return (
+                    <Row key={t.name}>
+                      <Cell>
+                        <button
+                          onClick={() => void openTable(selectedNs, t.name)}
+                          className="flex items-center gap-2 font-mono text-[13px] text-text hover:text-accent"
+                        >
+                          <Table2 size={14} className="text-muted shrink-0" />
+                          {t.name}
+                        </button>
+                      </Cell>
+                      <Cell align="right" className="font-mono">
+                        {f ? f.snapshots.toLocaleString() : "—"}
+                      </Cell>
+                      <Cell align="right">{f ? ago(f.lastUpdatedMs) : "—"}</Cell>
+                      <Cell>
+                        {policyStatements ? (
+                          <Badge kind="info">
+                            <Shield size={10} /> namespace policy
+                          </Badge>
+                        ) : (
+                          <span className="text-faint">—</span>
+                        )}
+                      </Cell>
+                      <Cell align="right">
+                        <button
+                          onClick={() => void deleteTable(selectedNs, t.name)}
+                          title="Delete table"
+                          className="p-1 rounded text-muted hover:text-err hover:bg-surface-2
+                            opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </Cell>
+                    </Row>
+                  );
+                })
+              : undefined}
+          </Table>
+        </>
+      )}
+
+      {view === "detail" && (
+        <Card title={`Table metadata · ${selectedTableName}`} bodyClassName="p-0">
+          {selectedTable ? (
+            <pre className="p-4 text-[11px] overflow-auto max-h-[calc(100vh-280px)] font-mono text-text-2">
+              {JSON.stringify(selectedTable, null, 2)}
+            </pre>
+          ) : (
+            <p className="p-4 text-[12px] text-muted">Loading…</p>
+          )}
+        </Card>
       )}
     </div>
   );

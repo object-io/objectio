@@ -26,13 +26,19 @@ export default function GroupsPanel() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [addingTo, setAddingTo] = useState<string | null>(null);
   const [pickUserId, setPickUserId] = useState("");
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
-    setError(null);
+    // Error clears on success rather than up front, so the mount path does
+    // not set state synchronously inside the effect.
     groupsApi
       .list()
-      .then((r) => setGroups(r.groups || []))
+      .then((r) => {
+        setGroups(r.groups || []);
+        setError(null);
+      })
       .catch((e) => {
         setGroups([]);
         setError(String(e));
@@ -94,23 +100,23 @@ export default function GroupsPanel() {
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
-        <span className="text-[12px] text-gray-500">
+        <span className="text-[12px] text-muted">
           IAM groups — attach a policy to a group and every member inherits it.
         </span>
         <button
           onClick={() => setShowCreate(true)}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
         >
           <Plus size={14} /> Create Group
         </button>
       </div>
 
       {error && (
-        <div className="mb-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-[12px] text-red-700 flex items-start justify-between gap-2">
+        <div className="mb-3 px-3 py-2 bg-err-soft border border-err/25 rounded-lg text-[12px] text-err flex items-start justify-between gap-2">
           <span className="font-mono break-all">{error}</span>
           <button
             onClick={() => setError(null)}
-            className="text-red-400 hover:text-red-700"
+            className="text-err hover:text-err"
           >
             <X size={12} />
           </button>
@@ -118,18 +124,18 @@ export default function GroupsPanel() {
       )}
 
       {showCreate && (
-        <div className="mb-3 bg-white rounded-xl border border-gray-200 p-3 flex gap-2 items-center">
+        <div className="mb-3 bg-surface rounded-xl border border-border p-3 flex gap-2 items-center">
           <input
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             placeholder="group-name"
-            className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+            className="flex-1 px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
             onKeyDown={(e) => e.key === "Enter" && create()}
             autoFocus
           />
           <button
             onClick={create}
-            className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+            className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
           >
             Create
           </button>
@@ -138,37 +144,37 @@ export default function GroupsPanel() {
               setShowCreate(false);
               setNewName("");
             }}
-            className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+            className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
           >
             Cancel
           </button>
         </div>
       )}
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-surface-2 border-b border-border">
             <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 Group
               </th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
                 Members
               </th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 ARN
               </th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+              <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                 Actions
               </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
+          <tbody className="divide-y divide-border">
             {loading ? (
               <tr>
                 <td
                   colSpan={4}
-                  className="px-4 py-6 text-center text-[12px] text-gray-400"
+                  className="px-4 py-6 text-center text-[12px] text-faint"
                 >
                   Loading…
                 </td>
@@ -177,7 +183,7 @@ export default function GroupsPanel() {
               <tr>
                 <td
                   colSpan={4}
-                  className="px-4 py-6 text-center text-[12px] text-gray-400"
+                  className="px-4 py-6 text-center text-[12px] text-faint"
                 >
                   No groups. Create one to start.
                 </td>
@@ -232,7 +238,7 @@ function RowFragment(p: RowProps) {
   );
   return (
     <>
-      <tr className="hover:bg-gray-50 group">
+      <tr className="hover:bg-surface-2 group">
         <td className="px-4 py-2.5">
           <button
             onClick={p.toggle}
@@ -240,22 +246,22 @@ function RowFragment(p: RowProps) {
           >
             <ChevronRight
               size={12}
-              className={`text-gray-400 transition-transform ${p.expanded ? "rotate-90" : ""}`}
+              className={`text-faint transition-transform ${p.expanded ? "rotate-90" : ""}`}
             />
-            <UsersIcon size={14} className="text-purple-500" />
+            <UsersIcon size={14} className="text-muted" />
             <span className="text-[13px] font-medium">{p.group.group_name}</span>
           </button>
         </td>
-        <td className="px-4 py-2.5 text-[12px] text-gray-600">
+        <td className="px-4 py-2.5 text-[12px] text-text-2">
           {p.group.member_user_ids.length}
         </td>
-        <td className="px-4 py-2.5 text-[11px] text-gray-500 font-mono truncate max-w-[280px]">
+        <td className="px-4 py-2.5 text-[11px] text-muted font-mono truncate max-w-[280px]">
           {p.group.arn}
         </td>
         <td className="px-4 py-2.5 text-right">
           <button
             onClick={() => p.remove(p.group)}
-            className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+            className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
           >
             <Trash2 size={13} />
           </button>
@@ -263,9 +269,9 @@ function RowFragment(p: RowProps) {
       </tr>
       {p.expanded && (
         <tr>
-          <td colSpan={4} className="bg-gray-50 px-4 py-3">
+          <td colSpan={4} className="bg-surface-2 px-4 py-3">
             <div className="flex items-center justify-between mb-2">
-              <h4 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <h4 className="text-[11px] font-medium text-muted uppercase tracking-wider">
                 Members
               </h4>
               {p.addingTo === p.group.group_id ? (
@@ -273,7 +279,7 @@ function RowFragment(p: RowProps) {
                   <select
                     value={p.pickUserId}
                     onChange={(e) => p.setPickUserId(e.target.value)}
-                    className="px-2 py-1 border border-gray-300 rounded text-[12px]"
+                    className="px-2 py-1 border border-border-strong rounded text-[12px]"
                   >
                     <option value="">— pick user —</option>
                     {nonMembers.map((u) => (
@@ -284,7 +290,7 @@ function RowFragment(p: RowProps) {
                   </select>
                   <button
                     onClick={() => p.addMember(p.group.group_id)}
-                    className="px-2 py-1 bg-gray-900 text-white rounded text-[11px]"
+                    className="px-2 py-1 bg-primary text-primary-fg rounded text-[11px]"
                   >
                     Add
                   </button>
@@ -293,7 +299,7 @@ function RowFragment(p: RowProps) {
                       p.setAddingTo(null);
                       p.setPickUserId("");
                     }}
-                    className="px-2 py-1 text-gray-500 text-[11px]"
+                    className="px-2 py-1 text-muted text-[11px]"
                   >
                     Cancel
                   </button>
@@ -301,31 +307,31 @@ function RowFragment(p: RowProps) {
               ) : (
                 <button
                   onClick={() => p.setAddingTo(p.group.group_id)}
-                  className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                  className="text-[11px] text-accent hover:text-accent flex items-center gap-1"
                 >
                   <UserPlus size={11} /> Add Member
                 </button>
               )}
             </div>
             {p.group.member_user_ids.length === 0 ? (
-              <p className="text-[12px] text-gray-400">No members</p>
+              <p className="text-[12px] text-faint">No members</p>
             ) : (
               <div className="space-y-1.5">
                 {p.group.member_user_ids.map((uid) => (
                   <div
                     key={uid}
-                    className="flex items-center justify-between bg-white rounded-lg px-3 py-1.5 border border-gray-200"
+                    className="flex items-center justify-between bg-surface rounded-lg px-3 py-1.5 border border-border"
                   >
                     <div className="flex items-center gap-2 text-[12px]">
-                      <UsersIcon size={11} className="text-gray-400" />
+                      <UsersIcon size={11} className="text-faint" />
                       <span>{p.userLabel(uid)}</span>
-                      <span className="text-[10px] font-mono text-gray-400">
+                      <span className="text-[10px] font-mono text-faint">
                         {uid.slice(0, 8)}
                       </span>
                     </div>
                     <button
                       onClick={() => p.removeMember(p.group.group_id, uid)}
-                      className="text-red-400 hover:text-red-600"
+                      className="text-err hover:text-err"
                       title="Remove from group"
                     >
                       <Trash2 size={12} />

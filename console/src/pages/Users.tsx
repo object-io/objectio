@@ -1,15 +1,28 @@
 import React, { useEffect, useState } from "react";
 import {
-  Users as UsersIcon,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Key,
   Plus,
   Trash2,
-  Key,
-  Copy,
-  Check,
-  UserCircle,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import GroupsPanel from "../components/GroupsPanel";
+import {
+  Badge,
+  Banner,
+  Button,
+  Card,
+  Chip,
+  Input,
+  Select,
+  Tabs,
+  Table,
+  Row,
+  Cell,
+} from "../components/ui";
 
 interface User {
   user_id: string;
@@ -53,9 +66,11 @@ export default function UsersPage() {
   const [keyScope, setKeyScope] = useState("");
   const [keyReadOnly, setKeyReadOnly] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     fetch("/_admin/users")
       .then((r) => r.json())
       .then((d) => setUserList(d.users || []))
@@ -173,52 +188,38 @@ export default function UsersPage() {
   return (
     <div className="p-6">
       <PageHeader
-        title="Users & Groups"
+        title="Users & groups"
         description="IAM users, access keys, and groups. Policies attach to either."
         action={
           tab === "users" ? (
-            <button
+            <Button
+              variant="primary"
+              icon={<Plus size={13} />}
               onClick={() => {
                 setShowCreate(true);
                 setCredentials(null);
               }}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
             >
-              <Plus size={14} /> Create User
-            </button>
+              Create user
+            </Button>
           ) : null
         }
       />
 
-      {/* Tab bar */}
-      <div className="flex border-b border-gray-200 mb-4">
-        {(
-          [
-            { key: "users", label: "Users", icon: UserCircle },
-            { key: "groups", label: "Groups", icon: UsersIcon },
-          ] as const
-        ).map((t) => {
-          const Icon = t.icon;
-          const active = tab === t.key;
-          return (
-            <button
-              key={t.key}
-              onClick={() => setTab(t.key)}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[12px] font-medium border-b-2 -mb-px transition-colors ${
-                active
-                  ? "border-gray-900 text-gray-900"
-                  : "border-transparent text-gray-500 hover:text-gray-800"
-              }`}
-            >
-              <Icon size={13} /> {t.label}
-            </button>
-          );
-        })}
-      </div>
+      <Tabs
+        variant="underline"
+        value={tab}
+        onChange={(k) => setTab(k as Tab)}
+        items={[
+          { key: "users", label: "Users", count: userList.length },
+          { key: "groups", label: "Groups" },
+        ]}
+        className="mb-4"
+      />
 
-      {tab === "groups" && <GroupsPanel />}
-      {tab !== "users" && null}
-      {tab !== "users" ? null : (
+      {tab === "groups" ? (
+        <GroupsPanel />
+      ) : (
         <UsersTabContent
           credentials={credentials}
           setCredentials={setCredentials}
@@ -287,247 +288,277 @@ interface UsersTabProps {
 
 function UsersTabContent(p: UsersTabProps) {
   const {
-    credentials,
-    setCredentials,
-    copied,
-    copyText,
-    showCreate,
-    setShowCreate,
-    newUsername,
-    setNewUsername,
-    newTenant,
-    setNewTenant,
-    tenants,
-    createUser,
-    loading,
-    userList,
-    loadKeys,
-    deleteUser,
-    expandedUser,
-    keys,
-    createKey,
-    deleteKey,
-    keyFormUser,
-    setKeyFormUser,
-    keyScope,
-    setKeyScope,
-    keyReadOnly,
-    setKeyReadOnly,
-    keyError,
+    credentials, setCredentials, copied, copyText,
+    showCreate, setShowCreate, newUsername, setNewUsername,
+    newTenant, setNewTenant, tenants, createUser,
+    loading, userList, loadKeys, deleteUser,
+    expandedUser, keys, createKey, deleteKey,
+    keyFormUser, setKeyFormUser, keyScope, setKeyScope,
+    keyReadOnly, setKeyReadOnly, keyError,
   } = p;
+
+  const columns = [
+    { key: "user", label: "User" },
+    { key: "tenant", label: "Tenant", className: "w-40" },
+    { key: "status", label: "Status", className: "w-32" },
+    { key: "created", label: "Created", className: "w-36" },
+    { key: "keys", label: "Keys", align: "right" as const, className: "w-20" },
+    { key: "actions", label: "", className: "w-20" },
+  ];
+
   return (
     <>
-      {/* Credentials banner */}
+      {/* The secret is returned once and never again, so this is the only
+          moment it can be copied. It stays until dismissed rather than
+          auto-hiding. */}
       {credentials && (
-        <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-xl p-4">
-          <h3 className="text-[12px] font-medium text-yellow-800 mb-2">Save these credentials now — the secret will not be shown again</h3>
-          <div className="space-y-1.5 font-mono text-[12px]">
-            <div className="flex items-center gap-2">
-              <span className="text-gray-500 w-24">Access Key:</span>
-              <span className="font-medium">{credentials.access_key_id}</span>
-              <button onClick={() => copyText(credentials.access_key_id, "ak")} className="p-0.5">
-                {copied === "ak" ? <Check size={12} className="text-green-500" /> : <Copy size={12} className="text-gray-400" />}
-              </button>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-gray-500 w-24">Secret Key:</span>
-              <span className="font-medium">{credentials.secret_access_key}</span>
-              <button onClick={() => copyText(credentials.secret_access_key, "sk")} className="p-0.5">
-                {copied === "sk" ? <Check size={12} className="text-green-500" /> : <Copy size={12} className="text-gray-400" />}
-              </button>
-            </div>
+        <Banner
+          kind="warn"
+          className="mb-4"
+          title="Save these credentials now — the secret will not be shown again"
+          action={
+            <Button size="sm" variant="ghost" onClick={() => setCredentials(null)}>
+              Dismiss
+            </Button>
+          }
+        >
+          <div className="flex flex-wrap gap-x-8 gap-y-1 mt-1.5">
+            {(
+              [
+                ["AK", credentials.access_key_id, "ak"],
+                ["SK", credentials.secret_access_key, "sk"],
+              ] as const
+            ).map(([label, value, id]) => (
+              <span key={id} className="inline-flex items-center gap-1.5 min-w-0">
+                <span className="font-mono text-[10px] uppercase tracking-wider opacity-70">
+                  {label}
+                </span>
+                <span className="font-mono text-[12px] truncate">{value}</span>
+                <button
+                  onClick={() => copyText(value, id)}
+                  className="p-0.5 opacity-70 hover:opacity-100"
+                  title="Copy"
+                >
+                  {copied === id ? <Check size={12} /> : <Copy size={12} />}
+                </button>
+              </span>
+            ))}
           </div>
-          <button onClick={() => setCredentials(null)} className="mt-2 text-[11px] text-yellow-700 underline">Dismiss</button>
-        </div>
+        </Banner>
       )}
 
       {showCreate && (
-        <div className="mb-4 bg-white rounded-xl border border-gray-200 p-4">
-          <h3 className="text-[12px] font-medium mb-2">Create New User</h3>
-          <div className="flex gap-2">
-            <input
-              value={newUsername}
-              onChange={(e) => setNewUsername(e.target.value)}
-              placeholder="Username"
-              className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-              onKeyDown={(e) => e.key === "Enter" && createUser()}
-              autoFocus
-            />
-            <select
-              value={newTenant}
-              onChange={(e) => setNewTenant(e.target.value)}
-              className="px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="">System (no tenant)</option>
-              {tenants.map((t) => (
-                <option key={t.name} value={t.name}>{t.name}</option>
-              ))}
-            </select>
-            <button onClick={createUser} className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800">Create</button>
-            <button onClick={() => setShowCreate(false)} className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50">Cancel</button>
+        <Card title="Create user" className="mb-4">
+          <div className="flex gap-2 items-end flex-wrap">
+            <div className="flex-1 min-w-48">
+              <Input
+                label="Username"
+                value={newUsername}
+                onChange={(e) => setNewUsername(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && createUser()}
+                placeholder="svc-spark"
+                autoFocus
+              />
+            </div>
+            <div className="w-56">
+              <Select
+                label="Tenant"
+                value={newTenant}
+                onChange={(e) => setNewTenant(e.target.value)}
+              >
+                <option value="">System (no tenant)</option>
+                {tenants.map((t) => (
+                  <option key={t.name} value={t.name}>
+                    {t.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+            <Button variant="primary" onClick={createUser} disabled={!newUsername.trim()}>
+              Create
+            </Button>
+            <Button onClick={() => setShowCreate(false)}>Cancel</Button>
           </div>
-        </div>
+          <p className="mt-2 text-[11px] text-muted">
+            An access key is created with the user and shown once.
+          </p>
+        </Card>
       )}
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">User</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Tenant</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Status</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Created</th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {loading ? (
-              <tr>
-                <td colSpan={5} className="px-4 py-8 text-center">
-                  <div className="flex items-center justify-center gap-3">
-                    <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                      <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
-                    </div>
-                    <span className="text-[12px] text-gray-400">Loading</span>
-                  </div>
-                </td>
-              </tr>
-            ) : userList.length === 0 ? (
-              <tr><td colSpan={5} className="px-4 py-8 text-center text-[12px] text-gray-400">No users</td></tr>
-            ) : (
-              userList.map((u) => (
-                <React.Fragment key={u.user_id}>
-                <tr className="hover:bg-gray-50 group">
-                    <td className="px-4 py-2">
-                      <div className="flex items-center gap-2">
-                        <UsersIcon size={14} className="text-purple-500" />
-                        <span className="text-[13px] font-medium">{u.display_name}</span>
-                        <span className="text-gray-400 text-[10px] font-mono">{u.user_id.slice(0, 8)}</span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-2 text-[12px]">
-                      {u.tenant ? (
-                        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-purple-100 text-purple-800">
-                          {u.tenant}
+      <Table
+        columns={columns}
+        loading={loading}
+        empty="No users"
+        footer={
+          userList.length
+            ? `${userList.length} user${userList.length === 1 ? "" : "s"}`
+            : undefined
+        }
+      >
+        {userList.length
+          ? userList.flatMap((u) => {
+              const open = expandedUser === u.user_id;
+              const rows: React.ReactElement[] = [
+                <Row key={u.user_id}>
+                  <Cell>
+                    <span className="flex items-center gap-2">
+                      <button
+                        onClick={() => loadKeys(u.user_id)}
+                        className="text-faint hover:text-text"
+                        aria-label={open ? "Collapse" : "Expand"}
+                      >
+                        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                      </button>
+                      <span className="text-[13px] font-medium text-text truncate">
+                        {u.display_name}
+                      </span>
+                      <span className="font-mono text-[10px] text-faint">
+                        {u.user_id.slice(0, 8)}
+                      </span>
+                    </span>
+                  </Cell>
+                  <Cell>
+                    {u.tenant ? (
+                      <Chip mono>{u.tenant}</Chip>
+                    ) : (
+                      <span className="text-faint">system</span>
+                    )}
+                  </Cell>
+                  <Cell>
+                    <Badge kind={u.status === "Active" ? "ok" : "neutral"}>{u.status}</Badge>
+                  </Cell>
+                  <Cell>
+                    {u.created_at
+                      ? new Date(u.created_at * 1000).toLocaleDateString(undefined, {
+                          month: "short",
+                          day: "numeric",
+                          year: "numeric",
+                        })
+                      : "—"}
+                  </Cell>
+                  <Cell align="right" className="font-mono">
+                    {open ? keys.length : ""}
+                  </Cell>
+                  <Cell align="right">
+                    <span className="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                      <button
+                        onClick={() => loadKeys(u.user_id)}
+                        title="Access keys"
+                        className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                      >
+                        <Key size={13} />
+                      </button>
+                      <button
+                        onClick={() => deleteUser(u.user_id)}
+                        title="Delete user"
+                        className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </span>
+                  </Cell>
+                </Row>,
+              ];
+
+              if (!open) return rows;
+
+              rows.push(
+                <tr key={`${u.user_id}:keys`} className="border-t border-border bg-surface-2/50">
+                  <Cell colSpan={columns.length}>
+                    <div className="py-1">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="font-mono text-[10px] uppercase tracking-wider text-muted">
+                          Access keys
                         </span>
-                      ) : (
-                        <span className="text-gray-300">system</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-[12px] text-gray-500">{u.status}</td>
-                    <td className="px-4 py-2 text-[12px] text-gray-500">{new Date(u.created_at * 1000).toLocaleDateString()}</td>
-                    <td className="px-4 py-2 text-right">
-                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button onClick={() => loadKeys(u.user_id)} className="text-gray-400 hover:text-blue-600 p-1" title="Access Keys">
-                          <Key size={14} />
-                        </button>
-                        <button onClick={() => deleteUser(u.user_id)} className="text-gray-400 hover:text-red-600 p-1">
-                          <Trash2 size={14} />
-                        </button>
+                        <Button
+                          size="sm"
+                          icon={<Plus size={12} />}
+                          onClick={() =>
+                            setKeyFormUser(keyFormUser === u.user_id ? null : u.user_id)
+                          }
+                        >
+                          Create key
+                        </Button>
                       </div>
-                    </td>
-                  </tr>
-                  {expandedUser === u.user_id && (
-                    <tr>
-                      <td colSpan={5} className="bg-gray-50 px-4 py-3">
-                        <div className="flex items-center justify-between mb-2">
-                          <h4 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">Access Keys</h4>
-                          <button
-                            onClick={() =>
-                              setKeyFormUser(keyFormUser === u.user_id ? null : u.user_id)
+
+                      {keyFormUser === u.user_id && (
+                        <div className="mb-2 bg-surface border border-border rounded-card p-3 space-y-2">
+                          <Input
+                            label={
+                              <>
+                                Scope <span className="font-normal text-faint">(optional)</span>
+                              </>
                             }
-                            className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
-                          >
-                            <Plus size={11} /> New Key
-                          </button>
+                            value={keyScope}
+                            onChange={(e) => setKeyScope(e.target.value)}
+                            placeholder="s3://bucket/prefix/"
+                            className="font-mono text-[12px]"
+                            hint="Confines the key to one bucket or prefix. A scope only narrows the user's access, never widens it."
+                          />
+                          <label className="flex items-center gap-2 text-[12px] text-text-2">
+                            <input
+                              type="checkbox"
+                              checked={keyReadOnly}
+                              onChange={(e) => setKeyReadOnly(e.target.checked)}
+                              className="accent-[var(--oio-accent)]"
+                            />
+                            Read-only — refuses PUT, POST and DELETE
+                          </label>
+                          {keyError && <Banner kind="err">{keyError}</Banner>}
+                          <div className="flex gap-2">
+                            <Button size="sm" variant="accent" onClick={() => createKey(u.user_id)}>
+                              Create key
+                            </Button>
+                            <Button size="sm" onClick={() => setKeyFormUser(null)}>
+                              Cancel
+                            </Button>
+                          </div>
                         </div>
+                      )}
 
-                        {keyFormUser === u.user_id && (
-                          <div className="mb-2 bg-white rounded-lg border border-gray-200 p-3 space-y-2">
-                            <div>
-                              <label className="block text-[11px] font-medium text-gray-500 mb-1">
-                                Scope <span className="text-gray-400">(optional)</span>
-                              </label>
-                              <input
-                                value={keyScope}
-                                onChange={(e) => setKeyScope(e.target.value)}
-                                placeholder="s3://bucket/prefix/"
-                                className="w-full font-mono text-[11px] border border-gray-200 rounded-md px-2 py-1.5"
-                              />
-                              <p className="text-[10px] text-gray-400 mt-1">
-                                Confines the key to one bucket or prefix. Leave blank for the
-                                user's full access — a scope only narrows, never widens.
-                              </p>
-                            </div>
-                            <label className="flex items-center gap-2 text-[11px] text-gray-600">
-                              <input
-                                type="checkbox"
-                                checked={keyReadOnly}
-                                onChange={(e) => setKeyReadOnly(e.target.checked)}
-                              />
-                              Read-only (refuses PUT, POST and DELETE)
-                            </label>
-                            {keyError && (
-                              <p className="text-[11px] text-red-600">{keyError}</p>
-                            )}
-                            <div className="flex gap-2">
-                              <button
-                                onClick={() => createKey(u.user_id)}
-                                className="text-[11px] bg-blue-600 text-white rounded-md px-3 py-1.5 hover:bg-blue-700"
+                      {keys.length === 0 ? (
+                        <p className="text-[12px] text-muted">No access keys</p>
+                      ) : (
+                        <ul className="space-y-1.5">
+                          {keys.map((k) => (
+                            <li
+                              key={k.access_key_id}
+                              className="flex items-center gap-2 bg-surface border border-border rounded-control px-3 h-9"
+                            >
+                              <span className="font-mono text-[12px] text-text">
+                                {k.access_key_id}
+                              </span>
+                              {k.scope && (
+                                <Chip mono className="truncate max-w-56">
+                                  {k.scope}
+                                </Chip>
+                              )}
+                              {k.operation === "READ" && <Chip>read-only</Chip>}
+                              <Badge
+                                kind={k.status === "Active" ? "ok" : "neutral"}
+                                className="ml-auto"
                               >
-                                Create Key
-                              </button>
+                                {k.status}
+                              </Badge>
                               <button
-                                onClick={() => setKeyFormUser(null)}
-                                className="text-[11px] text-gray-500 px-2 py-1.5 hover:text-gray-700"
+                                onClick={() => deleteKey(k.access_key_id, u.user_id)}
+                                title="Delete key"
+                                className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
                               >
-                                Cancel
+                                <Trash2 size={12} />
                               </button>
-                            </div>
-                          </div>
-                        )}
-
-                        {keys.length === 0 ? (
-                          <p className="text-[12px] text-gray-400">No access keys</p>
-                        ) : (
-                          <div className="space-y-1.5">
-                            {keys.map((k) => (
-                              <div key={k.access_key_id} className="flex items-center justify-between bg-white rounded-lg px-3 py-1.5 border border-gray-200">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <span className="font-mono text-[11px]">{k.access_key_id}</span>
-                                  {k.scope ? (
-                                    <span
-                                      className="text-[10px] font-mono bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5 truncate"
-                                      title={`Scoped to ${k.scope}`}
-                                    >
-                                      {k.scope}
-                                    </span>
-                                  ) : null}
-                                  {k.operation === "READ" ? (
-                                    <span className="text-[10px] bg-gray-100 text-gray-600 border border-gray-200 rounded px-1.5 py-0.5">
-                                      read-only
-                                    </span>
-                                  ) : null}
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[11px] text-gray-400">{k.status}</span>
-                                  <button onClick={() => deleteKey(k.access_key_id, u.user_id)} className="text-red-400 hover:text-red-600">
-                                    <Trash2 size={12} />
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  </Cell>
+                </tr>
+              );
+              return rows;
+            })
+          : undefined}
+      </Table>
     </>
   );
 }

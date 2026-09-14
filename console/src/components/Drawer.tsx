@@ -41,19 +41,19 @@ export default function Drawer({
 
   return (
     <aside
-      className={`${width} shrink-0 border-l border-gray-200 bg-white overflow-y-auto`}
+      className={`${width} shrink-0 border-l border-border bg-surface overflow-y-auto`}
     >
-      <div className="px-4 py-3 border-b border-gray-200 flex items-start justify-between gap-2">
+      <div className="px-4 py-3 border-b border-border flex items-start justify-between gap-2">
         <div className="min-w-0">
           {eyebrow && <div className="mb-1">{eyebrow}</div>}
-          <h2 className="text-[14px] font-semibold text-gray-900 truncate">
+          <h2 className="text-[14px] font-semibold text-text truncate">
             {title}
           </h2>
           {subtitle && <div className="mt-0.5">{subtitle}</div>}
         </div>
         <button
           onClick={onClose}
-          className="text-gray-400 hover:text-gray-700 p-1 rounded hover:bg-gray-50 shrink-0"
+          className="text-faint hover:text-text-2 p-1 rounded hover:bg-surface-2 shrink-0"
           aria-label="Close details"
         >
           <X size={14} />

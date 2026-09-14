@@ -56,8 +56,8 @@ export default function App() {
 
   if (checking) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <p className="text-sm text-gray-400">Loading...</p>
+      <div className="min-h-screen bg-surface-2 flex items-center justify-center">
+        <p className="text-sm text-faint">Loading...</p>
       </div>
     );
   }

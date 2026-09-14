@@ -1,8 +1,27 @@
-import { useEffect, useState } from "react";
-import { Building2, Plus, Trash2, Edit, ShieldCheck, UserPlus, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import {
+  Building2,
+  Plus,
+  Trash2,
+  Settings2,
+  Users,
+  UserPlus,
+  X,
+} from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import Card from "../components/Card";
-import StatusBadge from "../components/StatusBadge";
+import {
+  Badge,
+  Banner,
+  Button,
+  CapacityBar,
+  Card,
+  ChartCard,
+  Chip,
+  Input,
+  Table,
+  Row,
+  Cell,
+} from "../components/ui";
 
 interface Tenant {
   name: string;
@@ -26,22 +45,47 @@ interface TenantUser {
   tenant: string;
 }
 
+interface AdminBucket {
+  name: string;
+  tenant?: string;
+}
+
 const emptyTenant = {
-  name: "", display_name: "", default_pool: "", allowed_pools: [] as string[],
-  quota_bytes: 0, quota_buckets: 0, quota_objects: 0,
-  admin_users: [] as string[], oidc_provider: "", labels: {} as Record<string, string>, enabled: true,
+  name: "",
+  display_name: "",
+  default_pool: "",
+  allowed_pools: [] as string[],
+  quota_bytes: 0,
+  quota_buckets: 0,
+  quota_objects: 0,
+  admin_users: [] as string[],
+  oidc_provider: "",
+  labels: {} as Record<string, string>,
+  enabled: true,
 };
 
-function formatBytes(b: number) {
-  if (!b) return "Unlimited";
+const QUOTA_CHOICES = [
+  { bytes: 0, label: "Unlimited" },
+  { bytes: 2 * 1024 ** 3, label: "2 GB" },
+  { bytes: 100 * 1024 ** 3, label: "100 GB" },
+  { bytes: 500 * 1024 ** 3, label: "500 GB" },
+  { bytes: 1024 ** 4, label: "1 TB" },
+  { bytes: 10 * 1024 ** 4, label: "10 TB" },
+  { bytes: 50 * 1024 ** 4, label: "50 TB" },
+];
+
+function formatBytes(b: number): string {
+  if (!b) return "∞";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  const i = Math.floor(Math.log(b) / Math.log(1024));
-  return `${(b / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+  const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
+  const n = b / 1024 ** i;
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
 }
 
 export default function Tenants() {
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [pools, setPools] = useState<string[]>([]);
+  const [bucketsByTenant, setBucketsByTenant] = useState<Record<string, number>>({});
   const [editing, setEditing] = useState<string | null>(null);
   const [form, setForm] = useState(emptyTenant);
   const [allowedPoolsStr, setAllowedPoolsStr] = useState("");
@@ -51,17 +95,32 @@ export default function Tenants() {
   const [adminInput, setAdminInput] = useState("");
   const [adminError, setAdminError] = useState("");
 
-  const load = () => {
-    setLoading(true);
+  const load = useCallback(() => {
     Promise.all([
-      fetch("/_admin/tenants").then(r => r.json()).catch(() => []),
-      fetch("/_admin/pools").then(r => r.json()).catch(() => []),
-    ]).then(([t, p]) => {
-      setTenants(Array.isArray(t) ? t : t.tenants || []);
-      setPools(Array.isArray(p) ? p.map((pool: { name: string }) => pool.name) : (p.pools || []).map((pool: { name: string }) => pool.name));
-    }).finally(() => setLoading(false));
-  };
-  useEffect(load, []);
+      fetch("/_admin/tenants").then((r) => r.json()).catch(() => []),
+      fetch("/_admin/pools").then((r) => r.json()).catch(() => []),
+      fetch("/_admin/buckets").then((r) => r.json()).catch(() => ({ buckets: [] })),
+    ])
+      .then(([t, p, b]) => {
+        setTenants(Array.isArray(t) ? t : t.tenants || []);
+        const rawPools = Array.isArray(p) ? p : p.pools || [];
+        setPools(rawPools.map((pool: { name: string }) => pool.name));
+        // The bucket count per tenant is not on the tenant record, but every
+        // bucket carries its tenant — so count them here rather than adding a
+        // round trip per row.
+        const counts: Record<string, number> = {};
+        for (const bk of (b.buckets || []) as AdminBucket[]) {
+          const key = bk.tenant || "";
+          counts[key] = (counts[key] ?? 0) + 1;
+        }
+        setBucketsByTenant(counts);
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const startEdit = (t?: Tenant) => {
     if (t) {
@@ -76,17 +135,21 @@ export default function Tenants() {
   };
 
   const save = async () => {
-    // admin_users is managed via the dedicated admin panel — preserve whatever
-    // the tenant currently has and don't clobber it from the edit form.
-    const current = tenants.find(t => t.name === form.name);
+    // admin_users is managed in its own panel — carry the current value
+    // through so saving the form does not silently drop the tenant's admins.
+    const current = tenants.find((t) => t.name === form.name);
     const payload = {
       ...form,
-      allowed_pools: allowedPoolsStr.split(",").map(s => s.trim()).filter(Boolean),
+      allowed_pools: allowedPoolsStr.split(",").map((s) => s.trim()).filter(Boolean),
       admin_users: current?.admin_users || form.admin_users || [],
     };
     const method = editing === "__new__" ? "POST" : "PUT";
     const url = editing === "__new__" ? "/_admin/tenants" : `/_admin/tenants/${form.name}`;
-    await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
     setEditing(null);
     load();
   };
@@ -102,14 +165,10 @@ export default function Tenants() {
     setManagingAdmins(name);
     setAdminInput("");
     setAdminError("");
-    // Pull users scoped to this tenant so the picker doesn't leak other
-    // tenants' users. Admin API already filters by caller tenant, but the
-    // system admin sees everyone — filter client-side to the target tenant.
     try {
       const r = await fetch("/_admin/users");
       const d = await r.json();
-      const list: TenantUser[] = (d.users || []).filter((u: TenantUser) => u.tenant === name);
-      setTenantUsers(list);
+      setTenantUsers((d.users || []).filter((u: TenantUser) => u.tenant === name));
     } catch {
       setTenantUsers([]);
     }
@@ -134,9 +193,10 @@ export default function Tenants() {
 
   const removeAdmin = async (entry: string) => {
     if (!confirm(`Remove ${entry} from ${managingAdmins} admins?`)) return;
-    const r = await fetch(`/_admin/tenants/${managingAdmins}/admins/${encodeURIComponent(entry)}`, {
-      method: "DELETE",
-    });
+    const r = await fetch(
+      `/_admin/tenants/${managingAdmins}/admins/${encodeURIComponent(entry)}`,
+      { method: "DELETE" }
+    );
     if (!r.ok) {
       setAdminError(await r.text());
       return;
@@ -144,74 +204,101 @@ export default function Tenants() {
     load();
   };
 
-  const managingTenant = tenants.find(t => t.name === managingAdmins);
+  const managingTenant = tenants.find((t) => t.name === managingAdmins);
+  const totalQuota = tenants.reduce((a, t) => a + t.quota_bytes, 0);
+  const unlimited = tenants.filter((t) => !t.quota_bytes).length;
 
   return (
     <div className="p-6">
       <PageHeader
         title="Tenants"
-        description="Multi-tenant isolation — each tenant gets its own buckets, quotas, and identity"
+        description="Multi-tenant isolation — each tenant gets its own buckets, quotas and identity"
         action={
-          <button onClick={() => startEdit()} className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800">
-            <Plus size={14} /> Create Tenant
-          </button>
+          <Button variant="primary" icon={<Plus size={13} />} onClick={() => startEdit()}>
+            Create tenant
+          </Button>
         }
       />
 
+      <div className="grid lg:grid-cols-2 gap-4 mb-4">
+        <ChartCard title="Storage by tenant" subtitle="used bytes over time">
+          <NeedsSeries
+            metric="objectio_tenant_used_bytes"
+            reason="Nothing accounts for storage per tenant yet. Bucket and object
+              records carry a tenant, but nothing sums them into a usage figure,
+              so there is no series for Prometheus to keep history of."
+          />
+        </ChartCard>
+        <ChartCard title="Requests by tenant" subtitle="requests per hour">
+          <NeedsSeries
+            metric="objectio_s3_requests_total{tenant=…}"
+            reason="The S3 request counter is labelled by operation and status but
+              not by tenant, so requests cannot be split per tenant. The counter
+              is recorded in the metrics middleware, which runs before the auth
+              layer resolves who the caller is."
+          />
+        </ChartCard>
+      </div>
+
       {managingAdmins && managingTenant && (
         <Card
-          title={
-            <div className="flex items-center gap-2">
-              <ShieldCheck size={14} className="text-purple-500" />
-              <span>Tenant Admins: {managingTenant.display_name || managingAdmins}</span>
-            </div>
+          title={`Tenant admins · ${managingTenant.display_name || managingAdmins}`}
+          action={
+            <Button variant="ghost" size="sm" onClick={() => setManagingAdmins(null)}>
+              Close
+            </Button>
           }
           className="mb-4"
         >
-          <p className="text-[12px] text-gray-500 mb-3">
-            Tenant admins can manage users, access keys, buckets, warehouses, and shares <em>within this tenant only</em>.
-            They cannot touch other tenants or system-level resources.
+          <p className="text-[11px] text-muted mb-3">
+            Tenant admins manage users, access keys, buckets, warehouses and shares{" "}
+            <em>within this tenant only</em>. They cannot reach other tenants or
+            system-level resources.
           </p>
 
-          <div className="mb-3">
-            <label className="block text-[11px] font-medium text-gray-500 mb-1">Current admins</label>
-            {managingTenant.admin_users.length === 0 ? (
-              <div className="text-[12px] text-gray-400 italic py-2">
-                No tenant admins. Only the system admin can manage this tenant until one is added below.
-              </div>
-            ) : (
-              <ul className="space-y-1">
-                {managingTenant.admin_users.map((u) => {
-                  const user = tenantUsers.find((tu) => tu.user_id === u || tu.arn === u);
-                  return (
-                    <li key={u} className="flex items-center justify-between px-2.5 py-1.5 bg-gray-50 rounded-lg">
-                      <div className="flex flex-col min-w-0">
-                        <span className="text-[12px] font-medium text-gray-900 truncate">
-                          {user?.display_name || u}
-                        </span>
-                        <span className="text-[10px] text-gray-400 font-mono truncate">{u}</span>
-                      </div>
-                      <button
-                        onClick={() => removeAdmin(u)}
-                        className="text-gray-400 hover:text-red-600 p-1"
-                        title="Remove admin"
-                      >
-                        <X size={14} />
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </div>
+          {managingTenant.admin_users.length === 0 ? (
+            <Banner kind="warn" className="mb-3">
+              No tenant admins. Only the system admin can manage this tenant until
+              one is added.
+            </Banner>
+          ) : (
+            <ul className="space-y-1 mb-3">
+              {managingTenant.admin_users.map((u) => {
+                const user = tenantUsers.find((tu) => tu.user_id === u || tu.arn === u);
+                return (
+                  <li
+                    key={u}
+                    className="flex items-center justify-between px-2.5 py-1.5 bg-surface-2 rounded-control"
+                  >
+                    <span className="flex flex-col min-w-0">
+                      <span className="text-[12px] font-medium text-text truncate">
+                        {user?.display_name || u}
+                      </span>
+                      <span className="text-[10px] text-faint font-mono truncate">{u}</span>
+                    </span>
+                    <button
+                      onClick={() => void removeAdmin(u)}
+                      className="text-faint hover:text-err p-1"
+                      title="Remove admin"
+                    >
+                      <X size={14} />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
 
-          <div>
-            <label className="block text-[11px] font-medium text-gray-500 mb-1">Add admin</label>
-            <div className="flex gap-2">
+          <div className="flex gap-2 items-end">
+            <div className="flex-1">
+              <label className="block text-[11px] font-semibold text-text-2 mb-1">
+                Add from this tenant
+              </label>
               <select
                 value=""
-                onChange={(e) => e.target.value && addAdmin(e.target.value)}
-                className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                onChange={(e) => e.target.value && void addAdmin(e.target.value)}
+                className="w-full h-8 px-2.5 bg-surface text-text border border-border-strong
+                  rounded-control text-[13px] focus:outline-none focus:border-accent"
               >
                 <option value="">— Pick a tenant user —</option>
                 {tenantUsers
@@ -222,164 +309,240 @@ export default function Tenants() {
                     </option>
                   ))}
               </select>
-              <span className="text-[11px] text-gray-400 self-center">or</span>
-              <input
+            </div>
+            <div className="flex-1">
+              <Input
+                label="or by id / ARN"
                 value={adminInput}
                 onChange={(e) => setAdminInput(e.target.value)}
                 placeholder="user_id or user ARN"
-                className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none"
               />
-              <button
-                onClick={() => addAdmin(adminInput)}
-                disabled={!adminInput.trim()}
-                className="flex items-center gap-1 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800 disabled:opacity-40"
-              >
-                <UserPlus size={13} /> Add
-              </button>
             </div>
-            {adminError && (
-              <p className="mt-2 text-[11px] text-red-600">{adminError}</p>
-            )}
-          </div>
-
-          <div className="flex justify-end mt-4 pt-3 border-t border-gray-100">
-            <button
-              onClick={() => setManagingAdmins(null)}
-              className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+            <Button
+              variant="accent"
+              icon={<UserPlus size={13} />}
+              disabled={!adminInput.trim()}
+              onClick={() => void addAdmin(adminInput)}
             >
-              Close
-            </button>
+              Add
+            </Button>
           </div>
+          {adminError && (
+            <Banner kind="err" className="mt-3">
+              {adminError}
+            </Banner>
+          )}
         </Card>
       )}
 
       {editing && (
-        <Card title={editing === "__new__" ? "Create Tenant" : `Edit: ${editing}`} className="mb-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <Card
+          title={editing === "__new__" ? "Create tenant" : `Edit · ${editing}`}
+          className="mb-4"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <Input
+              label="Tenant name"
+              value={form.name}
+              disabled={editing !== "__new__"}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              placeholder="acme-corp"
+              hint={editing === "__new__" ? "Lowercase, used in ARNs" : undefined}
+            />
+            <Input
+              label="Display name"
+              value={form.display_name}
+              onChange={(e) => setForm({ ...form, display_name: e.target.value })}
+              placeholder="Acme Corporation"
+            />
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Tenant Name</label>
-              <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} disabled={editing !== "__new__"}
-                placeholder="e.g. acme-corp" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100" />
-            </div>
-            <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Display Name</label>
-              <input value={form.display_name} onChange={e => setForm({ ...form, display_name: e.target.value })}
-                placeholder="Acme Corporation" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
-            </div>
-            <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Default Pool</label>
-              <select value={form.default_pool} onChange={e => setForm({ ...form, default_pool: e.target.value })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none">
+              <label className="block text-[11px] font-semibold text-text-2 mb-1">
+                Default pool
+              </label>
+              <select
+                value={form.default_pool}
+                onChange={(e) => setForm({ ...form, default_pool: e.target.value })}
+                className="w-full h-8 px-2.5 bg-surface text-text border border-border-strong
+                  rounded-control text-[13px] focus:outline-none focus:border-accent"
+              >
                 <option value="">System default</option>
-                {pools.map(p => <option key={p} value={p}>{p}</option>)}
+                {pools.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
               </select>
             </div>
+            <Input
+              label="Allowed pools"
+              value={allowedPoolsStr}
+              onChange={(e) => setAllowedPoolsStr(e.target.value)}
+              placeholder="default, archive"
+              hint="Comma separated; blank means the default pool only"
+            />
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">OIDC Provider</label>
-              <input value={form.oidc_provider} onChange={e => setForm({ ...form, oidc_provider: e.target.value })}
-                placeholder="e.g. entra" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
-            </div>
-            <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Storage Quota</label>
-              <select value={form.quota_bytes} onChange={e => setForm({ ...form, quota_bytes: Number(e.target.value) })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none">
-                <option value={0}>Unlimited</option>
-                <option value={107374182400}>100 GB</option>
-                <option value={536870912000}>500 GB</option>
-                <option value={1099511627776}>1 TB</option>
-                <option value={10995116277760}>10 TB</option>
+              <label className="block text-[11px] font-semibold text-text-2 mb-1">
+                Storage quota
+              </label>
+              <select
+                value={form.quota_bytes}
+                onChange={(e) => setForm({ ...form, quota_bytes: Number(e.target.value) })}
+                className="w-full h-8 px-2.5 bg-surface text-text border border-border-strong
+                  rounded-control text-[13px] focus:outline-none focus:border-accent"
+              >
+                {QUOTA_CHOICES.map((q) => (
+                  <option key={q.bytes} value={q.bytes}>
+                    {q.label}
+                  </option>
+                ))}
               </select>
             </div>
-            <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Max Buckets (0=unlimited)</label>
-              <input type="number" value={form.quota_buckets} onChange={e => setForm({ ...form, quota_buckets: Number(e.target.value) })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+            <Input
+              label="Max buckets"
+              type="number"
+              value={form.quota_buckets}
+              onChange={(e) => setForm({ ...form, quota_buckets: Number(e.target.value) })}
+              hint="0 = unlimited"
+            />
+            <Input
+              label="OIDC provider"
+              value={form.oidc_provider}
+              onChange={(e) => setForm({ ...form, oidc_provider: e.target.value })}
+              placeholder="entra"
+              hint="Name of a configured provider; blank means password login"
+            />
+            <div className="flex items-end">
+              <label className="flex items-center gap-2 text-[12px] text-text-2 h-8">
+                <input
+                  type="checkbox"
+                  checked={form.enabled}
+                  onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+                  className="accent-[var(--oio-accent)]"
+                />
+                Enabled
+              </label>
             </div>
           </div>
-          <div className="flex gap-2 mt-4 pt-3 border-t border-gray-100">
-            <button onClick={save} className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800">Save</button>
-            <button onClick={() => setEditing(null)} className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50">Cancel</button>
+          <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+            <Button variant="primary" onClick={() => void save()}>
+              Save
+            </Button>
+            <Button onClick={() => setEditing(null)}>Cancel</Button>
           </div>
         </Card>
       )}
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
-            <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Tenant</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Pool</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Quota</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Buckets</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">OIDC</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Admins</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Status</th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-32">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100">
-            {loading ? (
-              <tr>
-                <td colSpan={7} className="px-4 py-8 text-center">
-                  <div className="flex items-center justify-center gap-3">
-                    <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                      <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
-                    </div>
-                    <span className="text-[12px] text-gray-400">Loading</span>
-                  </div>
-                </td>
-              </tr>
-            ) : tenants.length === 0 ? (
-              <tr><td colSpan={8} className="px-4 py-8 text-center text-[12px] text-gray-400">No tenants configured</td></tr>
-            ) : (
-              tenants.map(t => (
-                <tr key={t.name} className="hover:bg-gray-50 group">
-                  <td className="px-4 py-2">
-                    <div className="flex items-center gap-2">
-                      <Building2 size={14} className="text-purple-500" />
-                      <div>
-                        <span className="text-[13px] font-medium">{t.display_name || t.name}</span>
-                        {t.display_name && t.display_name !== t.name && (
-                          <span className="text-[10px] text-gray-400 ml-1.5 font-mono">{t.name}</span>
-                        )}
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500 font-mono">{t.default_pool || "default"}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{formatBytes(t.quota_bytes)}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{t.quota_buckets || "∞"}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{t.oidc_provider || <span className="text-gray-300">-</span>}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">
-                    {t.admin_users && t.admin_users.length > 0 ? (
-                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded text-[11px]">
-                        <ShieldCheck size={11} /> {t.admin_users.length}
+      <Table
+        columns={[
+          { key: "tenant", label: "Tenant" },
+          { key: "pool", label: "Pool", className: "w-40" },
+          { key: "quota", label: "Quota", className: "w-64" },
+          { key: "buckets", label: "Buckets", align: "right", className: "w-24" },
+          { key: "oidc", label: "OIDC", className: "w-32" },
+          { key: "admins", label: "Admins", align: "right", className: "w-24" },
+          { key: "status", label: "Status", className: "w-32" },
+          { key: "actions", label: "", className: "w-28" },
+        ]}
+        loading={loading}
+        empty="No tenants configured"
+        footer={
+          tenants.length
+            ? `${tenants.length} tenant${tenants.length === 1 ? "" : "s"} · ${formatBytes(
+                totalQuota
+              )} of quota allocated${unlimited ? ` · ${unlimited} unlimited` : ""}`
+            : undefined
+        }
+      >
+        {tenants.length
+          ? tenants.map((t) => (
+              <Row key={t.name}>
+                <Cell>
+                  <span className="flex items-center gap-2">
+                    <Building2 size={14} className="text-muted shrink-0" />
+                    <span className="flex flex-col">
+                      <span className="text-[13px] font-medium text-text">{t.name}</span>
+                      {t.display_name && t.display_name !== t.name && (
+                        <span className="text-[11px] text-muted">{t.display_name}</span>
+                      )}
+                    </span>
+                  </span>
+                </Cell>
+                <Cell className="font-mono">{t.default_pool || "default"}</Cell>
+                <Cell>
+                  {t.quota_bytes ? (
+                    <span className="flex items-center gap-2.5">
+                      {/* Used is unknown until per-tenant accounting exists, so
+                          the track stays empty rather than showing a guess. */}
+                      <CapacityBar used={0} total={t.quota_bytes} className="flex-1 min-w-24" />
+                      <span className="font-mono text-[11px] text-muted whitespace-nowrap">
+                        — / {formatBytes(t.quota_bytes)}
                       </span>
-                    ) : (
-                      <span className="text-gray-300">-</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2">
-                    <StatusBadge status={t.enabled ? "healthy" : "warning"} label={t.enabled ? "Active" : "Disabled"} />
-                  </td>
-                  <td className="px-4 py-2 text-right">
-                    <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => openAdmins(t.name)} className="text-gray-400 hover:text-purple-600 p-1" title="Manage tenant admins">
-                        <ShieldCheck size={14} />
-                      </button>
-                      <button onClick={() => startEdit(t)} className="text-gray-400 hover:text-blue-600 p-1" title="Edit">
-                        <Edit size={14} />
-                      </button>
-                      <button onClick={() => remove(t.name)} className="text-gray-400 hover:text-red-600 p-1" title="Delete">
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+                    </span>
+                  ) : (
+                    <span className="text-[12px] text-muted">Unlimited</span>
+                  )}
+                </Cell>
+                <Cell align="right" className="font-mono">
+                  {bucketsByTenant[t.name] ?? 0}
+                </Cell>
+                <Cell>
+                  {t.oidc_provider ? (
+                    <Chip mono>{t.oidc_provider}</Chip>
+                  ) : (
+                    <span className="text-[11px] text-faint">password</span>
+                  )}
+                </Cell>
+                <Cell align="right" className="font-mono">
+                  {t.admin_users?.length ?? 0}
+                </Cell>
+                <Cell>
+                  <Badge kind={t.enabled ? "ok" : "neutral"}>
+                    {t.enabled ? "Active" : "Disabled"}
+                  </Badge>
+                </Cell>
+                <Cell align="right">
+                  <span className="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    <button
+                      onClick={() => void openAdmins(t.name)}
+                      title="Tenant admins"
+                      className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                    >
+                      <Users size={13} />
+                    </button>
+                    <button
+                      onClick={() => startEdit(t)}
+                      title="Edit tenant"
+                      className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                    >
+                      <Settings2 size={13} />
+                    </button>
+                    <button
+                      onClick={() => void remove(t.name)}
+                      title="Delete tenant"
+                      className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </span>
+                </Cell>
+              </Row>
+            ))
+          : undefined}
+      </Table>
+    </div>
+  );
+}
+
+/// Placeholder for a panel whose series does not exist yet. Names the metric
+/// and why it is missing — an empty chart would read as "no traffic", which is
+/// a different and wrong statement.
+function NeedsSeries({ metric, reason }: { metric: string; reason: string }) {
+  return (
+    <div className="h-[200px] flex flex-col items-center justify-center text-center px-6 gap-1.5">
+      <code className="font-mono text-[11px] text-text-2 bg-surface-2 px-1.5 py-px rounded-[5px]">
+        {metric}
+      </code>
+      <p className="text-[11px] text-muted max-w-sm">{reason}</p>
     </div>
   );
 }

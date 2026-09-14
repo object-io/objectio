@@ -1,9 +1,86 @@
 @import "tailwindcss";
 @import "./brand-tokens.css";
+/* Semantic layer generated from the design canvas. Defines --oio-bg,
+   --oio-surface, --oio-border, --oio-text and friends, plus their
+   [data-theme="dark"] values. The @theme block below points Tailwind's
+   neutral scale at them so the utilities already in the markup resolve
+   through the tokens instead of fixed hex. */
+@import "./console-tokens.css";
+
+/* Remap Tailwind's blue scale onto the brand's data blue.
+
+   The console expresses its accent as `blue-*` utilities in roughly 190
+   places. Overriding the scale
+   here rebrands all of them at once, instead of rewriting every class name
+   and inviting drift between them.
+
+   The brand's three published anchors sit at 200 (data-light), 500 (data)
+   and 600 (data-deep). 600 and 700 are the steps used for text and filled
+   buttons, so they are kept dark enough to clear 4.5:1 on white — the lighter
+   mid-tones would not.
+
+   Amber (parity) is deliberately not mapped to a utility scale: it marks the
+   two parity shards in the mark and genuine parity/repair states, and loses
+   that meaning the moment it becomes a general accent. */
+/* Semantic scale, per design/HANDOFF.md §2. `inline` matters: it makes the
+   utilities emit `var(--oio-*)` rather than the resolved value, which is what
+   lets [data-theme="dark"] switch at runtime.
+
+   Every page is on the semantic names — `bg-surface`, `text-muted`,
+   `border-border`. The grey-scale bridge that carried the un-migrated pages is
+   gone, which is what makes [data-theme="dark"] usable: `bg-white` and
+   `text-white` used to share one token and could not be both a surface and an
+   on-button label. */
+@theme inline {
+  --color-bg: var(--oio-bg);
+  --color-surface: var(--oio-surface);
+  --color-surface-2: var(--oio-surface2);
+  --color-border: var(--oio-border);
+  --color-border-strong: var(--oio-border-strong);
+  --color-text: var(--oio-text);
+  --color-text-2: var(--oio-text2);
+  --color-muted: var(--oio-muted);
+  --color-faint: var(--oio-faint);
+
+  --color-accent: var(--oio-accent);
+  --color-accent-fg: var(--oio-accent-fg);
+  --color-accent-soft: var(--oio-accent-soft);
+  --color-accent-ring: var(--oio-accent-ring);
+  --color-primary: var(--oio-primary);
+  --color-primary-fg: var(--oio-primary-fg);
+  --color-primary-hover: var(--oio-primary-hover);
+
+  --color-ok: var(--oio-ok);
+  --color-ok-soft: var(--oio-ok-soft);
+  --color-warn: var(--oio-warn);
+  --color-warn-soft: var(--oio-warn-soft);
+  --color-warn-dot: var(--oio-warn-dot);
+  --color-err: var(--oio-err);
+  --color-err-soft: var(--oio-err-soft);
+  --color-info: var(--oio-info);
+  --color-info-soft: var(--oio-info-soft);
+
+  --color-sidebar: var(--oio-sidebar);
+  --color-code-bg: var(--oio-code-bg);
+  --color-code-fg: var(--oio-code-fg);
+
+  --font-display: var(--oio-font-display);
+  --font-sans: var(--oio-font-body);
+  --font-mono: var(--oio-font-mono);
+
+  --radius-control: var(--oio-radius-control);
+  --radius-card: var(--oio-radius-card);
+  --radius-dialog: var(--oio-radius-dialog);
+
+  /* Parity amber stays a named colour rather than a scale: it marks the
+     mark's parity shards and genuine parity/repair states, and stops meaning
+     that the moment it becomes a general accent. */
+  --color-parity: var(--oio-warn-dot);
+}
 
 body {
-  @apply bg-gray-50 text-gray-900 antialiased m-0;
-  font-family: var(--objectio-font-sans);
+  @apply bg-bg text-text antialiased m-0;
+  font-family: var(--oio-font-body);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -12,7 +89,7 @@ code,
 pre,
 kbd,
 .font-mono {
-  font-family: var(--objectio-font-mono);
+  font-family: var(--oio-font-mono);
 }
 
 #root {

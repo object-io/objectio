@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/readme-banner.png" width="100%" alt="ObjectIO"></p>
+
 # ObjectIO
 
 **Unified software-defined storage in Rust.** One cluster, one binary per

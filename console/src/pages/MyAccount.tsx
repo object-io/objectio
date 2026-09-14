@@ -20,9 +20,11 @@ export default function MyAccount() {
     user: string;
     tenant: string;
   } | null>(null);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const loadKeys = () => {
-    setLoading(true);
     fetch("/_console/api/me/keys")
       .then((r) => r.json())
       .then((d) => setKeys(d.access_keys || []))
@@ -70,7 +72,7 @@ export default function MyAccount() {
         action={
           <button
             onClick={createKey}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
           >
             <Plus size={14} /> Create Access Key
           </button>
@@ -79,19 +81,19 @@ export default function MyAccount() {
 
       {/* Profile info */}
       {session && (
-        <div className="bg-white rounded-xl border border-gray-200 p-4 mb-4">
+        <div className="bg-surface rounded-xl border border-border p-4 mb-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center">
-              <User size={18} className="text-blue-600" />
+            <div className="w-10 h-10 bg-accent-soft rounded-full flex items-center justify-center">
+              <User size={18} className="text-accent" />
             </div>
             <div>
               <p className="text-[13px] font-medium">{session.user}</p>
               {session.tenant ? (
-                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-purple-100 text-purple-800">
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-surface-2 text-muted">
                   {session.tenant}
                 </span>
               ) : (
-                <span className="text-[11px] text-gray-400">
+                <span className="text-[11px] text-faint">
                   System Admin
                 </span>
               )}
@@ -102,43 +104,43 @@ export default function MyAccount() {
 
       {/* New key banner */}
       {newKey && (
-        <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-xl p-4">
-          <h3 className="text-[12px] font-medium text-yellow-800 mb-2">
+        <div className="mb-4 bg-warn-soft border border-warn/25 rounded-xl p-4">
+          <h3 className="text-[12px] font-medium text-warn mb-2">
             Save these credentials now — the secret will not be shown again
           </h3>
           <div className="space-y-1.5 font-mono text-[12px]">
             <div className="flex items-center gap-2">
-              <span className="text-gray-500 w-24">Access Key:</span>
+              <span className="text-muted w-24">Access Key:</span>
               <span className="font-medium">{newKey.access_key_id}</span>
               <button
                 onClick={() => copyText(newKey.access_key_id, "ak")}
                 className="p-0.5"
               >
                 {copied === "ak" ? (
-                  <Check size={12} className="text-green-500" />
+                  <Check size={12} className="text-ok" />
                 ) : (
-                  <Copy size={12} className="text-gray-400" />
+                  <Copy size={12} className="text-faint" />
                 )}
               </button>
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-gray-500 w-24">Secret Key:</span>
+              <span className="text-muted w-24">Secret Key:</span>
               <span className="font-medium">{newKey.secret_access_key}</span>
               <button
                 onClick={() => copyText(newKey.secret_access_key, "sk")}
                 className="p-0.5"
               >
                 {copied === "sk" ? (
-                  <Check size={12} className="text-green-500" />
+                  <Check size={12} className="text-ok" />
                 ) : (
-                  <Copy size={12} className="text-gray-400" />
+                  <Copy size={12} className="text-faint" />
                 )}
               </button>
             </div>
           </div>
           <button
             onClick={() => setNewKey(null)}
-            className="mt-2 text-[11px] text-yellow-700 underline"
+            className="mt-2 text-[11px] text-warn underline"
           >
             Dismiss
           </button>
@@ -146,35 +148,35 @@ export default function MyAccount() {
       )}
 
       {/* Keys table */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200">
-          <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
+        <div className="px-4 py-2.5 bg-surface-2 border-b border-border">
+          <h3 className="text-[11px] font-medium text-muted uppercase tracking-wider">
             Access Keys
           </h3>
         </div>
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-100">
+          <thead className="bg-surface-2 border-b border-border">
             <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 Access Key ID
               </th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 Created
               </th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+              <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                 Actions
               </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-50">
+          <tbody className="divide-y divide-border">
             {loading ? (
               <tr>
                 <td colSpan={3} className="px-4 py-6 text-center">
                   <div className="flex items-center justify-center gap-3">
-                    <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                      <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                    <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                      <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                     </div>
-                    <span className="text-[12px] text-gray-400">Loading</span>
+                    <span className="text-[12px] text-faint">Loading</span>
                   </div>
                 </td>
               </tr>
@@ -182,23 +184,23 @@ export default function MyAccount() {
               <tr>
                 <td
                   colSpan={3}
-                  className="px-4 py-6 text-center text-[12px] text-gray-400"
+                  className="px-4 py-6 text-center text-[12px] text-faint"
                 >
                   No access keys. Create one for S3 API access.
                 </td>
               </tr>
             ) : (
               keys.map((k) => (
-                <tr key={k.access_key_id} className="hover:bg-gray-50 group">
+                <tr key={k.access_key_id} className="hover:bg-surface-2 group">
                   <td className="px-4 py-2.5">
                     <div className="flex items-center gap-2">
-                      <Key size={13} className="text-orange-500" />
+                      <Key size={13} className="text-warn" />
                       <span className="text-[12px] font-mono">
                         {k.access_key_id}
                       </span>
                     </div>
                   </td>
-                  <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                  <td className="px-4 py-2.5 text-[12px] text-muted">
                     {k.created_at
                       ? new Date(k.created_at * 1000).toLocaleDateString()
                       : "-"}
@@ -206,7 +208,7 @@ export default function MyAccount() {
                   <td className="px-4 py-2.5 text-right">
                     <button
                       onClick={() => deleteKey(k.access_key_id)}
-                      className="text-gray-300 hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                      className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                     >
                       <Trash2 size={13} />
                     </button>

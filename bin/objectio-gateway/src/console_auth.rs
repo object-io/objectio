@@ -17,7 +17,7 @@ use objectio_proto::metadata::GetAccessKeyForAuthRequest;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::s3::AppState;
 
@@ -71,6 +71,302 @@ fn build_oidc_provider_from_config(
             scopes,
         },
     ))
+}
+
+/// Default storage quota given to a tenant that registers itself through a
+/// multi-tenant provider. Self-registration is open by design, so the default
+/// is a modest allowance rather than unlimited; an operator raises it per
+/// tenant afterwards.
+pub const DEFAULT_SELF_REGISTERED_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Tenancy behavior for one OIDC provider, read from its stored config.
+#[derive(Debug, Clone)]
+pub struct ProviderTenancy {
+    /// True when the provider federates many upstream tenants (Entra
+    /// `common` / `organizations`). Each upstream tenant then gets its own
+    /// ObjectIO tenant, created on first login.
+    pub multi_tenant: bool,
+    /// Role/group claim value that makes a user an admin of their tenant.
+    /// Empty means nobody is promoted and only the system admin can manage it.
+    pub tenant_admin_role: String,
+    /// Quota applied to a self-registered tenant.
+    pub quota_bytes: u64,
+    /// Upstream tenant ids permitted to self-register. Empty means open —
+    /// any upstream tenant may register, which is what `common` implies.
+    pub allowed_tids: Vec<String>,
+}
+
+impl ProviderTenancy {
+    /// Read the tenancy settings out of a stored provider config document.
+    #[must_use]
+    pub fn from_config(config: &serde_json::Value) -> Self {
+        Self {
+            multi_tenant: config
+                .get("tenancy")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("multi")),
+            tenant_admin_role: config
+                .get("tenant_admin_role")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            quota_bytes: config
+                .get("tenant_quota_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_SELF_REGISTERED_QUOTA_BYTES),
+            allowed_tids: config
+                .get("allowed_tids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// May this upstream tenant register? Open unless an allowlist is set.
+    #[must_use]
+    pub fn admits(&self, tid: &str) -> bool {
+        self.allowed_tids.is_empty() || self.allowed_tids.iter().any(|t| t == tid)
+    }
+}
+
+/// Label under which a tenant records the upstream tenant it belongs to.
+///
+/// The mapping is keyed on the upstream `tid` rather than a domain because a
+/// domain can be added to or removed from an Entra tenant, while `tid` is
+/// immutable — keying on the name would break the moment a customer changes
+/// their vanity domain.
+pub const OIDC_TID_LABEL: &str = "oidc_tid";
+
+/// Derive a tenant name from an upstream identity.
+///
+/// Prefers the domain part of the user's sign-in name, which is readable and
+/// stable enough for display, and falls back to the tid. The name is only an
+/// identifier for humans; lookup always goes through [`OIDC_TID_LABEL`].
+#[must_use]
+pub fn derive_tenant_name(upstream_user: &str, tid: &str) -> String {
+    let candidate = upstream_user
+        .rsplit('@')
+        .next()
+        .filter(|d| !d.is_empty() && d.contains('.'))
+        .unwrap_or(tid);
+    let cleaned: String = candidate
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        tid.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Find, or self-register, the ObjectIO tenant for an upstream tenant id.
+///
+/// Returns the tenant name, or an error string suitable for showing the user.
+/// A tenant is created only when the provider is multi-tenant and the upstream
+/// tenant is admitted; it starts enabled, with the provider's quota, and
+/// carries the upstream id in [`OIDC_TID_LABEL`] so later logins find it again
+/// even if it is renamed.
+pub async fn resolve_or_register_tenant(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    tenancy: &ProviderTenancy,
+    provider_name: &str,
+    tid: &str,
+    upstream_user: &str,
+) -> Result<String, String> {
+    if !tenancy.admits(tid) {
+        return Err(format!(
+            "upstream tenant {tid} is not permitted to register"
+        ));
+    }
+
+    let existing = meta
+        .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
+        .await
+        .map_err(|e| format!("tenant lookup failed: {e}"))?
+        .into_inner()
+        .tenants;
+
+    // Match on the immutable upstream id, never the name.
+    if let Some(t) = existing
+        .iter()
+        .find(|t| t.labels.get(OIDC_TID_LABEL).is_some_and(|v| v == tid))
+    {
+        return Ok(t.name.clone());
+    }
+
+    // Pick a free name. The derived one is for humans; collisions just get a
+    // suffix rather than failing a login.
+    let base = derive_tenant_name(upstream_user, tid);
+    let mut name = base.clone();
+    if existing.iter().any(|t| t.name == name) {
+        name = format!("{base}-{}", &tid[..8.min(tid.len())]);
+    }
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(OIDC_TID_LABEL.to_string(), tid.to_string());
+    labels.insert("oidc_provider".to_string(), provider_name.to_string());
+
+    let tenant = objectio_proto::metadata::TenantConfig {
+        name: name.clone(),
+        display_name: base,
+        oidc_provider: provider_name.to_string(),
+        quota_bytes: tenancy.quota_bytes,
+        enabled: true,
+        labels,
+        ..Default::default()
+    };
+
+    meta.create_tenant(objectio_proto::metadata::CreateTenantRequest {
+        tenant: Some(tenant),
+    })
+    .await
+    .map_err(|e| format!("could not register tenant: {e}"))?;
+
+    info!(
+        "self-registered tenant '{name}' for upstream tid={tid} via provider '{provider_name}' \
+         (quota {} bytes)",
+        tenancy.quota_bytes
+    );
+    Ok(name)
+}
+
+/// Add a user to their tenant's admin list when their token carries the
+/// provider's configured admin role.
+///
+/// Control therefore sits in the customer's own identity provider: their
+/// administrators decide who administers their ObjectIO tenant, and we do not
+/// have to guess from login order.
+pub async fn apply_tenant_admin_role(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    tenancy: &ProviderTenancy,
+    tenant_name: &str,
+    user_arn: &str,
+    roles: &[String],
+) {
+    if tenancy.tenant_admin_role.is_empty()
+        || !roles.iter().any(|r| r == &tenancy.tenant_admin_role)
+    {
+        return;
+    }
+    let Ok(resp) = meta
+        .get_tenant(objectio_proto::metadata::GetTenantRequest {
+            name: tenant_name.to_string(),
+        })
+        .await
+    else {
+        return;
+    };
+    let inner = resp.into_inner();
+    let Some(mut tenant) = inner.tenant.filter(|_| inner.found) else {
+        return;
+    };
+    if tenant.admin_users.iter().any(|a| a == user_arn) {
+        return;
+    }
+    tenant.admin_users.push(user_arn.to_string());
+    if let Err(e) = meta
+        .update_tenant(objectio_proto::metadata::UpdateTenantRequest {
+            tenant: Some(tenant),
+        })
+        .await
+    {
+        warn!("could not promote {user_arn} to admin of '{tenant_name}': {e}");
+    } else {
+        info!("promoted {user_arn} to tenant admin of '{tenant_name}' via role claim");
+    }
+}
+
+/// Query for `GET /_console/api/oidc/enabled`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EnabledParams {
+    /// `signup` lists the providers an organisation can register through,
+    /// rather than the providers valid for signing in to this surface.
+    #[serde(default)]
+    pub purpose: String,
+}
+
+/// Base path of a console surface, with a trailing slash.
+///
+/// Every redirect out of the OIDC flow has to land on a real surface. There is
+/// no bundle at `/_console/` — the build produces the operator and tenant
+/// bundles only — so sending anyone there yields a blank page.
+#[must_use]
+pub fn console_base(audience: ConsoleAudience) -> &'static str {
+    match audience {
+        ConsoleAudience::Tenant => "/_console/tenant/",
+        // An unscoped request has no surface of its own; the operator console
+        // is the safe landing place, and a tenant session that reaches it is
+        // refused by the audience gate rather than silently accepted.
+        ConsoleAudience::Ops | ConsoleAudience::Unscoped => "/_console/admin/",
+    }
+}
+
+/// Where a completed login should land, given the tenant it resolved to.
+///
+/// Driven by the session that was actually minted rather than by where the
+/// flow began: a tenant login belongs on the tenant console even if it was
+/// started from an operator URL, and vice versa.
+#[must_use]
+pub fn landing_for_tenant(tenant: &str) -> &'static str {
+    if tenant.is_empty() {
+        "/_console/admin/"
+    } else {
+        "/_console/tenant/"
+    }
+}
+
+/// Which console surface a request belongs to.
+///
+/// Two signals can say this now. A dedicated listener carries a
+/// [`ListenerKind`]; a single-port deployment distinguishes the surfaces by
+/// path instead (`/_console/admin` vs `/_console/tenant`). The path is the
+/// more specific of the two, so it wins where both are present — on the
+/// legacy listener the path is the *only* signal, since `ListenerKind::Legacy`
+/// deliberately gates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleAudience {
+    /// Operator surface: system-admin sessions only.
+    Ops,
+    /// Self-service surface: tenant sessions only.
+    Tenant,
+    /// Nothing to enforce — legacy single bundle, or a non-console listener.
+    Unscoped,
+}
+
+/// Resolve the audience from the request path, falling back to the listener.
+///
+/// `path` is the console path the browser was on when it started the flow: the
+/// request path for direct calls, or the `Referer` for the OIDC callback,
+/// which the identity provider sends to one fixed redirect URI regardless of
+/// which surface the user began on.
+#[must_use]
+pub fn console_audience(path: &str, listener: Option<ListenerKind>) -> ConsoleAudience {
+    if path.contains("/_console/admin") {
+        return ConsoleAudience::Ops;
+    }
+    if path.contains("/_console/tenant") {
+        return ConsoleAudience::Tenant;
+    }
+    match listener {
+        Some(ListenerKind::OpsConsole | ListenerKind::AdminApi) => ConsoleAudience::Ops,
+        Some(ListenerKind::TenantConsole) => ConsoleAudience::Tenant,
+        _ => ConsoleAudience::Unscoped,
+    }
 }
 
 /// Which composite listener received this request. Set per-listener as
@@ -547,14 +843,24 @@ pub async fn my_delete_key(
 pub async fn oidc_enabled(
     State(state): State<Arc<ConsoleOidcState>>,
     listener: Option<Extension<ListenerKind>>,
+    Query(params): Query<EnabledParams>,
 ) -> Json<serde_json::Value> {
     let kind = listener.map(|l| l.0).unwrap_or(ListenerKind::Legacy);
 
-    if kind == ListenerKind::TenantConsole {
+    // `?purpose=signup` asks a different question: not "who may sign in here"
+    // but "which providers can an organisation register through". Only
+    // multi-tenant providers can, since registration keys on the upstream
+    // tenant in the token. Without this the registration screen has nothing
+    // to offer — the tenant console lists no providers at all, and the
+    // tenant-scoped SSO button needs a tenant that by definition does not
+    // exist yet.
+    let signup = params.purpose.eq_ignore_ascii_case("signup");
+
+    if kind == ListenerKind::TenantConsole && !signup {
         return Json(serde_json::json!({"enabled": false, "providers": []}));
     }
 
-    let only_system_admin = kind == ListenerKind::OpsConsole;
+    let only_system_admin = !signup && kind == ListenerKind::OpsConsole;
     let has_global = state.oidc_provider.is_some();
 
     let mut providers = Vec::new();
@@ -592,6 +898,11 @@ pub async fn oidc_enabled(
                 if only_system_admin && !system_admin {
                     continue;
                 }
+                // Registration is only possible through a provider that
+                // federates many upstream tenants.
+                if signup && !ProviderTenancy::from_config(&config).multi_tenant {
+                    continue;
+                }
                 providers.push(serde_json::json!({
                     "name": provider_name,
                     "label": format!("User SSO{}", if display != "SSO" { format!(" ({display})") } else { String::new() }),
@@ -602,7 +913,9 @@ pub async fn oidc_enabled(
 
     // Global `--oidc-*` provider is implicitly system-admin scoped, so
     // skip it on listeners that don't want system-admin SSO buttons.
-    let surface_global = has_global && !matches!(kind, ListenerKind::TenantConsole);
+    // A provider from CLI flags has no stored document and is single-tenant,
+    // so it can never be a registration route.
+    let surface_global = has_global && !signup && !matches!(kind, ListenerKind::TenantConsole);
     if surface_global {
         providers.insert(
             0,
@@ -782,7 +1095,17 @@ pub async fn oidc_authorize(
         Ok(ep) => ep,
         Err(e) => {
             warn!("Failed to resolve OIDC authorization endpoint: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OIDC discovery failed").into_response();
+            // Return the detail rather than a bare "discovery failed". This is
+            // reached by an operator who has just configured a provider, and
+            // the useful part — the provider's own rejection, e.g. a tenant
+            // that does not exist — is otherwise only visible in the gateway
+            // log. The discovery URL is the configured issuer, which is sent
+            // to the browser in the redirect anyway.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("OIDC discovery failed: {e}"),
+            )
+                .into_response();
         }
     };
 
@@ -826,6 +1149,11 @@ pub async fn oidc_authorize(
 /// Callback query params from OIDC provider
 #[derive(Deserialize)]
 pub struct OidcCallbackParams {
+    /// Absent when the provider is reporting a failure rather than returning a
+    /// grant — a cancelled consent screen sends `error` and no `code`. Required
+    /// here, that made the whole request fail to deserialize with a 400 and a
+    /// serde message, so the error branch below could never run.
+    #[serde(default)]
     pub code: String,
     #[serde(default)]
     pub state: String,
@@ -842,6 +1170,33 @@ pub async fn oidc_callback(
     headers: HeaderMap,
     Query(params): Query<OidcCallbackParams>,
 ) -> Response {
+    // The provider redirects to one fixed callback regardless of which console
+    // the user started on, so the surface is recovered from the Referer. Every
+    // error below returns them to where they came from instead of a path that
+    // serves nothing.
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let base = console_base(console_audience(referer, listener.as_ref().map(|l| l.0)));
+
+    // A callback with neither a grant nor an error is not something we can
+    // act on; say so rather than attempting an exchange with an empty code.
+    if params.code.is_empty() && params.error.is_none() {
+        warn!("OIDC callback carried neither code nor error");
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(
+                header::LOCATION,
+                format!(
+                    "{base}?error={}",
+                    urlencoding::encode("Sign-in did not return a result")
+                ),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     // Check for error from provider
     if let Some(ref err) = params.error {
         warn!(
@@ -853,7 +1208,7 @@ pub async fn oidc_callback(
             .header(
                 header::LOCATION,
                 format!(
-                    "/_console/?error={}",
+                    "{base}?error={}",
                     urlencoding::encode(params.error_description.as_deref().unwrap_or(err))
                 ),
             )
@@ -877,7 +1232,7 @@ pub async fn oidc_callback(
         warn!("OIDC callback: state mismatch");
         return Response::builder()
             .status(StatusCode::FOUND)
-            .header(header::LOCATION, "/_console/?error=Invalid+state")
+            .header(header::LOCATION, format!("{base}?error=Invalid+state"))
             .body(axum::body::Body::empty())
             .unwrap();
     }
@@ -891,52 +1246,65 @@ pub async fn oidc_callback(
     // the provider's `system_admin` flag — when true, a user
     // authenticated through this provider lands on the system-admin
     // console even if no tenant maps to the provider.
-    let (oidc, provider_is_system_admin) = if !provider_name.is_empty() && provider_name != "system"
-    {
-        let mut client = state.meta_client.clone();
-        let config_key = format!("identity/openid/{provider_name}");
-        match client
-            .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
-            .await
-        {
-            Ok(resp) => {
-                let entry = resp.into_inner().entry.unwrap_or_default();
-                let config_json: Option<serde_json::Value> =
-                    serde_json::from_slice(&entry.value).ok();
-                let system_admin = config_json
-                    .as_ref()
-                    .and_then(|c| c.get("system_admin"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
-                    Some(p) => (p, system_admin),
-                    None => {
-                        return Response::builder()
-                            .status(StatusCode::FOUND)
-                            .header(header::LOCATION, "/_console/?error=Invalid+provider+config")
-                            .body(axum::body::Body::empty())
-                            .unwrap();
+    let (oidc, provider_is_system_admin, tenancy) =
+        if !provider_name.is_empty() && provider_name != "system" {
+            let mut client = state.meta_client.clone();
+            let config_key = format!("identity/openid/{provider_name}");
+            match client
+                .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
+                .await
+            {
+                Ok(resp) => {
+                    let entry = resp.into_inner().entry.unwrap_or_default();
+                    let config_json: Option<serde_json::Value> =
+                        serde_json::from_slice(&entry.value).ok();
+                    let system_admin = config_json
+                        .as_ref()
+                        .and_then(|c| c.get("system_admin"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let tenancy = config_json
+                        .as_ref()
+                        .map(ProviderTenancy::from_config)
+                        .unwrap_or_else(|| ProviderTenancy::from_config(&serde_json::json!({})));
+                    match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
+                        Some(p) => (p, system_admin, tenancy),
+                        None => {
+                            return Response::builder()
+                                .status(StatusCode::FOUND)
+                                .header(
+                                    header::LOCATION,
+                                    format!("{base}?error=Invalid+provider+config"),
+                                )
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
                     }
                 }
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, format!("{base}?error=Provider+not+found"))
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
             }
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(header::LOCATION, "/_console/?error=Provider+not+found")
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+        } else {
+            // Global provider from --oidc-* CLI args is implicitly
+            // system-admin scoped.
+            match state.oidc_provider.as_ref() {
+                // A provider configured from CLI flags has no stored document, so
+                // it is single-tenant with no self-registration.
+                Some(p) => (
+                    (**p).clone(),
+                    true,
+                    ProviderTenancy::from_config(&serde_json::json!({})),
+                ),
+                None => {
+                    return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
+                }
             }
-        }
-    } else {
-        // Global provider from --oidc-* CLI args is implicitly
-        // system-admin scoped.
-        match state.oidc_provider.as_ref() {
-            Some(p) => ((**p).clone(), true),
-            None => {
-                return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
-            }
-        }
-    };
+        };
 
     // Exchange authorization code for tokens
     let callback_url = format!("{}/_console/api/oidc/callback", state.external_endpoint);
@@ -949,7 +1317,13 @@ pub async fn oidc_callback(
             warn!("OIDC token exchange failed: {e}");
             return Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, "/_console/?error=Token+exchange+failed")
+                .header(
+                    header::LOCATION,
+                    format!(
+                        "{base}?error={}",
+                        urlencoding::encode(&format!("Token exchange failed: {e}"))
+                    ),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap();
         }
@@ -962,7 +1336,7 @@ pub async fn oidc_callback(
         .as_deref()
         .unwrap_or(&token_resp.access_token);
 
-    let (user_id, _groups) = match oidc.validate_token(token_to_validate).await {
+    let (user_id, groups, upstream_tid) = match oidc.validate_token(token_to_validate).await {
         Ok(claims) => {
             let sub = claims
                 .extra
@@ -972,13 +1346,19 @@ pub async fn oidc_callback(
                 .unwrap_or(&claims.sub)
                 .to_string();
             let groups = oidc.extract_groups(&claims);
-            (sub, groups)
+            // Present on Entra tokens; absent elsewhere, in which case there
+            // is no upstream tenant to key self-registration on.
+            let tid = objectio_auth::OidcProvider::tenant_id(&claims);
+            (sub, groups, tid)
         }
         Err(e) => {
             warn!("OIDC token validation failed: {e}");
             return Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, "/_console/?error=Token+validation+failed")
+                .header(
+                    header::LOCATION,
+                    format!("{base}?error=Token+validation+failed"),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap();
         }
@@ -991,8 +1371,45 @@ pub async fn oidc_callback(
     // system-admin SSO" checkbox on the Identity page.
     let tenant = if !tenant_from_state.is_empty() {
         tenant_from_state
+    } else if tenancy.multi_tenant && !provider_name.is_empty() && provider_name != "system" {
+        // Multi-tenant provider: the ObjectIO tenant follows the *upstream*
+        // tenant the user signed in from, and is created on first contact.
+        // Without a `tid` there is nothing to key on, so the login is refused
+        // rather than silently landing everyone in one shared tenant.
+        let Some(tid) = upstream_tid.clone() else {
+            warn!(
+                "provider '{provider_name}' is multi-tenant but the token carries no \
+                 usable tid — login denied"
+            );
+            return Response::builder()
+                .status(StatusCode::FOUND)
+                .header(
+                    header::LOCATION,
+                    format!("{base}?error=Token+has+no+tenant+claim").as_str(),
+                )
+                .body(axum::body::Body::empty())
+                .unwrap();
+        };
+        let mut t_client = state.meta_client.clone();
+        match resolve_or_register_tenant(&mut t_client, &tenancy, &provider_name, &tid, &user_id)
+            .await
+        {
+            Ok(name) => name,
+            Err(e) => {
+                warn!("tenant self-registration failed for tid={tid}: {e}");
+                return Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(
+                        header::LOCATION,
+                        format!("{base}?error={}", urlencoding::encode(&e)),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+        }
     } else if !provider_name.is_empty() && provider_name != "system" {
-        // Look up all tenants to find which one uses this provider
+        // Single-tenant provider: exactly one tenant is bound to it, and
+        // nothing is created automatically.
         let mut t_client = state.meta_client.clone();
         let resolved = if let Ok(resp) = t_client
             .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
@@ -1022,7 +1439,7 @@ pub async fn oidc_callback(
                     .status(StatusCode::FOUND)
                     .header(
                         header::LOCATION,
-                        "/_console/?error=No+tenant+configured+for+this+provider",
+                        format!("{base}?error=No+tenant+configured+for+this+provider").as_str(),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap();
@@ -1074,6 +1491,15 @@ pub async fn oidc_callback(
         }
     };
 
+    // Promote to tenant admin when the token carries the provider's configured
+    // admin role. Done after provisioning so the ARN exists, and on every
+    // login so a change in the customer's IdP takes effect on their next
+    // sign-in rather than needing us to touch anything.
+    if !tenant.is_empty() {
+        let user_arn = format!("arn:objectio:iam::{tenant}:user/{user_id}");
+        apply_tenant_admin_role(&mut meta, &tenancy, &tenant, &user_arn, &groups).await;
+    }
+
     // Per-listener audience gate (mirror of the AK/SK login gate in
     // `console_login`). The redirect-based OIDC flow can land on
     // either the ops or tenant listener depending on which "Sign in"
@@ -1101,7 +1527,7 @@ pub async fn oidc_callback(
                 .status(StatusCode::FOUND)
                 .header(
                     header::LOCATION,
-                    format!("/_console/?error={}", urlencoding::encode(msg)),
+                    format!("{base}?error={}", urlencoding::encode(msg)),
                 )
                 .body(axum::body::Body::empty())
                 .unwrap();
@@ -1135,9 +1561,185 @@ pub async fn oidc_callback(
 
     Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, "/_console/")
+        .header(header::LOCATION, landing_for_tenant(&tenant))
         .header(header::SET_COOKIE, session_cookie)
         .header("Set-Cookie", clear_state)
         .body(axum::body::Body::empty())
         .unwrap()
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    #[test]
+    fn path_identifies_the_surface() {
+        assert_eq!(
+            console_audience("/_console/admin/users", None),
+            ConsoleAudience::Ops
+        );
+        assert_eq!(
+            console_audience("/_console/tenant/buckets", None),
+            ConsoleAudience::Tenant
+        );
+        assert_eq!(
+            console_audience("/_console/", None),
+            ConsoleAudience::Unscoped
+        );
+    }
+
+    #[test]
+    fn listener_still_works_when_there_is_no_path_signal() {
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::OpsConsole)),
+            ConsoleAudience::Ops
+        );
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::TenantConsole)),
+            ConsoleAudience::Tenant
+        );
+        // The admin API listener is gated like the operator surface.
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::AdminApi)),
+            ConsoleAudience::Ops
+        );
+        // Legacy deliberately gates nothing.
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::Legacy)),
+            ConsoleAudience::Unscoped
+        );
+    }
+
+    /// The path is the more specific signal, so it wins. This is what lets a
+    /// single-port deployment host both surfaces on one listener.
+    #[test]
+    fn path_wins_over_the_listener() {
+        assert_eq!(
+            console_audience("/_console/tenant/x", Some(ListenerKind::OpsConsole)),
+            ConsoleAudience::Tenant
+        );
+        assert_eq!(
+            console_audience("/_console/admin/x", Some(ListenerKind::Legacy)),
+            ConsoleAudience::Ops
+        );
+    }
+}
+
+#[cfg(test)]
+mod tenancy_tests {
+    use super::*;
+
+    #[test]
+    fn tenancy_defaults_to_single_with_a_2gb_allowance() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({}));
+        assert!(
+            !t.multi_tenant,
+            "a provider is single-tenant unless it says otherwise"
+        );
+        assert_eq!(t.quota_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(t.tenant_admin_role.is_empty());
+        // No allowlist means open registration, which is what `common` implies.
+        assert!(t.allowed_tids.is_empty());
+        assert!(t.admits("any-tid"));
+    }
+
+    #[test]
+    fn multi_tenant_is_opt_in_and_case_insensitive() {
+        assert!(
+            ProviderTenancy::from_config(&serde_json::json!({"tenancy": "multi"})).multi_tenant
+        );
+        assert!(
+            ProviderTenancy::from_config(&serde_json::json!({"tenancy": "MULTI"})).multi_tenant
+        );
+        assert!(
+            !ProviderTenancy::from_config(&serde_json::json!({"tenancy": "single"})).multi_tenant
+        );
+    }
+
+    #[test]
+    fn an_allowlist_closes_registration_to_everyone_else() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({
+            "tenancy": "multi",
+            "allowed_tids": ["aaa", "bbb"]
+        }));
+        assert!(t.admits("aaa"));
+        assert!(!t.admits("ccc"));
+    }
+
+    #[test]
+    fn quota_is_configurable_per_provider() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({"tenant_quota_bytes": 5000}));
+        assert_eq!(t.quota_bytes, 5000);
+        // Explicit zero means unlimited, and must not be read as "unset".
+        let t = ProviderTenancy::from_config(&serde_json::json!({"tenant_quota_bytes": 0}));
+        assert_eq!(t.quota_bytes, 0);
+    }
+
+    #[test]
+    fn tenant_name_comes_from_the_sign_in_domain() {
+        assert_eq!(derive_tenant_name("alice@acme.com", "TID"), "acme.com");
+        assert_eq!(
+            derive_tenant_name("bob@sub.example.co.uk", "TID"),
+            "sub.example.co.uk"
+        );
+    }
+
+    #[test]
+    fn tenant_name_falls_back_to_the_tid_when_there_is_no_domain() {
+        // No domain at all, or something that is not domain-shaped.
+        assert_eq!(derive_tenant_name("alice", "the-tid"), "the-tid");
+        assert_eq!(derive_tenant_name("alice@localhost", "the-tid"), "the-tid");
+    }
+
+    #[test]
+    fn tenant_name_is_sanitised() {
+        // Whatever the IdP sends, the name stays to a safe character set.
+        assert_eq!(derive_tenant_name("a@AC ME.com", "t"), "ac-me.com");
+        assert_eq!(derive_tenant_name("a@ac/me.com", "t"), "ac-me.com");
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+
+    /// Every redirect out of the OIDC flow must reach a surface that actually
+    /// has a bundle. `/_console/` does not.
+    #[test]
+    fn a_base_is_always_a_real_surface() {
+        for a in [
+            ConsoleAudience::Ops,
+            ConsoleAudience::Tenant,
+            ConsoleAudience::Unscoped,
+        ] {
+            let b = console_base(a);
+            assert!(b.ends_with('/'), "{b} must end with a slash");
+            assert!(
+                b == "/_console/admin/" || b == "/_console/tenant/",
+                "{b} is not a served surface"
+            );
+        }
+    }
+
+    #[test]
+    fn landing_follows_the_session_that_was_minted() {
+        // A system-admin session has no tenant and belongs on the operator
+        // console; anything else belongs on the tenant console.
+        assert_eq!(landing_for_tenant(""), "/_console/admin/");
+        assert_eq!(landing_for_tenant("acme"), "/_console/tenant/");
+    }
+
+    #[test]
+    fn errors_return_to_the_console_the_flow_started_on() {
+        assert_eq!(
+            console_base(console_audience("/_console/tenant/signup", None)),
+            "/_console/tenant/"
+        );
+        assert_eq!(
+            console_base(console_audience("/_console/admin/", None)),
+            "/_console/admin/"
+        );
+        // No usable referer still lands somewhere real.
+        assert_eq!(console_base(console_audience("", None)), "/_console/admin/");
+    }
 }
