@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Shield, Plus, Trash2, CheckCircle, AlertCircle, Edit } from "lucide-react";
+import { Shield, Plus, Trash2, CheckCircle, AlertCircle, Edit, Copy, Check } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 import Card from "../components/Card";
 
@@ -52,6 +52,12 @@ export default function Identity() {
   const [loading, setLoading] = useState(true);
   const [sessionTenant, setSessionTenant] = useState("");
   const [tenantOidcProvider, setTenantOidcProvider] = useState("");
+  // The redirect URI the gateway will actually send. It is derived from the
+  // gateway's --external-endpoint and is identical for every provider, so it
+  // is shown to be copied into the IdP rather than edited here.
+  const [callbackUrl, setCallbackUrl] = useState("");
+  const [callbackIsDefault, setCallbackIsDefault] = useState(false);
+  const [copiedCallback, setCopiedCallback] = useState(false);
 
   const load = () => {
     setLoading(true);
@@ -72,6 +78,16 @@ export default function Identity() {
       .catch(() => {});
 
     // Load all OIDC providers
+    fetch("/_console/api/oidc/enabled")
+      .then((r) => r.json())
+      .then((d) => {
+        setCallbackUrl(d.callback_url || "");
+        setCallbackIsDefault(Boolean(d.callback_url_is_default));
+      })
+      .catch(() => {
+        /* non-fatal: the form still works, it just cannot show the URI */
+      });
+
     fetch("/_admin/config?prefix=identity%2Fopenid")
       .then((r) => r.json())
       .then((all: OidcProvider[]) => {
@@ -182,6 +198,46 @@ export default function Identity() {
               {sessionTenant && editing === "__new__" && (
                 <p className="mt-1 text-xs text-gray-500">
                   Tenant-owned providers are auto-named <code>t-{sessionTenant.toLowerCase()}</code>.
+                </p>
+              )}
+            </div>
+            {/* The IdP needs this exact string registered as a redirect URI.
+                It is server-derived and the same for every provider, so it is
+                shown here rather than being an editable field. */}
+            <div className="md:col-span-2">
+              <label className="block text-xs font-medium text-gray-500 mb-1">
+                Redirect URI <span className="text-gray-400">(register this in your IdP)</span>
+              </label>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={callbackUrl || "unavailable"}
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50 font-mono text-xs text-gray-700"
+                />
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(callbackUrl);
+                    setCopiedCallback(true);
+                    setTimeout(() => setCopiedCallback(false), 2000);
+                  }}
+                  disabled={!callbackUrl}
+                  className="px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-40"
+                  title="Copy redirect URI"
+                >
+                  {copiedCallback ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              </div>
+              {callbackIsDefault ? (
+                <p className="mt-1 text-xs text-amber-700">
+                  This is built from the gateway's bind address because
+                  <code className="mx-1">--external-endpoint</code> is not set, so no
+                  identity provider will accept it. Set it to the console's public URL
+                  and restart the gateway before configuring SSO.
+                </p>
+              ) : (
+                <p className="mt-1 text-xs text-gray-400">
+                  One callback serves every provider and tenant — the provider and
+                  tenant travel in the OAuth <code>state</code> parameter, not the URL.
                 </p>
               )}
             </div>
