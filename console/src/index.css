@@ -1,5 +1,11 @@
 @import "tailwindcss";
 @import "./brand-tokens.css";
+/* Semantic layer generated from the design canvas. Defines --oio-bg,
+   --oio-surface, --oio-border, --oio-text and friends, plus their
+   [data-theme="dark"] values. The @theme block below points Tailwind's
+   neutral scale at them so the utilities already in the markup resolve
+   through the tokens instead of fixed hex. */
+@import "./console-tokens.css";
 
 /* Remap Tailwind's blue scale onto the brand's data blue.
 
@@ -29,6 +35,30 @@
   --color-blue-900: #0a4270;
 
   --color-parity:   #fc9f30;
+
+  /* Neutrals resolve through the semantic tokens. The mapping follows how the
+     markup already uses the scale: 50 is the page, 100 a raised surface, 200
+     and 300 borders, 400 and 500 secondary text, 600 and 700 body text, 800
+     and 900 the darkest ink.
+
+     `white` is deliberately NOT mapped. The markup uses it for two opposite
+     things — `bg-white` for a card surface and `text-white` for the label on a
+     filled button — and a single token cannot be both. Until those are split
+     in the markup, mapping it would invert one of them. */
+  --color-gray-50:  var(--oio-bg);
+  --color-gray-100: var(--oio-surface2);
+  --color-gray-200: var(--oio-border);
+  --color-gray-300: var(--oio-border-strong);
+  --color-gray-400: var(--oio-faint);
+  --color-gray-500: var(--oio-muted);
+  --color-gray-600: var(--oio-text2);
+  --color-gray-700: var(--oio-text2);
+  --color-gray-800: var(--oio-primary-hover);
+  --color-gray-900: var(--oio-text);
+
+  /* Accent follows the semantic token so a theme switch moves it too. */
+  --color-blue-600: var(--oio-accent);
+  --color-blue-500: var(--oio-accent-ring);
 
   --font-sans: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
   --font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
