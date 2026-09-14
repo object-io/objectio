@@ -7180,59 +7180,6 @@ pub struct CreateUserParams {
     pub tenant: String,
 }
 
-/// Admin user ARN - only this user can access admin endpoints
-const ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
-
-/// Check if the authenticated user is the admin user
-fn is_admin_user(auth: &AuthResult) -> bool {
-    auth.user_arn == ADMIN_USER_ARN
-}
-
-/// Return a 403 Forbidden response for non-admin users
-fn admin_forbidden_response() -> Response {
-    Response::builder()
-        .status(StatusCode::FORBIDDEN)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"error":"Admin access required. Only the 'admin' user can access this endpoint."}"#,
-        ))
-        .unwrap()
-}
-
-/// Return a 401 Unauthorized response when auth is disabled
-fn admin_auth_required_response() -> Response {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"error":"Admin API requires authentication. Start gateway without --no-auth flag."}"#))
-        .unwrap()
-}
-
-/// Check if request is from admin user, returns error response if not.
-/// Accepts SigV4 auth or console session cookie.
-#[allow(clippy::result_large_err)]
-fn check_admin_access(
-    auth: Option<Extension<AuthResult>>,
-    headers: &HeaderMap,
-) -> Result<(), Response> {
-    // SigV4 auth
-    if let Some(Extension(ref auth_result)) = auth {
-        if is_admin_user(auth_result) {
-            return Ok(());
-        }
-        warn!("Admin API access denied for user: {}", auth_result.user_arn);
-        return Err(admin_forbidden_response());
-    }
-
-    // Console session cookie — login already validated credentials
-    if crate::console_auth::validate_session_from_headers(headers).is_some() {
-        return Ok(());
-    }
-
-    warn!("Admin API access attempted without authentication");
-    Err(admin_auth_required_response())
-}
-
 /// List users (GET /_admin/users)
 pub async fn admin_list_users(
     State(state): State<Arc<AppState>>,
@@ -7246,8 +7193,20 @@ pub async fn admin_list_users(
         .or_else(|| crate::console_auth::validate_session_from_headers(&headers).map(|s| s.tenant))
         .unwrap_or_default();
 
-    if let Err(response) = check_admin_access(auth, &headers) {
-        return response;
+    // This handler already filters its result to the caller's tenant — it was
+    // written for tenant admins. The gate in front of it was not: over SigV4
+    // `check_admin_access` admits only the root key, so a tenant admin could
+    // create a user and mint its keys but never list them back. Every sibling
+    // route (list/create/delete access keys, delete user) uses the
+    // tenant-aware gate; this one was the outlier.
+    if tenant.is_empty() {
+        if let Some(deny) = crate::admin::require_system_admin(&auth, &headers) {
+            return deny;
+        }
+    } else if let Some(deny) =
+        crate::admin::require_tenant_admin_access(&state, &auth, &headers, &tenant).await
+    {
+        return deny;
     }
 
     let mut client = state.meta_client.clone();
