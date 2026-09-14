@@ -251,6 +251,9 @@ struct BucketEntry {
     /// `user_id` of the owner. Empty or `"default"` marks a bucket created
     /// before the gateway recorded real ownership.
     owner: String,
+    /// Owning tenant. Empty = the system tenant, which is also what every
+    /// bucket created before tenancy carries.
+    tenant: String,
     cached_at: Instant,
 }
 
@@ -360,7 +363,7 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         }
     };
 
-    let owner = match client
+    let (owner, tenant) = match client
         .get_bucket(GetBucketRequest {
             name: bucket.to_string(),
         })
@@ -369,19 +372,20 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         Ok(response) => response
             .into_inner()
             .bucket
-            .map(|b| b.owner)
+            .map(|b| (b.owner, b.tenant))
             .unwrap_or_default(),
         Err(e) => {
             if e.code() != tonic::Code::NotFound {
                 error!("Failed to fetch bucket meta for {bucket}: {e}");
             }
-            String::new()
+            (String::new(), String::new())
         }
     };
 
     let entry = BucketEntry {
         policy,
         owner,
+        tenant,
         cached_at: Instant::now(),
     };
     state.policy_cache.put_bucket(bucket, entry.clone());
@@ -474,9 +478,11 @@ pub struct AuthzRequest<'a> {
 ///
 /// 1. explicit `Deny` in any identity policy or the bucket policy — terminal
 /// 2. the credential's own scope, which can only narrow
-/// 3. `Allow` in any identity policy or the bucket policy
-/// 4. the caller owns the bucket, or is the system admin
-/// 5. otherwise deny
+/// 3. tenant mismatch — terminal, evaluated before any policy so that no
+///    policy can grant across a tenant boundary
+/// 4. `Allow` in any identity policy or the bucket policy
+/// 5. the caller owns the bucket, or is the system admin
+/// 6. otherwise deny
 ///
 /// Step 5 is the change from "no policy anywhere means everyone" to "no policy
 /// anywhere means the owner". Buckets with no recorded owner are exempt while
@@ -511,6 +517,14 @@ pub async fn authorize(
     }
 
     let bucket = load_bucket(state, req.bucket).await;
+
+    if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant, auth.auth_mode) {
+        debug!(
+            "Tenant boundary denied {} ({}) on {} ({})",
+            auth.user_arn, auth.tenant, req.bucket, bucket.tenant
+        );
+        return Some(deny(&reason));
+    }
 
     let resource = build_s3_arn(req.bucket, req.key);
     let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
@@ -592,6 +606,45 @@ pub async fn authorize(
         "No policy allows {} on {resource}",
         req.action
     )))
+}
+
+/// Decide whether a caller in `caller_tenant` may touch a bucket in
+/// `bucket_tenant`, returning the denial reason when it may not.
+///
+/// The boundary is structural: it is checked before any policy is consulted,
+/// so no bucket policy or attached policy can grant access across it. That is
+/// the difference between tenancy as a real boundary and tenancy as a label
+/// that a stray `Principal: "*"` can undo.
+///
+/// Two deliberate exemptions:
+///
+/// * A bucket with **no tenant** is in the system tenant, which is also where
+///   every bucket created before tenancy landed. Those stay policy-governed
+///   rather than becoming unreachable, so enabling this does not strand an
+///   existing deployment — exactly the migration cliff the ownership work
+///   needed a flag for.
+/// * **STS sessions** carry no tenant today (`auth_middleware` sets it empty
+///   when it validates a session token), so comparing would deny every
+///   Iceberg and Unity vended credential whose warehouse belongs to a tenant.
+///   They are already pinned to a single bucket and prefix by their scope,
+///   which is a narrower guarantee than the tenant check would add. Carrying
+///   the tenant in the session token would let this exemption go away.
+fn tenant_violation(
+    caller_tenant: &str,
+    bucket_tenant: &str,
+    auth_mode: objectio_auth::AuthMode,
+) -> Option<String> {
+    if auth_mode == objectio_auth::AuthMode::Sts {
+        return None;
+    }
+    if bucket_tenant.is_empty() || caller_tenant == bucket_tenant {
+        return None;
+    }
+    Some(if caller_tenant.is_empty() {
+        format!("bucket belongs to tenant '{bucket_tenant}'")
+    } else {
+        format!("tenant '{caller_tenant}' may not access a bucket in tenant '{bucket_tenant}'")
+    })
 }
 
 /// Buckets created before the gateway recorded a real owner carry either an
@@ -879,6 +932,7 @@ mod tests {
         BucketEntry {
             policy: None,
             owner: "u1".to_string(),
+            tenant: String::new(),
             cached_at: Instant::now(),
         }
     }
@@ -910,6 +964,52 @@ mod tests {
 
         cache.invalidate_identity("u1");
         assert!(cache.identity("u1").is_none());
+    }
+
+    #[test]
+    fn tenants_cannot_reach_each_others_buckets() {
+        use objectio_auth::AuthMode;
+        // The case this exists for.
+        assert!(tenant_violation("acme", "globex", AuthMode::Permanent).is_some());
+        // Same tenant is fine.
+        assert!(tenant_violation("acme", "acme", AuthMode::Permanent).is_none());
+    }
+
+    #[test]
+    fn system_tenant_buckets_stay_policy_governed() {
+        use objectio_auth::AuthMode;
+        // Every bucket created before tenancy carries an empty tenant. Denying
+        // those would strand an existing deployment, so they fall through to
+        // ownership and policy instead.
+        assert!(tenant_violation("acme", "", AuthMode::Permanent).is_none());
+        assert!(tenant_violation("", "", AuthMode::Permanent).is_none());
+    }
+
+    #[test]
+    fn a_system_user_cannot_reach_into_a_tenant() {
+        use objectio_auth::AuthMode;
+        // Not the system *admin* — that bypasses the chain earlier. An
+        // ordinary account outside any tenant gets no implicit reach in.
+        assert!(tenant_violation("", "acme", AuthMode::Permanent).is_some());
+    }
+
+    /// STS sessions carry no tenant, so gating them would deny every vended
+    /// Iceberg/Unity credential whose warehouse belongs to a tenant. Their
+    /// scope already pins them to one bucket and prefix.
+    #[test]
+    fn sts_sessions_are_exempt_until_tokens_carry_a_tenant() {
+        use objectio_auth::AuthMode;
+        assert!(tenant_violation("", "acme", AuthMode::Sts).is_none());
+        assert!(tenant_violation("acme", "globex", AuthMode::Sts).is_none());
+    }
+
+    #[test]
+    fn denial_reason_names_both_sides() {
+        use objectio_auth::AuthMode;
+        let r = tenant_violation("acme", "globex", AuthMode::Permanent).unwrap();
+        assert!(r.contains("acme") && r.contains("globex"));
+        let r = tenant_violation("", "globex", AuthMode::Permanent).unwrap();
+        assert!(r.contains("globex"));
     }
 
     #[test]
