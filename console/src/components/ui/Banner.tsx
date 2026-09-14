@@ -1,12 +1,13 @@
-import { CheckCircle2, AlertTriangle, XCircle } from "lucide-react";
+import { CheckCircle2, AlertTriangle, XCircle, Info } from "lucide-react";
 import type { ReactNode } from "react";
 
-export type BannerKind = "ok" | "warn" | "err";
+export type BannerKind = "ok" | "warn" | "err" | "info";
 
 const KINDS: Record<BannerKind, { wrap: string; Icon: typeof CheckCircle2 }> = {
   ok: { wrap: "bg-ok-soft border-ok/25 text-ok", Icon: CheckCircle2 },
   warn: { wrap: "bg-warn-soft border-warn/25 text-warn", Icon: AlertTriangle },
   err: { wrap: "bg-err-soft border-err/25 text-err", Icon: XCircle },
+  info: { wrap: "bg-info-soft border-info/25 text-info", Icon: Info },
 };
 
 /// Soft-background notice with an icon and optional action slot, per §4.
