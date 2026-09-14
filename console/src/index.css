@@ -1,6 +1,40 @@
 @import "tailwindcss";
 @import "./brand-tokens.css";
 
+/* Remap Tailwind's blue scale onto the brand's data blue.
+
+   The console expresses its accent as `blue-*` utilities in roughly 190
+   places (ring-blue-500, bg-blue-600, text-blue-600 …). Overriding the scale
+   here rebrands all of them at once, instead of rewriting every class name
+   and inviting drift between them.
+
+   The brand's three published anchors sit at 200 (data-light), 500 (data)
+   and 600 (data-deep). 600 and 700 are the steps used for text and filled
+   buttons, so they are kept dark enough to clear 4.5:1 on white — the lighter
+   mid-tones would not.
+
+   Amber (parity) is deliberately not mapped to a utility scale: it marks the
+   two parity shards in the mark and genuine parity/repair states, and loses
+   that meaning the moment it becomes a general accent. */
+@theme {
+  --color-blue-50:  #eff8ff;
+  --color-blue-100: #dbeefe;
+  --color-blue-200: #a2d4ff;
+  --color-blue-300: #6fbdfa;
+  --color-blue-400: #45aef6;
+  --color-blue-500: #249ff3;
+  --color-blue-600: #0077c7;
+  --color-blue-700: #0063a8;
+  --color-blue-800: #054f87;
+  --color-blue-900: #0a4270;
+
+  --color-parity:   #fc9f30;
+
+  --font-sans: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
+  --font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+}
+
 body {
   @apply bg-gray-50 text-gray-900 antialiased m-0;
   font-family: var(--objectio-font-sans);

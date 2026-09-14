@@ -1,0 +1,28 @@
+{
+  "color": {
+    "ink": "#0c121a",
+    "graphite": "#232933",
+    "slate": "#677284",
+    "mist": "#ccd1d9",
+    "paper": "#f5f7f9",
+    "data": "#249ff3",
+    "data-deep": "#0077c7",
+    "data-light": "#a2d4ff",
+    "parity": "#fc9f30"
+  },
+  "font": {
+    "display": "Sora",
+    "body": "IBM Plex Sans",
+    "mono": "IBM Plex Mono"
+  },
+  "mark": {
+    "segments": 8,
+    "data": 6,
+    "parity": 2,
+    "ring-radius": 36,
+    "stroke": 15,
+    "viewBox": 100,
+    "clear-space": "0.25 \u00d7 mark height on all sides",
+    "min-size-px": 16
+  }
+}

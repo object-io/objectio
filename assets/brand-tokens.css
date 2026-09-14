@@ -1,0 +1,14 @@
+:root {
+  --oio-ink: #0c121a;
+  --oio-graphite: #232933;
+  --oio-slate: #677284;
+  --oio-mist: #ccd1d9;
+  --oio-paper: #f5f7f9;
+  --oio-data: #249ff3;
+  --oio-data-deep: #0077c7;
+  --oio-data-light: #a2d4ff;
+  --oio-parity: #fc9f30;
+  --oio-font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+  --oio-font-body: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --oio-font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
+}
