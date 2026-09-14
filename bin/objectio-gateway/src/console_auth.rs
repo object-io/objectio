@@ -291,6 +291,15 @@ pub async fn apply_tenant_admin_role(
     }
 }
 
+/// Query for `GET /_console/api/oidc/enabled`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EnabledParams {
+    /// `signup` lists the providers an organisation can register through,
+    /// rather than the providers valid for signing in to this surface.
+    #[serde(default)]
+    pub purpose: String,
+}
+
 /// Which console surface a request belongs to.
 ///
 /// Two signals can say this now. A dedicated listener carries a
@@ -804,14 +813,24 @@ pub async fn my_delete_key(
 pub async fn oidc_enabled(
     State(state): State<Arc<ConsoleOidcState>>,
     listener: Option<Extension<ListenerKind>>,
+    Query(params): Query<EnabledParams>,
 ) -> Json<serde_json::Value> {
     let kind = listener.map(|l| l.0).unwrap_or(ListenerKind::Legacy);
 
-    if kind == ListenerKind::TenantConsole {
+    // `?purpose=signup` asks a different question: not "who may sign in here"
+    // but "which providers can an organisation register through". Only
+    // multi-tenant providers can, since registration keys on the upstream
+    // tenant in the token. Without this the registration screen has nothing
+    // to offer — the tenant console lists no providers at all, and the
+    // tenant-scoped SSO button needs a tenant that by definition does not
+    // exist yet.
+    let signup = params.purpose.eq_ignore_ascii_case("signup");
+
+    if kind == ListenerKind::TenantConsole && !signup {
         return Json(serde_json::json!({"enabled": false, "providers": []}));
     }
 
-    let only_system_admin = kind == ListenerKind::OpsConsole;
+    let only_system_admin = !signup && kind == ListenerKind::OpsConsole;
     let has_global = state.oidc_provider.is_some();
 
     let mut providers = Vec::new();
@@ -849,6 +868,11 @@ pub async fn oidc_enabled(
                 if only_system_admin && !system_admin {
                     continue;
                 }
+                // Registration is only possible through a provider that
+                // federates many upstream tenants.
+                if signup && !ProviderTenancy::from_config(&config).multi_tenant {
+                    continue;
+                }
                 providers.push(serde_json::json!({
                     "name": provider_name,
                     "label": format!("User SSO{}", if display != "SSO" { format!(" ({display})") } else { String::new() }),
@@ -859,7 +883,9 @@ pub async fn oidc_enabled(
 
     // Global `--oidc-*` provider is implicitly system-admin scoped, so
     // skip it on listeners that don't want system-admin SSO buttons.
-    let surface_global = has_global && !matches!(kind, ListenerKind::TenantConsole);
+    // A provider from CLI flags has no stored document and is single-tenant,
+    // so it can never be a registration route.
+    let surface_global = has_global && !signup && !matches!(kind, ListenerKind::TenantConsole);
     if surface_global {
         providers.insert(
             0,

@@ -1202,6 +1202,14 @@ pub async fn run(
             // The bare /_console mount stays for the legacy single bundle.
             .nest_service("/_console/admin", console_service(&ops_console_dir))
             .nest_service("/_console/tenant", console_service(&tenant_console_dir))
+            // Self-registration entry point. A short, shareable URL that lands
+            // in the tenant bundle's signup route — the bundle is built with
+            // its own base, so it has to be reached under that base rather
+            // than mounted a second time somewhere else.
+            .route(
+                "/_console/signup",
+                get(|| async { Redirect::temporary("/_console/tenant/signup") }),
+            )
             .nest_service("/_console", console_service(&legacy_console_dir))
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))

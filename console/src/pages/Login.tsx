@@ -171,6 +171,18 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
               </div>
             )}
 
+            {tenantApp && (
+              <p className="mb-4 text-[12px] text-gray-500">
+                New organisation?{" "}
+                <a
+                  href="/_console/tenant/signup"
+                  className="text-blue-600 hover:text-blue-700 font-medium"
+                >
+                  Create an account
+                </a>
+              </p>
+            )}
+
             <form onSubmit={handleLogin} className="space-y-3">
               {/* Account / Tenant. Only shown on the tenant console, where
                   every login is a tenant login. The operator console is
