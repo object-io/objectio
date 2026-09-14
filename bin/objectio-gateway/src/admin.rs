@@ -1203,10 +1203,20 @@ pub async fn admin_list_buckets(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    let tenant = extract_tenant(&auth, &headers);
+    // Like the user listing, this already scopes its query to the caller's
+    // tenant but was gated on the root key alone — so a tenant admin could
+    // create a bucket and never see it again. A provisioner that cannot list
+    // what it made cannot reconcile, which is most of what a provisioner does.
+    if tenant.is_empty() {
+        if let Some(deny) = require_system_admin(&auth, &headers) {
+            return deny;
+        }
+    } else if let Some(deny) =
+        require_tenant_admin_access(&state, &auth, &headers, &tenant).await
+    {
         return deny;
     }
-    let tenant = extract_tenant(&auth, &headers);
 
     let mut client = state.meta_client.clone();
     match client

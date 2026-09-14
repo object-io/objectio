@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "objectio"
+version = "0.1.0"
+description = "Client for the ObjectIO management API (/_admin/*)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+# No dependencies, deliberately: SigV4 is implemented on the standard
+# library so this installs into an operator or a provisioning job without
+# dragging in botocore.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["objectio*"]
