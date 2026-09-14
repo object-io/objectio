@@ -122,6 +122,16 @@ struct Args {
     /// a wildcard bind.
     #[arg(long, env = "OBJECTIO_EXTERNAL_ENDPOINT", default_value = "")]
     external_endpoint: String,
+
+    /// Base URL of a Prometheus that scrapes this server, e.g.
+    /// `http://127.0.0.1:9090`. Forwarded to the gateway, which proxies the
+    /// console's range queries to it.
+    ///
+    /// Without it the console falls back to polling `/metrics` in the browser,
+    /// which only knows what happened since the page opened — about five
+    /// minutes — and carries no per-instance labels. Leave empty for that.
+    #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
+    prometheus_url: String,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -553,6 +563,10 @@ async fn main() -> Result<()> {
     ];
     if !args.auth {
         gw_argv.push("--no-auth".into());
+    }
+    if !args.prometheus_url.is_empty() {
+        gw_argv.push("--prometheus-url".into());
+        gw_argv.push(args.prometheus_url.trim_end_matches('/').to_string());
     }
     // Forward optional split-mode listener flags. Empty / port 0 →
     // legacy single-port behavior (current default).
