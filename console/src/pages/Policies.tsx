@@ -419,12 +419,12 @@ export default function Policies() {
             </div>
           </div>
           {attachErr && (
-            <div className="mb-2 text-[11px] text-red-600 font-mono break-all">
+            <div className="mb-2 text-[11px] text-err font-mono break-all">
               {attachErr}
             </div>
           )}
           {attachMsg && (
-            <div className="mb-2 text-[11px] text-green-700">{attachMsg}</div>
+            <div className="mb-2 text-[11px] text-ok">{attachMsg}</div>
           )}
           <div className="flex gap-1.5">
             <button
@@ -603,7 +603,7 @@ export default function Policies() {
                       {!isBuiltin && (
                         <button
                           onClick={() => deletePolicy(p.name)}
-                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>

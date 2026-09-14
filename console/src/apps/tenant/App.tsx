@@ -65,7 +65,7 @@ export default function TenantApp() {
   if (checking) {
     return (
       <div className="min-h-screen bg-surface-2 flex items-center justify-center">
-        <p className="text-sm text-faint">Loading...</p>
+        <p className="text-[13px] text-faint">Loading...</p>
       </div>
     );
   }

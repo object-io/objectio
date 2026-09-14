@@ -112,11 +112,11 @@ export default function GroupsPanel() {
       </div>
 
       {error && (
-        <div className="mb-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-[12px] text-red-700 flex items-start justify-between gap-2">
+        <div className="mb-3 px-3 py-2 bg-err-soft border border-err/25 rounded-lg text-[12px] text-err flex items-start justify-between gap-2">
           <span className="font-mono break-all">{error}</span>
           <button
             onClick={() => setError(null)}
-            className="text-red-400 hover:text-red-700"
+            className="text-err hover:text-err"
           >
             <X size={12} />
           </button>
@@ -248,7 +248,7 @@ function RowFragment(p: RowProps) {
               size={12}
               className={`text-faint transition-transform ${p.expanded ? "rotate-90" : ""}`}
             />
-            <UsersIcon size={14} className="text-purple-500" />
+            <UsersIcon size={14} className="text-muted" />
             <span className="text-[13px] font-medium">{p.group.group_name}</span>
           </button>
         </td>
@@ -261,7 +261,7 @@ function RowFragment(p: RowProps) {
         <td className="px-4 py-2.5 text-right">
           <button
             onClick={() => p.remove(p.group)}
-            className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+            className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
           >
             <Trash2 size={13} />
           </button>
@@ -331,7 +331,7 @@ function RowFragment(p: RowProps) {
                     </div>
                     <button
                       onClick={() => p.removeMember(p.group.group_id, uid)}
-                      className="text-red-400 hover:text-red-600"
+                      className="text-err hover:text-err"
                       title="Remove from group"
                     >
                       <Trash2 size={12} />

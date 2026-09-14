@@ -150,7 +150,7 @@ export default function PoolPlacement() {
             </span>
           )}
           {migratingCount > 0 && (
-            <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">
+            <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-warn-soft text-warn border border-warn/25">
               <AlertTriangle size={11} />
               {migratingCount} migrating
             </span>
@@ -167,7 +167,7 @@ export default function PoolPlacement() {
       </div>
 
       {err && (
-        <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-800">
+        <div className="mb-3 rounded-lg border border-err/25 bg-err-soft px-3 py-2 text-[12px] text-err">
           {err}
         </div>
       )}
@@ -210,9 +210,9 @@ export default function PoolPlacement() {
           </h2>
           <div className="flex items-center gap-2 text-[10px] text-muted">
             <LegendSwatch color="bg-accent" label="PGs" />
-            <LegendSwatch color="bg-red-100 border border-red-400" label="overload" />
+            <LegendSwatch color="bg-err-soft border border-err/40" label="overload" />
             <LegendSwatch
-              color="bg-amber-100 border border-amber-400"
+              color="bg-warn-soft border border-warn/40"
               label="underload"
             />
           </div>
@@ -236,7 +236,7 @@ export default function PoolPlacement() {
                 <div className="flex items-center gap-1.5 min-w-0">
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      o.online ? "bg-green-500" : "bg-faint"
+                      o.online ? "bg-ok" : "bg-faint"
                     }`}
                   />
                   <span className="text-[11px] font-mono text-text-2 truncate">
@@ -247,9 +247,9 @@ export default function PoolPlacement() {
                   <div
                     className={`absolute inset-y-0 left-0 ${
                       isOver
-                        ? "bg-red-400"
+                        ? "bg-err"
                         : isUnder
-                          ? "bg-amber-400"
+                          ? "bg-warn-dot"
                           : "bg-accent"
                     }`}
                     style={{ width: `${pct}%` }}
@@ -263,7 +263,7 @@ export default function PoolPlacement() {
                   )}
                 </div>
                 <div className="flex items-center justify-end gap-2 text-[11px] font-mono">
-                  <span className={isOver ? "text-red-700 font-semibold" : isUnder ? "text-amber-700 font-semibold" : "text-text-2"}>
+                  <span className={isOver ? "text-err font-semibold" : isUnder ? "text-warn font-semibold" : "text-text-2"}>
                     {o.pgs}
                   </span>
                   <span className="text-faint">·</span>
@@ -307,7 +307,7 @@ export default function PoolPlacement() {
             )}
             <LegendSwatch color="bg-accent" label="member" />
             <LegendSwatch
-              color="bg-amber-400"
+              color="bg-warn-dot"
               label="migrating-to"
             />
           </div>
@@ -381,7 +381,7 @@ export default function PoolPlacement() {
                             v === 1
                               ? "bg-accent"
                               : v === 2
-                                ? "bg-amber-400"
+                                ? "bg-warn-dot"
                                 : "bg-surface-2"
                           }`}
                         />

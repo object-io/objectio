@@ -27,10 +27,10 @@ function UsageBar({ label, used, cap, formatter }: {
   const color = unlimited
     ? "bg-accent"
     : pct >= 100
-      ? "bg-red-500"
+      ? "bg-err"
       : pct >= 80
-        ? "bg-amber-500"
-        : "bg-green-500";
+        ? "bg-warn-dot"
+        : "bg-ok";
   return (
     <div className="mb-3">
       <div className="flex items-center justify-between mb-1">
@@ -135,12 +135,12 @@ export default function LicensePage() {
       />
 
       {error && (
-        <div className="mb-4 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-[12px] text-red-700">
+        <div className="mb-4 px-3 py-2 rounded-lg bg-err-soft border border-err/25 text-[12px] text-err">
           {error}
         </div>
       )}
       {notice && (
-        <div className="mb-4 px-3 py-2 rounded-lg bg-green-50 border border-green-200 text-[12px] text-green-700 flex items-center gap-1.5">
+        <div className="mb-4 px-3 py-2 rounded-lg bg-ok-soft border border-ok/25 text-[12px] text-ok flex items-center gap-1.5">
           <CheckCircle2 size={13} /> {notice}
         </div>
       )}
@@ -148,7 +148,7 @@ export default function LicensePage() {
       <Card
         title={
           <div className="flex items-center gap-2">
-            <ShieldCheck size={14} className={isEnterprise ? "text-green-600" : "text-faint"} />
+            <ShieldCheck size={14} className={isEnterprise ? "text-ok" : "text-faint"} />
             <span>Current tier: {isEnterprise ? "Enterprise" : "Community"}</span>
           </div>
         }
@@ -218,7 +218,7 @@ export default function LicensePage() {
               <li key={f} className="flex items-center justify-between px-2.5 py-1.5 bg-surface-2 rounded-lg">
                 <div className="flex items-center gap-2">
                   {on ? (
-                    <CheckCircle2 size={14} className="text-green-600" />
+                    <CheckCircle2 size={14} className="text-ok" />
                   ) : (
                     <Lock size={14} className="text-faint" />
                   )}
@@ -228,7 +228,7 @@ export default function LicensePage() {
                 </div>
                 <span
                   className={`text-[10px] uppercase tracking-wider ${
-                    on ? "text-green-700" : "text-faint"
+                    on ? "text-ok" : "text-faint"
                   }`}
                 >
                   {on ? "Enabled" : "Locked"}

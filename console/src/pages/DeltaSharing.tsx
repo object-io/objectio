@@ -242,33 +242,33 @@ export default function DeltaSharing() {
 
       {/* Token banner */}
       {newToken && (
-        <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-xl p-4">
-          <h3 className="text-[12px] font-medium text-yellow-800 mb-2">
+        <div className="mb-4 bg-warn-soft border border-warn/25 rounded-xl p-4">
+          <h3 className="text-[12px] font-medium text-warn mb-2">
             Save this token now — it will not be shown again
           </h3>
           <div className="flex items-center gap-2 mb-2">
-            <code className="text-[11px] bg-yellow-100 px-2 py-1 rounded font-mono flex-1 truncate">
+            <code className="text-[11px] bg-warn-soft px-2 py-1 rounded font-mono flex-1 truncate">
               {newToken}
             </code>
             <button onClick={() => copyText(newToken, "token")} className="p-1">
               {copied === "token" ? (
-                <Check size={14} className="text-green-500" />
+                <Check size={14} className="text-ok" />
               ) : (
                 <Copy size={14} className="text-faint" />
               )}
             </button>
           </div>
-          <details className="text-[11px] text-yellow-700">
+          <details className="text-[11px] text-warn">
             <summary className="cursor-pointer font-medium">
               profile.share (save as file)
             </summary>
-            <pre className="mt-1 bg-yellow-100 p-2 rounded text-[10px] font-mono overflow-auto">
+            <pre className="mt-1 bg-warn-soft p-2 rounded text-[10px] font-mono overflow-auto">
               {profileJson}
             </pre>
           </details>
           <button
             onClick={() => setNewToken("")}
-            className="mt-2 text-[11px] text-yellow-700 underline"
+            className="mt-2 text-[11px] text-warn underline"
           >
             Dismiss
           </button>
@@ -401,7 +401,7 @@ export default function DeltaSharing() {
                             e.stopPropagation();
                             deleteShare(s.name);
                           }}
-                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -489,7 +489,7 @@ export default function DeltaSharing() {
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Key size={13} className="text-purple-500" />
+                          <Key size={13} className="text-muted" />
                           <span className="text-[12px] font-medium">
                             {r.name}
                           </span>
@@ -508,7 +508,7 @@ export default function DeltaSharing() {
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteRecipient(r.name)}
-                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -697,7 +697,7 @@ export default function DeltaSharing() {
                   >
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-2">
-                        <Table2 size={13} className="text-emerald-500" />
+                        <Table2 size={13} className="text-ok" />
                         <span className="text-[13px] font-medium">
                           {t.schema}.{t.name}
                         </span>
@@ -708,7 +708,7 @@ export default function DeltaSharing() {
                         className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
                           t.table_type === "delta"
                             ? "bg-accent-soft text-accent"
-                            : "bg-green-100 text-green-700"
+                            : "bg-ok-soft text-ok"
                         }`}
                       >
                         {t.table_type || "iceberg"}
@@ -717,7 +717,7 @@ export default function DeltaSharing() {
                     <td className="px-4 py-2.5 text-right">
                       <button
                         onClick={() => removeTable(t.schema, t.name)}
-                        className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                       >
                         <Trash2 size={13} />
                       </button>

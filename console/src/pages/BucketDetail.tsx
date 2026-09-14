@@ -399,7 +399,7 @@ export default function BucketDetail() {
       <div className="mb-4">
         <Link
           to="/buckets"
-          className="inline-flex items-center gap-1 text-sm text-muted hover:text-text-2"
+          className="inline-flex items-center gap-1 text-[13px] text-muted hover:text-text-2"
         >
           <ArrowLeft size={14} /> Back to Buckets
         </Link>
@@ -415,7 +415,7 @@ export default function BucketDetail() {
           <button
             key={key}
             onClick={() => setTab(key)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-[13px] font-medium transition-colors ${
               tab === key
                 ? "bg-accent-soft text-accent"
                 : "text-text-2 hover:bg-surface-2"
@@ -430,7 +430,7 @@ export default function BucketDetail() {
       {/* Access Tab */}
       {tab === "access" && (
         <div className="bg-surface rounded-xl border border-border p-6">
-          <h3 className="text-sm font-semibold text-text mb-1">Ownership</h3>
+          <h3 className="text-[13px] font-semibold text-text mb-1">Ownership</h3>
           <p className="text-[12px] text-muted mb-4">
             The owner reaches this bucket when no policy grants access. Everyone
             else needs an attached policy or a bucket policy.
@@ -446,11 +446,11 @@ export default function BucketDetail() {
               </span>
             </div>
           ) : (
-            <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
-              <p className="text-[12px] text-amber-800 font-medium">
+            <div className="mb-5 rounded-lg border border-warn/25 bg-warn-soft px-3 py-2.5">
+              <p className="text-[12px] text-warn font-medium">
                 This bucket has no owner
               </p>
-              <p className="text-[11px] text-amber-700 mt-0.5">
+              <p className="text-[11px] text-warn mt-0.5">
                 It was created before ownership was recorded, so authorization
                 cannot fall back to an owner. It stays reachable only while the
                 gateway runs with <code>--authz-legacy-open-buckets</code>.
@@ -484,9 +484,9 @@ export default function BucketDetail() {
             </button>
           </div>
           {ownerMsg && (
-            <p className="text-[11px] text-green-600 mt-2">{ownerMsg}</p>
+            <p className="text-[11px] text-ok mt-2">{ownerMsg}</p>
           )}
-          {ownerErr && <p className="text-[11px] text-red-600 mt-2">{ownerErr}</p>}
+          {ownerErr && <p className="text-[11px] text-err mt-2">{ownerErr}</p>}
         </div>
       )}
 
@@ -495,22 +495,22 @@ export default function BucketDetail() {
         <div className="bg-surface rounded-xl border border-border p-6">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h3 className="text-sm font-semibold text-text">
+              <h3 className="text-[13px] font-semibold text-text">
                 Bucket Versioning
               </h3>
-              <p className="text-sm text-muted mt-1">
+              <p className="text-[13px] text-muted mt-1">
                 When enabled, multiple versions of each object are preserved
                 instead of being overwritten.
               </p>
             </div>
           </div>
           {versioningLoading ? (
-            <p className="text-sm text-faint">Loading...</p>
+            <p className="text-[13px] text-faint">Loading...</p>
           ) : (
             <div className="flex items-center gap-4">
               <button
                 onClick={toggleVersioning}
-                className="flex items-center gap-2 text-sm"
+                className="flex items-center gap-2 text-[13px]"
               >
                 {versioning === "Enabled" ? (
                   <ToggleRight size={28} className="text-accent" />
@@ -519,18 +519,18 @@ export default function BucketDetail() {
                 )}
               </button>
               <span
-                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium ${
                   versioning === "Enabled"
-                    ? "bg-green-100 text-green-800"
+                    ? "bg-ok-soft text-ok"
                     : versioning === "Suspended"
-                      ? "bg-yellow-100 text-yellow-800"
+                      ? "bg-warn-soft text-warn"
                       : "bg-surface-2 text-text"
                 }`}
               >
                 {versioning}
               </span>
               {versioning === "Suspended" && (
-                <span className="text-xs text-muted">
+                <span className="text-[11px] text-muted">
                   New objects won't get version IDs; existing versions are
                   preserved.
                 </span>
@@ -543,19 +543,19 @@ export default function BucketDetail() {
       {/* Object Lock Tab */}
       {tab === "lock" && (
         <div className="bg-surface rounded-xl border border-border p-6">
-          <h3 className="text-sm font-semibold text-text mb-1">
+          <h3 className="text-[13px] font-semibold text-text mb-1">
             Object Lock Configuration
           </h3>
-          <p className="text-sm text-muted mb-4">
+          <p className="text-[13px] text-muted mb-4">
             Prevent objects from being deleted or overwritten for a fixed period
             (WORM). Requires versioning.
           </p>
           {lockLoading ? (
-            <p className="text-sm text-faint">Loading...</p>
+            <p className="text-[13px] text-faint">Loading...</p>
           ) : (
             <div className="space-y-4">
               <div className="flex items-center gap-3">
-                <label className="text-sm font-medium text-text-2 w-32">
+                <label className="text-[13px] font-medium text-text-2 w-32">
                   Lock Enabled
                 </label>
                 <button
@@ -570,7 +570,7 @@ export default function BucketDetail() {
                   )}
                 </button>
                 <span
-                  className={`text-xs font-medium ${lockConfig.enabled ? "text-green-600" : "text-muted"}`}
+                  className={`text-[11px] font-medium ${lockConfig.enabled ? "text-ok" : "text-muted"}`}
                 >
                   {lockConfig.enabled ? "Enabled" : "Disabled"}
                 </span>
@@ -579,7 +579,7 @@ export default function BucketDetail() {
               {lockConfig.enabled && (
                 <>
                   <div className="flex items-center gap-3">
-                    <label className="text-sm font-medium text-text-2 w-32">
+                    <label className="text-[13px] font-medium text-text-2 w-32">
                       Retention Mode
                     </label>
                     <select
@@ -587,14 +587,14 @@ export default function BucketDetail() {
                       onChange={(e) =>
                         setLockConfig((c) => ({ ...c, mode: e.target.value }))
                       }
-                      className="px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     >
                       <option value="COMPLIANCE">Compliance</option>
                       <option value="GOVERNANCE">Governance</option>
                     </select>
                   </div>
                   <div className="flex items-center gap-3">
-                    <label className="text-sm font-medium text-text-2 w-32">
+                    <label className="text-[13px] font-medium text-text-2 w-32">
                       Retention Days
                     </label>
                     <input
@@ -607,11 +607,11 @@ export default function BucketDetail() {
                           days: parseInt(e.target.value, 10) || 0,
                         }))
                       }
-                      className="w-24 px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-24 px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div className="flex items-center gap-3">
-                    <label className="text-sm font-medium text-text-2 w-32">
+                    <label className="text-[13px] font-medium text-text-2 w-32">
                       Retention Years
                     </label>
                     <input
@@ -624,7 +624,7 @@ export default function BucketDetail() {
                           years: parseInt(e.target.value, 10) || 0,
                         }))
                       }
-                      className="w-24 px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-24 px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                 </>
@@ -633,7 +633,7 @@ export default function BucketDetail() {
               <div className="pt-2">
                 <button
                   onClick={saveLockConfig}
-                  className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
+                  className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-[13px] font-medium hover:bg-accent"
                 >
                   <Save size={16} /> Save Lock Configuration
                 </button>
@@ -649,17 +649,17 @@ export default function BucketDetail() {
           <div className="bg-surface rounded-xl border border-border p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h3 className="text-sm font-semibold text-text">
+                <h3 className="text-[13px] font-semibold text-text">
                   Lifecycle Rules
                 </h3>
-                <p className="text-sm text-muted mt-1">
+                <p className="text-[13px] text-muted mt-1">
                   Automatically expire objects, clean up delete markers, and
                   abort incomplete uploads.
                 </p>
               </div>
               <button
                 onClick={() => setShowAddRule(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
+                className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-[13px] font-medium hover:bg-accent"
               >
                 <Plus size={16} /> Add Rule
               </button>
@@ -667,10 +667,10 @@ export default function BucketDetail() {
 
             {showAddRule && (
               <div className="mb-4 p-4 bg-surface-2 rounded-lg border border-border">
-                <h4 className="text-sm font-medium mb-3">New Lifecycle Rule</h4>
+                <h4 className="text-[13px] font-medium mb-3">New Lifecycle Rule</h4>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="block text-xs text-muted mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Rule ID
                     </label>
                     <input
@@ -679,11 +679,11 @@ export default function BucketDetail() {
                         setNewRule((r) => ({ ...r, id: e.target.value }))
                       }
                       placeholder="e.g. expire-logs"
-                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-muted mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Prefix Filter
                     </label>
                     <input
@@ -692,11 +692,11 @@ export default function BucketDetail() {
                         setNewRule((r) => ({ ...r, prefix: e.target.value }))
                       }
                       placeholder="e.g. logs/"
-                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-muted mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Expiration Days
                     </label>
                     <input
@@ -709,11 +709,11 @@ export default function BucketDetail() {
                           expiration_days: parseInt(e.target.value, 10) || 0,
                         }))
                       }
-                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-muted mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Noncurrent Version Days
                     </label>
                     <input
@@ -726,11 +726,11 @@ export default function BucketDetail() {
                           noncurrent_days: parseInt(e.target.value, 10) || 0,
                         }))
                       }
-                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs text-muted mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Abort Incomplete Uploads (Days)
                     </label>
                     <input
@@ -743,11 +743,11 @@ export default function BucketDetail() {
                           abort_days: parseInt(e.target.value, 10) || 0,
                         }))
                       }
-                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+                      className="w-full px-3 py-2 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-2 focus:ring-accent"
                     />
                   </div>
                   <div className="flex items-end">
-                    <label className="flex items-center gap-2 text-sm">
+                    <label className="flex items-center gap-2 text-[13px]">
                       <input
                         type="checkbox"
                         checked={newRule.delete_markers}
@@ -766,13 +766,13 @@ export default function BucketDetail() {
                 <div className="flex gap-2 mt-3">
                   <button
                     onClick={addRule}
-                    className="px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
+                    className="px-4 py-2 bg-accent text-primary-fg rounded-lg text-[13px] font-medium hover:bg-accent"
                   >
                     Add Rule
                   </button>
                   <button
                     onClick={() => setShowAddRule(false)}
-                    className="px-4 py-2 bg-surface-2 text-text-2 rounded-lg text-sm font-medium hover:bg-border"
+                    className="px-4 py-2 bg-surface-2 text-text-2 rounded-lg text-[13px] font-medium hover:bg-border"
                   >
                     Cancel
                   </button>
@@ -781,31 +781,31 @@ export default function BucketDetail() {
             )}
 
             {lifecycleLoading ? (
-              <p className="text-sm text-faint">Loading...</p>
+              <p className="text-[13px] text-faint">Loading...</p>
             ) : rules.length === 0 ? (
-              <p className="text-sm text-faint py-4 text-center">
+              <p className="text-[13px] text-faint py-4 text-center">
                 No lifecycle rules configured
               </p>
             ) : (
-              <table className="w-full text-sm">
+              <table className="w-full text-[13px]">
                 <thead className="bg-surface-2 border-b border-border">
                   <tr>
-                    <th className="text-left px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Rule ID
                     </th>
-                    <th className="text-left px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Prefix
                     </th>
-                    <th className="text-left px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Expiration
                     </th>
-                    <th className="text-left px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Noncurrent
                     </th>
-                    <th className="text-left px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Status
                     </th>
-                    <th className="text-right px-4 py-2 text-xs font-medium text-muted uppercase">
+                    <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase">
                       Actions
                     </th>
                   </tr>
@@ -830,9 +830,9 @@ export default function BucketDetail() {
                       <td className="px-4 py-2">
                         <button
                           onClick={() => toggleRuleStatus(r.id)}
-                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+                          className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium ${
                             r.status === "Enabled"
-                              ? "bg-green-100 text-green-800"
+                              ? "bg-ok-soft text-ok"
                               : "bg-surface-2 text-text-2"
                           }`}
                         >
@@ -842,7 +842,7 @@ export default function BucketDetail() {
                       <td className="px-4 py-2 text-right">
                         <button
                           onClick={() => removeRule(r.id)}
-                          className="text-red-500 hover:text-red-700 p-1"
+                          className="text-err hover:text-err p-1"
                         >
                           <Trash2 size={14} />
                         </button>
@@ -937,10 +937,10 @@ function PolicyTab({
 
   return (
     <div className="bg-surface rounded-xl border border-border p-6">
-      <h3 className="text-sm font-semibold text-text mb-1">
+      <h3 className="text-[13px] font-semibold text-text mb-1">
         Bucket Policy
       </h3>
-      <p className="text-sm text-muted mb-4">
+      <p className="text-[13px] text-muted mb-4">
         Attach a named policy to control access to this bucket.
       </p>
 
@@ -982,7 +982,7 @@ function PolicyTab({
 
       {/* Current policy */}
       {policyLoading ? (
-        <p className="text-sm text-faint">Loading...</p>
+        <p className="text-[13px] text-faint">Loading...</p>
       ) : hasPolicy ? (
         <div className="mb-3">
           <label className="block text-[11px] font-medium text-muted mb-1">
@@ -1000,12 +1000,12 @@ function PolicyTab({
 
       <button
         onClick={onSave}
-        className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
+        className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-[13px] font-medium hover:bg-accent"
       >
         <Save size={16} /> {hasPolicy ? "Save Policy" : "Remove Policy"}
       </button>
       {policySaved && (
-        <span className="text-[12px] text-green-600 ml-3">Saved</span>
+        <span className="text-[12px] text-ok ml-3">Saved</span>
       )}
     </div>
   );

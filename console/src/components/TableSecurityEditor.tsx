@@ -168,7 +168,7 @@ export default function TableSecurityEditor({
       >
         <div className="flex items-start justify-between px-5 py-3 border-b border-border">
           <div className="flex items-center gap-2">
-            <Filter size={16} className="text-emerald-600" />
+            <Filter size={16} className="text-ok" />
             <div>
               <h2 className="text-[14px] font-semibold text-text">
                 Row filter & column masks
@@ -320,7 +320,7 @@ export default function TableSecurityEditor({
                       </div>
                       <button
                         onClick={() => removeMask(i)}
-                        className="p-1.5 text-faint hover:text-red-600"
+                        className="p-1.5 text-faint hover:text-err"
                         title="Remove mask"
                       >
                         <Trash2 size={14} />
@@ -332,7 +332,7 @@ export default function TableSecurityEditor({
             </section>
 
             {functions.length === 0 && (
-              <div className="text-[12px] text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+              <div className="text-[12px] text-warn bg-warn-soft border border-warn/25 rounded p-2">
                 No functions in <span className="font-mono">{catalog}.{schema}</span>.
                 Create one (Functions tab) before binding security.
               </div>
@@ -341,7 +341,7 @@ export default function TableSecurityEditor({
         )}
 
         {error && (
-          <div className="px-5 py-2 bg-red-50 border-t border-red-100 text-[12px] text-red-700 font-mono break-all">
+          <div className="px-5 py-2 bg-err-soft border-t border-err/25 text-[12px] text-err font-mono break-all">
             {error}
           </div>
         )}

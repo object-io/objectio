@@ -128,7 +128,7 @@ export default function Encryption() {
     return (
       <div className="p-6">
         <PageHeader title="Encryption" description="Server-side encryption configuration" />
-        <p className="text-sm text-faint">Loading…</p>
+        <p className="text-[13px] text-faint">Loading…</p>
       </div>
     );
   }
@@ -141,7 +141,7 @@ export default function Encryption() {
         action={
           <button
             onClick={() => void load()}
-            className="flex items-center gap-2 px-3 py-2 text-sm text-text-2 hover:text-text"
+            className="flex items-center gap-2 px-3 py-2 text-[13px] text-text-2 hover:text-text"
           >
             <RefreshCw size={14} /> Refresh
           </button>
@@ -153,19 +153,19 @@ export default function Encryption() {
         <div className="flex items-start gap-3">
           <KeyRound size={20} className="text-accent mt-0.5" />
           <div className="flex-1">
-            <div className="text-sm font-medium">Service master key</div>
-            <div className="text-xs text-muted mt-0.5">
+            <div className="text-[13px] font-medium">Service master key</div>
+            <div className="text-[11px] text-muted mt-0.5">
               Wraps per-object DEKs for SSE-S3 and, when the local KMS backend is used, KMS key
               material. Loaded from the <code>OBJECTIO_MASTER_KEY</code> environment variable at
               startup; rotation is an operator-only action to avoid orphaning existing objects.
             </div>
-            <div className="mt-2 text-sm">
+            <div className="mt-2 text-[13px]">
               {status?.master_key_configured ? (
-                <span className="inline-flex items-center gap-1.5 text-green-700">
+                <span className="inline-flex items-center gap-1.5 text-ok">
                   <CheckCircle2 size={14} /> Configured
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1.5 text-red-700">
+                <span className="inline-flex items-center gap-1.5 text-err">
                   <XCircle size={14} /> Not configured — SSE is disabled cluster-wide
                 </span>
               )}
@@ -178,8 +178,8 @@ export default function Encryption() {
       <Card>
         <div className="space-y-4">
           <div>
-            <div className="text-sm font-medium">KMS backend</div>
-            <div className="text-xs text-muted mt-0.5">
+            <div className="text-[13px] font-medium">KMS backend</div>
+            <div className="text-[11px] text-muted mt-0.5">
               Controls where per-object Data Encryption Keys are wrapped for SSE-KMS. Changes
               take effect immediately — no pod restart required. Objects already encrypted under
               the previous backend remain readable as long as that backend is still reachable;
@@ -187,7 +187,7 @@ export default function Encryption() {
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 text-sm">
+          <div className="grid grid-cols-3 gap-2 text-[13px]">
             {(["disabled", "local", "vault"] as Backend[]).map((b) => (
               <label
                 key={b}
@@ -205,7 +205,7 @@ export default function Encryption() {
                 />
                 <div>
                   <div className="font-medium capitalize">{b}</div>
-                  <div className="text-xs text-muted">
+                  <div className="text-[11px] text-muted">
                     {b === "disabled" && "SSE-KMS off; SSE-S3 still works."}
                     {b === "local" && "Keys stored via meta, wrapped by the service master key."}
                     {b === "vault" && "HashiCorp Vault Transit engine."}
@@ -218,30 +218,30 @@ export default function Encryption() {
           {backend === "vault" && (
             <div className="space-y-3 p-3 bg-surface-2 border border-border rounded-lg">
               <div>
-                <label className="text-xs font-medium text-text-2">VAULT_ADDR</label>
+                <label className="text-[11px] font-medium text-text-2">VAULT_ADDR</label>
                 <input
                   type="text"
                   value={addr}
                   onChange={(e) => setAddr(e.target.value)}
                   placeholder="https://vault.example.com:8200"
-                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-sm"
+                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-[13px]"
                 />
               </div>
               <div>
-                <label className="text-xs font-medium text-text-2">Transit mount path</label>
+                <label className="text-[11px] font-medium text-text-2">Transit mount path</label>
                 <input
                   type="text"
                   value={transitPath}
                   onChange={(e) => setTransitPath(e.target.value)}
                   placeholder="transit"
-                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-sm"
+                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-[13px]"
                 />
               </div>
               <div>
-                <label className="text-xs font-medium text-text-2">
+                <label className="text-[11px] font-medium text-text-2">
                   Vault token
                   {cfg?.backend === "vault" && cfg.token_set && (
-                    <span className="ml-2 text-xs text-muted">
+                    <span className="ml-2 text-[11px] text-muted">
                       (leave blank to keep the stored token)
                     </span>
                   )}
@@ -251,7 +251,7 @@ export default function Encryption() {
                   value={tokenEntry}
                   onChange={(e) => setTokenEntry(e.target.value)}
                   placeholder={cfg?.backend === "vault" && cfg.token_set ? "••••••••" : "paste Vault token"}
-                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-sm font-mono"
+                  className="mt-1 w-full px-3 py-1.5 border border-border-strong rounded text-[13px] font-mono"
                 />
               </div>
             </div>
@@ -261,11 +261,11 @@ export default function Encryption() {
             <button
               onClick={() => void save()}
               disabled={saving}
-              className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent disabled:opacity-50"
+              className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-[13px] font-medium hover:bg-accent disabled:opacity-50"
             >
               <Save size={14} /> {saving ? "Saving…" : "Save & apply"}
             </button>
-            {saveError && <span className="text-sm text-red-600">{saveError}</span>}
+            {saveError && <span className="text-[13px] text-err">{saveError}</span>}
           </div>
         </div>
       </Card>
@@ -274,8 +274,8 @@ export default function Encryption() {
       <Card>
         <div className="space-y-3">
           <div>
-            <div className="text-sm font-medium">Test backend</div>
-            <div className="text-xs text-muted mt-0.5">
+            <div className="text-[13px] font-medium">Test backend</div>
+            <div className="text-[11px] text-muted mt-0.5">
               Runs a <code>generate_data_key</code> + <code>decrypt</code> round-trip against the
               currently active provider. Safe to repeat — no data is persisted.
             </div>
@@ -286,27 +286,27 @@ export default function Encryption() {
               value={testKey}
               onChange={(e) => setTestKey(e.target.value)}
               placeholder="key id (e.g. my-bucket-key for Vault, or kms-abc12345 for Local)"
-              className="flex-1 px-3 py-1.5 border border-border-strong rounded text-sm"
+              className="flex-1 px-3 py-1.5 border border-border-strong rounded text-[13px]"
             />
             <button
               onClick={() => void runTest()}
               disabled={testing || !testKey.trim()}
-              className="px-4 py-2 bg-primary-hover text-primary-fg rounded-lg text-sm font-medium hover:bg-primary disabled:opacity-50"
+              className="px-4 py-2 bg-primary-hover text-primary-fg rounded-lg text-[13px] font-medium hover:bg-primary disabled:opacity-50"
             >
               {testing ? "Testing…" : "Test"}
             </button>
           </div>
           {testResult &&
             (testResult.ok ? (
-              <div className="flex items-center gap-2 text-sm text-green-700">
+              <div className="flex items-center gap-2 text-[13px] text-ok">
                 <CheckCircle2 size={14} /> Round-trip succeeded
               </div>
             ) : (
-              <div className="flex items-start gap-2 text-sm text-red-700">
+              <div className="flex items-start gap-2 text-[13px] text-err">
                 <XCircle size={14} className="mt-0.5" />
                 <div>
                   <div className="font-medium">Round-trip failed</div>
-                  <div className="text-xs text-red-600 mt-0.5">{testResult.error}</div>
+                  <div className="text-[11px] text-err mt-0.5">{testResult.error}</div>
                 </div>
               </div>
             ))}

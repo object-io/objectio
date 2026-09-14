@@ -30,10 +30,10 @@ export default function CapacityBar({
   const pct = total === 0 ? 0 : Math.min(100, Math.round((used / total) * 100));
   const fill =
     pct >= 90
-      ? "bg-red-500"
+      ? "bg-err"
       : pct >= 75
-        ? "bg-amber-500"
-        : "bg-gradient-to-r from-emerald-400 to-accent";
+        ? "bg-warn-dot"
+        : "bg-accent";
 
   const bar = (
     <div className="h-1.5 w-full bg-surface-2 rounded-full overflow-hidden">

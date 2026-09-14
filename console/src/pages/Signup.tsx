@@ -68,8 +68,8 @@ export default function Signup() {
           </p>
 
           {error && (
-            <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2">
-              <p className="text-[12px] text-red-700 break-words">{error}</p>
+            <div className="mb-4 rounded-lg border border-err/25 bg-err-soft px-3 py-2">
+              <p className="text-[12px] text-err break-words">{error}</p>
             </div>
           )}
 
@@ -78,11 +78,11 @@ export default function Signup() {
           ) : providers.length === 0 ? (
             /* Nothing to offer means no multi-tenant provider is configured.
                Say which setting is missing rather than showing an empty page. */
-            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
-              <p className="text-[12px] text-amber-800 font-medium">
+            <div className="rounded-lg border border-warn/25 bg-warn-soft px-3 py-2.5">
+              <p className="text-[12px] text-warn font-medium">
                 Registration is not open
               </p>
-              <p className="text-[11px] text-amber-700 mt-0.5">
+              <p className="text-[11px] text-warn mt-0.5">
                 No identity provider on this server is configured for
                 multi-tenant sign-up. An operator enables it by setting a
                 provider's Tenancy to &ldquo;multi-tenant&rdquo; in the admin

@@ -27,23 +27,23 @@ interface Props {
 
 const badge = {
   passed: {
-    bg: "bg-emerald-50",
-    border: "border-emerald-200",
-    text: "text-emerald-700",
+    bg: "bg-ok-soft",
+    border: "border-ok/25",
+    text: "text-ok",
     Icon: CheckCircle2,
     defaultMsg: "Validation passed",
   },
   warning: {
-    bg: "bg-amber-50",
-    border: "border-amber-200",
-    text: "text-amber-700",
+    bg: "bg-warn-soft",
+    border: "border-warn/25",
+    text: "text-warn",
     Icon: AlertCircle,
     defaultMsg: "Review before applying",
   },
   error: {
-    bg: "bg-red-50",
-    border: "border-red-200",
-    text: "text-red-700",
+    bg: "bg-err-soft",
+    border: "border-err/25",
+    text: "text-err",
     Icon: AlertCircle,
     defaultMsg: "Invalid configuration",
   },

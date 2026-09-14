@@ -89,7 +89,7 @@ export default function MyAccount() {
             <div>
               <p className="text-[13px] font-medium">{session.user}</p>
               {session.tenant ? (
-                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-purple-100 text-purple-800">
+                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[11px] font-medium bg-surface-2 text-muted">
                   {session.tenant}
                 </span>
               ) : (
@@ -104,8 +104,8 @@ export default function MyAccount() {
 
       {/* New key banner */}
       {newKey && (
-        <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-xl p-4">
-          <h3 className="text-[12px] font-medium text-yellow-800 mb-2">
+        <div className="mb-4 bg-warn-soft border border-warn/25 rounded-xl p-4">
+          <h3 className="text-[12px] font-medium text-warn mb-2">
             Save these credentials now — the secret will not be shown again
           </h3>
           <div className="space-y-1.5 font-mono text-[12px]">
@@ -117,7 +117,7 @@ export default function MyAccount() {
                 className="p-0.5"
               >
                 {copied === "ak" ? (
-                  <Check size={12} className="text-green-500" />
+                  <Check size={12} className="text-ok" />
                 ) : (
                   <Copy size={12} className="text-faint" />
                 )}
@@ -131,7 +131,7 @@ export default function MyAccount() {
                 className="p-0.5"
               >
                 {copied === "sk" ? (
-                  <Check size={12} className="text-green-500" />
+                  <Check size={12} className="text-ok" />
                 ) : (
                   <Copy size={12} className="text-faint" />
                 )}
@@ -140,7 +140,7 @@ export default function MyAccount() {
           </div>
           <button
             onClick={() => setNewKey(null)}
-            className="mt-2 text-[11px] text-yellow-700 underline"
+            className="mt-2 text-[11px] text-warn underline"
           >
             Dismiss
           </button>
@@ -194,7 +194,7 @@ export default function MyAccount() {
                 <tr key={k.access_key_id} className="hover:bg-surface-2 group">
                   <td className="px-4 py-2.5">
                     <div className="flex items-center gap-2">
-                      <Key size={13} className="text-orange-500" />
+                      <Key size={13} className="text-warn" />
                       <span className="text-[12px] font-mono">
                         {k.access_key_id}
                       </span>
@@ -208,7 +208,7 @@ export default function MyAccount() {
                   <td className="px-4 py-2.5 text-right">
                     <button
                       onClick={() => deleteKey(k.access_key_id)}
-                      className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                      className="text-faint hover:text-err p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                     >
                       <Trash2 size={13} />
                     </button>

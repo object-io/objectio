@@ -97,7 +97,7 @@ export default function PolicyEditor({ scope, load, save, onClose }: Props) {
       >
         <div className="flex items-start justify-between px-5 py-3 border-b border-border">
           <div className="flex items-center gap-2">
-            <Shield size={16} className="text-indigo-500" />
+            <Shield size={16} className="text-accent" />
             <div>
               <h2 className="text-[14px] font-semibold text-text">
                 Policy
@@ -134,7 +134,7 @@ export default function PolicyEditor({ scope, load, save, onClose }: Props) {
         )}
 
         {error && (
-          <div className="px-5 py-2 bg-red-50 border-t border-red-100 text-[12px] text-red-700 font-mono break-all">
+          <div className="px-5 py-2 bg-err-soft border-t border-err/25 text-[12px] text-err font-mono break-all">
             {error}
           </div>
         )}

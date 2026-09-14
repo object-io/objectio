@@ -511,11 +511,11 @@ export default function UnityCatalog() {
       )}
 
       {error && (
-        <div className="mb-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-[12px] text-red-700 flex items-start justify-between gap-2">
+        <div className="mb-3 px-3 py-2 bg-err-soft border border-err/25 rounded-lg text-[12px] text-err flex items-start justify-between gap-2">
           <span className="font-mono">{error}</span>
           <button
             onClick={() => setError(null)}
-            className="text-red-400 hover:text-red-700"
+            className="text-err hover:text-err"
           >
             <X size={12} />
           </button>
@@ -603,7 +603,7 @@ export default function UnityCatalog() {
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Database size={14} className="text-indigo-500" />
+                          <Database size={14} className="text-accent" />
                           <span className="text-[13px] font-medium">
                             {cat.name}
                           </span>
@@ -625,7 +625,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             setPolicyTarget({ kind: "catalog", name: cat.name });
                           }}
-                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-accent p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit catalog policy"
                         >
                           <Shield size={13} />
@@ -635,7 +635,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteCatalog(cat.name);
                           }}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -729,7 +729,7 @@ export default function UnityCatalog() {
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <FolderOpen size={14} className="text-yellow-500" />
+                          <FolderOpen size={14} className="text-warn" />
                           <span className="text-[13px] font-medium">
                             {s.name}
                           </span>
@@ -752,7 +752,7 @@ export default function UnityCatalog() {
                               schema: s.name,
                             });
                           }}
-                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-accent p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit schema policy"
                         >
                           <Shield size={13} />
@@ -762,7 +762,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteSchema(s.name);
                           }}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -960,7 +960,7 @@ export default function UnityCatalog() {
                             newTableColumns.filter((_, j) => j !== i),
                           )
                         }
-                        className="text-faint hover:text-red-600 p-1"
+                        className="text-faint hover:text-err p-1"
                         disabled={newTableColumns.length === 1}
                       >
                         <X size={12} />
@@ -1022,7 +1022,7 @@ export default function UnityCatalog() {
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Table2 size={14} className="text-emerald-500" />
+                          <Table2 size={14} className="text-ok" />
                           <span className="text-[13px] font-medium">
                             {t.name}
                           </span>
@@ -1055,8 +1055,8 @@ export default function UnityCatalog() {
                             t.row_filter ||
                             (t.column_masks &&
                               Object.keys(t.column_masks).length > 0)
-                              ? "text-emerald-600 hover:text-emerald-700 opacity-100"
-                              : "text-faint hover:text-emerald-600 opacity-0 group-hover:opacity-100"
+                              ? "text-ok hover:text-ok opacity-100"
+                              : "text-faint hover:text-ok opacity-0 group-hover:opacity-100"
                           }`}
                           title={
                             t.row_filter ||
@@ -1078,7 +1078,7 @@ export default function UnityCatalog() {
                               table: t.name,
                             });
                           }}
-                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-accent p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit table policy"
                         >
                           <Shield size={13} />
@@ -1088,7 +1088,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteTable(t.name);
                           }}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1242,7 +1242,7 @@ export default function UnityCatalog() {
                     <tr key={f.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Sigma size={14} className="text-purple-500" />
+                          <Sigma size={14} className="text-muted" />
                           <span className="text-[13px] font-medium font-mono">
                             {f.name}
                           </span>
@@ -1261,7 +1261,7 @@ export default function UnityCatalog() {
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteFunction(f.name)}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1386,7 +1386,7 @@ export default function UnityCatalog() {
                     <tr key={v.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <HardDrive size={14} className="text-cyan-500" />
+                          <HardDrive size={14} className="text-muted" />
                           <span className="text-[13px] font-medium font-mono">
                             {v.name}
                           </span>
@@ -1401,7 +1401,7 @@ export default function UnityCatalog() {
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteVolume(v.name)}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1493,7 +1493,7 @@ export default function UnityCatalog() {
                     <tr key={m.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Brain size={14} className="text-pink-500" />
+                          <Brain size={14} className="text-muted" />
                           <span className="text-[13px] font-medium font-mono">
                             {m.name}
                           </span>
@@ -1508,7 +1508,7 @@ export default function UnityCatalog() {
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteModel(m.name)}
-                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-err p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
