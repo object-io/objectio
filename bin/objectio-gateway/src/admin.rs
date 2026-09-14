@@ -446,7 +446,7 @@ pub fn extract_caller(
     CallerIdentity::default()
 }
 
-const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
+pub(crate) const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
 
 /// True iff the caller is a system-scope admin. Tenant users (tenant != "")
 /// never satisfy this.
@@ -1366,6 +1366,49 @@ pub async fn admin_delete_bucket_policy(
 }
 
 // ============================================================================
+/// `PUT /_admin/buckets/{bucket}/owner` — reassign a bucket's owner.
+///
+/// Body: `{"owner": "<user_id>"}`. Also the backfill path for buckets created
+/// before the gateway recorded an owner: until those have one, authorization
+/// cannot fall back to ownership and they rely on `--authz-legacy-open-buckets`.
+///
+/// System-admin only — ownership decides who reaches a bucket when no policy
+/// speaks, so handing it over is not a tenant-level operation.
+pub async fn admin_set_bucket_owner(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    let owner = body["owner"].as_str().unwrap_or_default().to_string();
+    if owner.is_empty() {
+        return (StatusCode::BAD_REQUEST, "owner must not be empty").into_response();
+    }
+
+    let mut client = state.meta_client.clone();
+    match client
+        .set_bucket_owner(objectio_proto::metadata::SetBucketOwnerRequest {
+            bucket: bucket.clone(),
+            owner: owner.clone(),
+        })
+        .await
+    {
+        Ok(_) => {
+            // The chain caches bucket owner alongside bucket policy.
+            state.policy_cache.invalidate(&bucket);
+            tracing::info!("Set owner of bucket '{bucket}' to '{owner}'");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, e.message().to_string()).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+    }
+}
 
 /// Query params for admin object listing
 #[derive(Debug, serde::Deserialize)]
@@ -1644,6 +1687,20 @@ pub async fn admin_create_policy(
     } else {
         serde_json::to_string(&body["policy"]).unwrap_or_default()
     };
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name must not be empty").into_response();
+    }
+    // Validate at write time. Without this a body with a misspelled field
+    // stores the literal `null`, which parses fine as JSON but fails as a
+    // policy on every authorization decision from then on — visible only as a
+    // log warning while the grant silently never applies.
+    if let Err(e) = objectio_auth::BucketPolicy::from_json(&policy_json) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid policy document: {e}"),
+        )
+            .into_response();
+    }
     let mut client = state.meta_client.clone();
     match client
         .create_policy(objectio_proto::metadata::CreatePolicyRequest { name, policy_json })
@@ -1693,6 +1750,11 @@ pub async fn admin_attach_policy(
     } else if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
+    let cache_key = if user_id.is_empty() {
+        group_id.clone()
+    } else {
+        user_id.clone()
+    };
     let mut client = state.meta_client.clone();
     match client
         .attach_policy(objectio_proto::metadata::AttachPolicyRequest {
@@ -1702,7 +1764,12 @@ pub async fn admin_attach_policy(
         })
         .await
     {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            // The authorization chain caches a principal's policy set;
+            // drop it so the change takes effect now rather than at TTL.
+            state.policy_cache.invalidate_identity(&cache_key);
+            StatusCode::OK.into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
     }
 }
@@ -1722,6 +1789,11 @@ pub async fn admin_detach_policy(
     } else if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
+    let cache_key = if user_id.is_empty() {
+        group_id.clone()
+    } else {
+        user_id.clone()
+    };
     let mut client = state.meta_client.clone();
     match client
         .detach_policy(objectio_proto::metadata::DetachPolicyRequest {
@@ -1731,7 +1803,12 @@ pub async fn admin_detach_policy(
         })
         .await
     {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            // The authorization chain caches a principal's policy set;
+            // drop it so the change takes effect now rather than at TTL.
+            state.policy_cache.invalidate_identity(&cache_key);
+            StatusCode::OK.into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
     }
 }
@@ -3015,7 +3092,8 @@ pub async fn admin_create_group(
                 .into_response()
         }
         Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code())).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(grpc_to_http(e.code()))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.message().to_string(),
         )
             .into_response(),
@@ -3038,7 +3116,8 @@ pub async fn admin_delete_group(
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code())).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(grpc_to_http(e.code()))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.message().to_string(),
         )
             .into_response(),
@@ -3070,7 +3149,8 @@ pub async fn admin_add_group_member(
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code())).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(grpc_to_http(e.code()))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.message().to_string(),
         )
             .into_response(),
@@ -3096,7 +3176,8 @@ pub async fn admin_remove_group_member(
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code())).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(grpc_to_http(e.code()))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             e.message().to_string(),
         )
             .into_response(),

@@ -41,31 +41,10 @@ type HmacSha256 = Hmac<Sha256>;
 /// Default session duration: 1 hour
 const DEFAULT_DURATION_SECS: u64 = 3600;
 
-/// What the holder of a vended credential is allowed to do against the
-/// scoped prefix. Mutating methods (PUT/POST/DELETE/PATCH) are rejected
-/// when the operation is `Read`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Operation {
-    Read,
-    ReadWrite,
-}
-
-impl Operation {
-    fn as_token_str(self) -> &'static str {
-        match self {
-            Operation::Read => "R",
-            Operation::ReadWrite => "RW",
-        }
-    }
-
-    fn from_token_str(s: &str) -> Option<Self> {
-        match s {
-            "R" => Some(Operation::Read),
-            "RW" => Some(Operation::ReadWrite),
-            _ => None,
-        }
-    }
-}
+// Scoping primitives moved to `crate::scope` once permanent access keys
+// gained the same restriction. Re-exported so `sts::Operation`,
+// `sts::scope_allows` and `sts::is_mutating_method` keep resolving.
+pub use crate::scope::{CredentialScope, Operation, is_mutating_method, scope_allows};
 
 /// Temporary S3 credentials with session token
 #[derive(Debug, Clone)]
@@ -194,34 +173,6 @@ impl StsProvider {
         mac.update(payload.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
-}
-
-/// Returns true if the request `bucket`/`key` falls within the holder's
-/// scope. `scope` is an `s3://bucket/prefix/` URI; an empty path component
-/// after the bucket means the entire bucket is in scope.
-///
-/// `key` is the object key without a leading slash (S3-style).
-pub fn scope_allows(scope: &str, bucket: &str, key: &str) -> bool {
-    let Some(rest) = scope.strip_prefix("s3://") else {
-        return false;
-    };
-    let (scope_bucket, scope_prefix) = match rest.split_once('/') {
-        Some((b, p)) => (b, p),
-        None => (rest, ""),
-    };
-    if scope_bucket != bucket {
-        return false;
-    }
-    // Empty prefix → whole bucket in scope.
-    key.starts_with(scope_prefix)
-}
-
-/// Returns true if `method` writes to S3 (would require `ReadWrite`).
-pub fn is_mutating_method(method: &str) -> bool {
-    matches!(
-        method.to_ascii_uppercase().as_str(),
-        "PUT" | "POST" | "DELETE" | "PATCH"
-    )
 }
 
 fn random_alphanum(len: usize) -> String {

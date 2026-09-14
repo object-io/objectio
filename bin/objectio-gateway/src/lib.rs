@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod auth_middleware;
+pub mod authz;
 pub mod chunked_decode;
 pub mod console_auth;
 pub mod grep;
@@ -29,8 +30,8 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, head, post, put},
 };
-use console_auth::ListenerKind;
 use clap::Parser;
+use console_auth::ListenerKind;
 use objectio_auth::policy::PolicyEvaluator;
 use objectio_delta_sharing::{
     DeltaSharingConfig, admin_router as delta_admin_router, router as delta_router,
@@ -217,6 +218,22 @@ pub struct Args {
     /// Disable authentication (for development)
     #[arg(long, default_value_t = false)]
     pub no_auth: bool,
+
+    /// Keep buckets that have no recorded owner accessible to any
+    /// authenticated caller. Buckets created before ownership was tracked
+    /// carry no owner, so enforcing owner-only on them would lock an existing
+    /// deployment out of everything it already has.
+    ///
+    /// Backfill with `PUT /_admin/buckets/{bucket}/owner`, then set this to
+    /// false to close the gap. Buckets created from now on always record
+    /// their creator and are unaffected either way.
+    #[arg(
+        long,
+        env = "OBJECTIO_AUTHZ_LEGACY_OPEN_BUCKETS",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub authz_legacy_open_buckets: bool,
 
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
@@ -801,6 +818,7 @@ pub async fn run(
         ec_k: args.ec_k,
         ec_m: args.ec_m,
         policy_evaluator: PolicyEvaluator::new(),
+        policy_cache: authz::AuthzCache::default(),
         scatter_gather,
         master_key,
         kms: parking_lot::RwLock::new(kms),
@@ -808,6 +826,7 @@ pub async fn run(
         license: parking_lot::RwLock::new(Arc::new(license)),
         self_topology,
         host_provider,
+        legacy_open_buckets: args.authz_legacy_open_buckets,
     });
 
     // Build router
@@ -928,6 +947,10 @@ pub async fn run(
             "/_admin/policies/{name}",
             delete(admin::admin_delete_policy),
         )
+        .route(
+            "/_admin/buckets/{bucket}/owner",
+            put(admin::admin_set_bucket_owner),
+        )
         .route("/_admin/policies/attach", post(admin::admin_attach_policy))
         .route("/_admin/policies/detach", post(admin::admin_detach_policy))
         .route(
@@ -937,7 +960,10 @@ pub async fn run(
         // IAM groups
         .route("/_admin/groups", get(admin::admin_list_groups))
         .route("/_admin/groups", post(admin::admin_create_group))
-        .route("/_admin/groups/{group_id}", delete(admin::admin_delete_group))
+        .route(
+            "/_admin/groups/{group_id}",
+            delete(admin::admin_delete_group),
+        )
         .route(
             "/_admin/groups/{group_id}/members",
             post(admin::admin_add_group_member),
@@ -1103,8 +1129,9 @@ pub async fn run(
         .unwrap_or_else(|_| format!("{legacy_console_dir}/tenant"));
 
     let console_service = |dir: &str| {
-        tower_http::services::ServeDir::new(dir)
-            .fallback(tower_http::services::ServeFile::new(format!("{dir}/index.html")))
+        tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(
+            format!("{dir}/index.html"),
+        ))
     };
 
     // S3-side layer stack (chunked-decode + body limit + optional SigV4 auth).
@@ -1116,7 +1143,14 @@ pub async fn run(
         if args.no_auth {
             r
         } else {
+            // Layers wrap in reverse application order, so the authorization
+            // layer is applied first and runs second: auth_layer puts the
+            // caller's AuthResult on the request, authz_layer reads it.
             r.layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                authz::authz_layer,
+            ))
+            .layer(middleware::from_fn_with_state(
                 Arc::clone(&auth_state),
                 auth_layer,
             ))
@@ -1178,7 +1212,11 @@ pub async fn run(
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Data))
             .layer(TraceLayer::new_for_http());
-        listeners.push((data_addr, data_router, "data plane (S3 + Iceberg + Delta Sharing)"));
+        listeners.push((
+            data_addr,
+            data_router,
+            "data plane (S3 + Iceberg + Delta Sharing)",
+        ));
 
         if let Some(addr) = admin_addr {
             if addr.ip().is_unspecified() {

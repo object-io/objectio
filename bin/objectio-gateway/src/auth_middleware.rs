@@ -13,9 +13,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
-use objectio_auth::AuthResult;
+use objectio_auth::{AuthResult, CredentialScope, Operation};
 use objectio_proto::metadata::{
-    GetAccessKeyForAuthRequest, GetUserGroupsRequest,
+    GetAccessKeyForAuthRequest, GetUserGroupsRequest, KeyOperation,
     metadata_service_client::MetadataServiceClient,
 };
 use parking_lot::RwLock;
@@ -38,7 +38,25 @@ pub struct CachedCredential {
     pub user_id: String,
     pub user_arn: String,
     pub tenant: String,
+    /// Bucket/prefix restriction carried by this key. `None` when the key is
+    /// unscoped and read-write, which is the common case.
+    pub scope: Option<CredentialScope>,
     pub cached_at: std::time::Instant,
+}
+
+/// Build a [`CredentialScope`] from the wire representation, collapsing the
+/// "no restriction at all" case to `None` so the hot path can skip it.
+fn credential_scope(scope: &str, operation: i32) -> Option<CredentialScope> {
+    let operation = if operation == KeyOperation::KeyOpRead as i32 {
+        Operation::Read
+    } else {
+        Operation::ReadWrite
+    };
+    let scope = CredentialScope {
+        scope: scope.to_string(),
+        operation,
+    };
+    (!scope.is_unrestricted()).then_some(scope)
 }
 
 /// Authentication state shared across requests
@@ -144,6 +162,7 @@ impl AuthState {
             user_id: user.user_id.clone(),
             user_arn: user.arn,
             tenant: user.tenant,
+            scope: credential_scope(&access_key.scope, access_key.operation),
             cached_at: std::time::Instant::now(),
         };
 
@@ -232,6 +251,10 @@ pub async fn auth_layer(
             user_id: session_info.user_arn.clone(),
             user_arn: session_info.user_arn.clone(),
             tenant: String::new(),
+            scope: Some(CredentialScope {
+                scope: session_info.scope.clone(),
+                operation: session_info.operation,
+            }),
             cached_at: std::time::Instant::now(),
         };
         match &parsed {
@@ -253,34 +276,6 @@ pub async fn auth_layer(
             }
         }
 
-        // Enforce scope + operation. The path is `/<bucket>/<key…>` (path
-        // style) — virtual-hosted-style is rewritten earlier in the chain.
-        // Bucket-level LIST has an empty path key but carries the requested
-        // prefix in the `prefix=` query param; use that as the effective key
-        // so a narrower-or-equal LIST is permitted but a broader LIST is
-        // rejected.
-        let uri = request.uri().clone();
-        let path = uri.path().trim_start_matches('/');
-        let (req_bucket, path_key) = path.split_once('/').map_or((path, ""), |(b, k)| (b, k));
-        let effective_key: String = if path_key.is_empty() {
-            extract_query_param(uri.query().unwrap_or(""), "prefix").unwrap_or_default()
-        } else {
-            path_key.to_string()
-        };
-        if !objectio_auth::sts::scope_allows(&session_info.scope, req_bucket, &effective_key) {
-            return Err(AuthError::AccessDenied(format!(
-                "vended credentials are scoped to {}, not s3://{}/{}",
-                session_info.scope, req_bucket, effective_key
-            )));
-        }
-        if session_info.operation == objectio_auth::sts::Operation::Read
-            && objectio_auth::sts::is_mutating_method(request.method().as_str())
-        {
-            return Err(AuthError::AccessDenied(
-                "vended credentials are READ-only; this method requires READ_WRITE".to_string(),
-            ));
-        }
-
         debug!(
             "STS auth ok: user_arn={} scope={} op={:?}",
             session_info.user_arn, session_info.scope, session_info.operation
@@ -293,6 +288,7 @@ pub async fn auth_layer(
             group_ids: Vec::new(),
             tenant: String::new(),
             auth_mode: objectio_auth::AuthMode::Sts,
+            scope: cred.scope.clone(),
         };
         request.extensions_mut().insert(auth_result);
         return Ok(next.run(request).await);
@@ -467,6 +463,7 @@ pub fn verify_request_v4<B>(
         group_ids: Vec::new(),
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
+        scope: cred.scope.clone(),
     })
 }
 
@@ -540,6 +537,7 @@ pub fn verify_request_v2<B>(
         group_ids: Vec::new(),
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
+        scope: cred.scope.clone(),
     })
 }
 
@@ -833,20 +831,6 @@ fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
-}
-
-/// Pull a single query parameter out of a raw query string. Used by the STS
-/// scope check to read `?prefix=` from bucket-level LIST requests. Returns
-/// the URL-decoded value or `None` when the key isn't present.
-fn extract_query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == key
-        {
-            return Some(url_decode(v));
-        }
-    }
-    None
 }
 
 /// URL encode a string (AWS style)

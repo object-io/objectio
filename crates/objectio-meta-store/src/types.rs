@@ -185,6 +185,59 @@ pub struct StoredAccessKey {
     pub created_at: u64,
     #[serde(default)]
     pub tenant: String,
+    /// `s3://bucket/prefix/` restriction. Empty = unscoped.
+    #[serde(default)]
+    pub scope: String,
+    /// `KeyOperation` proto value: 0 = READ_WRITE, 1 = READ. Zero is the
+    /// permissive default so an unset value imposes no restriction.
+    #[serde(default)]
+    pub operation: i32,
+}
+
+/// Layout of [`StoredAccessKey`] before scoping existed.
+///
+/// bincode is not self-describing, so `#[serde(default)]` cannot rescue a
+/// record that simply ends early — the decoder runs off the end and errors.
+/// Keeping the old shape lets [`decode_access_key`] fall back and upgrade in
+/// place, so adding scope fields does not invalidate keys already issued.
+#[derive(Deserialize)]
+struct StoredAccessKeyV1 {
+    access_key_id: String,
+    secret_access_key: String,
+    user_id: String,
+    status: i32,
+    created_at: u64,
+    #[serde(default)]
+    tenant: String,
+}
+
+impl From<StoredAccessKeyV1> for StoredAccessKey {
+    fn from(v1: StoredAccessKeyV1) -> Self {
+        Self {
+            access_key_id: v1.access_key_id,
+            secret_access_key: v1.secret_access_key,
+            user_id: v1.user_id,
+            status: v1.status,
+            created_at: v1.created_at,
+            tenant: v1.tenant,
+            scope: String::new(),
+            operation: 0,
+        }
+    }
+}
+
+/// Decode a stored access key, accepting records written before the `scope`
+/// and `operation` fields existed.
+///
+/// # Errors
+/// Returns the current-layout error when the bytes match neither layout.
+pub fn decode_access_key(bytes: &[u8]) -> Result<StoredAccessKey, bincode::Error> {
+    match bincode::deserialize::<StoredAccessKey>(bytes) {
+        Ok(k) => Ok(k),
+        Err(current) => bincode::deserialize::<StoredAccessKeyV1>(bytes)
+            .map(Into::into)
+            .map_err(|_| current),
+    }
 }
 
 /// Internal group storage
@@ -266,4 +319,67 @@ pub struct StoredAttachment {
     pub initiator: String,
     pub attached_at: u64,
     pub read_only: bool,
+}
+
+#[cfg(test)]
+mod access_key_compat_tests {
+    use super::*;
+
+    #[test]
+    fn current_layout_round_trips() {
+        let key = StoredAccessKey {
+            access_key_id: "AKIA1".into(),
+            secret_access_key: "s".into(),
+            user_id: "u".into(),
+            status: 0,
+            created_at: 1,
+            tenant: "t".into(),
+            scope: "s3://data/logs/".into(),
+            operation: 1,
+        };
+        let bytes = bincode::serialize(&key).unwrap();
+        let back = decode_access_key(&bytes).unwrap();
+        assert_eq!(back.scope, "s3://data/logs/");
+        assert_eq!(back.operation, 1);
+    }
+
+    /// A key issued before scoping existed must still authenticate, not vanish
+    /// from the store with a decode warning.
+    #[test]
+    fn pre_scope_records_still_decode() {
+        #[derive(Serialize)]
+        struct V1 {
+            access_key_id: String,
+            secret_access_key: String,
+            user_id: String,
+            status: i32,
+            created_at: u64,
+            tenant: String,
+        }
+        let bytes = bincode::serialize(&V1 {
+            access_key_id: "AKIAOLD".into(),
+            secret_access_key: "old-secret".into(),
+            user_id: "u1".into(),
+            status: 0,
+            created_at: 42,
+            tenant: "acme".into(),
+        })
+        .unwrap();
+
+        // Proves the fallback is load-bearing: the current layout cannot read it.
+        assert!(bincode::deserialize::<StoredAccessKey>(&bytes).is_err());
+
+        let upgraded = decode_access_key(&bytes).unwrap();
+        assert_eq!(upgraded.access_key_id, "AKIAOLD");
+        assert_eq!(upgraded.secret_access_key, "old-secret");
+        assert_eq!(upgraded.tenant, "acme");
+        // Upgraded records are unscoped, so existing keys keep working as-is.
+        assert!(upgraded.scope.is_empty());
+        assert_eq!(upgraded.operation, 0);
+    }
+
+    #[test]
+    fn garbage_is_still_an_error() {
+        assert!(decode_access_key(&[0xff, 0x00, 0x01]).is_err());
+    }
 }

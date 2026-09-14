@@ -466,6 +466,9 @@ pub async fn my_create_key(State(state): State<Arc<AppState>>, headers: HeaderMa
     match client
         .create_access_key(objectio_proto::metadata::CreateAccessKeyRequest {
             user_id: session.user.clone(),
+            // Self-service console keys inherit the user's full access.
+            scope: String::new(),
+            operation: 0,
         })
         .await
     {

@@ -275,6 +275,15 @@ enum KeyCommands {
     Create {
         /// User ID
         user_id: String,
+        /// Confine the key to a bucket or prefix, e.g. "s3://reports/2026/".
+        /// Omit for a key with the user's full access. A scope only narrows —
+        /// it can never grant more than the user already has.
+        #[arg(long)]
+        scope: Option<String>,
+        /// "rw" (default) or "r" for a read-only key. Applies with or without
+        /// --scope.
+        #[arg(long, default_value = "rw")]
+        operation: String,
     },
     /// Delete an access key
     Delete {
@@ -640,25 +649,60 @@ async fn main() -> Result<()> {
                     if resp.access_keys.is_empty() {
                         println!("No access keys found");
                     } else {
-                        println!("{:<25} {:<15} {:<20}", "ACCESS KEY ID", "STATUS", "CREATED");
-                        println!("{}", "-".repeat(60));
+                        println!(
+                            "{:<25} {:<10} {:<12} {:<24} {:<20}",
+                            "ACCESS KEY ID", "STATUS", "OPERATION", "SCOPE", "CREATED"
+                        );
+                        println!("{}", "-".repeat(95));
                         for key in resp.access_keys {
                             let status = match key.status {
                                 0 => "Active",
                                 1 => "Inactive",
                                 _ => "Unknown",
                             };
+                            let operation = if key.operation == 1 {
+                                "READ"
+                            } else {
+                                "READ_WRITE"
+                            };
+                            let scope = if key.scope.is_empty() {
+                                "-".to_string()
+                            } else {
+                                key.scope.clone()
+                            };
                             println!(
-                                "{:<25} {:<15} {:<20}",
-                                key.access_key_id, status, key.created_at
+                                "{:<25} {:<10} {:<12} {:<24} {:<20}",
+                                key.access_key_id, status, operation, scope, key.created_at
                             );
                         }
                     }
                 }
-                KeyCommands::Create { user_id } => {
+                KeyCommands::Create {
+                    user_id,
+                    scope,
+                    operation,
+                } => {
+                    let scope = scope.clone().unwrap_or_default();
+                    if !scope.is_empty() {
+                        objectio_auth::validate_scope(&scope)
+                            .map_err(|e| anyhow::anyhow!("invalid --scope: {e}"))?;
+                    }
+                    let operation = objectio_auth::Operation::parse(operation.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid --operation '{operation}': expected 'r' or 'rw'"
+                            )
+                        })?;
+                    let operation_code = match operation {
+                        objectio_auth::Operation::Read => 1,
+                        objectio_auth::Operation::ReadWrite => 0,
+                    };
+
                     let response = client
                         .create_access_key(CreateAccessKeyRequest {
                             user_id: user_id.clone(),
+                            scope: scope.clone(),
+                            operation: operation_code,
                         })
                         .await?;
 
@@ -667,6 +711,18 @@ async fn main() -> Result<()> {
                     println!();
                     println!("Access Key ID:     {}", key.access_key_id);
                     println!("Secret Access Key: {}", key.secret_access_key);
+                    if scope.is_empty() {
+                        println!("Scope:             (unscoped)");
+                    } else {
+                        println!("Scope:             {scope}");
+                    }
+                    println!(
+                        "Operation:         {}",
+                        match operation {
+                            objectio_auth::Operation::Read => "READ",
+                            objectio_auth::Operation::ReadWrite => "READ_WRITE",
+                        }
+                    );
                     println!();
                     println!("IMPORTANT: Save the secret access key now.");
                     println!("           It will not be shown again!");

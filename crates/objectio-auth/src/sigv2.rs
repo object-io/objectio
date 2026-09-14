@@ -111,6 +111,7 @@ impl SigV2Verifier {
             group_ids: Vec::new(),
             tenant: String::new(),
             auth_mode: crate::AuthMode::Permanent,
+            scope: None,
         })
     }
 

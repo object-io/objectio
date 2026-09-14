@@ -133,9 +133,7 @@ pub async fn iceberg_unified_auth_layer(
                 {
                     let iam_groups = resp.into_inner().groups;
                     for claim in identity.groups() {
-                        if let Some(g) =
-                            iam_groups.iter().find(|g| g.group_name == *claim)
-                        {
+                        if let Some(g) = iam_groups.iter().find(|g| g.group_name == *claim) {
                             group_arns.push(g.arn.clone());
                             group_ids.push(g.group_id.clone());
                         }
@@ -149,6 +147,7 @@ pub async fn iceberg_unified_auth_layer(
                     group_ids,
                     tenant: String::new(),
                     auth_mode: objectio_auth::AuthMode::Permanent,
+                    scope: None,
                 };
                 request.extensions_mut().insert(auth_result);
                 return next.run(request).await;
@@ -193,6 +192,7 @@ pub async fn iceberg_unified_auth_layer(
                             group_ids,
                             tenant: user.tenant,
                             auth_mode: objectio_auth::AuthMode::Permanent,
+                            scope: None,
                         }
                     }
                     None => {
@@ -228,6 +228,7 @@ pub async fn iceberg_unified_auth_layer(
                         group_ids,
                         tenant: cred.tenant,
                         auth_mode: objectio_auth::AuthMode::Permanent,
+                        scope: None,
                     }
                 }
                 Err(e) => {
