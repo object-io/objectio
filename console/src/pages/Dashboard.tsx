@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
-import { Line, LineChart, ResponsiveContainer, YAxis } from "recharts";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { Activity, RefreshCw } from "lucide-react";
 import { Link } from "react-router-dom";
 import PageHeader from "../components/PageHeader";
@@ -9,16 +17,50 @@ import {
   Button,
   CapacityBar,
   Card,
+  ChartCard,
   Chip,
+  LegendDot,
   StatTile,
 } from "../components/ui";
 import { seriesColor } from "../components/ui/chart-series";
 import { cluster, nodes as nodesApi, type NodeInfo } from "../api/client";
 import {
   LIVE_INTERVAL_MS,
+  QUERIES,
   capabilities,
+  queryInstant,
+  queryRange,
+  withRate,
   type MetricsCapabilities,
+  type Series,
 } from "../api/metrics";
+
+const DAY = 86_400;
+const AXIS = { fontSize: 10, fontFamily: "var(--oio-font-mono)", fill: "var(--oio-faint)" };
+const TOOLTIP = {
+  background: "var(--oio-surface)",
+  border: "1px solid var(--oio-border-strong)",
+  borderRadius: 8,
+  fontSize: 11,
+};
+
+/// Join Prometheus series into the row-per-timestamp shape Recharts wants,
+/// keyed by a label so each series keeps its identity across the join.
+function rows(series: Series[], key: string) {
+  const names = series.map((s, i) => s.labels[key] ?? `series ${i + 1}`);
+  const byTime = new Map<number, Record<string, number | string>>();
+  series.forEach((s, i) => {
+    for (const pt of s.points) {
+      const row = byTime.get(pt.t) ?? {
+        t: pt.t,
+        time: new Date(pt.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      };
+      row[names[i]] = pt.v;
+      byTime.set(pt.t, row);
+    }
+  });
+  return { names, data: [...byTime.values()].sort((a, b) => Number(a.t) - Number(b.t)) };
+}
 
 /// Read one counter from the Prometheus text exposition.
 function counter(text: string, name: string, label?: [string, string]): number {
@@ -61,6 +103,10 @@ export default function Dashboard() {
   const [rates, setRates] = useState<{ req: number; err: number; bytes: number }>({ req: 0, err: 0, bytes: 0 });
   const [spark, setSpark] = useState<Record<string, Spark[]>>({ req: [], err: [], bytes: [] });
   const [protection, setProtection] = useState({ data: 0, parity: 0 });
+  const [p99, setP99] = useState<number | null>(null);
+  const [p50, setP50] = useState<number | null>(null);
+  const [reqSeries, setReqSeries] = useState<Series[]>([]);
+  const [latSeries, setLatSeries] = useState<Series[]>([]);
   // Previous counter reading, held only to difference against the next one.
   const [, setPrev] = useState<Record<string, number> | null>(null);
 
@@ -113,8 +159,34 @@ export default function Dashboard() {
     }
   }, []);
 
+  // The 24h panels and the latency percentiles are the parts of this screen
+  // that cannot come from a browser polling /metrics: a quantile is computed
+  // from the histogram by Prometheus, and a day of history is history.
+  const loadHistory = useCallback(async () => {
+    const [ops, lat50, lat99, now99, now50] = await Promise.all([
+      queryRange(withRate(QUERIES.requestsByOperation, DAY), DAY).catch(() => [] as Series[]),
+      queryRange(withRate(QUERIES.latencyQuantile(0.5), DAY), DAY).catch(() => [] as Series[]),
+      queryRange(withRate(QUERIES.latencyQuantile(0.99), DAY), DAY).catch(() => [] as Series[]),
+      queryInstant(withRate(QUERIES.latencyQuantile(0.99), 300)).catch(() => [] as Series[]),
+      queryInstant(withRate(QUERIES.latencyQuantile(0.5), 300)).catch(() => [] as Series[]),
+    ]);
+    setReqSeries(ops);
+    setLatSeries([
+      ...lat50.map((x) => ({ ...x, labels: { q: "p50" } })),
+      ...lat99.map((x) => ({ ...x, labels: { q: "p99" } })),
+    ]);
+    const first = (s: Series[]) => s[0]?.points.at(-1)?.v;
+    setP99(first(now99) ?? null);
+    setP50(first(now50) ?? null);
+  }, []);
+
   useEffect(() => {
-    capabilities().then(setCaps).catch(() => setCaps(null));
+    capabilities()
+      .then((c) => {
+        setCaps(c);
+        if (c.prometheus) void loadHistory();
+      })
+      .catch(() => setCaps(null));
     void load();
     // Both are async and set state only after their awaits; the rule flags the
     // call because it cannot see past the function boundary.
@@ -122,7 +194,7 @@ export default function Dashboard() {
     void sampleMetrics();
     const t = setInterval(() => void sampleMetrics(), LIVE_INTERVAL_MS);
     return () => clearInterval(t);
-  }, [load, sampleMetrics]);
+  }, [load, sampleMetrics, loadHistory]);
 
   const disks = nodeList.flatMap((n) => n.disks ?? []);
   const totalCap = disks.reduce((a, d) => a + (d.total_capacity ?? 0), 0);
@@ -131,8 +203,20 @@ export default function Dashboard() {
   const shards = protection.data + protection.parity;
   const dataShare = shards > 0 ? protection.data / shards : 0;
 
+  const req = rows(reqSeries, "operation");
+  const lat = rows(latSeries, "q");
+
   const tiles = [
     { label: "S3 requests / s", value: rates.req.toFixed(1), sub: "all operations", key: "req" },
+    {
+      label: "p99 latency",
+      // A percentile has no meaning without the histogram, and the browser
+      // only sees running totals — so this is blank rather than wrong when
+      // Prometheus is not wired.
+      value: p99 == null ? "—" : `${(p99 * 1000).toFixed(0)} ms`,
+      sub: p50 == null ? "needs Prometheus" : `p50 ${(p50 * 1000).toFixed(0)} ms`,
+      key: "",
+    },
     { label: "Throughput", value: `${bytes(rates.bytes)}/s`, sub: "request + response", key: "bytes" },
     { label: "Errors (5xx) / s", value: rates.err.toFixed(2), sub: "server_error", key: "err" },
     { label: "OSDs up", value: `${online} / ${nodeList.length}`, sub: `${disks.length} disks`, key: "" },
@@ -175,7 +259,7 @@ export default function Dashboard() {
           .join(" · ")}
       </Banner>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
         {tiles.map((t) => (
           <StatTile
             key={t.label}
@@ -203,6 +287,91 @@ export default function Dashboard() {
             }
           />
         ))}
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4 mb-4">
+        <ChartCard
+          title="S3 request rate"
+          subtitle="requests per second · 24h"
+          legend={
+            req.names.length ? (
+              <div className="flex gap-3 flex-wrap">
+                {req.names.slice(0, 4).map((n, i) => (
+                  <LegendDot key={n} index={i} label={n} />
+                ))}
+              </div>
+            ) : undefined
+          }
+        >
+          {req.data.length ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={req.data} margin={{ top: 4, right: 4, left: -8, bottom: 0 }}>
+                <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+                <XAxis dataKey="time" tick={AXIS} tickLine={false} axisLine={false} minTickGap={40} />
+                <YAxis tick={AXIS} tickLine={false} axisLine={false} width={44} />
+                <Tooltip contentStyle={TOOLTIP} />
+                {req.names.slice(0, 4).map((n, i) => (
+                  <Line
+                    key={n}
+                    type="monotone"
+                    dataKey={n}
+                    stroke={seriesColor(i)}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <NeedsHistory promReady={caps?.prometheus === true} />
+          )}
+        </ChartCard>
+
+        <ChartCard
+          title="Request latency"
+          subtitle="milliseconds · 24h"
+          legend={
+            <div className="flex gap-3">
+              {["p50", "p99"].map((n, i) => (
+                <LegendDot key={n} index={i} label={n} />
+              ))}
+            </div>
+          }
+        >
+          {lat.data.length ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={lat.data} margin={{ top: 4, right: 4, left: -8, bottom: 0 }}>
+                <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+                <XAxis dataKey="time" tick={AXIS} tickLine={false} axisLine={false} minTickGap={40} />
+                <YAxis
+                  tick={AXIS}
+                  tickLine={false}
+                  axisLine={false}
+                  width={44}
+                  tickFormatter={(v) => `${(Number(v) * 1000).toFixed(0)}`}
+                />
+                <Tooltip
+                  contentStyle={TOOLTIP}
+                  formatter={(v) => [`${(Number(v) * 1000).toFixed(1)} ms`, ""]}
+                />
+                {["p50", "p99"].map((n, i) => (
+                  <Line
+                    key={n}
+                    type="monotone"
+                    dataKey={n}
+                    stroke={seriesColor(i)}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <NeedsHistory promReady={caps?.prometheus === true} />
+          )}
+        </ChartCard>
       </div>
 
       <div className="grid lg:grid-cols-4 gap-4">
@@ -295,6 +464,24 @@ export default function Dashboard() {
           </p>
         </Card>
       </div>
+    </div>
+  );
+}
+
+/// Shown where a 24h panel has no data. A browser polling /metrics knows
+/// nothing older than the moment the page opened, so an empty chart here
+/// would read as "no traffic" rather than "no history".
+function NeedsHistory({ promReady }: { promReady: boolean }) {
+  return (
+    <div className="h-[200px] flex flex-col items-center justify-center text-center px-6 gap-1.5">
+      <code className="font-mono text-[11px] text-text-2 bg-surface-2 px-1.5 py-px rounded-[5px]">
+        {promReady ? "no samples in the last 24h" : "--prometheus-url"}
+      </code>
+      <p className="text-[11px] text-muted max-w-xs">
+        {promReady
+          ? "Prometheus is wired but has not been scraping this long yet. The panel fills in as history accumulates."
+          : "A day of history comes from Prometheus. Without it this screen can only show the live scrape, which starts when the page opens."}
+      </p>
     </div>
   );
 }
