@@ -18,8 +18,11 @@ export default function Buckets() {
   const [newName, setNewName] = useState("");
   const [loading, setLoading] = useState(true);
 
+  // No `setLoading(true)` here: `loading` starts true so the mount path is
+  // already covered, and a refresh updating the list in place reads better
+  // than flashing a spinner over data that is already on screen. Setting it
+  // synchronously would also mean a setState inside the mount effect.
   const load = () => {
-    setLoading(true);
     fetch("/_admin/buckets")
       .then((r) => r.json())
       .then((data) => setBucketList(data.buckets || []))

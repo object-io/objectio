@@ -68,9 +68,11 @@ export default function DeltaSharing() {
   // Token display
   const [newToken, setNewToken] = useState("");
   const [copied, setCopied] = useState("");
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     Promise.all([
       fetch("/_admin/shares")
         .then((r) => r.json())

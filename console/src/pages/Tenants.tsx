@@ -50,9 +50,11 @@ export default function Tenants() {
   const [tenantUsers, setTenantUsers] = useState<TenantUser[]>([]);
   const [adminInput, setAdminInput] = useState("");
   const [adminError, setAdminError] = useState("");
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     Promise.all([
       fetch("/_admin/tenants").then(r => r.json()).catch(() => []),
       fetch("/_admin/pools").then(r => r.json()).catch(() => []),

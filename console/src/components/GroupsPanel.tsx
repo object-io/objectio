@@ -26,13 +26,19 @@ export default function GroupsPanel() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [addingTo, setAddingTo] = useState<string | null>(null);
   const [pickUserId, setPickUserId] = useState("");
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
-    setError(null);
+    // Error clears on success rather than up front, so the mount path does
+    // not set state synchronously inside the effect.
     groupsApi
       .list()
-      .then((r) => setGroups(r.groups || []))
+      .then((r) => {
+        setGroups(r.groups || []);
+        setError(null);
+      })
       .catch((e) => {
         setGroups([]);
         setError(String(e));

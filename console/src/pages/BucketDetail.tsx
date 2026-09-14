@@ -15,6 +15,15 @@ import {
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 
+
+/** Minimal shape of a policy statement as rendered here. */
+interface PolicyStatement {
+  Effect?: string;
+  Action?: string | string[];
+  Resource?: string | string[];
+  Principal?: unknown;
+}
+
 type Tab = "access" | "versioning" | "lock" | "lifecycle" | "policy";
 
 interface LifecycleRule {
@@ -280,6 +289,7 @@ export default function BucketDetail() {
   };
 
   // @ts-expect-error TODO: wire this up to the Policy Templates UI
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const applyTemplate = (template: string) => {
     const templates: Record<string, object> = {
       "public-read": {
@@ -905,8 +915,8 @@ function PolicyTab({
     }
 
     // Merge statements from the named policy, scoped to this bucket
-    const namedPolicy = policy.policy as { Statement?: unknown[] };
-    const newStatements = (namedPolicy.Statement || []).map((stmt: any) => ({
+    const namedPolicy = policy.policy as { Statement?: PolicyStatement[] };
+    const newStatements = (namedPolicy.Statement || []).map((stmt) => ({
       ...stmt,
       Resource: [
         `arn:obio:s3:::${bucketName}`,

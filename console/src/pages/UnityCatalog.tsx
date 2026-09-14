@@ -124,12 +124,16 @@ export default function UnityCatalog() {
   } | null>(null);
 
   // -------- Catalogs --------
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
   const loadCatalogs = () => {
-    setLoading(true);
-    setError(null);
     unity
       .listCatalogs()
-      .then((d) => setCatalogs(d.catalogs || []))
+      .then((d) => {
+        setCatalogs(d.catalogs || []);
+        setError(null);
+      })
       .catch((e: Error) => {
         setError(e.message);
         setCatalogs([]);

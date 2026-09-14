@@ -51,8 +51,10 @@ export default function IcebergCatalog() {
   const [loading, setLoading] = useState(true);
 
   // Load warehouses
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
   const loadWarehouses = () => {
-    setLoading(true);
     fetch("/_admin/warehouses")
       .then((r) => r.json())
       .then((d) => setWarehouses(d.warehouses || []))
@@ -129,7 +131,10 @@ export default function IcebergCatalog() {
     try {
       const r = await iceberg.getTable(ns, name, whName);
       // Strip vended credentials from display — they're transient, not metadata
-      const { config: _config, ...tableMetadata } = r;
+      // Vended credentials are transient, not metadata — drop them from
+      // what we display.
+      const tableMetadata = { ...r };
+      delete (tableMetadata as { config?: unknown }).config;
       setSelectedTable(tableMetadata);
     } catch (e) {
       setSelectedTable({ error: String(e) });

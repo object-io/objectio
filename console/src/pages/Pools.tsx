@@ -125,9 +125,11 @@ export default function Pools({ embedded = false }: PoolsProps = {}) {
   const [tab, setTab] = useState<WizardTab>("config");
   const [compression, setCompression] = useState(true);
   const [encryption, setEncryption] = useState(false);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     Promise.all([
       fetch("/_admin/pools")
         .then((r) => r.json())

@@ -73,9 +73,11 @@ export default function Identity() {
   const [callbackUrl, setCallbackUrl] = useState("");
   const [callbackIsDefault, setCallbackIsDefault] = useState(false);
   const [copiedCallback, setCopiedCallback] = useState(false);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
 
     // Get session tenant
     fetch("/_console/api/session")

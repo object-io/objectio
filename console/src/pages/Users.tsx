@@ -53,9 +53,11 @@ export default function UsersPage() {
   const [keyScope, setKeyScope] = useState("");
   const [keyReadOnly, setKeyReadOnly] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     fetch("/_admin/users")
       .then((r) => r.json())
       .then((d) => setUserList(d.users || []))

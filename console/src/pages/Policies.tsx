@@ -8,6 +8,15 @@ import {
   type Group,
 } from "../api/client";
 
+
+/** Minimal shape of a policy statement as rendered here. */
+interface PolicyStatement {
+  Effect?: string;
+  Action?: string | string[];
+  Resource?: string | string[];
+  Principal?: unknown;
+}
+
 interface Policy {
   name: string;
   policy: Record<string, unknown>;
@@ -32,9 +41,11 @@ export default function Policies() {
   const [attachGroupId, setAttachGroupId] = useState("");
   const [attachMsg, setAttachMsg] = useState<string | null>(null);
   const [attachErr, setAttachErr] = useState<string | null>(null);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const load = () => {
-    setLoading(true);
     fetch("/_admin/policies")
       .then((r) => r.json())
       .then((d) => setPolicies(d.policies || []))
@@ -545,12 +556,11 @@ export default function Policies() {
               </tr>
             ) : (
               policies.map((p) => {
-                const stmts = (p.policy as { Statement?: unknown[] })?.Statement || [];
+                const stmts =
+                  (p.policy as { Statement?: PolicyStatement[] })?.Statement || [];
                 const actions = stmts
-                  .flatMap((s: any) =>
-                    Array.isArray(s.Action) ? s.Action : [s.Action]
-                  )
-                  .filter(Boolean);
+                  .flatMap((s) => (Array.isArray(s.Action) ? s.Action : [s.Action]))
+                  .filter((a): a is string => Boolean(a));
                 const isBuiltin = [
                   "readonly",
                   "readwrite",

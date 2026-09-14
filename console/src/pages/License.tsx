@@ -73,10 +73,15 @@ export default function LicensePage() {
   const [notice, setNotice] = useState("");
 
   const load = () => {
-    setError("");
+    // The previous error clears when the reload actually succeeds, rather
+    // than optimistically up front — which would also be a synchronous
+    // setState on the mount path.
     fetch("/_admin/license", { credentials: "include" })
       .then((r) => r.json())
-      .then(setLicense)
+      .then((data) => {
+        setLicense(data);
+        setError("");
+      })
       .catch((e) => setError(String(e)));
   };
   useEffect(load, []);

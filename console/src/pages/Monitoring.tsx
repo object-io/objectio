@@ -141,12 +141,15 @@ export default function Monitoring() {
   };
 
   useEffect(() => {
+    // `scrape` is async and every setState in it happens after an await, so
+    // nothing here runs synchronously — the rule flags the call itself
+    // because it cannot see past the function boundary.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     scrape(); // initial
     timerRef.current = setInterval(() => {
       if (!paused) scrape();
     }, POLL_INTERVAL);
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paused]);
 
   const renderChart = (def: ChartDef) => {

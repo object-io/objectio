@@ -137,7 +137,6 @@ export default function Balancing() {
     // plenty granular to show progress without hammering the API.
     const h = setInterval(loadStatus, 5000);
     return () => clearInterval(h);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const saveOne = async (k: string, v: string) => {

@@ -20,9 +20,11 @@ export default function MyAccount() {
     user: string;
     tenant: string;
   } | null>(null);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const loadKeys = () => {
-    setLoading(true);
     fetch("/_console/api/me/keys")
       .then((r) => r.json())
       .then((d) => setKeys(d.access_keys || []))

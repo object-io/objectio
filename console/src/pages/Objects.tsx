@@ -36,7 +36,7 @@ export default function Objects() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    setLoading(true);
+    // `loading`/state already start correct; no synchronous set on mount.
     fetch("/_admin/buckets")
       .then((r) => r.json())
       .then((data) => setBuckets(data.buckets || []))
@@ -49,9 +49,11 @@ export default function Objects() {
     setPrefix("");
     loadObjects(name, "");
   };
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
 
   const loadObjects = (bucket: string, pfx: string) => {
-    setLoading(true);
     setPrefix(pfx);
     const params = new URLSearchParams();
     if (pfx) params.set("prefix", pfx);
