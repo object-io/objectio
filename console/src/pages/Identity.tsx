@@ -21,6 +21,10 @@ interface OidcProvider {
     /// Allow this provider to log users into the system-admin console
     /// (no tenant binding required). Defaults to false — tenant-scoped.
     system_admin?: boolean;
+    tenancy?: string;
+    tenant_admin_role?: string;
+    tenant_quota_bytes?: number;
+    allowed_tids?: string[];
   };
   updated_at: number;
   updated_by: string;
@@ -40,7 +44,16 @@ const emptyProvider = {
   vendor: "",
   azure_tenant_id: "",
   system_admin: false,
+  // Tenancy. "single" binds the provider to one tenant; "multi" follows the
+  // upstream tenant in the token and registers it on first login.
+  tenancy: "single",
+  tenant_admin_role: "",
+  tenant_quota_bytes: 2 * 1024 * 1024 * 1024,
+  allowed_tids: [] as string[],
 };
+
+/** 2 GiB, matching DEFAULT_SELF_REGISTERED_QUOTA_BYTES on the gateway. */
+const DEFAULT_TENANT_QUOTA_BYTES = 2 * 1024 * 1024 * 1024;
 
 export default function Identity() {
   const [providers, setProviders] = useState<OidcProvider[]>([]);
@@ -48,6 +61,8 @@ export default function Identity() {
   const [form, setForm] = useState(emptyProvider);
   const [providerName, setProviderName] = useState("");
   const [adminRolesStr, setAdminRolesStr] = useState("");
+  const [allowedTidsStr, setAllowedTidsStr] = useState("");
+  const [quotaGbStr, setQuotaGbStr] = useState("2");
   const [testResult, setTestResult] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [sessionTenant, setSessionTenant] = useState("");
@@ -113,6 +128,13 @@ export default function Identity() {
       setProviderName(name);
       setForm({ ...emptyProvider, ...p.value });
       setAdminRolesStr(p.value.admin_roles?.join(", ") || "");
+      setAllowedTidsStr(p.value.allowed_tids?.join(", ") || "");
+      setQuotaGbStr(
+        String(
+          (p.value.tenant_quota_bytes ?? DEFAULT_TENANT_QUOTA_BYTES) /
+            (1024 * 1024 * 1024)
+        )
+      );
       setEditing(name);
     } else {
       // Tenant admins own exactly the slug `t-{tenant}`; system admin
@@ -120,6 +142,8 @@ export default function Identity() {
       setProviderName(sessionTenant ? `t-${sessionTenant.toLowerCase()}` : "");
       setForm({ ...emptyProvider });
       setAdminRolesStr("");
+      setAllowedTidsStr("");
+      setQuotaGbStr("2");
       setEditing("__new__");
     }
     setTestResult(null);
@@ -127,9 +151,17 @@ export default function Identity() {
 
   const save = async () => {
     if (!providerName.trim()) return;
+    const gb = Number.parseFloat(quotaGbStr);
     const payload = {
       ...form,
       admin_roles: adminRolesStr.split(",").map((s) => s.trim()).filter(Boolean),
+      // Empty list = open registration, which is what a `common` endpoint
+      // implies. Populating it restricts self-registration to those tenants.
+      allowed_tids: allowedTidsStr.split(",").map((s) => s.trim()).filter(Boolean),
+      // Stored in bytes; entered in GB because that is how a quota is discussed.
+      tenant_quota_bytes: Number.isFinite(gb)
+        ? Math.round(gb * 1024 * 1024 * 1024)
+        : DEFAULT_TENANT_QUOTA_BYTES,
     };
     // For tenant admins, the gateway auto-binds tenant.oidc_provider when
     // the slug `identity/openid/t-{tenant}` is PUT, so no separate
@@ -314,14 +346,116 @@ export default function Identity() {
               </select>
             </div>
             {form.vendor === "azure" && (
-              <div>
-                <label className="block text-xs font-medium text-gray-500 mb-1">Azure Tenant ID</label>
-                <input
-                  value={form.azure_tenant_id}
-                  onChange={(e) => setForm({ ...form, azure_tenant_id: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                />
+              <div className="md:col-span-2">
+                <label className="block text-xs font-medium text-gray-500 mb-1">
+                  Directory (tenant) ID{" "}
+                  <span className="text-gray-400">— not the application ID</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    value={form.azure_tenant_id}
+                    onChange={(e) => {
+                      const tid = e.target.value.trim();
+                      // This field used to be stored and ignored while the
+                      // issuer was typed by hand, which is how a wrong issuer
+                      // survives until someone tries to log in. Writing the
+                      // issuer from it keeps the two from disagreeing.
+                      setForm({
+                        ...form,
+                        azure_tenant_id: tid,
+                        issuer_url: tid
+                          ? `https://login.microsoftonline.com/${tid}/v2.0`
+                          : form.issuer_url,
+                      });
+                    }}
+                    placeholder="72f988bf-86f1-41af-91ab-2d7cd011db47  ·  or: organizations / common"
+                    className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                </div>
+                <p className="mt-1 text-xs text-gray-400">
+                  Sets the Issuer URL above. Use your Directory (tenant) ID from
+                  Entra &rarr; Overview for a single organisation. Use{" "}
+                  <code>organizations</code> only with Tenancy set to
+                  &ldquo;multi-tenant&rdquo; below — it is the placeholder that
+                  lets any work or school account sign in.
+                </p>
               </div>
+            )}
+
+            {/* Tenancy ------------------------------------------------- */}
+            <div className="md:col-span-2 border-t border-gray-200 pt-4 mt-1">
+              <label className="block text-xs font-medium text-gray-500 mb-1">Tenancy</label>
+              <select
+                value={form.tenancy}
+                onChange={(e) => setForm({ ...form, tenancy: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+              >
+                <option value="single">
+                  Single tenant — this provider serves one ObjectIO tenant
+                </option>
+                <option value="multi">
+                  Multi-tenant — each signing-in organisation gets its own tenant
+                </option>
+              </select>
+              <p className="mt-1 text-xs text-gray-400">
+                Multi-tenant keys on the <code>tid</code> claim: the first login
+                from an organisation registers a tenant for it automatically.
+              </p>
+            </div>
+
+            {form.tenancy === "multi" && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                    Quota per registered tenant (GB)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.5"
+                    value={quotaGbStr}
+                    onChange={(e) => setQuotaGbStr(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">
+                    Applied at registration; raise it per tenant afterwards. 0 = unlimited.
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                    Tenant admin role
+                  </label>
+                  <input
+                    value={form.tenant_admin_role}
+                    onChange={(e) =>
+                      setForm({ ...form, tenant_admin_role: e.target.value })
+                    }
+                    placeholder="objectio-admin"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">
+                    A user whose token carries this role administers their own
+                    tenant. Leave empty and only you can manage them.
+                  </p>
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                    Allowed directory IDs{" "}
+                    <span className="text-gray-400">(optional)</span>
+                  </label>
+                  <input
+                    value={allowedTidsStr}
+                    onChange={(e) => setAllowedTidsStr(e.target.value)}
+                    placeholder="leave empty to let any organisation register"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  />
+                  <p className="mt-1 text-xs text-amber-700">
+                    Empty means open registration: any Microsoft work or school
+                    account anywhere can sign in and be given a tenant. List
+                    directory IDs here to restrict it.
+                  </p>
+                </div>
+              </>
             )}
             <div>
               <label className="block text-xs font-medium text-gray-500 mb-1">Groups Claim</label>
