@@ -22,29 +22,57 @@
    Amber (parity) is deliberately not mapped to a utility scale: it marks the
    two parity shards in the mark and genuine parity/repair states, and loses
    that meaning the moment it becomes a general accent. */
-@theme {
-  --color-blue-50:  #eff8ff;
-  --color-blue-100: #dbeefe;
-  --color-blue-200: #a2d4ff;
-  --color-blue-300: #6fbdfa;
-  --color-blue-400: #45aef6;
-  --color-blue-500: #249ff3;
-  --color-blue-600: #0077c7;
-  --color-blue-700: #0063a8;
-  --color-blue-800: #054f87;
-  --color-blue-900: #0a4270;
+/* Semantic scale, per design/HANDOFF.md §2. `inline` matters: it makes the
+   utilities emit `var(--oio-*)` rather than the resolved value, which is what
+   lets [data-theme="dark"] switch at runtime.
 
-  --color-parity:   #fc9f30;
+   Two vocabularies coexist during the migration. The semantic names below are
+   what new work uses (`bg-surface`, `text-muted`, `border-border`). The grey
+   scale beneath them is a bridge so the not-yet-migrated pages keep resolving
+   through the same tokens instead of fixed hex; it goes away as pages move
+   over. */
+@theme inline {
+  --color-bg: var(--oio-bg);
+  --color-surface: var(--oio-surface);
+  --color-surface-2: var(--oio-surface2);
+  --color-border: var(--oio-border);
+  --color-border-strong: var(--oio-border-strong);
+  --color-text: var(--oio-text);
+  --color-text-2: var(--oio-text2);
+  --color-muted: var(--oio-muted);
+  --color-faint: var(--oio-faint);
 
-  /* Neutrals resolve through the semantic tokens. The mapping follows how the
-     markup already uses the scale: 50 is the page, 100 a raised surface, 200
-     and 300 borders, 400 and 500 secondary text, 600 and 700 body text, 800
-     and 900 the darkest ink.
+  --color-accent: var(--oio-accent);
+  --color-accent-fg: var(--oio-accent-fg);
+  --color-accent-soft: var(--oio-accent-soft);
+  --color-accent-ring: var(--oio-accent-ring);
+  --color-primary: var(--oio-primary);
+  --color-primary-fg: var(--oio-primary-fg);
+  --color-primary-hover: var(--oio-primary-hover);
 
-     `white` is deliberately NOT mapped. The markup uses it for two opposite
-     things — `bg-white` for a card surface and `text-white` for the label on a
-     filled button — and a single token cannot be both. Until those are split
-     in the markup, mapping it would invert one of them. */
+  --color-ok: var(--oio-ok);
+  --color-ok-soft: var(--oio-ok-soft);
+  --color-warn: var(--oio-warn);
+  --color-warn-soft: var(--oio-warn-soft);
+  --color-warn-dot: var(--oio-warn-dot);
+  --color-err: var(--oio-err);
+  --color-err-soft: var(--oio-err-soft);
+  --color-info: var(--oio-info);
+  --color-info-soft: var(--oio-info-soft);
+
+  --color-sidebar: var(--oio-sidebar);
+  --color-code-bg: var(--oio-code-bg);
+  --color-code-fg: var(--oio-code-fg);
+
+  --font-display: var(--oio-font-display);
+  --font-sans: var(--oio-font-body);
+  --font-mono: var(--oio-font-mono);
+
+  --radius-control: var(--oio-radius-control);
+  --radius-card: var(--oio-radius-card);
+  --radius-dialog: var(--oio-radius-dialog);
+
+  /* Transitional bridge — see note above. */
   --color-gray-50:  var(--oio-bg);
   --color-gray-100: var(--oio-surface2);
   --color-gray-200: var(--oio-border);
@@ -55,14 +83,9 @@
   --color-gray-700: var(--oio-text2);
   --color-gray-800: var(--oio-primary-hover);
   --color-gray-900: var(--oio-text);
-
-  /* Accent follows the semantic token so a theme switch moves it too. */
   --color-blue-600: var(--oio-accent);
   --color-blue-500: var(--oio-accent-ring);
-
-  --font-sans: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
-  --font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
-  --font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+  --color-parity:   var(--oio-warn-dot);
 }
 
 body {
