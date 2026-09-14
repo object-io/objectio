@@ -59,11 +59,18 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
       setError(err);
       window.history.replaceState({}, "", window.location.pathname);
     }
+    // Tenant scoping is meaningless on the operator console — a system
+    // admin has no tenant, and a tenant session would be refused here by
+    // the audience gate anyway. Ignoring the query keeps a stray
+    // ?tenant= from applying a scope the user cannot see.
     const t = params.get("tenant");
-    if (t) {
+    if (t && tenantApp) {
       setTenantInput(t);
       lookupTenant(t);
     }
+    // Runs once on mount. `tenantApp` is derived from the bundle's own
+    // appKind prop and cannot change for the life of the component.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Resolve the tenant's SSO config. Called on URL pre-fill and on
@@ -165,16 +172,14 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
             )}
 
             <form onSubmit={handleLogin} className="space-y-3">
-              {/* Account / Tenant. On the tenant console the field is
-                  always meaningful (every login here is a tenant
-                  login); on the ops console it's optional — empty
-                  means system-admin login. */}
+              {/* Account / Tenant. Only shown on the tenant console, where
+                  every login is a tenant login. The operator console is
+                  system-admin only, so there is nothing to scope and the
+                  field was just an empty box to skip past. */}
+              {tenantApp && (
               <div>
                 <label className="block text-[11px] font-semibold text-gray-700 mb-1">
                   Account
-                  {!tenantApp && (
-                    <span className="text-gray-400 font-normal"> (optional)</span>
-                  )}
                 </label>
                 <div className="relative">
                   <Building2
@@ -191,10 +196,8 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
                       setTenantLookupError("");
                     }}
                     onBlur={(e) => lookupTenant(e.target.value)}
-                    placeholder={
-                      tenantApp ? "your account name" : "tenant name (leave blank for system)"
-                    }
-                    autoFocus={tenantApp}
+                    placeholder="your account name"
+                    autoFocus
                     className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
                 </div>
@@ -210,6 +213,7 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
                   </p>
                 )}
               </div>
+              )}
 
               {/* Access key */}
               <div>
