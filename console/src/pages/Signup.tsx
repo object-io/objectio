@@ -57,7 +57,7 @@ export default function Signup() {
         <div className="bg-surface rounded-2xl border border-border shadow-sm p-7">
           <div className="flex items-center gap-2 mb-1">
             <Building2 size={16} className="text-faint" />
-            <h1 className="text-[15px] font-semibold text-text">
+            <h1 className="font-display text-[20px] leading-tight font-semibold text-text">
               Create an organisation account
             </h1>
           </div>

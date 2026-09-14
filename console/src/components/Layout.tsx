@@ -19,7 +19,7 @@ import {
   Lock,
 } from "lucide-react";
 import { useLicense, allows, type FeatureKey } from "../lib/license";
-import wordmarkOnDark from "../assets/brand/wordmark-dark.svg";
+import appIcon from "../assets/brand/app-icon.svg";
 
 interface NavItem {
   to: string;
@@ -67,21 +67,27 @@ export default function Layout({ user, tenant, onLogout }: Props) {
     <div className="flex h-screen">
       {/* Sidebar */}
       <aside className="w-[208px] bg-sidebar border-r border-border flex flex-col shrink-0">
-        {/* Brand block. Inverted against the rest of the sidebar, per the
-            artboard — it reads as the product mark rather than another nav
-            row, and the on-dark wordmark is the asset built for it. */}
-        <div className="bg-primary px-4 py-3.5">
+        {/* Brand block. Black is the icon tile only — the sidebar itself
+            stays white. An inverted full-width band reads as a title bar and
+            is not what the artboard does. */}
+        <div className="flex items-center gap-2 px-3.5 h-[60px] border-b border-border">
           <img
-            src={wordmarkOnDark}
-            alt="ObjectIO"
-            className="h-[22px] w-auto select-none"
+            src={appIcon}
+            alt=""
+            aria-hidden
+            className="w-[32px] h-[32px] shrink-0 select-none"
             draggable={false}
           />
-          <span className="block mt-1 font-mono text-[10px] uppercase tracking-[0.14em] text-primary-fg/55">
-            {isSystemAdmin ? "Ops console" : "Console"}
+          <span className="min-w-0">
+            <span className="block font-display text-[16px] leading-none font-semibold text-text">
+              Object<span className="text-accent-ring">IO</span>
+            </span>
+            <span className="block mt-1 font-mono text-[10px] uppercase tracking-[0.14em] text-muted">
+              {isSystemAdmin ? "Ops console" : "Console"}
+            </span>
           </span>
         </div>
-        <nav className="flex-1 p-2 space-y-px overflow-y-auto">
+        <nav className="flex-1 px-2 py-2.5 space-y-0.5 overflow-y-auto">
           {visibleNav.map(({ to, icon: Icon, label, feature }) => {
             // A feature-gated nav item still renders when locked so users
             // can see what Enterprise unlocks — but the link points to
@@ -96,16 +102,16 @@ export default function Layout({ user, tenant, onLogout }: Props) {
                 end={to === "/"}
                 title={locked ? `Requires Enterprise license — click to manage` : undefined}
                 className={({ isActive }) =>
-                  `flex items-center gap-2.5 px-2.5 py-1.5 rounded-control text-[12px] font-medium transition-colors ${
+                  `flex items-center gap-2.5 px-3 h-9 rounded-[10px] text-[13px] transition-colors ${
                     isActive && !locked
-                      ? "bg-accent-soft text-accent"
+                      ? "bg-accent-soft text-accent font-medium"
                       : locked
                         ? "text-faint hover:bg-surface-2"
-                        : "text-text-2 hover:bg-surface-2 hover:text-text"
+                        : "text-text hover:bg-surface-2"
                   }`
                 }
               >
-                <Icon size={15} />
+                <Icon size={16} className="shrink-0" />
                 <span className="flex-1 min-w-0 truncate">{label}</span>
                 {locked && <Lock size={11} className="text-faint shrink-0" />}
               </NavLink>

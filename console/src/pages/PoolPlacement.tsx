@@ -143,7 +143,7 @@ export default function PoolPlacement() {
             Pools
           </button>
           <div className="text-faint">/</div>
-          <h1 className="text-[16px] font-semibold text-text">{poolName}</h1>
+          <h1 className="font-display text-[20px] leading-tight font-semibold text-text">{poolName}</h1>
           {pool && (
             <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-2 text-text-2">
               {ecString(pool)}

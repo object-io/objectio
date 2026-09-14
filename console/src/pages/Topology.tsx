@@ -324,7 +324,9 @@ export default function Topology({ embedded = false }: Props = {}) {
     <div className="flex flex-col lg:flex-row gap-4 items-start">
       <div className="flex-1 min-w-0 w-full">
         {!embedded && (
-          <h1 className="text-[15px] font-medium text-text mb-4">Cluster topology</h1>
+          <h1 className="font-display text-[20px] leading-tight font-semibold text-text mb-5">
+            Cluster topology
+          </h1>
         )}
 
         {rebal && <RebalanceBanner status={rebal} busy={rebalBusy} onToggle={toggleRebalance} />}
