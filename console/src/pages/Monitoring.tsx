@@ -1,283 +1,414 @@
-import { useEffect, useRef, useState } from "react";
-import { RefreshCw, Pause, Play } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  LineChart,
   Line,
-  AreaChart,
-  Area,
-  BarChart,
+  LineChart,
   Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  Legend,
 } from "recharts";
+import { ExternalLink, Pause, Play } from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import Card from "../components/Card";
+import { Banner, ChartCard, StatTile, Tabs } from "../components/ui";
+import { LegendDot } from "../components/ui/ChartCard";
+import { seriesColor } from "../components/ui/chart-series";
 import { cluster } from "../api/client";
+import {
+  LIVE_INTERVAL_MS,
+  MAX_LIVE_POINTS,
+  PrometheusError,
+  QUERIES,
+  RANGES,
+  capabilities,
+  queryRange,
+  withRate,
+  type MetricsCapabilities,
+  type Series,
+} from "../api/metrics";
 
-// Time-series data point
-interface DataPoint {
+interface Point {
+  t: number;
   time: string;
-  timestamp: number;
-  [key: string]: string | number;
+  [k: string]: string | number;
 }
 
-// Metric definition for charts
-interface ChartDef {
-  title: string;
-  type: "line" | "area" | "bar";
-  keys: { metric: string; label: string; color: string }[];
-  unit?: string;
+/// Read one counter out of the Prometheus text exposition, optionally matching
+/// a label. Used only by the live view; the Prometheus path gets structured
+/// data back and needs none of this.
+function readCounter(text: string, name: string, label?: [string, string]): number {
+  const sel = label ? `\\{[^}]*${label[0]}="${label[1]}"[^}]*\\}` : "(?:\\{[^}]*\\})?";
+  const m = text.match(new RegExp(`^${name}${sel}\\s+(\\S+)`, "m"));
+  return m ? Number.parseFloat(m[1]) : 0;
 }
 
-// Parse a single numeric metric from Prometheus text
-function parseMetric(text: string, name: string): number {
-  const re = new RegExp(`^${name}(?:\\{[^}]*\\})?\\s+(\\S+)`, "m");
-  const m = text.match(re);
-  return m ? parseFloat(m[1]) : 0;
+/// Turn Prometheus series into the row-per-timestamp shape Recharts wants,
+/// keyed by a label so each series keeps its identity across the join.
+function toRows(series: Series[], key: string): { rows: Point[]; names: string[] } {
+  const names = series.map((s) => s.labels[key] ?? "value");
+  const byTime = new Map<number, Point>();
+  series.forEach((s, i) => {
+    for (const p of s.points) {
+      const row =
+        byTime.get(p.t) ??
+        ({ t: p.t, time: new Date(p.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) } as Point);
+      row[names[i]] = p.v;
+      byTime.set(p.t, row);
+    }
+  });
+  return { rows: [...byTime.values()].sort((a, b) => a.t - b.t), names };
 }
 
-// Parse labeled metric (e.g. objectio_s3_requests_total{operation="GetObject"})
-function parseLabeledMetric(text: string, name: string, label: string, value: string): number {
-  const re = new RegExp(`^${name}\\{[^}]*${label}="${value}"[^}]*\\}\\s+(\\S+)`, "m");
-  const m = text.match(re);
-  return m ? parseFloat(m[1]) : 0;
+const AXIS = { fontSize: 10, fontFamily: "var(--oio-font-mono)", fill: "var(--oio-faint)" };
+
+function chartAxes() {
+  return (
+    <>
+      <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+      <XAxis dataKey="time" tick={AXIS} tickLine={false} axisLine={false} minTickGap={40} />
+      <YAxis tick={AXIS} tickLine={false} axisLine={false} width={44} />
+      <Tooltip
+        contentStyle={{
+          background: "var(--oio-surface)",
+          border: "1px solid var(--oio-border-strong)",
+          borderRadius: 8,
+          fontSize: 11,
+        }}
+        cursor={{ stroke: "var(--oio-muted)", strokeDasharray: "3 3" }}
+      />
+    </>
+  );
 }
-
-// Chart definitions — what to plot
-const CHARTS: ChartDef[] = [
-  {
-    title: "S3 Requests (total)",
-    type: "area",
-    keys: [
-      { metric: "s3_get", label: "GetObject", color: "#3b82f6" },
-      { metric: "s3_put", label: "PutObject", color: "#10b981" },
-      { metric: "s3_delete", label: "DeleteObject", color: "#ef4444" },
-      { metric: "s3_list", label: "ListObjects", color: "#f59e0b" },
-    ],
-  },
-  {
-    title: "S3 Request Latency (seconds)",
-    type: "line",
-    unit: "s",
-    keys: [
-      { metric: "latency_sum", label: "Total Latency", color: "#8b5cf6" },
-    ],
-  },
-  {
-    title: "Iceberg Operations",
-    type: "bar",
-    keys: [
-      { metric: "iceberg_requests", label: "Requests", color: "#06b6d4" },
-    ],
-  },
-  {
-    title: "HTTP Response Codes",
-    type: "area",
-    keys: [
-      { metric: "http_2xx", label: "2xx", color: "#10b981" },
-      { metric: "http_4xx", label: "4xx", color: "#f59e0b" },
-      { metric: "http_5xx", label: "5xx", color: "#ef4444" },
-    ],
-  },
-];
-
-const MAX_POINTS = 60; // 5 minutes at 5s interval
-const POLL_INTERVAL = 5000;
 
 export default function Monitoring() {
-  const [history, setHistory] = useState<DataPoint[]>([]);
-  const [raw, setRaw] = useState("");
-  const [showRaw, setShowRaw] = useState(false);
+  const [caps, setCaps] = useState<MetricsCapabilities | null>(null);
+  const [range, setRange] = useState("5m");
   const [paused, setPaused] = useState(false);
-  const prevValues = useRef<Record<string, number>>({});
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [live, setLive] = useState<Point[]>([]);
+  const [promData, setPromData] = useState<Record<string, Series[]>>({});
+  const [promError, setPromError] = useState<PrometheusError | null>(null);
+  const prev = useRef<Record<string, number>>({});
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const scrape = async () => {
+  const selected = RANGES.find((r) => r.key === range) ?? RANGES[0];
+  const usingPrometheus = selected.needsPrometheus;
+
+  // --- live scrape -------------------------------------------------------
+  const scrape = useCallback(async () => {
     try {
       const text = await cluster.metrics();
-      setRaw(text);
-
-      const now = new Date();
-      const timeLabel = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-
-      // Current counter values
+      const now = Date.now();
       const current: Record<string, number> = {
-        s3_get: parseLabeledMetric(text, "objectio_s3_requests_total", "operation", "GetObject"),
-        s3_put: parseLabeledMetric(text, "objectio_s3_requests_total", "operation", "PutObject"),
-        s3_delete: parseLabeledMetric(text, "objectio_s3_requests_total", "operation", "DeleteObject"),
-        s3_list: parseLabeledMetric(text, "objectio_s3_requests_total", "operation", "ListObjects"),
-        latency_sum: parseMetric(text, "objectio_s3_request_duration_seconds_sum"),
-        iceberg_requests: parseMetric(text, "objectio_iceberg_requests_total"),
-        http_2xx: parseLabeledMetric(text, "objectio_http_responses_total", "status", "2xx"),
-        http_4xx: parseLabeledMetric(text, "objectio_http_responses_total", "status", "4xx"),
-        http_5xx: parseLabeledMetric(text, "objectio_http_responses_total", "status", "5xx"),
+        GetObject: readCounter(text, "objectio_s3_requests_total", ["operation", "GetObject"]),
+        PutObject: readCounter(text, "objectio_s3_requests_total", ["operation", "PutObject"]),
+        DeleteObject: readCounter(text, "objectio_s3_requests_total", ["operation", "DeleteObject"]),
+        ListObjects: readCounter(text, "objectio_s3_requests_total", ["operation", "ListObjects"]),
+        // The previous build read objectio_http_responses_total, which this
+        // server does not export — the error chart was flat zero. Errors are a
+        // status on the S3 counter.
+        client_error: readCounter(text, "objectio_s3_requests_total", ["status", "client_error"]),
+        server_error: readCounter(text, "objectio_s3_requests_total", ["status", "server_error"]),
+        iceberg: readCounter(text, "objectio_iceberg_requests_total"),
       };
-
-      // Compute rates (delta from previous scrape)
-      const prev = prevValues.current;
-      const point: DataPoint = { time: timeLabel, timestamp: now.getTime() };
-
-      for (const [key, val] of Object.entries(current)) {
-        if (prev[key] !== undefined) {
-          point[key] = Math.max(0, val - prev[key]);
-        } else {
-          point[key] = 0;
-        }
+      const point: Point = {
+        t: now,
+        time: new Date(now).toLocaleTimeString([], { minute: "2-digit", second: "2-digit" }),
+      };
+      for (const [k, v] of Object.entries(current)) {
+        // Counters only go up; a drop means the process restarted, and
+        // reporting the difference then would invent a huge negative spike.
+        const p = prev.current[k];
+        point[k] = p === undefined || v < p ? 0 : (v - p) / (LIVE_INTERVAL_MS / 1000);
       }
-
-      prevValues.current = current;
-
-      setHistory((h) => {
-        const next = [...h, point];
-        return next.length > MAX_POINTS ? next.slice(-MAX_POINTS) : next;
-      });
+      prev.current = current;
+      setLive((h) => [...h, point].slice(-MAX_LIVE_POINTS));
     } catch {
-      // ignore scrape errors
+      // A failed scrape is a gap, not a reason to tear the page down.
     }
-  };
+  }, []);
+
+  // --- prometheus --------------------------------------------------------
+  const loadRange = useCallback(async (seconds: number) => {
+    const q = (s: string) => withRate(s, seconds);
+    try {
+      const [ops, p50, p95, p99, errs, iceberg, thru, osd] = await Promise.all([
+        queryRange(q(QUERIES.requestsByOperation), seconds),
+        queryRange(q(QUERIES.latencyQuantile(0.5)), seconds),
+        queryRange(q(QUERIES.latencyQuantile(0.95)), seconds),
+        queryRange(q(QUERIES.latencyQuantile(0.99)), seconds),
+        queryRange(q(QUERIES.errorsByClass), seconds),
+        queryRange(q(QUERIES.icebergOps), seconds),
+        queryRange(q(QUERIES.throughputByInstance), seconds),
+        queryRange(q(QUERIES.osdLatencyByInstance), seconds),
+      ]);
+      setPromData({ ops, p50, p95, p99, errs, iceberg, thru, osd });
+      // Cleared on success rather than up front: a previous failure should stay
+      // on screen while the retry is in flight, and clearing it synchronously
+      // would be a setState inside the mount effect.
+      setPromError(null);
+    } catch (e) {
+      setPromError(
+        e instanceof PrometheusError ? e : new PrometheusError(String(e), "query_failed")
+      );
+    }
+  }, []);
 
   useEffect(() => {
-    // `scrape` is async and every setState in it happens after an await, so
-    // nothing here runs synchronously — the rule flags the call itself
-    // because it cannot see past the function boundary.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    scrape(); // initial
-    timerRef.current = setInterval(() => {
-      if (!paused) scrape();
-    }, POLL_INTERVAL);
-    return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [paused]);
+    capabilities().then(setCaps).catch(() => setCaps(null));
+  }, []);
 
-  const renderChart = (def: ChartDef) => {
-    const ChartComponent = def.type === "bar" ? BarChart : def.type === "area" ? AreaChart : LineChart;
+  useEffect(() => {
+    if (usingPrometheus) {
+      if (timer.current) clearInterval(timer.current);
+      // `loadRange` is async and sets state only after its awaits, so nothing
+      // here runs synchronously — the rule flags the call because it cannot
+      // see past the function boundary.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      void loadRange(selected.seconds);
+      return;
+    }
+    void scrape();
+    timer.current = setInterval(() => {
+      if (!paused) void scrape();
+    }, LIVE_INTERVAL_MS);
+    return () => {
+      if (timer.current) clearInterval(timer.current);
+    };
+  }, [usingPrometheus, selected.seconds, paused, scrape, loadRange]);
 
-    return (
-      <Card key={def.title} title={def.title}>
-        <div className="h-52">
-          <ResponsiveContainer width="100%" height="100%">
-            <ChartComponent data={history} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-              <XAxis
-                dataKey="time"
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
-                interval="preserveStartEnd"
-              />
-              <YAxis
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
-                width={40}
-                tickFormatter={(v: number) =>
-                  def.unit === "s" ? `${v.toFixed(2)}s` : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v)
-                }
-              />
-              <Tooltip
-                contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #e5e7eb" }}
-                labelStyle={{ fontWeight: 600 }}
-              />
-              <Legend iconSize={10} wrapperStyle={{ fontSize: 11 }} />
-              {def.keys.map(({ metric, label, color }) =>
-                def.type === "area" ? (
-                  <Area
-                    key={metric}
-                    type="monotone"
-                    dataKey={metric}
-                    name={label}
-                    stroke={color}
-                    fill={color}
-                    fillOpacity={0.15}
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                ) : def.type === "bar" ? (
-                  <Bar key={metric} dataKey={metric} name={label} fill={color} radius={[4, 4, 0, 0]} />
-                ) : (
-                  <Line
-                    key={metric}
-                    type="monotone"
-                    dataKey={metric}
-                    name={label}
-                    stroke={color}
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                )
-              )}
-            </ChartComponent>
-          </ResponsiveContainer>
-        </div>
-      </Card>
-    );
-  };
+  const promReady = caps?.prometheus === true;
+  const latest = live.at(-1);
 
-  // Summary stats from latest scrape
-  const latest = history.length > 0 ? history[history.length - 1] : null;
+  // Tiles come from the live scrape in both modes: they are a "right now"
+  // reading, and a range query would answer a different question.
+  const tiles = [
+    { label: "GET / s", value: latest ? latest.GetObject : 0, sub: "objectio_s3_requests_total" },
+    { label: "PUT / s", value: latest ? latest.PutObject : 0, sub: "objectio_s3_requests_total" },
+    { label: "Iceberg ops / s", value: latest ? latest.iceberg : 0, sub: "objectio_iceberg_requests_total" },
+    { label: "Errors / s", value: latest ? Number(latest.client_error) + Number(latest.server_error) : 0, sub: "4xx + 5xx" },
+  ];
+
+  const opsRows = usingPrometheus ? toRows(promData.ops ?? [], "operation") : null;
+  const errRows = usingPrometheus ? toRows(promData.errs ?? [], "status") : null;
+  const thruRows = usingPrometheus ? toRows(promData.thru ?? [], "instance") : null;
+  const osdRows = usingPrometheus ? toRows(promData.osd ?? [], "instance") : null;
+
+  const latencyRows = usingPrometheus
+    ? (() => {
+        const merged = new Map<number, Point>();
+        (["p50", "p95", "p99"] as const).forEach((k) => {
+          for (const s of promData[k] ?? []) {
+            for (const p of s.points) {
+              const row =
+                merged.get(p.t) ??
+                ({ t: p.t, time: new Date(p.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) } as Point);
+              row[k] = p.v * 1000; // seconds → ms
+              merged.set(p.t, row);
+            }
+          }
+        });
+        return [...merged.values()].sort((a, b) => a.t - b.t);
+      })()
+    : null;
 
   return (
     <div className="p-6">
       <PageHeader
         title="Monitoring"
-        description={`Live metrics (${POLL_INTERVAL / 1000}s refresh) — ${history.length} data points`}
+        description={
+          usingPrometheus
+            ? `From Prometheus · ${selected.label} window`
+            : `Live scrape · ${LIVE_INTERVAL_MS / 1000}s · ${live.length}/${MAX_LIVE_POINTS} points`
+        }
         action={
-          <div className="flex gap-2">
-            <button
-              onClick={() => setPaused(!paused)}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium ${
-                paused ? "bg-green-100 text-green-700 hover:bg-green-200" : "bg-surface-2 hover:bg-border"
-              }`}
-            >
-              {paused ? <Play size={14} /> : <Pause size={14} />}
-              {paused ? "Resume" : "Pause"}
-            </button>
-            <button
-              onClick={() => setShowRaw(!showRaw)}
-              className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
-            >
-              {showRaw ? "Charts" : "Raw"}
-            </button>
-            <button
-              onClick={scrape}
-              className="flex items-center gap-2 px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
-            >
-              <RefreshCw size={14} /> Now
-            </button>
-          </div>
+          <a
+            href="/metrics"
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-control border border-border-strong bg-surface text-[12px] font-medium text-text hover:bg-surface-2"
+          >
+            <ExternalLink size={13} /> Raw /metrics
+          </a>
         }
       />
 
-      {showRaw ? (
-        <pre className="bg-surface rounded-xl border border-border p-6 text-xs overflow-auto max-h-[70vh] font-mono">
-          {raw}
-        </pre>
-      ) : (
-        <>
-          {/* Summary cards */}
-          {latest && (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-              {[
-                { label: "GET/s", value: latest.s3_get, color: "text-accent" },
-                { label: "PUT/s", value: latest.s3_put, color: "text-green-600" },
-                { label: "Iceberg ops", value: latest.iceberg_requests, color: "text-cyan-600" },
-                { label: "Errors", value: (Number(latest.http_4xx || 0) + Number(latest.http_5xx || 0)), color: "text-red-600" },
-              ].map(({ label, value, color }) => (
-                <div key={label} className="bg-surface rounded-xl border border-border p-4">
-                  <p className="text-xs text-muted">{label}</p>
-                  <p className={`text-2xl font-semibold ${color}`}>
-                    {typeof value === "number" ? value.toFixed(0) : value}
-                  </p>
-                </div>
+      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
+        <Tabs
+          items={RANGES.map((r) => ({
+            key: r.key,
+            label: r.needsPrometheus && !promReady ? `${r.label} ·` : r.label,
+          }))}
+          value={range}
+          onChange={(k) => {
+            const opt = RANGES.find((r) => r.key === k);
+            // Longer windows are not a richer version of the live view — they
+            // are a different source. Without it, say so rather than showing an
+            // empty chart.
+            if (opt?.needsPrometheus && !promReady) return;
+            setRange(k);
+          }}
+        />
+        {!usingPrometheus && (
+          <button
+            onClick={() => setPaused((p) => !p)}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-control border border-border-strong bg-surface text-[12px] font-medium text-text hover:bg-surface-2"
+          >
+            {paused ? <Play size={13} /> : <Pause size={13} />}
+            {paused ? "Resume" : "Pause"}
+          </button>
+        )}
+      </div>
+
+      {!promReady && (
+        <Banner kind="warn" className="mb-4" title="Showing the last five minutes">
+          This gateway has no Prometheus configured, so history beyond the live
+          scrape, and any series grouped by node or gateway, are unavailable.
+          Set <code>--prometheus-url</code> to enable the longer ranges.
+        </Banner>
+      )}
+
+      {promError && (
+        <Banner kind="err" className="mb-4" title="Prometheus query failed">
+          {promError.message}
+        </Banner>
+      )}
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+        {tiles.map((t) => (
+          <StatTile
+            key={t.label}
+            label={t.label}
+            value={Number(t.value).toLocaleString(undefined, { maximumFractionDigits: 1 })}
+            sub={t.sub}
+          />
+        ))}
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4">
+        <ChartCard
+          title="S3 requests by operation"
+          subtitle="requests per second"
+          legend={
+            <div className="flex gap-3">
+              {(usingPrometheus ? (opsRows?.names ?? []) : ["GetObject", "PutObject", "DeleteObject", "ListObjects"])
+                .slice(0, 4)
+                .map((n, i) => (
+                  <LegendDot key={n} index={i} label={n} />
+                ))}
+            </div>
+          }
+        >
+          <ResponsiveContainer width="100%" height={220}>
+            <LineChart data={usingPrometheus ? (opsRows?.rows ?? []) : live}>
+              {chartAxes()}
+              {(usingPrometheus
+                ? (opsRows?.names ?? [])
+                : ["GetObject", "PutObject", "DeleteObject", "ListObjects"]
+              )
+                .slice(0, 4)
+                .map((n, i) => (
+                  <Line
+                    key={n}
+                    type="monotone"
+                    dataKey={n}
+                    stroke={seriesColor(i)}
+                    strokeWidth={2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                ))}
+            </LineChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard
+          title="S3 request latency"
+          subtitle="milliseconds · from the duration histogram"
+          legend={
+            <div className="flex gap-3">
+              {["p50", "p95", "p99"].map((n, i) => (
+                <LegendDot key={n} index={i} label={n} />
               ))}
             </div>
+          }
+        >
+          {usingPrometheus ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={latencyRows ?? []}>
+                {chartAxes()}
+                {["p50", "p95", "p99"].map((n, i) => (
+                  <Line key={n} type="monotone" dataKey={n} stroke={seriesColor(i)} strokeWidth={2} dot={false} isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <Unavailable reason="Percentiles are computed from the histogram by Prometheus; the live scrape reads only the running totals." />
           )}
+        </ChartCard>
 
-          {/* Charts */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {CHARTS.map(renderChart)}
-          </div>
-        </>
-      )}
+        <ChartCard title="Error responses" subtitle="per second · 4xx and 5xx">
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={usingPrometheus ? (errRows?.rows ?? []) : live}>
+              {chartAxes()}
+              {(usingPrometheus ? (errRows?.names ?? []) : ["client_error", "server_error"]).map((n, i) => (
+                <Bar key={n} dataKey={n} fill={seriesColor(i)} isAnimationActive={false} />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Iceberg catalog operations" subtitle="objectio_iceberg_requests_total">
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={usingPrometheus ? (toRows(promData.iceberg ?? [], "__name__").rows) : live}>
+              {chartAxes()}
+              <Bar dataKey={usingPrometheus ? "value" : "iceberg"} fill={seriesColor(0)} isAnimationActive={false} />
+            </BarChart>
+          </ResponsiveContainer>
+        </ChartCard>
+
+        <ChartCard title="Throughput per gateway" subtitle="response bytes per second, by instance">
+          {usingPrometheus ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={thruRows?.rows ?? []}>
+                {chartAxes()}
+                {(thruRows?.names ?? []).slice(0, 4).map((n, i) => (
+                  <Line key={n} type="monotone" dataKey={n} stroke={seriesColor(i)} strokeWidth={2} dot={false} isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <Unavailable reason="Grouping by gateway needs the instance label, which Prometheus adds when it scrapes. The raw /metrics text has no such label." />
+          )}
+        </ChartCard>
+
+        <ChartCard title="OSD request latency" subtitle="objectio_osd_grpc_latency_seconds, by instance">
+          {usingPrometheus ? (
+            <ResponsiveContainer width="100%" height={200}>
+              <LineChart data={osdRows?.rows ?? []}>
+                {chartAxes()}
+                {(osdRows?.names ?? []).slice(0, 4).map((n, i) => (
+                  <Line key={n} type="monotone" dataKey={n} stroke={seriesColor(i)} strokeWidth={2} dot={false} isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <Unavailable reason="OSD metrics live on each OSD's own :9201 endpoint, which the browser cannot reach. Prometheus already scrapes them." />
+          )}
+        </ChartCard>
+      </div>
+    </div>
+  );
+}
+
+/// Shown where a panel has no data source in the current mode. Says which
+/// source is missing rather than rendering an empty chart, which would read as
+/// "nothing is happening".
+function Unavailable({ reason }: { reason: string }) {
+  return (
+    <div className="h-[200px] flex items-center justify-center text-center px-6">
+      <p className="text-[11px] text-muted max-w-xs">{reason}</p>
     </div>
   );
 }
