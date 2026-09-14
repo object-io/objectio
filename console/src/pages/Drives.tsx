@@ -180,7 +180,7 @@ export default function Drives({ embedded = false }: Props = {}) {
           <div className="flex items-center gap-2">
             <button
               onClick={load}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
             >
               <RefreshCw size={13} /> Refresh
             </button>
@@ -195,14 +195,14 @@ export default function Drives({ embedded = false }: Props = {}) {
                   ? "Scale the OSD StatefulSet by +1 (k8s)"
                   : "Requires a host provider (k8s / linux / appliance). Set --host-provider on the gateway."
               }
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[12px] font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-accent text-primary-fg rounded-lg text-[12px] font-medium hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Plus size={13} /> {adding ? "Adding…" : "Add Host"}
             </button>
             <button
               disabled
               title="Per-host OSD provisioning (multiple OSDs on one host) is a later phase; Add Host covers single-OSD-per-pod today."
-              className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Plus size={13} /> Add OSDs
             </button>
@@ -214,14 +214,14 @@ export default function Drives({ embedded = false }: Props = {}) {
         <div className="flex items-center justify-end gap-2 mb-3">
           <button
             onClick={load}
-            className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 text-gray-700 rounded-lg text-[11px] font-medium hover:bg-gray-50"
+            className="flex items-center gap-1.5 px-2.5 py-1 border border-border text-text-2 rounded-lg text-[11px] font-medium hover:bg-surface-2"
           >
             <RefreshCw size={12} /> Refresh
           </button>
           <button
             onClick={addHost}
             disabled={adding || !provider?.supports_add_host}
-            className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-600 text-white rounded-lg text-[11px] font-medium hover:bg-blue-700 disabled:opacity-50"
+            className="flex items-center gap-1.5 px-2.5 py-1 bg-accent text-primary-fg rounded-lg text-[11px] font-medium hover:bg-accent disabled:opacity-50"
           >
             <Plus size={12} /> {adding ? "Adding…" : "Add Host"}
           </button>
@@ -239,14 +239,14 @@ export default function Drives({ embedded = false }: Props = {}) {
         <div className="relative flex-1 max-w-xs">
           <Search
             size={13}
-            className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400"
+            className="absolute left-2 top-1/2 -translate-y-1/2 text-faint"
           />
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search hosts or OSDs..."
-            className="w-full pl-7 pr-2 py-1.5 border border-gray-200 rounded-lg text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+            className="w-full pl-7 pr-2 py-1.5 border border-border rounded-lg text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
           />
         </div>
         <Tabs
@@ -262,7 +262,7 @@ export default function Drives({ embedded = false }: Props = {}) {
         <button
           disabled
           title="Advanced filters coming soon"
-          className="flex items-center gap-1.5 px-2.5 py-1.5 border border-gray-200 text-gray-600 rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50"
         >
           <SlidersHorizontal size={12} /> Filters
         </button>
@@ -270,8 +270,8 @@ export default function Drives({ embedded = false }: Props = {}) {
           onClick={() => setGroupByRack((v) => !v)}
           className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded-lg text-[12px] font-medium ${
             groupByRack
-              ? "border-blue-200 bg-blue-50 text-blue-700"
-              : "border-gray-200 text-gray-600 hover:bg-gray-50"
+              ? "border-accent bg-accent-soft text-accent"
+              : "border-border text-text-2 hover:bg-surface-2"
           }`}
           title="Topology grouping requires region/zone/dc/rack on the OSD — showing flat list until then"
         >
@@ -280,9 +280,9 @@ export default function Drives({ embedded = false }: Props = {}) {
       </div>
 
       {/* Table */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         {/* Header */}
-        <div className="grid grid-cols-[28px_1fr_120px_260px_220px_140px_40px] items-center gap-2 px-3 py-2 border-b border-gray-200 bg-gray-50 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+        <div className="grid grid-cols-[28px_1fr_120px_260px_220px_140px_40px] items-center gap-2 px-3 py-2 border-b border-border bg-surface-2 text-[11px] font-medium text-muted uppercase tracking-wider">
           <div />
           <div>Host / OSD</div>
           <div>Status</div>
@@ -295,14 +295,14 @@ export default function Drives({ embedded = false }: Props = {}) {
         {loading ? (
           <div className="p-8 text-center">
             <div className="flex items-center justify-center gap-3">
-              <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+              <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
               </div>
-              <span className="text-[12px] text-gray-400">Loading</span>
+              <span className="text-[12px] text-faint">Loading</span>
             </div>
           </div>
         ) : visibleHosts.length === 0 ? (
-          <div className="p-8 text-center text-[12px] text-gray-400">
+          <div className="p-8 text-center text-[12px] text-faint">
             {hosts.length === 0 ? "No hosts registered" : "No matches"}
           </div>
         ) : (
@@ -314,12 +314,12 @@ export default function Drives({ embedded = false }: Props = {}) {
               header={
                 <div className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2">
                   <div className="flex items-center gap-2 min-w-0">
-                    <Server size={15} className="text-blue-500 shrink-0" />
+                    <Server size={15} className="text-accent shrink-0" />
                     <div className="min-w-0">
-                      <div className="text-[13px] font-medium text-gray-900 truncate">
+                      <div className="text-[13px] font-medium text-text truncate">
                         {host.name}
                       </div>
-                      <div className="text-[11px] text-gray-400 font-mono truncate">
+                      <div className="text-[11px] text-faint font-mono truncate">
                         {host.osds[0]?.address
                           ?.replace("http://", "")
                           .replace(/:\d+$/, "") || host.k8sNode}
@@ -341,24 +341,24 @@ export default function Drives({ embedded = false }: Props = {}) {
                   />
                   <div className="flex items-center gap-1 flex-wrap">
                     {host.osInfo && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
+                      <span className="px-1.5 py-0.5 bg-surface-2 text-text-2 rounded text-[10px] font-medium">
                         {host.osInfo.split(" ")[0].toLowerCase()}
                       </span>
                     )}
                     {host.cpuCores > 0 && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
+                      <span className="px-1.5 py-0.5 bg-surface-2 text-text-2 rounded text-[10px] font-medium">
                         {host.cpuCores}c
                       </span>
                     )}
                     {host.memoryBytes > 0 && (
-                      <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
+                      <span className="px-1.5 py-0.5 bg-surface-2 text-text-2 rounded text-[10px] font-medium">
                         {formatBytes(host.memoryBytes)}
                       </span>
                     )}
                   </div>
                   <button
                     onClick={(e) => e.stopPropagation()}
-                    className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-700 justify-self-end"
+                    className="p-1 rounded hover:bg-surface-2 text-faint hover:text-text-2 justify-self-end"
                     title="More actions (not yet wired)"
                   >
                     <MoreVertical size={14} />
@@ -380,15 +380,15 @@ export default function Drives({ embedded = false }: Props = {}) {
 
 function OsdRow({ osd }: { osd: NodeInfo }) {
   return (
-    <div className="border-b border-gray-100 last:border-0 pl-9">
+    <div className="border-b border-border last:border-0 pl-9">
       <div className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2 py-2 pr-3">
         <div className="flex items-center gap-2 min-w-0">
           <Container size={13} className="text-orange-500 shrink-0" />
           <div className="min-w-0">
-            <div className="text-[12px] font-medium text-gray-800 truncate">
+            <div className="text-[12px] font-medium text-text truncate">
               {osd.pod_name || osd.node_name}
             </div>
-            <div className="text-[10px] text-gray-400 font-mono truncate">
+            <div className="text-[10px] text-faint font-mono truncate">
               {osd.address.replace("http://", "")}
               {osd.version && ` · v${osd.version}`}
             </div>
@@ -398,7 +398,7 @@ function OsdRow({ osd }: { osd: NodeInfo }) {
           status={osd.online ? "healthy" : "error"}
           label={osd.online ? "In / Up" : "Offline"}
         />
-        <div className="text-[11px] text-gray-400 font-mono">
+        <div className="text-[11px] text-faint font-mono">
           up {formatUptime(osd.uptime_seconds)}
         </div>
         <CapacityBar
@@ -409,7 +409,7 @@ function OsdRow({ osd }: { osd: NodeInfo }) {
         />
         <div className="flex items-center gap-1">
           {osd.disks[0]?.status && (
-            <span className="px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded text-[10px] font-medium">
+            <span className="px-1.5 py-0.5 bg-surface-2 text-text-2 rounded text-[10px] font-medium">
               {osd.disks[0].status}
             </span>
           )}
@@ -417,7 +417,7 @@ function OsdRow({ osd }: { osd: NodeInfo }) {
         <button
           disabled
           title="OSD management actions coming soon"
-          className="px-2 py-1 text-[11px] font-medium text-gray-400 border border-gray-200 rounded justify-self-end disabled:cursor-not-allowed"
+          className="px-2 py-1 text-[11px] font-medium text-faint border border-border rounded justify-self-end disabled:cursor-not-allowed"
         >
           Manage
         </button>
@@ -429,7 +429,7 @@ function OsdRow({ osd }: { osd: NodeInfo }) {
           {osd.disks.map((disk) => (
             <div
               key={disk.disk_id}
-              className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2 text-[11px] text-gray-500"
+              className="grid grid-cols-[1fr_120px_260px_220px_140px_40px] items-center gap-2 text-[11px] text-muted"
             >
               <div className="flex items-center gap-2 min-w-0">
                 <HardDrive

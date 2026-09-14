@@ -488,22 +488,22 @@ export default function UnityCatalog() {
         <div className="flex items-center gap-1 text-[12px] mb-4">
           <button
             onClick={goBack}
-            className="text-gray-400 hover:text-gray-600 p-0.5 mr-1"
+            className="text-faint hover:text-text-2 p-0.5 mr-1"
           >
             <ArrowLeft size={14} />
           </button>
           {breadcrumb.map((b, i) => (
             <span key={i} className="flex items-center gap-1">
-              {i > 0 && <ChevronRight size={12} className="text-gray-300" />}
+              {i > 0 && <ChevronRight size={12} className="text-faint" />}
               {b.action ? (
                 <button
                   onClick={b.action}
-                  className="text-gray-500 hover:text-blue-600"
+                  className="text-muted hover:text-accent"
                 >
                   {b.label}
                 </button>
               ) : (
-                <span className="text-gray-900 font-medium">{b.label}</span>
+                <span className="text-text font-medium">{b.label}</span>
               )}
             </span>
           ))}
@@ -526,29 +526,29 @@ export default function UnityCatalog() {
       {view === "catalogs" && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">Catalogs</h2>
+            <h2 className="text-[13px] font-medium text-text-2">Catalogs</h2>
             <button
               onClick={() => setShowCreateCat(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Catalog
             </button>
           </div>
 
           {showCreateCat && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-2">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-2">
               <input
                 value={newCatName}
                 onChange={(e) => setNewCatName(e.target.value)}
                 placeholder="catalog-name"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                 autoFocus
               />
               <input
                 value={newCatComment}
                 onChange={(e) => setNewCatComment(e.target.value)}
                 placeholder="comment (optional)"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex gap-2 justify-end">
                 <button
@@ -557,13 +557,13 @@ export default function UnityCatalog() {
                     setNewCatName("");
                     setNewCatComment("");
                   }}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createCatalog}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
@@ -571,25 +571,25 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Catalog
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Comment
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-40">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-40">
                     Created
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={4} />
                 ) : catalogs.length === 0 ? (
@@ -598,7 +598,7 @@ export default function UnityCatalog() {
                   catalogs.map((cat) => (
                     <tr
                       key={cat.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
+                      className="hover:bg-surface-2 cursor-pointer group"
                       onClick={() => openCatalog(cat)}
                     >
                       <td className="px-4 py-2.5">
@@ -609,14 +609,14 @@ export default function UnityCatalog() {
                           </span>
                           <ChevronRight
                             size={14}
-                            className="ml-auto text-gray-300"
+                            className="ml-auto text-faint"
                           />
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {cat.comment || "—"}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {fmtTs(cat.created_at)}
                       </td>
                       <td className="px-4 py-2.5 text-right">
@@ -625,7 +625,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             setPolicyTarget({ kind: "catalog", name: cat.name });
                           }}
-                          className="text-gray-400 hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit catalog policy"
                         >
                           <Shield size={13} />
@@ -635,7 +635,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteCatalog(cat.name);
                           }}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -653,31 +653,31 @@ export default function UnityCatalog() {
       {view === "schemas" && selectedCat && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Schemas in {selectedCat.name}
             </h2>
             <button
               onClick={() => setShowCreateSchema(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Schema
             </button>
           </div>
 
           {showCreateSchema && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-2">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-2">
               <input
                 value={newSchemaName}
                 onChange={(e) => setNewSchemaName(e.target.value)}
                 placeholder="schema_name"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                 autoFocus
               />
               <input
                 value={newSchemaComment}
                 onChange={(e) => setNewSchemaComment(e.target.value)}
                 placeholder="comment (optional)"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex gap-2 justify-end">
                 <button
@@ -686,13 +686,13 @@ export default function UnityCatalog() {
                     setNewSchemaName("");
                     setNewSchemaComment("");
                   }}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createSchema}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
@@ -700,22 +700,22 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Schema
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Comment
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={3} />
                 ) : schemas.length === 0 ? (
@@ -724,7 +724,7 @@ export default function UnityCatalog() {
                   schemas.map((s) => (
                     <tr
                       key={s.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
+                      className="hover:bg-surface-2 cursor-pointer group"
                       onClick={() => openSchema(s)}
                     >
                       <td className="px-4 py-2.5">
@@ -735,11 +735,11 @@ export default function UnityCatalog() {
                           </span>
                           <ChevronRight
                             size={14}
-                            className="ml-auto text-gray-300"
+                            className="ml-auto text-faint"
                           />
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {s.comment || "—"}
                       </td>
                       <td className="px-4 py-2.5 text-right">
@@ -752,7 +752,7 @@ export default function UnityCatalog() {
                               schema: s.name,
                             });
                           }}
-                          className="text-gray-400 hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit schema policy"
                         >
                           <Shield size={13} />
@@ -762,7 +762,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteSchema(s.name);
                           }}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -780,7 +780,7 @@ export default function UnityCatalog() {
       {view === "tables" && selectedCat && selectedSchema && (
         <>
           {/* Tab bar — Tables / Functions / Volumes / Models */}
-          <div className="flex border-b border-gray-200 mb-4">
+          <div className="flex border-b border-border mb-4">
             {(
               [
                 { key: "tables", label: "Tables", icon: Table2, count: tables.length },
@@ -807,13 +807,13 @@ export default function UnityCatalog() {
                   onClick={() => setEntityTab(t.key)}
                   className={`flex items-center gap-1.5 px-3 py-2 text-[12px] font-medium border-b-2 -mb-px transition-colors ${
                     active
-                      ? "border-blue-600 text-blue-600"
-                      : "border-transparent text-gray-500 hover:text-gray-900"
+                      ? "border-accent text-accent"
+                      : "border-transparent text-muted hover:text-text"
                   }`}
                 >
                   <Icon size={14} />
                   {t.label}
-                  <span className="text-gray-400 font-mono">({t.count})</span>
+                  <span className="text-faint font-mono">({t.count})</span>
                 </button>
               );
             })}
@@ -828,53 +828,53 @@ export default function UnityCatalog() {
         selectedSchema && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Tables in {selectedCat.name}.{selectedSchema.name}
             </h2>
             <button
               onClick={() => setShowCreateTable(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Table
             </button>
           </div>
 
           {showCreateTable && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-3">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-3">
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Table name
                   </label>
                   <input
                     value={newTableName}
                     onChange={(e) => setNewTableName(e.target.value)}
                     placeholder="events"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                     autoFocus
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Type
                   </label>
                   <select
                     value={newTableType}
                     onChange={(e) => setNewTableType(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="MANAGED">MANAGED</option>
                     <option value="EXTERNAL">EXTERNAL</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Format
                   </label>
                   <select
                     value={newTableFormat}
                     onChange={(e) => setNewTableFormat(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="DELTA">DELTA</option>
                     <option value="ICEBERG">ICEBERG</option>
@@ -887,21 +887,21 @@ export default function UnityCatalog() {
 
               {newTableType === "EXTERNAL" && (
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Storage location (s3://bucket/path/)
                   </label>
                   <input
                     value={newTableLocation}
                     onChange={(e) => setNewTableLocation(e.target.value)}
                     placeholder="s3://my-bucket/external/events/"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                   />
                 </div>
               )}
 
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-[10px] font-medium text-gray-500 uppercase tracking-wider">
+                  <label className="text-[10px] font-medium text-muted uppercase tracking-wider">
                     Columns
                   </label>
                   <button
@@ -911,7 +911,7 @@ export default function UnityCatalog() {
                         { ...DEFAULT_COLUMN },
                       ])
                     }
-                    className="text-[11px] text-blue-600 hover:text-blue-800"
+                    className="text-[11px] text-accent hover:text-accent"
                   >
                     + add column
                   </button>
@@ -927,7 +927,7 @@ export default function UnityCatalog() {
                           })
                         }
                         placeholder="column_name"
-                        className="flex-1 px-2 py-1 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                        className="flex-1 px-2 py-1 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                       />
                       <input
                         value={c.type_text}
@@ -937,9 +937,9 @@ export default function UnityCatalog() {
                           })
                         }
                         placeholder="string"
-                        className="w-32 px-2 py-1 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                        className="w-32 px-2 py-1 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                       />
-                      <label className="flex items-center gap-1 text-[11px] text-gray-600">
+                      <label className="flex items-center gap-1 text-[11px] text-text-2">
                         <input
                           type="checkbox"
                           checked={c.nullable}
@@ -960,7 +960,7 @@ export default function UnityCatalog() {
                             newTableColumns.filter((_, j) => j !== i),
                           )
                         }
-                        className="text-gray-400 hover:text-red-600 p-1"
+                        className="text-faint hover:text-red-600 p-1"
                         disabled={newTableColumns.length === 1}
                       >
                         <X size={12} />
@@ -973,13 +973,13 @@ export default function UnityCatalog() {
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={resetTableForm}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createTable}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
@@ -987,28 +987,28 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Table
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
                     Type
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
                     Format
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Location
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={5} />
                 ) : tables.length === 0 ? (
@@ -1017,7 +1017,7 @@ export default function UnityCatalog() {
                   tables.map((t) => (
                     <tr
                       key={t.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
+                      className="hover:bg-surface-2 cursor-pointer group"
                       onClick={() => openTable(t.name)}
                     >
                       <td className="px-4 py-2.5">
@@ -1028,17 +1028,17 @@ export default function UnityCatalog() {
                           </span>
                           <ChevronRight
                             size={14}
-                            className="ml-auto text-gray-300"
+                            className="ml-auto text-faint"
                           />
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {t.table_type}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {t.data_source_format}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono truncate max-w-[280px]">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono truncate max-w-[280px]">
                         {t.storage_location}
                       </td>
                       <td className="px-4 py-2.5 text-right">
@@ -1056,7 +1056,7 @@ export default function UnityCatalog() {
                             (t.column_masks &&
                               Object.keys(t.column_masks).length > 0)
                               ? "text-emerald-600 hover:text-emerald-700 opacity-100"
-                              : "text-gray-400 hover:text-emerald-600 opacity-0 group-hover:opacity-100"
+                              : "text-faint hover:text-emerald-600 opacity-0 group-hover:opacity-100"
                           }`}
                           title={
                             t.row_filter ||
@@ -1078,7 +1078,7 @@ export default function UnityCatalog() {
                               table: t.name,
                             });
                           }}
-                          className="text-gray-400 hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-indigo-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           title="Edit table policy"
                         >
                           <Shield size={13} />
@@ -1088,7 +1088,7 @@ export default function UnityCatalog() {
                             e.stopPropagation();
                             deleteTable(t.name);
                           }}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1109,66 +1109,66 @@ export default function UnityCatalog() {
         selectedSchema && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Functions in {selectedCat.name}.{selectedSchema.name}
             </h2>
             <button
               onClick={() => setShowCreateFunction(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Function
             </button>
           </div>
 
           {showCreateFunction && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-3">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-3">
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Function name
                   </label>
                   <input
                     value={newFnName}
                     onChange={(e) => setNewFnName(e.target.value)}
                     placeholder="lower"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                     autoFocus
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Routine body
                   </label>
                   <select
                     value={newFnRoutineBody}
                     onChange={(e) => setNewFnRoutineBody(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="SQL">SQL</option>
                     <option value="EXTERNAL">EXTERNAL</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Return type
                   </label>
                   <input
                     value={newFnDataType}
                     onChange={(e) => setNewFnDataType(e.target.value)}
                     placeholder="STRING"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                   />
                 </div>
               </div>
               {newFnRoutineBody === "EXTERNAL" && (
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     External language
                   </label>
                   <select
                     value={newFnExternalLanguage}
                     onChange={(e) => setNewFnExternalLanguage(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="PYTHON">PYTHON</option>
                     <option value="SCALA">SCALA</option>
@@ -1177,7 +1177,7 @@ export default function UnityCatalog() {
                 </div>
               )}
               <div>
-                <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                   Routine definition
                 </label>
                 <textarea
@@ -1185,25 +1185,25 @@ export default function UnityCatalog() {
                   onChange={(e) => setNewFnDefinition(e.target.value)}
                   placeholder="RETURN LOWER(input_value)"
                   rows={4}
-                  className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                  className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[12px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                 />
               </div>
               <input
                 value={newFnComment}
                 onChange={(e) => setNewFnComment(e.target.value)}
                 placeholder="comment (optional)"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setShowCreateFunction(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createFunction}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
@@ -1211,35 +1211,35 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Function
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-28">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-28">
                     Body
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-28">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-28">
                     Returns
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Definition
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={5} />
                 ) : functions.length === 0 ? (
                   <EmptyRow cols={5} text="No functions in this schema." />
                 ) : (
                   functions.map((f) => (
-                    <tr key={f.name} className="hover:bg-gray-50 group">
+                    <tr key={f.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
                           <Sigma size={14} className="text-purple-500" />
@@ -1248,20 +1248,20 @@ export default function UnityCatalog() {
                           </span>
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {f.routine_body}
                         {f.external_language ? ` (${f.external_language})` : ""}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono">
                         {f.data_type || "—"}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono truncate max-w-[280px]">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono truncate max-w-[280px]">
                         {f.routine_definition}
                       </td>
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteFunction(f.name)}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1282,40 +1282,40 @@ export default function UnityCatalog() {
         selectedSchema && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Volumes in {selectedCat.name}.{selectedSchema.name}
             </h2>
             <button
               onClick={() => setShowCreateVolume(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Volume
             </button>
           </div>
 
           {showCreateVolume && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-3">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-3">
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Volume name
                   </label>
                   <input
                     value={newVolName}
                     onChange={(e) => setNewVolName(e.target.value)}
                     placeholder="raw_data"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                     autoFocus
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Type
                   </label>
                   <select
                     value={newVolType}
                     onChange={(e) => setNewVolType(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="MANAGED">MANAGED</option>
                     <option value="EXTERNAL">EXTERNAL</option>
@@ -1324,14 +1324,14 @@ export default function UnityCatalog() {
               </div>
               {newVolType === "EXTERNAL" && (
                 <div>
-                  <label className="block text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">
+                  <label className="block text-[10px] font-medium text-muted uppercase tracking-wider mb-1">
                     Storage location (s3://bucket/path/)
                   </label>
                   <input
                     value={newVolLocation}
                     onChange={(e) => setNewVolLocation(e.target.value)}
                     placeholder="s3://my-bucket/external/raw/"
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                   />
                 </div>
               )}
@@ -1339,18 +1339,18 @@ export default function UnityCatalog() {
                 value={newVolComment}
                 onChange={(e) => setNewVolComment(e.target.value)}
                 placeholder="comment (optional)"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setShowCreateVolume(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createVolume}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
@@ -1358,32 +1358,32 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Volume
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
                     Type
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Storage location
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={4} />
                 ) : volumes.length === 0 ? (
                   <EmptyRow cols={4} text="No volumes in this schema." />
                 ) : (
                   volumes.map((v) => (
-                    <tr key={v.name} className="hover:bg-gray-50 group">
+                    <tr key={v.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
                           <HardDrive size={14} className="text-cyan-500" />
@@ -1392,16 +1392,16 @@ export default function UnityCatalog() {
                           </span>
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {v.volume_type}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono truncate max-w-[360px]">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono truncate max-w-[360px]">
                         {v.storage_location}
                       </td>
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteVolume(v.name)}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1422,42 +1422,42 @@ export default function UnityCatalog() {
         selectedSchema && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Models in {selectedCat.name}.{selectedSchema.name}
             </h2>
             <button
               onClick={() => setShowCreateModel(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Register Model
             </button>
           </div>
 
           {showCreateModel && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4 space-y-2">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4 space-y-2">
               <input
                 value={newModelName}
                 onChange={(e) => setNewModelName(e.target.value)}
                 placeholder="model_name"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                 autoFocus
               />
               <input
                 value={newModelComment}
                 onChange={(e) => setNewModelComment(e.target.value)}
                 placeholder="comment (optional)"
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
               />
               <div className="flex gap-2 justify-end">
                 <button
                   onClick={() => setShowCreateModel(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={createModel}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Register
                 </button>
@@ -1465,32 +1465,32 @@ export default function UnityCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Model
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Storage location
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Comment
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <LoadingRow cols={4} />
                 ) : models.length === 0 ? (
                   <EmptyRow cols={4} text="No models in this schema." />
                 ) : (
                   models.map((m) => (
-                    <tr key={m.name} className="hover:bg-gray-50 group">
+                    <tr key={m.name} className="hover:bg-surface-2 group">
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
                           <Brain size={14} className="text-pink-500" />
@@ -1499,16 +1499,16 @@ export default function UnityCatalog() {
                           </span>
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono truncate max-w-[360px]">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono truncate max-w-[360px]">
                         {m.storage_location}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500">
+                      <td className="px-4 py-2.5 text-[12px] text-muted">
                         {m.comment || "—"}
                       </td>
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteModel(m.name)}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -1524,9 +1524,9 @@ export default function UnityCatalog() {
 
       {/* ================= Detail ================= */}
       {view === "detail" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200">
-            <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+        <div className="bg-surface rounded-xl border border-border overflow-hidden">
+          <div className="px-4 py-2.5 bg-surface-2 border-b border-border">
+            <h3 className="text-[11px] font-medium text-muted uppercase tracking-wider">
               Table Metadata
             </h3>
           </div>
@@ -1546,39 +1546,39 @@ export default function UnityCatalog() {
               />
               {selectedTable.columns && selectedTable.columns.length > 0 && (
                 <div>
-                  <h4 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">
+                  <h4 className="text-[11px] font-medium text-muted uppercase tracking-wider mb-2">
                     Columns
                   </h4>
-                  <table className="w-full border border-gray-200 rounded-lg overflow-hidden">
-                    <thead className="bg-gray-50">
+                  <table className="w-full border border-border rounded-lg overflow-hidden">
+                    <thead className="bg-surface-2">
                       <tr>
-                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-gray-500">
+                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-muted">
                           #
                         </th>
-                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-gray-500">
+                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-muted">
                           Name
                         </th>
-                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-gray-500">
+                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-muted">
                           Type
                         </th>
-                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-gray-500">
+                        <th className="text-left px-3 py-1.5 text-[11px] font-medium text-muted">
                           Nullable
                         </th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100">
+                    <tbody className="divide-y divide-border">
                       {selectedTable.columns.map((c) => (
                         <tr key={c.position}>
-                          <td className="px-3 py-1.5 text-[12px] text-gray-500 font-mono">
+                          <td className="px-3 py-1.5 text-[12px] text-muted font-mono">
                             {c.position}
                           </td>
                           <td className="px-3 py-1.5 text-[12px] font-mono font-medium">
                             {c.name}
                           </td>
-                          <td className="px-3 py-1.5 text-[12px] text-gray-600 font-mono">
+                          <td className="px-3 py-1.5 text-[12px] text-text-2 font-mono">
                             {c.type_text}
                           </td>
-                          <td className="px-3 py-1.5 text-[12px] text-gray-500">
+                          <td className="px-3 py-1.5 text-[12px] text-muted">
                             {c.nullable ? "yes" : "no"}
                           </td>
                         </tr>
@@ -1591,10 +1591,10 @@ export default function UnityCatalog() {
           ) : (
             <div className="p-4">
               <div className="flex items-center justify-center gap-3 py-8">
-                <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                  <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                  <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                 </div>
-                <span className="text-[12px] text-gray-400">Loading</span>
+                <span className="text-[12px] text-faint">Loading</span>
               </div>
             </div>
           )}
@@ -1670,10 +1670,10 @@ function LoadingRow({ cols }: { cols: number }) {
     <tr>
       <td colSpan={cols} className="px-4 py-8 text-center">
         <div className="flex items-center justify-center gap-3">
-          <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-            <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+          <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+            <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
           </div>
-          <span className="text-[12px] text-gray-400">Loading</span>
+          <span className="text-[12px] text-faint">Loading</span>
         </div>
       </td>
     </tr>
@@ -1685,7 +1685,7 @@ function EmptyRow({ cols, text }: { cols: number; text: string }) {
     <tr>
       <td
         colSpan={cols}
-        className="px-4 py-8 text-center text-[12px] text-gray-400"
+        className="px-4 py-8 text-center text-[12px] text-faint"
       >
         {text}
       </td>
@@ -1698,8 +1698,8 @@ function DetailGrid({ rows }: { rows: [string, string][] }) {
     <dl className="grid grid-cols-[180px_1fr] gap-x-4 gap-y-1.5 text-[12px]">
       {rows.map(([k, v]) => (
         <div key={k} className="contents">
-          <dt className="text-gray-500">{k}</dt>
-          <dd className="text-gray-900 font-mono break-all">{v || "—"}</dd>
+          <dt className="text-muted">{k}</dt>
+          <dd className="text-text font-mono break-all">{v || "—"}</dd>
         </div>
       ))}
     </dl>

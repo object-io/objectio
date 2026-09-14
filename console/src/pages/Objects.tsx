@@ -108,30 +108,30 @@ export default function Objects() {
           title="Object Browser"
           description="Browse and manage objects in S3 buckets"
         />
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <div className="bg-surface rounded-xl border border-border overflow-hidden">
           <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
+            <thead className="bg-surface-2 border-b border-border">
               <tr>
-                <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                   Bucket
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-border">
               {loading ? (
                 <tr>
                   <td className="px-4 py-8 text-center">
                     <div className="flex items-center justify-center gap-3">
-                      <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                        <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                      <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                        <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                       </div>
-                      <span className="text-[12px] text-gray-400">Loading</span>
+                      <span className="text-[12px] text-faint">Loading</span>
                     </div>
                   </td>
                 </tr>
               ) : buckets.length === 0 ? (
                 <tr>
-                  <td className="px-4 py-8 text-center text-[12px] text-gray-400">
+                  <td className="px-4 py-8 text-center text-[12px] text-faint">
                     No buckets
                   </td>
                 </tr>
@@ -140,12 +140,12 @@ export default function Objects() {
                   <tr
                     key={b.name}
                     onClick={() => openBucket(b.name)}
-                    className="hover:bg-gray-50 cursor-pointer"
+                    className="hover:bg-surface-2 cursor-pointer"
                   >
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-2.5">
                         <Archive size={14} className="text-orange-500" />
-                        <span className="text-[13px] font-medium text-gray-900">
+                        <span className="text-[13px] font-medium text-text">
                           {b.name}
                         </span>
                       </div>
@@ -168,24 +168,24 @@ export default function Objects() {
         description="Browse and manage objects in S3 buckets"
       />
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         {/* Breadcrumb bar */}
-        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between">
-          <div className="flex items-center gap-0 text-[13px] text-gray-500 min-w-0">
+        <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div className="flex items-center gap-0 text-[13px] text-muted min-w-0">
             {pathSegments.map((seg, i) => (
               <span key={i} className="flex items-center">
                 {i > 0 && (
-                  <span className="mx-2 text-gray-300">/</span>
+                  <span className="mx-2 text-faint">/</span>
                 )}
                 <button
                   onClick={() => {
                     if (i === 0) loadObjects(selectedBucket, "");
                     else loadObjects(selectedBucket, seg.path);
                   }}
-                  className={`hover:text-gray-900 ${
+                  className={`hover:text-text ${
                     i === pathSegments.length - 1
-                      ? "text-gray-900 font-medium"
-                      : "text-gray-500"
+                      ? "text-text font-medium"
+                      : "text-muted"
                   }`}
                 >
                   {seg.label}
@@ -197,20 +197,20 @@ export default function Objects() {
           {/* Toolbar icons */}
           <div className="flex items-center gap-1 ml-4">
             <button
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded"
+              className="p-1.5 text-faint hover:text-text-2 hover:bg-surface-2 rounded"
               title="New folder"
             >
               <FolderPlus size={15} />
             </button>
             <button
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded"
+              className="p-1.5 text-faint hover:text-text-2 hover:bg-surface-2 rounded"
               title="Upload"
             >
               <Upload size={15} />
             </button>
             <button
               onClick={() => loadObjects(selectedBucket, prefix)}
-              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded"
+              className="p-1.5 text-faint hover:text-text-2 hover:bg-surface-2 rounded"
               title="Refresh"
             >
               <RefreshCw size={15} />
@@ -222,51 +222,51 @@ export default function Objects() {
         <div className="max-h-[calc(100vh-230px)] overflow-auto">
           {loading ? (
             <div className="flex items-center justify-center gap-3 py-12">
-              <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+              <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
               </div>
-              <span className="text-[12px] text-gray-400">Loading</span>
+              <span className="text-[12px] text-faint">Loading</span>
             </div>
           ) : folderCount === 0 && fileCount === 0 && !prefix ? (
             <div className="py-12 text-center">
-              <Folder size={28} className="mx-auto mb-2 text-gray-300" />
-              <p className="text-[12px] text-gray-400">Empty bucket</p>
+              <Folder size={28} className="mx-auto mb-2 text-faint" />
+              <p className="text-[12px] text-faint">Empty bucket</p>
             </div>
           ) : (
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-100 sticky top-0">
+              <thead className="bg-surface-2 border-b border-border sticky top-0">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Name
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-28">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-28">
                     Size
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-36">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-36">
                     Modified
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-50">
+              <tbody className="divide-y divide-border">
                 {/* Parent folder (..) */}
                 {(prefix || selectedBucket) && (
                   <tr
                     onClick={navigateUp}
-                    className="hover:bg-gray-50 cursor-pointer"
+                    className="hover:bg-surface-2 cursor-pointer"
                   >
                     <td className="px-4 py-2">
                       <div className="flex items-center gap-2.5">
                         <Folder
                           size={15}
-                          className="text-gray-400 flex-shrink-0"
+                          className="text-faint flex-shrink-0"
                         />
-                        <span className="text-[13px] text-gray-500">..</span>
+                        <span className="text-[13px] text-muted">..</span>
                       </div>
                     </td>
-                    <td className="px-4 py-2 text-right text-[12px] text-gray-300">
+                    <td className="px-4 py-2 text-right text-[12px] text-faint">
                       -
                     </td>
-                    <td className="px-4 py-2 text-right text-[12px] text-gray-300">
+                    <td className="px-4 py-2 text-right text-[12px] text-faint">
                       -
                     </td>
                   </tr>
@@ -277,7 +277,7 @@ export default function Objects() {
                   return (
                     <tr
                       key={p}
-                      className="hover:bg-gray-50 cursor-pointer"
+                      className="hover:bg-surface-2 cursor-pointer"
                       onClick={() => loadObjects(selectedBucket, p)}
                     >
                       <td className="px-4 py-2">
@@ -287,15 +287,15 @@ export default function Objects() {
                             className="text-yellow-500 flex-shrink-0"
                             fill="currentColor"
                           />
-                          <span className="text-[13px] text-gray-900">
+                          <span className="text-[13px] text-text">
                             {name}/
                           </span>
                         </div>
                       </td>
-                      <td className="px-4 py-2 text-right text-[12px] text-gray-300">
+                      <td className="px-4 py-2 text-right text-[12px] text-faint">
                         -
                       </td>
-                      <td className="px-4 py-2 text-right text-[12px] text-gray-300">
+                      <td className="px-4 py-2 text-right text-[12px] text-faint">
                         -
                       </td>
                     </tr>
@@ -307,22 +307,22 @@ export default function Objects() {
                   .map((o) => {
                     const name = o.key.replace(prefix, "");
                     return (
-                      <tr key={o.key} className="hover:bg-gray-50">
+                      <tr key={o.key} className="hover:bg-surface-2">
                         <td className="px-4 py-2">
                           <div className="flex items-center gap-2.5">
                             <File
                               size={15}
-                              className="text-gray-400 flex-shrink-0"
+                              className="text-faint flex-shrink-0"
                             />
-                            <span className="text-[13px] text-gray-700 font-mono">
+                            <span className="text-[13px] text-text-2 font-mono">
                               {name}
                             </span>
                           </div>
                         </td>
-                        <td className="px-4 py-2 text-right text-[12px] text-gray-500 font-mono">
+                        <td className="px-4 py-2 text-right text-[12px] text-muted font-mono">
                           {formatSize(o.size)}
                         </td>
-                        <td className="px-4 py-2 text-right text-[12px] text-gray-500">
+                        <td className="px-4 py-2 text-right text-[12px] text-muted">
                           {o.last_modified
                             ? new Date(
                                 o.last_modified * 1000
@@ -337,7 +337,7 @@ export default function Objects() {
                   <tr>
                     <td
                       colSpan={3}
-                      className="px-4 py-8 text-center text-[12px] text-gray-400"
+                      className="px-4 py-8 text-center text-[12px] text-faint"
                     >
                       Empty folder
                     </td>
@@ -349,7 +349,7 @@ export default function Objects() {
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-1.5 border-t border-gray-100 bg-gray-50 text-[11px] text-gray-400">
+        <div className="px-4 py-1.5 border-t border-border bg-surface-2 text-[11px] text-faint">
           {folderCount} folder{folderCount !== 1 ? "s" : ""}, {fileCount} file
           {fileCount !== 1 ? "s" : ""}
         </div>

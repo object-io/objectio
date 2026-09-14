@@ -92,35 +92,35 @@ export default function PolicyEditor({ scope, load, save, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col"
+        className="bg-surface rounded-xl shadow-xl w-full max-w-2xl max-h-[85vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between px-5 py-3 border-b border-gray-200">
+        <div className="flex items-start justify-between px-5 py-3 border-b border-border">
           <div className="flex items-center gap-2">
             <Shield size={16} className="text-indigo-500" />
             <div>
-              <h2 className="text-[14px] font-semibold text-gray-900">
+              <h2 className="text-[14px] font-semibold text-text">
                 Policy
               </h2>
-              <div className="text-[12px] text-gray-500 font-mono">{scope}</div>
+              <div className="text-[12px] text-muted font-mono">{scope}</div>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-700 p-1 rounded hover:bg-gray-50"
+            className="text-faint hover:text-text-2 p-1 rounded hover:bg-surface-2"
           >
             <X size={14} />
           </button>
         </div>
 
-        <div className="px-5 py-3 text-[12px] text-gray-600 border-b border-gray-100">
+        <div className="px-5 py-3 text-[12px] text-text-2 border-b border-border">
           IAM-shape JSON. Evaluated <span className="font-medium">after</span>{" "}
           attached IAM policies, before child entities. Deny at any level wins.
           Empty saves clear the policy.
         </div>
 
         {loading ? (
-          <div className="p-8 text-center text-[12px] text-gray-400">
+          <div className="p-8 text-center text-[12px] text-faint">
             Loading…
           </div>
         ) : (
@@ -139,17 +139,17 @@ export default function PolicyEditor({ scope, load, save, onClose }: Props) {
           </div>
         )}
 
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-border bg-surface-2 rounded-b-xl">
           <button
             onClick={onClose}
-            className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-white"
+            className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface"
           >
             Cancel
           </button>
           <button
             onClick={onSave}
             disabled={busy || loading}
-            className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800 disabled:opacity-50"
+            className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover disabled:opacity-50"
           >
             {busy ? "Saving…" : "Save"}
           </button>

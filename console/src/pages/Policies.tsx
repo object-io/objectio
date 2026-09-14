@@ -338,13 +338,13 @@ export default function Policies() {
           <div className="flex gap-2">
             <button
               onClick={() => setShowAttach(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+              className="flex items-center gap-1.5 px-3 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
             >
               <Link2 size={14} /> Attach
             </button>
             <button
               onClick={() => setShowCreate(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Policy
             </button>
@@ -354,19 +354,19 @@ export default function Policies() {
 
       {/* Attach dialog */}
       {showAttach && (
-        <div className="mb-4 bg-white rounded-xl border border-gray-200 p-4">
+        <div className="mb-4 bg-surface rounded-xl border border-border p-4">
           <h3 className="text-[12px] font-medium mb-2">
             Attach Policy to User or Group
           </h3>
           <div className="grid grid-cols-3 gap-2 mb-2">
             <div>
-              <label className="block text-[11px] text-gray-500 mb-1">
+              <label className="block text-[11px] text-muted mb-1">
                 Policy
               </label>
               <select
                 value={attachPolicy}
                 onChange={(e) => setAttachPolicy(e.target.value)}
-                className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
               >
                 <option value="">Select policy...</option>
                 {policies.map((p) => (
@@ -377,7 +377,7 @@ export default function Policies() {
               </select>
             </div>
             <div>
-              <label className="block text-[11px] text-gray-500 mb-1">
+              <label className="block text-[11px] text-muted mb-1">
                 User
               </label>
               <select
@@ -386,7 +386,7 @@ export default function Policies() {
                   setAttachUserId(e.target.value);
                   if (e.target.value) setAttachGroupId("");
                 }}
-                className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
               >
                 <option value="">— pick user —</option>
                 {users.map((u) => (
@@ -397,7 +397,7 @@ export default function Policies() {
               </select>
             </div>
             <div>
-              <label className="block text-[11px] text-gray-500 mb-1">
+              <label className="block text-[11px] text-muted mb-1">
                 Group
               </label>
               <select
@@ -407,7 +407,7 @@ export default function Policies() {
                   if (e.target.value) setAttachUserId("");
                 }}
                 disabled={!!attachUserId}
-                className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-gray-50 disabled:text-gray-400"
+                className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent disabled:bg-surface-2 disabled:text-faint"
               >
                 <option value="">— pick group —</option>
                 {groups.map((g) => (
@@ -429,7 +429,7 @@ export default function Policies() {
           <div className="flex gap-1.5">
             <button
               onClick={doAttach}
-              className="px-3 py-1.5 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+              className="px-3 py-1.5 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
             >
               Attach
             </button>
@@ -439,7 +439,7 @@ export default function Policies() {
                 setAttachErr(null);
                 setAttachMsg(null);
               }}
-              className="px-3 py-1.5 text-gray-500 text-[11px]"
+              className="px-3 py-1.5 text-muted text-[11px]"
             >
               Close
             </button>
@@ -449,32 +449,32 @@ export default function Policies() {
 
       {/* Create dialog */}
       {showCreate && (
-        <div className="mb-4 bg-white rounded-xl border border-gray-200 p-4">
+        <div className="mb-4 bg-surface rounded-xl border border-border p-4">
           <h3 className="text-[12px] font-medium mb-2">Create Policy</h3>
           <div className="mb-2">
             <input
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               placeholder="Policy name"
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500 mb-2"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent mb-2"
             />
             <div className="space-y-1.5 mb-2">
               <div className="flex gap-1.5 items-center flex-wrap">
-                <span className="text-[11px] text-gray-500 py-0.5 w-12">
+                <span className="text-[11px] text-muted py-0.5 w-12">
                   S3:
                 </span>
                 {["s3-readonly", "s3-readwrite", "s3-writeonly", "s3-deny-non-sts"].map((t) => (
                   <button
                     key={t}
                     onClick={() => applyTemplate(t)}
-                    className="px-2 py-0.5 rounded border border-gray-200 text-[11px] text-gray-600 hover:bg-gray-50"
+                    className="px-2 py-0.5 rounded border border-border text-[11px] text-text-2 hover:bg-surface-2"
                   >
                     {t.replace("s3-", "")}
                   </button>
                 ))}
               </div>
               <div className="flex gap-1.5 items-center flex-wrap">
-                <span className="text-[11px] text-gray-500 py-0.5 w-12">
+                <span className="text-[11px] text-muted py-0.5 w-12">
                   Unity:
                 </span>
                 {[
@@ -487,7 +487,7 @@ export default function Policies() {
                   <button
                     key={t}
                     onClick={() => applyTemplate(t)}
-                    className="px-2 py-0.5 rounded border border-gray-200 text-[11px] text-gray-600 hover:bg-gray-50"
+                    className="px-2 py-0.5 rounded border border-border text-[11px] text-text-2 hover:bg-surface-2"
                   >
                     {t.replace("unity-", "")}
                   </button>
@@ -499,19 +499,19 @@ export default function Policies() {
               onChange={(e) => setNewPolicyJson(e.target.value)}
               placeholder='{"Version":"2012-10-17","Statement":[...]}'
               rows={8}
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[12px] font-mono focus:outline-none focus:ring-1 focus:ring-blue-500 bg-gray-50"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[12px] font-mono focus:outline-none focus:ring-1 focus:ring-accent bg-surface-2"
             />
           </div>
           <div className="flex gap-1.5">
             <button
               onClick={createPolicy}
-              className="px-3 py-1.5 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+              className="px-3 py-1.5 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
             >
               Create
             </button>
             <button
               onClick={() => setShowCreate(false)}
-              className="px-3 py-1.5 text-gray-500 text-[11px]"
+              className="px-3 py-1.5 text-muted text-[11px]"
             >
               Cancel
             </button>
@@ -520,28 +520,28 @@ export default function Policies() {
       )}
 
       {/* Policies table */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-surface-2 border-b border-border">
             <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 Policy
               </th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                 Actions
               </th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20"></th>
+              <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20"></th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-50">
+          <tbody className="divide-y divide-border">
             {loading ? (
               <tr>
                 <td colSpan={3} className="px-4 py-6 text-center">
                   <div className="flex items-center justify-center gap-3">
-                    <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                      <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                    <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                      <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                     </div>
-                    <span className="text-[12px] text-gray-400">Loading</span>
+                    <span className="text-[12px] text-faint">Loading</span>
                   </div>
                 </td>
               </tr>
@@ -549,7 +549,7 @@ export default function Policies() {
               <tr>
                 <td
                   colSpan={3}
-                  className="px-4 py-6 text-center text-[12px] text-gray-400"
+                  className="px-4 py-6 text-center text-[12px] text-faint"
                 >
                   No policies
                 </td>
@@ -568,15 +568,15 @@ export default function Policies() {
                   "consoleAdmin",
                 ].includes(p.name);
                 return (
-                  <tr key={p.name} className="hover:bg-gray-50 group">
+                  <tr key={p.name} className="hover:bg-surface-2 group">
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-2">
-                        <Shield size={13} className="text-blue-500" />
+                        <Shield size={13} className="text-accent" />
                         <span className="text-[13px] font-medium">
                           {p.name}
                         </span>
                         {isBuiltin && (
-                          <span className="text-[10px] px-1 py-0.5 bg-gray-100 text-gray-500 rounded">
+                          <span className="text-[10px] px-1 py-0.5 bg-surface-2 text-muted rounded">
                             built-in
                           </span>
                         )}
@@ -587,13 +587,13 @@ export default function Policies() {
                         {actions.slice(0, 4).map((a: string, i: number) => (
                           <span
                             key={i}
-                            className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded font-mono"
+                            className="text-[10px] px-1.5 py-0.5 bg-accent-soft text-accent rounded font-mono"
                           >
                             {a}
                           </span>
                         ))}
                         {actions.length > 4 && (
-                          <span className="text-[10px] text-gray-400">
+                          <span className="text-[10px] text-faint">
                             +{actions.length - 4} more
                           </span>
                         )}
@@ -603,7 +603,7 @@ export default function Policies() {
                       {!isBuiltin && (
                         <button
                           onClick={() => deletePolicy(p.name)}
-                          className="text-gray-300 hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>

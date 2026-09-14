@@ -77,7 +77,7 @@ export default function Layout({ user, tenant, onLogout }: Props) {
             className="h-[22px] w-auto select-none"
             draggable={false}
           />
-          <span className="block mt-1 font-mono text-[10px] uppercase tracking-[0.14em] text-white/55">
+          <span className="block mt-1 font-mono text-[10px] uppercase tracking-[0.14em] text-primary-fg/55">
             {isSystemAdmin ? "Ops console" : "Console"}
           </span>
         </div>

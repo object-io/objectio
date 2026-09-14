@@ -225,7 +225,7 @@ export default function Monitoring() {
             <button
               onClick={() => setPaused(!paused)}
               className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium ${
-                paused ? "bg-green-100 text-green-700 hover:bg-green-200" : "bg-gray-100 hover:bg-gray-200"
+                paused ? "bg-green-100 text-green-700 hover:bg-green-200" : "bg-surface-2 hover:bg-border"
               }`}
             >
               {paused ? <Play size={14} /> : <Pause size={14} />}
@@ -233,13 +233,13 @@ export default function Monitoring() {
             </button>
             <button
               onClick={() => setShowRaw(!showRaw)}
-              className="px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium hover:bg-gray-200"
+              className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
             >
               {showRaw ? "Charts" : "Raw"}
             </button>
             <button
               onClick={scrape}
-              className="flex items-center gap-2 px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium hover:bg-gray-200"
+              className="flex items-center gap-2 px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
             >
               <RefreshCw size={14} /> Now
             </button>
@@ -248,7 +248,7 @@ export default function Monitoring() {
       />
 
       {showRaw ? (
-        <pre className="bg-white rounded-xl border border-gray-200 p-6 text-xs overflow-auto max-h-[70vh] font-mono">
+        <pre className="bg-surface rounded-xl border border-border p-6 text-xs overflow-auto max-h-[70vh] font-mono">
           {raw}
         </pre>
       ) : (
@@ -257,13 +257,13 @@ export default function Monitoring() {
           {latest && (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
               {[
-                { label: "GET/s", value: latest.s3_get, color: "text-blue-600" },
+                { label: "GET/s", value: latest.s3_get, color: "text-accent" },
                 { label: "PUT/s", value: latest.s3_put, color: "text-green-600" },
                 { label: "Iceberg ops", value: latest.iceberg_requests, color: "text-cyan-600" },
                 { label: "Errors", value: (Number(latest.http_4xx || 0) + Number(latest.http_5xx || 0)), color: "text-red-600" },
               ].map(({ label, value, color }) => (
-                <div key={label} className="bg-white rounded-xl border border-gray-200 p-4">
-                  <p className="text-xs text-gray-500">{label}</p>
+                <div key={label} className="bg-surface rounded-xl border border-border p-4">
+                  <p className="text-xs text-muted">{label}</p>
                   <p className={`text-2xl font-semibold ${color}`}>
                     {typeof value === "number" ? value.toFixed(0) : value}
                   </p>

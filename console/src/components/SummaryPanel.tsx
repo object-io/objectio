@@ -64,14 +64,14 @@ export default function SummaryPanel({
     <aside
       className={`w-72 shrink-0 sticky top-0 self-start ${className}`}
     >
-      <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-200">
-          <h3 className="text-[13px] font-semibold text-gray-900 flex items-center gap-1.5">
-            <Info size={13} className="text-gray-400" />
+      <div className="bg-surface border border-border rounded-xl overflow-hidden">
+        <div className="px-4 py-3 border-b border-border">
+          <h3 className="text-[13px] font-semibold text-text flex items-center gap-1.5">
+            <Info size={13} className="text-faint" />
             {title}
           </h3>
           {subtitle && (
-            <p className="mt-0.5 text-[11px] text-gray-500">{subtitle}</p>
+            <p className="mt-0.5 text-[11px] text-muted">{subtitle}</p>
           )}
         </div>
 
@@ -104,9 +104,9 @@ export default function SummaryPanel({
         <dl className="px-4 py-3 space-y-2">
           {rows.map((r, i) => (
             <div key={i} className="flex items-baseline justify-between gap-3">
-              <dt className="text-[11px] text-gray-500 shrink-0">{r.label}</dt>
+              <dt className="text-[11px] text-muted shrink-0">{r.label}</dt>
               <dd
-                className={`text-[12px] text-right text-gray-900 ${r.mono ? "font-mono" : "font-medium"}`}
+                className={`text-[12px] text-right text-text ${r.mono ? "font-mono" : "font-medium"}`}
               >
                 {r.value}
               </dd>
@@ -114,7 +114,7 @@ export default function SummaryPanel({
           ))}
         </dl>
 
-        {footer && <div className="px-4 py-3 border-t border-gray-200">{footer}</div>}
+        {footer && <div className="px-4 py-3 border-t border-border">{footer}</div>}
       </div>
     </aside>
   );

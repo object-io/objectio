@@ -85,7 +85,7 @@ function ecMinNodes(p: Pool) {
 
 function ecTypeBadge(ec_type: number) {
   if (ec_type === 1) return "bg-orange-100 text-orange-800";
-  if (ec_type === 2) return "bg-blue-100 text-blue-800";
+  if (ec_type === 2) return "bg-accent-soft text-accent";
   return "bg-green-100 text-green-800";
 }
 
@@ -232,7 +232,7 @@ export default function Pools({ embedded = false }: PoolsProps = {}) {
             !editing ? (
               <button
                 onClick={() => startEdit()}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[12px] font-medium hover:bg-blue-700"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-accent text-primary-fg rounded-lg text-[12px] font-medium hover:bg-accent"
               >
                 <Plus size={14} /> Create Pool
               </button>
@@ -244,7 +244,7 @@ export default function Pools({ embedded = false }: PoolsProps = {}) {
         <div className="flex items-center justify-end mb-3">
           <button
             onClick={() => startEdit()}
-            className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-600 text-white rounded-lg text-[11px] font-medium hover:bg-blue-700"
+            className="flex items-center gap-1.5 px-2.5 py-1 bg-accent text-primary-fg rounded-lg text-[11px] font-medium hover:bg-accent"
           >
             <Plus size={12} /> Create Pool
           </button>
@@ -329,17 +329,17 @@ function PoolWizard({
     <div className="flex gap-4 items-start">
       {/* Form column */}
       <div className="flex-1 min-w-0 space-y-4">
-        <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between gap-4">
+        <div className="bg-surface border border-border rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-4">
             <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center">
-                <Layers size={14} className="text-blue-600" />
+              <div className="w-8 h-8 rounded-lg bg-accent-soft flex items-center justify-center">
+                <Layers size={14} className="text-accent" />
               </div>
               <div>
-                <h2 className="text-[14px] font-semibold text-gray-900">
+                <h2 className="text-[14px] font-semibold text-text">
                   {isNew ? "Create Storage Pool" : `Edit: ${editing}`}
                 </h2>
-                <p className="text-[11px] text-gray-500">
+                <p className="text-[11px] text-muted">
                   Configure redundancy, placement, and policies.
                 </p>
               </div>
@@ -433,14 +433,14 @@ function PoolWizard({
             <div className="flex gap-1.5">
               <button
                 onClick={onCancel}
-                className="flex-1 px-2.5 py-1.5 border border-gray-200 text-gray-700 rounded-md text-[12px] font-medium hover:bg-gray-50"
+                className="flex-1 px-2.5 py-1.5 border border-border text-text-2 rounded-md text-[12px] font-medium hover:bg-surface-2"
               >
                 Cancel
               </button>
               <button
                 onClick={onSave}
                 disabled={validation.kind === "error" || !form.name.trim()}
-                className="flex-1 flex items-center justify-center gap-1 px-2.5 py-1.5 bg-blue-600 text-white rounded-md text-[12px] font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex-1 flex items-center justify-center gap-1 px-2.5 py-1.5 bg-accent text-primary-fg rounded-md text-[12px] font-medium hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Check size={12} />
                 {isNew ? "Create Pool" : "Apply"}
@@ -495,7 +495,7 @@ function ConfigTab({
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               disabled={!isNew}
               placeholder="production-nvme-pool"
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none disabled:bg-surface-2"
             />
           </FormField>
           <FormField label="Application Type">
@@ -504,7 +504,7 @@ function ConfigTab({
               onChange={(e) =>
                 setForm({ ...form, description: e.target.value })
               }
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
             >
               <option value="">Object / S3</option>
               <option value="Database (Block)">Database (Block)</option>
@@ -545,8 +545,8 @@ function ConfigTab({
         </div>
 
         {form.ec_type === 2 ? (
-          <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-lg">
-            <div className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">
+          <div className="mt-3 p-3 bg-surface-2 border border-border rounded-lg">
+            <div className="text-[11px] text-muted uppercase tracking-wider mb-2">
               Replica Count
             </div>
             <Stepper
@@ -564,13 +564,13 @@ function ConfigTab({
             </div>
           </div>
         ) : (
-          <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-lg">
-            <div className="text-[11px] text-gray-500 uppercase tracking-wider mb-2">
+          <div className="mt-3 p-3 bg-surface-2 border border-border rounded-lg">
+            <div className="text-[11px] text-muted uppercase tracking-wider mb-2">
               Erasure Code Profile (K + M)
             </div>
             <div className="flex items-start gap-8">
               <div>
-                <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">
+                <div className="text-[10px] text-faint uppercase tracking-wider mb-1">
                   Data Chunks (K)
                 </div>
                 <Stepper
@@ -581,7 +581,7 @@ function ConfigTab({
                 />
               </div>
               <div>
-                <div className="text-[10px] text-gray-400 uppercase tracking-wider mb-1">
+                <div className="text-[10px] text-faint uppercase tracking-wider mb-1">
                   Coding Chunks (M)
                 </div>
                 <Stepper
@@ -607,7 +607,7 @@ function ConfigTab({
         title="Placement & Failure Domain"
         icon={<Layers size={13} />}
         rightAccessory={
-          <button className="flex items-center gap-1 text-[11px] text-blue-600 hover:text-blue-700">
+          <button className="flex items-center gap-1 text-[11px] text-accent hover:text-accent">
             View Topology <ExternalLink size={10} />
           </button>
         }
@@ -621,7 +621,7 @@ function ConfigTab({
             onChange={(e) =>
               setForm({ ...form, failure_domain: e.target.value })
             }
-            className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+            className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
           >
             <option value="osd">OSD (disk-level)</option>
             <option
@@ -650,12 +650,12 @@ function ConfigTab({
               <input
                 readOnly
                 value={crushRuleName(form)}
-                className="flex-1 px-2.5 py-1.5 border border-gray-200 bg-gray-50 rounded-lg text-[13px] font-mono text-gray-700"
+                className="flex-1 px-2.5 py-1.5 border border-border bg-surface-2 rounded-lg text-[13px] font-mono text-text-2"
               />
               <button
                 disabled
                 title="CRUSH rule editor is admin-only; coming soon"
-                className="px-3 py-1.5 border border-gray-200 text-gray-500 rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="px-3 py-1.5 border border-border text-muted rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Edit Rule
               </button>
@@ -686,7 +686,7 @@ function ConfigTab({
               value={tagsStr}
               onChange={(e) => setTagsStr(e.target.value)}
               placeholder="nvme, ssd"
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none"
             />
           </FormField>
           <FormField label="Storage Quota" hint="Optional">
@@ -695,7 +695,7 @@ function ConfigTab({
               onChange={(e) =>
                 setForm({ ...form, quota_bytes: Number(e.target.value) })
               }
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
             >
               <option value={0}>Unlimited</option>
               <option value={107374182400}>100 GB</option>
@@ -713,7 +713,7 @@ function ConfigTab({
               onChange={(e) =>
                 setForm({ ...form, pg_count: Number(e.target.value) })
               }
-              className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
             >
               <option value={0}>0 (legacy)</option>
               <option value={64}>64</option>
@@ -727,7 +727,7 @@ function ConfigTab({
           </FormField>
         </div>
         {osdCount > 0 && (
-          <p className="mt-2 text-[11px] text-gray-400">
+          <p className="mt-2 text-[11px] text-faint">
             {osdCount} OSDs on {k8sNodeCount} host
             {k8sNodeCount !== 1 ? "s" : ""} available in the cluster.
           </p>
@@ -753,10 +753,10 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="border border-gray-200 rounded-xl">
-      <header className="flex items-center justify-between px-4 py-2.5 border-b border-gray-200 bg-gray-50">
-        <div className="flex items-center gap-1.5 text-[12px] font-semibold text-gray-800">
-          <span className="text-gray-400">{icon}</span>
+    <section className="border border-border rounded-xl">
+      <header className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-surface-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold text-text">
+          <span className="text-faint">{icon}</span>
           {title}
         </div>
         {rightAccessory}
@@ -777,8 +777,8 @@ function FormField({
 }) {
   return (
     <label className="block">
-      <div className="text-[11px] font-medium text-gray-700 mb-1">{label}</div>
-      {hint && <div className="text-[10px] text-gray-400 mb-1">{hint}</div>}
+      <div className="text-[11px] font-medium text-text-2 mb-1">{label}</div>
+      {hint && <div className="text-[10px] text-faint mb-1">{hint}</div>}
       {children}
     </label>
   );
@@ -800,21 +800,21 @@ function RadioCard({
       onClick={onClick}
       className={`text-left p-3 rounded-lg border transition-colors ${
         selected
-          ? "border-blue-400 bg-blue-50 ring-1 ring-blue-400"
-          : "border-gray-200 hover:bg-gray-50"
+          ? "border-accent bg-accent-soft ring-1 ring-accent"
+          : "border-border hover:bg-surface-2"
       }`}
     >
       <div className="flex items-center gap-2 mb-1">
         <span
           className={`w-3 h-3 rounded-full border-2 flex items-center justify-center shrink-0 ${
-            selected ? "border-blue-500" : "border-gray-300"
+            selected ? "border-accent" : "border-border-strong"
           }`}
         >
-          {selected && <span className="w-1.5 h-1.5 bg-blue-500 rounded-full" />}
+          {selected && <span className="w-1.5 h-1.5 bg-accent rounded-full" />}
         </span>
-        <span className="text-[13px] font-semibold text-gray-900">{title}</span>
+        <span className="text-[13px] font-semibold text-text">{title}</span>
       </div>
-      <p className="text-[11px] text-gray-500">{desc}</p>
+      <p className="text-[11px] text-muted">{desc}</p>
     </button>
   );
 }
@@ -833,10 +833,10 @@ function Stepper({
   width?: string;
 }) {
   return (
-    <div className={`inline-flex items-center border border-gray-300 rounded-lg ${width}`}>
+    <div className={`inline-flex items-center border border-border-strong rounded-lg ${width}`}>
       <button
         onClick={() => onChange(Math.max(min, value - 1))}
-        className="px-2 py-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-50 rounded-l-lg"
+        className="px-2 py-1.5 text-muted hover:text-text hover:bg-surface-2 rounded-l-lg"
         aria-label="Decrement"
       >
         <Minus size={12} />
@@ -850,11 +850,11 @@ function Stepper({
           const n = Number(e.target.value);
           if (!Number.isNaN(n)) onChange(Math.min(max, Math.max(min, n)));
         }}
-        className="flex-1 min-w-0 px-1 py-1 text-center text-[13px] font-semibold text-gray-900 focus:outline-none tabular-nums"
+        className="flex-1 min-w-0 px-1 py-1 text-center text-[13px] font-semibold text-text focus:outline-none tabular-nums"
       />
       <button
         onClick={() => onChange(Math.min(max, value + 1))}
-        className="px-2 py-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-50 rounded-r-lg"
+        className="px-2 py-1.5 text-muted hover:text-text hover:bg-surface-2 rounded-r-lg"
         aria-label="Increment"
       >
         <PlusIcon size={12} />
@@ -875,21 +875,21 @@ function FeatureToggle({
   onChange: (b: boolean) => void;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3 p-3 border border-gray-200 rounded-lg">
+    <div className="flex items-start justify-between gap-3 p-3 border border-border rounded-lg">
       <div>
-        <div className="text-[13px] font-semibold text-gray-900">{title}</div>
-        <div className="text-[11px] text-gray-500">{desc}</div>
+        <div className="text-[13px] font-semibold text-text">{title}</div>
+        <div className="text-[11px] text-muted">{desc}</div>
       </div>
       <button
         onClick={() => onChange(!checked)}
         role="switch"
         aria-checked={checked}
         className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${
-          checked ? "bg-emerald-500" : "bg-gray-300"
+          checked ? "bg-emerald-500" : "bg-border-strong"
         }`}
       >
         <span
-          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+          className={`inline-block h-4 w-4 transform rounded-full bg-surface transition-transform ${
             checked ? "translate-x-4" : "translate-x-0.5"
           }`}
         />
@@ -907,10 +907,10 @@ function Tag({
 }) {
   const style =
     tone === "blue"
-      ? "bg-blue-50 text-blue-700 border-blue-200"
+      ? "bg-accent-soft text-accent border-accent"
       : tone === "green"
         ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-        : "bg-gray-100 text-gray-700 border-gray-200";
+        : "bg-surface-2 text-text-2 border-border";
   return (
     <span
       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${style}`}
@@ -929,8 +929,8 @@ function EmptyTabPlaceholder({
 }) {
   return (
     <div className="py-12 text-center">
-      <div className="text-[14px] font-semibold text-gray-900">{title}</div>
-      <p className="mt-1 text-[12px] text-gray-500 max-w-md mx-auto">{message}</p>
+      <div className="text-[14px] font-semibold text-text">{title}</div>
+      <p className="mt-1 text-[12px] text-muted max-w-md mx-auto">{message}</p>
     </div>
   );
 }
@@ -953,48 +953,48 @@ function PoolList({
   onViewPlacement?: (name: string) => void;
 }) {
   return (
-    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+    <div className="bg-surface rounded-xl border border-border overflow-hidden">
       <table className="w-full">
-        <thead className="bg-gray-50 border-b border-gray-200">
+        <thead className="bg-surface-2 border-b border-border">
           <tr>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Pool
             </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Protection
             </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Efficiency
             </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Domain
             </th>
             <th
-              className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider"
+              className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider"
               title="Placement groups — 0 = legacy per-object CRUSH"
             >
               PGs
             </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Quota
             </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
               Status
             </th>
-            <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-24">
+            <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
               Actions
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-gray-100">
+        <tbody className="divide-y divide-border">
           {loading ? (
             <tr>
               <td colSpan={8} className="px-4 py-8 text-center">
                 <div className="flex items-center justify-center gap-3">
-                  <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                    <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                  <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                    <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                   </div>
-                  <span className="text-[12px] text-gray-400">Loading</span>
+                  <span className="text-[12px] text-faint">Loading</span>
                 </div>
               </td>
             </tr>
@@ -1002,21 +1002,21 @@ function PoolList({
             <tr>
               <td
                 colSpan={8}
-                className="px-4 py-8 text-center text-[12px] text-gray-400"
+                className="px-4 py-8 text-center text-[12px] text-faint"
               >
                 No storage pools configured
               </td>
             </tr>
           ) : (
             pools.map((p) => (
-              <tr key={p.name} className="hover:bg-gray-50 group">
+              <tr key={p.name} className="hover:bg-surface-2 group">
                 <td className="px-4 py-2">
                   <div className="flex items-center gap-2">
-                    <Layers size={14} className="text-blue-500" />
+                    <Layers size={14} className="text-accent" />
                     <div>
                       <span className="text-[13px] font-medium">{p.name}</span>
                       {p.description && (
-                        <p className="text-[10px] text-gray-400">
+                        <p className="text-[10px] text-faint">
                           {p.description}
                         </p>
                       )}
@@ -1030,18 +1030,18 @@ function PoolList({
                     >
                       {ecTypeName(p.ec_type)}
                     </span>
-                    <span className="text-[12px] font-mono text-gray-700">
+                    <span className="text-[12px] font-mono text-text-2">
                       {ecLabel(p)}
                     </span>
                   </div>
                 </td>
-                <td className="px-4 py-2 text-[12px] text-gray-500 font-mono">
+                <td className="px-4 py-2 text-[12px] text-muted font-mono">
                   {ecEfficiency(p)}
                 </td>
-                <td className="px-4 py-2 text-[12px] text-gray-500">
+                <td className="px-4 py-2 text-[12px] text-muted">
                   {p.failure_domain}
                 </td>
-                <td className="px-4 py-2 text-[12px] font-mono text-gray-500">
+                <td className="px-4 py-2 text-[12px] font-mono text-muted">
                   {p.pg_count && p.pg_count > 0 ? (
                     <button
                       onClick={(e) => {
@@ -1054,10 +1054,10 @@ function PoolList({
                       {p.pg_count.toLocaleString()}
                     </button>
                   ) : (
-                    <span className="text-gray-400 text-[10px]">legacy</span>
+                    <span className="text-faint text-[10px]">legacy</span>
                   )}
                 </td>
-                <td className="px-4 py-2 text-[12px] text-gray-500">
+                <td className="px-4 py-2 text-[12px] text-muted">
                   {formatBytes(p.quota_bytes)}
                 </td>
                 <td className="px-4 py-2">
@@ -1071,7 +1071,7 @@ function PoolList({
                     {p.pg_count && p.pg_count > 0 && onViewPlacement && (
                       <button
                         onClick={() => onViewPlacement(p.name)}
-                        className="text-gray-400 hover:text-indigo-600 p-1"
+                        className="text-faint hover:text-indigo-600 p-1"
                         title="View placement groups"
                       >
                         <Layers size={14} />
@@ -1079,14 +1079,14 @@ function PoolList({
                     )}
                     <button
                       onClick={() => onEdit(p)}
-                      className="text-gray-400 hover:text-blue-600 p-1"
+                      className="text-faint hover:text-accent p-1"
                       title="Edit"
                     >
                       <Edit size={14} />
                     </button>
                     <button
                       onClick={() => onDelete(p.name)}
-                      className="text-gray-400 hover:text-red-600 p-1"
+                      className="text-faint hover:text-red-600 p-1"
                       title="Delete"
                     >
                       <Trash2 size={14} />

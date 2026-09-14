@@ -33,10 +33,10 @@ export default function CapacityBar({
       ? "bg-red-500"
       : pct >= 75
         ? "bg-amber-500"
-        : "bg-gradient-to-r from-emerald-400 to-blue-500";
+        : "bg-gradient-to-r from-emerald-400 to-accent";
 
   const bar = (
-    <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+    <div className="h-1.5 w-full bg-surface-2 rounded-full overflow-hidden">
       <div
         className={`h-full rounded-full ${fill}`}
         style={{ width: `${pct}%` }}
@@ -47,10 +47,10 @@ export default function CapacityBar({
   if (layout === "inline") {
     return (
       <div className={`flex items-center gap-2 ${className}`}>
-        {caption && <span className="text-[11px] text-gray-500">{caption}</span>}
+        {caption && <span className="text-[11px] text-muted">{caption}</span>}
         <div className="flex-1 min-w-[60px]">{bar}</div>
         {showLabel && (
-          <span className="text-[11px] text-gray-500 w-12 text-right tabular-nums">
+          <span className="text-[11px] text-muted w-12 text-right tabular-nums">
             {pct}%
           </span>
         )}
@@ -61,13 +61,13 @@ export default function CapacityBar({
   return (
     <div className={className}>
       {caption && (
-        <div className="text-[12px] font-medium text-gray-800 mb-0.5">
+        <div className="text-[12px] font-medium text-text mb-0.5">
           {caption}
         </div>
       )}
       {bar}
       {showLabel && (
-        <div className="text-[10px] text-gray-400 mt-1 tabular-nums">
+        <div className="text-[10px] text-faint mt-1 tabular-nums">
           {formatBytes(used)} / {formatBytes(total)}
         </div>
       )}

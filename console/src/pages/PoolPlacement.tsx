@@ -137,15 +137,15 @@ export default function PoolPlacement() {
         <div className="flex items-center gap-3">
           <button
             onClick={() => nav("/cluster/pools")}
-            className="flex items-center gap-1 text-[12px] text-gray-600 hover:text-gray-900"
+            className="flex items-center gap-1 text-[12px] text-text-2 hover:text-text"
           >
             <ArrowLeft size={14} />
             Pools
           </button>
-          <div className="text-gray-300">/</div>
-          <h1 className="text-[16px] font-semibold text-gray-900">{poolName}</h1>
+          <div className="text-faint">/</div>
+          <h1 className="text-[16px] font-semibold text-text">{poolName}</h1>
           {pool && (
-            <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-gray-100 text-gray-700">
+            <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-2 text-text-2">
               {ecString(pool)}
             </span>
           )}
@@ -159,7 +159,7 @@ export default function PoolPlacement() {
         <button
           onClick={load}
           disabled={loading}
-          className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 rounded-lg text-[11px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          className="flex items-center gap-1.5 px-2.5 py-1 border border-border rounded-lg text-[11px] font-medium text-text-2 hover:bg-surface-2 disabled:opacity-50"
         >
           <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
           Refresh
@@ -203,13 +203,13 @@ export default function PoolPlacement() {
       </div>
 
       {/* Per-OSD bar chart */}
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden mb-4">
-        <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between">
-          <h2 className="text-[12px] font-medium text-gray-700 uppercase tracking-wide">
+      <div className="bg-surface rounded-lg border border-border overflow-hidden mb-4">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+          <h2 className="text-[12px] font-medium text-text-2 uppercase tracking-wide">
             PG-membership per OSD
           </h2>
-          <div className="flex items-center gap-2 text-[10px] text-gray-500">
-            <LegendSwatch color="bg-blue-500" label="PGs" />
+          <div className="flex items-center gap-2 text-[10px] text-muted">
+            <LegendSwatch color="bg-accent" label="PGs" />
             <LegendSwatch color="bg-red-100 border border-red-400" label="overload" />
             <LegendSwatch
               color="bg-amber-100 border border-amber-400"
@@ -229,45 +229,45 @@ export default function PoolPlacement() {
                 onClick={() =>
                   setSelectedOsd(selectedOsd === o.id ? null : o.id)
                 }
-                className={`w-full grid grid-cols-[140px_1fr_72px] items-center gap-2 px-1 py-0.5 rounded hover:bg-gray-50 text-left ${
-                  selectedOsd === o.id ? "bg-blue-50" : ""
+                className={`w-full grid grid-cols-[140px_1fr_72px] items-center gap-2 px-1 py-0.5 rounded hover:bg-surface-2 text-left ${
+                  selectedOsd === o.id ? "bg-accent-soft" : ""
                 }`}
               >
                 <div className="flex items-center gap-1.5 min-w-0">
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
-                      o.online ? "bg-green-500" : "bg-gray-400"
+                      o.online ? "bg-green-500" : "bg-faint"
                     }`}
                   />
-                  <span className="text-[11px] font-mono text-gray-700 truncate">
+                  <span className="text-[11px] font-mono text-text-2 truncate">
                     {o.name}
                   </span>
                 </div>
-                <div className="relative h-4 bg-gray-100 rounded overflow-hidden">
+                <div className="relative h-4 bg-surface-2 rounded overflow-hidden">
                   <div
                     className={`absolute inset-y-0 left-0 ${
                       isOver
                         ? "bg-red-400"
                         : isUnder
                           ? "bg-amber-400"
-                          : "bg-blue-500"
+                          : "bg-accent"
                     }`}
                     style={{ width: `${pct}%` }}
                   />
                   {target > 0 && (
                     <div
-                      className="absolute inset-y-0 w-px bg-gray-700 opacity-60"
+                      className="absolute inset-y-0 w-px bg-text-2 opacity-60"
                       style={{ left: `${targetPct}%` }}
                       title={`target ${target.toFixed(1)}`}
                     />
                   )}
                 </div>
                 <div className="flex items-center justify-end gap-2 text-[11px] font-mono">
-                  <span className={isOver ? "text-red-700 font-semibold" : isUnder ? "text-amber-700 font-semibold" : "text-gray-700"}>
+                  <span className={isOver ? "text-red-700 font-semibold" : isUnder ? "text-amber-700 font-semibold" : "text-text-2"}>
                     {o.pgs}
                   </span>
-                  <span className="text-gray-400">·</span>
-                  <span className="text-gray-400" title={`${o.shards} shards on disk`}>
+                  <span className="text-faint">·</span>
+                  <span className="text-faint" title={`${o.shards} shards on disk`}>
                     {o.shards}s
                   </span>
                 </div>
@@ -275,7 +275,7 @@ export default function PoolPlacement() {
             );
           })}
           {osdEntries.length === 0 && !loading && (
-            <div className="text-center text-[12px] text-gray-400 py-4">
+            <div className="text-center text-[12px] text-faint py-4">
               No active OSDs
             </div>
           )}
@@ -283,16 +283,16 @@ export default function PoolPlacement() {
       </div>
 
       {/* PG × OSD matrix */}
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden mb-4">
-        <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between">
-          <h2 className="text-[12px] font-medium text-gray-700 uppercase tracking-wide">
+      <div className="bg-surface rounded-lg border border-border overflow-hidden mb-4">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+          <h2 className="text-[12px] font-medium text-text-2 uppercase tracking-wide">
             PG × OSD matrix
           </h2>
-          <div className="flex items-center gap-2 text-[10px] text-gray-500">
+          <div className="flex items-center gap-2 text-[10px] text-muted">
             {selectedOsd && (
               <button
                 onClick={() => setSelectedOsd(null)}
-                className="px-1.5 py-0.5 rounded bg-gray-100 hover:bg-gray-200"
+                className="px-1.5 py-0.5 rounded bg-surface-2 hover:bg-border"
               >
                 Clear OSD filter
               </button>
@@ -300,12 +300,12 @@ export default function PoolPlacement() {
             {selectedPg !== null && (
               <button
                 onClick={() => setSelectedPg(null)}
-                className="px-1.5 py-0.5 rounded bg-gray-100 hover:bg-gray-200"
+                className="px-1.5 py-0.5 rounded bg-surface-2 hover:bg-border"
               >
                 Clear PG filter
               </button>
             )}
-            <LegendSwatch color="bg-blue-500" label="member" />
+            <LegendSwatch color="bg-accent" label="member" />
             <LegendSwatch
               color="bg-amber-400"
               label="migrating-to"
@@ -314,9 +314,9 @@ export default function PoolPlacement() {
         </div>
         <div className="overflow-auto" style={{ maxHeight: "480px" }}>
           <table className="text-[10px] border-collapse">
-            <thead className="sticky top-0 bg-white z-10">
+            <thead className="sticky top-0 bg-surface z-10">
               <tr>
-                <th className="px-2 py-1 text-left text-gray-500 font-normal sticky left-0 bg-white z-20 border-b border-gray-100">
+                <th className="px-2 py-1 text-left text-muted font-normal sticky left-0 bg-surface z-20 border-b border-border">
                   pg_id
                 </th>
                 {osdEntries.map((o) => (
@@ -325,15 +325,15 @@ export default function PoolPlacement() {
                     onClick={() =>
                       setSelectedOsd(selectedOsd === o.id ? null : o.id)
                     }
-                    className={`px-1 py-1 text-center font-normal cursor-pointer border-b border-gray-100 ${
-                      selectedOsd === o.id ? "bg-blue-50 text-blue-700" : "text-gray-500 hover:bg-gray-50"
+                    className={`px-1 py-1 text-center font-normal cursor-pointer border-b border-border ${
+                      selectedOsd === o.id ? "bg-accent-soft text-accent" : "text-muted hover:bg-surface-2"
                     }`}
                     title={`${o.name} — ${o.pgs} PGs`}
                   >
                     <div className="font-mono">{o.name.replace("objectio-osd-", "osd")}</div>
                   </th>
                 ))}
-                <th className="px-2 py-1 text-center text-gray-500 font-normal border-b border-gray-100">
+                <th className="px-2 py-1 text-center text-muted font-normal border-b border-border">
                   v
                 </th>
               </tr>
@@ -360,14 +360,14 @@ export default function PoolPlacement() {
                 return (
                   <tr
                     key={pg.pg_id}
-                    className={`hover:bg-gray-50 cursor-pointer ${
-                      selectedPg === pg.pg_id ? "bg-blue-50" : ""
+                    className={`hover:bg-surface-2 cursor-pointer ${
+                      selectedPg === pg.pg_id ? "bg-accent-soft" : ""
                     }`}
                     onClick={() =>
                       setSelectedPg(selectedPg === pg.pg_id ? null : pg.pg_id)
                     }
                   >
-                    <td className="px-2 py-0.5 font-mono text-gray-600 sticky left-0 bg-white z-10">
+                    <td className="px-2 py-0.5 font-mono text-text-2 sticky left-0 bg-surface z-10">
                       {pg.pg_id}
                     </td>
                     {row.map((v, i) => (
@@ -379,15 +379,15 @@ export default function PoolPlacement() {
                         <div
                           className={`inline-block w-3 h-3 rounded-sm ${
                             v === 1
-                              ? "bg-blue-500"
+                              ? "bg-accent"
                               : v === 2
                                 ? "bg-amber-400"
-                                : "bg-gray-100"
+                                : "bg-surface-2"
                           }`}
                         />
                       </td>
                     ))}
-                    <td className="px-2 py-0.5 font-mono text-gray-400">
+                    <td className="px-2 py-0.5 font-mono text-faint">
                       v{pg.version}
                     </td>
                   </tr>
@@ -397,7 +397,7 @@ export default function PoolPlacement() {
                 <tr>
                   <td
                     colSpan={osdEntries.length + 2}
-                    className="px-3 py-6 text-center text-gray-400"
+                    className="px-3 py-6 text-center text-faint"
                   >
                     No placement groups in this pool
                   </td>
@@ -423,15 +423,15 @@ function StatCard({
   hint?: string;
 }) {
   return (
-    <div className="bg-white rounded-lg border border-gray-200 px-3 py-2.5">
-      <div className="flex items-center gap-1.5 text-[10px] text-gray-500 uppercase tracking-wide">
+    <div className="bg-surface rounded-lg border border-border px-3 py-2.5">
+      <div className="flex items-center gap-1.5 text-[10px] text-muted uppercase tracking-wide">
         {icon}
         {label}
       </div>
-      <div className="text-[18px] font-semibold text-gray-900 mt-0.5">
+      <div className="text-[18px] font-semibold text-text mt-0.5">
         {value}
       </div>
-      {hint && <div className="text-[10px] text-gray-400 mt-0.5">{hint}</div>}
+      {hint && <div className="text-[10px] text-faint mt-0.5">{hint}</div>}
     </div>
   );
 }

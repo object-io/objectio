@@ -7,14 +7,14 @@ const styles = {
   healthy: "bg-green-100 text-green-800",
   warning: "bg-yellow-100 text-yellow-800",
   error: "bg-red-100 text-red-800",
-  unknown: "bg-gray-100 text-gray-600",
+  unknown: "bg-surface-2 text-text-2",
 };
 
 const dots = {
   healthy: "bg-green-500",
   warning: "bg-yellow-500",
   error: "bg-red-500",
-  unknown: "bg-gray-400",
+  unknown: "bg-faint",
 };
 
 export default function StatusBadge({ status, label }: Props) {

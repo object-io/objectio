@@ -22,14 +22,14 @@ interface Metric {
 
 function StatCard({ label, value, icon: Icon, color }: Metric) {
   return (
-    <div className="bg-white rounded-xl border border-gray-200 p-4">
+    <div className="bg-surface rounded-xl border border-border p-4">
       <div className="flex items-center justify-between">
         <div>
-          <p className="text-[11px] text-gray-500 uppercase tracking-wider font-medium">{label}</p>
-          <p className="text-xl font-semibold text-gray-900 mt-1">{value}</p>
+          <p className="text-[11px] text-muted uppercase tracking-wider font-medium">{label}</p>
+          <p className="text-xl font-semibold text-text mt-1">{value}</p>
         </div>
         <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${color}`}>
-          <Icon size={16} className="text-white" />
+          <Icon size={16} className="text-primary-fg" />
         </div>
       </div>
     </div>
@@ -57,7 +57,7 @@ export default function Dashboard() {
   };
 
   const stats: Metric[] = [
-    { label: "Buckets", value: bucketCount, icon: Database, color: "bg-blue-500" },
+    { label: "Buckets", value: bucketCount, icon: Database, color: "bg-accent" },
     { label: "Users", value: userCount, icon: Users, color: "bg-purple-500" },
     { label: "Iceberg Namespaces", value: nsCount, icon: Table2, color: "bg-emerald-500" },
     { label: "S3 Requests", value: parseMetric("objectio_s3_requests_total"), icon: Activity, color: "bg-orange-500" },
@@ -77,7 +77,7 @@ export default function Dashboard() {
             ? "bg-green-50 border-green-200"
             : healthy === false
               ? "bg-red-50 border-red-200"
-              : "bg-gray-50 border-gray-200"
+              : "bg-surface-2 border-border"
         }`}
       >
         {healthy === true ? (
@@ -85,7 +85,7 @@ export default function Dashboard() {
         ) : healthy === false ? (
           <AlertCircle className="text-red-600" size={16} />
         ) : (
-          <Activity className="text-gray-400 animate-spin" size={16} />
+          <Activity className="text-faint animate-spin" size={16} />
         )}
         <span className="text-[13px] font-medium">
           {healthy === true
@@ -111,19 +111,19 @@ export default function Dashboard() {
         <Card title="Cluster Configuration">
           <dl className="space-y-2.5 text-[13px]">
             <div className="flex justify-between">
-              <dt className="text-gray-500">Erasure Coding</dt>
+              <dt className="text-muted">Erasure Coding</dt>
               <dd className="font-medium">3+2 (Reed-Solomon)</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-gray-500">OSDs</dt>
+              <dt className="text-muted">OSDs</dt>
               <dd className="font-medium">5</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-gray-500">Region</dt>
+              <dt className="text-muted">Region</dt>
               <dd className="font-medium">us-east-1</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-gray-500">Gateway</dt>
+              <dt className="text-muted">Gateway</dt>
               <dd>
                 <StatusBadge status={healthy ? "healthy" : "error"} label={healthy ? "Running" : "Down"} />
               </dd>
@@ -141,11 +141,11 @@ export default function Dashboard() {
             ].map((svc) => (
               <div key={svc.name} className="flex items-center justify-between text-[13px]">
                 <div className="flex items-center gap-2">
-                  <HardDrive size={13} className="text-gray-400" />
+                  <HardDrive size={13} className="text-faint" />
                   <span>{svc.name}</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="text-gray-400 font-mono text-[11px]">:{svc.port}</span>
+                  <span className="text-faint font-mono text-[11px]">:{svc.port}</span>
                   <StatusBadge
                     status={svc.status ? "healthy" : "error"}
                     label={svc.status ? "Running" : "Down"}

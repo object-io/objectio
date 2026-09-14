@@ -186,24 +186,24 @@ export default function IcebergCatalog() {
         <div className="flex items-center gap-1 text-[12px] mb-4">
           <button
             onClick={goBack}
-            className="text-gray-400 hover:text-gray-600 p-0.5 mr-1"
+            className="text-faint hover:text-text-2 p-0.5 mr-1"
           >
             <ArrowLeft size={14} />
           </button>
           {breadcrumb.map((b, i) => (
             <span key={i} className="flex items-center gap-1">
               {i > 0 && (
-                <ChevronRight size={12} className="text-gray-300" />
+                <ChevronRight size={12} className="text-faint" />
               )}
               {b.action ? (
                 <button
                   onClick={b.action}
-                  className="text-gray-500 hover:text-blue-600"
+                  className="text-muted hover:text-accent"
                 >
                   {b.label}
                 </button>
               ) : (
-                <span className="text-gray-900 font-medium">{b.label}</span>
+                <span className="text-text font-medium">{b.label}</span>
               )}
             </span>
           ))}
@@ -214,37 +214,37 @@ export default function IcebergCatalog() {
       {view === "warehouses" && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Warehouses
             </h2>
             <button
               onClick={() => setShowCreateWh(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Warehouse
             </button>
           </div>
 
           {showCreateWh && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4">
               <div className="flex gap-2">
                 <input
                   value={newWhName}
                   onChange={(e) => setNewWhName(e.target.value)}
                   placeholder="warehouse-name"
-                  className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="flex-1 px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   onKeyDown={(e) => e.key === "Enter" && createWarehouse()}
                   autoFocus
                 />
                 <button
                   onClick={createWarehouse}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
                 <button
                   onClick={() => setShowCreateWh(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
@@ -252,33 +252,33 @@ export default function IcebergCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Warehouse
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Location
                   </th>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Bucket
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <tr>
                     <td colSpan={4} className="px-4 py-8 text-center">
                       <div className="flex items-center justify-center gap-3">
-                        <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                        <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                          <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                         </div>
-                        <span className="text-[12px] text-gray-400">
+                        <span className="text-[12px] text-faint">
                           Loading
                         </span>
                       </div>
@@ -288,7 +288,7 @@ export default function IcebergCatalog() {
                   <tr>
                     <td
                       colSpan={4}
-                      className="px-4 py-8 text-center text-[12px] text-gray-400"
+                      className="px-4 py-8 text-center text-[12px] text-faint"
                     >
                       No warehouses. Create one to start managing Iceberg
                       tables.
@@ -298,7 +298,7 @@ export default function IcebergCatalog() {
                   warehouses.map((wh) => (
                     <tr
                       key={wh.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
+                      className="hover:bg-surface-2 cursor-pointer group"
                       onClick={() => openWarehouse(wh)}
                     >
                       <td className="px-4 py-2.5">
@@ -309,14 +309,14 @@ export default function IcebergCatalog() {
                           </span>
                           <ChevronRight
                             size={14}
-                            className="ml-auto text-gray-300"
+                            className="ml-auto text-faint"
                           />
                         </div>
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono">
                         {wh.location}
                       </td>
-                      <td className="px-4 py-2.5 text-[12px] text-gray-500 font-mono">
+                      <td className="px-4 py-2.5 text-[12px] text-muted font-mono">
                         {wh.bucket}
                       </td>
                       <td className="px-4 py-2.5 text-right">
@@ -325,7 +325,7 @@ export default function IcebergCatalog() {
                             e.stopPropagation();
                             deleteWarehouse(wh.name);
                           }}
-                          className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -343,37 +343,37 @@ export default function IcebergCatalog() {
       {view === "namespaces" && (
         <>
           <div className="flex items-center justify-between mb-3">
-            <h2 className="text-[13px] font-medium text-gray-700">
+            <h2 className="text-[13px] font-medium text-text-2">
               Namespaces in {selectedWh?.name}
             </h2>
             <button
               onClick={() => setShowCreateNs(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
             >
               <Plus size={14} /> Create Namespace
             </button>
           </div>
 
           {showCreateNs && (
-            <div className="mb-3 bg-white rounded-xl border border-gray-200 p-4">
+            <div className="mb-3 bg-surface rounded-xl border border-border p-4">
               <div className="flex gap-2">
                 <input
                   value={newNsName}
                   onChange={(e) => setNewNsName(e.target.value)}
                   placeholder="namespace_name"
-                  className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="flex-1 px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-accent"
                   onKeyDown={(e) => e.key === "Enter" && createNamespace()}
                   autoFocus
                 />
                 <button
                   onClick={createNamespace}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover"
                 >
                   Create
                 </button>
                 <button
                   onClick={() => setShowCreateNs(false)}
-                  className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   Cancel
                 </button>
@@ -381,27 +381,27 @@ export default function IcebergCatalog() {
             </div>
           )}
 
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Namespace
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <tr>
                     <td colSpan={2} className="px-4 py-8 text-center">
                       <div className="flex items-center justify-center gap-3">
-                        <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                        <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                          <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                         </div>
-                        <span className="text-[12px] text-gray-400">
+                        <span className="text-[12px] text-faint">
                           Loading
                         </span>
                       </div>
@@ -411,7 +411,7 @@ export default function IcebergCatalog() {
                   <tr>
                     <td
                       colSpan={2}
-                      className="px-4 py-8 text-center text-[12px] text-gray-400"
+                      className="px-4 py-8 text-center text-[12px] text-faint"
                     >
                       No namespaces
                     </td>
@@ -422,7 +422,7 @@ export default function IcebergCatalog() {
                     return (
                       <tr
                         key={name}
-                        className="hover:bg-gray-50 cursor-pointer group"
+                        className="hover:bg-surface-2 cursor-pointer group"
                         onClick={() => openNamespace(name)}
                       >
                         <td className="px-4 py-2.5">
@@ -436,7 +436,7 @@ export default function IcebergCatalog() {
                             </span>
                             <ChevronRight
                               size={14}
-                              className="ml-auto text-gray-300"
+                              className="ml-auto text-faint"
                             />
                           </div>
                         </td>
@@ -446,7 +446,7 @@ export default function IcebergCatalog() {
                               e.stopPropagation();
                               deleteNamespace(name);
                             }}
-                            className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                            className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                           >
                             <Trash2 size={13} />
                           </button>
@@ -463,24 +463,24 @@ export default function IcebergCatalog() {
 
       {/* Tables View */}
       {view === "tables" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <div className="bg-surface rounded-xl border border-border overflow-hidden">
           <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
+            <thead className="bg-surface-2 border-b border-border">
               <tr>
-                <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                   Table
                 </th>
-                <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                   Actions
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-border">
               {tables.length === 0 ? (
                 <tr>
                   <td
                     colSpan={2}
-                    className="px-4 py-8 text-center text-[12px] text-gray-400"
+                    className="px-4 py-8 text-center text-[12px] text-faint"
                   >
                     No tables in {selectedNs}
                   </td>
@@ -489,7 +489,7 @@ export default function IcebergCatalog() {
                 tables.map((t) => (
                   <tr
                     key={t.name}
-                    className="hover:bg-gray-50 cursor-pointer group"
+                    className="hover:bg-surface-2 cursor-pointer group"
                     onClick={() => openTable(selectedNs, t.name)}
                   >
                     <td className="px-4 py-2.5">
@@ -500,7 +500,7 @@ export default function IcebergCatalog() {
                         </span>
                         <ChevronRight
                           size={14}
-                          className="ml-auto text-gray-300"
+                          className="ml-auto text-faint"
                         />
                       </div>
                     </td>
@@ -510,7 +510,7 @@ export default function IcebergCatalog() {
                           e.stopPropagation();
                           deleteTable(selectedNs, t.name);
                         }}
-                        className="text-gray-400 hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="text-faint hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                       >
                         <Trash2 size={13} />
                       </button>
@@ -525,23 +525,23 @@ export default function IcebergCatalog() {
 
       {/* Table Detail View */}
       {view === "detail" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200">
-            <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+        <div className="bg-surface rounded-xl border border-border overflow-hidden">
+          <div className="px-4 py-2.5 bg-surface-2 border-b border-border">
+            <h3 className="text-[11px] font-medium text-muted uppercase tracking-wider">
               Table Metadata
             </h3>
           </div>
           <div className="p-4">
             {selectedTable ? (
-              <pre className="bg-gray-50 rounded-lg p-3 text-[11px] overflow-auto max-h-[calc(100vh-280px)] border border-gray-200 font-mono text-gray-700">
+              <pre className="bg-surface-2 rounded-lg p-3 text-[11px] overflow-auto max-h-[calc(100vh-280px)] border border-border font-mono text-text-2">
                 {JSON.stringify(selectedTable, null, 2)}
               </pre>
             ) : (
               <div className="flex items-center justify-center gap-3 py-8">
-                <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                  <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                  <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                 </div>
-                <span className="text-[12px] text-gray-400">Loading</span>
+                <span className="text-[12px] text-faint">Loading</span>
               </div>
             )}
           </div>

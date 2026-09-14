@@ -154,7 +154,7 @@ export default function Tenants() {
         title="Tenants"
         description="Multi-tenant isolation — each tenant gets its own buckets, quotas, and identity"
         action={
-          <button onClick={() => startEdit()} className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800">
+          <button onClick={() => startEdit()} className="flex items-center gap-1.5 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover">
             <Plus size={14} /> Create Tenant
           </button>
         }
@@ -170,15 +170,15 @@ export default function Tenants() {
           }
           className="mb-4"
         >
-          <p className="text-[12px] text-gray-500 mb-3">
+          <p className="text-[12px] text-muted mb-3">
             Tenant admins can manage users, access keys, buckets, warehouses, and shares <em>within this tenant only</em>.
             They cannot touch other tenants or system-level resources.
           </p>
 
           <div className="mb-3">
-            <label className="block text-[11px] font-medium text-gray-500 mb-1">Current admins</label>
+            <label className="block text-[11px] font-medium text-muted mb-1">Current admins</label>
             {managingTenant.admin_users.length === 0 ? (
-              <div className="text-[12px] text-gray-400 italic py-2">
+              <div className="text-[12px] text-faint italic py-2">
                 No tenant admins. Only the system admin can manage this tenant until one is added below.
               </div>
             ) : (
@@ -186,16 +186,16 @@ export default function Tenants() {
                 {managingTenant.admin_users.map((u) => {
                   const user = tenantUsers.find((tu) => tu.user_id === u || tu.arn === u);
                   return (
-                    <li key={u} className="flex items-center justify-between px-2.5 py-1.5 bg-gray-50 rounded-lg">
+                    <li key={u} className="flex items-center justify-between px-2.5 py-1.5 bg-surface-2 rounded-lg">
                       <div className="flex flex-col min-w-0">
-                        <span className="text-[12px] font-medium text-gray-900 truncate">
+                        <span className="text-[12px] font-medium text-text truncate">
                           {user?.display_name || u}
                         </span>
-                        <span className="text-[10px] text-gray-400 font-mono truncate">{u}</span>
+                        <span className="text-[10px] text-faint font-mono truncate">{u}</span>
                       </div>
                       <button
                         onClick={() => removeAdmin(u)}
-                        className="text-gray-400 hover:text-red-600 p-1"
+                        className="text-faint hover:text-red-600 p-1"
                         title="Remove admin"
                       >
                         <X size={14} />
@@ -208,12 +208,12 @@ export default function Tenants() {
           </div>
 
           <div>
-            <label className="block text-[11px] font-medium text-gray-500 mb-1">Add admin</label>
+            <label className="block text-[11px] font-medium text-muted mb-1">Add admin</label>
             <div className="flex gap-2">
               <select
                 value=""
                 onChange={(e) => e.target.value && addAdmin(e.target.value)}
-                className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                className="flex-1 px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none"
               >
                 <option value="">— Pick a tenant user —</option>
                 {tenantUsers
@@ -224,17 +224,17 @@ export default function Tenants() {
                     </option>
                   ))}
               </select>
-              <span className="text-[11px] text-gray-400 self-center">or</span>
+              <span className="text-[11px] text-faint self-center">or</span>
               <input
                 value={adminInput}
                 onChange={(e) => setAdminInput(e.target.value)}
                 placeholder="user_id or user ARN"
-                className="flex-1 px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                className="flex-1 px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none"
               />
               <button
                 onClick={() => addAdmin(adminInput)}
                 disabled={!adminInput.trim()}
-                className="flex items-center gap-1 px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800 disabled:opacity-40"
+                className="flex items-center gap-1 px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover disabled:opacity-40"
               >
                 <UserPlus size={13} /> Add
               </button>
@@ -244,10 +244,10 @@ export default function Tenants() {
             )}
           </div>
 
-          <div className="flex justify-end mt-4 pt-3 border-t border-gray-100">
+          <div className="flex justify-end mt-4 pt-3 border-t border-border">
             <button
               onClick={() => setManagingAdmins(null)}
-              className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+              className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
             >
               Close
             </button>
@@ -259,32 +259,32 @@ export default function Tenants() {
         <Card title={editing === "__new__" ? "Create Tenant" : `Edit: ${editing}`} className="mb-4">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Tenant Name</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">Tenant Name</label>
               <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} disabled={editing !== "__new__"}
-                placeholder="e.g. acme-corp" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100" />
+                placeholder="e.g. acme-corp" className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none disabled:bg-surface-2" />
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Display Name</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">Display Name</label>
               <input value={form.display_name} onChange={e => setForm({ ...form, display_name: e.target.value })}
-                placeholder="Acme Corporation" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+                placeholder="Acme Corporation" className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none" />
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Default Pool</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">Default Pool</label>
               <select value={form.default_pool} onChange={e => setForm({ ...form, default_pool: e.target.value })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none">
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none">
                 <option value="">System default</option>
                 {pools.map(p => <option key={p} value={p}>{p}</option>)}
               </select>
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">OIDC Provider</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">OIDC Provider</label>
               <input value={form.oidc_provider} onChange={e => setForm({ ...form, oidc_provider: e.target.value })}
-                placeholder="e.g. entra" className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+                placeholder="e.g. entra" className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none" />
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Storage Quota</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">Storage Quota</label>
               <select value={form.quota_bytes} onChange={e => setForm({ ...form, quota_bytes: Number(e.target.value) })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none">
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none">
                 <option value={0}>Unlimited</option>
                 <option value={107374182400}>100 GB</option>
                 <option value={536870912000}>500 GB</option>
@@ -293,71 +293,71 @@ export default function Tenants() {
               </select>
             </div>
             <div>
-              <label className="block text-[11px] font-medium text-gray-500 mb-1">Max Buckets (0=unlimited)</label>
+              <label className="block text-[11px] font-medium text-muted mb-1">Max Buckets (0=unlimited)</label>
               <input type="number" value={form.quota_buckets} onChange={e => setForm({ ...form, quota_buckets: Number(e.target.value) })}
-                className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[13px] focus:ring-1 focus:ring-blue-500 focus:outline-none" />
+                className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none" />
             </div>
           </div>
-          <div className="flex gap-2 mt-4 pt-3 border-t border-gray-100">
-            <button onClick={save} className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800">Save</button>
-            <button onClick={() => setEditing(null)} className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50">Cancel</button>
+          <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+            <button onClick={save} className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover">Save</button>
+            <button onClick={() => setEditing(null)} className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2">Cancel</button>
           </div>
         </Card>
       )}
 
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-surface-2 border-b border-border">
             <tr>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Tenant</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Pool</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Quota</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Buckets</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">OIDC</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Admins</th>
-              <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">Status</th>
-              <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-32">Actions</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Tenant</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Pool</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Quota</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Buckets</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">OIDC</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Admins</th>
+              <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">Status</th>
+              <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-32">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
+          <tbody className="divide-y divide-border">
             {loading ? (
               <tr>
                 <td colSpan={7} className="px-4 py-8 text-center">
                   <div className="flex items-center justify-center gap-3">
-                    <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                      <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                    <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                      <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                     </div>
-                    <span className="text-[12px] text-gray-400">Loading</span>
+                    <span className="text-[12px] text-faint">Loading</span>
                   </div>
                 </td>
               </tr>
             ) : tenants.length === 0 ? (
-              <tr><td colSpan={8} className="px-4 py-8 text-center text-[12px] text-gray-400">No tenants configured</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-[12px] text-faint">No tenants configured</td></tr>
             ) : (
               tenants.map(t => (
-                <tr key={t.name} className="hover:bg-gray-50 group">
+                <tr key={t.name} className="hover:bg-surface-2 group">
                   <td className="px-4 py-2">
                     <div className="flex items-center gap-2">
                       <Building2 size={14} className="text-purple-500" />
                       <div>
                         <span className="text-[13px] font-medium">{t.display_name || t.name}</span>
                         {t.display_name && t.display_name !== t.name && (
-                          <span className="text-[10px] text-gray-400 ml-1.5 font-mono">{t.name}</span>
+                          <span className="text-[10px] text-faint ml-1.5 font-mono">{t.name}</span>
                         )}
                       </div>
                     </div>
                   </td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500 font-mono">{t.default_pool || "default"}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{formatBytes(t.quota_bytes)}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{t.quota_buckets || "∞"}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">{t.oidc_provider || <span className="text-gray-300">-</span>}</td>
-                  <td className="px-4 py-2 text-[12px] text-gray-500">
+                  <td className="px-4 py-2 text-[12px] text-muted font-mono">{t.default_pool || "default"}</td>
+                  <td className="px-4 py-2 text-[12px] text-muted">{formatBytes(t.quota_bytes)}</td>
+                  <td className="px-4 py-2 text-[12px] text-muted">{t.quota_buckets || "∞"}</td>
+                  <td className="px-4 py-2 text-[12px] text-muted">{t.oidc_provider || <span className="text-faint">-</span>}</td>
+                  <td className="px-4 py-2 text-[12px] text-muted">
                     {t.admin_users && t.admin_users.length > 0 ? (
                       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-purple-50 text-purple-700 rounded text-[11px]">
                         <ShieldCheck size={11} /> {t.admin_users.length}
                       </span>
                     ) : (
-                      <span className="text-gray-300">-</span>
+                      <span className="text-faint">-</span>
                     )}
                   </td>
                   <td className="px-4 py-2">
@@ -365,13 +365,13 @@ export default function Tenants() {
                   </td>
                   <td className="px-4 py-2 text-right">
                     <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => openAdmins(t.name)} className="text-gray-400 hover:text-purple-600 p-1" title="Manage tenant admins">
+                      <button onClick={() => openAdmins(t.name)} className="text-faint hover:text-purple-600 p-1" title="Manage tenant admins">
                         <ShieldCheck size={14} />
                       </button>
-                      <button onClick={() => startEdit(t)} className="text-gray-400 hover:text-blue-600 p-1" title="Edit">
+                      <button onClick={() => startEdit(t)} className="text-faint hover:text-accent p-1" title="Edit">
                         <Edit size={14} />
                       </button>
-                      <button onClick={() => remove(t.name)} className="text-gray-400 hover:text-red-600 p-1" title="Delete">
+                      <button onClick={() => remove(t.name)} className="text-faint hover:text-red-600 p-1" title="Delete">
                         <Trash2 size={14} />
                       </button>
                     </div>

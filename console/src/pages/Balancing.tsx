@@ -166,8 +166,8 @@ export default function Balancing() {
   const tone = status?.paused
     ? "bg-red-50 border-red-200 text-red-800"
     : status?.started
-      ? "bg-blue-50 border-blue-200 text-blue-800"
-      : "bg-gray-50 border-gray-200 text-gray-600";
+      ? "bg-accent-soft border-accent text-accent"
+      : "bg-surface-2 border-border text-text-2";
 
   return (
     <div className="flex flex-col gap-4">
@@ -180,8 +180,8 @@ export default function Balancing() {
                 status?.paused
                   ? "bg-red-100"
                   : status?.started
-                    ? "bg-blue-100"
-                    : "bg-gray-100"
+                    ? "bg-accent-soft"
+                    : "bg-surface-2"
               }`}
             >
               {status?.paused ? (
@@ -233,7 +233,7 @@ export default function Balancing() {
               saveOne("balancer/paused", paused ? "false" : "true");
             }}
             disabled={!status}
-            className="flex items-center gap-1.5 px-3 py-1.5 border bg-white rounded-lg text-[12px] font-medium hover:bg-gray-50 disabled:opacity-50"
+            className="flex items-center gap-1.5 px-3 py-1.5 border bg-surface rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50"
           >
             {status?.paused ? <Play size={13} /> : <Pause size={13} />}
             {status?.paused ? "Resume" : "Pause"}
@@ -253,19 +253,19 @@ export default function Balancing() {
       )}
 
       {/* Knobs */}
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-        <div className="px-4 py-2.5 border-b border-gray-200 flex items-center justify-between">
-          <div className="text-[12px] font-medium text-gray-700 uppercase tracking-wide">
+      <div className="bg-surface rounded-lg border border-border overflow-hidden">
+        <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div className="text-[12px] font-medium text-text-2 uppercase tracking-wide">
             Tuning
           </div>
           <button
             onClick={loadKnobs}
-            className="flex items-center gap-1.5 px-2 py-0.5 text-[11px] text-gray-500 hover:text-gray-800"
+            className="flex items-center gap-1.5 px-2 py-0.5 text-[11px] text-muted hover:text-text"
           >
             <RefreshCw size={11} /> Reload
           </button>
         </div>
-        <div className="divide-y divide-gray-100">
+        <div className="divide-y divide-border">
           {KNOBS.map((k) => {
             const cur = values[k.key] ?? "";
             const sv = saved[k.key] ?? "";
@@ -273,13 +273,13 @@ export default function Balancing() {
             return (
               <div key={k.key} className="flex items-center gap-3 px-4 py-2.5">
                 <div className="flex-1 min-w-0">
-                  <div className="text-[12px] font-medium text-gray-800">
+                  <div className="text-[12px] font-medium text-text">
                     {k.label}
-                    <span className="ml-1.5 font-mono text-[10px] text-gray-400">
+                    <span className="ml-1.5 font-mono text-[10px] text-faint">
                       {k.key}
                     </span>
                   </div>
-                  <div className="text-[11px] text-gray-500 mt-0.5">{k.hint}</div>
+                  <div className="text-[11px] text-muted mt-0.5">{k.hint}</div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {k.type === "bool" ? (
@@ -288,7 +288,7 @@ export default function Balancing() {
                       onChange={(e) =>
                         setValues((s) => ({ ...s, [k.key]: e.target.value }))
                       }
-                      className="px-2 py-1 border border-gray-300 rounded text-[12px] bg-white w-28"
+                      className="px-2 py-1 border border-border-strong rounded text-[12px] bg-surface w-28"
                     >
                       <option value="false">false</option>
                       <option value="true">true</option>
@@ -304,7 +304,7 @@ export default function Balancing() {
                       onChange={(e) =>
                         setValues((s) => ({ ...s, [k.key]: e.target.value }))
                       }
-                      className="px-2 py-1 border border-gray-300 rounded text-[12px] w-28 font-mono"
+                      className="px-2 py-1 border border-border-strong rounded text-[12px] w-28 font-mono"
                     />
                   )}
                   <button
@@ -312,8 +312,8 @@ export default function Balancing() {
                     disabled={!dirty || saving === k.key}
                     className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium ${
                       dirty
-                        ? "bg-blue-600 text-white hover:bg-blue-700"
-                        : "bg-gray-100 text-gray-400 cursor-not-allowed"
+                        ? "bg-accent text-primary-fg hover:bg-accent"
+                        : "bg-surface-2 text-faint cursor-not-allowed"
                     } disabled:opacity-50`}
                   >
                     <Save size={11} />
@@ -326,7 +326,7 @@ export default function Balancing() {
         </div>
       </div>
 
-      <p className="text-[11px] text-gray-500">
+      <p className="text-[11px] text-muted">
         Changes hot-reload — no restart needed. Tick interval changes take effect
         on the next sweep. See the balancer docs in the source for the
         algorithm details.

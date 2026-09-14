@@ -63,7 +63,7 @@ const LEVEL_META = {
   zone:       { color: "bg-sky-50 text-sky-800 border-sky-200",           icon: Compass   },
   datacenter: { color: "bg-teal-50 text-teal-800 border-teal-200",        icon: Building2 },
   rack:       { color: "bg-amber-50 text-amber-800 border-amber-200",     icon: Layers3   },
-  host:       { color: "bg-gray-50 text-gray-800 border-gray-200",        icon: Server    },
+  host:       { color: "bg-surface-2 text-text border-border",        icon: Server    },
 } as const;
 
 type LevelKey = keyof typeof LEVEL_META;
@@ -115,8 +115,8 @@ function TreeRow({
       <div
         className={`group flex items-center gap-1.5 text-[12px] rounded-lg border px-2 py-1 ${
           meta.color
-        } ${selected ? "ring-2 ring-blue-400" : ""} ${
-          onSelect ? "cursor-pointer hover:ring-1 hover:ring-blue-200" : ""
+        } ${selected ? "ring-2 ring-accent" : ""} ${
+          onSelect ? "cursor-pointer hover:ring-1 hover:ring-accent-soft" : ""
         }`}
       >
         {hasChildren ? (
@@ -144,14 +144,14 @@ function TreeRow({
           {label || "(none)"}
         </span>
         {badge && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/70 border border-current/10 opacity-80 font-normal">
+          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface/70 border border-current/10 opacity-80 font-normal">
             {badge}
           </span>
         )}
         {rightAccessory}
       </div>
       {hasChildren && open && (
-        <div className="relative ml-3 pl-4 mt-1.5 border-l border-dashed border-gray-200 space-y-1.5">
+        <div className="relative ml-3 pl-4 mt-1.5 border-l border-dashed border-border space-y-1.5">
           {children}
         </div>
       )}
@@ -390,7 +390,7 @@ export default function Topology({ embedded = false }: Props = {}) {
   }, [selectedHost, topology]);
 
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex h-screen bg-surface-2">
       {/* Main tree area */}
       <div className="flex-1 overflow-y-auto p-6 min-w-0">
         {!embedded && (
@@ -404,7 +404,7 @@ export default function Topology({ embedded = false }: Props = {}) {
                 <StatusDot status="error" label={`${hostSummary.down} Down`} size="md" />
                 <button
                   onClick={() => setRefreshKey((k) => k + 1)}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 border border-gray-200 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-gray-50"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
                 >
                   <RefreshCw size={13} /> Refresh
                 </button>
@@ -419,7 +419,7 @@ export default function Topology({ embedded = false }: Props = {}) {
             <StatusDot status="error" label={`${hostSummary.down} Down`} size="sm" />
             <button
               onClick={() => setRefreshKey((k) => k + 1)}
-              className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 text-gray-700 rounded-lg text-[11px] font-medium hover:bg-gray-50"
+              className="flex items-center gap-1.5 px-2.5 py-1 border border-border text-text-2 rounded-lg text-[11px] font-medium hover:bg-surface-2"
             >
               <RefreshCw size={12} /> Refresh
             </button>
@@ -427,7 +427,7 @@ export default function Topology({ embedded = false }: Props = {}) {
         )}
 
         {loading && !topology && (
-          <div className="text-[12px] text-gray-400">Loading topology…</div>
+          <div className="text-[12px] text-faint">Loading topology…</div>
         )}
 
         {rebal && (
@@ -441,7 +441,7 @@ export default function Topology({ embedded = false }: Props = {}) {
         {topology && (
           <Card title="Topology tree">
             {topology.tree.length === 0 ? (
-              <div className="text-[12px] text-gray-400 italic py-6 text-center">
+              <div className="text-[12px] text-faint italic py-6 text-center">
                 No OSDs registered.
               </div>
             ) : (
@@ -591,7 +591,7 @@ export default function Topology({ embedded = false }: Props = {}) {
           </Card>
         )}
 
-        <p className="mt-3 text-[11px] text-gray-400">
+        <p className="mt-3 text-[11px] text-faint">
           Hierarchy: region → zone → datacenter → rack → host → OSDs. Click a
           host to inspect OSDs and host actions.
         </p>
@@ -603,7 +603,7 @@ export default function Topology({ embedded = false }: Props = {}) {
           title={selectedHost}
           eyebrow={
             <div className="flex items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 text-[10px] font-semibold uppercase tracking-wider">
+              <span className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-accent-soft text-accent text-[10px] font-semibold uppercase tracking-wider">
                 Host
               </span>
               <StatusDot
@@ -793,7 +793,7 @@ function HostDrawerBody({
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1">
+        <div className="text-[10px] text-muted uppercase tracking-wider mb-1">
           Storage Utilization
         </div>
         <CapacityBar used={used} total={total} showLabel layout="stacked" />
@@ -809,10 +809,10 @@ function HostDrawerBody({
 
       <div>
         <div className="flex items-center justify-between mb-1.5">
-          <div className="text-[10px] text-gray-500 uppercase tracking-wider">
+          <div className="text-[10px] text-muted uppercase tracking-wider">
             OSD Inventory
           </div>
-          <div className="text-[10px] text-gray-400">
+          <div className="text-[10px] text-faint">
             {orderedOsds.length} total
           </div>
         </div>
@@ -827,29 +827,29 @@ function HostDrawerBody({
                 key={osd.node_id}
                 className={`flex items-center justify-between gap-2 border rounded-md px-2 py-1.5 ${
                   muted
-                    ? "bg-gray-50/50 border-gray-100"
-                    : "bg-gray-50 border-gray-100"
+                    ? "bg-surface-2/50 border-border"
+                    : "bg-surface-2 border-border"
                 }`}
               >
                 <div className="flex items-center gap-2 min-w-0 flex-1">
                   <HardDrive
                     size={12}
-                    className={muted ? "text-gray-300 shrink-0" : "text-gray-400 shrink-0"}
+                    className={muted ? "text-faint shrink-0" : "text-faint shrink-0"}
                   />
                   <div className="min-w-0">
                     <div
                       className={`text-[12px] font-medium truncate ${
-                        muted ? "text-gray-500" : "text-gray-800"
+                        muted ? "text-muted" : "text-text"
                       }`}
                     >
                       {osd.pod_name || osd.node_name}
                     </div>
-                    <div className="text-[10px] text-gray-400 font-mono">
+                    <div className="text-[10px] text-faint font-mono">
                       {osd.online ? "up" : "down"} / {adminState}
                     </div>
                   </div>
                 </div>
-                <div className="text-[11px] text-gray-500 tabular-nums shrink-0">
+                <div className="text-[11px] text-muted tabular-nums shrink-0">
                   {formatBytes(osd.total_capacity)}
                 </div>
                 {/* Per-OSD action: swap to the opposite state. Keep
@@ -865,7 +865,7 @@ function HostDrawerBody({
             );
           })}
           {orderedOsds.length === 0 && (
-            <li className="text-[11px] text-gray-400 italic py-2 text-center">
+            <li className="text-[11px] text-faint italic py-2 text-center">
               No OSDs on this host.
             </li>
           )}
@@ -873,8 +873,8 @@ function HostDrawerBody({
       </div>
 
       <div>
-        <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-1.5">
-          Host Actions <span className="text-gray-400 normal-case">— all OSDs</span>
+        <div className="text-[10px] text-muted uppercase tracking-wider mb-1.5">
+          Host Actions <span className="text-faint normal-case">— all OSDs</span>
         </div>
         {error && (
           <div className="mb-2 px-2 py-1 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
@@ -922,7 +922,7 @@ function HostDrawerBody({
             title="Return to placement"
           />
         </div>
-        <p className="mt-2 text-[10px] text-gray-400">
+        <p className="mt-2 text-[10px] text-faint">
           Mark Out / Mark In / Drain persist through Raft. Reboot uses
           the configured platform provider ({provider?.provider ?? "…"}).
           Real shard migration for Drain is Phase 3.
@@ -946,16 +946,16 @@ function StatTile({
       ? "border-emerald-200 bg-emerald-50"
       : tone === "warn"
         ? "border-amber-200 bg-amber-50"
-        : "border-gray-200 bg-gray-50";
+        : "border-border bg-surface-2";
   const valueColor =
     tone === "good"
       ? "text-emerald-700"
       : tone === "warn"
         ? "text-amber-700"
-        : "text-gray-800";
+        : "text-text";
   return (
     <div className={`rounded-lg border px-2.5 py-2 ${ring}`}>
-      <div className="text-[10px] text-gray-500 uppercase tracking-wider">
+      <div className="text-[10px] text-muted uppercase tracking-wider">
         {label}
       </div>
       <div className={`text-[13px] font-semibold mt-0.5 ${valueColor}`}>
@@ -996,8 +996,8 @@ function RebalanceBanner({
   const tone = status.paused
     ? "bg-red-50 border-red-200 text-red-800"
     : active
-      ? "bg-blue-50 border-blue-200 text-blue-800"
-      : "bg-gray-50 border-gray-200 text-gray-600";
+      ? "bg-accent-soft border-accent text-accent"
+      : "bg-surface-2 border-border text-text-2";
 
   return (
     <div
@@ -1009,8 +1009,8 @@ function RebalanceBanner({
             status.paused
               ? "bg-red-500"
               : active
-                ? "bg-blue-500 animate-pulse"
-                : "bg-gray-400"
+                ? "bg-accent animate-pulse"
+                : "bg-faint"
           }`}
         />
         <div className="text-[12px] truncate">
@@ -1058,7 +1058,7 @@ function RebalanceBanner({
         className={`shrink-0 text-[11px] font-semibold uppercase tracking-wider border rounded px-2 py-0.5 ${
           status.paused
             ? "border-emerald-300 text-emerald-700 hover:bg-emerald-50"
-            : "border-gray-300 text-gray-700 hover:bg-gray-100"
+            : "border-border-strong text-text-2 hover:bg-surface-2"
         } disabled:opacity-50 disabled:cursor-not-allowed`}
       >
         {busy ? "…" : status.paused ? "Resume" : "Pause"}
@@ -1191,7 +1191,7 @@ function HostActionButton({
   const palette =
     tone === "danger"
       ? "border-red-200 text-red-600 bg-red-50/30 hover:bg-red-50"
-      : "border-gray-200 text-gray-700 hover:bg-gray-50";
+      : "border-border text-text-2 hover:bg-surface-2";
   return (
     <button
       disabled={disabled}

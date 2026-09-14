@@ -209,7 +209,7 @@ export default function Identity() {
         action={
           <button
             onClick={() => startEdit()}
-            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+            className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
           >
             <Plus size={16} /> Add Provider
           </button>
@@ -221,16 +221,16 @@ export default function Identity() {
         <Card title={editing === "__new__" ? "Add OIDC Provider" : `Edit: ${editing}`} className="mb-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Provider Name</label>
+              <label className="block text-xs font-medium text-muted mb-1">Provider Name</label>
               <input
                 value={providerName}
                 onChange={(e) => setProviderName(e.target.value)}
                 disabled={editing !== "__new__" || !!sessionTenant}
                 placeholder="e.g. entra, keycloak, okta"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none disabled:bg-surface-2"
               />
               {sessionTenant && editing === "__new__" && (
-                <p className="mt-1 text-xs text-gray-500">
+                <p className="mt-1 text-xs text-muted">
                   Tenant-owned providers are auto-named <code>t-{sessionTenant.toLowerCase()}</code>.
                 </p>
               )}
@@ -239,14 +239,14 @@ export default function Identity() {
                 It is server-derived and the same for every provider, so it is
                 shown here rather than being an editable field. */}
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-gray-500 mb-1">
-                Redirect URI <span className="text-gray-400">(register this in your IdP)</span>
+              <label className="block text-xs font-medium text-muted mb-1">
+                Redirect URI <span className="text-faint">(register this in your IdP)</span>
               </label>
               <div className="flex gap-2">
                 <input
                   readOnly
                   value={callbackUrl || "unavailable"}
-                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50 font-mono text-xs text-gray-700"
+                  className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm bg-surface-2 font-mono text-xs text-text-2"
                 />
                 <button
                   onClick={() => {
@@ -255,7 +255,7 @@ export default function Identity() {
                     setTimeout(() => setCopiedCallback(false), 2000);
                   }}
                   disabled={!callbackUrl}
-                  className="px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-40"
+                  className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border disabled:opacity-40"
                   title="Copy redirect URI"
                 >
                   {copiedCallback ? <Check size={14} /> : <Copy size={14} />}
@@ -269,19 +269,19 @@ export default function Identity() {
                   and restart the gateway before configuring SSO.
                 </p>
               ) : (
-                <p className="mt-1 text-xs text-gray-400">
+                <p className="mt-1 text-xs text-faint">
                   One callback serves every provider and tenant — the provider and
                   tenant travel in the OAuth <code>state</code> parameter, not the URL.
                 </p>
               )}
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Display Name</label>
+              <label className="block text-xs font-medium text-muted mb-1">Display Name</label>
               <input
                 value={form.display_name}
                 onChange={(e) => setForm({ ...form, display_name: e.target.value })}
                 placeholder="Corporate SSO"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             {/* For Microsoft the issuer is fully determined by the directory
@@ -291,73 +291,73 @@ export default function Identity() {
                 in. It is shown read-only instead. */}
             {form.vendor === "azure" ? (
               <div className="md:col-span-2">
-                <label className="block text-xs font-medium text-gray-500 mb-1">
+                <label className="block text-xs font-medium text-muted mb-1">
                   Issuer URL{" "}
-                  <span className="text-gray-400">— derived, not editable</span>
+                  <span className="text-faint">— derived, not editable</span>
                 </label>
                 <input
                   readOnly
                   value={form.issuer_url || "set the directory ID below"}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50 font-mono text-xs text-gray-600"
+                  className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm bg-surface-2 font-mono text-xs text-text-2"
                 />
               </div>
             ) : (
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-gray-500 mb-1">Issuer URL</label>
+              <label className="block text-xs font-medium text-muted mb-1">Issuer URL</label>
               <div className="flex gap-2">
                 <input
                   value={form.issuer_url}
                   onChange={(e) => setForm({ ...form, issuer_url: e.target.value })}
                   placeholder="https://login.microsoftonline.com/{tenant}/v2.0"
-                  className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
                 />
                 <button
                   onClick={testConnection}
-                  className="px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium hover:bg-gray-200"
+                  className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
                 >
                   Test
                 </button>
               </div>
               {testResult && (
-                <p className={`mt-1 text-xs ${testResult.startsWith("Connected") ? "text-green-600" : testResult === "testing" ? "text-gray-400" : "text-red-600"}`}>
+                <p className={`mt-1 text-xs ${testResult.startsWith("Connected") ? "text-green-600" : testResult === "testing" ? "text-faint" : "text-red-600"}`}>
                   {testResult === "testing" ? "Testing connection..." : testResult}
                 </p>
               )}
             </div>
             )}
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Client ID</label>
+              <label className="block text-xs font-medium text-muted mb-1">Client ID</label>
               <input
                 value={form.client_id}
                 onChange={(e) => setForm({ ...form, client_id: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Client Secret</label>
+              <label className="block text-xs font-medium text-muted mb-1">Client Secret</label>
               <input
                 type="password"
                 value={form.client_secret}
                 onChange={(e) => setForm({ ...form, client_secret: e.target.value })}
                 placeholder={editing !== "__new__" ? "********" : ""}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Audience</label>
+              <label className="block text-xs font-medium text-muted mb-1">Audience</label>
               <input
                 value={form.audience}
                 onChange={(e) => setForm({ ...form, audience: e.target.value })}
                 placeholder="Same as Client ID if empty"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Vendor</label>
+              <label className="block text-xs font-medium text-muted mb-1">Vendor</label>
               <select
                 value={form.vendor}
                 onChange={(e) => setForm({ ...form, vendor: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               >
                 <option value="">Generic OIDC</option>
                 <option value="azure">Microsoft Entra ID (Azure AD)</option>
@@ -368,9 +368,9 @@ export default function Identity() {
             </div>
             {form.vendor === "azure" && (
               <div className="md:col-span-2">
-                <label className="block text-xs font-medium text-gray-500 mb-1">
+                <label className="block text-xs font-medium text-muted mb-1">
                   Directory (tenant) ID{" "}
-                  <span className="text-gray-400">— not the application ID</span>
+                  <span className="text-faint">— not the application ID</span>
                 </label>
                 <div className="flex gap-2">
                   <input
@@ -390,10 +390,10 @@ export default function Identity() {
                       });
                     }}
                     placeholder="72f988bf-86f1-41af-91ab-2d7cd011db47  ·  or: organizations / common"
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-accent focus:outline-none"
                   />
                 </div>
-                <p className="mt-1 text-xs text-gray-400">
+                <p className="mt-1 text-xs text-faint">
                   Sets the Issuer URL above. Use your Directory (tenant) ID from
                   Entra &rarr; Overview for a single organisation. Use{" "}
                   <code>organizations</code> only with Tenancy set to
@@ -404,12 +404,12 @@ export default function Identity() {
             )}
 
             {/* Tenancy ------------------------------------------------- */}
-            <div className="md:col-span-2 border-t border-gray-200 pt-4 mt-1">
-              <label className="block text-xs font-medium text-gray-500 mb-1">Tenancy</label>
+            <div className="md:col-span-2 border-t border-border pt-4 mt-1">
+              <label className="block text-xs font-medium text-muted mb-1">Tenancy</label>
               <select
                 value={form.tenancy}
                 onChange={(e) => setForm({ ...form, tenancy: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               >
                 <option value="single">
                   Single tenant — this provider serves one ObjectIO tenant
@@ -418,7 +418,7 @@ export default function Identity() {
                   Multi-tenant — each signing-in organisation gets its own tenant
                 </option>
               </select>
-              <p className="mt-1 text-xs text-gray-400">
+              <p className="mt-1 text-xs text-faint">
                 Multi-tenant keys on the <code>tid</code> claim: the first login
                 from an organisation registers a tenant for it automatically.
               </p>
@@ -427,7 +427,7 @@ export default function Identity() {
             {form.tenancy === "multi" && (
               <>
                 <div>
-                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                  <label className="block text-xs font-medium text-muted mb-1">
                     Quota per registered tenant (GB)
                   </label>
                   <input
@@ -436,14 +436,14 @@ export default function Identity() {
                     step="0.5"
                     value={quotaGbStr}
                     onChange={(e) => setQuotaGbStr(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
                   />
-                  <p className="mt-1 text-xs text-gray-400">
+                  <p className="mt-1 text-xs text-faint">
                     Applied at registration; raise it per tenant afterwards. 0 = unlimited.
                   </p>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                  <label className="block text-xs font-medium text-muted mb-1">
                     Tenant admin role
                   </label>
                   <input
@@ -452,23 +452,23 @@ export default function Identity() {
                       setForm({ ...form, tenant_admin_role: e.target.value })
                     }
                     placeholder="objectio-admin"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
                   />
-                  <p className="mt-1 text-xs text-gray-400">
+                  <p className="mt-1 text-xs text-faint">
                     A user whose token carries this role administers their own
                     tenant. Leave empty and only you can manage them.
                   </p>
                 </div>
                 <div className="md:col-span-2">
-                  <label className="block text-xs font-medium text-gray-500 mb-1">
+                  <label className="block text-xs font-medium text-muted mb-1">
                     Allowed directory IDs{" "}
-                    <span className="text-gray-400">(optional)</span>
+                    <span className="text-faint">(optional)</span>
                   </label>
                   <input
                     value={allowedTidsStr}
                     onChange={(e) => setAllowedTidsStr(e.target.value)}
                     placeholder="leave empty to let any organisation register"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-accent focus:outline-none"
                   />
                   <p className="mt-1 text-xs text-amber-700">
                     Empty means open registration: any Microsoft work or school
@@ -479,29 +479,29 @@ export default function Identity() {
               </>
             )}
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Groups Claim</label>
+              <label className="block text-xs font-medium text-muted mb-1">Groups Claim</label>
               <input
                 value={form.claim_name}
                 onChange={(e) => setForm({ ...form, claim_name: e.target.value })}
                 placeholder="groups"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-500 mb-1">Scopes</label>
+              <label className="block text-xs font-medium text-muted mb-1">Scopes</label>
               <input
                 value={form.scopes}
                 onChange={(e) => setForm({ ...form, scopes: e.target.value })}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-gray-500 mb-1">Admin Roles (comma-separated group/role IDs)</label>
+              <label className="block text-xs font-medium text-muted mb-1">Admin Roles (comma-separated group/role IDs)</label>
               <input
                 value={adminRolesStr}
                 onChange={(e) => setAdminRolesStr(e.target.value)}
                 placeholder="e.g. 0d35f722-797c-46ec-8360-8dc018c81e09"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
               />
             </div>
             <div className="md:col-span-2 flex items-center gap-2">
@@ -526,7 +526,7 @@ export default function Identity() {
                 />
                 <label htmlFor="system_admin_chk" className="text-sm">
                   Allow system-admin SSO
-                  <span className="block text-xs text-gray-500 mt-0.5">
+                  <span className="block text-xs text-muted mt-0.5">
                     Users authenticated through this provider log into the
                     system-admin console without a tenant binding. Leave
                     unchecked if this provider is only for tenant users.
@@ -535,16 +535,16 @@ export default function Identity() {
               </div>
             )}
           </div>
-          <div className="flex gap-3 mt-6 pt-4 border-t border-gray-100">
+          <div className="flex gap-3 mt-6 pt-4 border-t border-border">
             <button
               onClick={save}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+              className="px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
             >
               Save
             </button>
             <button
               onClick={() => setEditing(null)}
-              className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200"
+              className="px-4 py-2 bg-surface-2 text-text-2 rounded-lg text-sm font-medium hover:bg-border"
             >
               Cancel
             </button>
@@ -553,49 +553,49 @@ export default function Identity() {
       )}
 
       {/* Provider list */}
-      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="bg-surface rounded-xl border border-border overflow-hidden">
         <table className="w-full text-sm">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-surface-2 border-b border-border">
             <tr>
-              <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase">Provider</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase">Issuer</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase">Client ID</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase">Status</th>
-              <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase">Actions</th>
+              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Provider</th>
+              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Issuer</th>
+              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Client ID</th>
+              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Status</th>
+              <th className="text-right px-6 py-3 text-xs font-medium text-muted uppercase">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-100">
+          <tbody className="divide-y divide-border">
             {loading ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-gray-400">Loading...</td></tr>
+              <tr><td colSpan={5} className="px-6 py-8 text-center text-faint">Loading...</td></tr>
             ) : visibleProviders.length === 0 ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-gray-400">No OIDC providers configured</td></tr>
+              <tr><td colSpan={5} className="px-6 py-8 text-center text-faint">No OIDC providers configured</td></tr>
             ) : (
               visibleProviders.map((p) => (
-                <tr key={p.key} className="hover:bg-gray-50">
+                <tr key={p.key} className="hover:bg-surface-2">
                   <td className="px-6 py-3">
                     <div className="flex items-center gap-2">
-                      <Shield size={16} className="text-blue-500" />
+                      <Shield size={16} className="text-accent" />
                       <div>
                         <span className="font-medium">{p.value.display_name || p.key.replace("identity/openid/", "")}</span>
-                        <span className="text-gray-400 ml-2 text-xs">{p.value.vendor || "oidc"}</span>
+                        <span className="text-faint ml-2 text-xs">{p.value.vendor || "oidc"}</span>
                       </div>
                     </div>
                   </td>
-                  <td className="px-6 py-3 text-gray-500 truncate max-w-xs">{p.value.issuer_url}</td>
-                  <td className="px-6 py-3 font-mono text-xs text-gray-500">{p.value.client_id}</td>
+                  <td className="px-6 py-3 text-muted truncate max-w-xs">{p.value.issuer_url}</td>
+                  <td className="px-6 py-3 font-mono text-xs text-muted">{p.value.client_id}</td>
                   <td className="px-6 py-3">
                     {p.value.enabled ? (
                       <span className="inline-flex items-center gap-1 text-green-700 text-xs">
                         <CheckCircle size={14} /> Enabled
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 text-gray-400 text-xs">
+                      <span className="inline-flex items-center gap-1 text-faint text-xs">
                         <AlertCircle size={14} /> Disabled
                       </span>
                     )}
                   </td>
                   <td className="px-6 py-3 text-right">
-                    <button onClick={() => startEdit(p)} className="text-blue-500 hover:text-blue-700 p-1">
+                    <button onClick={() => startEdit(p)} className="text-accent hover:text-accent p-1">
                       <Edit size={16} />
                     </button>
                     <button onClick={() => remove(p.key)} className="text-red-500 hover:text-red-700 p-1 ml-2">

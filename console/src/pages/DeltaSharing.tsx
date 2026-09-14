@@ -254,7 +254,7 @@ export default function DeltaSharing() {
               {copied === "token" ? (
                 <Check size={14} className="text-green-500" />
               ) : (
-                <Copy size={14} className="text-gray-400" />
+                <Copy size={14} className="text-faint" />
               )}
             </button>
           </div>
@@ -279,7 +279,7 @@ export default function DeltaSharing() {
       {view === "detail" && (
         <button
           onClick={() => setView("list")}
-          className="flex items-center gap-1 text-[12px] text-gray-500 hover:text-gray-700 mb-3"
+          className="flex items-center gap-1 text-[12px] text-muted hover:text-text-2 mb-3"
         >
           <ArrowLeft size={14} /> Back to shares
         </button>
@@ -289,27 +289,27 @@ export default function DeltaSharing() {
       {view === "list" && (
         <div className="space-y-4">
           {/* Shares table */}
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-            <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-              <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
+            <div className="px-4 py-2.5 bg-surface-2 border-b border-border flex items-center justify-between">
+              <h3 className="text-[11px] font-medium text-muted uppercase tracking-wider">
                 Shares
               </h3>
               <button
                 onClick={() => setShowCreateShare(true)}
-                className="flex items-center gap-1 px-2 py-1 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+                className="flex items-center gap-1 px-2 py-1 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
               >
                 <Plus size={12} /> New Share
               </button>
             </div>
 
             {showCreateShare && (
-              <div className="p-3 border-b border-gray-100">
+              <div className="p-3 border-b border-border">
                 <div className="flex gap-2 mb-1.5">
                   <input
                     value={newShareName}
                     onChange={(e) => setNewShareName(e.target.value)}
                     placeholder="share-name"
-                    className="flex-1 px-2 py-1 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="flex-1 px-2 py-1 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     onKeyDown={(e) => e.key === "Enter" && createShare()}
                     autoFocus
                   />
@@ -317,19 +317,19 @@ export default function DeltaSharing() {
                     value={newShareComment}
                     onChange={(e) => setNewShareComment(e.target.value)}
                     placeholder="Description (optional)"
-                    className="flex-1 px-2 py-1 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="flex-1 px-2 py-1 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                   />
                 </div>
                 <div className="flex gap-1.5">
                   <button
                     onClick={createShare}
-                    className="px-2 py-1 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+                    className="px-2 py-1 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
                   >
                     Create
                   </button>
                   <button
                     onClick={() => setShowCreateShare(false)}
-                    className="px-2 py-1 text-gray-500 text-[11px]"
+                    className="px-2 py-1 text-muted text-[11px]"
                   >
                     Cancel
                   </button>
@@ -338,25 +338,25 @@ export default function DeltaSharing() {
             )}
 
             <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-100">
+              <thead className="bg-surface-2 border-b border-border">
                 <tr>
-                  <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                     Share
                   </th>
-                  <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                  <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                     Actions
                   </th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-50">
+              <tbody className="divide-y divide-border">
                 {loading ? (
                   <tr>
                     <td colSpan={2} className="px-4 py-6 text-center">
                       <div className="flex items-center justify-center gap-3">
-                        <div className="w-16 h-0.5 bg-gray-200 rounded-full overflow-hidden">
-                          <div className="h-full w-1/2 bg-blue-400 rounded-full animate-loading-bar" />
+                        <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
+                          <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
                         </div>
-                        <span className="text-[12px] text-gray-400">
+                        <span className="text-[12px] text-faint">
                           Loading
                         </span>
                       </div>
@@ -366,7 +366,7 @@ export default function DeltaSharing() {
                   <tr>
                     <td
                       colSpan={2}
-                      className="px-4 py-6 text-center text-[12px] text-gray-400"
+                      className="px-4 py-6 text-center text-[12px] text-faint"
                     >
                       No shares. Create one to start sharing tables.
                     </td>
@@ -375,23 +375,23 @@ export default function DeltaSharing() {
                   shares.map((s) => (
                     <tr
                       key={s.name}
-                      className="hover:bg-gray-50 cursor-pointer group"
+                      className="hover:bg-surface-2 cursor-pointer group"
                       onClick={() => openShare(s.name)}
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
-                          <Share2 size={13} className="text-blue-500" />
+                          <Share2 size={13} className="text-accent" />
                           <span className="text-[13px] font-medium">
                             {s.name}
                           </span>
                           {s.comment && (
-                            <span className="text-[11px] text-gray-400">
+                            <span className="text-[11px] text-faint">
                               {s.comment}
                             </span>
                           )}
                           <ChevronRight
                             size={14}
-                            className="ml-auto text-gray-300"
+                            className="ml-auto text-faint"
                           />
                         </div>
                       </td>
@@ -401,7 +401,7 @@ export default function DeltaSharing() {
                             e.stopPropagation();
                             deleteShare(s.name);
                           }}
-                          className="text-gray-300 hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -414,30 +414,30 @@ export default function DeltaSharing() {
           </div>
 
           {/* Recipients table */}
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-            <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-              <h3 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+          <div className="bg-surface rounded-xl border border-border overflow-hidden">
+            <div className="px-4 py-2.5 bg-surface-2 border-b border-border flex items-center justify-between">
+              <h3 className="text-[11px] font-medium text-muted uppercase tracking-wider">
                 Recipients
               </h3>
               <button
                 onClick={() => setShowCreateRecipient(true)}
-                className="flex items-center gap-1 px-2 py-1 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+                className="flex items-center gap-1 px-2 py-1 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
               >
                 <Plus size={12} /> New Recipient
               </button>
             </div>
 
             {showCreateRecipient && (
-              <div className="p-3 border-b border-gray-100 space-y-2">
+              <div className="p-3 border-b border-border space-y-2">
                 <input
                   value={newRecipientName}
                   onChange={(e) => setNewRecipientName(e.target.value)}
                   placeholder="Recipient name"
-                  className="w-full px-2 py-1 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  className="w-full px-2 py-1 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                   autoFocus
                 />
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Grant access to shares:
                   </label>
                   <div className="flex flex-wrap gap-1.5">
@@ -447,8 +447,8 @@ export default function DeltaSharing() {
                         onClick={() => toggleRecipientShare(s.name)}
                         className={`px-2 py-0.5 rounded text-[11px] border ${
                           selectedRecipientShares.has(s.name)
-                            ? "bg-blue-50 border-blue-300 text-blue-700"
-                            : "bg-white border-gray-200 text-gray-500 hover:border-gray-300"
+                            ? "bg-accent-soft border-accent text-accent"
+                            : "bg-surface border-border text-muted hover:border-border-strong"
                         }`}
                       >
                         {s.name}
@@ -459,13 +459,13 @@ export default function DeltaSharing() {
                 <div className="flex gap-1.5">
                   <button
                     onClick={createRecipient}
-                    className="px-2 py-1 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+                    className="px-2 py-1 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
                   >
                     Create
                   </button>
                   <button
                     onClick={() => setShowCreateRecipient(false)}
-                    className="px-2 py-1 text-gray-500 text-[11px]"
+                    className="px-2 py-1 text-muted text-[11px]"
                   >
                     Cancel
                   </button>
@@ -474,10 +474,10 @@ export default function DeltaSharing() {
             )}
 
             <table className="w-full">
-              <tbody className="divide-y divide-gray-50">
+              <tbody className="divide-y divide-border">
                 {recipients.length === 0 ? (
                   <tr>
-                    <td className="px-4 py-6 text-center text-[12px] text-gray-400">
+                    <td className="px-4 py-6 text-center text-[12px] text-faint">
                       No recipients
                     </td>
                   </tr>
@@ -485,7 +485,7 @@ export default function DeltaSharing() {
                   recipients.map((r) => (
                     <tr
                       key={r.name}
-                      className="hover:bg-gray-50 group"
+                      className="hover:bg-surface-2 group"
                     >
                       <td className="px-4 py-2.5">
                         <div className="flex items-center gap-2">
@@ -497,7 +497,7 @@ export default function DeltaSharing() {
                             {r.shares?.map((s) => (
                               <span
                                 key={s}
-                                className="text-[10px] px-1 py-0.5 bg-blue-50 text-blue-600 rounded"
+                                className="text-[10px] px-1 py-0.5 bg-accent-soft text-accent rounded"
                               >
                                 {s}
                               </span>
@@ -508,7 +508,7 @@ export default function DeltaSharing() {
                       <td className="px-4 py-2.5 text-right">
                         <button
                           onClick={() => deleteRecipient(r.name)}
-                          className="text-gray-300 hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                          className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -524,55 +524,55 @@ export default function DeltaSharing() {
 
       {/* ===== DETAIL VIEW ===== */}
       {view === "detail" && (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-          <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-            <h3 className="text-[13px] font-medium text-gray-700">
-              Tables in <span className="text-blue-600">{selectedShare}</span>
+        <div className="bg-surface rounded-xl border border-border overflow-hidden">
+          <div className="px-4 py-2.5 bg-surface-2 border-b border-border flex items-center justify-between">
+            <h3 className="text-[13px] font-medium text-text-2">
+              Tables in <span className="text-accent">{selectedShare}</span>
             </h3>
             <button
               onClick={startAddTable}
-              className="flex items-center gap-1 px-2 py-1 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+              className="flex items-center gap-1 px-2 py-1 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
             >
               <Plus size={12} /> Add Table
             </button>
           </div>
 
           {showAddTable && (
-            <div className="p-4 border-b border-gray-100 space-y-3">
+            <div className="p-4 border-b border-border space-y-3">
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Type
                   </label>
                   <select
                     value={tableType}
                     onChange={(e) => setTableType(e.target.value)}
-                    className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                   >
                     <option value="uniform">Iceberg (UniForm)</option>
                     <option value="delta">Delta Lake</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Schema
                   </label>
                   <input
                     value={addSchema}
                     onChange={(e) => setAddSchema(e.target.value)}
                     placeholder="e.g. HR"
-                    className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                   />
                 </div>
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Table Name
                   </label>
                   {tableType === "uniform" ? (
                     <select
                       value={addTableName}
                       onChange={(e) => setAddTableName(e.target.value)}
-                      className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     >
                       <option value="">Select table...</option>
                       {icebergTables.map((t) => (
@@ -586,7 +586,7 @@ export default function DeltaSharing() {
                       value={addTableName}
                       onChange={(e) => setAddTableName(e.target.value)}
                       placeholder="Table name"
-                      className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     />
                   )}
                 </div>
@@ -595,7 +595,7 @@ export default function DeltaSharing() {
               {tableType === "uniform" && (
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-[11px] text-gray-500 mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Iceberg Namespace
                     </label>
                     <select
@@ -603,7 +603,7 @@ export default function DeltaSharing() {
                       onChange={(e) => {
                         loadIcebergTables(e.target.value);
                       }}
-                      className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     >
                       <option value="">Select namespace...</option>
                       {icebergNamespaces.map((ns) => (
@@ -614,7 +614,7 @@ export default function DeltaSharing() {
                     </select>
                   </div>
                   <div className="flex items-end">
-                    <p className="text-[11px] text-gray-400 pb-1.5">
+                    <p className="text-[11px] text-faint pb-1.5">
                       Select namespace to browse existing Iceberg tables
                     </p>
                   </div>
@@ -624,25 +624,25 @@ export default function DeltaSharing() {
               {tableType === "delta" && (
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-[11px] text-gray-500 mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       S3 Bucket
                     </label>
                     <input
                       value={deltaBucket}
                       onChange={(e) => setDeltaBucket(e.target.value)}
                       placeholder="analytics"
-                      className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] text-gray-500 mb-1">
+                    <label className="block text-[11px] text-muted mb-1">
                       Path
                     </label>
                     <input
                       value={deltaPath}
                       onChange={(e) => setDeltaPath(e.target.value)}
                       placeholder="employees/"
-                      className="w-full px-2 py-1.5 border border-gray-300 rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
                     />
                   </div>
                 </div>
@@ -651,13 +651,13 @@ export default function DeltaSharing() {
               <div className="flex gap-1.5">
                 <button
                   onClick={addTable}
-                  className="px-3 py-1.5 bg-gray-900 text-white rounded text-[11px] hover:bg-gray-800"
+                  className="px-3 py-1.5 bg-primary text-primary-fg rounded text-[11px] hover:bg-primary-hover"
                 >
                   Add Table
                 </button>
                 <button
                   onClick={() => setShowAddTable(false)}
-                  className="px-3 py-1.5 text-gray-500 text-[11px]"
+                  className="px-3 py-1.5 text-muted text-[11px]"
                 >
                   Cancel
                 </button>
@@ -666,25 +666,25 @@ export default function DeltaSharing() {
           )}
 
           <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-100">
+            <thead className="bg-surface-2 border-b border-border">
               <tr>
-                <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                   Table
                 </th>
-                <th className="text-left px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
                   Type
                 </th>
-                <th className="text-right px-4 py-2 text-[11px] font-medium text-gray-500 uppercase tracking-wider w-20">
+                <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-20">
                   Actions
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-50">
+            <tbody className="divide-y divide-border">
               {shareTables.length === 0 ? (
                 <tr>
                   <td
                     colSpan={3}
-                    className="px-4 py-6 text-center text-[12px] text-gray-400"
+                    className="px-4 py-6 text-center text-[12px] text-faint"
                   >
                     No tables in this share. Add one to start sharing.
                   </td>
@@ -693,7 +693,7 @@ export default function DeltaSharing() {
                 shareTables.map((t) => (
                   <tr
                     key={`${t.schema}.${t.name}`}
-                    className="hover:bg-gray-50 group"
+                    className="hover:bg-surface-2 group"
                   >
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-2">
@@ -707,7 +707,7 @@ export default function DeltaSharing() {
                       <span
                         className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
                           t.table_type === "delta"
-                            ? "bg-blue-100 text-blue-700"
+                            ? "bg-accent-soft text-accent"
                             : "bg-green-100 text-green-700"
                         }`}
                       >
@@ -717,7 +717,7 @@ export default function DeltaSharing() {
                     <td className="px-4 py-2.5 text-right">
                       <button
                         onClick={() => removeTable(t.schema, t.name)}
-                        className="text-gray-300 hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                        className="text-faint hover:text-red-500 p-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
                       >
                         <Trash2 size={13} />
                       </button>

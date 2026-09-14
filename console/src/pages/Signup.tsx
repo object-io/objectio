@@ -48,20 +48,20 @@ export default function Signup() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-50 via-white to-gray-100 flex items-center justify-center p-6">
+    <div className="min-h-screen bg-gradient-to-br bg-bg flex items-center justify-center p-6">
       <div className="w-full max-w-md">
         <div className="flex justify-center mb-8">
           <img src={wordmark} alt="ObjectIO" className="h-8" />
         </div>
 
-        <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-7">
+        <div className="bg-surface rounded-2xl border border-border shadow-sm p-7">
           <div className="flex items-center gap-2 mb-1">
-            <Building2 size={16} className="text-gray-400" />
-            <h1 className="text-[15px] font-semibold text-gray-900">
+            <Building2 size={16} className="text-faint" />
+            <h1 className="text-[15px] font-semibold text-text">
               Create an organisation account
             </h1>
           </div>
-          <p className="text-[12px] text-gray-500 mb-6">
+          <p className="text-[12px] text-muted mb-6">
             Sign in with your work account. Your organisation gets its own
             account, and you become its first member — there is nothing to fill
             in and nobody to wait for.
@@ -74,7 +74,7 @@ export default function Signup() {
           )}
 
           {loading ? (
-            <p className="text-[12px] text-gray-400">Loading…</p>
+            <p className="text-[12px] text-faint">Loading…</p>
           ) : providers.length === 0 ? (
             /* Nothing to offer means no multi-tenant provider is configured.
                Say which setting is missing rather than showing an empty page. */
@@ -95,7 +95,7 @@ export default function Signup() {
                 <button
                   key={p.name}
                   onClick={() => start(p.name)}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-800 rounded-lg text-[13px] font-medium hover:bg-gray-100"
+                  className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-surface-2 border border-border text-text rounded-lg text-[13px] font-medium hover:bg-surface-2"
                 >
                   <LogIn size={14} />
                   Continue with {p.label}
@@ -104,10 +104,10 @@ export default function Signup() {
             </div>
           )}
 
-          <div className="mt-6 pt-4 border-t border-gray-200">
+          <div className="mt-6 pt-4 border-t border-border">
             <a
               href="/_console/tenant/"
-              className="inline-flex items-center gap-1.5 text-[12px] text-gray-500 hover:text-gray-700"
+              className="inline-flex items-center gap-1.5 text-[12px] text-muted hover:text-text-2"
             >
               <ArrowLeft size={12} />
               Already have an account? Sign in

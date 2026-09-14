@@ -30,7 +30,7 @@ export default function Tabs<K extends string>({
   if (variant === "pill") {
     return (
       <div
-        className={`inline-flex items-center gap-1 bg-gray-100 p-0.5 rounded-lg ${className}`}
+        className={`inline-flex items-center gap-1 bg-surface-2 p-0.5 rounded-lg ${className}`}
         role="tablist"
       >
         {tabs.map((t) => {
@@ -44,8 +44,8 @@ export default function Tabs<K extends string>({
               onClick={() => onChange(t.key)}
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors ${
                 isActive
-                  ? "bg-white text-gray-900 shadow-sm"
-                  : "text-gray-600 hover:text-gray-900"
+                  ? "bg-surface text-text shadow-sm"
+                  : "text-text-2 hover:text-text"
               } disabled:opacity-40 disabled:cursor-not-allowed`}
             >
               {t.icon}
@@ -54,8 +54,8 @@ export default function Tabs<K extends string>({
                 <span
                   className={`inline-flex items-center justify-center min-w-[16px] px-1 h-4 rounded-full text-[10px] font-semibold ${
                     isActive
-                      ? "bg-blue-100 text-blue-700"
-                      : "bg-gray-200 text-gray-600"
+                      ? "bg-accent-soft text-accent"
+                      : "bg-border text-text-2"
                   }`}
                 >
                   {t.count}
@@ -70,7 +70,7 @@ export default function Tabs<K extends string>({
 
   return (
     <div
-      className={`flex items-center gap-1 border-b border-gray-200 ${className}`}
+      className={`flex items-center gap-1 border-b border-border ${className}`}
       role="tablist"
     >
       {tabs.map((t) => {
@@ -84,8 +84,8 @@ export default function Tabs<K extends string>({
             onClick={() => onChange(t.key)}
             className={`flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium border-b-2 -mb-px transition-colors ${
               isActive
-                ? "border-blue-600 text-blue-700"
-                : "border-transparent text-gray-500 hover:text-gray-900"
+                ? "border-accent text-accent"
+                : "border-transparent text-muted hover:text-text"
             } disabled:opacity-40 disabled:cursor-not-allowed`}
           >
             {t.icon}
@@ -94,8 +94,8 @@ export default function Tabs<K extends string>({
               <span
                 className={`inline-flex items-center justify-center min-w-[16px] px-1 h-4 rounded-full text-[10px] font-semibold ${
                   isActive
-                    ? "bg-blue-100 text-blue-700"
-                    : "bg-gray-100 text-gray-600"
+                    ? "bg-accent-soft text-accent"
+                    : "bg-surface-2 text-text-2"
                 }`}
               >
                 {t.count}

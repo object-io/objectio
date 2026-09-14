@@ -163,55 +163,55 @@ export default function TableSecurityEditor({
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col"
+        className="bg-surface rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between px-5 py-3 border-b border-gray-200">
+        <div className="flex items-start justify-between px-5 py-3 border-b border-border">
           <div className="flex items-center gap-2">
             <Filter size={16} className="text-emerald-600" />
             <div>
-              <h2 className="text-[14px] font-semibold text-gray-900">
+              <h2 className="text-[14px] font-semibold text-text">
                 Row filter & column masks
               </h2>
-              <div className="text-[12px] text-gray-500 font-mono">
+              <div className="text-[12px] text-muted font-mono">
                 {catalog}.{schema}.{table}
               </div>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-700 p-1 rounded hover:bg-gray-50"
+            className="text-faint hover:text-text-2 p-1 rounded hover:bg-surface-2"
           >
             <X size={14} />
           </button>
         </div>
 
-        <div className="px-5 py-3 text-[12px] text-gray-600 border-b border-gray-100">
+        <div className="px-5 py-3 text-[12px] text-text-2 border-b border-border">
           Functions are looked up in the same schema. Row filter must be a
           SQL UDF returning BOOLEAN; masks must return the masked column's
           type. Clear by leaving fields empty.
         </div>
 
         {loading ? (
-          <div className="p-8 text-center text-[12px] text-gray-400">
+          <div className="p-8 text-center text-[12px] text-faint">
             Loading…
           </div>
         ) : (
           <div className="flex-1 overflow-y-auto px-5 py-4 space-y-5">
             {/* Row filter */}
             <section>
-              <div className="text-[11px] font-medium text-gray-500 uppercase tracking-wider mb-2">
+              <div className="text-[11px] font-medium text-muted uppercase tracking-wider mb-2">
                 Row filter
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Filter function
                   </label>
                   <select
                     value={rowFilterFn}
                     onChange={(e) => setRowFilterFn(e.target.value)}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[12px] font-mono"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[12px] font-mono"
                   >
                     <option value="">— none —</option>
                     {fnNames.map((n) => (
@@ -222,7 +222,7 @@ export default function TableSecurityEditor({
                   </select>
                 </div>
                 <div>
-                  <label className="block text-[11px] text-gray-500 mb-1">
+                  <label className="block text-[11px] text-muted mb-1">
                     Input columns (comma-separated)
                   </label>
                   <input
@@ -230,7 +230,7 @@ export default function TableSecurityEditor({
                     onChange={(e) => setRowFilterCols(e.target.value)}
                     placeholder="region, tenant_id"
                     disabled={rowFilterFn === ""}
-                    className="w-full px-2.5 py-1.5 border border-gray-300 rounded-lg text-[12px] font-mono disabled:bg-gray-50 disabled:text-gray-400"
+                    className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[12px] font-mono disabled:bg-surface-2 disabled:text-faint"
                   />
                 </div>
               </div>
@@ -239,18 +239,18 @@ export default function TableSecurityEditor({
             {/* Column masks */}
             <section>
               <div className="flex items-center justify-between mb-2">
-                <div className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">
+                <div className="text-[11px] font-medium text-muted uppercase tracking-wider">
                   Column masks
                 </div>
                 <button
                   onClick={addMask}
-                  className="flex items-center gap-1 px-2 py-1 border border-gray-300 rounded text-[11px] text-gray-700 hover:bg-gray-50"
+                  className="flex items-center gap-1 px-2 py-1 border border-border-strong rounded text-[11px] text-text-2 hover:bg-surface-2"
                 >
                   <Plus size={12} /> Add mask
                 </button>
               </div>
               {masks.length === 0 ? (
-                <div className="text-[12px] text-gray-400 py-3 text-center border border-dashed border-gray-200 rounded">
+                <div className="text-[12px] text-faint py-3 text-center border border-dashed border-border rounded">
                   No column masks. Click <span className="font-medium">Add mask</span> to bind one.
                 </div>
               ) : (
@@ -258,10 +258,10 @@ export default function TableSecurityEditor({
                   {masks.map((m, i) => (
                     <div
                       key={i}
-                      className="grid grid-cols-[1fr_1.5fr_1.5fr_auto] gap-2 items-end border border-gray-200 rounded-lg p-2"
+                      className="grid grid-cols-[1fr_1.5fr_1.5fr_auto] gap-2 items-end border border-border rounded-lg p-2"
                     >
                       <div>
-                        <label className="block text-[10px] text-gray-500 mb-1">
+                        <label className="block text-[10px] text-muted mb-1">
                           Column
                         </label>
                         <select
@@ -269,7 +269,7 @@ export default function TableSecurityEditor({
                           onChange={(e) =>
                             updateMask(i, { column: e.target.value })
                           }
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-[12px] font-mono"
+                          className="w-full px-2 py-1 border border-border-strong rounded text-[12px] font-mono"
                         >
                           <option value="">—</option>
                           {colNames.map((c) => (
@@ -280,7 +280,7 @@ export default function TableSecurityEditor({
                         </select>
                       </div>
                       <div>
-                        <label className="block text-[10px] text-gray-500 mb-1">
+                        <label className="block text-[10px] text-muted mb-1">
                           Mask function
                         </label>
                         <select
@@ -290,7 +290,7 @@ export default function TableSecurityEditor({
                               function_full_name: e.target.value,
                             })
                           }
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-[12px] font-mono"
+                          className="w-full px-2 py-1 border border-border-strong rounded text-[12px] font-mono"
                         >
                           <option value="">—</option>
                           {fnNames.map((n) => (
@@ -301,7 +301,7 @@ export default function TableSecurityEditor({
                         </select>
                       </div>
                       <div>
-                        <label className="block text-[10px] text-gray-500 mb-1">
+                        <label className="block text-[10px] text-muted mb-1">
                           Using columns (comma-separated)
                         </label>
                         <input
@@ -315,12 +315,12 @@ export default function TableSecurityEditor({
                             })
                           }
                           placeholder="role, tenant_id"
-                          className="w-full px-2 py-1 border border-gray-300 rounded text-[12px] font-mono"
+                          className="w-full px-2 py-1 border border-border-strong rounded text-[12px] font-mono"
                         />
                       </div>
                       <button
                         onClick={() => removeMask(i)}
-                        className="p-1.5 text-gray-400 hover:text-red-600"
+                        className="p-1.5 text-faint hover:text-red-600"
                         title="Remove mask"
                       >
                         <Trash2 size={14} />
@@ -346,17 +346,17 @@ export default function TableSecurityEditor({
           </div>
         )}
 
-        <div className="flex justify-end gap-2 px-5 py-3 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+        <div className="flex justify-end gap-2 px-5 py-3 border-t border-border bg-surface-2 rounded-b-xl">
           <button
             onClick={onClose}
-            className="px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg text-[12px] font-medium hover:bg-white"
+            className="px-3 py-1.5 border border-border-strong text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface"
           >
             Cancel
           </button>
           <button
             onClick={onSave}
             disabled={busy || loading}
-            className="px-3 py-1.5 bg-gray-900 text-white rounded-lg text-[12px] font-medium hover:bg-gray-800 disabled:opacity-50"
+            className="px-3 py-1.5 bg-primary text-primary-fg rounded-lg text-[12px] font-medium hover:bg-primary-hover disabled:opacity-50"
           >
             {busy ? "Saving…" : "Save"}
           </button>
