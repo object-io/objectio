@@ -7331,10 +7331,23 @@ pub async fn admin_create_user(
         }
         Err(e) => {
             error!("Failed to create user: {}", e);
+            // Map the gRPC code rather than calling everything a 500, and
+            // send `e.message()` rather than `e` — the Display impl embeds the
+            // whole tonic Status including its MetadataMap, which put response
+            // headers and internal detail into the client's error body.
+            let status = match e.code() {
+                tonic::Code::AlreadyExists => StatusCode::CONFLICT,
+                tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+                tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                .body(Body::from(
+                    serde_json::json!({ "error": e.message() }).to_string(),
+                ))
                 .unwrap()
         }
     }

@@ -33,9 +33,13 @@ class APIError(ObjectIOError):
     def already_exists(self) -> bool:
         """The server refusing to create something that is already there.
 
-        It answers 400 for this, so the status alone cannot distinguish it
-        from a malformed request; the message is what settles it.
+        409 is the clean answer, but the tenant and bucket creates predate
+        that and still return 400 with the reason in the message — so accept
+        either rather than making a caller's idempotency depend on which
+        endpoint it happened to call.
         """
+        if self.status_code == 409:
+            return True
         if self.status_code != 400:
             return False
         lowered = self.message.lower()

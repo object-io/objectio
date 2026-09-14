@@ -108,11 +108,20 @@ func IsForbidden(err error) bool {
 }
 
 // IsAlreadyExists reports whether err is the server refusing to create
-// something that is already there. The management API answers 400 for this,
-// so the status alone is not enough to tell it from a malformed request.
+// something that is already there.
+//
+// 409 is the clean answer, but the tenant and bucket creates predate that and
+// still return 400 with the reason in the message — so accept either, rather
+// than making a caller's idempotency depend on which endpoint it called.
 func IsAlreadyExists(err error) bool {
 	var ae *APIError
-	if !errors.As(err, &ae) || ae.StatusCode != http.StatusBadRequest {
+	if !errors.As(err, &ae) {
+		return false
+	}
+	if ae.StatusCode == http.StatusConflict {
+		return true
+	}
+	if ae.StatusCode != http.StatusBadRequest {
 		return false
 	}
 	m := strings.ToLower(ae.Message)

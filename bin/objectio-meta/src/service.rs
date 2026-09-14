@@ -4353,13 +4353,14 @@ impl MetadataService for MetaService {
             return Err(Status::invalid_argument("display_name is required"));
         }
 
-        // Check if user with same name exists
-        if self
-            .users
-            .read()
-            .values()
-            .any(|u| u.display_name == req.display_name)
-        {
+        // Check if a *live* user with this name exists. DeleteUser is a soft
+        // delete — it flips status to Deleted and leaves the record in place —
+        // so scanning every value meant a deleted name was taken forever.
+        // Listing already hides those users, which made it look like the name
+        // was free right up until the create failed.
+        if self.users.read().values().any(|u| {
+            u.display_name == req.display_name && u.status != UserStatus::UserDeleted as i32
+        }) {
             return Err(Status::already_exists("user with this name already exists"));
         }
 
