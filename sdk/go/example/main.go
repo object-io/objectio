@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/object-io/objectio/sdk/go/objectio"
+	"github.com/object-io/objectio-go-sdk"
 )
 
 func main() {

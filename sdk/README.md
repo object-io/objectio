@@ -7,10 +7,16 @@ They deliberately do **not** do S3 data operations. Use the S3 SDK you already
 have — aws-sdk-go-v2, boto3, mountpoint-s3, s3fs, rclone — pointed at the same
 endpoint with a credential these mint. The handoff is one call.
 
-| | |
-|---|---|
-| `go/` | Go module `github.com/object-io/objectio/sdk/go` |
-| `python/` | Package `objectio`, Python ≥ 3.9 |
+| | | |
+|---|---|---|
+| `go/` | module `github.com/object-io/objectio-go-sdk` | mirrored to [object-io/objectio-go-sdk](https://github.com/object-io/objectio-go-sdk) on every push to `main` |
+| `python/` | package `objectio`, Python ≥ 3.9 | |
+
+**Source of truth is here.** The Go module lives in a repo of its own so its
+import path is clean and its release tags are plain `v0.1.0` — a module nested
+in a subdirectory has to be tagged `sdk/go/v0.1.0`, which is the most common
+way nested modules fail to publish. `.github/workflows/sdk-go-mirror.yml`
+copies `sdk/go/` there; edits made in the mirror are overwritten.
 
 Both sign with SigV4 on the standard library alone, so neither adds a
 dependency — which matters when this goes into a CSI driver or an operator.
@@ -109,7 +115,7 @@ used as a provisioner one.
 ## Go
 
 ```go
-import "github.com/object-io/objectio/sdk/go/objectio"
+import "github.com/object-io/objectio-go-sdk"
 
 app, _ := objectio.New(objectio.Config{
     Endpoint:  "https://s3.example.com",
@@ -137,10 +143,16 @@ s3c := s3.NewFromConfig(cfg, func(o *s3.Options) {
 })
 ```
 
+Install it:
+
+```bash
+go get github.com/object-io/objectio-go-sdk
+```
+
 Run the walkthrough against a live server:
 
 ```
-go run ./example -endpoint http://127.0.0.1:9000 -access-key AKIA… -secret-key …
+cd sdk/go && go run ./example -endpoint http://127.0.0.1:9000 -access-key AKIA… -secret-key …
 ```
 
 ## Python
@@ -230,5 +242,9 @@ if err := app.CreateBucket(ctx, "ws-1", ""); err != nil && !objectio.IsAlreadyEx
 cd sdk/go     && go test ./...
 cd sdk/python && python -m pytest tests -q
 ```
+
+CI runs both on every pull request touching `sdk/`
+(`.github/workflows/sdk-ci.yml`), including an assertion that neither has
+picked up a dependency.
 
 The signature tests need no server. The `example` program does.
