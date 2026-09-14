@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Activity, Pause, Play, RefreshCw, Save } from "lucide-react";
+import { Pause, Play, RefreshCw, Save } from "lucide-react";
 import { rebalance as rebalanceApi, type RebalanceStatus, request } from "../api/client";
+import { Banner, Button, StatTile } from "../components/ui";
 
 /// Balancing tab — live PG balancer status + tuning knobs.
 ///
@@ -163,132 +164,93 @@ export default function Balancing() {
     }
   };
 
-  const tone = status?.paused
-    ? "bg-red-50 border-red-200 text-red-800"
-    : status?.started
-      ? "bg-accent-soft border-accent text-accent"
-      : "bg-surface-2 border-border text-text-2";
+  const tiles = [
+    { label: "PG moves total", value: (status?.pgs_moved_total ?? 0).toLocaleString() },
+    {
+      label: "Scanned last tick",
+      value: (status?.pgs_scanned_last_tick ?? 0).toLocaleString(),
+      sub: "PGs",
+    },
+    {
+      label: "Candidates pending",
+      value: (status?.pg_candidates_last_tick ?? 0).toLocaleString(),
+    },
+    {
+      label: "Last tick",
+      value: status?.last_sweep_at
+        ? new Date(status.last_sweep_at * 1000).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          })
+        : "—",
+    },
+  ];
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Live status card */}
-      <div className={`rounded-lg border px-4 py-3 ${tone}`}>
-        <div className="flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <span
-              className={`inline-flex items-center justify-center w-8 h-8 rounded-md ${
-                status?.paused
-                  ? "bg-red-100"
-                  : status?.started
-                    ? "bg-accent-soft"
-                    : "bg-surface-2"
-              }`}
-            >
-              {status?.paused ? (
-                <Pause size={16} />
-              ) : (
-                <Activity size={16} className={status?.started ? "animate-pulse" : ""} />
-              )}
-            </span>
-            <div>
-              <div className="text-[13px] font-semibold">
-                Balancer{" "}
-                {status?.paused
-                  ? "paused"
-                  : status?.started
-                    ? "running"
-                    : "idle"}
-              </div>
-              <div className="text-[11px] opacity-80 mt-0.5">
-                {status ? (
-                  <>
-                    {(status.pgs_moved_total ?? 0).toLocaleString()} PG moves
-                    total
-                    {" · "}
-                    {(status.pgs_scanned_last_tick ?? 0).toLocaleString()} PGs
-                    scanned last tick
-                    {(status.pg_candidates_last_tick ?? 0) > 0 && (
-                      <>
-                        {" · "}
-                        {status.pg_candidates_last_tick!.toLocaleString()}{" "}
-                        candidates pending
-                      </>
-                    )}
-                    {status.last_sweep_at > 0 && (
-                      <>
-                        {" · last tick "}
-                        {new Date(status.last_sweep_at * 1000).toLocaleTimeString()}
-                      </>
-                    )}
-                  </>
-                ) : (
-                  "Loading…"
-                )}
-              </div>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              const paused = status?.paused;
-              saveOne("balancer/paused", paused ? "false" : "true");
-            }}
+      <Banner
+        kind={status?.paused ? "err" : status?.started ? "info" : "warn"}
+        title={`Balancer ${status?.paused ? "paused" : status?.started ? "running" : "idle"}`}
+        action={
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={status?.paused ? <Play size={12} /> : <Pause size={12} />}
             disabled={!status}
-            className="flex items-center gap-1.5 px-3 py-1.5 border bg-surface rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50"
+            onClick={() => saveOne("balancer/paused", status?.paused ? "false" : "true")}
           >
-            {status?.paused ? <Play size={13} /> : <Pause size={13} />}
             {status?.paused ? "Resume" : "Pause"}
-          </button>
-        </div>
-        {status?.last_error && (
-          <div className="mt-2 text-[11px] text-red-700">
-            last error: {status.last_error}
-          </div>
-        )}
+          </Button>
+        }
+      >
+        {status
+          ? status.paused
+            ? "Ticks still run so the logs stay fresh, but no move is committed."
+            : "Moves commit through Raft; a knob change takes effect on the next sweep."
+          : "Loading…"}
+        {status?.last_error && <> · last error: {status.last_error}</>}
+      </Banner>
+
+      {err && <Banner kind="err">{err}</Banner>}
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        {tiles.map((t) => (
+          <StatTile key={t.label} label={t.label} value={t.value} sub={t.sub} />
+        ))}
       </div>
 
-      {err && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-800">
-          {err}
+      <div className="bg-surface border border-border rounded-card shadow-sm overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-border">
+          <h3 className="font-mono text-[11px] uppercase tracking-wider text-muted">Tuning</h3>
+          <Button size="sm" variant="ghost" icon={<RefreshCw size={12} />} onClick={loadKnobs}>
+            Reload
+          </Button>
         </div>
-      )}
-
-      {/* Knobs */}
-      <div className="bg-surface rounded-lg border border-border overflow-hidden">
-        <div className="px-4 py-2.5 border-b border-border flex items-center justify-between">
-          <div className="text-[12px] font-medium text-text-2 uppercase tracking-wide">
-            Tuning
-          </div>
-          <button
-            onClick={loadKnobs}
-            className="flex items-center gap-1.5 px-2 py-0.5 text-[11px] text-muted hover:text-text"
-          >
-            <RefreshCw size={11} /> Reload
-          </button>
-        </div>
-        <div className="divide-y divide-border">
+        <div>
           {KNOBS.map((k) => {
             const cur = values[k.key] ?? "";
             const sv = saved[k.key] ?? "";
             const dirty = cur !== sv;
             return (
-              <div key={k.key} className="flex items-center gap-3 px-4 py-2.5">
+              <div
+                key={k.key}
+                className="flex items-center gap-3 px-4 py-2.5 border-t border-border first:border-t-0"
+              >
                 <div className="flex-1 min-w-0">
-                  <div className="text-[12px] font-medium text-text">
+                  <p className="text-[12px] font-medium text-text">
                     {k.label}
-                    <span className="ml-1.5 font-mono text-[10px] text-faint">
-                      {k.key}
-                    </span>
-                  </div>
-                  <div className="text-[11px] text-muted mt-0.5">{k.hint}</div>
+                    <span className="ml-1.5 font-mono text-[10px] text-faint">{k.key}</span>
+                  </p>
+                  <p className="text-[11px] text-muted mt-0.5">{k.hint}</p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   {k.type === "bool" ? (
                     <select
                       value={cur || "false"}
-                      onChange={(e) =>
-                        setValues((s) => ({ ...s, [k.key]: e.target.value }))
-                      }
-                      className="px-2 py-1 border border-border-strong rounded text-[12px] bg-surface w-28"
+                      onChange={(e) => setValues((s) => ({ ...s, [k.key]: e.target.value }))}
+                      className="h-8 px-2 bg-surface text-text border border-border-strong
+                        rounded-control text-[12px] font-mono w-28 focus:outline-none focus:border-accent"
                     >
                       <option value="false">false</option>
                       <option value="true">true</option>
@@ -301,24 +263,20 @@ export default function Balancing() {
                       step={k.step}
                       value={cur}
                       placeholder={k.placeholder}
-                      onChange={(e) =>
-                        setValues((s) => ({ ...s, [k.key]: e.target.value }))
-                      }
-                      className="px-2 py-1 border border-border-strong rounded text-[12px] w-28 font-mono"
+                      onChange={(e) => setValues((s) => ({ ...s, [k.key]: e.target.value }))}
+                      className="h-8 px-2 bg-surface text-text border border-border-strong
+                        rounded-control text-[12px] font-mono w-28 focus:outline-none focus:border-accent"
                     />
                   )}
-                  <button
-                    onClick={() => saveOne(k.key, cur)}
+                  <Button
+                    size="sm"
+                    variant={dirty ? "accent" : "secondary"}
+                    icon={<Save size={11} />}
                     disabled={!dirty || saving === k.key}
-                    className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium ${
-                      dirty
-                        ? "bg-accent text-primary-fg hover:bg-accent"
-                        : "bg-surface-2 text-faint cursor-not-allowed"
-                    } disabled:opacity-50`}
+                    onClick={() => saveOne(k.key, cur)}
                   >
-                    <Save size={11} />
                     {saving === k.key ? "Saving…" : dirty ? "Save" : "Saved"}
-                  </button>
+                  </Button>
                 </div>
               </div>
             );
@@ -327,9 +285,8 @@ export default function Balancing() {
       </div>
 
       <p className="text-[11px] text-muted">
-        Changes hot-reload — no restart needed. Tick interval changes take effect
-        on the next sweep. See the balancer docs in the source for the
-        algorithm details.
+        Knobs hot-reload through Raft — no restart. A tick-interval change lands
+        on the next sweep.
       </p>
     </div>
   );

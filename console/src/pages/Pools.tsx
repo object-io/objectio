@@ -14,11 +14,11 @@ import {
   Plus as PlusIcon,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import StatusBadge from "../components/StatusBadge";
 import Tabs from "../components/Tabs";
 import SummaryPanel, {
   type ValidationState,
 } from "../components/SummaryPanel";
+import { Badge, Chip, Table, Row, Cell } from "../components/ui";
 
 interface Pool {
   name: string;
@@ -84,9 +84,9 @@ function ecMinNodes(p: Pool) {
 }
 
 function ecTypeBadge(ec_type: number) {
-  if (ec_type === 1) return "bg-orange-100 text-orange-800";
+  if (ec_type === 1) return "bg-warn-soft text-warn";
   if (ec_type === 2) return "bg-accent-soft text-accent";
-  return "bg-green-100 text-green-800";
+  return "bg-ok-soft text-ok";
 }
 
 function ecTypeName(ec_type: number) {
@@ -337,7 +337,7 @@ function PoolWizard({
               </div>
               <div>
                 <h2 className="text-[14px] font-semibold text-text">
-                  {isNew ? "Create Storage Pool" : `Edit: ${editing}`}
+                  {isNew ? "New pool" : `Edit · ${editing}`}
                 </h2>
                 <p className="text-[11px] text-muted">
                   Configure redundancy, placement, and policies.
@@ -349,7 +349,7 @@ function PoolWizard({
               active={tab}
               onChange={setTab}
               tabs={[
-                { key: "config" as const, label: "Pool Config" },
+                { key: "config" as const, label: "Pool config" },
                 { key: "volumes" as const, label: "Volumes" },
                 { key: "policies" as const, label: "Policies" },
               ]}
@@ -390,7 +390,7 @@ function PoolWizard({
 
       {/* Right column: Change Summary */}
       <SummaryPanel
-        title="Change Summary"
+        title="Change summary"
         subtitle="Review configuration before applying."
         validation={validation}
         rows={[
@@ -417,12 +417,12 @@ function PoolWizard({
         ]}
         footer={
           <div className="space-y-2">
-            <div className="flex items-start gap-1.5 p-2 rounded-md bg-amber-50 border border-amber-200">
+            <div className="flex items-start gap-1.5 p-2 rounded-card bg-warn-soft border border-warn/25">
               <AlertTriangle
                 size={12}
-                className="text-amber-600 shrink-0 mt-px"
+                className="text-warn shrink-0 mt-px"
               />
-              <div className="text-[10px] text-amber-800">
+              <div className="text-[10px] text-warn">
                 <div className="font-semibold">Data Rebalancing</div>
                 <div className="opacity-80">
                   Applying this pool may initiate background peering and
@@ -443,7 +443,7 @@ function PoolWizard({
                 className="flex-1 flex items-center justify-center gap-1 px-2.5 py-1.5 bg-accent text-primary-fg rounded-md text-[12px] font-medium hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Check size={12} />
-                {isNew ? "Create Pool" : "Apply"}
+                {isNew ? "Create pool" : "Apply"}
               </button>
             </div>
           </div>
@@ -556,7 +556,7 @@ function ConfigTab({
               max={10}
               width="w-28"
             />
-            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-1 w-fit">
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-ok bg-ok-soft border border-ok/25 rounded-[5px] px-2 py-1 w-fit">
               <Check size={11} />
               {(100 / Math.max(1, form.replication_count)).toFixed(0)}%
               efficiency. Survives {form.replication_count - 1} concurrent
@@ -592,7 +592,7 @@ function ConfigTab({
                 />
               </div>
             </div>
-            <div className="mt-3 flex items-center gap-1.5 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-1 w-fit">
+            <div className="mt-3 flex items-center gap-1.5 text-[11px] text-ok bg-ok-soft border border-ok/25 rounded-[5px] px-2 py-1 w-fit">
               <Check size={11} />
               Yields {ecEfficiency(form as Pool)} storage efficiency. Can
               survive {form.ec_m} concurrent {form.failure_domain}{" "}
@@ -885,7 +885,7 @@ function FeatureToggle({
         role="switch"
         aria-checked={checked}
         className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${
-          checked ? "bg-emerald-500" : "bg-border-strong"
+          checked ? "bg-ok" : "bg-border-strong"
         }`}
       >
         <span
@@ -909,7 +909,7 @@ function Tag({
     tone === "blue"
       ? "bg-accent-soft text-accent border-accent"
       : tone === "green"
-        ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+        ? "bg-ok-soft text-ok border-ok/25"
         : "bg-surface-2 text-text-2 border-border";
   return (
     <span
@@ -953,151 +953,114 @@ function PoolList({
   onViewPlacement?: (name: string) => void;
 }) {
   return (
-    <div className="bg-surface rounded-xl border border-border overflow-hidden">
-      <table className="w-full">
-        <thead className="bg-surface-2 border-b border-border">
-          <tr>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Pool
-            </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Protection
-            </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Efficiency
-            </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Domain
-            </th>
-            <th
-              className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider"
-              title="Placement groups — 0 = legacy per-object CRUSH"
-            >
-              PGs
-            </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Quota
-            </th>
-            <th className="text-left px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider">
-              Status
-            </th>
-            <th className="text-right px-4 py-2 text-[11px] font-medium text-muted uppercase tracking-wider w-24">
-              Actions
-            </th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-border">
-          {loading ? (
-            <tr>
-              <td colSpan={8} className="px-4 py-8 text-center">
-                <div className="flex items-center justify-center gap-3">
-                  <div className="w-16 h-0.5 bg-border rounded-full overflow-hidden">
-                    <div className="h-full w-1/2 bg-accent rounded-full animate-loading-bar" />
-                  </div>
-                  <span className="text-[12px] text-faint">Loading</span>
-                </div>
-              </td>
-            </tr>
-          ) : pools.length === 0 ? (
-            <tr>
-              <td
-                colSpan={8}
-                className="px-4 py-8 text-center text-[12px] text-faint"
-              >
-                No storage pools configured
-              </td>
-            </tr>
-          ) : (
-            pools.map((p) => (
-              <tr key={p.name} className="hover:bg-surface-2 group">
-                <td className="px-4 py-2">
-                  <div className="flex items-center gap-2">
-                    <Layers size={14} className="text-accent" />
-                    <div>
-                      <span className="text-[13px] font-medium">{p.name}</span>
-                      {p.description && (
-                        <p className="text-[10px] text-faint">
-                          {p.description}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                </td>
-                <td className="px-4 py-2">
-                  <div className="flex items-center gap-1.5">
-                    <span
-                      className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${ecTypeBadge(p.ec_type)}`}
-                    >
-                      {ecTypeName(p.ec_type)}
+    <Table
+      columns={[
+        { key: "pool", label: "Pool" },
+        { key: "protection", label: "Protection", className: "w-56" },
+        { key: "efficiency", label: "Efficiency", align: "right", className: "w-28" },
+        { key: "domain", label: "Domain", className: "w-28" },
+        { key: "pgs", label: "PGs", align: "right", className: "w-24" },
+        { key: "quota", label: "Quota", align: "right", className: "w-28" },
+        { key: "status", label: "Status", className: "w-28" },
+        { key: "actions", label: "", className: "w-24" },
+      ]}
+      loading={loading}
+      empty="No storage pools configured"
+      footer={
+        pools.length
+          ? `${pools.length} pool${pools.length === 1 ? "" : "s"} · ${
+              pools.filter((p) => p.enabled).length
+            } active`
+          : undefined
+      }
+    >
+      {pools.length
+        ? pools.map((p) => (
+            <Row key={p.name}>
+              <Cell>
+                <span className="flex items-center gap-2">
+                  <Layers size={14} className="text-muted shrink-0" />
+                  <span className="flex flex-col min-w-0">
+                    <span className="font-mono text-[13px] font-medium text-text truncate">
+                      {p.name}
                     </span>
-                    <span className="text-[12px] font-mono text-text-2">
-                      {ecLabel(p)}
-                    </span>
-                  </div>
-                </td>
-                <td className="px-4 py-2 text-[12px] text-muted font-mono">
-                  {ecEfficiency(p)}
-                </td>
-                <td className="px-4 py-2 text-[12px] text-muted">
-                  {p.failure_domain}
-                </td>
-                <td className="px-4 py-2 text-[12px] font-mono text-muted">
-                  {p.pg_count && p.pg_count > 0 ? (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onViewPlacement?.(p.name);
-                      }}
-                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 text-[10px] font-medium hover:bg-indigo-100 transition-colors"
-                      title="Show placement-group distribution"
-                    >
-                      {p.pg_count.toLocaleString()}
-                    </button>
-                  ) : (
-                    <span className="text-faint text-[10px]">legacy</span>
-                  )}
-                </td>
-                <td className="px-4 py-2 text-[12px] text-muted">
-                  {formatBytes(p.quota_bytes)}
-                </td>
-                <td className="px-4 py-2">
-                  <StatusBadge
-                    status={p.enabled ? "healthy" : "warning"}
-                    label={p.enabled ? "Active" : "Disabled"}
-                  />
-                </td>
-                <td className="px-4 py-2 text-right">
-                  <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {p.pg_count && p.pg_count > 0 && onViewPlacement && (
-                      <button
-                        onClick={() => onViewPlacement(p.name)}
-                        className="text-faint hover:text-indigo-600 p-1"
-                        title="View placement groups"
-                      >
-                        <Layers size={14} />
-                      </button>
+                    {p.description && (
+                      <span className="text-[11px] text-muted truncate">{p.description}</span>
                     )}
+                  </span>
+                </span>
+              </Cell>
+              <Cell>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={`inline-flex items-center px-1.5 py-px rounded-[5px] text-[10px] font-medium ${ecTypeBadge(
+                      p.ec_type
+                    )}`}
+                  >
+                    {ecTypeName(p.ec_type)}
+                  </span>
+                  <span className="font-mono text-[12px] text-text-2">{ecLabel(p)}</span>
+                </span>
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {ecEfficiency(p)}
+              </Cell>
+              <Cell>
+                <Chip mono>{p.failure_domain}</Chip>
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {p.pg_count && p.pg_count > 0 ? (
+                  <button
+                    onClick={() => onViewPlacement?.(p.name)}
+                    className="text-accent hover:underline"
+                    title="Show placement-group distribution"
+                  >
+                    {p.pg_count.toLocaleString()}
+                  </button>
+                ) : (
+                  // 0 PGs is not "none" — it selects the legacy per-object
+                  // CRUSH path, which is a different placement mode.
+                  <span className="text-faint">legacy</span>
+                )}
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {p.quota_bytes ? formatBytes(p.quota_bytes) : "—"}
+              </Cell>
+              <Cell>
+                <Badge kind={p.enabled ? "ok" : "neutral"}>
+                  {p.enabled ? "Active" : "Disabled"}
+                </Badge>
+              </Cell>
+              <Cell align="right">
+                <span className="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                  {p.pg_count && p.pg_count > 0 && onViewPlacement && (
                     <button
-                      onClick={() => onEdit(p)}
-                      className="text-faint hover:text-accent p-1"
-                      title="Edit"
+                      onClick={() => onViewPlacement(p.name)}
+                      title="View placement groups"
+                      className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
                     >
-                      <Edit size={14} />
+                      <Layers size={13} />
                     </button>
-                    <button
-                      onClick={() => onDelete(p.name)}
-                      className="text-faint hover:text-red-600 p-1"
-                      title="Delete"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
-    </div>
+                  )}
+                  <button
+                    onClick={() => onEdit(p)}
+                    title="Edit pool"
+                    className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                  >
+                    <Edit size={13} />
+                  </button>
+                  <button
+                    onClick={() => onDelete(p.name)}
+                    title="Delete pool"
+                    className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </span>
+              </Cell>
+            </Row>
+          ))
+        : undefined}
+    </Table>
   );
 }
