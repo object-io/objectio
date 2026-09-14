@@ -2,6 +2,9 @@
 // ObjectIO, then tears it down. It is the Go mirror of the README walkthrough.
 //
 //	go run ./example -endpoint http://127.0.0.1:9000 -access-key AKIA… -secret-key …
+//
+// Or with no flags at all, from OBJECTIO_URL / OBJECTIO_ACCESS_KEY[_FILE] /
+// OBJECTIO_SECRET_KEY[_FILE].
 package main
 
 import (
@@ -20,7 +23,16 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	root, err := objectio.New(objectio.Config{Endpoint: *endpoint, AccessKey: *ak, SecretKey: *sk})
+
+	// Flags win when given; otherwise fall back to the environment, which is
+	// how this runs in a cluster.
+	var root *objectio.Client
+	var err error
+	if *ak != "" && *sk != "" {
+		root, err = objectio.New(objectio.Config{Endpoint: *endpoint, AccessKey: *ak, SecretKey: *sk})
+	} else {
+		root, err = objectio.NewFromEnv()
+	}
 	if err != nil {
 		log.Fatal(err)
 	}

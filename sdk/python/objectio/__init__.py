@@ -20,7 +20,14 @@ Requests are signed with SigV4 using the standard library alone, so this
 package has no dependencies.
 """
 
-from .client import AccessKey, Bucket, Client, User, Workspace
+from .client import (
+    AccessKey,
+    Bucket,
+    Client,
+    User,
+    Workspace,
+    provisioner_user_id_from_env,
+)
 from .errors import APIError, ObjectIOError
 
 __all__ = [
@@ -31,5 +38,6 @@ __all__ = [
     "ObjectIOError",
     "User",
     "Workspace",
+    "provisioner_user_id_from_env",
 ]
 __version__ = "0.1.0"

@@ -45,6 +45,67 @@ be used against the management API at all: a scoped key is refused there by
 design, so a credential handed to a workload can never mint itself a wider
 one.
 
+## Configuration
+
+Both read the environment, which is how a deployed provisioner is configured:
+
+| | |
+|---|---|
+| `OBJECTIO_ENDPOINT` or `OBJECTIO_URL` | gateway base URL — **required** |
+| `OBJECTIO_ACCESS_KEY` or `OBJECTIO_ACCESS_KEY_FILE` or `AWS_ACCESS_KEY_ID` | |
+| `OBJECTIO_SECRET_KEY` or `OBJECTIO_SECRET_KEY_FILE` or `AWS_SECRET_ACCESS_KEY` | |
+| `OBJECTIO_REGION` or `AWS_REGION` or `AWS_DEFAULT_REGION` | default `us-east-1` |
+| `OBJECTIO_PROVISIONER_USER_ID` | the user workspace keys are minted on |
+
+```go
+app, err := objectio.NewFromEnv()
+```
+```python
+app = Client.from_env()
+```
+
+The AWS names are fallbacks so one set of variables configures this client and
+the S3 SDK beside it — a pod that already has `AWS_ACCESS_KEY_ID` for
+mountpoint-s3 needs nothing extra. The `OBJECTIO_*` names win when both are set.
+
+**Prefer the `_FILE` forms in Kubernetes.** A secret in the environment is
+readable from `/proc`, lands in crash dumps, and shows up in `kubectl describe
+pod` when it was set inline rather than from a `secretRef`. File contents are
+stripped — a projected Secret ends in a newline, and a `\n` inside a signing
+key produces a `SignatureDoesNotMatch` that reads like a wrong password.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata: { name: objectio-provisioner }
+stringData:
+  access-key: AKIA…
+  secret-key: …
+---
+# in the pod spec
+env:
+  - name: OBJECTIO_URL
+    value: https://s3.example.com
+  - name: OBJECTIO_ACCESS_KEY_FILE
+    value: /var/run/objectio/access-key
+  - name: OBJECTIO_SECRET_KEY_FILE
+    value: /var/run/objectio/secret-key
+  - name: OBJECTIO_PROVISIONER_USER_ID
+    value: 97817a81-…
+volumeMounts:
+  - name: objectio-creds
+    mountPath: /var/run/objectio
+    readOnly: true
+volumes:
+  - name: objectio-creds
+    secret:
+      secretName: objectio-provisioner
+```
+
+The credential must be **unscoped** — a key confined to a bucket is refused on
+the management API, which is exactly what stops a workspace credential being
+used as a provisioner one.
+
 ## Go
 
 ```go

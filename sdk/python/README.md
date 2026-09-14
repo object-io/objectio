@@ -9,6 +9,8 @@ See [../README.md](../README.md) for the full walkthrough.
 ```python
 from objectio import Client
 
+app = Client.from_env()          # OBJECTIO_URL / OBJECTIO_ACCESS_KEY[_FILE] / …
+# or explicitly:
 app = Client(endpoint="https://s3.example.com",
              access_key="AKIA…", secret_key="…")
 ws = app.provision_workspace("ws-1", provisioner_user_id=uid)

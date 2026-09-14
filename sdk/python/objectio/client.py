@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -100,6 +101,44 @@ def _only_known(cls, payload: dict[str, Any]):
     return cls(**{k: v for k, v in payload.items() if k in known})
 
 
+#: Environment variables read by :meth:`Client.from_env`.
+ENV_ENDPOINT = "OBJECTIO_ENDPOINT"
+ENV_URL = "OBJECTIO_URL"
+ENV_ACCESS_KEY = "OBJECTIO_ACCESS_KEY"
+ENV_ACCESS_KEY_FILE = "OBJECTIO_ACCESS_KEY_FILE"
+ENV_SECRET_KEY = "OBJECTIO_SECRET_KEY"
+ENV_SECRET_KEY_FILE = "OBJECTIO_SECRET_KEY_FILE"
+ENV_REGION = "OBJECTIO_REGION"
+#: The provisioner's own ``user_id``, which :meth:`Client.provision_workspace`
+#: needs. Read it with :func:`provisioner_user_id_from_env`.
+ENV_PROVISIONER_USER_ID = "OBJECTIO_PROVISIONER_USER_ID"
+
+
+def _from_env(file_var: str | None, direct_var: str, *fallbacks: str) -> str:
+    """Resolve one setting: a ``*_FILE`` variable first, then the direct name,
+    then any fallbacks.
+
+    File contents are stripped. A mounted secret almost always ends in a
+    newline, and a trailing ``\n`` inside a signing key produces a
+    SignatureDoesNotMatch that reads like a wrong password.
+    """
+    if file_var:
+        path = os.environ.get(file_var, "")
+        if path:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+    for name in (direct_var, *fallbacks):
+        value = os.environ.get(name, "")
+        if value:
+            return value.strip()
+    return ""
+
+
+def provisioner_user_id_from_env() -> str:
+    """The provisioner's ``user_id`` from the environment, or ``""``."""
+    return os.environ.get(ENV_PROVISIONER_USER_ID, "").strip()
+
+
 @dataclass
 class Client:
     """Talks to the ObjectIO management API.
@@ -113,6 +152,52 @@ class Client:
     secret_key: str
     region: str = DEFAULT_REGION
     timeout: float = DEFAULT_TIMEOUT
+
+    @classmethod
+    def from_env(cls) -> "Client":
+        """Build a client from the environment.
+
+        ::
+
+            OBJECTIO_ENDPOINT   | OBJECTIO_URL                           (required)
+            OBJECTIO_ACCESS_KEY | OBJECTIO_ACCESS_KEY_FILE | AWS_ACCESS_KEY_ID
+            OBJECTIO_SECRET_KEY | OBJECTIO_SECRET_KEY_FILE | AWS_SECRET_ACCESS_KEY
+            OBJECTIO_REGION     | AWS_REGION | AWS_DEFAULT_REGION   (default us-east-1)
+
+        The AWS names are accepted so one set of variables configures both this
+        client and the boto3 client beside it.
+
+        Prefer the ``*_FILE`` forms in Kubernetes: a secret in the environment
+        is readable from ``/proc``, lands in crash dumps, and shows up in
+        ``kubectl describe pod`` when it was set inline rather than from a
+        ``secretRef``.
+
+        The credential must be unscoped — a key confined to a bucket is
+        refused on the management API.
+        """
+        endpoint = _from_env(None, ENV_ENDPOINT, ENV_URL)
+        if not endpoint:
+            raise ValueError(f"{ENV_ENDPOINT} (or {ENV_URL}) is not set")
+
+        access_key = _from_env(ENV_ACCESS_KEY_FILE, ENV_ACCESS_KEY, "AWS_ACCESS_KEY_ID")
+        if not access_key:
+            raise ValueError(
+                f"{ENV_ACCESS_KEY}, {ENV_ACCESS_KEY_FILE} or AWS_ACCESS_KEY_ID is not set"
+            )
+
+        secret_key = _from_env(ENV_SECRET_KEY_FILE, ENV_SECRET_KEY, "AWS_SECRET_ACCESS_KEY")
+        if not secret_key:
+            raise ValueError(
+                f"{ENV_SECRET_KEY}, {ENV_SECRET_KEY_FILE} or AWS_SECRET_ACCESS_KEY is not set"
+            )
+
+        region = _from_env(None, ENV_REGION, "AWS_REGION", "AWS_DEFAULT_REGION")
+        return cls(
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            region=region or DEFAULT_REGION,
+        )
 
     def __post_init__(self) -> None:
         if not self.endpoint:
