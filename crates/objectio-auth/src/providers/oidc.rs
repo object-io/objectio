@@ -49,6 +49,8 @@ struct DiscoveryCache {
     jwks_uri: String,
     token_endpoint: String,
     authorization_endpoint: String,
+    /// Issuer as published by discovery; may contain `{tenantid}`.
+    issuer: String,
     cached_at: Instant,
 }
 
@@ -68,6 +70,13 @@ struct OidcDiscovery {
     token_endpoint: String,
     #[serde(default)]
     authorization_endpoint: String,
+    /// The issuer the provider says it will stamp on tokens. Multi-tenant
+    /// endpoints publish a *template* here — Entra's `common` and
+    /// `organizations` return `https://login.microsoftonline.com/{tenantid}/v2.0`
+    /// — because the concrete issuer depends on which upstream tenant the user
+    /// signed in from.
+    #[serde(default)]
+    issuer: String,
 }
 
 /// OAuth2 token response
@@ -103,6 +112,17 @@ pub struct Claims {
     // Groups are extracted dynamically via the configured claim name
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Is this a plausible upstream tenant id?
+///
+/// Guards the issuer substitution: only a bare GUID may be interpolated, so a
+/// crafted `tid` cannot inject path segments or a different host into the
+/// issuer that is about to be matched.
+fn is_tenant_id(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && value.split('-').map(str::len).eq([8, 4, 4, 4, 12])
 }
 
 /// Cache TTL for JWKS keys (5 minutes)
@@ -191,6 +211,7 @@ impl OidcProvider {
             jwks_uri: discovery.jwks_uri.clone(),
             token_endpoint: discovery.token_endpoint.clone(),
             authorization_endpoint: discovery.authorization_endpoint.clone(),
+            issuer: discovery.issuer.clone(),
             cached_at: Instant::now(),
         });
 
@@ -402,7 +423,7 @@ impl OidcProvider {
         })?;
 
         let mut validation = Validation::new(algorithm);
-        validation.set_issuer(&[&self.config.issuer_url]);
+        validation.set_issuer(&[&self.resolve_expected_issuer(token).await]);
         validation.set_audience(&[&self.config.audience]);
         validation.leeway = 60; // 60 seconds clock skew tolerance
 
@@ -417,6 +438,70 @@ impl OidcProvider {
         })?;
 
         Ok(token_data.claims)
+    }
+
+    /// The exact issuer this token must carry.
+    ///
+    /// For a single-tenant provider that is just the configured issuer. A
+    /// multi-tenant endpoint publishes a templated issuer instead — Entra's
+    /// `common` and `organizations` return `.../{tenantid}/v2.0` — because the
+    /// concrete value depends on which upstream tenant signed the user in. In
+    /// that case the token's own `tid` is substituted, so the issuer stays
+    /// pinned to one exact string; it is merely computed per token rather than
+    /// fixed at configuration time.
+    ///
+    /// Falls back to the configured issuer whenever a template or a usable
+    /// `tid` is missing, which keeps the previous behavior for every provider
+    /// that is not multi-tenant.
+    async fn resolve_expected_issuer(&self, token: &str) -> String {
+        let template = {
+            let cache = self.discovery_cache.read();
+            cache.as_ref().map(|c| c.issuer.clone()).unwrap_or_default()
+        };
+        if !template.contains("{tenantid}") {
+            return self.config.issuer_url.clone();
+        }
+        match Self::peek_tenant_id(token) {
+            Some(tid) => template.replace("{tenantid}", &tid),
+            None => self.config.issuer_url.clone(),
+        }
+    }
+
+    /// The upstream tenant id (`tid`) a validated token was issued for.
+    ///
+    /// Entra stamps this on every token; other providers may not, in which
+    /// case there is no upstream tenant to key on and the caller should treat
+    /// the provider as single-tenant.
+    #[must_use]
+    pub fn tenant_id(claims: &Claims) -> Option<String> {
+        claims
+            .extra
+            .get("tid")
+            .and_then(|v| v.as_str())
+            .filter(|t| is_tenant_id(t))
+            .map(ToString::to_string)
+    }
+
+    /// Read `tid` out of an *unverified* token body.
+    ///
+    /// Needed because a multi-tenant issuer is only known once you know which
+    /// upstream tenant issued the token — the value has to be read before the
+    /// issuer can be checked. Nothing here is trusted: the value is only used
+    /// to construct the expected issuer, and the token still has to carry a
+    /// valid signature and that exact issuer to pass validation. A forged
+    /// `tid` therefore selects an issuer the token cannot match.
+    fn peek_tenant_id(token: &str) -> Option<String> {
+        use base64::Engine;
+        let payload = token.split('.').nth(1)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value
+            .get("tid")
+            .and_then(|v| v.as_str())
+            .filter(|t| is_tenant_id(t))
+            .map(ToString::to_string)
     }
 
     /// Extract groups from claims using the configured claim name
@@ -483,6 +568,83 @@ impl IdentityProvider for OidcProvider {
         );
 
         Ok(identity)
+    }
+}
+
+#[cfg(test)]
+mod multi_tenant_tests {
+    use super::*;
+
+    fn token_with(payload: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!("{}.{}.{}", b64.encode("{}"), b64.encode(payload), "sig")
+    }
+
+    #[test]
+    fn tenant_id_shape_is_enforced() {
+        assert!(is_tenant_id("72f988bf-86f1-41af-91ab-2d7cd011db47"));
+        // Anything that could steer the issuer substitution is rejected.
+        assert!(!is_tenant_id("../../evil"));
+        assert!(!is_tenant_id("72f988bf-86f1-41af-91ab-2d7cd011db47/x"));
+        assert!(!is_tenant_id("evil.com"));
+        assert!(!is_tenant_id(""));
+        assert!(!is_tenant_id("72f988bf86f141af91ab2d7cd011db47"));
+        // Right length and characters, wrong group layout.
+        assert!(!is_tenant_id("72f988bf-86f1-41af-91ab2-d7cd011db4"));
+    }
+
+    #[test]
+    fn peek_reads_tid_from_an_unverified_body() {
+        let t = token_with(r#"{"tid":"72f988bf-86f1-41af-91ab-2d7cd011db47"}"#);
+        assert_eq!(
+            OidcProvider::peek_tenant_id(&t).as_deref(),
+            Some("72f988bf-86f1-41af-91ab-2d7cd011db47")
+        );
+    }
+
+    #[test]
+    fn peek_rejects_a_crafted_tid() {
+        // A tid that would inject a different host must not be interpolated;
+        // callers then fall back to the configured issuer.
+        let t = token_with(r#"{"tid":"https://evil.example/"}"#);
+        assert_eq!(OidcProvider::peek_tenant_id(&t), None);
+        assert_eq!(OidcProvider::peek_tenant_id("not.a.jwt"), None);
+        assert_eq!(OidcProvider::peek_tenant_id(""), None);
+    }
+
+    #[test]
+    fn tenant_id_from_validated_claims() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "tid".to_string(),
+            serde_json::json!("72f988bf-86f1-41af-91ab-2d7cd011db47"),
+        );
+        let claims = Claims {
+            sub: "u".into(),
+            email: None,
+            name: None,
+            exp: 0,
+            extra,
+        };
+        assert_eq!(
+            OidcProvider::tenant_id(&claims).as_deref(),
+            Some("72f988bf-86f1-41af-91ab-2d7cd011db47")
+        );
+    }
+
+    /// A provider with no `tid` at all is single-tenant as far as we are
+    /// concerned, and must keep using its configured issuer.
+    #[test]
+    fn absent_tid_is_not_a_tenant() {
+        let claims = Claims {
+            sub: "u".into(),
+            email: None,
+            name: None,
+            exp: 0,
+            extra: std::collections::HashMap::new(),
+        };
+        assert_eq!(OidcProvider::tenant_id(&claims), None);
     }
 }
 
