@@ -282,6 +282,24 @@ export default function Identity() {
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
               />
             </div>
+            {/* For Microsoft the issuer is fully determined by the directory
+                id (or the multi-tenant placeholder) below, so asking for it
+                separately only creates two fields that can disagree — which is
+                exactly how a wrong issuer survives until someone tries to log
+                in. It is shown read-only instead. */}
+            {form.vendor === "azure" ? (
+              <div className="md:col-span-2">
+                <label className="block text-xs font-medium text-gray-500 mb-1">
+                  Issuer URL{" "}
+                  <span className="text-gray-400">— derived, not editable</span>
+                </label>
+                <input
+                  readOnly
+                  value={form.issuer_url || "set the directory ID below"}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-gray-50 font-mono text-xs text-gray-600"
+                />
+              </div>
+            ) : (
             <div className="md:col-span-2">
               <label className="block text-xs font-medium text-gray-500 mb-1">Issuer URL</label>
               <div className="flex gap-2">
@@ -304,6 +322,7 @@ export default function Identity() {
                 </p>
               )}
             </div>
+            )}
             <div>
               <label className="block text-xs font-medium text-gray-500 mb-1">Client ID</label>
               <input

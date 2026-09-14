@@ -191,7 +191,7 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
               {tenantApp && (
               <div>
                 <label className="block text-[11px] font-semibold text-gray-700 mb-1">
-                  Account
+                  Account <span className="text-gray-400 font-normal">(optional)</span>
                 </label>
                 <div className="relative">
                   <Building2
@@ -208,11 +208,17 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
                       setTenantLookupError("");
                     }}
                     onBlur={(e) => lookupTenant(e.target.value)}
-                    placeholder="your account name"
-                    autoFocus
+                    placeholder="detected from your credentials"
+
                     className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
                 </div>
+                <p className="mt-1 text-[11px] text-gray-400">
+                  Your account is worked out from your access key, or from your
+                  sign-in when using SSO. Fill this in only to reach an
+                  organisation's own SSO provider, or to be told if you are
+                  about to sign in to the wrong one.
+                </p>
                 {tenantLookupError && (
                   <p className="mt-1 text-[11px] text-red-600">{tenantLookupError}</p>
                 )}
@@ -243,7 +249,7 @@ export default function Login({ onLogin, appKind = "ops" }: Props) {
                     onChange={(e) => setAccessKey(e.target.value)}
                     placeholder="AKIA…"
                     className="w-full pl-8 pr-2.5 py-2 border border-gray-300 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-blue-500"
-                    autoFocus={!tenantApp}
+                    autoFocus
                   />
                 </div>
               </div>
