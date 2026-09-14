@@ -17,6 +17,7 @@ pub mod license_gate;
 pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
+pub mod prom;
 pub mod s3;
 pub mod scatter_gather;
 
@@ -218,6 +219,19 @@ pub struct Args {
     /// Disable authentication (for development)
     #[arg(long, default_value_t = false)]
     pub no_auth: bool,
+
+    /// Base URL of a Prometheus that scrapes this cluster, e.g.
+    /// `http://prometheus:9090`. The console proxies range queries through the
+    /// gateway to it.
+    ///
+    /// `/metrics` is a point-in-time scrape, so a browser polling it only knows
+    /// what happened since the page opened — about five minutes. Ranges beyond
+    /// that, and any series labelled per node or per gateway, come from
+    /// Prometheus, which already scrapes the gateway, the meta nodes and the
+    /// OSDs. Leave empty to run without it: the console falls back to the live
+    /// scrape and says so.
+    #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
+    pub prometheus_url: String,
 
     /// Keep buckets that have no recorded owner accessible to any
     /// authenticated caller. Buckets created before ownership was tracked
@@ -827,6 +841,7 @@ pub async fn run(
         self_topology,
         host_provider,
         legacy_open_buckets: args.authz_legacy_open_buckets,
+        prometheus_url: args.prometheus_url.clone(),
     });
 
     // Build router
@@ -1024,6 +1039,12 @@ pub async fn run(
         .route("/_admin/license", get(admin::admin_get_license))
         .route("/_admin/license", put(admin::admin_put_license))
         .route("/_admin/license", delete(admin::admin_delete_license))
+        // Prometheus proxy. Sits with the other admin APIs so it inherits the
+        // same optional SigV4 layer — a console session and a signed request
+        // are both recognised. Inert when --prometheus-url is unset.
+        .route("/_admin/metrics/capabilities", get(prom::capabilities))
+        .route("/_admin/metrics/query", get(prom::query))
+        .route("/_admin/metrics/query_range", get(prom::query_range))
         .with_state(Arc::clone(&state))
         // Layer SigV4 verification that is optional — if a request carries
         // `Authorization: AWS4-HMAC-SHA256 ...`, verify it and inject

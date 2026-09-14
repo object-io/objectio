@@ -137,6 +137,9 @@ pub struct AppState {
     /// window between deploying ownership enforcement and backfilling owners
     /// on buckets created before it existed.
     pub legacy_open_buckets: bool,
+    /// Base URL of a Prometheus that scrapes this cluster. Empty = the
+    /// console falls back to scraping /metrics live.
+    pub prometheus_url: String,
 }
 
 impl AppState {
