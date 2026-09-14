@@ -1372,8 +1372,11 @@ pub async fn admin_delete_bucket_policy(
 /// before the gateway recorded an owner: until those have one, authorization
 /// cannot fall back to ownership and they rely on `--authz-legacy-open-buckets`.
 ///
-/// System-admin only — ownership decides who reaches a bucket when no policy
-/// speaks, so handing it over is not a tenant-level operation.
+/// Gated per-bucket: the system admin may re-home any bucket, a tenant admin
+/// only buckets in their own tenant. Buckets with no tenant stay system-admin
+/// only. This matches the other bucket admin endpoints, and without it a
+/// tenant admin cannot re-home a bucket whose owner has left — leaving it
+/// owned by a departed account with the operator as the only recourse.
 pub async fn admin_set_bucket_owner(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -1381,12 +1384,35 @@ pub async fn admin_set_bucket_owner(
     Path(bucket): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
         return deny;
     }
     let owner = body["owner"].as_str().unwrap_or_default().to_string();
     if owner.is_empty() {
         return (StatusCode::BAD_REQUEST, "owner must not be empty").into_response();
+    }
+
+    // A bucket in a tenant must be owned by someone in that tenant. The
+    // authorization chain denies on tenant mismatch before it ever reaches the
+    // ownership check, so a cross-tenant owner would be unable to open their
+    // own bucket — an unreachable bucket rather than a useful handover.
+    let bucket_tenant = lookup_bucket_tenant(&state, &bucket)
+        .await
+        .unwrap_or_default();
+    if !bucket_tenant.is_empty() {
+        match lookup_user_tenant(&state, &owner).await {
+            None => return (StatusCode::BAD_REQUEST, "owner user not found").into_response(),
+            Some(t) if t != bucket_tenant => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "owner is in tenant '{t}' but bucket '{bucket}' is in tenant                          '{bucket_tenant}'; the owner would not be able to access it"
+                    ),
+                )
+                    .into_response();
+            }
+            Some(_) => {}
+        }
     }
 
     let mut client = state.meta_client.clone();
