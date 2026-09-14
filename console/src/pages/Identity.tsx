@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
-import { Shield, Plus, Trash2, CheckCircle, AlertCircle, Edit, Copy, Check } from "lucide-react";
+import { Shield, Plus, Trash2, Edit, Copy, Check } from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import Card from "../components/Card";
+import {
+  Badge,
+  Banner,
+  Button,
+  Card,
+  Input,
+  Select,
+  Table,
+  Row,
+  Cell,
+} from "../components/ui";
 
 interface OidcProvider {
   key: string;
@@ -205,409 +215,370 @@ export default function Identity() {
     <div className="p-6">
       <PageHeader
         title="Identity"
-        description={sessionTenant ? `OIDC provider for ${sessionTenant}` : "Manage OIDC identity providers"}
+        description={
+          sessionTenant
+            ? `OIDC provider for ${sessionTenant}`
+            : "OIDC providers that can sign users into this console"
+        }
         action={
-          <button
-            onClick={() => startEdit()}
-            className="flex items-center gap-2 px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
-          >
-            <Plus size={16} /> Add Provider
-          </button>
+          <Button variant="primary" icon={<Plus size={13} />} onClick={() => startEdit()}>
+            Add provider
+          </Button>
         }
       />
 
-      {/* Editor */}
       {editing && (
-        <Card title={editing === "__new__" ? "Add OIDC Provider" : `Edit: ${editing}`} className="mb-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Provider Name</label>
-              <input
-                value={providerName}
-                onChange={(e) => setProviderName(e.target.value)}
-                disabled={editing !== "__new__" || !!sessionTenant}
-                placeholder="e.g. entra, keycloak, okta"
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none disabled:bg-surface-2"
-              />
-              {sessionTenant && editing === "__new__" && (
-                <p className="mt-1 text-xs text-muted">
-                  Tenant-owned providers are auto-named <code>t-{sessionTenant.toLowerCase()}</code>.
-                </p>
-              )}
-            </div>
+        <Card
+          title={editing === "__new__" ? "Add OIDC provider" : `Edit · ${editing}`}
+          className="mb-4"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Input
+              label="Provider name"
+              value={providerName}
+              onChange={(e) => setProviderName(e.target.value)}
+              disabled={editing !== "__new__" || !!sessionTenant}
+              placeholder="entra, keycloak, okta"
+              hint={
+                sessionTenant && editing === "__new__"
+                  ? `Tenant-owned providers are auto-named t-${sessionTenant.toLowerCase()}`
+                  : undefined
+              }
+            />
+            <Input
+              label="Display name"
+              value={form.display_name}
+              onChange={(e) => setForm({ ...form, display_name: e.target.value })}
+              placeholder="Corporate SSO"
+            />
+
             {/* The IdP needs this exact string registered as a redirect URI.
-                It is server-derived and the same for every provider, so it is
-                shown here rather than being an editable field. */}
+                It is server-derived and identical for every provider, so it is
+                shown rather than typed. */}
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-muted mb-1">
-                Redirect URI <span className="text-faint">(register this in your IdP)</span>
+              <label className="block text-[11px] font-semibold text-text-2 mb-1">
+                Redirect URI <span className="font-normal text-faint">— register this in your IdP</span>
               </label>
               <div className="flex gap-2">
                 <input
                   readOnly
                   value={callbackUrl || "unavailable"}
-                  className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm bg-surface-2 font-mono text-xs text-text-2"
+                  className="flex-1 h-8 px-2.5 bg-surface-2 text-text-2 border border-border-strong
+                    rounded-control font-mono text-[12px]"
                 />
-                <button
+                <Button
+                  icon={copiedCallback ? <Check size={13} /> : <Copy size={13} />}
+                  disabled={!callbackUrl}
                   onClick={() => {
                     navigator.clipboard.writeText(callbackUrl);
                     setCopiedCallback(true);
                     setTimeout(() => setCopiedCallback(false), 2000);
                   }}
-                  disabled={!callbackUrl}
-                  className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border disabled:opacity-40"
-                  title="Copy redirect URI"
                 >
-                  {copiedCallback ? <Check size={14} /> : <Copy size={14} />}
-                </button>
+                  {copiedCallback ? "Copied" : "Copy"}
+                </Button>
               </div>
               {callbackIsDefault ? (
-                <p className="mt-1 text-xs text-amber-700">
-                  This is built from the gateway's bind address because
-                  <code className="mx-1">--external-endpoint</code> is not set, so no
-                  identity provider will accept it. Set it to the console's public URL
-                  and restart the gateway before configuring SSO.
-                </p>
+                <Banner kind="warn" className="mt-2" title="No identity provider will accept this URI">
+                  It is built from the gateway's bind address because{" "}
+                  <code>--external-endpoint</code> is not set. Point that at the
+                  console's public URL and restart the gateway before configuring SSO.
+                </Banner>
               ) : (
-                <p className="mt-1 text-xs text-faint">
-                  One callback serves every provider and tenant — the provider and
-                  tenant travel in the OAuth <code>state</code> parameter, not the URL.
+                <p className="mt-1 text-[11px] text-faint">
+                  One callback serves every provider and tenant — both travel in the
+                  OAuth <code>state</code> parameter, not the URL.
                 </p>
               )}
             </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Display Name</label>
-              <input
-                value={form.display_name}
-                onChange={(e) => setForm({ ...form, display_name: e.target.value })}
-                placeholder="Corporate SSO"
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            {/* For Microsoft the issuer is fully determined by the directory
-                id (or the multi-tenant placeholder) below, so asking for it
-                separately only creates two fields that can disagree — which is
-                exactly how a wrong issuer survives until someone tries to log
-                in. It is shown read-only instead. */}
+
+            <Select
+              label="Vendor"
+              value={form.vendor}
+              onChange={(e) => setForm({ ...form, vendor: e.target.value })}
+            >
+              <option value="">Generic OIDC</option>
+              <option value="azure">Microsoft Entra ID (Azure AD)</option>
+              <option value="keycloak">Keycloak</option>
+              <option value="okta">Okta</option>
+              <option value="google">Google</option>
+            </Select>
+
             {form.vendor === "azure" ? (
-              <div className="md:col-span-2">
-                <label className="block text-xs font-medium text-muted mb-1">
-                  Issuer URL{" "}
-                  <span className="text-faint">— derived, not editable</span>
-                </label>
-                <input
-                  readOnly
-                  value={form.issuer_url || "set the directory ID below"}
-                  className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm bg-surface-2 font-mono text-xs text-text-2"
+              <>
+                <Input
+                  label={
+                    <>
+                      Directory (tenant) ID{" "}
+                      <span className="font-normal text-faint">— not the application ID</span>
+                    </>
+                  }
+                  value={form.azure_tenant_id}
+                  className="font-mono text-[12px]"
+                  placeholder="72f988bf-… · or organizations / common"
+                  onChange={(e) => {
+                    const tid = e.target.value.trim();
+                    // This field used to be stored and ignored while the issuer
+                    // was typed by hand, which is how a wrong issuer survives
+                    // until someone tries to log in. Writing the issuer from it
+                    // keeps the two from disagreeing.
+                    setForm({
+                      ...form,
+                      azure_tenant_id: tid,
+                      issuer_url: tid
+                        ? `https://login.microsoftonline.com/${tid}/v2.0`
+                        : form.issuer_url,
+                    });
+                  }}
+                  hint="organizations only makes sense with multi-tenant below — it is the placeholder that lets any work or school account sign in."
                 />
-              </div>
-            ) : (
-            <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-muted mb-1">Issuer URL</label>
-              <div className="flex gap-2">
-                <input
-                  value={form.issuer_url}
-                  onChange={(e) => setForm({ ...form, issuer_url: e.target.value })}
-                  placeholder="https://login.microsoftonline.com/{tenant}/v2.0"
-                  className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-                />
-                <button
-                  onClick={testConnection}
-                  className="px-3 py-2 bg-surface-2 rounded-lg text-sm font-medium hover:bg-border"
-                >
-                  Test
-                </button>
-              </div>
-              {testResult && (
-                <p className={`mt-1 text-xs ${testResult.startsWith("Connected") ? "text-green-600" : testResult === "testing" ? "text-faint" : "text-red-600"}`}>
-                  {testResult === "testing" ? "Testing connection..." : testResult}
-                </p>
-              )}
-            </div>
-            )}
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Client ID</label>
-              <input
-                value={form.client_id}
-                onChange={(e) => setForm({ ...form, client_id: e.target.value })}
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Client Secret</label>
-              <input
-                type="password"
-                value={form.client_secret}
-                onChange={(e) => setForm({ ...form, client_secret: e.target.value })}
-                placeholder={editing !== "__new__" ? "********" : ""}
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Audience</label>
-              <input
-                value={form.audience}
-                onChange={(e) => setForm({ ...form, audience: e.target.value })}
-                placeholder="Same as Client ID if empty"
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Vendor</label>
-              <select
-                value={form.vendor}
-                onChange={(e) => setForm({ ...form, vendor: e.target.value })}
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              >
-                <option value="">Generic OIDC</option>
-                <option value="azure">Microsoft Entra ID (Azure AD)</option>
-                <option value="keycloak">Keycloak</option>
-                <option value="okta">Okta</option>
-                <option value="google">Google</option>
-              </select>
-            </div>
-            {form.vendor === "azure" && (
-              <div className="md:col-span-2">
-                <label className="block text-xs font-medium text-muted mb-1">
-                  Directory (tenant) ID{" "}
-                  <span className="text-faint">— not the application ID</span>
-                </label>
-                <div className="flex gap-2">
+                <div className="md:col-span-2">
+                  <label className="block text-[11px] font-semibold text-text-2 mb-1">
+                    Issuer URL <span className="font-normal text-faint">— derived, not editable</span>
+                  </label>
                   <input
-                    value={form.azure_tenant_id}
-                    onChange={(e) => {
-                      const tid = e.target.value.trim();
-                      // This field used to be stored and ignored while the
-                      // issuer was typed by hand, which is how a wrong issuer
-                      // survives until someone tries to log in. Writing the
-                      // issuer from it keeps the two from disagreeing.
-                      setForm({
-                        ...form,
-                        azure_tenant_id: tid,
-                        issuer_url: tid
-                          ? `https://login.microsoftonline.com/${tid}/v2.0`
-                          : form.issuer_url,
-                      });
-                    }}
-                    placeholder="72f988bf-86f1-41af-91ab-2d7cd011db47  ·  or: organizations / common"
-                    className="flex-1 px-3 py-2 border border-border-strong rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-accent focus:outline-none"
+                    readOnly
+                    value={form.issuer_url || "set the directory ID above"}
+                    className="w-full h-8 px-2.5 bg-surface-2 text-text-2 border border-border-strong
+                      rounded-control font-mono text-[12px]"
                   />
                 </div>
-                <p className="mt-1 text-xs text-faint">
-                  Sets the Issuer URL above. Use your Directory (tenant) ID from
-                  Entra &rarr; Overview for a single organisation. Use{" "}
-                  <code>organizations</code> only with Tenancy set to
-                  &ldquo;multi-tenant&rdquo; below — it is the placeholder that
-                  lets any work or school account sign in.
-                </p>
+              </>
+            ) : (
+              <div className="md:col-span-2">
+                <label className="block text-[11px] font-semibold text-text-2 mb-1">Issuer URL</label>
+                <div className="flex gap-2">
+                  <input
+                    value={form.issuer_url}
+                    onChange={(e) => setForm({ ...form, issuer_url: e.target.value })}
+                    placeholder="https://login.example.com/realms/main"
+                    className="flex-1 h-8 px-2.5 bg-surface text-text border border-border-strong
+                      rounded-control text-[13px] placeholder:text-faint
+                      focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
+                  />
+                  <Button onClick={testConnection}>Test</Button>
+                </div>
+                {testResult && (
+                  <p
+                    className={`mt-1 text-[11px] ${
+                      testResult.startsWith("Connected")
+                        ? "text-ok"
+                        : testResult === "testing"
+                          ? "text-faint"
+                          : "text-err"
+                    }`}
+                  >
+                    {testResult === "testing" ? "Testing connection…" : testResult}
+                  </p>
+                )}
               </div>
             )}
 
-            {/* Tenancy ------------------------------------------------- */}
-            <div className="md:col-span-2 border-t border-border pt-4 mt-1">
-              <label className="block text-xs font-medium text-muted mb-1">Tenancy</label>
-              <select
+            <Input
+              label="Client ID"
+              value={form.client_id}
+              onChange={(e) => setForm({ ...form, client_id: e.target.value })}
+            />
+            <Input
+              label="Client secret"
+              type="password"
+              value={form.client_secret}
+              onChange={(e) => setForm({ ...form, client_secret: e.target.value })}
+              placeholder={editing !== "__new__" ? "••••••••" : ""}
+              hint="The secret value, not the secret ID — Entra shows the ID next to it and they look alike."
+            />
+            <Input
+              label="Audience"
+              value={form.audience}
+              onChange={(e) => setForm({ ...form, audience: e.target.value })}
+              placeholder="Same as Client ID if empty"
+            />
+            <Input
+              label="Scopes"
+              value={form.scopes}
+              onChange={(e) => setForm({ ...form, scopes: e.target.value })}
+            />
+
+            <div className="md:col-span-2 border-t border-border pt-3 mt-1">
+              <Select
+                label="Tenancy"
                 value={form.tenancy}
                 onChange={(e) => setForm({ ...form, tenancy: e.target.value })}
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
+                hint="Multi-tenant keys on the tid claim: the first login from an organisation registers a tenant for it automatically."
               >
-                <option value="single">
-                  Single tenant — this provider serves one ObjectIO tenant
-                </option>
-                <option value="multi">
-                  Multi-tenant — each signing-in organisation gets its own tenant
-                </option>
-              </select>
-              <p className="mt-1 text-xs text-faint">
-                Multi-tenant keys on the <code>tid</code> claim: the first login
-                from an organisation registers a tenant for it automatically.
-              </p>
+                <option value="single">Single tenant — this provider serves one ObjectIO tenant</option>
+                <option value="multi">Multi-tenant — each signing-in organisation gets its own tenant</option>
+              </Select>
             </div>
 
             {form.tenancy === "multi" && (
               <>
-                <div>
-                  <label className="block text-xs font-medium text-muted mb-1">
-                    Quota per registered tenant (GB)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.5"
-                    value={quotaGbStr}
-                    onChange={(e) => setQuotaGbStr(e.target.value)}
-                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-                  />
-                  <p className="mt-1 text-xs text-faint">
-                    Applied at registration; raise it per tenant afterwards. 0 = unlimited.
-                  </p>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-muted mb-1">
-                    Tenant admin role
-                  </label>
-                  <input
-                    value={form.tenant_admin_role}
-                    onChange={(e) =>
-                      setForm({ ...form, tenant_admin_role: e.target.value })
-                    }
-                    placeholder="objectio-admin"
-                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-                  />
-                  <p className="mt-1 text-xs text-faint">
-                    A user whose token carries this role administers their own
-                    tenant. Leave empty and only you can manage them.
-                  </p>
-                </div>
+                <Input
+                  label="Quota per registered tenant (GB)"
+                  type="number"
+                  min="0"
+                  step="0.5"
+                  value={quotaGbStr}
+                  onChange={(e) => setQuotaGbStr(e.target.value)}
+                  hint="Applied at registration; raise it per tenant afterwards. 0 = unlimited."
+                />
+                <Input
+                  label="Tenant admin role"
+                  value={form.tenant_admin_role}
+                  onChange={(e) => setForm({ ...form, tenant_admin_role: e.target.value })}
+                  placeholder="objectio-admin"
+                  hint="A user whose token carries this role administers their own tenant. Empty means only you can."
+                />
                 <div className="md:col-span-2">
-                  <label className="block text-xs font-medium text-muted mb-1">
-                    Allowed directory IDs{" "}
-                    <span className="text-faint">(optional)</span>
-                  </label>
-                  <input
+                  <Input
+                    label={
+                      <>
+                        Allowed directory IDs{" "}
+                        <span className="font-normal text-faint">(optional)</span>
+                      </>
+                    }
                     value={allowedTidsStr}
                     onChange={(e) => setAllowedTidsStr(e.target.value)}
                     placeholder="leave empty to let any organisation register"
-                    className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm font-mono text-xs focus:ring-2 focus:ring-accent focus:outline-none"
+                    className="font-mono text-[12px]"
                   />
-                  <p className="mt-1 text-xs text-amber-700">
-                    Empty means open registration: any Microsoft work or school
-                    account anywhere can sign in and be given a tenant. List
-                    directory IDs here to restrict it.
-                  </p>
+                  {!allowedTidsStr.trim() && (
+                    <Banner kind="warn" className="mt-2" title="Open registration">
+                      Any Microsoft work or school account, anywhere, can sign in and
+                      be given a tenant. List directory IDs to restrict it.
+                    </Banner>
+                  )}
                 </div>
               </>
             )}
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Groups Claim</label>
-              <input
-                value={form.claim_name}
-                onChange={(e) => setForm({ ...form, claim_name: e.target.value })}
-                placeholder="groups"
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted mb-1">Scopes</label>
-              <input
-                value={form.scopes}
-                onChange={(e) => setForm({ ...form, scopes: e.target.value })}
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-muted mb-1">Admin Roles (comma-separated group/role IDs)</label>
-              <input
-                value={adminRolesStr}
-                onChange={(e) => setAdminRolesStr(e.target.value)}
-                placeholder="e.g. 0d35f722-797c-46ec-8360-8dc018c81e09"
-                className="w-full px-3 py-2 border border-border-strong rounded-lg text-sm focus:ring-2 focus:ring-accent focus:outline-none"
-              />
-            </div>
-            <div className="md:col-span-2 flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={form.enabled}
-                onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
-                className="rounded"
-              />
-              <label className="text-sm">Enabled</label>
-            </div>
-            {!sessionTenant && (
-              <div className="md:col-span-2 flex items-start gap-2">
+
+            <Input
+              label="Groups claim"
+              value={form.claim_name}
+              onChange={(e) => setForm({ ...form, claim_name: e.target.value })}
+              placeholder="groups"
+            />
+            <Input
+              label="Admin roles"
+              value={adminRolesStr}
+              onChange={(e) => setAdminRolesStr(e.target.value)}
+              placeholder="0d35f722-797c-46ec-8360-8dc018c81e09"
+              hint="Comma-separated group or role IDs."
+            />
+
+            <div className="md:col-span-2 flex flex-col gap-2 border-t border-border pt-3">
+              <label className="flex items-center gap-2 text-[12px] text-text-2">
                 <input
-                  id="system_admin_chk"
                   type="checkbox"
-                  checked={form.system_admin ?? false}
-                  onChange={(e) =>
-                    setForm({ ...form, system_admin: e.target.checked })
-                  }
-                  className="rounded mt-1"
+                  checked={form.enabled}
+                  onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
+                  className="accent-[var(--oio-accent)]"
                 />
-                <label htmlFor="system_admin_chk" className="text-sm">
-                  Allow system-admin SSO
-                  <span className="block text-xs text-muted mt-0.5">
-                    Users authenticated through this provider log into the
-                    system-admin console without a tenant binding. Leave
-                    unchecked if this provider is only for tenant users.
+                Enabled
+              </label>
+              {!sessionTenant && (
+                <label className="flex items-start gap-2 text-[12px] text-text-2">
+                  <input
+                    type="checkbox"
+                    checked={form.system_admin ?? false}
+                    onChange={(e) => setForm({ ...form, system_admin: e.target.checked })}
+                    className="accent-[var(--oio-accent)] mt-0.5"
+                  />
+                  <span>
+                    Allow system-admin SSO
+                    <span className="block text-[11px] text-muted mt-0.5">
+                      Users from this provider sign into the system-admin console with
+                      no tenant binding. Leave unchecked for a tenant-only provider.
+                    </span>
                   </span>
                 </label>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-          <div className="flex gap-3 mt-6 pt-4 border-t border-border">
-            <button
-              onClick={save}
-              className="px-4 py-2 bg-accent text-primary-fg rounded-lg text-sm font-medium hover:bg-accent"
-            >
+
+          <div className="flex gap-2 mt-4 pt-3 border-t border-border">
+            <Button variant="primary" onClick={save}>
               Save
-            </button>
-            <button
-              onClick={() => setEditing(null)}
-              className="px-4 py-2 bg-surface-2 text-text-2 rounded-lg text-sm font-medium hover:bg-border"
-            >
-              Cancel
-            </button>
+            </Button>
+            <Button onClick={() => setEditing(null)}>Cancel</Button>
           </div>
         </Card>
       )}
 
-      {/* Provider list */}
-      <div className="bg-surface rounded-xl border border-border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-surface-2 border-b border-border">
-            <tr>
-              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Provider</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Issuer</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Client ID</th>
-              <th className="text-left px-6 py-3 text-xs font-medium text-muted uppercase">Status</th>
-              <th className="text-right px-6 py-3 text-xs font-medium text-muted uppercase">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {loading ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-faint">Loading...</td></tr>
-            ) : visibleProviders.length === 0 ? (
-              <tr><td colSpan={5} className="px-6 py-8 text-center text-faint">No OIDC providers configured</td></tr>
-            ) : (
-              visibleProviders.map((p) => (
-                <tr key={p.key} className="hover:bg-surface-2">
-                  <td className="px-6 py-3">
-                    <div className="flex items-center gap-2">
-                      <Shield size={16} className="text-accent" />
-                      <div>
-                        <span className="font-medium">{p.value.display_name || p.key.replace("identity/openid/", "")}</span>
-                        <span className="text-faint ml-2 text-xs">{p.value.vendor || "oidc"}</span>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-3 text-muted truncate max-w-xs">{p.value.issuer_url}</td>
-                  <td className="px-6 py-3 font-mono text-xs text-muted">{p.value.client_id}</td>
-                  <td className="px-6 py-3">
-                    {p.value.enabled ? (
-                      <span className="inline-flex items-center gap-1 text-green-700 text-xs">
-                        <CheckCircle size={14} /> Enabled
+      <Table
+        columns={[
+          { key: "provider", label: "Provider" },
+          { key: "issuer", label: "Issuer" },
+          { key: "client", label: "Client ID", className: "w-72" },
+          { key: "tenancy", label: "Tenancy", className: "w-32" },
+          { key: "status", label: "Status", className: "w-32" },
+          { key: "actions", label: "", className: "w-24" },
+        ]}
+        loading={loading}
+        empty="No OIDC providers configured"
+        footer={
+          visibleProviders.length
+            ? `${visibleProviders.length} provider${visibleProviders.length === 1 ? "" : "s"} · ${
+                visibleProviders.filter((p) => p.value.enabled).length
+              } enabled`
+            : undefined
+        }
+      >
+        {visibleProviders.length
+          ? visibleProviders.map((p) => (
+              <Row key={p.key}>
+                <Cell>
+                  <span className="flex items-center gap-2">
+                    <Shield size={14} className="text-muted shrink-0" />
+                    <span className="flex flex-col min-w-0">
+                      <span className="text-[13px] font-medium text-text truncate">
+                        {p.value.display_name || p.key.replace("identity/openid/", "")}
                       </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-faint text-xs">
-                        <AlertCircle size={14} /> Disabled
+                      <span className="font-mono text-[11px] text-muted truncate">
+                        {p.value.vendor || "oidc"}
                       </span>
-                    )}
-                  </td>
-                  <td className="px-6 py-3 text-right">
-                    <button onClick={() => startEdit(p)} className="text-accent hover:text-accent p-1">
-                      <Edit size={16} />
+                    </span>
+                  </span>
+                </Cell>
+                <Cell className="font-mono text-[11px] max-w-xs truncate">
+                  {p.value.issuer_url}
+                </Cell>
+                <Cell className="font-mono text-[11px] truncate">{p.value.client_id}</Cell>
+                <Cell>
+                  {/* Multi-tenant is the setting that decides whether a stranger
+                      can self-register, so it belongs in the list rather than
+                      two clicks into the form. */}
+                  <Badge kind={p.value.tenancy === "multi" ? "info" : "neutral"}>
+                    {p.value.tenancy === "multi" ? "multi" : "single"}
+                  </Badge>
+                </Cell>
+                <Cell>
+                  <Badge kind={p.value.enabled ? "ok" : "neutral"}>
+                    {p.value.enabled ? "Enabled" : "Disabled"}
+                  </Badge>
+                </Cell>
+                <Cell align="right">
+                  <span className="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    <button
+                      onClick={() => startEdit(p)}
+                      title="Edit provider"
+                      className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                    >
+                      <Edit size={13} />
                     </button>
-                    <button onClick={() => remove(p.key)} className="text-red-500 hover:text-red-700 p-1 ml-2">
-                      <Trash2 size={16} />
+                    <button
+                      onClick={() => remove(p.key)}
+                      title="Delete provider"
+                      className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
+                    >
+                      <Trash2 size={13} />
                     </button>
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+                  </span>
+                </Cell>
+              </Row>
+            ))
+          : undefined}
+      </Table>
     </div>
   );
 }

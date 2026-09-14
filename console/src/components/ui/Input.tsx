@@ -2,10 +2,10 @@ import type { InputHTMLAttributes, ReactNode } from "react";
 
 interface Props extends InputHTMLAttributes<HTMLInputElement> {
   /** 11px/600 label rendered above the control. */
-  label?: string;
+  label?: ReactNode;
   /** Leading icon, 13px, sits at left-2.5. */
   icon?: ReactNode;
-  hint?: string;
+  hint?: ReactNode;
   error?: string;
 }
 
