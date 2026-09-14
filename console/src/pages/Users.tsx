@@ -23,6 +23,10 @@ interface AccessKey {
   access_key_id: string;
   status: string;
   created_at: number;
+  /** "s3://bucket/prefix/" the key is confined to; empty = unscoped. */
+  scope?: string;
+  /** "READ" or "READ_WRITE". */
+  operation?: string;
 }
 
 interface Tenant {
@@ -43,6 +47,12 @@ export default function UsersPage() {
   const [keys, setKeys] = useState<AccessKey[]>([]);
   const [copied, setCopied] = useState("");
   const [loading, setLoading] = useState(true);
+  // Scoped-key form. A key can narrow its user's access to one bucket or
+  // prefix and/or to reads only; it can never widen it.
+  const [keyFormUser, setKeyFormUser] = useState<string | null>(null);
+  const [keyScope, setKeyScope] = useState("");
+  const [keyReadOnly, setKeyReadOnly] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
 
   const load = () => {
     setLoading(true);
@@ -118,9 +128,34 @@ export default function UsersPage() {
   };
 
   const createKey = async (userId: string) => {
-    const r = await fetch(`/_admin/users/${userId}/access-keys`, { method: "POST" });
+    setKeyError(null);
+    const body: { scope?: string; operation?: string } = {};
+    if (keyScope.trim()) body.scope = keyScope.trim();
+    if (keyReadOnly) body.operation = "r";
+    const r = await fetch(`/_admin/users/${userId}/access-keys`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      // The gateway rejects a malformed scope rather than storing one that
+      // matches nothing — show its message rather than a generic failure.
+      const text = await r.text();
+      try {
+        setKeyError(JSON.parse(text).error || text);
+      } catch {
+        setKeyError(text || `Request failed (${r.status})`);
+      }
+      return;
+    }
     const data = await r.json();
     setCredentials(data);
+    setKeyFormUser(null);
+    setKeyScope("");
+    setKeyReadOnly(false);
+    if (expandedUser === userId) {
+      setExpandedUser(null);
+    }
     loadKeys(userId);
   };
 
@@ -205,6 +240,13 @@ export default function UsersPage() {
           keys={keys}
           createKey={createKey}
           deleteKey={deleteKey}
+          keyFormUser={keyFormUser}
+          setKeyFormUser={setKeyFormUser}
+          keyScope={keyScope}
+          setKeyScope={setKeyScope}
+          keyReadOnly={keyReadOnly}
+          setKeyReadOnly={setKeyReadOnly}
+          keyError={keyError}
         />
       )}
     </div>
@@ -234,6 +276,13 @@ interface UsersTabProps {
   keys: AccessKey[];
   createKey: (userId: string) => void;
   deleteKey: (keyId: string, userId: string) => void;
+  keyFormUser: string | null;
+  setKeyFormUser: (v: string | null) => void;
+  keyScope: string;
+  setKeyScope: (v: string) => void;
+  keyReadOnly: boolean;
+  setKeyReadOnly: (v: boolean) => void;
+  keyError: string | null;
 }
 
 function UsersTabContent(p: UsersTabProps) {
@@ -258,6 +307,13 @@ function UsersTabContent(p: UsersTabProps) {
     keys,
     createKey,
     deleteKey,
+    keyFormUser,
+    setKeyFormUser,
+    keyScope,
+    setKeyScope,
+    keyReadOnly,
+    setKeyReadOnly,
+    keyError,
   } = p;
   return (
     <>
@@ -376,17 +432,83 @@ function UsersTabContent(p: UsersTabProps) {
                       <td colSpan={5} className="bg-gray-50 px-4 py-3">
                         <div className="flex items-center justify-between mb-2">
                           <h4 className="text-[11px] font-medium text-gray-500 uppercase tracking-wider">Access Keys</h4>
-                          <button onClick={() => createKey(u.user_id)} className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1">
+                          <button
+                            onClick={() =>
+                              setKeyFormUser(keyFormUser === u.user_id ? null : u.user_id)
+                            }
+                            className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                          >
                             <Plus size={11} /> New Key
                           </button>
                         </div>
+
+                        {keyFormUser === u.user_id && (
+                          <div className="mb-2 bg-white rounded-lg border border-gray-200 p-3 space-y-2">
+                            <div>
+                              <label className="block text-[11px] font-medium text-gray-500 mb-1">
+                                Scope <span className="text-gray-400">(optional)</span>
+                              </label>
+                              <input
+                                value={keyScope}
+                                onChange={(e) => setKeyScope(e.target.value)}
+                                placeholder="s3://bucket/prefix/"
+                                className="w-full font-mono text-[11px] border border-gray-200 rounded-md px-2 py-1.5"
+                              />
+                              <p className="text-[10px] text-gray-400 mt-1">
+                                Confines the key to one bucket or prefix. Leave blank for the
+                                user's full access — a scope only narrows, never widens.
+                              </p>
+                            </div>
+                            <label className="flex items-center gap-2 text-[11px] text-gray-600">
+                              <input
+                                type="checkbox"
+                                checked={keyReadOnly}
+                                onChange={(e) => setKeyReadOnly(e.target.checked)}
+                              />
+                              Read-only (refuses PUT, POST and DELETE)
+                            </label>
+                            {keyError && (
+                              <p className="text-[11px] text-red-600">{keyError}</p>
+                            )}
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => createKey(u.user_id)}
+                                className="text-[11px] bg-blue-600 text-white rounded-md px-3 py-1.5 hover:bg-blue-700"
+                              >
+                                Create Key
+                              </button>
+                              <button
+                                onClick={() => setKeyFormUser(null)}
+                                className="text-[11px] text-gray-500 px-2 py-1.5 hover:text-gray-700"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
                         {keys.length === 0 ? (
                           <p className="text-[12px] text-gray-400">No access keys</p>
                         ) : (
                           <div className="space-y-1.5">
                             {keys.map((k) => (
                               <div key={k.access_key_id} className="flex items-center justify-between bg-white rounded-lg px-3 py-1.5 border border-gray-200">
-                                <span className="font-mono text-[11px]">{k.access_key_id}</span>
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="font-mono text-[11px]">{k.access_key_id}</span>
+                                  {k.scope ? (
+                                    <span
+                                      className="text-[10px] font-mono bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5 truncate"
+                                      title={`Scoped to ${k.scope}`}
+                                    >
+                                      {k.scope}
+                                    </span>
+                                  ) : null}
+                                  {k.operation === "READ" ? (
+                                    <span className="text-[10px] bg-gray-100 text-gray-600 border border-gray-200 rounded px-1.5 py-0.5">
+                                      read-only
+                                    </span>
+                                  ) : null}
+                                </div>
                                 <div className="flex items-center gap-2">
                                   <span className="text-[11px] text-gray-400">{k.status}</span>
                                   <button onClick={() => deleteKey(k.access_key_id, u.user_id)} className="text-red-400 hover:text-red-600">

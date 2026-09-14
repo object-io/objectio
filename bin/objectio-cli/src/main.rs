@@ -10,12 +10,14 @@ use objectio_proto::block::{
     ListVolumesRequest, ResizeVolumeRequest, block_service_client::BlockServiceClient,
 };
 use objectio_proto::metadata::{
-    AddUserToGroupRequest, CreateAccessKeyRequest, CreateGroupRequest, CreateTenantRequest,
-    CreateUserRequest, DeleteAccessKeyRequest, DeleteConfigRequest, DeleteGroupRequest,
-    DeleteTenantRequest, DeleteUserRequest, GetConfigRequest, GetTenantRequest,
-    GetUserGroupsRequest, ListAccessKeysRequest, ListGroupsRequest, ListTenantsRequest,
-    ListUsersRequest, RemoveUserFromGroupRequest, SetConfigRequest, TenantConfig,
-    UpdateTenantRequest, metadata_service_client::MetadataServiceClient,
+    AddUserToGroupRequest, AttachPolicyRequest, CreateAccessKeyRequest, CreateGroupRequest,
+    CreatePolicyRequest, CreateTenantRequest, CreateUserRequest, DeleteAccessKeyRequest,
+    DeleteConfigRequest, DeleteGroupRequest, DeletePolicyRequest, DeleteTenantRequest,
+    DeleteUserRequest, DetachPolicyRequest, GetBucketRequest, GetConfigRequest, GetPolicyRequest,
+    GetTenantRequest, GetUserGroupsRequest, ListAccessKeysRequest, ListAttachedPoliciesRequest,
+    ListBucketsRequest, ListGroupsRequest, ListPoliciesRequest, ListTenantsRequest,
+    ListUsersRequest, RemoveUserFromGroupRequest, SetBucketOwnerRequest, SetConfigRequest,
+    TenantConfig, UpdateTenantRequest, metadata_service_client::MetadataServiceClient,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -72,6 +74,11 @@ enum Commands {
     Group {
         #[command(subcommand)]
         action: GroupCommands,
+    },
+    /// Named policy operations (IAM)
+    Policy {
+        #[command(subcommand)]
+        action: PolicyCommands,
     },
     /// Block volume operations
     Volume {
@@ -230,11 +237,82 @@ enum DiskCommands {
 #[derive(Subcommand, Debug)]
 enum BucketCommands {
     /// List all buckets
-    List,
-    /// Show bucket details
+    List {
+        /// Filter by tenant (empty = all tenants)
+        #[arg(short, long, default_value = "")]
+        tenant: String,
+    },
+    /// Show bucket details, including its owner
     Show {
         /// Bucket name
         name: String,
+    },
+    /// Reassign a bucket's owner.
+    ///
+    /// The owner is who reaches a bucket when no policy grants access, so
+    /// this is also how you backfill buckets created before ownership was
+    /// recorded — those show an owner of "default" or none at all, and stay
+    /// open only while the gateway runs with --authz-legacy-open-buckets.
+    SetOwner {
+        /// Bucket name
+        name: String,
+        /// user_id of the new owner
+        owner: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommands {
+    /// List all named IAM policies
+    List,
+    /// Print one policy document
+    Show {
+        /// Policy name
+        name: String,
+    },
+    /// Create or replace a named policy from a JSON document
+    Create {
+        /// Policy name
+        name: String,
+        /// Path to the policy JSON, or "-" to read stdin
+        #[arg(long)]
+        file: String,
+    },
+    /// Delete a named policy
+    Delete {
+        /// Policy name
+        name: String,
+    },
+    /// Attach a policy to a user or a group
+    Attach {
+        /// Policy name
+        name: String,
+        /// Attach to this user
+        #[arg(long, conflicts_with = "group")]
+        user: Option<String>,
+        /// Attach to this group
+        #[arg(long, conflicts_with = "user")]
+        group: Option<String>,
+    },
+    /// Detach a policy from a user or a group
+    Detach {
+        /// Policy name
+        name: String,
+        /// Detach from this user
+        #[arg(long, conflicts_with = "group")]
+        user: Option<String>,
+        /// Detach from this group
+        #[arg(long, conflicts_with = "user")]
+        group: Option<String>,
+    },
+    /// List the policies attached to a user or a group
+    Attached {
+        /// The user
+        #[arg(long, conflicts_with = "group")]
+        user: Option<String>,
+        /// The group
+        #[arg(long, conflicts_with = "user")]
+        group: Option<String>,
     },
 }
 
@@ -469,6 +547,39 @@ fn format_snapshot_state(state: i32) -> &'static str {
     }
 }
 
+/// Render a bucket owner for display. Buckets created before ownership was
+/// recorded carry an empty owner or the literal placeholder "default".
+fn owner_label(owner: &str) -> String {
+    if owner.is_empty() {
+        "(none)".to_string()
+    } else if owner == "default" {
+        "(none - legacy)".to_string()
+    } else {
+        owner.to_string()
+    }
+}
+
+/// Turn `--user`/`--group` into the (user_id, group_id) pair the policy RPCs
+/// take, where exactly one is set and the other is empty.
+fn principal_args(
+    user: &Option<String>,
+    group: &Option<String>,
+) -> anyhow::Result<(String, String)> {
+    match (user, group) {
+        (Some(u), None) => Ok((u.clone(), String::new())),
+        (None, Some(g)) => Ok((String::new(), g.clone())),
+        _ => Err(anyhow::anyhow!("specify exactly one of --user or --group")),
+    }
+}
+
+fn principal_label(user_id: &str, group_id: &str) -> String {
+    if user_id.is_empty() {
+        format!("group {group_id}")
+    } else {
+        format!("user {user_id}")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -524,17 +635,222 @@ async fn main() -> Result<()> {
                 println!("(placeholder)");
             }
         },
-        Commands::Bucket { action } => match action {
-            BucketCommands::List => {
-                println!("Buckets");
-                println!("=======");
-                println!("(placeholder)");
+        Commands::Bucket { action } => {
+            let mut client = MetadataServiceClient::connect(args.endpoint.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to metadata service: {}", e))?;
+
+            match action {
+                BucketCommands::List { tenant } => {
+                    let resp = client
+                        .list_buckets(ListBucketsRequest {
+                            owner: String::new(),
+                            tenant: tenant.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    println!("Buckets");
+                    println!("=======");
+                    if resp.buckets.is_empty() {
+                        println!("No buckets found");
+                    } else {
+                        println!(
+                            "{:<32} {:<40} {:<16} {:<20}",
+                            "NAME", "OWNER", "TENANT", "CREATED"
+                        );
+                        println!("{}", "-".repeat(110));
+                        for b in resp.buckets {
+                            println!(
+                                "{:<32} {:<40} {:<16} {:<20}",
+                                b.name,
+                                owner_label(&b.owner),
+                                if b.tenant.is_empty() { "-" } else { &b.tenant },
+                                b.created_at
+                            );
+                        }
+                    }
+                }
+                BucketCommands::Show { name } => {
+                    let resp = client
+                        .get_bucket(GetBucketRequest { name: name.clone() })
+                        .await?
+                        .into_inner();
+                    let Some(b) = resp.bucket else {
+                        return Err(anyhow::anyhow!("bucket '{name}' not found"));
+                    };
+                    println!("Bucket: {}", b.name);
+                    println!("========{}", "=".repeat(b.name.len()));
+                    println!("Owner:          {}", owner_label(&b.owner));
+                    println!(
+                        "Tenant:         {}",
+                        if b.tenant.is_empty() {
+                            "(system)"
+                        } else {
+                            &b.tenant
+                        }
+                    );
+                    println!("Storage class:  {}", b.storage_class);
+                    println!(
+                        "Pool:           {}",
+                        if b.pool.is_empty() {
+                            "(default)"
+                        } else {
+                            &b.pool
+                        }
+                    );
+                    println!("Created:        {}", b.created_at);
+                    if b.owner.is_empty() || b.owner == "default" {
+                        println!();
+                        println!(
+                            "NOTE: this bucket has no real owner, so authorization cannot fall"
+                        );
+                        println!(
+                            "      back to ownership. It stays reachable only while the gateway"
+                        );
+                        println!("      runs with --authz-legacy-open-buckets. Assign one with:");
+                        println!("        objectio-cli bucket set-owner {} <user_id>", b.name);
+                    }
+                }
+                BucketCommands::SetOwner { name, owner } => {
+                    client
+                        .set_bucket_owner(SetBucketOwnerRequest {
+                            bucket: name.clone(),
+                            owner: owner.clone(),
+                        })
+                        .await?;
+                    println!("Owner of bucket '{name}' set to '{owner}'");
+                }
             }
-            BucketCommands::Show { name } => {
-                println!("Bucket: {name}");
-                println!("(placeholder)");
+        }
+        Commands::Policy { action } => {
+            let mut client = MetadataServiceClient::connect(args.endpoint.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to metadata service: {}", e))?;
+
+            match action {
+                PolicyCommands::List => {
+                    let resp = client
+                        .list_policies(ListPoliciesRequest {})
+                        .await?
+                        .into_inner();
+                    println!("Policies");
+                    println!("========");
+                    if resp.policies.is_empty() {
+                        println!("No policies found");
+                    } else {
+                        println!("{:<28} {:<12} {:<20}", "NAME", "STATEMENTS", "UPDATED");
+                        println!("{}", "-".repeat(62));
+                        for p in resp.policies {
+                            // Statement count is the useful one-line summary;
+                            // the document itself is behind `policy show`.
+                            let statements = objectio_auth::BucketPolicy::from_json(&p.policy_json)
+                                .map_or_else(
+                                    |_| "invalid".to_string(),
+                                    |d| d.statements.len().to_string(),
+                                );
+                            println!("{:<28} {:<12} {:<20}", p.name, statements, p.updated_at);
+                        }
+                    }
+                }
+                PolicyCommands::Show { name } => {
+                    let resp = client
+                        .get_policy(GetPolicyRequest { name: name.clone() })
+                        .await?
+                        .into_inner();
+                    if !resp.found {
+                        return Err(anyhow::anyhow!("policy '{name}' not found"));
+                    }
+                    let p = resp
+                        .policy
+                        .ok_or_else(|| anyhow::anyhow!("policy '{name}' has no document"))?;
+                    // Pretty-print when it parses; otherwise show it raw so a
+                    // broken document can still be inspected and fixed.
+                    match serde_json::from_str::<serde_json::Value>(&p.policy_json) {
+                        Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                        Err(_) => println!("{}", p.policy_json),
+                    }
+                }
+                PolicyCommands::Create { name, file } => {
+                    let policy_json = if file == "-" {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    } else {
+                        std::fs::read_to_string(&file)
+                            .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?
+                    };
+                    // Validate before writing. A document that does not parse
+                    // is silently inert at request time — it fails on every
+                    // authorization decision while the grant never applies.
+                    objectio_auth::BucketPolicy::from_json(&policy_json)
+                        .map_err(|e| anyhow::anyhow!("invalid policy document: {e}"))?;
+                    client
+                        .create_policy(CreatePolicyRequest {
+                            name: name.clone(),
+                            policy_json,
+                        })
+                        .await?;
+                    println!("Policy '{name}' saved");
+                }
+                PolicyCommands::Delete { name } => {
+                    client
+                        .delete_policy(DeletePolicyRequest { name: name.clone() })
+                        .await?;
+                    println!("Policy '{name}' deleted");
+                }
+                PolicyCommands::Attach { name, user, group } => {
+                    let (user_id, group_id) = principal_args(&user, &group)?;
+                    client
+                        .attach_policy(AttachPolicyRequest {
+                            policy_name: name.clone(),
+                            user_id: user_id.clone(),
+                            group_id: group_id.clone(),
+                        })
+                        .await?;
+                    println!(
+                        "Attached policy '{name}' to {}",
+                        principal_label(&user_id, &group_id)
+                    );
+                }
+                PolicyCommands::Detach { name, user, group } => {
+                    let (user_id, group_id) = principal_args(&user, &group)?;
+                    client
+                        .detach_policy(DetachPolicyRequest {
+                            policy_name: name.clone(),
+                            user_id: user_id.clone(),
+                            group_id: group_id.clone(),
+                        })
+                        .await?;
+                    println!(
+                        "Detached policy '{name}' from {}",
+                        principal_label(&user_id, &group_id)
+                    );
+                }
+                PolicyCommands::Attached { user, group } => {
+                    let (user_id, group_id) = principal_args(&user, &group)?;
+                    let resp = client
+                        .list_attached_policies(ListAttachedPoliciesRequest {
+                            user_id: user_id.clone(),
+                            group_id: group_id.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    println!(
+                        "Policies attached to {}",
+                        principal_label(&user_id, &group_id)
+                    );
+                    println!("{}", "-".repeat(40));
+                    if resp.policy_names.is_empty() {
+                        println!("(none)");
+                    } else {
+                        for n in resp.policy_names {
+                            println!("{n}");
+                        }
+                    }
+                }
             }
-        },
+        }
         Commands::User { action } => {
             let mut client = MetadataServiceClient::connect(args.endpoint.clone())
                 .await
