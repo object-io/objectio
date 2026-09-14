@@ -1,24 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Globe2,
-  Compass,
-  Building2,
-  Layers3,
-  Server,
-  HardDrive,
-  ChevronRight,
-  ChevronDown,
-  RefreshCw,
-  Power,
-  Shuffle,
   Ban,
+  Building2,
+  ChevronDown,
+  ChevronRight,
+  Compass,
+  Globe2,
+  HardDrive,
+  Layers3,
+  Pause,
+  Play,
+  Power,
+  Server,
+  Shuffle,
+  X,
 } from "lucide-react";
-import PageHeader from "../components/PageHeader";
-import Card from "../components/Card";
-import Drawer from "../components/Drawer";
-import CapacityBar from "../components/CapacityBar";
-import BreadcrumbPath from "../components/BreadcrumbPath";
-import StatusDot from "../components/StatusDot";
+import { Badge, Banner, Button, CapacityBar, Chip } from "../components/ui";
 import {
   nodes as nodesApi,
   hostProvider as hostProviderApi,
@@ -39,58 +36,36 @@ interface RegionNode { region: string; zones: ZoneNode[]; }
 
 interface TopologyData {
   osd_count: number;
-  distinct: {
-    region: number;
-    zone: number;
-    datacenter: number;
-    rack: number;
-    host: number;
-  };
+  distinct: { region: number; zone: number; datacenter: number; rack: number; host: number };
   tree: RegionNode[];
 }
 
 function formatBytes(b: number): string {
-  if (b === 0) return "0 B";
+  if (!b) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB", "PB"];
   const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
-  const v = b / Math.pow(1024, i);
+  const v = b / 1024 ** i;
   return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
-// Per-level pill styling — lets every tree node read at a glance.
-const LEVEL_META = {
-  region:     { color: "bg-indigo-50 text-indigo-800 border-indigo-200",  icon: Globe2    },
-  zone:       { color: "bg-sky-50 text-sky-800 border-sky-200",           icon: Compass   },
-  datacenter: { color: "bg-teal-50 text-teal-800 border-teal-200",        icon: Building2 },
-  rack:       { color: "bg-amber-50 text-amber-800 border-amber-200",     icon: Layers3   },
-  host:       { color: "bg-surface-2 text-text border-border",        icon: Server    },
+/// Level icons only. The artboard draws every tier on the same surface —
+/// depth is carried by indentation and the mono tier label, not by giving
+/// each level its own colour, which competed with the status dots.
+const LEVEL_ICON = {
+  region: Globe2,
+  zone: Compass,
+  datacenter: Building2,
+  rack: Layers3,
+  host: Server,
 } as const;
 
-type LevelKey = keyof typeof LEVEL_META;
+type LevelKey = keyof typeof LEVEL_ICON;
 
-interface TreeRowProps {
-  level: LevelKey;
-  label: string;
-  badge?: string;
-  rightAccessory?: React.ReactNode;
-  path: string;
-  expanded: Set<string>;
-  setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>;
-  hasChildren: boolean;
-  children?: React.ReactNode;
-  onSelect?: () => void;
-  selected?: boolean;
-}
-
-/// Single row in the topology tree. Opens/closes via the chevron; the
-/// label area is optionally clickable (used on host rows to open the
-/// detail drawer). Expansion state is lifted so callers can collapse
-/// everything at once or deep-link to a specific host.
 function TreeRow({
   level,
   label,
-  badge,
-  rightAccessory,
+  count,
+  right,
   path,
   expanded,
   setExpanded,
@@ -98,26 +73,36 @@ function TreeRow({
   children,
   onSelect,
   selected,
-}: TreeRowProps) {
+}: {
+  level: LevelKey;
+  label: string;
+  count?: string;
+  right?: React.ReactNode;
+  path: string;
+  expanded: Set<string>;
+  setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>;
+  hasChildren: boolean;
+  children?: React.ReactNode;
+  onSelect?: () => void;
+  selected?: boolean;
+}) {
   const open = expanded.has(path);
-  const meta = LEVEL_META[level];
-  const Icon = meta.icon;
-  const toggle = () => {
+  const Icon = LEVEL_ICON[level];
+  const toggle = () =>
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(path)) next.delete(path);
       else next.add(path);
       return next;
     });
-  };
+
   return (
-    <div className="relative">
+    <div>
       <div
-        className={`group flex items-center gap-1.5 text-[12px] rounded-lg border px-2 py-1 ${
-          meta.color
-        } ${selected ? "ring-2 ring-accent" : ""} ${
-          onSelect ? "cursor-pointer hover:ring-1 hover:ring-accent-soft" : ""
-        }`}
+        onClick={onSelect}
+        className={`flex items-center gap-2 h-9 px-2.5 rounded-control border bg-surface
+          ${selected ? "border-accent ring-1 ring-accent-soft bg-accent-soft/40" : "border-border"}
+          ${onSelect ? "cursor-pointer hover:border-border-strong" : ""}`}
       >
         {hasChildren ? (
           <button
@@ -125,45 +110,35 @@ function TreeRow({
               e.stopPropagation();
               toggle();
             }}
-            className="text-current opacity-60 hover:opacity-100"
+            className="text-faint hover:text-text"
             aria-label={open ? "Collapse" : "Expand"}
           >
-            {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
           </button>
         ) : (
-          <span className="w-3" />
+          <span className="w-[13px]" />
         )}
-        <Icon size={12} />
-        <span className="text-[10px] uppercase tracking-wider opacity-60">
+        <Icon size={13} className="text-muted shrink-0" />
+        <span className="font-mono text-[10px] uppercase tracking-wider text-faint w-[78px] shrink-0">
           {level}
         </span>
-        <span
-          onClick={onSelect}
-          className={`font-mono font-medium ${onSelect ? "flex-1 truncate" : ""}`}
-        >
+        <span className="font-mono text-[12px] font-medium text-text truncate">
           {label || "(none)"}
         </span>
-        {badge && (
-          <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-surface/70 border border-current/10 opacity-80 font-normal">
-            {badge}
-          </span>
-        )}
-        {rightAccessory}
+        {count && <Chip mono>{count}</Chip>}
+        {right && <span className="ml-auto flex items-center gap-3 shrink-0">{right}</span>}
       </div>
       {hasChildren && open && (
-        <div className="relative ml-3 pl-4 mt-1.5 border-l border-dashed border-border space-y-1.5">
-          {children}
-        </div>
+        <div className="ml-4 pl-4 mt-1.5 space-y-1.5 border-l border-border">{children}</div>
       )}
     </div>
   );
 }
 
-/// Cluster Topology — hierarchical tree + selectable host rows with a
-/// right-side detail drawer (mirrors the mock's Cluster Topology screen).
 interface Props {
-  /// When rendered as a tab inside the unified /cluster page, the
-  /// parent PageHeader already shows the title — skip ours.
+  /// Rendered as a tab inside /cluster: the shell already draws the page
+  /// header, the host-health summary and Refresh, so this component draws
+  /// none of them. Standalone it is the whole page.
   embedded?: boolean;
 }
 
@@ -179,7 +154,39 @@ export default function Topology({ embedded = false }: Props = {}) {
   const [rebal, setRebal] = useState<RebalanceStatus | null>(null);
   const [rebalBusy, setRebalBusy] = useState(false);
 
-  const toggleRebalance = async () => {
+  useEffect(() => {
+    hostProviderApi
+      .info()
+      .then(setProvider)
+      .catch(() =>
+        setProvider({ provider: "noop", supports_add_host: false, supports_reboot: false })
+      );
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      drainApi.status().then((d) => !cancelled && setDrains(d.drains ?? [])).catch(() => {});
+      rebalanceApi.status().then((r) => !cancelled && setRebal(r)).catch(() => {});
+    };
+    poll();
+    const t = setInterval(poll, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [refreshKey]);
+
+  // While anything is draining, reload the tree too — the status endpoints
+  // above move the shard counter, but the per-host capacity and the
+  // auto-finalise from Draining to Out only show up in a fresh node list.
+  useEffect(() => {
+    if (!osdNodes.some((n) => n.admin_state === "draining")) return;
+    const t = setInterval(() => setRefreshKey((k) => k + 1), 15000);
+    return () => clearInterval(t);
+  }, [osdNodes]);
+
+  const toggleRebalance = useCallback(async () => {
     if (!rebal) return;
     setRebalBusy(true);
     try {
@@ -187,60 +194,16 @@ export default function Topology({ embedded = false }: Props = {}) {
       else await rebalanceApi.pause();
       const r = await rebalanceApi.status();
       setRebal(r);
+    } catch {
+      /* the banner keeps its last known state */
     } finally {
       setRebalBusy(false);
     }
-  };
-
-  useEffect(() => {
-    hostProviderApi
-      .info()
-      .then(setProvider)
-      .catch(() =>
-        setProvider({
-          provider: "noop",
-          supports_add_host: false,
-          supports_reboot: false,
-        }),
-      );
-  }, []);
-
-  // Pull drain progress alongside node list. Auto-refreshes with the
-  // same 15 s cadence as the rest of the page when any OSD is
-  // Draining.
-  useEffect(() => {
-    drainApi
-      .status()
-      .then((d) => setDrains(d.drains))
-      .catch(() => setDrains([]));
-    rebalanceApi
-      .status()
-      .then(setRebal)
-      .catch(() => setRebal(null));
-  }, [refreshKey]);
-
-  // Rebalancer polls more slowly than the drain path — auto-refresh
-  // every 30 s so the banner counter advances without requiring a
-  // manual refresh.
-  useEffect(() => {
-    const t = setInterval(() => setRefreshKey((k) => k + 1), 30000);
-    return () => clearInterval(t);
-  }, []);
-
-  // If any OSD is Draining, auto-refresh every 15 s so the operator
-  // sees the shard count drop toward zero (and the auto-finalise to Out
-  // when it hits zero) without manually clicking Refresh.
-  useEffect(() => {
-    const someDraining = osdNodes.some((n) => n.admin_state === "draining");
-    if (!someDraining) return;
-    const t = setInterval(() => setRefreshKey((k) => k + 1), 15000);
-    return () => clearInterval(t);
-  }, [osdNodes]);
+  }, [rebal]);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      setLoading(true);
       try {
         const [t, n] = await Promise.all([
           fetch("/_admin/topology").then((r) => r.json()),
@@ -250,7 +213,7 @@ export default function Topology({ embedded = false }: Props = {}) {
         setTopology(t);
         setOsdNodes(n.nodes || []);
         // Auto-expand everything so the tree reads as a diagram on first
-        // view. Users can collapse anything they don't care about.
+        // view. Anything uninteresting can be collapsed.
         const paths = new Set<string>();
         for (const r of (t.tree || []) as RegionNode[]) {
           paths.add(`r:${r.region}`);
@@ -259,9 +222,7 @@ export default function Topology({ embedded = false }: Props = {}) {
             for (const d of z.datacenters) {
               paths.add(`r:${r.region}/z:${z.zone}/d:${d.datacenter}`);
               for (const rk of d.racks) {
-                paths.add(
-                  `r:${r.region}/z:${z.zone}/d:${d.datacenter}/rk:${rk.rack}`,
-                );
+                paths.add(`r:${r.region}/z:${z.zone}/d:${d.datacenter}/rk:${rk.rack}`);
               }
             }
           }
@@ -279,46 +240,31 @@ export default function Topology({ embedded = false }: Props = {}) {
 
   // Fast lookup from host name → OSDs on that host. The topology tree
   // identifies hosts by the failure-domain `host` field, which in k8s
-  // deployments maps to `spec.nodeName` (the worker node). Fall back
-  // through alternative identifiers to cover bare-metal or legacy
-  // registrations where only hostname / pod name is populated.
+  // deployments maps to `spec.nodeName`. Fall back through alternative
+  // identifiers to cover bare-metal or legacy registrations.
   //
   // Two independent dedup concerns:
   //
   //  1. The same OSD can match multiple candidate keys (hostname and
-  //     node_name are usually identical on k8s pods), so we track a
-  //     per-key Set of node_ids and skip repeats.
-  //  2. Stale registrations: if an OSD pod restarted with a fresh
-  //     persistent state, meta keeps the old entry until it re-roles
-  //     the address. Prefer the online one (online=true over false),
-  //     then the most recent — since meta appends newer entries at the
-  //     end, a later duplicate wins.
+  //     node_name are usually identical on k8s pods).
+  //  2. Stale registrations: if an OSD pod restarted with fresh state,
+  //     meta keeps the old entry until it re-roles the address. Prefer
+  //     the online one, then the most recent.
   const osdsByHost = useMemo(() => {
     const m = new Map<string, Map<string, NodeInfo>>();
     for (const osd of osdNodes) {
       const candidates = Array.from(
-        new Set(
-          [osd.kubernetes_node, osd.hostname, osd.node_name].filter(
-            Boolean,
-          ) as string[],
-        ),
+        new Set([osd.kubernetes_node, osd.hostname, osd.node_name].filter(Boolean) as string[])
       );
       for (const key of candidates) {
         if (!m.has(key)) m.set(key, new Map());
         const byId = m.get(key)!;
         const existing = byId.get(osd.node_id);
-        // Keep the newer/online entry when IDs collide. Typically
-        // node_ids ARE unique per OSD registration, so this branch
-        // only fires on literal duplicates emitted by meta.
-        if (!existing || (!existing.online && osd.online)) {
-          byId.set(osd.node_id, osd);
-        }
+        if (!existing || (!existing.online && osd.online)) byId.set(osd.node_id, osd);
       }
     }
-    // Collapse to arrays and also dedupe by address as a last-resort
-    // guard against stale same-address / different-node_id ghosts —
-    // meta evicts those on re-registration but they survive briefly
-    // between heartbeats.
+    // Collapse to arrays, deduping by address as a last-resort guard
+    // against stale same-address ghosts between heartbeats.
     const out = new Map<string, NodeInfo[]>();
     for (const [host, byId] of m) {
       const seenAddr = new Set<string>();
@@ -333,142 +279,83 @@ export default function Topology({ embedded = false }: Props = {}) {
     return out;
   }, [osdNodes]);
 
-  // Derived host health summary for the top strip. `osdsByHost` is
-  // indexed by MULTIPLE keys per OSD (kubernetes_node, hostname,
-  // node_name) so the drawer can find shards via any identifier — but
-  // that means iterating its values over-counts hosts. Group by
-  // canonical host (kubernetes_node, else hostname / node_name) and
-  // classify once per real host.
-  const hostSummary = useMemo(() => {
-    const byCanonical = new Map<string, NodeInfo[]>();
-    for (const osd of osdNodes) {
-      const key =
-        osd.kubernetes_node || osd.hostname || osd.node_name || "(unknown)";
-      if (!byCanonical.has(key)) byCanonical.set(key, []);
-      byCanonical.get(key)!.push(osd);
-    }
-    let up = 0,
-      warn = 0,
-      down = 0;
-    for (const osds of byCanonical.values()) {
-      const allUp = osds.every((o) => o.online);
-      const allDown = osds.every((o) => !o.online);
-      if (allDown) down += 1;
-      else if (allUp) up += 1;
-      else warn += 1;
-    }
-    return { up, warn, down };
-  }, [osdNodes]);
+  const selectedOsds = selectedHost != null ? (osdsByHost.get(selectedHost) ?? []) : [];
 
-  const selectedOsds =
-    selectedHost != null ? (osdsByHost.get(selectedHost) ?? []) : [];
-
-  // Discover the topology path to the selected host for the drawer
-  // breadcrumb — walk the tree so region/zone/dc/rack match what's
-  // actually drawn on the left.
+  // Topology path to the selected host, walked from the same tree that is
+  // drawn on the left so the drawer's breadcrumb cannot disagree with it.
   const selectedPath = useMemo(() => {
     if (!selectedHost || !topology) return null;
-    for (const r of topology.tree) {
-      for (const z of r.zones) {
-        for (const d of z.datacenters) {
-          for (const rk of d.racks) {
-            for (const h of rk.hosts) {
-              if (h.host === selectedHost) {
-                return {
-                  region: r.region,
-                  zone: z.zone,
-                  datacenter: d.datacenter,
-                  rack: rk.rack,
-                };
-              }
-            }
-          }
-        }
-      }
-    }
+    for (const r of topology.tree)
+      for (const z of r.zones)
+        for (const d of z.datacenters)
+          for (const rk of d.racks)
+            for (const h of rk.hosts)
+              if (h.host === selectedHost)
+                return { region: r.region, zone: z.zone, datacenter: d.datacenter, rack: rk.rack };
     return null;
   }, [selectedHost, topology]);
 
+  const hostStats = (host: string) => {
+    const osds = osdsByHost.get(host) ?? [];
+    const total = osds.reduce((s, o) => s + o.total_capacity, 0);
+    const used = osds.reduce((s, o) => s + o.used_capacity, 0);
+    const allUp = osds.length > 0 && osds.every((o) => o.online);
+    const someUp = osds.some((o) => o.online);
+    return {
+      osds,
+      total,
+      used,
+      kind: (osds.length === 0 ? "neutral" : allUp ? "ok" : someUp ? "warn" : "err") as
+        | "ok"
+        | "warn"
+        | "err"
+        | "neutral",
+    };
+  };
+
+  const countOsds = {
+    rack: (rk: RackNode) => rk.hosts.reduce((n, h) => n + h.osds.length, 0),
+    dc: (d: DcNode) => d.racks.reduce((n, rk) => n + countOsds.rack(rk), 0),
+    zone: (z: ZoneNode) => z.datacenters.reduce((n, d) => n + countOsds.dc(d), 0),
+    region: (r: RegionNode) => r.zones.reduce((n, z) => n + countOsds.zone(z), 0),
+  };
+
   return (
-    <div className="flex h-screen bg-surface-2">
-      {/* Main tree area */}
-      <div className="flex-1 overflow-y-auto p-6 min-w-0">
+    <div className="flex flex-col lg:flex-row gap-4 items-start">
+      <div className="flex-1 min-w-0 w-full">
         {!embedded && (
-          <PageHeader
-            title="Cluster Topology"
-            description="Visual hierarchy and status of physical storage resources."
-            action={
-              <div className="flex items-center gap-2">
-                <StatusDot status="healthy" label={`${hostSummary.up} Hosts Up`} size="md" />
-                <StatusDot status="warning" label={`${hostSummary.warn} Warn`} size="md" />
-                <StatusDot status="error" label={`${hostSummary.down} Down`} size="md" />
-                <button
-                  onClick={() => setRefreshKey((k) => k + 1)}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 border border-border text-text-2 rounded-lg text-[12px] font-medium hover:bg-surface-2"
-                >
-                  <RefreshCw size={13} /> Refresh
-                </button>
-              </div>
-            }
-          />
+          <h1 className="text-[15px] font-medium text-text mb-4">Cluster topology</h1>
         )}
-        {embedded && (
-          <div className="flex items-center justify-end gap-2 mb-3">
-            <StatusDot status="healthy" label={`${hostSummary.up} Up`} size="sm" />
-            <StatusDot status="warning" label={`${hostSummary.warn} Warn`} size="sm" />
-            <StatusDot status="error" label={`${hostSummary.down} Down`} size="sm" />
-            <button
-              onClick={() => setRefreshKey((k) => k + 1)}
-              className="flex items-center gap-1.5 px-2.5 py-1 border border-border text-text-2 rounded-lg text-[11px] font-medium hover:bg-surface-2"
-            >
-              <RefreshCw size={12} /> Refresh
-            </button>
+
+        {rebal && <RebalanceBanner status={rebal} busy={rebalBusy} onToggle={toggleRebalance} />}
+
+        <div className="bg-surface border border-border rounded-card shadow-sm">
+          <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border">
+            <span className="font-mono text-[11px] uppercase tracking-wider text-muted truncate">
+              Topology tree{" "}
+              <span className="text-faint">· region › zone › datacenter › rack › host</span>
+            </span>
+            <Chip mono>CRUSH2</Chip>
           </div>
-        )}
-
-        {loading && !topology && (
-          <div className="text-[12px] text-faint">Loading topology…</div>
-        )}
-
-        {rebal && (
-          <RebalanceBanner
-            status={rebal}
-            busy={rebalBusy}
-            onToggle={toggleRebalance}
-          />
-        )}
-
-        {topology && (
-          <Card title="Topology tree">
-            {topology.tree.length === 0 ? (
-              <div className="text-[12px] text-faint italic py-6 text-center">
+          <div className="p-4">
+            {loading && !topology ? (
+              <div className="h-24 flex items-center justify-center text-[12px] text-muted">
+                Loading topology…
+              </div>
+            ) : !topology || topology.tree.length === 0 ? (
+              <div className="h-24 flex items-center justify-center text-[12px] text-muted">
                 No OSDs registered.
               </div>
             ) : (
-              <div className="space-y-3 overflow-x-auto py-2">
+              <div className="space-y-1.5 min-w-[640px] lg:min-w-0">
                 {topology.tree.map((r) => {
-                  const regionOsds = r.zones.reduce(
-                    (n, z) =>
-                      n +
-                      z.datacenters.reduce(
-                        (dn, d) =>
-                          dn +
-                          d.racks.reduce(
-                            (rn, rk) =>
-                              rn + rk.hosts.reduce((hn, h) => hn + h.osds.length, 0),
-                            0,
-                          ),
-                        0,
-                      ),
-                    0,
-                  );
                   const rKey = `r:${r.region}`;
                   return (
                     <TreeRow
                       key={rKey}
                       level="region"
                       label={r.region}
-                      badge={`${r.zones.length} Zone${r.zones.length !== 1 ? "s" : ""}  ${regionOsds} OSDs`}
+                      count={`${countOsds.region(r)} OSDs`}
                       path={rKey}
                       expanded={expanded}
                       setExpanded={setExpanded}
@@ -476,22 +363,12 @@ export default function Topology({ embedded = false }: Props = {}) {
                     >
                       {r.zones.map((z) => {
                         const zKey = `${rKey}/z:${z.zone}`;
-                        const zoneOsds = z.datacenters.reduce(
-                          (n, d) =>
-                            n +
-                            d.racks.reduce(
-                              (rn, rk) =>
-                                rn + rk.hosts.reduce((hn, h) => hn + h.osds.length, 0),
-                              0,
-                            ),
-                          0,
-                        );
                         return (
                           <TreeRow
                             key={zKey}
                             level="zone"
                             label={z.zone}
-                            badge={`${zoneOsds} OSDs`}
+                            count={`${countOsds.zone(z)} OSDs`}
                             path={zKey}
                             expanded={expanded}
                             setExpanded={setExpanded}
@@ -499,17 +376,12 @@ export default function Topology({ embedded = false }: Props = {}) {
                           >
                             {z.datacenters.map((d) => {
                               const dKey = `${zKey}/d:${d.datacenter}`;
-                              const dcOsds = d.racks.reduce(
-                                (n, rk) =>
-                                  n + rk.hosts.reduce((hn, h) => hn + h.osds.length, 0),
-                                0,
-                              );
                               return (
                                 <TreeRow
                                   key={dKey}
                                   level="datacenter"
                                   label={d.datacenter}
-                                  badge={`${dcOsds} OSDs`}
+                                  count={`${countOsds.dc(d)} OSDs`}
                                   path={dKey}
                                   expanded={expanded}
                                   setExpanded={setExpanded}
@@ -517,59 +389,53 @@ export default function Topology({ embedded = false }: Props = {}) {
                                 >
                                   {d.racks.map((rk) => {
                                     const rkKey = `${dKey}/rk:${rk.rack}`;
-                                    const rackOsds = rk.hosts.reduce(
-                                      (n, h) => n + h.osds.length,
-                                      0,
-                                    );
                                     return (
                                       <TreeRow
                                         key={rkKey}
                                         level="rack"
                                         label={rk.rack}
-                                        badge={`${rk.hosts.length} Hosts, ${rackOsds} OSDs`}
+                                        count={`${countOsds.rack(rk)} OSDs`}
                                         path={rkKey}
                                         expanded={expanded}
                                         setExpanded={setExpanded}
                                         hasChildren
                                       >
                                         {rk.hosts.map((h) => {
-                                          const hostOsds = osdsByHost.get(h.host) ?? [];
-                                          const allUp = hostOsds.every((o) => o.online);
-                                          const someUp = hostOsds.some((o) => o.online);
-                                          const status =
-                                            hostOsds.length === 0
-                                              ? "unknown"
-                                              : allUp
-                                                ? "healthy"
-                                                : someUp
-                                                  ? "warning"
-                                                  : "error";
-                                          const total = hostOsds.reduce(
-                                            (s, o) => s + o.total_capacity,
-                                            0,
-                                          );
-                                          const used = hostOsds.reduce(
-                                            (s, o) => s + o.used_capacity,
-                                            0,
-                                          );
-                                          const pct =
-                                            total === 0
-                                              ? 0
-                                              : Math.round((used / total) * 100);
+                                          const st = hostStats(h.host);
                                           return (
                                             <TreeRow
                                               key={h.host}
                                               level="host"
                                               label={h.host}
-                                              badge={`${h.osds.length} OSDs · ${pct}% util`}
+                                              count={`${h.osds.length} OSDs`}
                                               path={`${rkKey}/h:${h.host}`}
                                               expanded={expanded}
                                               setExpanded={setExpanded}
                                               hasChildren={false}
                                               onSelect={() => setSelectedHost(h.host)}
                                               selected={selectedHost === h.host}
-                                              rightAccessory={
-                                                <StatusDot status={status} />
+                                              right={
+                                                <>
+                                                  <CapacityBar
+                                                    used={st.used}
+                                                    total={st.total}
+                                                    className="w-24 hidden sm:block"
+                                                  />
+                                                  <span className="font-mono text-[11px] text-muted tabular-nums whitespace-nowrap">
+                                                    {formatBytes(st.used)} / {formatBytes(st.total)}
+                                                  </span>
+                                                  <span
+                                                    className={`w-[7px] h-[7px] rounded-full ${
+                                                      st.kind === "ok"
+                                                        ? "bg-ok"
+                                                        : st.kind === "warn"
+                                                          ? "bg-warn-dot"
+                                                          : st.kind === "err"
+                                                            ? "bg-err"
+                                                            : "bg-faint"
+                                                    }`}
+                                                  />
+                                                </>
                                               }
                                             />
                                           );
@@ -588,80 +454,50 @@ export default function Topology({ embedded = false }: Props = {}) {
                 })}
               </div>
             )}
-          </Card>
-        )}
-
-        <p className="mt-3 text-[11px] text-faint">
-          Hierarchy: region → zone → datacenter → rack → host → OSDs. Click a
-          host to inspect OSDs and host actions.
-        </p>
+          </div>
+        </div>
       </div>
 
-      {/* Right-side detail drawer */}
       {selectedHost != null && (
-        <Drawer
-          title={selectedHost}
-          eyebrow={
-            <div className="flex items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-accent-soft text-accent text-[10px] font-semibold uppercase tracking-wider">
-                Host
-              </span>
-              <StatusDot
-                status={
-                  selectedOsds.length === 0
-                    ? "unknown"
-                    : selectedOsds.every((o) => o.online)
-                      ? "healthy"
-                      : selectedOsds.some((o) => o.online)
-                        ? "warning"
-                        : "error"
-                }
-              />
-            </div>
-          }
-          subtitle={
-            selectedPath && (
-              <BreadcrumbPath
-                segments={[
-                  selectedPath.region,
-                  selectedPath.zone,
-                  selectedPath.datacenter,
-                  selectedPath.rack,
-                ]}
-              />
-            )
-          }
+        <HostPanel
+          host={selectedHost}
+          osds={selectedOsds}
+          path={selectedPath}
+          provider={provider}
+          drains={drains}
           onClose={() => setSelectedHost(null)}
-          width="w-[22rem]"
-        >
-          <HostDrawerBody
-            osds={selectedOsds}
-            provider={provider}
-            drains={drains}
-            onChanged={() => setRefreshKey((k) => k + 1)}
-          />
-        </Drawer>
+          onChanged={() => setRefreshKey((k) => k + 1)}
+        />
       )}
     </div>
   );
 }
 
-function HostDrawerBody({
+/// Host detail. In flow at 320px beside the tree rather than an overlay —
+/// the artboard keeps the tree readable while a host is open, and an
+/// overlay would hide the rack the host sits in, which is the context an
+/// operator is usually comparing against.
+function HostPanel({
+  host,
   osds,
+  path,
   provider,
   drains,
+  onClose,
   onChanged,
 }: {
+  host: string;
   osds: NodeInfo[];
+  path: { region: string; zone: string; datacenter: string; rack: string } | null;
   provider: HostProviderInfo | null;
   drains: DrainStatus[];
+  onClose: () => void;
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState<null | OsdAdminState | "reboot">(null);
   const [error, setError] = useState<string | null>(null);
-  // Per-OSD busy state — keyed by node_id so clicking Out on one OSD
-  // doesn't grey out the buttons on the others. Host-level batch ops
-  // still use `busy` above; the two coexist.
+  // Per-OSD busy state keyed by node_id, so acting on one OSD does not grey
+  // out the buttons on its neighbours.
   const [busyOsd, setBusyOsd] = useState<Record<string, OsdAdminState>>({});
 
   const setOneState = async (nodeId: string, target: OsdAdminState) => {
@@ -681,14 +517,26 @@ function HostDrawerBody({
     }
   };
 
+  const applyToAll = async (target: OsdAdminState) => {
+    setBusy(target);
+    setError(null);
+    try {
+      await Promise.all(osds.map((o) => nodesApi.setAdminState(o.node_id, target)));
+      onChanged();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const reboot = async () => {
     setBusy("reboot");
     setError(null);
     try {
-      // Rebooting one OSD pod is enough in k8s — the StatefulSet's
-      // other pods stay up. For BYO-Linux / appliance hosts with
-      // multiple OSDs per host, the provider itself decides whether
-      // to recycle the whole host or just one OSD service.
+      // One OSD pod is enough on k8s — the StatefulSet's other pods stay
+      // up. For appliance hosts the provider decides whether to recycle
+      // the whole host or a single OSD service.
       const first = osds[0];
       if (!first) return;
       await nodesApi.reboot(first.node_id);
@@ -700,275 +548,216 @@ function HostDrawerBody({
     }
   };
 
-  const upCount = osds.filter((o) => o.online).length;
   const total = osds.reduce((s, o) => s + o.total_capacity, 0);
   const used = osds.reduce((s, o) => s + o.used_capacity, 0);
-  const allUp = osds.length > 0 && upCount === osds.length;
-  // Split by operator intent. The topology tree shows only In OSDs,
-  // which is how the rack/host "5 OSDs" count is derived. Without a
-  // breakdown, a host that has 5 In + 4 Out reads as "9 Total" in the
-  // drawer — confusing. Display In / Draining / Out explicitly so
-  // the numbers reconcile with the tree at a glance.
+  const pct = total > 0 ? Math.round((used / total) * 100) : 0;
+  const upCount = osds.filter((o) => o.online).length;
+  const shards = osds.reduce((s, o) => s + (o.shard_count ?? 0), 0);
+
+  // The tree shows only In OSDs, so a host with 5 In + 4 Out would read as
+  // "9" in here without the split. Order by operational priority.
   const inOsds = osds.filter((o) => (o.admin_state ?? "in") === "in");
   const drainingOsds = osds.filter((o) => o.admin_state === "draining");
   const outOsds = osds.filter((o) => o.admin_state === "out");
-  // Sort the inventory: In first, Draining next, Out last — matches
-  // the operational priority an operator triaging the host cares about.
-  const orderedOsds = [...inOsds, ...drainingOsds, ...outOsds];
+  const ordered = [...inOsds, ...drainingOsds, ...outOsds];
 
-  // Host-level state summary: the drawer acts on ALL OSDs on the host
-  // at once. Show the most restrictive state (Out > Draining > In) so
-  // the operator can see "at least one OSD is already Out" without
-  // clicking through each row.
-  const effective: OsdAdminState = osds.some((o) => o.admin_state === "out")
+  // The panel acts on every OSD at once, so show the most restrictive
+  // state: an operator needs to see that one OSD is already Out without
+  // opening each row.
+  const effective: OsdAdminState = outOsds.length
     ? "out"
-    : osds.some((o) => o.admin_state === "draining")
+    : drainingOsds.length
       ? "draining"
       : "in";
-  // Sum shards across Draining OSDs so the drawer can render drain
-  // progress. Meta's leader-only observer flips Draining → Out
-  // automatically once a given OSD's count reaches 0.
-  const drainingShardsRemaining = osds
-    .filter((o) => o.admin_state === "draining")
-    .reduce((s, o) => s + (o.shard_count ?? 0), 0);
 
-  const applyToAll = async (target: OsdAdminState) => {
-    setBusy(target);
-    setError(null);
-    try {
-      await Promise.all(
-        osds.map((o) => nodesApi.setAdminState(o.node_id, target)),
-      );
-      onChanged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  };
+  const health =
+    osds.length === 0 ? "neutral" : upCount === osds.length ? "ok" : upCount ? "warn" : "err";
+  const first = osds[0];
 
   return (
-    <>
-      <div className="grid grid-cols-2 gap-3">
-        <StatTile
-          label="Status"
-          value={
-            osds.length === 0
-              ? "–"
-              : effective === "out"
-                ? "Out"
-                : effective === "draining"
-                  ? "Draining"
-                  : allUp
-                    ? "Up / In"
-                    : `${upCount}/${osds.length} Up`
-          }
-          tone={
-            osds.length === 0
-              ? "muted"
-              : effective === "out"
-                ? "warn"
-                : effective === "draining"
-                  ? "warn"
-                  : allUp
-                    ? "good"
-                    : "warn"
-          }
-        />
-        <StatTile
-          label="OSDs"
-          value={
-            outOsds.length + drainingOsds.length === 0
-              ? `${inOsds.length} In`
-              : [
-                  inOsds.length && `${inOsds.length} In`,
-                  drainingOsds.length && `${drainingOsds.length} Drn`,
-                  outOsds.length && `${outOsds.length} Out`,
-                ]
-                  .filter(Boolean)
-                  .join(" · ")
-          }
-          tone="muted"
-        />
+    <aside className="w-full lg:w-80 shrink-0 bg-surface border border-border rounded-card shadow-sm">
+      <div className="flex items-center gap-2 px-3.5 py-2.5 border-b border-border">
+        <Server size={14} className="text-muted shrink-0" />
+        <span className="font-mono text-[13px] font-semibold text-text truncate">{host}</span>
+        <Badge kind={health}>
+          {osds.length === 0
+            ? "No OSDs"
+            : effective === "out"
+              ? "Out"
+              : effective === "draining"
+                ? "Draining"
+                : health === "ok"
+                  ? "Healthy"
+                  : `${upCount}/${osds.length} up`}
+        </Badge>
+        <button
+          onClick={onClose}
+          className="ml-auto p-1 rounded text-faint hover:text-text hover:bg-surface-2"
+          aria-label="Close"
+        >
+          <X size={14} />
+        </button>
       </div>
 
-      <div>
-        <div className="text-[10px] text-muted uppercase tracking-wider mb-1">
-          Storage Utilization
+      <div className="p-3.5 space-y-3.5">
+        <div>
+          <p className="font-display text-[26px] leading-none font-semibold text-text tabular-nums">
+            {formatBytes(used)}{" "}
+            <span className="text-[12px] font-normal text-muted">
+              of {formatBytes(total)} · {pct}%
+            </span>
+          </p>
+          <CapacityBar used={used} total={total} className="mt-2" />
         </div>
-        <CapacityBar used={used} total={total} showLabel layout="stacked" />
-      </div>
 
-      {effective === "draining" && (
-        <DrainProgressPanel
-          drainingShardsRemaining={drainingShardsRemaining}
-          drains={drains}
-          drainingOsdIds={drainingOsds.map((o) => o.node_id)}
-        />
-      )}
+        <dl className="space-y-1.5 text-[11px]">
+          <Field label="Address" value={first?.address} mono />
+          <Field label="Kubernetes node" value={first?.kubernetes_node} mono />
+          <Field
+            label="Path"
+            value={
+              path
+                ? `${path.region} / ${path.zone} / ${path.datacenter} / ${path.rack}`
+                : undefined
+            }
+            mono
+          />
+          <Field label="Admin state" value={effective} mono />
+          <Field label="Shards" value={shards ? shards.toLocaleString() : "0"} />
+        </dl>
 
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="text-[10px] text-muted uppercase tracking-wider">
-            OSD Inventory
-          </div>
-          <div className="text-[10px] text-faint">
-            {orderedOsds.length} total
-          </div>
-        </div>
-        <ul className="space-y-1">
-          {orderedOsds.map((osd) => {
-            const adminState = osd.admin_state ?? "in";
-            const muted = adminState !== "in";
-            const busyFor = busyOsd[osd.node_id];
-            const rowBusy = busyFor !== undefined;
-            return (
-              <li
-                key={osd.node_id}
-                className={`flex items-center justify-between gap-2 border rounded-md px-2 py-1.5 ${
-                  muted
-                    ? "bg-surface-2/50 border-border"
-                    : "bg-surface-2 border-border"
-                }`}
-              >
-                <div className="flex items-center gap-2 min-w-0 flex-1">
-                  <HardDrive
-                    size={12}
-                    className={muted ? "text-faint shrink-0" : "text-faint shrink-0"}
-                  />
-                  <div className="min-w-0">
-                    <div
-                      className={`text-[12px] font-medium truncate ${
-                        muted ? "text-muted" : "text-text"
+        {drainingOsds.length > 0 && (
+          <DrainProgress drains={drains} ids={drainingOsds.map((o) => o.node_id)} />
+        )}
+
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-wider text-muted mb-1.5">
+            OSDs · {upCount} up
+          </p>
+          <ul className="space-y-2">
+            {ordered.map((osd) => {
+              const state = osd.admin_state ?? "in";
+              const busyFor = busyOsd[osd.node_id];
+              // From `in`, "Out" starts a drain — the progress-tracked
+              // path that auto-finalises to Out. Flipping straight to Out
+              // stranded shards waiting on the background rebalancer.
+              const next: OsdAdminState = state === "in" ? "draining" : "in";
+              return (
+                <li key={osd.node_id}>
+                  <div className="flex items-center gap-2">
+                    <HardDrive size={12} className="text-faint shrink-0" />
+                    <span
+                      className={`font-mono text-[12px] truncate ${
+                        state === "in" ? "text-text" : "text-muted"
                       }`}
                     >
                       {osd.pod_name || osd.node_name}
-                    </div>
-                    <div className="text-[10px] text-faint font-mono">
-                      {osd.online ? "up" : "down"} / {adminState}
-                    </div>
+                    </span>
+                    <Badge kind={osd.online && state === "in" ? "ok" : "neutral"}>
+                      {osd.online ? "up" : "down"} / {state}
+                    </Badge>
+                    <span className="ml-auto font-mono text-[11px] text-muted tabular-nums whitespace-nowrap">
+                      {formatBytes(osd.used_capacity)} / {formatBytes(osd.total_capacity)}
+                    </span>
                   </div>
-                </div>
-                <div className="text-[11px] text-muted tabular-nums shrink-0">
-                  {formatBytes(osd.total_capacity)}
-                </div>
-                {/* Per-OSD action: swap to the opposite state. Keep
-                    it compact (one button, not three) since host-level
-                    batch controls below cover the full matrix. */}
-                <OsdRowAction
-                  current={adminState}
-                  busy={busyFor}
-                  disabled={rowBusy || busy !== null}
-                  onToggle={(next) => setOneState(osd.node_id, next)}
-                />
-              </li>
-            );
-          })}
-          {orderedOsds.length === 0 && (
-            <li className="text-[11px] text-faint italic py-2 text-center">
-              No OSDs on this host.
-            </li>
-          )}
-        </ul>
-      </div>
+                  <div className="flex items-center gap-2 mt-1">
+                    <CapacityBar
+                      used={osd.used_capacity}
+                      total={osd.total_capacity}
+                      className="flex-1"
+                    />
+                    <button
+                      disabled={busyFor !== undefined || busy !== null}
+                      onClick={() => void setOneState(osd.node_id, next)}
+                      title={
+                        next === "draining"
+                          ? "Drain, then auto-finalise Out"
+                          : "Return this OSD to placement"
+                      }
+                      className={`font-mono text-[10px] uppercase tracking-wider px-1.5 rounded-[5px]
+                        border disabled:opacity-40 ${
+                          next === "in"
+                            ? "border-ok/30 text-ok hover:bg-ok-soft"
+                            : "border-err/30 text-err hover:bg-err-soft"
+                        }`}
+                    >
+                      {busyFor === next ? "…" : next === "in" ? "in" : "out"}
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+            {ordered.length === 0 && (
+              <li className="text-[11px] text-muted py-1">No OSDs on this host.</li>
+            )}
+          </ul>
+        </div>
 
-      <div>
-        <div className="text-[10px] text-muted uppercase tracking-wider mb-1.5">
-          Host Actions <span className="text-faint normal-case">— all OSDs</span>
+        {error && <Banner kind="err">{error}</Banner>}
+
+        <div className="flex flex-wrap gap-2 pt-1 border-t border-border">
+          {provider?.supports_reboot && (
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Power size={12} />}
+              disabled={busy !== null || osds.length === 0}
+              onClick={() => void reboot()}
+              title={`Recycle via ${provider.provider}`}
+            >
+              {busy === "reboot" ? "Rebooting…" : "Reboot"}
+            </Button>
+          )}
+          {effective === "in" ? (
+            <>
+              <Button
+                size="sm"
+                icon={<Shuffle size={12} />}
+                disabled={busy !== null || osds.length === 0}
+                onClick={() => void applyToAll("draining")}
+              >
+                {busy === "draining" ? "Draining…" : "Drain host"}
+              </Button>
+              <Button
+                size="sm"
+                variant="danger"
+                icon={<Ban size={12} />}
+                disabled={busy !== null || osds.length === 0}
+                onClick={() => void applyToAll("out")}
+              >
+                {busy === "out" ? "Marking…" : "Mark out"}
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              icon={<Power size={12} />}
+              disabled={busy !== null || osds.length === 0}
+              onClick={() => void applyToAll("in")}
+            >
+              {busy === "in" ? "Returning…" : "Mark in"}
+            </Button>
+          )}
         </div>
-        {error && (
-          <div className="mb-2 px-2 py-1 rounded bg-red-50 border border-red-200 text-[11px] text-red-700">
-            {error}
-          </div>
-        )}
-        <div className="grid grid-cols-2 gap-1.5">
-          <HostActionButton
-            icon={Power}
-            label={busy === "reboot" ? "Rebooting…" : "Reboot"}
-            disabled={
-              busy !== null ||
-              osds.length === 0 ||
-              !(provider?.supports_reboot ?? false)
-            }
-            onClick={reboot}
-            title={
-              provider?.supports_reboot
-                ? `Delete the first OSD's pod (${provider.provider})`
-                : "Requires a host provider. Set --host-provider=k8s on the gateway."
-            }
-          />
-          <HostActionButton
-            icon={Shuffle}
-            label={busy === "draining" ? "Draining…" : "Drain"}
-            disabled={busy !== null || effective === "draining" || osds.length === 0}
-            onClick={() => applyToAll("draining")}
-            title="Mark all OSDs on this host as Draining (no new shards; real migration comes in Phase 3)"
-          />
-        </div>
-        <div className="mt-1.5 grid grid-cols-2 gap-1.5">
-          <HostActionButton
-            icon={Ban}
-            label={busy === "out" ? "Marking…" : "Mark Out"}
-            disabled={busy !== null || effective === "out" || osds.length === 0}
-            onClick={() => applyToAll("out")}
-            tone="danger"
-            title="Immediately remove from placement"
-          />
-          <HostActionButton
-            icon={Power}
-            label={busy === "in" ? "Returning…" : "Mark In"}
-            disabled={busy !== null || effective === "in" || osds.length === 0}
-            onClick={() => applyToAll("in")}
-            title="Return to placement"
-          />
-        </div>
-        <p className="mt-2 text-[10px] text-faint">
-          Mark Out / Mark In / Drain persist through Raft. Reboot uses
-          the configured platform provider ({provider?.provider ?? "…"}).
-          Real shard migration for Drain is Phase 3.
-        </p>
       </div>
-    </>
+    </aside>
   );
 }
 
-function StatTile({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: React.ReactNode;
-  tone: "good" | "warn" | "muted";
-}) {
-  const ring =
-    tone === "good"
-      ? "border-emerald-200 bg-emerald-50"
-      : tone === "warn"
-        ? "border-amber-200 bg-amber-50"
-        : "border-border bg-surface-2";
-  const valueColor =
-    tone === "good"
-      ? "text-emerald-700"
-      : tone === "warn"
-        ? "text-amber-700"
-        : "text-text";
+function Field({ label, value, mono }: { label: string; value?: string; mono?: boolean }) {
   return (
-    <div className={`rounded-lg border px-2.5 py-2 ${ring}`}>
-      <div className="text-[10px] text-muted uppercase tracking-wider">
-        {label}
-      </div>
-      <div className={`text-[13px] font-semibold mt-0.5 ${valueColor}`}>
-        {value}
-      </div>
+    <div className="flex items-baseline justify-between gap-3">
+      <dt className="text-muted shrink-0">{label}</dt>
+      <dd className={`text-text-2 truncate text-right ${mono ? "font-mono" : ""}`}>
+        {value || "—"}
+      </dd>
     </div>
   );
 }
 
-/// Cluster-wide rebalance banner. Renders at the top of the Topology
-/// page whenever the reconciler has data — active (drifts being fixed),
-/// paused (red), or idle (subtle grey). Operator can click
-/// Pause/Resume inline without leaving the page.
+/// Cluster-wide rebalancer state. The artboard puts this above the tree
+/// because it explains a host sitting at 82% — without it the skew looks
+/// like a problem rather than something already being worked on.
 function RebalanceBanner({
   status,
   busy,
@@ -978,13 +767,11 @@ function RebalanceBanner({
   busy: boolean;
   onToggle: () => void;
 }) {
-  // PG-era counters fall back to the legacy drift fields when the
-  // server is older. pgs_moved_total wins when present because the
-  // drift rebalancer is disabled in greenfield mode.
+  // PG counters win when present; the drift fields are the fallback for an
+  // older server, where the drift rebalancer is what runs.
   const pgsMoved = status.pgs_moved_total ?? 0;
   const pgCandidates = status.pg_candidates_last_tick ?? 0;
   const pgsScanned = status.pgs_scanned_last_tick ?? 0;
-
   const active =
     !status.paused &&
     (pgCandidates > 0 ||
@@ -993,214 +780,75 @@ function RebalanceBanner({
       pgsMoved > 0 ||
       status.shards_rebalanced_total > 0);
 
-  const tone = status.paused
-    ? "bg-red-50 border-red-200 text-red-800"
-    : active
-      ? "bg-accent-soft border-accent text-accent"
-      : "bg-surface-2 border-border text-text-2";
-
   return (
-    <div
-      className={`mb-3 flex items-center justify-between gap-3 rounded-md border px-3 py-2 ${tone}`}
-    >
-      <div className="flex items-center gap-2 min-w-0 flex-1">
-        <span
-          className={`inline-block w-2 h-2 rounded-full shrink-0 ${
-            status.paused
-              ? "bg-red-500"
-              : active
-                ? "bg-accent animate-pulse"
-                : "bg-faint"
-          }`}
-        />
-        <div className="text-[12px] truncate">
-          <span className="font-semibold mr-2">
-            Rebalancer{" "}
-            {status.paused
-              ? "paused"
-              : active
-                ? "running"
-                : "idle"}
-          </span>
-          <span className="opacity-80">
-            {pgsMoved > 0 ? (
-              <>
-                {pgsMoved.toLocaleString()} PG moves total
-                {pgsScanned > 0 && (
-                  <> · {pgsScanned.toLocaleString()} PGs scanned last tick</>
-                )}
-                {active && pgCandidates > 0 && (
-                  <> · {pgCandidates.toLocaleString()} candidates pending</>
-                )}
-              </>
-            ) : (
-              <>
-                {status.shards_rebalanced_total.toLocaleString()} shards moved total
-                {active && status.drifts_seen_this_pass > 0 && (
-                  <> · {status.drifts_seen_this_pass.toLocaleString()} drifts this pass</>
-                )}
-              </>
-            )}
-          </span>
-        </div>
-      </div>
-      {status.last_error && (
-        <span
-          className="text-[11px] text-red-700 max-w-xs truncate"
-          title={status.last_error}
+    <Banner
+      kind={status.paused ? "err" : active ? "warn" : "info"}
+      className="mb-4"
+      title={`Rebalancer ${status.paused ? "paused" : active ? "running" : "idle"}`}
+      action={
+        <Button
+          size="sm"
+          variant="secondary"
+          icon={status.paused ? <Play size={12} /> : <Pause size={12} />}
+          disabled={busy}
+          onClick={onToggle}
         >
-          err: {status.last_error}
-        </span>
+          {busy ? "…" : status.paused ? "Resume balancer" : "Pause balancer"}
+        </Button>
+      }
+    >
+      {pgsMoved > 0 ? (
+        <>
+          {pgsMoved.toLocaleString()} PG moves total
+          {pgsScanned > 0 && <> · {pgsScanned.toLocaleString()} PGs scanned last tick</>}
+          {active && pgCandidates > 0 && (
+            <> · {pgCandidates.toLocaleString()} candidates pending</>
+          )}
+        </>
+      ) : (
+        <>
+          {status.shards_rebalanced_total.toLocaleString()} shards moved total
+          {active && status.drifts_seen_this_pass > 0 && (
+            <> · {status.drifts_seen_this_pass.toLocaleString()} drifts this pass</>
+          )}
+        </>
       )}
-      <button
-        onClick={onToggle}
-        disabled={busy}
-        className={`shrink-0 text-[11px] font-semibold uppercase tracking-wider border rounded px-2 py-0.5 ${
-          status.paused
-            ? "border-emerald-300 text-emerald-700 hover:bg-emerald-50"
-            : "border-border-strong text-text-2 hover:bg-surface-2"
-        } disabled:opacity-50 disabled:cursor-not-allowed`}
-      >
-        {busy ? "…" : status.paused ? "Resume" : "Pause"}
-      </button>
-    </div>
+      {status.last_error && <> · last error: {status.last_error}</>}
+    </Banner>
   );
 }
 
-/// Progress card for the Draining OSDs on the selected host. Sums
-/// initial/migrated/remaining across every Draining OSD on the host so
-/// a multi-OSD host drains as one visual bar. `last_error` from any
-/// Draining OSD surfaces inline — surfaces real failures instead of
-/// silent stalls.
-function DrainProgressPanel({
-  drainingShardsRemaining,
-  drains,
-  drainingOsdIds,
-}: {
-  drainingShardsRemaining: number;
-  drains: DrainStatus[];
-  drainingOsdIds: string[];
-}) {
-  const ours = drains.filter((d) => drainingOsdIds.includes(d.node_id));
+/// Drain progress for the Draining OSDs on this host, summed so a
+/// multi-OSD host drains as one bar.
+function DrainProgress({ drains, ids }: { drains: DrainStatus[]; ids: string[] }) {
+  const ours = drains.filter((d) => ids.includes(d.node_id));
   const initial = ours.reduce((s, d) => s + d.initial_shards, 0);
   const remaining = ours.reduce((s, d) => s + d.shards_remaining, 0);
   const migrated = ours.reduce((s, d) => s + d.shards_migrated, 0);
-  const pct = initial > 0
-    ? Math.min(100, Math.round(((initial - remaining) / initial) * 100))
-    : 0;
+  const pct = initial > 0 ? Math.min(100, Math.round(((initial - remaining) / initial) * 100)) : 0;
   const lastError = ours.find((d) => d.last_error)?.last_error ?? "";
 
   return (
-    <div className="rounded-md bg-amber-50 border border-amber-200 px-2.5 py-2">
-      <div className="flex items-center justify-between gap-2">
-        <div className="text-[11px] font-semibold text-amber-800">Draining</div>
-        <div className="text-[11px] text-amber-800 tabular-nums">
-          {(initial > 0 ? remaining : drainingShardsRemaining).toLocaleString()}{" "}
-          shards remaining
-        </div>
+    <div className="rounded-card border border-warn/25 bg-warn-soft px-2.5 py-2">
+      <div className="flex items-center justify-between text-[11px] text-warn">
+        <span className="font-medium">Draining</span>
+        <span className="tabular-nums">{remaining.toLocaleString()} shards remaining</span>
       </div>
       {initial > 0 && (
         <>
-          <div className="mt-1.5 h-1.5 bg-amber-100 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-amber-500 rounded-full transition-all"
-              style={{ width: `${pct}%` }}
-            />
+          <div className="mt-1.5 h-1.5 rounded-full bg-surface-2 overflow-hidden">
+            <div className="h-full rounded-full bg-warn-dot" style={{ width: `${pct}%` }} />
           </div>
-          <div className="mt-1 flex items-center justify-between text-[10px] text-amber-800/90 tabular-nums">
-            <span>
-              {migrated.toLocaleString()} of {initial.toLocaleString()} migrated
-            </span>
-            <span>{pct}%</span>
-          </div>
+          <p className="mt-1 text-[10px] text-warn tabular-nums">
+            {migrated.toLocaleString()} of {initial.toLocaleString()} migrated · {pct}%
+          </p>
         </>
       )}
-      {lastError && (
-        <p className="mt-1.5 text-[10px] text-red-700 truncate" title={lastError}>
-          last error: {lastError}
-        </p>
-      )}
-      <p className="mt-1.5 text-[10px] text-amber-700/80">
-        Meta leader migrates one shard per OSD every 30 s. When the count
-        hits zero the OSD auto-finalises to Out.
+      {lastError && <p className="mt-1 text-[10px] text-err truncate">{lastError}</p>}
+      <p className="mt-1.5 text-[10px] text-warn/80">
+        The meta leader migrates one shard per OSD every 30s; at zero the OSD
+        finalises to Out on its own.
       </p>
     </div>
-  );
-}
-
-/// Single compact action on an OSD row: flips between participating
-/// and evacuating. From `in`, clicking "Out" triggers a **drain**
-/// — the fast, progress-tracked evacuation path that auto-finalizes
-/// to Out once shards reach zero. Flipping directly to Out (without
-/// drain) left shards stranded on the OSD waiting for the slower
-/// background rebalancer, which confused operators expecting the
-/// click to actually take the OSD out of service.
-///
-/// From `out` or `draining`, the action is "In" (return to placement,
-/// cancelling any in-flight drain).
-function OsdRowAction({
-  current,
-  busy,
-  disabled,
-  onToggle,
-}: {
-  current: OsdAdminState;
-  busy: OsdAdminState | undefined;
-  disabled: boolean;
-  onToggle: (next: OsdAdminState) => void;
-}) {
-  // `in` → kick off a drain; every other state → return to placement.
-  const next: OsdAdminState = current === "in" ? "draining" : "in";
-  const labelBase = next === "in" ? "In" : "Out";
-  const label = busy === next ? "…" : labelBase;
-  const tone =
-    next === "in"
-      ? "border-emerald-200 text-emerald-700 hover:bg-emerald-50"
-      : "border-red-200 text-red-600 hover:bg-red-50";
-  return (
-    <button
-      disabled={disabled}
-      onClick={() => onToggle(next)}
-      title={
-        next === "draining"
-          ? "Drain + auto-finalize Out (evacuates shards, shows progress)"
-          : "Return this OSD to placement"
-      }
-      className={`text-[10px] font-semibold uppercase tracking-wider border rounded px-1.5 py-0.5 shrink-0 w-9 text-center ${tone} disabled:opacity-40 disabled:cursor-not-allowed`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function HostActionButton({
-  icon: Icon,
-  label,
-  disabled,
-  tone = "default",
-  onClick,
-  title,
-}: {
-  icon: typeof Power;
-  label: string;
-  disabled?: boolean;
-  tone?: "default" | "danger";
-  onClick?: () => void;
-  title?: string;
-}) {
-  const palette =
-    tone === "danger"
-      ? "border-red-200 text-red-600 bg-red-50/30 hover:bg-red-50"
-      : "border-border text-text-2 hover:bg-surface-2";
-  return (
-    <button
-      disabled={disabled}
-      onClick={onClick}
-      title={title}
-      className={`w-full flex items-center justify-center gap-1.5 border rounded-md px-2 py-1.5 text-[11px] font-medium ${palette} disabled:opacity-50 disabled:cursor-not-allowed`}
-    >
-      <Icon size={12} />
-      {label}
-    </button>
   );
 }
