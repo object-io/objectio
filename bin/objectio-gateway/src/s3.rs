@@ -1343,6 +1343,10 @@ pub async fn create_bucket(
         .await
     {
         Ok(_) => {
+            // The authorization chain caches bucket tenant and owner; drop any
+            // entry so the next request reads the newly recorded values rather
+            // than anything stale.
+            state.policy_cache.invalidate(&bucket);
             // If object lock requested, enable versioning and lock config
             if enable_lock {
                 let _ = client

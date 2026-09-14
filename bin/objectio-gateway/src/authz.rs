@@ -363,22 +363,21 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         }
     };
 
-    let (owner, tenant) = match client
+    let (owner, tenant, found) = match client
         .get_bucket(GetBucketRequest {
             name: bucket.to_string(),
         })
         .await
     {
-        Ok(response) => response
-            .into_inner()
-            .bucket
-            .map(|b| (b.owner, b.tenant))
-            .unwrap_or_default(),
+        Ok(response) => match response.into_inner().bucket {
+            Some(b) => (b.owner, b.tenant, true),
+            None => (String::new(), String::new(), false),
+        },
         Err(e) => {
             if e.code() != tonic::Code::NotFound {
                 error!("Failed to fetch bucket meta for {bucket}: {e}");
             }
-            (String::new(), String::new())
+            (String::new(), String::new(), false)
         }
     };
 
@@ -388,7 +387,17 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         tenant,
         cached_at: Instant::now(),
     };
-    state.policy_cache.put_bucket(bucket, entry.clone());
+
+    // Only cache a bucket we actually read. `CreateBucket` is authorized
+    // *before* the bucket exists, so caching the miss would leave a
+    // tenant-less, owner-less entry standing for the whole TTL — and during
+    // that window the tenant gate sees no tenant to compare and the ownership
+    // fallback sees no owner, so a freshly created bucket would be reachable
+    // by anyone. A miss from a degraded meta read is left uncached for the
+    // same reason.
+    if found {
+        state.policy_cache.put_bucket(bucket, entry.clone());
+    }
     entry
 }
 
@@ -949,6 +958,32 @@ mod tests {
         let expired = AuthzCache::new(0);
         expired.put_bucket("b", empty_entry());
         assert!(expired.bucket("b").is_none());
+    }
+
+    /// `CreateBucket` is authorized before the bucket exists. If that miss were
+    /// cached, the entry would carry no tenant and no owner for the whole TTL,
+    /// and during that window the tenant gate would find nothing to compare
+    /// and the ownership fallback nothing to match — leaving a freshly created
+    /// bucket open to anyone. Caching only happens on a real read, so an
+    /// absent bucket must leave the cache untouched.
+    #[test]
+    fn a_missing_bucket_is_never_cached() {
+        let cache = AuthzCache::new(60);
+        assert!(cache.bucket("brand-new").is_none());
+        // Whatever a miss produced, nothing was stored for it.
+        assert!(cache.bucket("brand-new").is_none());
+
+        // A real read is cached, and carries the tenant the gate compares.
+        cache.put_bucket(
+            "brand-new",
+            BucketEntry {
+                policy: None,
+                owner: "u1".to_string(),
+                tenant: "globex".to_string(),
+                cached_at: Instant::now(),
+            },
+        );
+        assert_eq!(cache.bucket("brand-new").unwrap().tenant, "globex");
     }
 
     #[test]
