@@ -150,19 +150,42 @@ impl OidcProvider {
         );
 
         debug!("Fetching OIDC discovery from {}", discovery_url);
-        let discovery: OidcDiscovery = self
+        let response = self
             .http_client
             .get(&discovery_url)
             .send()
             .await
             .map_err(|e| {
-                AuthProviderError::ProviderUnavailable(format!("OIDC discovery failed: {e}"))
-            })?
-            .json()
-            .await
-            .map_err(|e| {
-                AuthProviderError::ConfigurationError(format!("Invalid OIDC discovery: {e}"))
+                AuthProviderError::ProviderUnavailable(format!(
+                    "OIDC discovery request to {discovery_url} failed: {e}"
+                ))
             })?;
+
+        // Check the status before decoding. Providers answer a bad issuer with
+        // a JSON *error* document and a 4xx — feeding that straight to the
+        // discovery deserializer reports "error decoding response body" and
+        // throws away the one thing that says what is wrong (Entra, for
+        // example, returns "AADSTS90002: Tenant 'x' not found").
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(400).collect();
+            return Err(AuthProviderError::ConfigurationError(format!(
+                "OIDC discovery at {discovery_url} returned HTTP {status}: {snippet}"
+            )));
+        }
+
+        let body = response.text().await.map_err(|e| {
+            AuthProviderError::ProviderUnavailable(format!(
+                "OIDC discovery at {discovery_url} returned an unreadable body: {e}"
+            ))
+        })?;
+        let discovery: OidcDiscovery = serde_json::from_str(&body).map_err(|e| {
+            let snippet: String = body.chars().take(400).collect();
+            AuthProviderError::ConfigurationError(format!(
+                "OIDC discovery at {discovery_url} is not a valid discovery document: {e};                  body began: {snippet}"
+            ))
+        })?;
 
         *self.discovery_cache.write() = Some(DiscoveryCache {
             jwks_uri: discovery.jwks_uri.clone(),

@@ -782,7 +782,17 @@ pub async fn oidc_authorize(
         Ok(ep) => ep,
         Err(e) => {
             warn!("Failed to resolve OIDC authorization endpoint: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "OIDC discovery failed").into_response();
+            // Return the detail rather than a bare "discovery failed". This is
+            // reached by an operator who has just configured a provider, and
+            // the useful part — the provider's own rejection, e.g. a tenant
+            // that does not exist — is otherwise only visible in the gateway
+            // log. The discovery URL is the configured issuer, which is sent
+            // to the browser in the redirect anyway.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("OIDC discovery failed: {e}"),
+            )
+                .into_response();
         }
     };
 
