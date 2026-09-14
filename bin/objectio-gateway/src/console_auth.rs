@@ -17,7 +17,7 @@ use objectio_proto::metadata::GetAccessKeyForAuthRequest;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::s3::AppState;
 
@@ -71,6 +71,224 @@ fn build_oidc_provider_from_config(
             scopes,
         },
     ))
+}
+
+/// Default storage quota given to a tenant that registers itself through a
+/// multi-tenant provider. Self-registration is open by design, so the default
+/// is a modest allowance rather than unlimited; an operator raises it per
+/// tenant afterwards.
+pub const DEFAULT_SELF_REGISTERED_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Tenancy behavior for one OIDC provider, read from its stored config.
+#[derive(Debug, Clone)]
+pub struct ProviderTenancy {
+    /// True when the provider federates many upstream tenants (Entra
+    /// `common` / `organizations`). Each upstream tenant then gets its own
+    /// ObjectIO tenant, created on first login.
+    pub multi_tenant: bool,
+    /// Role/group claim value that makes a user an admin of their tenant.
+    /// Empty means nobody is promoted and only the system admin can manage it.
+    pub tenant_admin_role: String,
+    /// Quota applied to a self-registered tenant.
+    pub quota_bytes: u64,
+    /// Upstream tenant ids permitted to self-register. Empty means open —
+    /// any upstream tenant may register, which is what `common` implies.
+    pub allowed_tids: Vec<String>,
+}
+
+impl ProviderTenancy {
+    /// Read the tenancy settings out of a stored provider config document.
+    #[must_use]
+    pub fn from_config(config: &serde_json::Value) -> Self {
+        Self {
+            multi_tenant: config
+                .get("tenancy")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("multi")),
+            tenant_admin_role: config
+                .get("tenant_admin_role")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            quota_bytes: config
+                .get("tenant_quota_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_SELF_REGISTERED_QUOTA_BYTES),
+            allowed_tids: config
+                .get("allowed_tids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// May this upstream tenant register? Open unless an allowlist is set.
+    #[must_use]
+    pub fn admits(&self, tid: &str) -> bool {
+        self.allowed_tids.is_empty() || self.allowed_tids.iter().any(|t| t == tid)
+    }
+}
+
+/// Label under which a tenant records the upstream tenant it belongs to.
+///
+/// The mapping is keyed on the upstream `tid` rather than a domain because a
+/// domain can be added to or removed from an Entra tenant, while `tid` is
+/// immutable — keying on the name would break the moment a customer changes
+/// their vanity domain.
+pub const OIDC_TID_LABEL: &str = "oidc_tid";
+
+/// Derive a tenant name from an upstream identity.
+///
+/// Prefers the domain part of the user's sign-in name, which is readable and
+/// stable enough for display, and falls back to the tid. The name is only an
+/// identifier for humans; lookup always goes through [`OIDC_TID_LABEL`].
+#[must_use]
+pub fn derive_tenant_name(upstream_user: &str, tid: &str) -> String {
+    let candidate = upstream_user
+        .rsplit('@')
+        .next()
+        .filter(|d| !d.is_empty() && d.contains('.'))
+        .unwrap_or(tid);
+    let cleaned: String = candidate
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        tid.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Find, or self-register, the ObjectIO tenant for an upstream tenant id.
+///
+/// Returns the tenant name, or an error string suitable for showing the user.
+/// A tenant is created only when the provider is multi-tenant and the upstream
+/// tenant is admitted; it starts enabled, with the provider's quota, and
+/// carries the upstream id in [`OIDC_TID_LABEL`] so later logins find it again
+/// even if it is renamed.
+pub async fn resolve_or_register_tenant(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    tenancy: &ProviderTenancy,
+    provider_name: &str,
+    tid: &str,
+    upstream_user: &str,
+) -> Result<String, String> {
+    if !tenancy.admits(tid) {
+        return Err(format!(
+            "upstream tenant {tid} is not permitted to register"
+        ));
+    }
+
+    let existing = meta
+        .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
+        .await
+        .map_err(|e| format!("tenant lookup failed: {e}"))?
+        .into_inner()
+        .tenants;
+
+    // Match on the immutable upstream id, never the name.
+    if let Some(t) = existing
+        .iter()
+        .find(|t| t.labels.get(OIDC_TID_LABEL).is_some_and(|v| v == tid))
+    {
+        return Ok(t.name.clone());
+    }
+
+    // Pick a free name. The derived one is for humans; collisions just get a
+    // suffix rather than failing a login.
+    let base = derive_tenant_name(upstream_user, tid);
+    let mut name = base.clone();
+    if existing.iter().any(|t| t.name == name) {
+        name = format!("{base}-{}", &tid[..8.min(tid.len())]);
+    }
+
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(OIDC_TID_LABEL.to_string(), tid.to_string());
+    labels.insert("oidc_provider".to_string(), provider_name.to_string());
+
+    let tenant = objectio_proto::metadata::TenantConfig {
+        name: name.clone(),
+        display_name: base,
+        oidc_provider: provider_name.to_string(),
+        quota_bytes: tenancy.quota_bytes,
+        enabled: true,
+        labels,
+        ..Default::default()
+    };
+
+    meta.create_tenant(objectio_proto::metadata::CreateTenantRequest {
+        tenant: Some(tenant),
+    })
+    .await
+    .map_err(|e| format!("could not register tenant: {e}"))?;
+
+    info!(
+        "self-registered tenant '{name}' for upstream tid={tid} via provider '{provider_name}' \
+         (quota {} bytes)",
+        tenancy.quota_bytes
+    );
+    Ok(name)
+}
+
+/// Add a user to their tenant's admin list when their token carries the
+/// provider's configured admin role.
+///
+/// Control therefore sits in the customer's own identity provider: their
+/// administrators decide who administers their ObjectIO tenant, and we do not
+/// have to guess from login order.
+pub async fn apply_tenant_admin_role(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    tenancy: &ProviderTenancy,
+    tenant_name: &str,
+    user_arn: &str,
+    roles: &[String],
+) {
+    if tenancy.tenant_admin_role.is_empty()
+        || !roles.iter().any(|r| r == &tenancy.tenant_admin_role)
+    {
+        return;
+    }
+    let Ok(resp) = meta
+        .get_tenant(objectio_proto::metadata::GetTenantRequest {
+            name: tenant_name.to_string(),
+        })
+        .await
+    else {
+        return;
+    };
+    let inner = resp.into_inner();
+    let Some(mut tenant) = inner.tenant.filter(|_| inner.found) else {
+        return;
+    };
+    if tenant.admin_users.iter().any(|a| a == user_arn) {
+        return;
+    }
+    tenant.admin_users.push(user_arn.to_string());
+    if let Err(e) = meta
+        .update_tenant(objectio_proto::metadata::UpdateTenantRequest {
+            tenant: Some(tenant),
+        })
+        .await
+    {
+        warn!("could not promote {user_arn} to admin of '{tenant_name}': {e}");
+    } else {
+        info!("promoted {user_arn} to tenant admin of '{tenant_name}' via role claim");
+    }
 }
 
 /// Which console surface a request belongs to.
@@ -940,7 +1158,8 @@ pub async fn oidc_callback(
     // the provider's `system_admin` flag — when true, a user
     // authenticated through this provider lands on the system-admin
     // console even if no tenant maps to the provider.
-    let (oidc, provider_is_system_admin) = if !provider_name.is_empty() && provider_name != "system"
+    let (oidc, provider_is_system_admin, tenancy) = if !provider_name.is_empty()
+        && provider_name != "system"
     {
         let mut client = state.meta_client.clone();
         let config_key = format!("identity/openid/{provider_name}");
@@ -957,8 +1176,12 @@ pub async fn oidc_callback(
                     .and_then(|c| c.get("system_admin"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let tenancy = config_json
+                    .as_ref()
+                    .map(ProviderTenancy::from_config)
+                    .unwrap_or_else(|| ProviderTenancy::from_config(&serde_json::json!({})));
                 match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
-                    Some(p) => (p, system_admin),
+                    Some(p) => (p, system_admin, tenancy),
                     None => {
                         return Response::builder()
                             .status(StatusCode::FOUND)
@@ -980,7 +1203,13 @@ pub async fn oidc_callback(
         // Global provider from --oidc-* CLI args is implicitly
         // system-admin scoped.
         match state.oidc_provider.as_ref() {
-            Some(p) => ((**p).clone(), true),
+            // A provider configured from CLI flags has no stored document, so
+            // it is single-tenant with no self-registration.
+            Some(p) => (
+                (**p).clone(),
+                true,
+                ProviderTenancy::from_config(&serde_json::json!({})),
+            ),
             None => {
                 return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
             }
@@ -1011,7 +1240,7 @@ pub async fn oidc_callback(
         .as_deref()
         .unwrap_or(&token_resp.access_token);
 
-    let (user_id, _groups) = match oidc.validate_token(token_to_validate).await {
+    let (user_id, groups, upstream_tid) = match oidc.validate_token(token_to_validate).await {
         Ok(claims) => {
             let sub = claims
                 .extra
@@ -1021,7 +1250,10 @@ pub async fn oidc_callback(
                 .unwrap_or(&claims.sub)
                 .to_string();
             let groups = oidc.extract_groups(&claims);
-            (sub, groups)
+            // Present on Entra tokens; absent elsewhere, in which case there
+            // is no upstream tenant to key self-registration on.
+            let tid = objectio_auth::OidcProvider::tenant_id(&claims);
+            (sub, groups, tid)
         }
         Err(e) => {
             warn!("OIDC token validation failed: {e}");
@@ -1040,8 +1272,45 @@ pub async fn oidc_callback(
     // system-admin SSO" checkbox on the Identity page.
     let tenant = if !tenant_from_state.is_empty() {
         tenant_from_state
+    } else if tenancy.multi_tenant && !provider_name.is_empty() && provider_name != "system" {
+        // Multi-tenant provider: the ObjectIO tenant follows the *upstream*
+        // tenant the user signed in from, and is created on first contact.
+        // Without a `tid` there is nothing to key on, so the login is refused
+        // rather than silently landing everyone in one shared tenant.
+        let Some(tid) = upstream_tid.clone() else {
+            warn!(
+                "provider '{provider_name}' is multi-tenant but the token carries no \
+                 usable tid — login denied"
+            );
+            return Response::builder()
+                .status(StatusCode::FOUND)
+                .header(
+                    header::LOCATION,
+                    "/_console/?error=Token+has+no+tenant+claim",
+                )
+                .body(axum::body::Body::empty())
+                .unwrap();
+        };
+        let mut t_client = state.meta_client.clone();
+        match resolve_or_register_tenant(&mut t_client, &tenancy, &provider_name, &tid, &user_id)
+            .await
+        {
+            Ok(name) => name,
+            Err(e) => {
+                warn!("tenant self-registration failed for tid={tid}: {e}");
+                return Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(
+                        header::LOCATION,
+                        format!("/_console/?error={}", urlencoding::encode(&e)),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+        }
     } else if !provider_name.is_empty() && provider_name != "system" {
-        // Look up all tenants to find which one uses this provider
+        // Single-tenant provider: exactly one tenant is bound to it, and
+        // nothing is created automatically.
         let mut t_client = state.meta_client.clone();
         let resolved = if let Ok(resp) = t_client
             .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
@@ -1122,6 +1391,15 @@ pub async fn oidc_callback(
             }
         }
     };
+
+    // Promote to tenant admin when the token carries the provider's configured
+    // admin role. Done after provisioning so the ARN exists, and on every
+    // login so a change in the customer's IdP takes effect on their next
+    // sign-in rather than needing us to touch anything.
+    if !tenant.is_empty() {
+        let user_arn = format!("arn:objectio:iam::{tenant}:user/{user_id}");
+        apply_tenant_admin_role(&mut meta, &tenancy, &tenant, &user_arn, &groups).await;
+    }
 
     // Per-listener audience gate (mirror of the AK/SK login gate in
     // `console_login`). The redirect-based OIDC flow can land on
@@ -1245,5 +1523,79 @@ mod audience_tests {
             console_audience("/_console/admin/x", Some(ListenerKind::Legacy)),
             ConsoleAudience::Ops
         );
+    }
+}
+
+#[cfg(test)]
+mod tenancy_tests {
+    use super::*;
+
+    #[test]
+    fn tenancy_defaults_to_single_with_a_2gb_allowance() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({}));
+        assert!(
+            !t.multi_tenant,
+            "a provider is single-tenant unless it says otherwise"
+        );
+        assert_eq!(t.quota_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(t.tenant_admin_role.is_empty());
+        // No allowlist means open registration, which is what `common` implies.
+        assert!(t.allowed_tids.is_empty());
+        assert!(t.admits("any-tid"));
+    }
+
+    #[test]
+    fn multi_tenant_is_opt_in_and_case_insensitive() {
+        assert!(
+            ProviderTenancy::from_config(&serde_json::json!({"tenancy": "multi"})).multi_tenant
+        );
+        assert!(
+            ProviderTenancy::from_config(&serde_json::json!({"tenancy": "MULTI"})).multi_tenant
+        );
+        assert!(
+            !ProviderTenancy::from_config(&serde_json::json!({"tenancy": "single"})).multi_tenant
+        );
+    }
+
+    #[test]
+    fn an_allowlist_closes_registration_to_everyone_else() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({
+            "tenancy": "multi",
+            "allowed_tids": ["aaa", "bbb"]
+        }));
+        assert!(t.admits("aaa"));
+        assert!(!t.admits("ccc"));
+    }
+
+    #[test]
+    fn quota_is_configurable_per_provider() {
+        let t = ProviderTenancy::from_config(&serde_json::json!({"tenant_quota_bytes": 5000}));
+        assert_eq!(t.quota_bytes, 5000);
+        // Explicit zero means unlimited, and must not be read as "unset".
+        let t = ProviderTenancy::from_config(&serde_json::json!({"tenant_quota_bytes": 0}));
+        assert_eq!(t.quota_bytes, 0);
+    }
+
+    #[test]
+    fn tenant_name_comes_from_the_sign_in_domain() {
+        assert_eq!(derive_tenant_name("alice@acme.com", "TID"), "acme.com");
+        assert_eq!(
+            derive_tenant_name("bob@sub.example.co.uk", "TID"),
+            "sub.example.co.uk"
+        );
+    }
+
+    #[test]
+    fn tenant_name_falls_back_to_the_tid_when_there_is_no_domain() {
+        // No domain at all, or something that is not domain-shaped.
+        assert_eq!(derive_tenant_name("alice", "the-tid"), "the-tid");
+        assert_eq!(derive_tenant_name("alice@localhost", "the-tid"), "the-tid");
+    }
+
+    #[test]
+    fn tenant_name_is_sanitised() {
+        // Whatever the IdP sends, the name stays to a safe character set.
+        assert_eq!(derive_tenant_name("a@AC ME.com", "t"), "ac-me.com");
+        assert_eq!(derive_tenant_name("a@ac/me.com", "t"), "ac-me.com");
     }
 }
