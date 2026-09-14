@@ -215,7 +215,7 @@ impl<'de> Deserialize<'de> for Principal {
             type Value = Principal;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("\"*\" or {\"OBIO\": [...]}")
+                formatter.write_str("\"*\" or {\"AWS\": [...]} or {\"OBIO\": [...]}")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Principal, E>
@@ -239,7 +239,12 @@ impl<'de> Deserialize<'de> for Principal {
                 let mut obio_principals: Option<Vec<String>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
-                    if key == "OBIO" {
+                    // `AWS` is the spelling every S3 tool, tutorial and
+                    // generated policy uses. Accepting only `OBIO` meant an
+                    // otherwise-correct policy failed to parse, and a policy
+                    // that fails to parse is treated as no policy at all — so
+                    // the grant silently did nothing.
+                    if key == "OBIO" || key == "AWS" {
                         // OBIO can be "*", a single string, or an array
                         let value: serde_json::Value = map.next_value()?;
                         match value {
@@ -274,7 +279,7 @@ impl<'de> Deserialize<'de> for Principal {
 
                 obio_principals
                     .map(Principal::OBIO)
-                    .ok_or_else(|| de::Error::custom("missing OBIO key in principal"))
+                    .ok_or_else(|| de::Error::custom("principal needs an \"AWS\" or \"OBIO\" key"))
             }
         }
 
@@ -1525,5 +1530,74 @@ mod tests {
         // Exact IP match (no prefix)
         assert!(evaluator.ip_matches_cidr(&"10.0.0.1".parse().unwrap(), "10.0.0.1"));
         assert!(!evaluator.ip_matches_cidr(&"10.0.0.2".parse().unwrap(), "10.0.0.1"));
+    }
+}
+
+#[cfg(test)]
+mod principal_spelling_tests {
+    use super::*;
+
+    /// `AWS` is what every S3 tool and tutorial emits. Rejecting it made the
+    /// whole policy fail to parse, and an unparseable policy is treated as no
+    /// policy — so the grant silently did nothing.
+    #[test]
+    fn aws_principal_is_accepted() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow",
+            "Principal":{"AWS":["arn:objectio:iam::user/bot"]},
+            "Action":["s3:GetObject"],
+            "Resource":["arn:obio:s3:::b/*"]}]}"#;
+        let p = BucketPolicy::from_json(json).expect("AWS principal must parse");
+        match &p.statements[0].principal {
+            Principal::OBIO(v) => assert_eq!(v, &["arn:objectio:iam::user/bot"]),
+            other => panic!("expected specific principals, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn obio_spelling_still_works() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow",
+            "Principal":{"OBIO":["arn:objectio:iam::user/bot"]},
+            "Action":["s3:GetObject"],
+            "Resource":["arn:obio:s3:::b/*"]}]}"#;
+        assert!(BucketPolicy::from_json(json).is_ok());
+    }
+
+    #[test]
+    fn an_aws_principal_actually_grants() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow",
+            "Principal":{"AWS":["arn:objectio:iam::user/bot"]},
+            "Action":["s3:GetObject"],
+            "Resource":["arn:obio:s3:::b/*"]}]}"#;
+        let policy = BucketPolicy::from_json(json).unwrap();
+        let ctx = RequestContext::new(
+            "arn:objectio:iam::user/bot",
+            "s3:GetObject",
+            "arn:obio:s3:::b/k",
+        );
+        assert_eq!(
+            PolicyEvaluator::new().evaluate(&policy, &ctx),
+            PolicyDecision::Allow
+        );
+        // A different user is not covered by it.
+        let other = RequestContext::new(
+            "arn:objectio:iam::user/someone-else",
+            "s3:GetObject",
+            "arn:obio:s3:::b/k",
+        );
+        assert_eq!(
+            PolicyEvaluator::new().evaluate(&policy, &other),
+            PolicyDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn a_principal_with_no_recognised_key_is_still_an_error() {
+        let json = r#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Allow","Principal":{"Nonsense":["x"]},
+            "Action":["s3:GetObject"],"Resource":["arn:obio:s3:::b/*"]}]}"#;
+        assert!(BucketPolicy::from_json(json).is_err());
     }
 }

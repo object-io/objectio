@@ -18,7 +18,10 @@ use axum::{
 };
 use base64::Engine;
 use bytes::Bytes;
-use objectio_auth::{AuthResult, policy::PolicyEvaluator};
+use objectio_auth::{
+    AuthResult,
+    policy::{BucketPolicy, PolicyEvaluator},
+};
 use objectio_common::ErasureConfig;
 use objectio_erasure::{
     ErasureCodec,
@@ -4164,6 +4167,18 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
         return S3Error::xml_response(
             "MalformedPolicy",
             "The policy is not valid JSON",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    // Valid JSON is not enough: a document that is not a valid *policy* parses
+    // as nothing at authorization time, and the bucket then behaves as though
+    // no policy were set — a grant that silently does nothing, visible only as
+    // a log line. Reject it here instead.
+    if let Err(e) = BucketPolicy::from_json(&policy_json) {
+        return S3Error::xml_response(
+            "MalformedPolicy",
+            &format!("The policy is not a valid bucket policy: {e}"),
             StatusCode::BAD_REQUEST,
         );
     }
