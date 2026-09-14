@@ -300,6 +300,36 @@ pub struct EnabledParams {
     pub purpose: String,
 }
 
+/// Base path of a console surface, with a trailing slash.
+///
+/// Every redirect out of the OIDC flow has to land on a real surface. There is
+/// no bundle at `/_console/` — the build produces the operator and tenant
+/// bundles only — so sending anyone there yields a blank page.
+#[must_use]
+pub fn console_base(audience: ConsoleAudience) -> &'static str {
+    match audience {
+        ConsoleAudience::Tenant => "/_console/tenant/",
+        // An unscoped request has no surface of its own; the operator console
+        // is the safe landing place, and a tenant session that reaches it is
+        // refused by the audience gate rather than silently accepted.
+        ConsoleAudience::Ops | ConsoleAudience::Unscoped => "/_console/admin/",
+    }
+}
+
+/// Where a completed login should land, given the tenant it resolved to.
+///
+/// Driven by the session that was actually minted rather than by where the
+/// flow began: a tenant login belongs on the tenant console even if it was
+/// started from an operator URL, and vice versa.
+#[must_use]
+pub fn landing_for_tenant(tenant: &str) -> &'static str {
+    if tenant.is_empty() {
+        "/_console/admin/"
+    } else {
+        "/_console/tenant/"
+    }
+}
+
 /// Which console surface a request belongs to.
 ///
 /// Two signals can say this now. A dedicated listener carries a
@@ -1119,6 +1149,11 @@ pub async fn oidc_authorize(
 /// Callback query params from OIDC provider
 #[derive(Deserialize)]
 pub struct OidcCallbackParams {
+    /// Absent when the provider is reporting a failure rather than returning a
+    /// grant — a cancelled consent screen sends `error` and no `code`. Required
+    /// here, that made the whole request fail to deserialize with a 400 and a
+    /// serde message, so the error branch below could never run.
+    #[serde(default)]
     pub code: String,
     #[serde(default)]
     pub state: String,
@@ -1135,6 +1170,33 @@ pub async fn oidc_callback(
     headers: HeaderMap,
     Query(params): Query<OidcCallbackParams>,
 ) -> Response {
+    // The provider redirects to one fixed callback regardless of which console
+    // the user started on, so the surface is recovered from the Referer. Every
+    // error below returns them to where they came from instead of a path that
+    // serves nothing.
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let base = console_base(console_audience(referer, listener.as_ref().map(|l| l.0)));
+
+    // A callback with neither a grant nor an error is not something we can
+    // act on; say so rather than attempting an exchange with an empty code.
+    if params.code.is_empty() && params.error.is_none() {
+        warn!("OIDC callback carried neither code nor error");
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(
+                header::LOCATION,
+                format!(
+                    "{base}?error={}",
+                    urlencoding::encode("Sign-in did not return a result")
+                ),
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     // Check for error from provider
     if let Some(ref err) = params.error {
         warn!(
@@ -1146,7 +1208,7 @@ pub async fn oidc_callback(
             .header(
                 header::LOCATION,
                 format!(
-                    "/_console/?error={}",
+                    "{base}?error={}",
                     urlencoding::encode(params.error_description.as_deref().unwrap_or(err))
                 ),
             )
@@ -1170,7 +1232,7 @@ pub async fn oidc_callback(
         warn!("OIDC callback: state mismatch");
         return Response::builder()
             .status(StatusCode::FOUND)
-            .header(header::LOCATION, "/_console/?error=Invalid+state")
+            .header(header::LOCATION, format!("{base}?error=Invalid+state"))
             .body(axum::body::Body::empty())
             .unwrap();
     }
@@ -1184,63 +1246,65 @@ pub async fn oidc_callback(
     // the provider's `system_admin` flag — when true, a user
     // authenticated through this provider lands on the system-admin
     // console even if no tenant maps to the provider.
-    let (oidc, provider_is_system_admin, tenancy) = if !provider_name.is_empty()
-        && provider_name != "system"
-    {
-        let mut client = state.meta_client.clone();
-        let config_key = format!("identity/openid/{provider_name}");
-        match client
-            .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
-            .await
-        {
-            Ok(resp) => {
-                let entry = resp.into_inner().entry.unwrap_or_default();
-                let config_json: Option<serde_json::Value> =
-                    serde_json::from_slice(&entry.value).ok();
-                let system_admin = config_json
-                    .as_ref()
-                    .and_then(|c| c.get("system_admin"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let tenancy = config_json
-                    .as_ref()
-                    .map(ProviderTenancy::from_config)
-                    .unwrap_or_else(|| ProviderTenancy::from_config(&serde_json::json!({})));
-                match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
-                    Some(p) => (p, system_admin, tenancy),
-                    None => {
-                        return Response::builder()
-                            .status(StatusCode::FOUND)
-                            .header(header::LOCATION, "/_console/?error=Invalid+provider+config")
-                            .body(axum::body::Body::empty())
-                            .unwrap();
+    let (oidc, provider_is_system_admin, tenancy) =
+        if !provider_name.is_empty() && provider_name != "system" {
+            let mut client = state.meta_client.clone();
+            let config_key = format!("identity/openid/{provider_name}");
+            match client
+                .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
+                .await
+            {
+                Ok(resp) => {
+                    let entry = resp.into_inner().entry.unwrap_or_default();
+                    let config_json: Option<serde_json::Value> =
+                        serde_json::from_slice(&entry.value).ok();
+                    let system_admin = config_json
+                        .as_ref()
+                        .and_then(|c| c.get("system_admin"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let tenancy = config_json
+                        .as_ref()
+                        .map(ProviderTenancy::from_config)
+                        .unwrap_or_else(|| ProviderTenancy::from_config(&serde_json::json!({})));
+                    match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
+                        Some(p) => (p, system_admin, tenancy),
+                        None => {
+                            return Response::builder()
+                                .status(StatusCode::FOUND)
+                                .header(
+                                    header::LOCATION,
+                                    format!("{base}?error=Invalid+provider+config"),
+                                )
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
                     }
                 }
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, format!("{base}?error=Provider+not+found"))
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
             }
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(header::LOCATION, "/_console/?error=Provider+not+found")
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+        } else {
+            // Global provider from --oidc-* CLI args is implicitly
+            // system-admin scoped.
+            match state.oidc_provider.as_ref() {
+                // A provider configured from CLI flags has no stored document, so
+                // it is single-tenant with no self-registration.
+                Some(p) => (
+                    (**p).clone(),
+                    true,
+                    ProviderTenancy::from_config(&serde_json::json!({})),
+                ),
+                None => {
+                    return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
+                }
             }
-        }
-    } else {
-        // Global provider from --oidc-* CLI args is implicitly
-        // system-admin scoped.
-        match state.oidc_provider.as_ref() {
-            // A provider configured from CLI flags has no stored document, so
-            // it is single-tenant with no self-registration.
-            Some(p) => (
-                (**p).clone(),
-                true,
-                ProviderTenancy::from_config(&serde_json::json!({})),
-            ),
-            None => {
-                return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
-            }
-        }
-    };
+        };
 
     // Exchange authorization code for tokens
     let callback_url = format!("{}/_console/api/oidc/callback", state.external_endpoint);
@@ -1256,7 +1320,7 @@ pub async fn oidc_callback(
                 .header(
                     header::LOCATION,
                     format!(
-                        "/_console/?error={}",
+                        "{base}?error={}",
                         urlencoding::encode(&format!("Token exchange failed: {e}"))
                     ),
                 )
@@ -1291,7 +1355,10 @@ pub async fn oidc_callback(
             warn!("OIDC token validation failed: {e}");
             return Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, "/_console/?error=Token+validation+failed")
+                .header(
+                    header::LOCATION,
+                    format!("{base}?error=Token+validation+failed"),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap();
         }
@@ -1318,7 +1385,7 @@ pub async fn oidc_callback(
                 .status(StatusCode::FOUND)
                 .header(
                     header::LOCATION,
-                    "/_console/?error=Token+has+no+tenant+claim",
+                    format!("{base}?error=Token+has+no+tenant+claim").as_str(),
                 )
                 .body(axum::body::Body::empty())
                 .unwrap();
@@ -1334,7 +1401,7 @@ pub async fn oidc_callback(
                     .status(StatusCode::FOUND)
                     .header(
                         header::LOCATION,
-                        format!("/_console/?error={}", urlencoding::encode(&e)),
+                        format!("{base}?error={}", urlencoding::encode(&e)),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap();
@@ -1372,7 +1439,7 @@ pub async fn oidc_callback(
                     .status(StatusCode::FOUND)
                     .header(
                         header::LOCATION,
-                        "/_console/?error=No+tenant+configured+for+this+provider",
+                        format!("{base}?error=No+tenant+configured+for+this+provider").as_str(),
                     )
                     .body(axum::body::Body::empty())
                     .unwrap();
@@ -1460,7 +1527,7 @@ pub async fn oidc_callback(
                 .status(StatusCode::FOUND)
                 .header(
                     header::LOCATION,
-                    format!("/_console/?error={}", urlencoding::encode(msg)),
+                    format!("{base}?error={}", urlencoding::encode(msg)),
                 )
                 .body(axum::body::Body::empty())
                 .unwrap();
@@ -1494,7 +1561,7 @@ pub async fn oidc_callback(
 
     Response::builder()
         .status(StatusCode::FOUND)
-        .header(header::LOCATION, "/_console/")
+        .header(header::LOCATION, landing_for_tenant(&tenant))
         .header(header::SET_COOKIE, session_cookie)
         .header("Set-Cookie", clear_state)
         .body(axum::body::Body::empty())
@@ -1629,5 +1696,50 @@ mod tenancy_tests {
         // Whatever the IdP sends, the name stays to a safe character set.
         assert_eq!(derive_tenant_name("a@AC ME.com", "t"), "ac-me.com");
         assert_eq!(derive_tenant_name("a@ac/me.com", "t"), "ac-me.com");
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    use super::*;
+
+    /// Every redirect out of the OIDC flow must reach a surface that actually
+    /// has a bundle. `/_console/` does not.
+    #[test]
+    fn a_base_is_always_a_real_surface() {
+        for a in [
+            ConsoleAudience::Ops,
+            ConsoleAudience::Tenant,
+            ConsoleAudience::Unscoped,
+        ] {
+            let b = console_base(a);
+            assert!(b.ends_with('/'), "{b} must end with a slash");
+            assert!(
+                b == "/_console/admin/" || b == "/_console/tenant/",
+                "{b} is not a served surface"
+            );
+        }
+    }
+
+    #[test]
+    fn landing_follows_the_session_that_was_minted() {
+        // A system-admin session has no tenant and belongs on the operator
+        // console; anything else belongs on the tenant console.
+        assert_eq!(landing_for_tenant(""), "/_console/admin/");
+        assert_eq!(landing_for_tenant("acme"), "/_console/tenant/");
+    }
+
+    #[test]
+    fn errors_return_to_the_console_the_flow_started_on() {
+        assert_eq!(
+            console_base(console_audience("/_console/tenant/signup", None)),
+            "/_console/tenant/"
+        );
+        assert_eq!(
+            console_base(console_audience("/_console/admin/", None)),
+            "/_console/admin/"
+        );
+        // No usable referer still lands somewhere real.
+        assert_eq!(console_base(console_audience("", None)), "/_console/admin/");
     }
 }

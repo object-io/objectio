@@ -1210,7 +1210,18 @@ pub async fn run(
                 "/_console/signup",
                 get(|| async { Redirect::temporary("/_console/tenant/signup") }),
             )
-            .nest_service("/_console", console_service(&legacy_console_dir))
+            // `/_console` itself has no bundle — the build produces the ops and
+            // tenant bundles only — so it redirects to the operator console
+            // rather than serving a directory with no index.html, which
+            // renders as a blank page.
+            .route(
+                "/_console",
+                get(|| async { Redirect::temporary("/_console/admin/") }),
+            )
+            .route(
+                "/_console/",
+                get(|| async { Redirect::temporary("/_console/admin/") }),
+            )
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Legacy))
