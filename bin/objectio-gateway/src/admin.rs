@@ -1521,6 +1521,88 @@ pub async fn admin_list_objects(
     .into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminObjectParams {
+    #[serde(rename = "versionId", default)]
+    pub version_id: Option<String>,
+}
+
+/// Upload an object from the console.
+///
+/// The S3 path (`PUT /{bucket}/{key}`) is signed with SigV4, and the console
+/// holds a session cookie rather than a key pair — so without this the browser
+/// would have to be handed a live access key to put a single file. This runs
+/// the same handler behind the same tenant-admin check as the rest of
+/// `/_admin/*`, which keeps the credential where it belongs.
+///
+/// A key ending in `/` with an empty body is how the object browser makes a
+/// folder: there are no directories to create, only a zero-byte marker that
+/// makes an empty prefix visible to a delimiter listing.
+pub async fn admin_put_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    if key.is_empty() {
+        return (StatusCode::BAD_REQUEST, "object key is required").into_response();
+    }
+    crate::s3::put_object(State(state), Path((bucket, key)), auth, headers, body).await
+}
+
+/// Delete one object from the console. `?versionId=` targets a single version.
+pub async fn admin_delete_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<AdminObjectParams>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    crate::s3::delete_object(
+        State(state),
+        Path((bucket, key)),
+        auth,
+        params.version_id,
+        headers,
+    )
+    .await
+}
+
+/// Download an object from the console.
+///
+/// Forces `Content-Disposition: attachment` so a click saves the file instead
+/// of navigating the console away to render it — an HTML object would
+/// otherwise load as a page on the console's own origin.
+pub async fn admin_get_object(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    let filename = key.rsplit('/').next().unwrap_or(&key).to_string();
+    let mut resp = crate::s3::get_object(State(state), Path((bucket, key)), auth, headers).await;
+    if resp.status().is_success()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            filename.replace('"', "")
+        ))
+    {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, v);
+    }
+    resp
+}
+
 // ============================================================================
 // Warehouses
 // ============================================================================

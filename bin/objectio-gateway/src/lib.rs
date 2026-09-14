@@ -1019,6 +1019,20 @@ pub async fn run(
             "/_admin/buckets/{name}/objects",
             get(admin::admin_list_objects),
         )
+        // Object read/write for the console. The S3 path needs a SigV4
+        // signature; the console has a session cookie, so these run the same
+        // handlers behind the `/_admin/*` tenant-admin check rather than
+        // handing the browser an access key.
+        .route(
+            "/_admin/buckets/{name}/objects/{*key}",
+            get(admin::admin_get_object)
+                .put(admin::admin_put_object)
+                .delete(admin::admin_delete_object)
+                // The admin router carries no body limit, so it would
+                // otherwise inherit axum's 2 MB default and cap a console
+                // upload well below what the S3 path accepts.
+                .layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
         // KMS admin API
         .route("/_admin/kms/status", get(kms::admin_kms_status))
         .route("/_admin/kms/version", get(kms::admin_kms_version))
