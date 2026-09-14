@@ -7,16 +7,22 @@ They deliberately do **not** do S3 data operations. Use the S3 SDK you already
 have — aws-sdk-go-v2, boto3, mountpoint-s3, s3fs, rclone — pointed at the same
 endpoint with a credential these mint. The handoff is one call.
 
-| | | |
+| | install | mirrored to |
 |---|---|---|
-| `go/` | module `github.com/object-io/objectio-go-sdk` | mirrored to [object-io/objectio-go-sdk](https://github.com/object-io/objectio-go-sdk) on every push to `main` |
-| `python/` | package `objectio`, Python ≥ 3.9 | |
+| `go/` | `go get github.com/object-io/objectio-go-sdk` | [object-io/objectio-go-sdk](https://github.com/object-io/objectio-go-sdk) |
+| `python/` | `pip install objectio-sdk` | [object-io/objectio-python-sdk](https://github.com/object-io/objectio-python-sdk) |
 
-**Source of truth is here.** The Go module lives in a repo of its own so its
-import path is clean and its release tags are plain `v0.1.0` — a module nested
-in a subdirectory has to be tagged `sdk/go/v0.1.0`, which is the most common
-way nested modules fail to publish. `.github/workflows/sdk-go-mirror.yml`
-copies `sdk/go/` there; edits made in the mirror are overwritten.
+The Python distribution is **`objectio-sdk`** because `objectio` is taken on
+PyPI by an unrelated package, last touched in 2020. The import is still
+`objectio`.
+
+**Source of truth is here.** Each SDK gets a repo of its own because each is
+published on its own: for Go that means a clean import path and plain `v0.1.0`
+tags — a module nested in a subdirectory has to be tagged `sdk/go/v0.1.0`,
+which is the most common way nested modules fail to publish — and for Python
+it gives the package a home and a build context for the PyPI upload. `sdk-go-mirror.yml` and
+`sdk-python-mirror.yml` copy each directory out on every push to `main`; edits
+made in a mirror are overwritten.
 
 Both sign with SigV4 on the standard library alone, so neither adds a
 dependency — which matters when this goes into a CSI driver or an operator.
