@@ -13,15 +13,12 @@ use axum::{
     Extension,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::Response,
 };
 use base64::Engine;
 use bytes::Bytes;
-use objectio_auth::{
-    AuthResult,
-    policy::{BucketPolicy, PolicyDecision, PolicyEvaluator, RequestContext},
-};
+use objectio_auth::{AuthResult, policy::PolicyEvaluator};
 use objectio_common::ErasureConfig;
 use objectio_erasure::{
     ErasureCodec,
@@ -54,6 +51,7 @@ use objectio_proto::metadata::{
     GetObjectLockConfigRequest,
     GetPlacementRequest,
     GetUserRequest,
+    KeyOperation as ProtoKeyOperation,
     LegalHold,
     LifecycleConfiguration as ProtoLifecycleConfig,
     LifecycleRule as ProtoLifecycleRule,
@@ -96,6 +94,10 @@ pub struct AppState {
     pub ec_k: u32,
     pub ec_m: u32,
     pub policy_evaluator: PolicyEvaluator,
+    /// TTL cache of bucket policies, bucket owners and attached identity
+    /// policies, read by the authorization middleware on every S3 request.
+    /// Invalidated locally when this gateway changes any of them.
+    pub policy_cache: crate::authz::AuthzCache,
     pub scatter_gather: ScatterGatherEngine,
     /// SSE-S3 master key for wrapping per-object DEKs. `None` when
     /// no master key was configured — PUTs targeting buckets with
@@ -127,6 +129,11 @@ pub struct AppState {
     /// at startup. Behind an `Arc<dyn>` so handlers can clone into async
     /// tasks without bound-lifetime issues.
     pub host_provider: Arc<dyn crate::host_provider::HostProvider>,
+    /// When set, buckets with no recorded owner stay readable/writable by any
+    /// authenticated caller instead of falling through to a deny. Covers the
+    /// window between deploying ownership enforcement and backfilling owners
+    /// on buckets created before it existed.
+    pub legacy_open_buckets: bool,
 }
 
 impl AppState {
@@ -702,7 +709,7 @@ fn overlapping_stripes(
 /// These are the AWS IAM/S3 condition keys relevant to object-level SSE
 /// enforcement — bucket policies like `Deny unless s3:x-amz-server-side-encryption`
 /// read these values from `RequestContext.variables`.
-fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String, String> {
+pub(crate) fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     // Currently the gateway terminates TLS upstream (Cloudflare/ingress), so
     // every request here effectively came in over HTTPS. Mark it so
@@ -727,92 +734,8 @@ fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String, String> {
     vars
 }
 
-/// Check bucket policy and return error response if access is denied.
-///
-/// `headers` (when provided) is used to populate request-side condition
-/// keys like `s3:x-amz-server-side-encryption`. Most callers pass the
-/// incoming HTTP request headers; callers without a header-carrying
-/// context (internal RPCs) can pass `None`.
-async fn check_bucket_policy(
-    state: &AppState,
-    bucket: &str,
-    user_arn: &str,
-    action: &str,
-    resource: &str,
-    headers: Option<&HeaderMap>,
-    auth_mode: objectio_auth::AuthMode,
-) -> Option<Response> {
-    let mut client = state.meta_client.clone();
-
-    // Get bucket policy
-    match client
-        .get_bucket_policy(GetBucketPolicyRequest {
-            bucket: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(response) => {
-            let policy_resp = response.into_inner();
-            if policy_resp.has_policy {
-                // Parse and evaluate policy
-                match BucketPolicy::from_json(&policy_resp.policy_json) {
-                    Ok(policy) => {
-                        let mut context = RequestContext::new(user_arn, action, resource);
-                        for (k, v) in sse_condition_vars(headers) {
-                            context = context.with_variable(k, v);
-                        }
-                        // Surface credential-type so policies can deny
-                        // permanent-key direct access while allowing STS.
-                        context = context.with_variable(
-                            "obio:CredentialType".to_string(),
-                            auth_mode.as_str().to_string(),
-                        );
-                        let decision = state.policy_evaluator.evaluate(&policy, &context);
-
-                        match decision {
-                            PolicyDecision::Deny => {
-                                debug!(
-                                    "Policy denied access: {} {} {}",
-                                    user_arn, action, resource
-                                );
-                                Some(S3Error::xml_response(
-                                    "AccessDenied",
-                                    "Access Denied by bucket policy",
-                                    StatusCode::FORBIDDEN,
-                                ))
-                            }
-                            PolicyDecision::ImplicitDeny => {
-                                // No explicit allow in policy - check if user is bucket owner
-                                // For now, we allow implicit deny (owner has full access)
-                                // In production, you'd check if user is the bucket owner
-                                None
-                            }
-                            PolicyDecision::Allow => None,
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse bucket policy: {}", e);
-                        // Invalid policy, don't block - log and continue
-                        None
-                    }
-                }
-            } else {
-                // No policy set - allow (owner-only access by default)
-                None
-            }
-        }
-        Err(e) => {
-            // Error fetching policy - don't block on policy errors
-            if e.code() != tonic::Code::NotFound {
-                error!("Failed to fetch bucket policy: {}", e);
-            }
-            None
-        }
-    }
-}
-
 /// Build ARN for an S3 resource
-fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
+pub(crate) fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
     match key {
         Some(k) => format!("arn:obio:s3:::{}/{}", bucket, k),
         None => format!("arn:obio:s3:::{}", bucket),
@@ -1301,6 +1224,16 @@ pub async fn list_buckets(
         .map(|Extension(a)| a.tenant.clone())
         .unwrap_or_default();
 
+    // A bucket-scoped key must not be able to enumerate the whole namespace.
+    // ListAllMyBuckets has no bucket to authorize against, so the layer lets
+    // it through and the result is narrowed here instead.
+    let scoped_bucket = auth.as_ref().and_then(|Extension(a)| {
+        a.scope
+            .as_ref()
+            .filter(|s| !s.scope.is_empty())
+            .map(|s| crate::authz::scope_bucket(&s.scope))
+    });
+
     let mut client = state.meta_client.clone();
 
     match client
@@ -1311,7 +1244,10 @@ pub async fn list_buckets(
         .await
     {
         Ok(response) => {
-            let buckets = response.into_inner();
+            let mut buckets = response.into_inner();
+            if let Some(only) = &scoped_bucket {
+                buckets.buckets.retain(|b| &b.name == only);
+            }
             let result = ListBucketsResult {
                 owner: Owner {
                     id: "objectio".to_string(),
@@ -1393,7 +1329,13 @@ pub async fn create_bucket(
     match client
         .create_bucket(CreateBucketRequest {
             name: bucket.clone(),
-            owner: "default".to_string(),
+            // Recording the creator is what lets authorization fall back to
+            // ownership when no policy speaks; the old hardcoded "default"
+            // meant no bucket had an owner to fall back to.
+            owner: auth
+                .as_ref()
+                .map(|Extension(a)| a.user_id.clone())
+                .unwrap_or_default(),
             storage_class: "STANDARD".to_string(),
             region: "us-east-1".to_string(),
             tenant,
@@ -1401,6 +1343,10 @@ pub async fn create_bucket(
         .await
     {
         Ok(_) => {
+            // The authorization chain caches bucket tenant and owner; drop any
+            // entry so the next request reads the newly recorded values rather
+            // than anything stale.
+            state.policy_cache.invalidate(&bucket);
             // If object lock requested, enable versioning and lock config
             if enable_lock {
                 let _ = client
@@ -1574,7 +1520,8 @@ pub async fn list_objects(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
     Query(params): Query<ListObjectsParams>,
-    auth: Option<Extension<AuthResult>>,
+    // Authorized by `authz::authz_layer` before this handler runs.
+    _auth: Option<Extension<AuthResult>>,
 ) -> Response {
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
@@ -1599,24 +1546,6 @@ pub async fn list_objects(
             params.max_keys.unwrap_or(1000),
         )
         .await;
-    }
-
-    // Check bucket policy if user is authenticated
-    if let Some(Extension(auth_result)) = &auth {
-        let resource = build_s3_arn(&bucket, None);
-        if let Some(deny_response) = check_bucket_policy(
-            &state,
-            &bucket,
-            &auth_result.user_arn,
-            "s3:ListBucket",
-            &resource,
-            None,
-            auth_result.auth_mode,
-        )
-        .await
-        {
-            return deny_response;
-        }
     }
 
     let prefix = params.prefix.clone().unwrap_or_default();
@@ -2129,22 +2058,25 @@ pub async fn put_object(
         let source_bucket = parts[0];
         let source_key = parts[1];
 
-        // Auth check (PutObject on destination)
-        if let Some(Extension(auth_result)) = &auth {
-            let resource = build_s3_arn(&bucket, Some(&key));
-            if let Some(deny_response) = check_bucket_policy(
+        // CopyObject reads the source as well as writing the destination.
+        // The middleware authorized the destination; the source is a
+        // different bucket/key and is checked here.
+        if let Some(Extension(auth_result)) = &auth
+            && let Some(deny_response) = crate::authz::authorize(
                 &state,
-                &bucket,
-                &auth_result.user_arn,
-                "s3:PutObject",
-                &resource,
-                Some(&headers),
-                auth_result.auth_mode,
+                auth_result,
+                &crate::authz::AuthzRequest {
+                    method: &Method::GET,
+                    action: "s3:GetObject",
+                    bucket: source_bucket,
+                    key: Some(source_key),
+                    scope_key: source_key,
+                    headers: Some(&headers),
+                },
             )
             .await
-            {
-                return deny_response;
-            }
+        {
+            return deny_response;
         }
 
         let mut meta_client = state.meta_client.clone();
@@ -2339,24 +2271,6 @@ pub async fn put_object(
         state.ec_k,
         state.ec_m,
     );
-
-    // Check bucket policy if user is authenticated
-    if let Some(Extension(auth_result)) = &auth {
-        let resource = build_s3_arn(&bucket, Some(&key));
-        if let Some(deny_response) = check_bucket_policy(
-            &state,
-            &bucket,
-            &auth_result.user_arn,
-            "s3:PutObject",
-            &resource,
-            Some(&headers),
-            auth_result.auth_mode,
-        )
-        .await
-        {
-            return deny_response;
-        }
-    }
 
     let mut meta_client = state.meta_client.clone();
 
@@ -2987,31 +2901,14 @@ pub async fn put_object(
 pub async fn get_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
-    auth: Option<Extension<AuthResult>>,
+    // Authorized by `authz::authz_layer` before this handler runs.
+    _auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
     debug!("GET object: {}/{}", bucket, key);
 
     // Parse Range header if present
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-
-    // Check bucket policy if user is authenticated
-    if let Some(Extension(auth_result)) = &auth {
-        let resource = build_s3_arn(&bucket, Some(&key));
-        if let Some(deny_response) = check_bucket_policy(
-            &state,
-            &bucket,
-            &auth_result.user_arn,
-            "s3:GetObject",
-            &resource,
-            Some(&headers),
-            auth_result.auth_mode,
-        )
-        .await
-        {
-            return deny_response;
-        }
-    }
 
     let mut meta_client = state.meta_client.clone();
 
@@ -3763,29 +3660,12 @@ async fn resolve_node_address(
 pub async fn head_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
-    auth: Option<Extension<AuthResult>>,
+    // Authorized by `authz::authz_layer` before this handler runs.
+    _auth: Option<Extension<AuthResult>>,
 ) -> Response {
     // If key is empty (trailing slash on bucket), treat as head_bucket
     if key.is_empty() {
         return head_bucket(State(state), Path(bucket)).await;
-    }
-
-    // Check bucket policy if user is authenticated
-    if let Some(Extension(auth_result)) = &auth {
-        let resource = build_s3_arn(&bucket, Some(&key));
-        if let Some(deny_response) = check_bucket_policy(
-            &state,
-            &bucket,
-            &auth_result.user_arn,
-            "s3:GetObject",
-            &resource,
-            None,
-            auth_result.auth_mode,
-        )
-        .await
-        {
-            return deny_response;
-        }
     }
 
     let mut meta_client = state.meta_client.clone();
@@ -3875,28 +3755,11 @@ pub async fn head_object(
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
-    auth: Option<Extension<AuthResult>>,
+    // Authorized by `authz::authz_layer` before this handler runs.
+    _auth: Option<Extension<AuthResult>>,
     version_id: Option<String>,
     headers: HeaderMap,
 ) -> Response {
-    // Check bucket policy if user is authenticated
-    if let Some(Extension(auth_result)) = &auth {
-        let resource = build_s3_arn(&bucket, Some(&key));
-        if let Some(deny_response) = check_bucket_policy(
-            &state,
-            &bucket,
-            &auth_result.user_arn,
-            "s3:DeleteObject",
-            &resource,
-            Some(&headers),
-            auth_result.auth_mode,
-        )
-        .await
-        {
-            return deny_response;
-        }
-    }
-
     let mut meta_client = state.meta_client.clone();
 
     // Get placement to find primary OSD
@@ -4121,27 +3984,31 @@ pub async fn delete_objects(
 
     // Delete each object
     for obj in delete_request.objects {
-        // Check bucket policy if user is authenticated
-        if let Some(Extension(auth_result)) = &auth {
-            let resource = build_s3_arn(&bucket, Some(&obj.key));
-            if let Some(_deny_response) = check_bucket_policy(
+        // Batch delete reports per-key outcomes inside a 200 response, so
+        // each key is evaluated here instead of by the middleware, which
+        // classifies this route as `DeferToHandler`.
+        if let Some(Extension(auth_result)) = &auth
+            && crate::authz::authorize(
                 &state,
-                &bucket,
-                &auth_result.user_arn,
-                "s3:DeleteObject",
-                &resource,
-                None,
-                auth_result.auth_mode,
+                auth_result,
+                &crate::authz::AuthzRequest {
+                    method: &Method::DELETE,
+                    action: "s3:DeleteObject",
+                    bucket: &bucket,
+                    key: Some(&obj.key),
+                    scope_key: &obj.key,
+                    headers: None,
+                },
             )
             .await
-            {
-                errors.push(DeleteError {
-                    key: obj.key,
-                    code: "AccessDenied".to_string(),
-                    message: "Access Denied".to_string(),
-                });
-                continue;
-            }
+            .is_some()
+        {
+            errors.push(DeleteError {
+                key: obj.key,
+                code: "AccessDenied".to_string(),
+                message: "Access Denied".to_string(),
+            });
+            continue;
         }
 
         // Get placement to find primary OSD
@@ -4310,6 +4177,9 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
     {
         Ok(_) => {
             info!("Set bucket policy for: {}", bucket);
+            // Drop the cached copy so this gateway enforces the new policy on
+            // the next request instead of after the TTL.
+            state.policy_cache.invalidate(&bucket);
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(Body::empty())
@@ -4348,6 +4218,7 @@ async fn delete_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> 
     {
         Ok(_) => {
             info!("Deleted bucket policy for: {}", bucket);
+            state.policy_cache.invalidate(&bucket);
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(Body::empty())
@@ -7240,6 +7111,33 @@ pub struct AdminAccessKeyResponse {
     pub user_id: String,
     pub status: String,
     pub created_at: u64,
+    /// `s3://bucket/prefix/` the key is confined to. Empty = unscoped.
+    pub scope: String,
+    /// `"READ"` or `"READ_WRITE"`.
+    pub operation: String,
+}
+
+/// Optional JSON body for `POST /_admin/users/{user_id}/keys`.
+///
+/// An absent or empty body yields an unscoped read-write key, which is what
+/// every pre-scoping caller sends.
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateAccessKeyBody {
+    /// `s3://bucket/prefix/` restriction. Omitted or empty = unscoped.
+    #[serde(default)]
+    pub scope: String,
+    /// `"R"`/`"read-only"` or `"RW"`/`"read-write"`. Omitted = read-write.
+    #[serde(default)]
+    pub operation: Option<String>,
+}
+
+/// Render a `KeyOperation` proto value for API responses.
+fn operation_label(operation: i32) -> String {
+    if operation == ProtoKeyOperation::KeyOpRead as i32 {
+        "READ".to_string()
+    } else {
+        "READ_WRITE".to_string()
+    }
 }
 
 #[derive(Serialize)]
@@ -7602,6 +7500,8 @@ pub async fn admin_list_access_keys(
                         user_id: k.user_id,
                         status: format!("{:?}", k.status),
                         created_at: k.created_at,
+                        scope: k.scope,
+                        operation: operation_label(k.operation),
                     })
                     .collect(),
             };
@@ -7630,6 +7530,15 @@ pub async fn admin_list_access_keys(
         }
     }
 }
+/// 400 with a JSON error body, for bad scope/operation input.
+fn admin_key_error(message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
 
 /// Create access key for user (POST /_admin/users/{user_id}/access-keys)
 pub async fn admin_create_access_key(
@@ -7637,6 +7546,7 @@ pub async fn admin_create_access_key(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
     Path(user_id): Path<String>,
+    body: Bytes,
 ) -> Response {
     let target_tenant = match lookup_user_tenant(&state, &user_id).await {
         Some(t) => t,
@@ -7658,11 +7568,43 @@ pub async fn admin_create_access_key(
         return deny;
     }
 
+    // Body is optional: callers that predate scoped keys send none.
+    let params: CreateAccessKeyBody = if body.is_empty() {
+        CreateAccessKeyBody::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(p) => p,
+            Err(e) => return admin_key_error(&format!("invalid request body: {e}")),
+        }
+    };
+
+    // Reject a malformed scope rather than storing one that matches nothing.
+    if !params.scope.is_empty()
+        && let Err(msg) = objectio_auth::validate_scope(&params.scope)
+    {
+        return admin_key_error(&msg);
+    }
+
+    let operation = match params.operation.as_deref() {
+        None => ProtoKeyOperation::KeyOpReadWrite,
+        Some(raw) => match objectio_auth::Operation::parse(raw) {
+            Some(objectio_auth::Operation::Read) => ProtoKeyOperation::KeyOpRead,
+            Some(objectio_auth::Operation::ReadWrite) => ProtoKeyOperation::KeyOpReadWrite,
+            None => {
+                return admin_key_error(&format!(
+                    "invalid operation '{raw}': expected 'R'/'read-only' or 'RW'/'read-write'"
+                ));
+            }
+        },
+    };
+
     let mut client = state.meta_client.clone();
 
     match client
         .create_access_key(CreateAccessKeyRequest {
             user_id: user_id.clone(),
+            scope: params.scope.clone(),
+            operation: operation as i32,
         })
         .await
     {
@@ -7675,6 +7617,8 @@ pub async fn admin_create_access_key(
                 user_id: key.user_id,
                 status: format!("{:?}", key.status),
                 created_at: key.created_at,
+                scope: key.scope,
+                operation: operation_label(key.operation),
             };
 
             info!(

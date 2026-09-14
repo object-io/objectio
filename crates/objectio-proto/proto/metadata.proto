@@ -6,6 +6,9 @@ package objectio.metadata;
 service MetadataService {
     // Bucket operations
     rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+    // Reassign a bucket's owner. Also the backfill path for buckets created
+    // before the gateway recorded a real owner.
+    rpc SetBucketOwner(SetBucketOwnerRequest) returns (SetBucketOwnerResponse);
     rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
     rpc GetBucket(GetBucketRequest) returns (GetBucketResponse);
     rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
@@ -341,6 +344,15 @@ message CreateBucketRequest {
     string storage_class = 3;
     string region = 4;
     string tenant = 5;              // Owning tenant (empty = system tenant)
+}
+
+message SetBucketOwnerRequest {
+    string bucket = 1;
+    string owner = 2;               // user_id of the new owner
+}
+
+message SetBucketOwnerResponse {
+    bool success = 1;
 }
 
 message CreateBucketResponse {
@@ -840,6 +852,14 @@ enum KeyStatus {
     KEY_INACTIVE = 1;
 }
 
+// What a scoped access key may do. READ_WRITE is deliberately the zero value
+// so that an unset field — a key issued before scoping existed, or a client
+// that does not set it — imposes no restriction.
+enum KeyOperation {
+    KEY_OP_READ_WRITE = 0;
+    KEY_OP_READ = 1;
+}
+
 // User metadata
 message UserMeta {
     string user_id = 1;
@@ -859,6 +879,11 @@ message AccessKeyMeta {
     KeyStatus status = 4;
     uint64 created_at = 5;
     string tenant = 6;              // Inherited from user's tenant
+    // Bucket/prefix this key is confined to, as "s3://bucket/prefix/".
+    // Empty = unscoped. Narrowing only: it subtracts from the owning user's
+    // permissions and can never add to them.
+    string scope = 7;
+    KeyOperation operation = 8;     // Applies with or without a scope
 }
 
 // Create user
@@ -905,6 +930,8 @@ message DeleteUserResponse {
 // Create access key
 message CreateAccessKeyRequest {
     string user_id = 1;
+    string scope = 2;               // Optional "s3://bucket/prefix/"
+    KeyOperation operation = 3;     // Defaults to READ_WRITE
 }
 
 message CreateAccessKeyResponse {

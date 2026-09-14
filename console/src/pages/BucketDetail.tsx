@@ -11,10 +11,11 @@ import {
   Save,
   ToggleLeft,
   ToggleRight,
+  UserCircle,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
 
-type Tab = "versioning" | "lock" | "lifecycle" | "policy";
+type Tab = "access" | "versioning" | "lock" | "lifecycle" | "policy";
 
 interface LifecycleRule {
   id: string;
@@ -35,7 +36,16 @@ interface LockConfig {
 
 export default function BucketDetail() {
   const { bucketName } = useParams<{ bucketName: string }>();
-  const [tab, setTab] = useState<Tab>("versioning");
+  const [tab, setTab] = useState<Tab>("access");
+
+  // Ownership. The owner is who reaches the bucket when no policy grants
+  // access, so a bucket with none relies on --authz-legacy-open-buckets.
+  const [owner, setOwner] = useState<string>("");
+  const [ownerLoading, setOwnerLoading] = useState(true);
+  const [ownerInput, setOwnerInput] = useState("");
+  const [ownerMsg, setOwnerMsg] = useState<string | null>(null);
+  const [ownerErr, setOwnerErr] = useState<string | null>(null);
+  const [userList, setUserList] = useState<{ user_id: string; display_name: string }[]>([]);
 
   // Versioning state
   const [versioning, setVersioning] = useState<string>("Disabled");
@@ -312,7 +322,53 @@ export default function BucketDetail() {
     setPolicyJson(JSON.stringify(templates[template], null, 2));
   };
 
+  const loadOwner = async () => {
+    setOwnerLoading(true);
+    try {
+      const r = await fetch("/_admin/buckets");
+      if (r.ok) {
+        const data = await r.json();
+        const list: { name: string; owner?: string }[] = Array.isArray(data)
+          ? data
+          : data.buckets || [];
+        setOwner(list.find((b) => b.name === bucketName)?.owner || "");
+      }
+    } finally {
+      setOwnerLoading(false);
+    }
+  };
+
+  const loadUsers = async () => {
+    try {
+      const r = await fetch("/_admin/users");
+      if (!r.ok) return;
+      const data = await r.json();
+      setUserList(Array.isArray(data) ? data : data.users || []);
+    } catch {
+      // Owner reassignment falls back to a free-text user_id.
+    }
+  };
+
+  const saveOwner = async () => {
+    setOwnerMsg(null);
+    setOwnerErr(null);
+    const r = await fetch(`/_admin/buckets/${bucketName}/owner`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owner: ownerInput }),
+    });
+    if (r.ok) {
+      setOwnerMsg("Owner updated");
+      setOwnerInput("");
+      loadOwner();
+    } else {
+      setOwnerErr((await r.text()) || `Request failed (${r.status})`);
+    }
+  };
+
   useEffect(() => {
+    loadOwner();
+    loadUsers();
     loadVersioning();
     loadLockConfig();
     loadLifecycle();
@@ -321,6 +377,7 @@ export default function BucketDetail() {
   }, [bucketName]);
 
   const tabs: { key: Tab; label: string; icon: typeof GitBranch }[] = [
+    { key: "access", label: "Access", icon: UserCircle },
     { key: "versioning", label: "Versioning", icon: GitBranch },
     { key: "lock", label: "Object Lock", icon: Lock },
     { key: "lifecycle", label: "Lifecycle", icon: Timer },
@@ -359,6 +416,69 @@ export default function BucketDetail() {
           </button>
         ))}
       </div>
+
+      {/* Access Tab */}
+      {tab === "access" && (
+        <div className="bg-white rounded-xl border border-gray-200 p-6">
+          <h3 className="text-sm font-semibold text-gray-900 mb-1">Ownership</h3>
+          <p className="text-[12px] text-gray-500 mb-4">
+            The owner reaches this bucket when no policy grants access. Everyone
+            else needs an attached policy or a bucket policy.
+          </p>
+
+          {ownerLoading ? (
+            <p className="text-[12px] text-gray-400">Loading…</p>
+          ) : owner && owner !== "default" ? (
+            <div className="flex items-center gap-2 mb-5">
+              <span className="text-[12px] text-gray-500">Current owner:</span>
+              <span className="font-mono text-[12px] bg-gray-50 border border-gray-200 rounded px-2 py-1">
+                {userList.find((u) => u.user_id === owner)?.display_name || owner}
+              </span>
+            </div>
+          ) : (
+            <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">
+              <p className="text-[12px] text-amber-800 font-medium">
+                This bucket has no owner
+              </p>
+              <p className="text-[11px] text-amber-700 mt-0.5">
+                It was created before ownership was recorded, so authorization
+                cannot fall back to an owner. It stays reachable only while the
+                gateway runs with <code>--authz-legacy-open-buckets</code>.
+                Assign an owner below before turning that off.
+              </p>
+            </div>
+          )}
+
+          <label className="block text-[11px] font-medium text-gray-500 mb-1">
+            Assign owner
+          </label>
+          <div className="flex gap-2 items-start">
+            <select
+              value={ownerInput}
+              onChange={(e) => setOwnerInput(e.target.value)}
+              className="text-[12px] border border-gray-200 rounded-md px-2 py-1.5 min-w-64"
+            >
+              <option value="">Select a user…</option>
+              {userList.map((u) => (
+                <option key={u.user_id} value={u.user_id}>
+                  {u.display_name} ({u.user_id.slice(0, 8)}…)
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={saveOwner}
+              disabled={!ownerInput}
+              className="flex items-center gap-1.5 text-[12px] bg-blue-600 text-white rounded-md px-3 py-1.5 hover:bg-blue-700 disabled:opacity-40"
+            >
+              <Save size={13} /> Save
+            </button>
+          </div>
+          {ownerMsg && (
+            <p className="text-[11px] text-green-600 mt-2">{ownerMsg}</p>
+          )}
+          {ownerErr && <p className="text-[11px] text-red-600 mt-2">{ownerErr}</p>}
+        </div>
+      )}
 
       {/* Versioning Tab */}
       {tab === "versioning" && (

@@ -29,6 +29,10 @@ export interface AccessKey {
   access_key_id: string;
   status: string;
   created_at: number;
+  /** `s3://bucket/prefix/` the key is confined to; empty = unscoped. */
+  scope?: string;
+  /** `"READ"` or `"READ_WRITE"`. Applies with or without a scope. */
+  operation?: string;
 }
 
 export interface Bucket {
@@ -101,11 +105,21 @@ export const users = {
       "GET",
       `/_admin/users/${userId}/access-keys`
     ),
-  createKey: (userId: string) =>
-    request<{ access_key_id: string; secret_access_key: string }>(
-      "POST",
-      `/_admin/users/${userId}/access-keys`
-    ),
+  /**
+   * Create an access key, optionally confined to `scope`
+   * (`s3://bucket/prefix/`) and/or limited to reads. Both narrow the owning
+   * user's access and can never widen it.
+   */
+  createKey: (
+    userId: string,
+    opts?: { scope?: string; operation?: "r" | "rw" }
+  ) =>
+    request<{
+      access_key_id: string;
+      secret_access_key: string;
+      scope: string;
+      operation: string;
+    }>("POST", `/_admin/users/${userId}/access-keys`, opts ?? {}),
   deleteKey: (keyId: string) =>
     request<void>("DELETE", `/_admin/access-keys/${keyId}`),
 };
@@ -143,6 +157,17 @@ export const groups = {
 export const buckets = {
   list: () =>
     request<Bucket[]>("GET", "/").catch(() => [] as Bucket[]),
+  /**
+   * Reassign a bucket's owner. The owner is who reaches a bucket when no
+   * policy grants access, so this is also the backfill path for buckets
+   * created before ownership was recorded.
+   */
+  setOwner: (bucket: string, owner: string) =>
+    request<void>(
+      "PUT",
+      `/_admin/buckets/${encodeURIComponent(bucket)}/owner`,
+      { owner }
+    ),
 };
 
 // Iceberg API

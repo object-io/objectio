@@ -206,6 +206,12 @@ pub struct AuthResult {
     /// How the caller authenticated. Drives `obio:CredentialType` in
     /// policy evaluation.
     pub auth_mode: AuthMode,
+    /// Bucket/prefix restriction carried by the credential itself, for both
+    /// STS-vended sessions and scoped permanent keys. `None` = unrestricted.
+    ///
+    /// Enforced as a narrowing filter: it can only subtract from what the
+    /// identity's policies already allow, never add.
+    pub scope: Option<crate::scope::CredentialScope>,
 }
 
 impl AuthResult {

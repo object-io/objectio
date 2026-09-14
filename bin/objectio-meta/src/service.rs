@@ -258,6 +258,8 @@ use objectio_proto::metadata::{
     RegisterPartResponse,
     RemoveUserFromGroupRequest,
     RemoveUserFromGroupResponse,
+    SetBucketOwnerRequest,
+    SetBucketOwnerResponse,
     SetBucketPolicyRequest,
     SetBucketPolicyResponse,
     SetConfigRequest,
@@ -993,7 +995,7 @@ impl MetaService {
     fn apply_access_key_event(&self, key: &str, new_value: Option<&[u8]>) {
         let mut m = self.access_keys.write();
         match new_value {
-            Some(bytes) => match bincode::deserialize::<StoredAccessKey>(bytes) {
+            Some(bytes) => match objectio_meta_store::decode_access_key(bytes) {
                 Ok(k) => {
                     // Keep user_keys index consistent: insert the
                     // access_key_id under the owning user if absent.
@@ -2324,6 +2326,9 @@ impl MetaService {
             status: KeyStatus::KeyActive as i32,
             created_at: now,
             tenant: String::new(),
+            // The bootstrap admin key is deliberately unscoped.
+            scope: String::new(),
+            operation: 0,
         };
 
         self.access_keys
@@ -4651,6 +4656,8 @@ impl MetadataService for MetaService {
             status: KeyStatus::KeyActive as i32,
             created_at: now,
             tenant: user.tenant.clone(),
+            scope: req.scope.clone(),
+            operation: req.operation,
         };
 
         let key_bytes = bincode::serialize(&key)
@@ -4694,11 +4701,16 @@ impl MetadataService for MetaService {
         self.access_keys
             .write()
             .insert(access_key_id.clone(), key.clone());
-        self.user_keys
-            .write()
-            .entry(req.user_id.clone())
-            .or_default()
-            .push(access_key_id.clone());
+        // `apply_access_key_event` maintains this index too, and the raft
+        // write above already ran it — without a guard every key lands twice
+        // and `key list` shows duplicates.
+        {
+            let mut idx = self.user_keys.write();
+            let ids = idx.entry(req.user_id.clone()).or_default();
+            if !ids.contains(&access_key_id) {
+                ids.push(access_key_id.clone());
+            }
+        }
 
         info!(
             "Created access key {} for user {}",
@@ -4713,6 +4725,8 @@ impl MetadataService for MetaService {
                 status: key.status,
                 created_at: key.created_at,
                 tenant: key.tenant,
+                scope: key.scope,
+                operation: key.operation,
             }),
         }))
     }
@@ -4741,6 +4755,8 @@ impl MetadataService for MetaService {
                 status: k.status,
                 created_at: k.created_at,
                 tenant: k.tenant.clone(),
+                scope: k.scope.clone(),
+                operation: k.operation,
             })
             .collect();
 
@@ -4840,6 +4856,8 @@ impl MetadataService for MetaService {
                 status: key.status,
                 created_at: key.created_at,
                 tenant: key.tenant,
+                scope: key.scope,
+                operation: key.operation,
             }),
             user: Some(UserMeta {
                 user_id: user.user_id,
@@ -9674,6 +9692,61 @@ impl MetadataService for MetaService {
             req.state()
         );
         Ok(Response::new(PutBucketVersioningResponse { success: true }))
+    }
+
+    async fn set_bucket_owner(
+        &self,
+        request: Request<SetBucketOwnerRequest>,
+    ) -> Result<Response<SetBucketOwnerResponse>, Status> {
+        let req = request.into_inner();
+        if req.owner.is_empty() {
+            return Err(Status::invalid_argument("owner must not be empty"));
+        }
+
+        let (expected_bytes, new_bucket, new_bytes) = {
+            let buckets = self.buckets.read();
+            let current = buckets
+                .get(&req.bucket)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("bucket '{}' not found", req.bucket)))?;
+            let expected = current.encode_to_vec();
+            let mut new_bucket = current;
+            new_bucket.owner = req.owner.clone();
+            let new_bytes = new_bucket.encode_to_vec();
+            (expected, new_bucket, new_bytes)
+        };
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Buckets,
+                    key: req.bucket.clone(),
+                    expected: Some(expected_bytes),
+                    new_value: Some(new_bytes),
+                }],
+                requested_by: "set-bucket-owner".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("bucket changed since read; retry"));
+                    }
+                    other => {
+                        error!("unexpected raft response for set_bucket_owner: {:?}", other);
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.put_bucket(&req.bucket, &new_bucket);
+        }
+
+        self.buckets.write().insert(req.bucket.clone(), new_bucket);
+        info!("Set owner for bucket '{}' to '{}'", req.bucket, req.owner);
+        Ok(Response::new(SetBucketOwnerResponse { success: true }))
     }
 
     async fn get_bucket_versioning(

@@ -111,6 +111,17 @@ struct Args {
     /// `--listen-addr`. Safe to expose publicly. Pass 0 to skip.
     #[arg(long, default_value_t = 0)]
     tenant_console_port: u16,
+
+    /// Public base URL clients reach this server on, e.g.
+    /// `https://s3.example.com`. Used for the OIDC callback, Iceberg vended
+    /// credentials, and Delta Sharing presigned URLs — all of which must hand
+    /// out an address that resolves for the *caller*, not the bind address.
+    ///
+    /// Seed this on any deployment that is reachable by a name. Left empty it
+    /// is derived from `--listen-addr`, which cannot produce a usable URL for
+    /// a wildcard bind.
+    #[arg(long, env = "OBJECTIO_EXTERNAL_ENDPOINT", default_value = "")]
+    external_endpoint: String,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -495,10 +506,32 @@ async fn main() -> Result<()> {
     // (used for OIDC callback + Iceberg vended creds + Delta Sharing
     // presign) stays as `localhost` when loopback-only; otherwise falls
     // back to the bind address for LAN-reachable mode.
-    let external_host = if args.listen_addr == "127.0.0.1" || args.listen_addr == "localhost" {
-        "localhost".to_string()
+    // A wildcard bind has no usable host in it: `http://0.0.0.0:9000` is not
+    // an address any client — or any identity provider — can resolve. Fall
+    // back to localhost and say so, rather than handing out a URL that fails
+    // silently at the point an operator is configuring SSO.
+    let wildcard_bind = matches!(args.listen_addr.as_str(), "0.0.0.0" | "::" | "[::]");
+    let external_endpoint = if !args.external_endpoint.is_empty() {
+        args.external_endpoint.trim_end_matches('/').to_string()
     } else {
-        args.listen_addr.clone()
+        let host = if args.listen_addr == "127.0.0.1"
+            || args.listen_addr == "localhost"
+            || wildcard_bind
+        {
+            "localhost".to_string()
+        } else {
+            args.listen_addr.clone()
+        };
+        if wildcard_bind {
+            eprintln!(
+                "  WARNING: --external-endpoint is not set and the server binds {}.",
+                args.listen_addr
+            );
+            eprintln!("           Falling back to http://localhost:{gateway_port} for OIDC");
+            eprintln!("           callbacks, vended credentials and presigned URLs. Set");
+            eprintln!("           --external-endpoint to this server's public URL.");
+        }
+        format!("http://{host}:{gateway_port}")
     };
     // aio is a single-process dev binary — every Enterprise feature should
     // just work without obtaining a signed license. The gateway picks up
@@ -514,7 +547,7 @@ async fn main() -> Result<()> {
         "--meta-endpoint".into(),
         format!("http://127.0.0.1:{meta_grpc}"),
         "--external-endpoint".into(),
-        format!("http://{external_host}:{gateway_port}"),
+        external_endpoint.clone(),
         "--log-level".into(),
         args.log_level.clone(),
     ];
@@ -571,16 +604,27 @@ async fn main() -> Result<()> {
     eprintln!("━━━ ObjectIO ready ━━━");
     eprintln!("  S3 / Iceberg / Delta Sharing : http://{display_host}:{gateway_port}");
     if args.ops_console_port == 0 && args.tenant_console_port == 0 {
-        eprintln!("  Console                       : http://{display_host}:{gateway_port}/_console/");
+        eprintln!(
+            "  Console                       : http://{display_host}:{gateway_port}/_console/"
+        );
     }
     if args.admin_port != 0 {
-        eprintln!("  Admin API + /metrics          : http://{display_host}:{port}/_admin/  (split listener)", port = args.admin_port);
+        eprintln!(
+            "  Admin API + /metrics          : http://{display_host}:{port}/_admin/  (split listener)",
+            port = args.admin_port
+        );
     }
     if args.ops_console_port != 0 {
-        eprintln!("  Ops console                   : http://{display_host}:{port}/_console/  (system admins)", port = args.ops_console_port);
+        eprintln!(
+            "  Ops console                   : http://{display_host}:{port}/_console/  (system admins)",
+            port = args.ops_console_port
+        );
     }
     if args.tenant_console_port != 0 {
-        eprintln!("  Tenant console                : http://{display_host}:{port}/_console/  (end users)", port = args.tenant_console_port);
+        eprintln!(
+            "  Tenant console                : http://{display_host}:{port}/_console/  (end users)",
+            port = args.tenant_console_port
+        );
     }
     if args.listen_addr == "0.0.0.0" {
         eprintln!(

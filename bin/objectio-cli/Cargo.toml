@@ -13,6 +13,7 @@ path = "src/main.rs"
 objectio-common = { workspace = true }
 objectio-client = { workspace = true }
 objectio-proto = { workspace = true }
+objectio-auth = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

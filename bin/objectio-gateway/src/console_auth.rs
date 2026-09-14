@@ -466,6 +466,9 @@ pub async fn my_create_key(State(state): State<Arc<AppState>>, headers: HeaderMa
     match client
         .create_access_key(objectio_proto::metadata::CreateAccessKeyRequest {
             user_id: session.user.clone(),
+            // Self-service console keys inherit the user's full access.
+            scope: String::new(),
+            operation: 0,
         })
         .await
     {
@@ -613,6 +616,19 @@ pub async fn oidc_enabled(
     Json(serde_json::json!({
         "enabled": surface_global || !providers.is_empty(),
         "providers": providers,
+        // The exact redirect URI the gateway will send to the IdP, so the
+        // console can tell an operator what to register. It is derived from
+        // --external-endpoint and is the same for every provider and tenant
+        // (provider and tenant travel in the OAuth `state`, not the URL), so
+        // it is reported rather than configured per provider.
+        "callback_url": format!("{}/_console/api/oidc/callback", state.external_endpoint),
+        // True when --external-endpoint was never set, in which case the
+        // callback above is built from the bind address and no IdP will
+        // accept it. Surfaced so the console can say so instead of handing
+        // over a URL that silently cannot work.
+        "callback_url_is_default": state.external_endpoint.starts_with("http://0.0.0.0")
+            || state.external_endpoint.starts_with("http://127.0.0.1")
+            || state.external_endpoint.starts_with("http://localhost"),
     }))
 }
 

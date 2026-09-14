@@ -14,4 +14,5 @@ pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
 pub use types::{
     EcConfig, MultipartUploadState, OsdNode, PartState, StoredAccessKey, StoredAttachment,
     StoredChunkRef, StoredDataFilter, StoredGroup, StoredSnapshot, StoredUser, StoredVolume,
+    decode_access_key,
 };
