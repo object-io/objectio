@@ -14,9 +14,20 @@ import tailwindcss from "@tailwindcss/vite";
 // layout (e.g. tooling that pre-dates the split).
 const app = process.env.APP;
 
+// Each bundle is served at one canonical path, and is built with that path as
+// its base. A relative base would not work: the SPA falls back to index.html
+// for deep routes, so `./assets/x.js` on `/_console/admin/buckets/foo` would
+// resolve against `/_console/admin/buckets/`. An absolute base per bundle
+// keeps asset URLs correct at any depth, and means the dedicated-listener mode
+// can serve the same bundle at the same path rather than needing its own build.
+const BASE: Record<string, string> = {
+  ops: "/_console/admin/",
+  tenant: "/_console/tenant/",
+};
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  base: "/_console/",
+  base: app ? BASE[app] : "/_console/",
   server: {
     proxy: {
       "/_admin": { target: "https://s3.imys.in", changeOrigin: true },

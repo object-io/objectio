@@ -6,7 +6,7 @@ import OpsApp from "./App";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter basename="/_console">
+    <BrowserRouter basename="/_console/admin">
       <OpsApp />
     </BrowserRouter>
   </StrictMode>

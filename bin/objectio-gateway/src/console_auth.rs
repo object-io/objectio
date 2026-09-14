@@ -73,6 +73,45 @@ fn build_oidc_provider_from_config(
     ))
 }
 
+/// Which console surface a request belongs to.
+///
+/// Two signals can say this now. A dedicated listener carries a
+/// [`ListenerKind`]; a single-port deployment distinguishes the surfaces by
+/// path instead (`/_console/admin` vs `/_console/tenant`). The path is the
+/// more specific of the two, so it wins where both are present — on the
+/// legacy listener the path is the *only* signal, since `ListenerKind::Legacy`
+/// deliberately gates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleAudience {
+    /// Operator surface: system-admin sessions only.
+    Ops,
+    /// Self-service surface: tenant sessions only.
+    Tenant,
+    /// Nothing to enforce — legacy single bundle, or a non-console listener.
+    Unscoped,
+}
+
+/// Resolve the audience from the request path, falling back to the listener.
+///
+/// `path` is the console path the browser was on when it started the flow: the
+/// request path for direct calls, or the `Referer` for the OIDC callback,
+/// which the identity provider sends to one fixed redirect URI regardless of
+/// which surface the user began on.
+#[must_use]
+pub fn console_audience(path: &str, listener: Option<ListenerKind>) -> ConsoleAudience {
+    if path.contains("/_console/admin") {
+        return ConsoleAudience::Ops;
+    }
+    if path.contains("/_console/tenant") {
+        return ConsoleAudience::Tenant;
+    }
+    match listener {
+        Some(ListenerKind::OpsConsole | ListenerKind::AdminApi) => ConsoleAudience::Ops,
+        Some(ListenerKind::TenantConsole) => ConsoleAudience::Tenant,
+        _ => ConsoleAudience::Unscoped,
+    }
+}
+
 /// Which composite listener received this request. Set per-listener as
 /// an Axum `Extension` layer in `lib.rs` so handlers can refuse session
 /// flows that don't fit the listener's audience — e.g. system-admin
@@ -1150,4 +1189,61 @@ pub async fn oidc_callback(
         .header("Set-Cookie", clear_state)
         .body(axum::body::Body::empty())
         .unwrap()
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    #[test]
+    fn path_identifies_the_surface() {
+        assert_eq!(
+            console_audience("/_console/admin/users", None),
+            ConsoleAudience::Ops
+        );
+        assert_eq!(
+            console_audience("/_console/tenant/buckets", None),
+            ConsoleAudience::Tenant
+        );
+        assert_eq!(
+            console_audience("/_console/", None),
+            ConsoleAudience::Unscoped
+        );
+    }
+
+    #[test]
+    fn listener_still_works_when_there_is_no_path_signal() {
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::OpsConsole)),
+            ConsoleAudience::Ops
+        );
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::TenantConsole)),
+            ConsoleAudience::Tenant
+        );
+        // The admin API listener is gated like the operator surface.
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::AdminApi)),
+            ConsoleAudience::Ops
+        );
+        // Legacy deliberately gates nothing.
+        assert_eq!(
+            console_audience("/", Some(ListenerKind::Legacy)),
+            ConsoleAudience::Unscoped
+        );
+    }
+
+    /// The path is the more specific signal, so it wins. This is what lets a
+    /// single-port deployment host both surfaces on one listener.
+    #[test]
+    fn path_wins_over_the_listener() {
+        assert_eq!(
+            console_audience("/_console/tenant/x", Some(ListenerKind::OpsConsole)),
+            ConsoleAudience::Tenant
+        );
+        assert_eq!(
+            console_audience("/_console/admin/x", Some(ListenerKind::Legacy)),
+            ConsoleAudience::Ops
+        );
+    }
 }

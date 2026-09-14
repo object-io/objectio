@@ -6,7 +6,7 @@ import TenantApp from "./App";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter basename="/_console">
+    <BrowserRouter basename="/_console/tenant">
       <TenantApp />
     </BrowserRouter>
   </StrictMode>

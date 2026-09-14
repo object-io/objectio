@@ -27,7 +27,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{StatusCode, header},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{delete, get, head, post, put},
 };
 use clap::Parser;
@@ -1195,6 +1195,13 @@ pub async fn run(
             .merge(unity_gated.clone())
             .nest("/delta-sharing", delta_gated.clone())
             .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+            // Path-mounted consoles. These are the addressable surfaces:
+            // /_console/admin is the operator console, /_console/tenant the
+            // self-service one. Each bundle is built with its own base, so the
+            // same build serves correctly here and on a dedicated listener.
+            // The bare /_console mount stays for the legacy single bundle.
+            .nest_service("/_console/admin", console_service(&ops_console_dir))
+            .nest_service("/_console/tenant", console_service(&tenant_console_dir))
             .nest_service("/_console", console_service(&legacy_console_dir))
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
@@ -1253,7 +1260,17 @@ pub async fn run(
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
                 .nest("/_admin/delta-sharing", delta_admin_gated.clone())
-                .nest_service("/_console", console_service(&ops_console_dir))
+                // Same canonical path as the single-port mount, so one
+                // build serves both modes.
+                .nest_service("/_console/admin", console_service(&ops_console_dir))
+                .route(
+                    "/",
+                    get(|| async { Redirect::permanent("/_console/admin/") }),
+                )
+                .route(
+                    "/_console",
+                    get(|| async { Redirect::permanent("/_console/admin/") }),
+                )
                 .layer(Extension(ListenerKind::OpsConsole))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, ops_router, "ops console"));
@@ -1274,7 +1291,15 @@ pub async fn run(
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
                 .nest("/_admin/delta-sharing", delta_admin_gated.clone())
-                .nest_service("/_console", console_service(&tenant_console_dir))
+                .nest_service("/_console/tenant", console_service(&tenant_console_dir))
+                .route(
+                    "/",
+                    get(|| async { Redirect::permanent("/_console/tenant/") }),
+                )
+                .route(
+                    "/_console",
+                    get(|| async { Redirect::permanent("/_console/tenant/") }),
+                )
                 .layer(Extension(ListenerKind::TenantConsole))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, tenant_router, "tenant console"));
