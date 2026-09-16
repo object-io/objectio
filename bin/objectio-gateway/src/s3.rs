@@ -3918,9 +3918,12 @@ pub async fn delete_object(
         get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
         && !meta.stripes.is_empty()
     {
-        let failed =
-            crate::osd_pool::delete_shards_for_object(&state.osd_pool, &placement.nodes, &meta.stripes)
-                .await;
+        let failed = crate::osd_pool::delete_shards_for_object(
+            &state.osd_pool,
+            &placement.nodes,
+            &meta.stripes,
+        )
+        .await;
         if failed > 0 {
             // Leaked blocks, not lost data — the object is gone either way.
             warn!(

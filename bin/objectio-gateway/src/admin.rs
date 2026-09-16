@@ -460,7 +460,9 @@ pub fn extract_caller(
 /// refusal rather than a narrowing: there is no meaningful way to apply
 /// "confined to s3://ws1/" to "create a tenant".
 fn deny_scoped_credential(auth: &Option<Extension<AuthResult>>) -> Option<Response> {
-    let Some(Extension(a)) = auth else { return None };
+    let Some(Extension(a)) = auth else {
+        return None;
+    };
     let scoped = a.scope.as_ref().is_some_and(|s| !s.scope.is_empty());
     if scoped {
         return Some(
@@ -1212,9 +1214,7 @@ pub async fn admin_list_buckets(
         if let Some(deny) = require_system_admin(&auth, &headers) {
             return deny;
         }
-    } else if let Some(deny) =
-        require_tenant_admin_access(&state, &auth, &headers, &tenant).await
-    {
+    } else if let Some(deny) = require_tenant_admin_access(&state, &auth, &headers, &tenant).await {
         return deny;
     }
 

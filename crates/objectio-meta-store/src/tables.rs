@@ -8,8 +8,7 @@ pub const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets"
 // Raft CAS apply path opens. raft_storage::apply_multi_cas opens every
 // CAS table as `Table<&str, &[u8]>`; defining it as `<&str, &str>` here
 // would surface as a runtime type-mismatch on any transactional write.
-pub const BUCKET_POLICIES: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("bucket_policies");
+pub const BUCKET_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("bucket_policies");
 pub const MULTIPART_UPLOADS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("multipart_uploads");
 
@@ -95,8 +94,7 @@ pub const UNITY_SCHEMAS: TableDefinition<&str, &[u8]> = TableDefinition::new("un
 // Key: "{catalog}\x00{schema}\x00{table}". Value: prost-encoded UnityTable.
 pub const UNITY_TABLES: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_tables");
 // Key: "{catalog}\x00{schema}\x00{function}". Value: prost-encoded UnityFunction.
-pub const UNITY_FUNCTIONS: TableDefinition<&str, &[u8]> =
-    TableDefinition::new("unity_functions");
+pub const UNITY_FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_functions");
 // Key: "{catalog}\x00{schema}\x00{volume}". Value: prost-encoded UnityVolume.
 pub const UNITY_VOLUMES: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_volumes");
 // Key: "{catalog}\x00{schema}\x00{model}". Value: prost-encoded UnityModel.

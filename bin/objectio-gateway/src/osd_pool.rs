@@ -644,9 +644,7 @@ pub async fn delete_shards_for_object(
                     let fut = client.delete_shard(req);
                     let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
                         .await
-                        .map_err(|_| {
-                            OsdPoolError::ConnectionFailed("delete_shard timeout".into())
-                        })?
+                        .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
                         .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
                     Ok::<_, OsdPoolError>(resp.into_inner().success)
                 });
@@ -663,7 +661,10 @@ pub async fn delete_shards_for_object(
             warn!("delete_shard failed: {e}");
         }
     }
-    tracing::debug!("delete_shards_for_object: {} of {total} calls failed", failed);
+    tracing::debug!(
+        "delete_shards_for_object: {} of {total} calls failed",
+        failed
+    );
     failed
 }
 

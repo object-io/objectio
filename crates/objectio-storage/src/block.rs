@@ -300,7 +300,6 @@ impl BlockBitmap {
         Ok(())
     }
 
-
     pub fn free(&self, block: u64) -> Result<()> {
         if block >= self.total_blocks {
             return Err(Error::Storage(format!(

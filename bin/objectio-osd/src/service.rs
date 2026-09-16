@@ -925,7 +925,9 @@ impl StorageService for OsdService {
         let removed = self.shard_index.write().remove(&key);
         // Mirror the removal in the persistent index so a future
         // restart doesn't resurrect the deleted shard.
-        if removed.is_some() && let Err(e) = Self::forget_shard_location(&self.meta_store, &key) {
+        if removed.is_some()
+            && let Err(e) = Self::forget_shard_location(&self.meta_store, &key)
+        {
             warn!("Failed to persist shard delete for {key}: {e}");
         }
 

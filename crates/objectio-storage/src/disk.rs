@@ -617,7 +617,10 @@ mod tests {
 
         let disk = DiskManager::open(&path).unwrap();
         assert!(disk.is_block_allocated(taken[0]));
-        assert!(!disk.is_block_allocated(taken[1]), "a freed block came back allocated");
+        assert!(
+            !disk.is_block_allocated(taken[1]),
+            "a freed block came back allocated"
+        );
         assert!(disk.is_block_allocated(taken[4]));
         assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
     }
@@ -633,7 +636,8 @@ mod tests {
 
         let total = disk.capacity() / u64::from(disk.block_size());
         for _ in 0..total {
-            disk.allocate_block().expect("should allocate up to capacity");
+            disk.allocate_block()
+                .expect("should allocate up to capacity");
         }
         assert_eq!(disk.free_space(), 0);
         assert!(
@@ -657,7 +661,10 @@ mod tests {
         assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
         // The next allocation avoids every reconciled block.
         let next = disk.allocate_block().unwrap();
-        assert!(![0, 1, 2, 9].contains(&next), "allocator reused a live block {next}");
+        assert!(
+            ![0, 1, 2, 9].contains(&next),
+            "allocator reused a live block {next}"
+        );
     }
     use super::*;
     use tempfile::tempdir;
