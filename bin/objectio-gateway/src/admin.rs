@@ -1327,6 +1327,41 @@ pub async fn admin_delete_bucket(
     } else if let Some(deny) = require_tenant_admin_access(&state, &auth, &headers, &tenant).await {
         return deny;
     }
+    // Refuse a bucket that still holds objects, as S3 does.
+    //
+    // This used to drop the bucket regardless, without deleting the objects
+    // in it — so every one of their shards was orphaned on the platter with
+    // nothing left to point at them. It is the same leak that filled this
+    // deployment's disk, reached by a different route, and it survived the
+    // fix to the object-delete path because it never went through it.
+    //
+    // Refusing rather than cascading: a bucket delete that silently removes
+    // an unknown quantity of data is the wrong default for an operator API,
+    // and a caller that wants it gone can list and delete, which now
+    // reclaims correctly.
+    match state
+        .scatter_gather
+        .list_objects(&mut client.clone(), &name, "", 1, None)
+        .await
+    {
+        Ok(result) if result.objects.iter().any(|o| !o.is_delete_marker) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("bucket '{name}' is not empty: delete its objects first"),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Cannot prove it is empty, so do not destroy it.
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not check whether '{name}' is empty: {e}"),
+            )
+                .into_response();
+        }
+    }
+
     match client
         .delete_bucket(objectio_proto::metadata::DeleteBucketRequest { name })
         .await

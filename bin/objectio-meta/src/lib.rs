@@ -7,6 +7,7 @@
 pub mod balancer;
 pub mod block_service;
 pub mod drain_observer;
+pub mod liveness;
 pub mod raft_admin;
 pub mod raft_rpc;
 pub mod service;
@@ -289,6 +290,7 @@ pub async fn run(
     // issues client_writes. Kick it off once the Raft handle is wired
     // so `is_raft_leader` returns a meaningful answer.
     drain_observer::spawn(meta_service.clone());
+    liveness::spawn(meta_service.clone());
     // PG balancer — leader-only, evaluates placement-group load each
     // tick. Currently observational (Phase 4a); execution lands with
     // the Phase 5 migration path.
