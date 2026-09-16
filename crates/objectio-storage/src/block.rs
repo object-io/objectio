@@ -277,6 +277,30 @@ impl BlockBitmap {
     }
 
     /// Free a single block
+    /// Mark a block used without searching for a free one.
+    ///
+    /// For reconciling a bitmap against a source of truth that already
+    /// exists — an OSD replaying its shard index over a disk whose bitmap
+    /// predates the allocator being wired up. Idempotent: a block already
+    /// marked is left alone rather than counted twice, because a caller
+    /// replaying an index cannot easily know which entries are new.
+    pub fn mark_used(&self, block: u64) -> Result<()> {
+        if block >= self.total_blocks {
+            return Err(Error::Storage(format!(
+                "block {} out of range (max {})",
+                block, self.total_blocks
+            )));
+        }
+        let mut data = self.data.write();
+        if Self::is_set_in_slice(&data, block) {
+            return Ok(());
+        }
+        Self::set_in_slice(&mut data, block);
+        self.free_blocks.fetch_sub(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+
     pub fn free(&self, block: u64) -> Result<()> {
         if block >= self.total_blocks {
             return Err(Error::Storage(format!(
@@ -530,6 +554,76 @@ impl Default for BlockAllocator {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mark_used_is_idempotent() {
+        // The OSD replays its whole shard index through this on startup and
+        // cannot tell which entries the bitmap already knows about. Counting
+        // one twice would under-report free space until the next restart.
+        let b = BlockBitmap::new(64);
+        assert_eq!(b.free_count(), 64);
+        b.mark_used(7).unwrap();
+        assert_eq!(b.free_count(), 63);
+        b.mark_used(7).unwrap();
+        assert_eq!(b.free_count(), 63);
+        assert!(b.is_allocated(7));
+    }
+
+    #[test]
+    fn mark_used_rejects_a_block_past_the_end() {
+        let b = BlockBitmap::new(8);
+        assert!(b.mark_used(8).is_err());
+        assert_eq!(b.free_count(), 8);
+    }
+
+    #[test]
+    fn allocation_stops_at_the_end_of_the_device() {
+        // The bug this guards: the OSD allocated with a bare counter, so a
+        // full disk produced a write past the end of the device reported as
+        // an internal error rather than "no space".
+        let b = BlockBitmap::new(4);
+        for _ in 0..4 {
+            assert!(b.allocate().is_some());
+        }
+        assert_eq!(b.free_count(), 0);
+        assert!(b.allocate().is_none());
+    }
+
+    #[test]
+    fn a_freed_block_is_handed_out_again() {
+        let b = BlockBitmap::new(4);
+        let blocks: Vec<u64> = (0..4).map(|_| b.allocate().unwrap()).collect();
+        assert!(b.allocate().is_none());
+        b.free(blocks[2]).unwrap();
+        assert_eq!(b.free_count(), 1);
+        assert_eq!(b.allocate(), Some(blocks[2]));
+        assert!(b.allocate().is_none());
+    }
+
+    #[test]
+    fn freeing_an_unallocated_block_is_an_error() {
+        // Silently succeeding would let a double delete inflate free_count
+        // past reality, and the disk would then hand out a live block.
+        let b = BlockBitmap::new(4);
+        let block = b.allocate().unwrap();
+        b.free(block).unwrap();
+        assert!(b.free(block).is_err());
+        assert_eq!(b.free_count(), 4);
+    }
+
+    #[test]
+    fn a_bitmap_survives_a_round_trip_through_bytes() {
+        let b = BlockBitmap::new(128);
+        for block in [0u64, 5, 63, 64, 127] {
+            b.mark_used(block).unwrap();
+        }
+        let restored = BlockBitmap::from_bytes(&b.to_bytes(), 128);
+        assert_eq!(restored.free_count(), 123);
+        for block in [0u64, 5, 63, 64, 127] {
+            assert!(restored.is_allocated(block), "block {block} lost");
+        }
+        assert!(!restored.is_allocated(1));
+    }
     use super::*;
 
     #[test]
