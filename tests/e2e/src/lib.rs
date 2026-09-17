@@ -295,8 +295,22 @@ impl Cluster {
 
         let resp = req.send().expect("request");
         let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
         let bytes = resp.bytes().expect("body").to_vec();
-        Response { status, bytes }
+        Response {
+            status,
+            bytes,
+            headers,
+        }
     }
 
     /// Convenience: signed request whose body is JSON.
@@ -326,6 +340,17 @@ impl Cluster {
 pub struct Response {
     pub status: u16,
     pub bytes: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Response {
+    /// A response header, lowercased name.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
 }
 
 impl Response {

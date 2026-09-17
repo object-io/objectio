@@ -2603,17 +2603,7 @@ impl MetaService {
             return Err(Status::unavailable("no storage nodes available"));
         }
 
-        // Collect available disk placements (node, disk pairs).
-        //
-        // Honour operator intent: an OSD marked Out or Draining must not be
-        // handed new writes. The CRUSH path already does this through
-        // `active_nodes()`; this path did not filter at all, so marking an
-        // OSD out took it out of one placement engine and not the other.
-        let mut all_disks: Vec<(&OsdNode, &[u8; 16])> = nodes
-            .iter()
-            .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
-            .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
-            .collect();
+        let mut all_disks = eligible_disks(&nodes);
 
         if all_disks.is_empty() {
             return Err(Status::unavailable(
@@ -10651,5 +10641,101 @@ impl MetadataService for MetaService {
         let attachments = self.policy_attachments.read();
         let policy_names = attachments.get(&key).cloned().unwrap_or_default();
         Ok(Response::new(ListAttachedPoliciesResponse { policy_names }))
+    }
+}
+
+/// The (node, disk) pairs the legacy placement engine may choose from.
+///
+/// Extracted from `get_placement_legacy` so it can be tested without standing
+/// up a whole `MetaService`. The filter is the point: this path used to
+/// collect every registered node with no filter at all, so marking an OSD Out
+/// removed it from the CRUSH engine — which honours intent through
+/// `active_nodes()` — and not from this one. Which engine answered then
+/// decided whether the operator's instruction meant anything.
+fn eligible_disks(nodes: &[OsdNode]) -> Vec<(&OsdNode, &[u8; 16])> {
+    nodes
+        .iter()
+        .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
+        .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
+        .collect()
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use objectio_common::OsdAdminState;
+
+    fn node(id: u8, disks: usize, admin_state: OsdAdminState) -> OsdNode {
+        OsdNode {
+            node_id: [id; 16],
+            address: format!("http://127.0.0.1:{}", 9200 + u16::from(id)),
+            disk_ids: (0..disks).map(|d| [id * 10 + d as u8; 16]).collect(),
+            failure_domain: None,
+            topology: None,
+            disk_capacity_bytes: vec![1_000_000_000; disks],
+            admin_state,
+        }
+    }
+
+    #[test]
+    fn every_disk_of_an_in_node_is_selectable() {
+        let nodes = vec![node(1, 2, OsdAdminState::In), node(2, 3, OsdAdminState::In)];
+        assert_eq!(eligible_disks(&nodes).len(), 5);
+    }
+
+    #[test]
+    fn an_out_node_is_not_handed_writes() {
+        // The operator said no. Before this filter existed, the legacy engine
+        // ignored that entirely and kept placing on it.
+        let nodes = vec![
+            node(1, 2, OsdAdminState::In),
+            node(2, 2, OsdAdminState::Out),
+        ];
+        let picked = eligible_disks(&nodes);
+        assert_eq!(picked.len(), 2);
+        assert!(
+            picked.iter().all(|(n, _)| n.node_id == [1; 16]),
+            "a node marked Out was selected"
+        );
+    }
+
+    #[test]
+    fn a_draining_node_is_not_handed_writes() {
+        // Draining means "no new data, keep serving reads" — placing on it
+        // would fight the drain that is trying to empty it.
+        let nodes = vec![
+            node(1, 1, OsdAdminState::In),
+            node(2, 4, OsdAdminState::Draining),
+        ];
+        let picked = eligible_disks(&nodes);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0.node_id, [1; 16]);
+    }
+
+    #[test]
+    fn no_eligible_nodes_yields_nothing_rather_than_a_default() {
+        // The caller turns this into "no storage nodes are accepting writes",
+        // which is actionable. Falling back to any node would place data on a
+        // disk the operator is trying to remove.
+        let nodes = vec![
+            node(1, 2, OsdAdminState::Out),
+            node(2, 2, OsdAdminState::Draining),
+        ];
+        assert!(eligible_disks(&nodes).is_empty());
+    }
+
+    #[test]
+    fn a_node_with_no_disks_contributes_nothing() {
+        // The stale registration that broke writes on the live cluster looked
+        // exactly like this: still listed, zero disks.
+        let nodes = vec![node(1, 0, OsdAdminState::In), node(2, 2, OsdAdminState::In)];
+        let picked = eligible_disks(&nodes);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|(n, _)| n.node_id == [2; 16]));
+    }
+
+    #[test]
+    fn an_empty_cluster_is_empty() {
+        assert!(eligible_disks(&[]).is_empty());
     }
 }
