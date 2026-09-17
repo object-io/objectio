@@ -17,9 +17,9 @@ use crate::types::{
     CreateModelRequest, CreateModelVersionRequest, CreateSchemaRequest, CreateTableRequest,
     CreateVolumeRequest, DeleteParams, FunctionInfo, GetPolicyResponse, ListCatalogsParams,
     ListCatalogsResponse, ListFunctionsParams, ListFunctionsResponse, ListModelVersionsResponse,
-    ListModelsParams, ListModelsResponse, ListSchemasParams, ListSchemasResponse,
-    ListTablesParams, ListTablesResponse, ListVolumesParams, ListVolumesResponse, ModelInfo,
-    ModelVersionInfo, SchemaInfo, SetPolicyRequest, SetTableSecurityRequest, TableInfo,
+    ListModelsParams, ListModelsResponse, ListSchemasParams, ListSchemasResponse, ListTablesParams,
+    ListTablesResponse, ListVolumesParams, ListVolumesResponse, ModelInfo, ModelVersionInfo,
+    SchemaInfo, SetPolicyRequest, SetTableSecurityRequest, TableInfo,
     TemporaryTableCredentialsRequest, TemporaryTableCredentialsResponse,
     TemporaryVolumeCredentialsRequest, TemporaryVolumeCredentialsResponse, UpdateCatalogRequest,
     UpdateModelVersionStatusRequest, UpdateSchemaRequest, VolumeInfo,
@@ -323,7 +323,16 @@ async fn check_catalog_only(
         return Ok(());
     };
     let resource_arn = build_unity_arn(catalog, None, None);
-    check_iam_policies(state, auth_result, action, &resource_arn, catalog, None, None).await?;
+    check_iam_policies(
+        state,
+        auth_result,
+        action,
+        &resource_arn,
+        catalog,
+        None,
+        None,
+    )
+    .await?;
     let cat_policy = state
         .catalog
         .get_catalog_policy(catalog)
@@ -1219,10 +1228,7 @@ pub async fn delete_model(
         "unity:DeleteModel",
     )
     .await?;
-    state
-        .catalog
-        .delete_model(&catalog, &schema, &name)
-        .await?;
+    state.catalog.delete_model(&catalog, &schema, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -3,19 +3,40 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "objectio"
+# The distribution is "objectio-sdk" because "objectio" is taken on PyPI by an
+# unrelated (and unmaintained since 2020) package. The import stays `objectio`
+# — `pip install objectio-sdk` then `import objectio`, the same shape as
+# python-dateutil → dateutil.
+name = "objectio-sdk"
 version = "0.1.0"
 description = "Client for the ObjectIO management API (/_admin/*)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
-# No dependencies, deliberately: SigV4 is implemented on the standard
-# library so this installs into an operator or a provisioning job without
-# dragging in botocore.
+authors = [{ name = "ObjectIO" }]
+keywords = ["objectio", "s3", "object-storage", "iam", "provisioning"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: System :: Systems Administration",
+  "Topic :: System :: Distributed Computing",
+]
+# No dependencies, deliberately: SigV4 is implemented on the standard library
+# so this installs into an operator or a provisioning job without dragging in
+# botocore.
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/object-io/objectio"
+Source = "https://github.com/object-io/objectio-python-sdk"
+Issues = "https://github.com/object-io/objectio/issues"
 
 [tool.setuptools.packages.find]
 include = ["objectio*"]

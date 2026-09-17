@@ -592,6 +592,82 @@ pub async fn delete_object_meta_from_all(
     Ok(())
 }
 
+/// Delete every shard of an object from the OSDs that hold them.
+///
+/// Nothing did this. Deleting an object removed its metadata and its listing
+/// entry, so it vanished from the API, and left every shard on the platter
+/// forever — storage was write-once until the disk filled, at which point all
+/// writes failed. A cluster could report an empty bucket and a full disk at
+/// the same time.
+///
+/// The request is broadcast to every placement node rather than routed by
+/// `node_id`: an OSD that does not hold a given shard answers
+/// `success: false` and does nothing, which is cheaper than maintaining a
+/// node-to-address map here and is idempotent under retry.
+///
+/// Best-effort by design. A shard that cannot be deleted now is a leaked
+/// block, not a correctness problem — the object is already gone as far as
+/// every reader is concerned — so this never fails the caller's delete. It
+/// returns how many shards it could not place so the caller can log it.
+pub async fn delete_shards_for_object(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    stripes: &[objectio_proto::metadata::StripeMeta],
+) -> usize {
+    use objectio_proto::storage::{DeleteShardRequest, ShardId};
+
+    let targets = unique_node_placements(placements);
+    if targets.is_empty() || stripes.is_empty() {
+        return 0;
+    }
+
+    let mut futs = Vec::new();
+    for stripe in stripes {
+        // Multipart uploads write each part under its own object_id, so the
+        // id has to come from the stripe rather than the object.
+        let object_id = stripe.object_id.clone();
+        if object_id.is_empty() {
+            continue;
+        }
+        for shard in &stripe.shards {
+            for placement in &targets {
+                let req = DeleteShardRequest {
+                    shard_id: Some(ShardId {
+                        object_id: object_id.clone(),
+                        stripe_id: stripe.stripe_id,
+                        position: shard.position,
+                    }),
+                };
+                let p = placement.clone();
+                futs.push(async move {
+                    let mut client = pool.get_client_for_placement(&p).await?;
+                    let fut = client.delete_shard(req);
+                    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+                        .await
+                        .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                        .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    Ok::<_, OsdPoolError>(resp.into_inner().success)
+                });
+            }
+        }
+    }
+
+    let total = futs.len();
+    let results = futures::future::join_all(futs).await;
+    let mut failed = 0usize;
+    for r in results {
+        if let Err(e) = r {
+            failed += 1;
+            warn!("delete_shard failed: {e}");
+        }
+    }
+    tracing::debug!(
+        "delete_shards_for_object: {} of {total} calls failed",
+        failed
+    );
+    failed
+}
+
 /// Legacy same-OSD meta rename. Unused now that ObjectMeta is replicated on
 /// every shard-carrying OSD (a one-node rename would leave other replicas out
 /// of sync). Kept compiling but gated so a future rebuild with proper fan-out

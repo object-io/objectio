@@ -6,6 +6,7 @@
 //! - Background scrubbing
 
 use crate::aligned_buf::AlignedBuf;
+use crate::block::BlockBitmap;
 use crate::io_backend::{IoBackend, best_available};
 use crate::layout::{BlockFooter, BlockHeader, DEFAULT_BLOCK_SIZE, SUPERBLOCK_SIZE, Superblock};
 use crate::raw_io::{AlignedBuffer, RawFile};
@@ -36,6 +37,17 @@ pub struct DiskManager {
     superblock: RwLock<Superblock>,
     /// Next block sequence number
     sequence: AtomicU64,
+    /// Which data blocks are in use.
+    ///
+    /// The on-disk format has always reserved a region for this (see
+    /// `Superblock::bitmap_offset`), and `BlockBitmap` has always known how
+    /// to allocate and free against it — the two were simply never
+    /// connected. Until they were, the OSD allocated with a bare
+    /// incrementing counter: it never bounded itself against
+    /// `total_blocks`, so a full disk surfaced as a write past the end of
+    /// the device, and it could never reuse a block, so deleting an object
+    /// freed nothing.
+    allocator: BlockBitmap,
     /// Statistics
     stats: DiskStats,
 }
@@ -80,12 +92,14 @@ impl DiskManager {
         file.sync()?;
 
         let disk_io = best_available(&path_buf, false, true)?;
+        let allocator = BlockBitmap::new(superblock.total_blocks);
         Ok(Self {
             file,
             disk_io,
             path: path_buf,
             superblock: RwLock::new(superblock),
             sequence: AtomicU64::new(1),
+            allocator,
             stats: DiskStats::default(),
         })
     }
@@ -102,6 +116,14 @@ impl DiskManager {
         let superblock = Superblock::from_bytes(buf.as_slice())?;
         superblock.validate()?;
 
+        // Load the allocation bitmap from its reserved region. A disk
+        // written before the allocator was wired up has an all-zero bitmap
+        // even though its blocks are occupied; the OSD repairs that on
+        // startup by replaying its shard index through `mark_block_used`.
+        let mut bitmap_buf = AlignedBuffer::new(superblock.bitmap_size as usize);
+        file.read_at(superblock.bitmap_offset, bitmap_buf.as_mut_slice())?;
+        let allocator = BlockBitmap::from_bytes(bitmap_buf.as_slice(), superblock.total_blocks);
+
         let disk_io = best_available(&path_buf, false, true)?;
         Ok(Self {
             file,
@@ -109,6 +131,7 @@ impl DiskManager {
             path: path_buf,
             superblock: RwLock::new(superblock),
             sequence: AtomicU64::new(1),
+            allocator,
             stats: DiskStats::default(),
         })
     }
@@ -173,10 +196,63 @@ impl DiskManager {
         sb.total_blocks * u64::from(sb.block_size)
     }
 
-    /// Get free space in bytes
+    /// Get free space in bytes.
+    ///
+    /// Read from the live bitmap, not `superblock.free_blocks` — that field
+    /// was written once at format time and never again, which is why every
+    /// capacity reading in the cluster was the disk's full size and why a
+    /// disk could fill with nothing warning about it.
     pub fn free_space(&self) -> u64 {
+        self.allocator.free_count() * u64::from(self.block_size())
+    }
+
+    /// Get used space in bytes.
+    pub fn used_space(&self) -> u64 {
         let sb = self.superblock.read();
-        sb.free_blocks * u64::from(sb.block_size)
+        let used_blocks = sb.total_blocks.saturating_sub(self.allocator.free_count());
+        used_blocks * u64::from(sb.block_size)
+    }
+
+    /// Claim a free data block. `Error::DiskFull` when there are none.
+    pub fn allocate_block(&self) -> Result<u64> {
+        self.allocator.allocate().ok_or(Error::DiskFull)
+    }
+
+    /// Release a block back to the pool.
+    pub fn free_block(&self, block_num: u64) -> Result<()> {
+        self.allocator.free(block_num)
+    }
+
+    /// Mark a block used without allocating it.
+    ///
+    /// Only for startup reconciliation: a disk written before the allocator
+    /// existed has occupied blocks and an empty bitmap, so the OSD replays
+    /// its shard index through this to make the two agree. Idempotent — a
+    /// block already marked is left alone rather than double-counted.
+    pub fn mark_block_used(&self, block_num: u64) -> Result<()> {
+        self.allocator.mark_used(block_num)
+    }
+
+    /// Whether a block is currently allocated.
+    pub fn is_block_allocated(&self, block_num: u64) -> bool {
+        self.allocator.is_allocated(block_num)
+    }
+
+    /// Write the allocation bitmap back to its reserved region and update
+    /// `superblock.free_blocks` to match, so a restart sees the same picture.
+    pub fn persist_allocator(&self) -> Result<()> {
+        let (offset, size) = {
+            let sb = self.superblock.read();
+            (sb.bitmap_offset, sb.bitmap_size)
+        };
+        let bytes = self.allocator.to_bytes();
+        let mut buf = AlignedBuffer::new(size as usize);
+        buf.copy_from(&bytes);
+        self.file.write_at(offset, buf.as_slice())?;
+        self.superblock.write().free_blocks = self.allocator.free_count();
+        self.update_superblock()?;
+        self.file.sync()?;
+        Ok(())
     }
 
     /// Get block size
@@ -496,6 +572,100 @@ impl Drop for DiskManager {
 
 #[cfg(test)]
 mod tests {
+
+    /// `DiskManager::init` refuses anything under 1 GiB, so the tests use the
+    /// floor rather than a convenient small number.
+    const MIN_TEST_DISK: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn allocation_and_reclaim_move_the_reported_usage() {
+        // The whole point. Before this, used_space was derived from a
+        // superblock field written once at format time, so a disk reported
+        // itself empty right up until every write failed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        let capacity = disk.capacity();
+        assert_eq!(disk.used_space(), 0);
+        assert_eq!(disk.free_space(), capacity);
+
+        let a = disk.allocate_block().unwrap();
+        let b = disk.allocate_block().unwrap();
+        assert_ne!(a, b, "the allocator handed out the same block twice");
+        let block = u64::from(disk.block_size());
+        assert_eq!(disk.used_space(), 2 * block);
+
+        disk.free_block(a).unwrap();
+        assert_eq!(disk.used_space(), block);
+        // Freed space is usable again, not merely accounted for.
+        assert_eq!(disk.allocate_block().unwrap(), a);
+    }
+
+    #[test]
+    fn the_bitmap_survives_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+
+        let taken = {
+            let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+            let blocks: Vec<u64> = (0..5).map(|_| disk.allocate_block().unwrap()).collect();
+            disk.free_block(blocks[1]).unwrap();
+            disk.persist_allocator().unwrap();
+            blocks
+        };
+
+        let disk = DiskManager::open(&path).unwrap();
+        assert!(disk.is_block_allocated(taken[0]));
+        assert!(
+            !disk.is_block_allocated(taken[1]),
+            "a freed block came back allocated"
+        );
+        assert!(disk.is_block_allocated(taken[4]));
+        assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
+    }
+
+    #[test]
+    fn a_full_disk_says_so_instead_of_writing_past_the_end() {
+        // `block N exceeds total blocks M` as a 500 was the symptom that
+        // started this: a full disk has to be a distinguishable condition,
+        // because a caller can act on it and cannot act on an internal error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        let total = disk.capacity() / u64::from(disk.block_size());
+        for _ in 0..total {
+            disk.allocate_block()
+                .expect("should allocate up to capacity");
+        }
+        assert_eq!(disk.free_space(), 0);
+        assert!(
+            matches!(disk.allocate_block(), Err(Error::DiskFull)),
+            "a full disk must report DiskFull"
+        );
+    }
+
+    #[test]
+    fn mark_block_used_reconciles_a_disk_whose_bitmap_predates_the_allocator() {
+        // A disk formatted before the allocator was wired up has occupied
+        // blocks and an all-zero bitmap. Without this replay the OSD would
+        // hand out block 0 on restart and overwrite a live shard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        for block in [0u64, 1, 2, 9] {
+            disk.mark_block_used(block).unwrap();
+        }
+        assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
+        // The next allocation avoids every reconciled block.
+        let next = disk.allocate_block().unwrap();
+        assert!(
+            ![0, 1, 2, 9].contains(&next),
+            "allocator reused a live block {next}"
+        );
+    }
     use super::*;
     use tempfile::tempdir;
 

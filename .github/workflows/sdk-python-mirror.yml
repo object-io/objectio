@@ -1,0 +1,150 @@
+# Mirrors sdk/python/ to the standalone package repo
+# object-io/objectio-python-sdk, and optionally publishes to PyPI.
+#
+# Same reasoning as the Go mirror: the package is published on its own, so it
+# gets a repo whose root is the package root. Unlike Go, Python does not
+# resolve from a git URL — PyPI is the distribution channel — so the repo is
+# mostly there to give the package a home, an issue-free README and a build
+# context for the publish step.
+#
+# How to run:
+#   Automatic — every push to main that touches sdk/python/**.
+#   Manual   — Actions → "Mirror Python SDK" → "Run workflow", optionally
+#              with `tag` (e.g. 0.1.0) to tag the mirror, and `publish` to
+#              push that build to PyPI.
+#
+# What it does:
+#   1. Tests sdk/python on 3.9 and 3.12, then builds the sdist and wheel.
+#      Publishing something that does not import is the one failure mode
+#      that reaches users directly.
+#   2. Replaces the target repo's contents with sdk/python/ (deletions
+#      included), committing with the source SHA.
+#   3. With `tag`, tags v<tag>. With `publish`, uploads to PyPI.
+#
+# Required repo settings:
+#   - Target repo object-io/objectio-python-sdk must exist.
+#   - Secret SDK_MIRROR_TOKEN: fine-grained PAT, Contents: read+write on the
+#     target. The default GITHUB_TOKEN cannot write to another repository.
+#   - To publish: configure PyPI Trusted Publishing for project
+#     "objectio-sdk", owner object-io, repo objectio, workflow
+#     sdk-python-mirror.yml. That uses OIDC — no API token to store or leak.
+#     https://docs.pypi.org/trusted-publishers/
+#
+# Note on versions: a PyPI version can never be reused, even after deletion.
+# Bump rather than re-upload.
+
+name: Mirror Python SDK
+
+on:
+  push:
+    branches: [main]
+    paths: ['sdk/python/**', '.github/workflows/sdk-python-mirror.yml']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version to tag, semver without leading v (e.g. 0.1.0). Must match pyproject.toml. Empty = mirror only.'
+        required: false
+        default: ''
+      publish:
+        description: 'Also upload to PyPI (requires Trusted Publishing to be configured)'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  TARGET_REPO: object-io/objectio-python-sdk
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # id-token is what Trusted Publishing signs with; harmless when unused.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the monorepo
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test and build
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade pip build
+          pip install -e '.[dev]'
+          python -m pytest tests -q
+          python -m build
+
+      - name: Check the tag matches pyproject.toml
+        if: inputs.tag != ''
+        working-directory: sdk/python
+        run: |
+          if ! [[ "${{ inputs.tag }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc.]+[0-9]+)?$ ]]; then
+            echo "tag '${{ inputs.tag }}' is not a version without a leading 'v'" >&2
+            exit 1
+          fi
+          declared="$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          if [ "$declared" != "${{ inputs.tag }}" ]; then
+            echo "pyproject.toml says $declared but you asked to tag ${{ inputs.tag }}" >&2
+            echo "Bump the version in the monorepo first — a PyPI version cannot be reused." >&2
+            exit 1
+          fi
+
+      - name: Check out the target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.SDK_MIRROR_TOKEN }}
+          path: target
+          fetch-depth: 0
+
+      - name: Sync sdk/python into it
+        run: |
+          # Build artefacts are ours, not the mirror's.
+          rm -rf sdk/python/dist sdk/python/build sdk/python/*.egg-info
+          find sdk/python -name __pycache__ -type d -prune -exec rm -rf {} +
+          rsync -a --delete --exclude '.git/' sdk/python/ target/
+
+      - name: Commit and push
+        working-directory: target
+        run: |
+          git config user.name  "objectio-bot"
+          git config user.email "noreply@object-io.dev"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No change to mirror."
+          else
+            git commit -m "sync from object-io/objectio@${GITHUB_SHA:0:12}
+
+          Mirrored from sdk/python/. Do not edit here — open pull requests
+          against object-io/objectio."
+            git push
+          fi
+
+      - name: Tag the release
+        if: inputs.tag != ''
+        working-directory: target
+        run: |
+          if git rev-parse "v${{ inputs.tag }}" >/dev/null 2>&1; then
+            echo "v${{ inputs.tag }} already exists — refusing to move it." >&2
+            exit 1
+          fi
+          git tag -a "v${{ inputs.tag }}" -m "v${{ inputs.tag }}"
+          git push origin "v${{ inputs.tag }}"
+
+      # Rebuilt from the synced tree so what ships is exactly what the mirror
+      # holds, not what happened to be in the earlier working directory.
+      - name: Rebuild from the mirrored tree
+        if: inputs.publish
+        working-directory: target
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI
+        if: inputs.publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: target/dist

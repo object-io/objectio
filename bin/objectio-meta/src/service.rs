@@ -272,20 +272,44 @@ use objectio_proto::metadata::{
     UnityCatalog,
     UnityCreateCatalogRequest,
     UnityCreateCatalogResponse,
+    UnityCreateFunctionRequest,
+    UnityCreateFunctionResponse,
+    UnityCreateModelRequest,
+    UnityCreateModelResponse,
+    UnityCreateModelVersionRequest,
+    UnityCreateModelVersionResponse,
     UnityCreateSchemaRequest,
     UnityCreateSchemaResponse,
     UnityCreateTableRequest,
     UnityCreateTableResponse,
+    UnityCreateVolumeRequest,
+    UnityCreateVolumeResponse,
     UnityDeleteCatalogRequest,
     UnityDeleteCatalogResponse,
+    UnityDeleteFunctionRequest,
+    UnityDeleteFunctionResponse,
+    UnityDeleteModelRequest,
+    UnityDeleteModelResponse,
+    UnityDeleteModelVersionRequest,
+    UnityDeleteModelVersionResponse,
     UnityDeleteSchemaRequest,
     UnityDeleteSchemaResponse,
     UnityDeleteTableRequest,
     UnityDeleteTableResponse,
+    UnityDeleteVolumeRequest,
+    UnityDeleteVolumeResponse,
+    // Functions
+    UnityFunction,
     UnityGetCatalogPolicyRequest,
     UnityGetCatalogPolicyResponse,
     UnityGetCatalogRequest,
     UnityGetCatalogResponse,
+    UnityGetFunctionRequest,
+    UnityGetFunctionResponse,
+    UnityGetModelRequest,
+    UnityGetModelResponse,
+    UnityGetModelVersionRequest,
+    UnityGetModelVersionResponse,
     UnityGetSchemaPolicyRequest,
     UnityGetSchemaPolicyResponse,
     UnityGetSchemaRequest,
@@ -294,12 +318,25 @@ use objectio_proto::metadata::{
     UnityGetTablePolicyResponse,
     UnityGetTableRequest,
     UnityGetTableResponse,
+    UnityGetVolumeRequest,
+    UnityGetVolumeResponse,
     UnityListCatalogsRequest,
     UnityListCatalogsResponse,
+    UnityListFunctionsRequest,
+    UnityListFunctionsResponse,
+    UnityListModelVersionsRequest,
+    UnityListModelVersionsResponse,
+    UnityListModelsRequest,
+    UnityListModelsResponse,
     UnityListSchemasRequest,
     UnityListSchemasResponse,
     UnityListTablesRequest,
     UnityListTablesResponse,
+    UnityListVolumesRequest,
+    UnityListVolumesResponse,
+    // Models + Versions
+    UnityModel,
+    UnityModelVersion,
     UnitySchema,
     UnitySetCatalogPolicyRequest,
     UnitySetCatalogPolicyResponse,
@@ -312,49 +349,12 @@ use objectio_proto::metadata::{
     UnityTable,
     UnityUpdateCatalogRequest,
     UnityUpdateCatalogResponse,
-    UnityUpdateSchemaRequest,
-    UnityUpdateSchemaResponse,
-    // Functions
-    UnityFunction,
-    UnityCreateFunctionRequest,
-    UnityCreateFunctionResponse,
-    UnityListFunctionsRequest,
-    UnityListFunctionsResponse,
-    UnityGetFunctionRequest,
-    UnityGetFunctionResponse,
-    UnityDeleteFunctionRequest,
-    UnityDeleteFunctionResponse,
-    // Volumes
-    UnityVolume,
-    UnityCreateVolumeRequest,
-    UnityCreateVolumeResponse,
-    UnityListVolumesRequest,
-    UnityListVolumesResponse,
-    UnityGetVolumeRequest,
-    UnityGetVolumeResponse,
-    UnityDeleteVolumeRequest,
-    UnityDeleteVolumeResponse,
-    // Models + Versions
-    UnityModel,
-    UnityModelVersion,
-    UnityCreateModelRequest,
-    UnityCreateModelResponse,
-    UnityListModelsRequest,
-    UnityListModelsResponse,
-    UnityGetModelRequest,
-    UnityGetModelResponse,
-    UnityDeleteModelRequest,
-    UnityDeleteModelResponse,
-    UnityCreateModelVersionRequest,
-    UnityCreateModelVersionResponse,
-    UnityListModelVersionsRequest,
-    UnityListModelVersionsResponse,
-    UnityGetModelVersionRequest,
-    UnityGetModelVersionResponse,
     UnityUpdateModelVersionStatusRequest,
     UnityUpdateModelVersionStatusResponse,
-    UnityDeleteModelVersionRequest,
-    UnityDeleteModelVersionResponse,
+    UnityUpdateSchemaRequest,
+    UnityUpdateSchemaResponse,
+    // Volumes
+    UnityVolume,
     UpdatePoolRequest,
     UpdatePoolResponse,
     UpdateTenantRequest,
@@ -1579,6 +1579,37 @@ impl MetaService {
             .map(|n| n.address.clone())
     }
 
+    /// Snapshot of every registered OSD. Cloned so a caller can make network
+    /// calls without holding the lock.
+    pub fn osd_nodes_snapshot(&self) -> Vec<OsdNode> {
+        self.osd_nodes.read().clone()
+    }
+
+    /// Set one node's observed status in the topology and rebuild CRUSH.
+    ///
+    /// Nothing outside registration used to touch node status, which is why a
+    /// dead OSD stayed in the placement set: `NodeStatus::Down` existed and
+    /// `active_nodes()` already skipped it, but there was no path that ever
+    /// set it.
+    pub fn set_topology_node_status(&self, node_id: NodeId, status: NodeStatus) {
+        {
+            let mut topology = self.topology.write();
+            let Some(current) = topology.get_node(node_id) else {
+                return;
+            };
+            if current.status == status {
+                return;
+            }
+            let mut updated = current.clone();
+            updated.status = status;
+            topology.upsert_node(updated);
+        }
+        // Same rebuild the registration path does — replacing the engine
+        // wholesale would drop its stripe-group configuration.
+        let topology = self.topology.read().clone();
+        self.crush.write().update_topology(topology);
+    }
+
     /// List addresses of every registered OSD (any admin_state).
     /// Drain migrator uses this to fan out the
     /// `FindObjectsReferencingNode` scan.
@@ -2572,11 +2603,23 @@ impl MetaService {
             return Err(Status::unavailable("no storage nodes available"));
         }
 
-        // Collect all available disk placements (node, disk pairs)
+        // Collect available disk placements (node, disk pairs).
+        //
+        // Honour operator intent: an OSD marked Out or Draining must not be
+        // handed new writes. The CRUSH path already does this through
+        // `active_nodes()`; this path did not filter at all, so marking an
+        // OSD out took it out of one placement engine and not the other.
         let mut all_disks: Vec<(&OsdNode, &[u8; 16])> = nodes
             .iter()
+            .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
             .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
             .collect();
+
+        if all_disks.is_empty() {
+            return Err(Status::unavailable(
+                "no storage nodes are accepting writes (all are draining or out)",
+            ));
+        }
 
         // Use object key hash for deterministic placement
         let hash_seed = {
@@ -9364,7 +9407,9 @@ impl MetadataService for MetaService {
             store.delete_unity_model_version(&key);
         }
         self.unity_model_versions.write().remove(&key);
-        Ok(Response::new(UnityDeleteModelVersionResponse { success: true }))
+        Ok(Response::new(UnityDeleteModelVersionResponse {
+            success: true,
+        }))
     }
 
     async fn unity_set_catalog_policy(

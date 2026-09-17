@@ -3908,6 +3908,31 @@ pub async fn delete_object(
 
     // Non-versioned delete, or versioned delete with specific version_id
     let vid = version_id.as_deref().unwrap_or("");
+
+    // Reclaim the shards *before* dropping the metadata: the stripe layout is
+    // the only record of where they live, so destroying it first would leak
+    // every block the object occupied with no way left to find them. That is
+    // what used to happen — the shards were never deleted at all — so a
+    // cluster could show an empty bucket and a disk with no free blocks.
+    if let Ok(Some(meta)) =
+        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
+        && !meta.stripes.is_empty()
+    {
+        let failed = crate::osd_pool::delete_shards_for_object(
+            &state.osd_pool,
+            &placement.nodes,
+            &meta.stripes,
+        )
+        .await;
+        if failed > 0 {
+            // Leaked blocks, not lost data — the object is gone either way.
+            warn!(
+                "{}/{}: {} shard deletes failed; those blocks stay allocated",
+                bucket, key, failed
+            );
+        }
+    }
+
     if let Err(e) =
         delete_object_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
     {

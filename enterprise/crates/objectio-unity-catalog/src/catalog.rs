@@ -31,8 +31,7 @@ use objectio_proto::metadata::{
     UnityModel as ProtoModel, UnityModelVersion as ProtoModelVersion, UnitySchema as ProtoSchema,
     UnitySetCatalogPolicyRequest, UnitySetSchemaPolicyRequest, UnitySetTablePolicyRequest,
     UnitySetTableSecurityRequest, UnityTable as ProtoTable, UnityUpdateCatalogRequest,
-    UnityUpdateModelVersionStatusRequest,
-    UnityUpdateSchemaRequest, UnityVolume as ProtoVolume,
+    UnityUpdateModelVersionStatusRequest, UnityUpdateSchemaRequest, UnityVolume as ProtoVolume,
     metadata_service_client::MetadataServiceClient,
 };
 use tonic::transport::Channel;
@@ -756,10 +755,7 @@ impl UnityCatalogClient {
         schema_name: String,
         table_name: String,
         row_filter: Option<objectio_proto::metadata::UnityRowFilter>,
-        column_masks: std::collections::HashMap<
-            String,
-            objectio_proto::metadata::UnityColumnMask,
-        >,
+        column_masks: std::collections::HashMap<String, objectio_proto::metadata::UnityColumnMask>,
     ) -> Result<TableInfo> {
         let resp = self
             .meta_client

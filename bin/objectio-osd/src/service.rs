@@ -266,8 +266,6 @@ pub struct OsdService {
     start_time: Instant,
     /// Round-robin disk selection for writes
     next_disk: RwLock<usize>,
-    /// Per-disk atomic block counter for allocation (no race conditions)
-    next_block: Vec<std::sync::atomic::AtomicU64>,
     /// gRPC metrics collector
     grpc_metrics: Arc<GrpcMetrics>,
 }
@@ -484,19 +482,43 @@ impl OsdService {
             "Rebuilt shard index from persistent store: {} entries",
             persisted.len()
         );
-        // Advance the per-disk next_block cursor past any block we
-        // already wrote so we don't overwrite existing shards.
-        let next_block: Vec<std::sync::atomic::AtomicU64> = (0..num_disks)
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect();
+        // Reconcile each disk's allocation bitmap against the shard index.
+        //
+        // The index is the source of truth for what is actually on the
+        // platter. A disk formatted before the allocator was wired up has an
+        // all-zero bitmap under a full data region, so without this the OSD
+        // would hand out block 0 on restart and overwrite live shards. It is
+        // also what makes the fix work on an existing disk rather than only
+        // on a freshly formatted one.
+        let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
         for loc in persisted.values() {
-            if loc.disk_idx < next_block.len() {
-                let cur = next_block[loc.disk_idx].load(std::sync::atomic::Ordering::Relaxed);
-                let want = loc.block_num + 1;
-                if want > cur {
-                    next_block[loc.disk_idx].store(want, std::sync::atomic::Ordering::Relaxed);
-                }
+            if loc.disk_idx >= disks.len() {
+                warn!(
+                    "Shard index references disk {} but only {} are attached; skipping",
+                    loc.disk_idx,
+                    disks.len()
+                );
+                continue;
             }
+            if let Err(e) = disks[loc.disk_idx].mark_block_used(loc.block_num) {
+                warn!(
+                    "Could not mark block {} on disk {} as used: {e}",
+                    loc.block_num, loc.disk_idx
+                );
+            } else {
+                reclaimed_check[loc.disk_idx] += 1;
+            }
+        }
+        for (idx, disk) in disks.iter().enumerate() {
+            if let Err(e) = disk.persist_allocator() {
+                warn!("Could not persist allocation bitmap for disk {idx}: {e}");
+            }
+            info!(
+                "Disk {idx}: {} of {} bytes used across {} indexed shards",
+                disk.used_space(),
+                disk.capacity(),
+                reclaimed_check[idx]
+            );
         }
         Ok(Self {
             node_id,
@@ -506,7 +528,6 @@ impl OsdService {
             meta_store: Arc::new(meta_store),
             start_time: Instant::now(),
             next_disk: RwLock::new(0),
-            next_block,
             grpc_metrics: Arc::new(GrpcMetrics::default()),
         })
     }
@@ -689,11 +710,20 @@ impl OsdService {
         out
     }
 
-    /// Allocate a block for writing
+    /// Allocate a block for writing.
+    ///
+    /// Was `next_block.fetch_add(1)` — a counter that never checked itself
+    /// against the size of the device and never reused anything. A full disk
+    /// therefore surfaced as `block 2718 exceeds total blocks 2303`, a 500
+    /// from the gateway, rather than as "out of space".
     #[allow(clippy::result_large_err)]
     fn allocate_block(&self, disk_idx: usize) -> Result<u64, Status> {
-        // Atomic increment ensures no two concurrent writes get the same block
-        Ok(self.next_block[disk_idx].fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        self.disks[disk_idx].allocate_block().map_err(|e| {
+            // ResourceExhausted, not Internal: the caller can act on a full
+            // disk — pick another OSD, alert, expand — and cannot act on an
+            // internal error.
+            Status::resource_exhausted(format!("disk {disk_idx} is full: {e}"))
+        })
     }
 
     /// Get current timestamp
@@ -892,17 +922,47 @@ impl StorageService for OsdService {
 
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
 
-        let removed = self.shard_index.write().remove(&key).is_some();
+        let removed = self.shard_index.write().remove(&key);
         // Mirror the removal in the persistent index so a future
         // restart doesn't resurrect the deleted shard.
-        if removed && let Err(e) = Self::forget_shard_location(&self.meta_store, &key) {
+        if removed.is_some()
+            && let Err(e) = Self::forget_shard_location(&self.meta_store, &key)
+        {
             warn!("Failed to persist shard delete for {key}: {e}");
         }
 
-        // Note: actual block space is not reclaimed in this simple implementation
-        // A real implementation would mark the block as free in the bitmap
+        // Return the block to the pool. This used to be a comment saying a
+        // real implementation would do it, which meant storage was write-once
+        // until the disk filled and then every write failed — with the
+        // capacity readings still reporting the disk as empty, because those
+        // came from a superblock field written at format time.
+        //
+        // Order matters: the index entry goes first, so a crash between the
+        // two leaks a block rather than handing a live shard's block to the
+        // next write.
+        if let Some(loc) = removed.as_ref()
+            && loc.disk_idx < self.disks.len()
+        {
+            let disk = &self.disks[loc.disk_idx];
+            match disk.free_block(loc.block_num) {
+                Ok(()) => {
+                    if let Err(e) = disk.persist_allocator() {
+                        warn!(
+                            "Freed block {} on disk {} but could not persist the bitmap: {e}",
+                            loc.block_num, loc.disk_idx
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "Could not free block {} on disk {}: {e}",
+                    loc.block_num, loc.disk_idx
+                ),
+            }
+        }
 
-        Ok(Response::new(DeleteShardResponse { success: removed }))
+        Ok(Response::new(DeleteShardResponse {
+            success: removed.is_some(),
+        }))
     }
 
     async fn get_shard_meta(
