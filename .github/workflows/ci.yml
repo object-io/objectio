@@ -1,0 +1,110 @@
+# Rust CI — formatting, lints, unit tests, and the end-to-end smoke test.
+#
+# This did not exist. The only workflows were a manual release and three
+# that fire on `sdk/**`, so `cargo test` never ran anywhere but a developer's
+# laptop: a pull request could break the build, fail every test, and nothing
+# would say so. The workspace already had 448 unit tests and a `make ci`
+# target; nothing invoked them.
+#
+# Jobs are split so a failure names itself — "fmt" and "clippy" are cheap and
+# fail fast, "test" is the bulk, and "e2e" is the slow one that boots a real
+# cluster. Splitting also means a formatting nit does not hide a test failure
+# behind it.
+#
+# Not using `make ci` directly: it runs fmt → lint → test in one sequence, so
+# the first failure masks the rest. Same commands, run independently.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref. Saves minutes on
+  # a branch being pushed to repeatedly.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the cache useful without blowing the size limit: debug info is the
+  # bulk of target/ and the tests do not need it.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # The workspace sets clippy::all + pedantic + nursery in Cargo.toml and
+      # the Makefile passes -D warnings; match it rather than letting CI be
+      # laxer than the local command.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # Excluding the e2e package: it boots a cluster and belongs in its own
+      # job so its runtime and its failures stay legible.
+      - run: cargo test --workspace --exclude objectio-e2e
+
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    # Boots a real single-process cluster and drives it over HTTP, so it is
+    # slower than everything above put together.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: build the aio binary the tests drive
+        run: cargo build --bin objectio-aio
+      - name: run
+        run: cargo test --package objectio-e2e -- --test-threads=1 --nocapture
+
+  console:
+    name: console
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - working-directory: console
+        run: npm ci
+      - working-directory: console
+        run: npm run lint
+      # tsc runs as part of the build, so this covers type errors too.
+      - working-directory: console
+        run: npm run build

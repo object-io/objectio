@@ -2361,6 +2361,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-e2e"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "objectio-erasure"
 version = "0.1.0"
 dependencies = [
@@ -3351,7 +3363,9 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",

@@ -22,6 +22,9 @@ members = [
     "bin/objectio-osd",
     "bin/objectio-cli",
     "bin/objectio-install",
+
+    # End-to-end tests: boots a real cluster and drives it over HTTP.
+    "tests/e2e",
     "bin/objectio-block-gateway",
     "bin/objectio-aio",
     "bin/objectio-io-bench",
