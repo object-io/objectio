@@ -2594,6 +2594,7 @@ dependencies = [
  "prost",
  "serde",
  "sys-info",
+ "tempfile",
  "tokio",
  "toml",
  "tonic",

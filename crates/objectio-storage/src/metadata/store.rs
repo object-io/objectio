@@ -8,7 +8,7 @@ use super::cache::ArcCache;
 use super::types::{MetadataKey, MetadataOp, ShardMeta};
 use super::wal::{MetadataWal, WalConfig};
 use objectio_common::{Error, Result};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +75,9 @@ pub struct MetadataStore {
     compaction_lock: Mutex<()>,
     /// Shutdown flag for background thread
     shutdown: Arc<AtomicBool>,
+    /// Wakes the compaction thread out of its sleep so shutdown does not have
+    /// to wait for the interval to elapse.
+    shutdown_signal: Arc<(Mutex<()>, Condvar)>,
     /// Background compaction handle
     compaction_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -105,6 +108,7 @@ impl MetadataStore {
             config,
             compaction_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
         };
 
@@ -153,6 +157,7 @@ impl MetadataStore {
             config,
             compaction_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
         };
 
@@ -344,6 +349,7 @@ impl MetadataStore {
         let wal = Arc::clone(&self.wal);
         let index = Arc::clone(&self.index);
         let shutdown = Arc::clone(&self.shutdown);
+        let signal = Arc::clone(&self.shutdown_signal);
         let interval = self.config.compaction_interval;
         let compaction_lock = self.compaction_lock.lock();
         drop(compaction_lock); // Just checking it exists
@@ -352,7 +358,20 @@ impl MetadataStore {
             info!("Background compaction thread started");
 
             while !shutdown.load(Ordering::Relaxed) {
-                thread::sleep(interval);
+                // Sleep on a condvar rather than `thread::sleep`, so shutdown
+                // can wake this thread instead of waiting out the interval.
+                // With the plain sleep, `shutdown()` set the flag and then
+                // joined a thread that was not going to look at it for up to
+                // `compaction_interval` — 60 seconds by default. Under
+                // Kubernetes' 30-second default grace period that meant SIGKILL
+                // arrived first, and the WAL sync that shutdown performs *after*
+                // the join never ran.
+                let (lock, cv) = &*signal;
+                let mut guard = lock.lock();
+                if !shutdown.load(Ordering::Relaxed) {
+                    cv.wait_for(&mut guard, interval);
+                }
+                drop(guard);
 
                 if shutdown.load(Ordering::Relaxed) {
                     break;
@@ -389,6 +408,16 @@ impl MetadataStore {
     /// Stop background compaction and shutdown
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+
+        // Wake the compaction thread now. Taking the lock first means the flag
+        // is visible to a thread that is about to start waiting, so shutdown
+        // cannot be missed in the window between the check and the wait.
+        {
+            let (lock, cv) = &*self.shutdown_signal;
+            let guard = lock.lock();
+            cv.notify_all();
+            drop(guard);
+        }
 
         if let Some(handle) = self.compaction_handle.lock().take() {
             let _ = handle.join();
@@ -700,5 +729,65 @@ mod tests {
         let stats_after = store.cache.stats().hits.load(Ordering::Relaxed);
 
         assert!(stats_after > stats_before);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::{MetadataStore, MetadataStoreConfig};
+    use std::time::{Duration, Instant};
+
+    /// Shutting down must not wait out the compaction interval.
+    ///
+    /// The compaction thread slept for the whole interval before looking at
+    /// the shutdown flag, and `shutdown()` set the flag and then joined it —
+    /// so closing a store took up to `compaction_interval`, 60 seconds by
+    /// default. That is past Kubernetes' 30-second default grace period, so a
+    /// terminating OSD was killed before the join returned and the WAL sync
+    /// that shutdown performs *after* the join never ran.
+    #[test]
+    fn closing_a_store_does_not_wait_for_the_compaction_interval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = MetadataStoreConfig::with_data_dir(dir.path());
+        config.background_compaction = true;
+        config.compaction_interval = Duration::from_secs(600);
+
+        let store = MetadataStore::open_or_create(config).expect("open");
+        let started = Instant::now();
+        store.shutdown();
+        let took = started.elapsed();
+
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown took {took:?}; it is waiting out the compaction interval"
+        );
+    }
+
+    /// Dropping is the path a real process takes, and it must be just as quick.
+    #[test]
+    fn dropping_a_store_does_not_wait_either() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = MetadataStoreConfig::with_data_dir(dir.path());
+        config.background_compaction = true;
+        config.compaction_interval = Duration::from_secs(600);
+
+        let store = MetadataStore::open_or_create(config).expect("open");
+        let started = Instant::now();
+        drop(store);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drop waited on the compaction thread"
+        );
+    }
+
+    /// Shutting down twice is not an error — `Drop` runs after an explicit
+    /// `shutdown()` on every store that is closed deliberately.
+    #[test]
+    fn shutting_down_twice_is_harmless() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            MetadataStore::open_or_create(MetadataStoreConfig::with_data_dir(dir.path())).unwrap();
+        store.shutdown();
+        store.shutdown();
     }
 }

@@ -44,3 +44,6 @@ default = []
 # + pread. Linux 5.6+ only; no-op on macOS / Windows. Measured +25%
 # throughput on 4 MiB stripes (see objectio-docs storage-io-levels).
 io-uring = ["objectio-storage/io-uring"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
