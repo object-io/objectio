@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, transport::Channel};
 use tracing::{info, warn};
 
-use crate::ec_io::read_chunk;
+use crate::ec_io::{delete_chunk, read_chunk};
 use crate::flush::flush_volume_all;
 use crate::nbd::NbdServer;
 use crate::osd_pool::OsdPool;
@@ -150,6 +150,41 @@ impl BlockService for BlockGatewayService {
             .map_err(block_err_to_status)?;
 
         self.state.cache.remove_volume(&req.volume_id);
+
+        // Hand the storage back before the refs that name it are dropped.
+        // Deleting a volume used to remove the local records and nothing else,
+        // so every chunk it had flushed stayed on the OSDs permanently — the
+        // space was neither in use nor reclaimable, and nothing in the cluster
+        // knew it existed.
+        //
+        // Best effort, and deliberately not a reason to fail the delete: the
+        // caller asked for the volume to go away, and a shard that will not
+        // delete is a leaked block rather than a live volume.
+        match self.state.store.list_volume_chunks(&req.volume_id) {
+            Ok(chunks) => {
+                for object_key in &chunks {
+                    if let Err(e) = delete_chunk(
+                        Arc::clone(&self.state.meta_client),
+                        &self.state.osd_pool,
+                        object_key,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "volume {}: chunk {object_key} not freed: {e}",
+                            req.volume_id
+                        );
+                    }
+                }
+                if !chunks.is_empty() {
+                    info!("Freed {} chunks for volume {}", chunks.len(), req.volume_id);
+                }
+            }
+            Err(e) => warn!(
+                "volume {}: cannot list chunks, storage will leak: {e}",
+                req.volume_id
+            ),
+        }
 
         if let Err(e) = self.state.store.delete_volume(&req.volume_id) {
             warn!("Failed to delete volume record {}: {e}", req.volume_id);

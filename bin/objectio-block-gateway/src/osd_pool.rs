@@ -387,3 +387,84 @@ pub async fn delete_object_meta_from_osd(
 
     Ok(())
 }
+
+/// Free the shards a chunk generation occupies.
+///
+/// The block path had no way to give storage back. `write_chunk` mints a
+/// fresh `object_id` on every flush, so rewriting a chunk wrote a whole new
+/// stripe and orphaned the old one — and a block device is rewrite-shaped by
+/// definition, so a volume under steady write grew its OSD footprint without
+/// bound while reporting a fixed size. Volume delete had the same hole from
+/// the other end: it dropped the local chunk refs and left every shard on the
+/// platter with nothing left pointing at it.
+///
+/// Broadcast to every placement node rather than routed by `node_id`: the
+/// shard locations recorded in `ObjectMeta` carry a node id but no address,
+/// and an OSD that does not hold a given shard answers `success: false` and
+/// does nothing. Idempotent under retry, and cheaper than keeping a
+/// node-to-address map here.
+///
+/// Best effort. A shard that will not delete is a leaked block, not a failed
+/// write or a failed delete — the chunk is already unreachable as far as
+/// every reader is concerned. Returns the number of calls that failed so the
+/// caller can log it.
+pub async fn delete_shards_for_object(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    stripes: &[objectio_proto::metadata::StripeMeta],
+) -> usize {
+    use objectio_proto::storage::{DeleteShardRequest, ShardId};
+
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let targets: Vec<NodePlacement> = placements
+        .iter()
+        .filter(|p| seen.insert(p.node_id.clone()))
+        .cloned()
+        .collect();
+    if targets.is_empty() || stripes.is_empty() {
+        return 0;
+    }
+
+    let mut futs = Vec::new();
+    for stripe in stripes {
+        // The id lives on the stripe: each generation of a chunk is written
+        // under its own object_id, which is the whole reason the old one has
+        // to be chased down here.
+        let object_id = if stripe.object_id.is_empty() {
+            continue;
+        } else {
+            stripe.object_id.clone()
+        };
+        for shard in &stripe.shards {
+            for placement in &targets {
+                let req = DeleteShardRequest {
+                    shard_id: Some(ShardId {
+                        object_id: object_id.clone(),
+                        stripe_id: stripe.stripe_id,
+                        position: shard.position,
+                    }),
+                };
+                let p = placement.clone();
+                futs.push(async move {
+                    let mut client = pool.get_client_for_placement(&p).await?;
+                    let fut = client.delete_shard(req);
+                    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+                        .await
+                        .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                        .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    Ok::<_, OsdPoolError>(resp.into_inner().success)
+                });
+            }
+        }
+    }
+
+    let results = futures::future::join_all(futs).await;
+    let mut failed = 0usize;
+    for r in results {
+        if let Err(e) = r {
+            failed += 1;
+            warn!("delete_shard failed: {e}");
+        }
+    }
+    failed
+}

@@ -86,6 +86,23 @@ pub struct NbdServer {
     ec_m: u32,
 }
 
+/// Where a chunk's slice of a read lands in the reply buffer.
+///
+/// The reply is one flat buffer covering `[read_offset, read_offset + length)`
+/// and each `ChunkRange` describes one chunk's intersection with it, so a
+/// range's bytes belong at its absolute position minus where the read started.
+///
+/// Getting this wrong is invisible in a single-chunk read — the answer is
+/// always 0 — and is exactly what a read crossing a chunk boundary depends on.
+fn reply_offset(
+    range: &objectio_block::chunk::ChunkRange,
+    read_offset: u64,
+    chunk_size: u64,
+) -> usize {
+    let absolute = range.chunk_id * chunk_size + range.offset_in_chunk;
+    absolute.saturating_sub(read_offset) as usize
+}
+
 impl NbdServer {
     pub fn new(
         cache: Arc<objectio_block::WriteCache>,
@@ -366,13 +383,26 @@ impl NbdServer {
 
             match cmd {
                 NBD_CMD_READ => {
-                    let data = self
+                    let mut data = self
                         .nbd_read(vol_id, offset, length as u64)
                         .await
                         .unwrap_or_else(|e| {
                             warn!("NBD read error for {peer}: {e}");
                             vec![0u8; length as usize]
                         });
+
+                    // A simple reply has no length field, so the client reads
+                    // exactly `length` bytes off the socket no matter what we
+                    // send. Anything else desynchronises the connection for
+                    // good — belt and braces on top of nbd_read's own
+                    // guarantee, because the failure is silent corruption.
+                    if data.len() != length as usize {
+                        warn!(
+                            "NBD read for {peer} returned {} bytes for a {length}-byte request",
+                            data.len()
+                        );
+                        data.resize(length as usize, 0);
+                    }
 
                     // Reply: magic(4) + error(4) + handle(8) + data
                     stream.write_u32(NBD_REPLY_MAGIC).await?;
@@ -442,41 +472,145 @@ impl NbdServer {
         Ok(())
     }
 
+    /// Read `length` bytes at `offset`, always returning exactly that many.
+    ///
+    /// This used to serve only the chunk containing `offset`, so a read that
+    /// crossed a 4 MB boundary came back short. An NBD simple reply carries no
+    /// length — the client reads exactly as many bytes as it asked for — so a
+    /// short reply does not produce a short read, it slides the client one
+    /// frame out of step and every subsequent reply is parsed as data. A
+    /// filesystem with readahead crosses a chunk boundary within seconds of
+    /// being mounted.
+    ///
+    /// Sparse chunks read as zeros: a never-written region of a thin volume is
+    /// zeros by definition, not an error.
     async fn nbd_read(&self, vol_id: &str, offset: u64, length: u64) -> anyhow::Result<Vec<u8>> {
-        // Try cache first
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Try cache first — it assembles across chunks itself.
         if let Some(data) = self.cache.read(vol_id, offset, length) {
             return Ok(data);
         }
 
-        // Cache miss: determine chunk and read from EC
         let chunk_mapper = objectio_block::chunk::ChunkMapper::default();
-        let chunk_id = chunk_mapper.byte_offset_to_chunk_id(offset);
+        let chunk_size = chunk_mapper.chunk_size() as usize;
+        let mut out = vec![0u8; length as usize];
 
-        let object_key = self.store.get_chunk(vol_id, chunk_id)?;
+        for range in chunk_mapper.byte_range_to_chunks(offset, length) {
+            let chunk_data = match self.store.get_chunk(vol_id, range.chunk_id)? {
+                Some(key) => {
+                    read_chunk(
+                        Arc::clone(&self.meta_client),
+                        &self.osd_pool,
+                        &key,
+                        self.ec_k,
+                        self.ec_m,
+                    )
+                    .await?
+                }
+                None => vec![0u8; chunk_size],
+            };
 
-        let chunk_data = if let Some(key) = object_key {
-            read_chunk(
-                Arc::clone(&self.meta_client),
-                &self.osd_pool,
-                &key,
-                self.ec_k,
-                self.ec_m,
-            )
-            .await?
-        } else {
-            // Sparse (never written) → return zeros
-            vec![0u8; chunk_mapper.chunk_size() as usize]
-        };
+            self.cache.add_clean(
+                vol_id,
+                range.chunk_id,
+                bytes::Bytes::from(chunk_data.clone()),
+            );
 
-        // Add to clean cache
-        self.cache
-            .add_clean(vol_id, chunk_id, bytes::Bytes::from(chunk_data.clone()));
+            // Copy what this chunk actually holds; anything past its end stays
+            // zero rather than shortening the reply.
+            let dst = reply_offset(&range, offset, chunk_mapper.chunk_size());
+            let start = (range.offset_in_chunk as usize).min(chunk_data.len());
+            let end = (start + range.length as usize).min(chunk_data.len());
+            let src = &chunk_data[start..end];
+            let copy = src.len().min(out.len().saturating_sub(dst));
+            out[dst..dst + copy].copy_from_slice(&src[..copy]);
+        }
 
-        // Slice out the requested range
-        let chunk_offset = chunk_mapper.byte_offset_to_chunk_id(offset) * chunk_mapper.chunk_size();
-        let start = (offset - chunk_offset) as usize;
-        let end = (start as u64 + length) as usize;
-        let end = end.min(chunk_data.len());
-        Ok(chunk_data[start..end].to_vec())
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reply_offset;
+    use objectio_block::chunk::ChunkMapper;
+
+    /// The reply buffer must be tiled exactly: every byte written once, no
+    /// gaps, no overlaps, nothing past the end.
+    ///
+    /// The bug this pins served only the chunk containing the start offset, so
+    /// a read crossing a boundary came back short — and an NBD simple reply
+    /// has no length field, so a short reply slides the client one frame out of
+    /// step and silently corrupts everything after it.
+    fn assert_tiles(offset: u64, length: u64) {
+        let mapper = ChunkMapper::default();
+        let chunk_size = mapper.chunk_size();
+        let mut covered = vec![0u8; usize::try_from(length).unwrap()];
+
+        for range in mapper.byte_range_to_chunks(offset, length) {
+            let dst = reply_offset(&range, offset, chunk_size);
+            let len = usize::try_from(range.length).unwrap();
+            assert!(
+                dst + len <= covered.len(),
+                "chunk {} writes past the end of a {length}-byte reply at {offset}",
+                range.chunk_id
+            );
+            for b in &mut covered[dst..dst + len] {
+                *b += 1;
+            }
+        }
+
+        assert!(
+            covered.iter().all(|&n| n == 1),
+            "read at {offset} for {length} bytes does not tile its reply: \
+             {} bytes unwritten, {} written twice",
+            covered.iter().filter(|&&n| n == 0).count(),
+            covered.iter().filter(|&&n| n > 1).count(),
+        );
+    }
+
+    #[test]
+    fn a_read_inside_one_chunk_starts_at_zero() {
+        assert_tiles(0, 4096);
+        assert_tiles(1024, 4096);
+    }
+
+    #[test]
+    fn a_read_crossing_one_boundary_tiles_both_chunks() {
+        let chunk = ChunkMapper::default().chunk_size();
+        assert_tiles(chunk - 64 * 1024, 128 * 1024);
+    }
+
+    #[test]
+    fn a_read_spanning_several_whole_chunks_tiles_all_of_them() {
+        let chunk = ChunkMapper::default().chunk_size();
+        assert_tiles(0, chunk * 3);
+        assert_tiles(chunk * 5, chunk * 2);
+    }
+
+    #[test]
+    fn an_unaligned_read_across_three_chunks_tiles_them() {
+        // The shape a filesystem actually produces: neither end on a boundary.
+        let chunk = ChunkMapper::default().chunk_size();
+        assert_tiles(chunk + 1234, chunk * 2 + 4567);
+    }
+
+    #[test]
+    fn a_read_starting_far_into_the_volume_tiles_correctly() {
+        // reply_offset subtracts the read offset from an absolute position; at
+        // a large offset an unsubtracted value would index far out of bounds.
+        let chunk = ChunkMapper::default().chunk_size();
+        assert_tiles(chunk * 100_000 + 512, 256 * 1024);
+    }
+
+    #[test]
+    fn single_sector_reads_tile_at_every_position_in_a_chunk() {
+        let chunk = ChunkMapper::default().chunk_size();
+        for at in [0, 512, chunk / 2, chunk - 512, chunk, chunk + 512] {
+            assert_tiles(at, 512);
+        }
     }
 }
