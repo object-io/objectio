@@ -224,3 +224,70 @@ fn a_non_ascii_object_key_round_trips() {
         assert_eq!(got.text(), key, "round trip changed the body for {key:?}");
     }
 }
+
+/// A zero-byte object can be read back.
+///
+/// It could be written and never read: an empty object has no stripes — there
+/// are no bytes to erasure-code — and the GET path treated a missing stripe
+/// list as corruption and answered 500 `InternalError`. `touch x && aws s3 cp
+/// x s3://b/` succeeded and `aws s3 cp s3://b/x .` failed, which makes every
+/// empty file a write-only object. Empty files are ordinary: .gitkeep, an
+/// empty `__init__.py`, a zero-length marker.
+#[test]
+fn a_zero_byte_object_round_trips() {
+    let c = Cluster::start();
+    c.json("POST", "/_admin/buckets", json!({"name": "empties"}))
+        .expect_ok();
+
+    c.request("PUT", "/empties/nothing.txt", b"").expect(200);
+
+    let got = c.request("GET", "/empties/nothing.txt", &[]);
+    got.expect(200);
+    assert!(
+        got.bytes.is_empty(),
+        "a zero-byte object came back with {} bytes",
+        got.bytes.len()
+    );
+    assert_eq!(
+        got.header("content-length").as_deref(),
+        Some("0"),
+        "Content-Length must be 0, not absent"
+    );
+
+    // It lists, and it deletes.
+    let listed = c.request("GET", "/empties?prefix=nothing", &[]);
+    listed.expect(200);
+    assert!(
+        listed.text().contains("nothing.txt"),
+        "a zero-byte object is missing from the listing: {}",
+        listed.text()
+    );
+    c.request("DELETE", "/empties/nothing.txt", &[]).expect(204);
+    assert_eq!(
+        c.request("GET", "/empties/nothing.txt", &[]).status,
+        404,
+        "a deleted zero-byte object is still readable"
+    );
+}
+
+/// And a Range over one is unsatisfiable rather than a server error.
+#[test]
+fn a_range_over_a_zero_byte_object_is_unsatisfiable() {
+    let c = Cluster::start();
+    c.json("POST", "/_admin/buckets", json!({"name": "empty-range"}))
+        .expect_ok();
+    c.request("PUT", "/empty-range/nothing.txt", b"")
+        .expect(200);
+
+    // `bytes=-5` is the one that used to underflow `total_size - 1` before it
+    // was guarded; the 500 above hid it, since the handler never got this far.
+    for range in ["bytes=-5", "bytes=0-0", "bytes=0-"] {
+        let got =
+            c.request_with_headers("GET", "/empty-range/nothing.txt", &[], &[("range", range)]);
+        assert_eq!(
+            got.status, 416,
+            "Range {range} over a zero-byte object answered {} rather than 416",
+            got.status
+        );
+    }
+}

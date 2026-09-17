@@ -366,6 +366,27 @@ impl Cluster {
         self.request_as(method, path, body, &self.access_key, &self.secret_key)
     }
 
+    /// Signed request carrying extra headers that are *not* signed.
+    ///
+    /// `SigV4` only covers the headers named in `SignedHeaders`, and real clients
+    /// do not sign `Range`, so sending it unsigned is what an SDK does.
+    pub fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        extra: &[(&str, &str)],
+    ) -> Response {
+        self.request_inner(
+            method,
+            path,
+            body,
+            &self.access_key,
+            &self.secret_key,
+            extra,
+        )
+    }
+
     /// Signed request with specific credentials — for testing what a scoped
     /// or tenant-scoped key is allowed to do.
     pub fn request_as(
@@ -375,6 +396,18 @@ impl Cluster {
         body: &[u8],
         access_key: &str,
         secret_key: &str,
+    ) -> Response {
+        self.request_inner(method, path, body, access_key, secret_key, &[])
+    }
+
+    fn request_inner(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        access_key: &str,
+        secret_key: &str,
+        extra_headers: &[(&str, &str)],
     ) -> Response {
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.endpoint.trim_start_matches("http://").to_string();
@@ -448,6 +481,9 @@ impl Cluster {
                      SignedHeaders={signed_headers}, Signature={signature}"
                 ),
             );
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
         if json_body {
             req = req.header("Content-Type", "application/json");
         }

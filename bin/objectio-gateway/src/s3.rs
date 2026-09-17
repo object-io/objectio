@@ -3032,9 +3032,44 @@ pub async fn get_object(
         }
     };
 
+    // A zero-byte object legitimately has no stripes — there are no bytes to
+    // erasure-code, so nothing was ever written to an OSD. It used to fall
+    // into the "no stripe metadata" arm below and answer 500, so an empty file
+    // could be stored and then never read back: `touch x && aws s3 cp x
+    // s3://b/` succeeded and `aws s3 cp s3://b/x .` returned InternalError.
+    // Empty files are ordinary — .gitkeep, an empty __init__.py, a zero-length
+    // marker — and this made every one of them a write-only object.
+    if object.stripes.is_empty() && object.size == 0 {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &object.content_type)
+            .header(header::CONTENT_LENGTH, "0")
+            .header("ETag", &object.etag)
+            .header("Accept-Ranges", "bytes")
+            .header(
+                header::LAST_MODIFIED,
+                timestamp_to_http_date(object.modified_at),
+            );
+        // Any Range over zero bytes is unsatisfiable, which is what
+        // `parse_range_header` already says; answer it the way the ranged path
+        // below would rather than returning a body the client did not ask for.
+        if headers.contains_key(header::RANGE) {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("Content-Range", "bytes */0")
+                .body(Body::empty())
+                .unwrap();
+        }
+        builder = add_metadata_headers(builder, &object.user_metadata);
+        return builder.body(Body::empty()).unwrap();
+    }
+
     // Check for stripes
     if object.stripes.is_empty() {
-        error!("Object has no stripe metadata: {}/{}", bucket, key);
+        error!(
+            "Object has no stripe metadata: {}/{} (size {})",
+            bucket, key, object.size
+        );
         return S3Error::xml_response(
             "InternalError",
             "Object has no stripe metadata",
