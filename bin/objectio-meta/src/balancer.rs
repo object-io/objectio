@@ -227,6 +227,67 @@ fn copy_count(pool: &PoolConfig) -> usize {
     }
 }
 
+/// How many moves one pool may commit in a single tick.
+///
+/// `0` means auto, documented as `max(3, osd_count / 3)`. The code applied the
+/// floor to the wrong operand — `active_osds.max(3) / 3` — so the floor never
+/// took effect and it read as `osd_count / 3`, which on a small cluster is 1.
+/// A three-OSD cluster that needed rebalancing therefore moved one PG a
+/// minute, a floor of three being the whole reason `.max(3)` was written.
+fn per_tick_cap(active_osds: usize, override_value: usize) -> usize {
+    if override_value > 0 {
+        override_value
+    } else {
+        (active_osds / 3).max(3)
+    }
+}
+
+/// How many PGs each of this PG's OSDs is currently carrying.
+///
+/// An osd_id that is not 16 bytes is dropped rather than counted as zero:
+/// treating a malformed id as an empty OSD would make the PG look colder than
+/// it is and pull work toward a disk that does not exist.
+fn pg_osd_counts(pg: &PlacementGroup, osd_counts: &HashMap<[u8; 16], usize>) -> Vec<usize> {
+    pg.osd_ids
+        .iter()
+        .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
+        .map(|arr| *osd_counts.get(&arr).unwrap_or(&0))
+        .collect()
+}
+
+/// A PG's cost: how far its hottest OSD is above the ideal share. Sorted on,
+/// so the hottest PG is considered first.
+fn pg_cost(counts: &[usize], target: f64) -> f64 {
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+    (max_count as f64) - target
+}
+
+/// Whether a PG is worth considering for a move this tick.
+///
+/// Two independent reasons. Hot: one of its OSDs is at or above the overload
+/// threshold. Cold-swap: some OSD in the cluster is underloaded *and* this PG
+/// has an OSD above target to swap away from it — without that second half
+/// every PG in the pool would qualify the moment one disk ran cold, and the
+/// balancer would churn through all of them.
+fn is_candidate(
+    counts: &[usize],
+    target: f64,
+    overload_threshold: f64,
+    has_cold_osd: bool,
+) -> bool {
+    let hot = counts.iter().any(|c| (*c as f64) >= overload_threshold);
+    let cold_swap = has_cold_osd && counts.iter().any(|c| (*c as f64) > target);
+    hot || cold_swap
+}
+
+/// Whether a candidate copyset is enough better than the current one to be
+/// worth the move. Requires `best <= factor * current`, which with the default
+/// 0.90 means a 10% improvement. Without a margin the balancer flip-flops
+/// between two near-equal placements forever.
+fn improves_enough(best_cost: f64, current_load: f64, factor: f64) -> bool {
+    best_cost < current_load * factor
+}
+
 async fn evaluate_pool(
     meta: &Arc<MetaService>,
     pool: &PoolConfig,
@@ -282,11 +343,7 @@ async fn evaluate_pool(
         return Ok(stats);
     }
 
-    let per_tick_cap = if tuning.per_tick_cap_override > 0 {
-        tuning.per_tick_cap_override
-    } else {
-        active_osds.max(3) / 3
-    };
+    let per_tick_cap = per_tick_cap(active_osds, tuning.per_tick_cap_override);
 
     // Score PGs: cost = max count across its OSDs - target. Filter
     // when either (a) some OSD >= overload_threshold, or (b) any
@@ -300,32 +357,11 @@ async fn evaluate_pool(
     let mut scored: Vec<(f64, PlacementGroup)> = pgs
         .into_iter()
         .map(|pg| {
-            let max_count = pg
-                .osd_ids
-                .iter()
-                .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
-                .map(|arr| *osd_counts.get(&arr).unwrap_or(&0))
-                .max()
-                .unwrap_or(0);
-            ((max_count as f64) - target, pg)
+            let counts = pg_osd_counts(&pg, &osd_counts);
+            (pg_cost(&counts, target), counts, pg)
         })
-        .filter(|(_, pg)| {
-            let hot = pg
-                .osd_ids
-                .iter()
-                .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
-                .any(|arr| (*osd_counts.get(&arr).unwrap_or(&0) as f64) >= overload_threshold);
-            // Underload path: there exists a cold OSD somewhere AND
-            // this PG has an OSD above target (a candidate to swap
-            // out toward the cold one).
-            let cold_swap = has_cold_osd
-                && pg
-                    .osd_ids
-                    .iter()
-                    .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
-                    .any(|arr| (*osd_counts.get(&arr).unwrap_or(&0) as f64) > target);
-            hot || cold_swap
-        })
+        .filter(|(_, counts, _)| is_candidate(counts, target, overload_threshold, has_cold_osd))
+        .map(|(cost, _, pg)| (cost, pg))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     stats.candidates = scored.len() as u64;
@@ -366,7 +402,7 @@ async fn evaluate_pool(
         let best_cost = best_cost_cell.get();
 
         // Improvement gate: require best candidate ≤ factor × current.
-        if best_cost >= current_load * tuning.improvement {
+        if !improves_enough(best_cost, current_load, tuning.improvement) {
             debug!(
                 "balancer: pool={} pg_id={} improvement {}→{} below {}×; skip",
                 pool.name, pg.pg_id, current_load, best_cost, tuning.improvement
@@ -492,4 +528,171 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pg(osd_ids: &[[u8; 16]]) -> PlacementGroup {
+        PlacementGroup {
+            pg_id: 1,
+            osd_ids: osd_ids.iter().map(|id| id.to_vec()).collect(),
+            version: 1,
+            ..Default::default()
+        }
+    }
+
+    fn osd(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+
+    // ── per-tick cap ──────────────────────────────────────────────────────
+
+    /// The floor is the point of the auto value.
+    ///
+    /// `active_osds.max(3) / 3` put the `.max(3)` on the wrong side of the
+    /// division, so it never did anything: a three-OSD cluster got a cap of
+    /// one move per tick and, at the default 60-second sweep, took an hour to
+    /// move sixty PGs.
+    #[test]
+    fn a_small_cluster_still_gets_three_moves_a_tick() {
+        for osds in [1, 2, 3, 6, 9] {
+            assert!(
+                per_tick_cap(osds, 0) >= 3,
+                "{osds} OSDs got a cap of {}",
+                per_tick_cap(osds, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_cluster_scales_with_a_third_of_its_osds() {
+        assert_eq!(per_tick_cap(30, 0), 10);
+        assert_eq!(per_tick_cap(300, 0), 100);
+    }
+
+    #[test]
+    fn an_explicit_cap_wins_over_the_auto_value() {
+        assert_eq!(per_tick_cap(300, 1), 1);
+        assert_eq!(per_tick_cap(3, 25), 25);
+    }
+
+    #[test]
+    fn an_empty_cluster_does_not_divide_by_zero() {
+        assert_eq!(per_tick_cap(0, 0), 3);
+    }
+
+    // ── per-PG counts ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_pgs_counts_are_read_from_the_live_map() {
+        let mut counts = HashMap::new();
+        counts.insert(osd(1), 5);
+        counts.insert(osd(2), 2);
+        assert_eq!(pg_osd_counts(&pg(&[osd(1), osd(2)]), &counts), vec![5, 2]);
+    }
+
+    #[test]
+    fn an_osd_absent_from_the_map_counts_as_empty() {
+        // A newly registered OSD holds no PGs yet; that is a real zero, not a
+        // missing measurement.
+        let counts = HashMap::new();
+        assert_eq!(pg_osd_counts(&pg(&[osd(9)]), &counts), vec![0]);
+    }
+
+    /// A malformed osd_id is dropped, not counted as an empty OSD.
+    ///
+    /// Counting it as zero would drag the PG's apparent load down and make the
+    /// balancer move work toward a disk that does not exist.
+    #[test]
+    fn a_malformed_osd_id_is_ignored_rather_than_read_as_empty() {
+        let mut counts = HashMap::new();
+        counts.insert(osd(1), 7);
+        let mut bad = pg(&[osd(1)]);
+        bad.osd_ids.push(vec![0u8; 4]);
+        assert_eq!(pg_osd_counts(&bad, &counts), vec![7]);
+    }
+
+    // ── cost ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cost_is_the_hottest_osds_distance_above_target() {
+        assert!((pg_cost(&[2, 9, 4], 5.0) - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_underloaded_pg_has_a_negative_cost_and_sorts_last() {
+        let hot = pg_cost(&[9], 5.0);
+        let cold = pg_cost(&[1], 5.0);
+        assert!(cold < 0.0);
+        assert!(hot > cold, "a cold PG outranked a hot one");
+    }
+
+    #[test]
+    fn a_pg_with_no_usable_osds_costs_nothing_above_target() {
+        assert!((pg_cost(&[], 5.0) - -5.0).abs() < f64::EPSILON);
+    }
+
+    // ── candidate filter ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_pg_at_the_overload_threshold_is_a_candidate() {
+        // Inclusive: exactly at the threshold counts as hot.
+        assert!(is_candidate(&[6, 2], 5.0, 6.0, false));
+    }
+
+    #[test]
+    fn a_balanced_pg_is_left_alone() {
+        assert!(!is_candidate(&[5, 5, 5], 5.0, 6.0, false));
+    }
+
+    /// The cold-swap path needs both halves.
+    ///
+    /// A cold OSD somewhere is not on its own a reason to move *this* PG — if
+    /// it were, every PG in the pool would qualify the moment one disk ran
+    /// cold and the balancer would churn through all of them. It also needs an
+    /// OSD above target here, to swap away from.
+    #[test]
+    fn a_cold_osd_alone_does_not_make_every_pg_a_candidate() {
+        assert!(!is_candidate(&[5, 5], 5.0, 6.0, true));
+        assert!(is_candidate(&[6, 5], 5.0, 99.0, true));
+    }
+
+    #[test]
+    fn underload_rebalancing_stays_off_unless_it_is_enabled() {
+        // has_cold_osd is false whenever the multiplier is 0, so a PG that is
+        // merely above target is not moved.
+        assert!(!is_candidate(&[6, 5], 5.0, 99.0, false));
+    }
+
+    // ── improvement gate ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_move_needs_to_beat_the_current_placement_by_the_margin() {
+        // 10% better is not enough at factor 0.90 — the gate is strict.
+        assert!(!improves_enough(90.0, 100.0, 0.90));
+        assert!(improves_enough(89.0, 100.0, 0.90));
+    }
+
+    #[test]
+    fn a_worse_or_equal_candidate_is_refused() {
+        assert!(!improves_enough(100.0, 100.0, 0.90));
+        assert!(!improves_enough(120.0, 100.0, 0.90));
+    }
+
+    /// Near-equal placements must not trade back and forth.
+    ///
+    /// Without a margin, two copysets one PG apart would each look better than
+    /// the other on alternate ticks and the balancer would move data forever.
+    #[test]
+    fn two_near_equal_placements_do_not_flip_flop() {
+        assert!(!improves_enough(29.0, 30.0, 0.90));
+        assert!(!improves_enough(30.0, 29.0, 0.90));
+    }
+
+    #[test]
+    fn an_empty_pg_cannot_be_improved_on() {
+        assert!(!improves_enough(0.0, 0.0, 0.90));
+    }
 }
