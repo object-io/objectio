@@ -6,7 +6,7 @@
 //! - Background scrubbing
 
 use crate::aligned_buf::AlignedBuf;
-use crate::block::BlockBitmap;
+use crate::block::{BlockBitmap, Extent};
 use crate::io_backend::{IoBackend, best_available};
 use crate::layout::{BlockFooter, BlockHeader, DEFAULT_BLOCK_SIZE, SUPERBLOCK_SIZE, Superblock};
 use crate::raw_io::{AlignedBuffer, RawFile};
@@ -213,6 +213,53 @@ impl DiskManager {
         used_blocks * u64::from(sb.block_size)
     }
 
+    /// How many contiguous blocks a payload of `data_len` needs.
+    ///
+    /// One shard used to occupy exactly one block, and the block was sized for
+    /// the largest shard any scheme could produce — 4 MB. So a 4 KB object and
+    /// a 4 MB object cost the same 24 MB across a 4+2 stripe, measured at
+    /// 6144x and 6x amplification, and the real capacity limit was an object
+    /// count (~12,500 on a 294 GiB cluster) that nothing reported. Sizing the
+    /// allocation to the payload is what fixes that.
+    ///
+    /// An extent is laid out exactly as a single block was — header at the
+    /// very start, footer at the very end — so `data_len` in the header tells
+    /// a reader how far the extent runs. That is why nothing had to be added
+    /// to the persisted shard index.
+    #[must_use]
+    pub fn blocks_for(data_len: usize, block_size: usize) -> u64 {
+        let total = BlockHeader::SIZE + data_len + BlockFooter::SIZE;
+        total.div_ceil(block_size) as u64
+    }
+
+    /// Blocks a shard of `data_len` bytes occupies on this disk.
+    #[must_use]
+    pub fn blocks_for_len(&self, data_len: usize) -> u64 {
+        Self::blocks_for(data_len, self.superblock.read().block_size as usize)
+    }
+
+    /// Claim `count` contiguous free blocks, returning the first.
+    pub fn allocate_extent(&self, count: u64) -> Result<u64> {
+        self.allocator
+            .allocate_extent(count)
+            .map(|e| e.start)
+            .ok_or(Error::DiskFull)
+    }
+
+    /// Release `count` blocks starting at `start`.
+    pub fn free_extent(&self, start: u64, count: u64) -> Result<()> {
+        self.allocator.free_extent(&Extent::new(start, count))
+    }
+
+    /// Mark `count` blocks starting at `start` used, for startup
+    /// reconciliation. Idempotent, like [`Self::mark_block_used`].
+    pub fn mark_extent_used(&self, start: u64, count: u64) -> Result<()> {
+        for i in 0..count {
+            self.allocator.mark_used(start + i)?;
+        }
+        Ok(())
+    }
+
     /// Claim a free data block. `Error::DiskFull` when there are none.
     pub fn allocate_block(&self) -> Result<u64> {
         self.allocator.allocate().ok_or(Error::DiskFull)
@@ -277,27 +324,22 @@ impl DiskManager {
     ) -> Result<()> {
         let sb = self.superblock.read();
         let block_size = sb.block_size as usize;
-        let max_data_size = block_size - BlockHeader::SIZE - BlockFooter::SIZE;
+        let blocks = Self::blocks_for(data.len(), block_size);
 
-        if data.len() > max_data_size {
+        if block_num + blocks > sb.total_blocks {
             return Err(Error::Storage(format!(
-                "data size {} exceeds max block data size {}",
-                data.len(),
-                max_data_size
+                "extent {}..{} exceeds total blocks {}",
+                block_num,
+                block_num + blocks,
+                sb.total_blocks
             )));
         }
-
-        if block_num >= sb.total_blocks {
-            return Err(Error::Storage(format!(
-                "block {} exceeds total blocks {}",
-                block_num, sb.total_blocks
-            )));
-        }
+        let extent_bytes = blocks as usize * block_size;
 
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
 
         // Build block: header + data + padding + footer
-        let mut buf = AlignedBuffer::new(block_size);
+        let mut buf = AlignedBuffer::new(extent_bytes);
         let block_buf = buf.as_mut_slice();
 
         // Write header
@@ -312,9 +354,9 @@ impl DiskManager {
         // Calculate data checksum
         let data_checksum = crc32c::crc32c(data);
 
-        // Write footer at the end of the block
+        // Write footer at the end of the extent
         let footer = BlockFooter::new(data_checksum, sequence);
-        let footer_start = block_size - BlockFooter::SIZE;
+        let footer_start = extent_bytes - BlockFooter::SIZE;
         block_buf[footer_start..].copy_from_slice(&footer.to_bytes());
 
         // Calculate disk offset
@@ -327,7 +369,7 @@ impl DiskManager {
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_written
-            .fetch_add(block_size as u64, Ordering::Relaxed);
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
         Ok(())
     }
@@ -349,22 +391,31 @@ impl DiskManager {
         let offset = sb.data_offset + block_num * block_size as u64;
         drop(sb);
 
-        // Read block
-        let mut buf = AlignedBuffer::new(block_size);
-        self.file.read_at(offset, buf.as_mut_slice())?;
+        // Read the first block to learn the payload length, then the whole
+        // extent if it runs further.
+        let mut probe = AlignedBuffer::new(block_size);
+        self.file.read_at(offset, probe.as_mut_slice())?;
+        let header = BlockHeader::from_bytes(&probe.as_slice()[..BlockHeader::SIZE])?;
+
+        let extent_bytes =
+            Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
+
+        let mut whole;
+        let block_buf: &[u8] = if extent_bytes > block_size {
+            whole = AlignedBuffer::new(extent_bytes);
+            self.file.read_at(offset, whole.as_mut_slice())?;
+            whole.as_slice()
+        } else {
+            probe.as_slice()
+        };
 
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_read
-            .fetch_add(block_size as u64, Ordering::Relaxed);
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
-        let block_buf = buf.as_slice();
-
-        // Parse header
-        let header = BlockHeader::from_bytes(&block_buf[..BlockHeader::SIZE])?;
-
-        // Parse footer
-        let footer_start = block_size - BlockFooter::SIZE;
+        // Parse footer from the end of the extent
+        let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 
         // Verify sequence numbers match
@@ -423,18 +474,17 @@ impl DiskManager {
         let (block_size, offset) = {
             let sb = self.superblock.read();
             let block_size = sb.block_size as usize;
-            let max_data_size = block_size - BlockHeader::SIZE - BlockFooter::SIZE;
-            if data.len() > max_data_size {
+            // The payload spans as many blocks as it needs. It used to have to
+            // fit in one, which is why the block was sized for the largest
+            // shard any EC scheme could produce and every shard paid for that
+            // worst case whatever its actual size.
+            let blocks = Self::blocks_for(data.len(), block_size);
+            if block_num + blocks > sb.total_blocks {
                 return Err(Error::Storage(format!(
-                    "data size {} exceeds max block data size {}",
-                    data.len(),
-                    max_data_size
-                )));
-            }
-            if block_num >= sb.total_blocks {
-                return Err(Error::Storage(format!(
-                    "block {} exceeds total blocks {}",
-                    block_num, sb.total_blocks
+                    "extent {}..{} exceeds total blocks {}",
+                    block_num,
+                    block_num + blocks,
+                    sb.total_blocks
                 )));
             }
             let offset = sb.data_offset + block_num * block_size as u64;
@@ -446,7 +496,12 @@ impl DiskManager {
         // Build header+data+padding+footer into an aligned owned buf
         // so ownership can transfer through the io_uring submission
         // and the buffer's address satisfies O_DIRECT alignment.
-        let mut buf = AlignedBuf::new(block_size);
+        //
+        // The buffer covers the whole extent, not one block: header at the
+        // very start, footer at the very end of the last block, data in
+        // between. A single-block extent is byte-for-byte the old layout.
+        let extent_bytes = Self::blocks_for(data.len(), block_size) as usize * block_size;
+        let mut buf = AlignedBuf::new(extent_bytes);
         let block_buf = buf.as_mut_slice();
         let header = BlockHeader::new(sequence, object_id, object_offset, data.len() as u32);
         block_buf[..BlockHeader::SIZE].copy_from_slice(&header.to_bytes());
@@ -456,7 +511,7 @@ impl DiskManager {
 
         let data_checksum = crc32c::crc32c(data);
         let footer = BlockFooter::new(data_checksum, sequence);
-        let footer_start = block_size - BlockFooter::SIZE;
+        let footer_start = extent_bytes - BlockFooter::SIZE;
         block_buf[footer_start..].copy_from_slice(&footer.to_bytes());
 
         // Transfer to disk via IoBackend — frees the reactor and,
@@ -466,7 +521,7 @@ impl DiskManager {
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_written
-            .fetch_add(block_size as u64, Ordering::Relaxed);
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -488,20 +543,33 @@ impl DiskManager {
             )
         };
 
-        let buf = AlignedBuf::new(block_size);
-        let block_buf_owned = self.disk_io.read_at_owned(buf, offset).await?;
-        let block_buf = block_buf_owned.as_slice();
+        // Read the first block to learn how long the payload is, then the rest
+        // of the extent if it spans further. The header carries `data_size`,
+        // which is what makes the extent self-describing — no block count had
+        // to be added to the persisted shard index.
+        let first = AlignedBuf::new(block_size);
+        let first_owned = self.disk_io.read_at_owned(first, offset).await?;
+        let header = BlockHeader::from_bytes(&first_owned.as_slice()[..BlockHeader::SIZE])?;
+
+        let extent_bytes =
+            Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
+
+        let owned;
+        let block_buf: &[u8] = if extent_bytes > block_size {
+            let whole = AlignedBuf::new(extent_bytes);
+            owned = self.disk_io.read_at_owned(whole, offset).await?;
+            owned.as_slice()
+        } else {
+            first_owned.as_slice()
+        };
 
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_read
-            .fetch_add(block_size as u64, Ordering::Relaxed);
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
-        // Parse header
-        let header = BlockHeader::from_bytes(&block_buf[..BlockHeader::SIZE])?;
-
-        // Parse footer
-        let footer_start = block_size - BlockFooter::SIZE;
+        // Parse footer from the end of the extent
+        let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 
         if header.sequence != footer.sequence {
@@ -721,5 +789,136 @@ mod tests {
         disk.write_block(5, object_id, 1024, data).unwrap();
 
         assert!(disk.verify_block(5).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    const DISK: u64 = 1024 * 1024 * 1024;
+
+    fn disk(dir: &tempfile::TempDir, block_size: u32) -> DiskManager {
+        DiskManager::init(dir.path().join("d.raw"), DISK, Some(block_size)).expect("init")
+    }
+
+    /// The allocation is sized to the payload, not to the largest shard any
+    /// scheme could produce.
+    #[test]
+    fn a_payload_occupies_only_the_blocks_it_needs() {
+        let bs = 4096;
+        // header + footer is 96 bytes, so a block holds 4000 of payload.
+        assert_eq!(DiskManager::blocks_for(1, bs), 1);
+        assert_eq!(DiskManager::blocks_for(4000, bs), 1);
+        assert_eq!(DiskManager::blocks_for(4001, bs), 2);
+        assert_eq!(DiskManager::blocks_for(8000, bs), 2);
+        // A 1 MiB shard — what 4+2 produces from a 4 MiB stripe.
+        assert_eq!(DiskManager::blocks_for(1024 * 1024, bs), 257);
+    }
+
+    /// Zero-length payloads still need somewhere for the header and footer.
+    #[test]
+    fn an_empty_payload_still_takes_one_block() {
+        assert_eq!(DiskManager::blocks_for(0, 4096), 1);
+    }
+
+    /// Data larger than one block round-trips — the case that could not exist
+    /// before, because a shard had to fit in a single block.
+    #[test]
+    fn a_multi_block_payload_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        for len in [1usize, 4000, 4001, 65536, 1024 * 1024] {
+            let payload: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let blocks = d.blocks_for_len(len);
+            let start = d.allocate_extent(blocks).expect("allocate");
+
+            d.write_block(start, [7u8; 16], 0, &payload).expect("write");
+            let (header, got) = d.read_block(start).expect("read");
+
+            assert_eq!(header.data_size as usize, len, "length lost for {len}");
+            assert_eq!(got, payload, "bytes changed for a {len}-byte payload");
+        }
+    }
+
+    /// Freeing an extent returns every block, not just the first.
+    ///
+    /// Releasing only the head would leak the rest permanently — and at 4 KiB
+    /// granularity a 1 MiB shard is 257 blocks, so it would leak 256 of them.
+    #[test]
+    fn freeing_an_extent_returns_all_of_its_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let before = d.free_space();
+        let len = 1024 * 1024;
+        let blocks = d.blocks_for_len(len);
+        assert!(blocks > 1, "this test needs a multi-block extent");
+
+        let start = d.allocate_extent(blocks).expect("allocate");
+        assert!(d.free_space() < before, "allocation did not consume space");
+
+        d.free_extent(start, blocks).expect("free");
+        assert_eq!(
+            d.free_space(),
+            before,
+            "freeing the extent left {} bytes behind",
+            before.saturating_sub(d.free_space())
+        );
+    }
+
+    /// Startup reconciliation has to claim the whole extent too, or the
+    /// allocator will hand out blocks that already hold a shard.
+    #[test]
+    fn reconciliation_marks_every_block_of_an_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let blocks = d.blocks_for_len(1024 * 1024);
+        d.mark_extent_used(100, blocks).expect("mark");
+
+        for b in 100..100 + blocks {
+            assert!(d.is_block_allocated(b), "block {b} of the extent is free");
+        }
+        assert!(!d.is_block_allocated(100 + blocks), "marked one too many");
+    }
+
+    /// Two shards must never be handed overlapping blocks.
+    #[test]
+    fn extents_do_not_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let n = d.blocks_for_len(64 * 1024);
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..50 {
+            let start = d.allocate_extent(n).expect("allocate");
+            spans.push((start, start + n));
+        }
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "extents {:?} and {:?} overlap",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// A single-block extent is byte-for-byte the old layout, so the change is
+    /// a generalisation rather than a new format.
+    #[test]
+    fn a_single_block_extent_is_the_old_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+        let payload = b"small".to_vec();
+        assert_eq!(d.blocks_for_len(payload.len()), 1);
+
+        let start = d.allocate_extent(1).expect("allocate");
+        d.write_block(start, [1u8; 16], 0, &payload).unwrap();
+        let (_, got) = d.read_block(start).unwrap();
+        assert_eq!(got, payload);
     }
 }

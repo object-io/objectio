@@ -207,8 +207,17 @@ fn default_meta_endpoint() -> String {
     "http://localhost:9001".to_string()
 }
 
+/// Disk allocation granularity.
+///
+/// Derived from the storage layer's constant rather than restated, because it
+/// was restated here as 4 MiB — the *stripe* size — and that is the value the
+/// OSD actually used. `objectio_common::StorageConfig` said one thing,
+/// `objectio-storage` said another, and this said a third; this one won.
+///
+/// The effect: every shard occupied a whole 4 MiB block however small it was,
+/// so a 4 KB object and a 4 MB object both cost 24 MB across a 4+2 stripe.
 fn default_block_size() -> usize {
-    4194304
+    objectio_storage::DEFAULT_BLOCK_SIZE as usize
 }
 
 fn default_log_level() -> String {
