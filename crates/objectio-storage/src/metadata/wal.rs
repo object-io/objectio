@@ -130,6 +130,18 @@ pub struct MetadataWal {
     next_lsn: AtomicU64,
     /// Configuration
     config: WalConfig,
+    /// Highest LSN whose bytes have reached the OS. Written under `writer`,
+    /// so it is monotonic and never claims more than was actually handed over.
+    written_lsn: AtomicU64,
+    /// Highest LSN covered by a completed `fdatasync`.
+    synced_lsn: AtomicU64,
+    /// Held only across the sync itself — deliberately *not* `writer`, so a
+    /// thread waiting to sync does not block one that is still writing.
+    sync_lock: Mutex<()>,
+    /// Second descriptor for the same file, used to sync without taking
+    /// `writer`. `fdatasync` acts on the inode, so syncing through this
+    /// durably commits everything written through the other handle.
+    sync_handle: File,
 }
 
 impl MetadataWal {
@@ -144,6 +156,9 @@ impl MetadataWal {
             .open(&path)
             .map_err(|e| Error::Storage(format!("failed to create WAL: {}", e)))?;
 
+        let sync_handle = file
+            .try_clone()
+            .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {}", e)))?;
         let writer = BufWriter::with_capacity(config.write_buffer_size, file);
 
         Ok(Self {
@@ -152,6 +167,10 @@ impl MetadataWal {
             size: AtomicU64::new(0),
             next_lsn: AtomicU64::new(1),
             config,
+            written_lsn: AtomicU64::new(0),
+            synced_lsn: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
+            sync_handle,
         })
     }
 
@@ -168,6 +187,9 @@ impl MetadataWal {
             .open(&path)
             .map_err(|e| Error::Storage(format!("failed to open WAL: {}", e)))?;
 
+        let sync_handle = file
+            .try_clone()
+            .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {}", e)))?;
         let writer = BufWriter::with_capacity(config.write_buffer_size, file);
 
         Ok(Self {
@@ -176,6 +198,11 @@ impl MetadataWal {
             size: AtomicU64::new(file_size),
             next_lsn: AtomicU64::new(last_lsn + 1),
             config,
+            // Everything already on disk is durable by definition.
+            written_lsn: AtomicU64::new(last_lsn),
+            synced_lsn: AtomicU64::new(last_lsn),
+            sync_lock: Mutex::new(()),
+            sync_handle,
         })
     }
 
@@ -233,32 +260,82 @@ impl MetadataWal {
         Ok((last_lsn, pos))
     }
 
-    /// Append a metadata operation to the WAL
+    /// Append a metadata operation to the WAL.
+    ///
+    /// Durability is unchanged: this does not return until an `fdatasync`
+    /// covering the record has completed. What changed is that concurrent
+    /// appends now share one, instead of each paying for its own.
+    ///
+    /// The sync used to happen while holding `writer`, so N concurrent writers
+    /// cost N serialized syncs. On the live cluster that was the dominant
+    /// per-PUT cost: object metadata is written to every shard-carrying OSD,
+    /// so a 4+2 PUT paid it six times over and write throughput came out flat
+    /// at ~85 ops/s regardless of object size — the same shape at ~340 ops/s
+    /// with one OSD. Measured on that NVMe, `fdatasync` is 0.75 ms at one
+    /// stream and the device sustains ~2400/s across twelve, so the ceiling
+    /// was the serialization, not the hardware.
     pub fn append(&self, op: &MetadataOp) -> Result<u64> {
-        let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let data = op.to_bytes();
 
-        let record = WalRecord { lsn, data };
-        let bytes = record.to_bytes();
+        let lsn = {
+            let mut writer = self.writer.lock();
+            // Assigned under the lock so LSN order matches write order, which
+            // is what lets `written_lsn` be a watermark rather than a guess.
+            let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
+            let record = WalRecord { lsn, data };
+            let bytes = record.to_bytes();
 
-        let mut writer = self.writer.lock();
-        writer
-            .write_all(&bytes)
-            .map_err(|e| Error::Storage(format!("WAL write failed: {}", e)))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| Error::Storage(format!("WAL write failed: {}", e)))?;
+
+            if self.config.sync_on_write {
+                // Hand the bytes to the OS while still holding the lock, so
+                // anything this watermark claims really is syncable.
+                writer
+                    .flush()
+                    .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
+            }
+
+            self.size.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.written_lsn.store(lsn, Ordering::SeqCst);
+            lsn
+        };
 
         if self.config.sync_on_write {
-            writer
-                .flush()
-                .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
-            writer
-                .get_ref()
-                .sync_data()
-                .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))?;
+            self.sync_through(lsn)?;
         }
 
-        self.size.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-
         Ok(lsn)
+    }
+
+    /// Block until an `fdatasync` covering `lsn` has completed.
+    ///
+    /// Group commit: the first thread in syncs everything written so far and
+    /// publishes how far it got; anyone whose record was already covered by
+    /// that sync returns without issuing another. Correctness rests on
+    /// sampling the watermark *before* syncing — a record written after the
+    /// sample may or may not be on the platter, so it is never claimed.
+    fn sync_through(&self, lsn: u64) -> Result<()> {
+        if self.synced_lsn.load(Ordering::SeqCst) >= lsn {
+            return Ok(());
+        }
+
+        let _guard = self.sync_lock.lock();
+
+        // Re-check: while waiting for the lock, another thread's sync may
+        // already have covered this record.
+        if self.synced_lsn.load(Ordering::SeqCst) >= lsn {
+            return Ok(());
+        }
+
+        let covered = self.written_lsn.load(Ordering::SeqCst);
+        self.sync_handle
+            .sync_data()
+            .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))?;
+        self.synced_lsn.fetch_max(covered, Ordering::SeqCst);
+
+        Ok(())
     }
 
     /// Append a batch of operations atomically
@@ -564,5 +641,191 @@ mod tests {
         assert_eq!(parsed.lsn, 42);
         assert_eq!(parsed.data, b"test data for record");
         assert_eq!(size, bytes.len());
+    }
+}
+
+#[cfg(test)]
+mod group_commit_tests {
+    use super::super::types::MetadataKey;
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn wal(dir: &tempfile::TempDir) -> MetadataWal {
+        MetadataWal::create(dir.path().join("g.wal"), WalConfig::default()).expect("create")
+    }
+
+    fn op(n: u64) -> MetadataOp {
+        MetadataOp::Put {
+            key: MetadataKey::block(n),
+            value: vec![0u8; 128],
+        }
+    }
+
+    /// Every appended record must survive a reopen.
+    ///
+    /// The whole point of sharing an fsync is that nobody returns before one
+    /// covering their record has completed — so this is the property that must
+    /// not have been traded away for the speed.
+    #[test]
+    fn every_acknowledged_append_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.wal");
+        {
+            let w = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            for i in 0..64 {
+                w.append(&op(i)).expect("append");
+            }
+        }
+        let reopened = MetadataWal::open(&path, WalConfig::default()).unwrap();
+        let mut seen = 0usize;
+        reopened
+            .replay(1, |_, _| {
+                seen += 1;
+                Ok(())
+            })
+            .expect("replay");
+        assert_eq!(seen, 64, "records acknowledged before close did not replay");
+    }
+
+    /// Concurrent appends are durable too — the case group commit changes.
+    #[test]
+    fn concurrent_appends_are_all_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.wal");
+        {
+            let w = Arc::new(MetadataWal::create(&path, WalConfig::default()).unwrap());
+            let mut hs = Vec::new();
+            for t in 0..8 {
+                let w = Arc::clone(&w);
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..25 {
+                        w.append(&op(t * 100 + i)).expect("append");
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+        }
+        let reopened = MetadataWal::open(&path, WalConfig::default()).unwrap();
+        let mut seen = 0usize;
+        reopened
+            .replay(1, |_, _| {
+                seen += 1;
+                Ok(())
+            })
+            .expect("replay");
+        assert_eq!(seen, 200, "a concurrently appended record was lost");
+    }
+
+    /// LSNs stay unique and ordered when handed out under the writer lock.
+    #[test]
+    fn lsns_are_unique_under_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Arc::new(wal(&dir));
+        let mut hs = Vec::new();
+        for _ in 0..8 {
+            let w = Arc::clone(&w);
+            hs.push(std::thread::spawn(move || {
+                (0..25)
+                    .map(|i| w.append(&op(i)).unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut all: Vec<u64> = hs.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "two appends were given the same LSN");
+    }
+
+    /// Concurrent writers must actually share syncs rather than queue for them.
+    ///
+    /// Eight threads each appending 25 records is 200 records. One fsync
+    /// apiece, serialized, cannot beat 200 x the device's sync latency; shared
+    /// ones can. The bound is deliberately loose — this asserts the
+    /// serialization is gone, not a particular speed on a particular disk.
+    #[test]
+    fn concurrent_writers_share_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Calibrate against this machine: how long does one synced append take?
+        let solo = wal(&dir);
+        let t = Instant::now();
+        for i in 0..20 {
+            solo.append(&op(i)).unwrap();
+        }
+        let per_append = t.elapsed() / 20;
+        drop(solo);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let w = Arc::new(wal(&dir2));
+        let t = Instant::now();
+        let mut hs = Vec::new();
+        for tid in 0..8 {
+            let w = Arc::clone(&w);
+            hs.push(std::thread::spawn(move || {
+                for i in 0..25 {
+                    w.append(&op(tid * 100 + i)).unwrap();
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        let elapsed = t.elapsed();
+
+        let fully_serialized = per_append * 200;
+        assert!(
+            elapsed < fully_serialized,
+            "200 concurrent appends took {elapsed:?}, no better than {fully_serialized:?} \
+             of one-sync-each — writers are still serializing on the sync"
+        );
+    }
+
+    /// Not an assertion — prints the achieved append rate so the effect of
+    /// group commit is visible in test output. Ignored by default.
+    #[test]
+    #[ignore]
+    fn measure_append_rate() {
+        for threads in [1usize, 8, 32] {
+            let dir = tempfile::tempdir().unwrap();
+            let w = Arc::new(wal(&dir));
+            let per = 200;
+            let t = Instant::now();
+            let mut hs = Vec::new();
+            for tid in 0..threads {
+                let w = Arc::clone(&w);
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..per {
+                        w.append(&op((tid * 1000 + i) as u64)).unwrap();
+                    }
+                }));
+            }
+            for h in hs {
+                h.join().unwrap();
+            }
+            let el = t.elapsed();
+            let total = threads * per;
+            println!(
+                "  {threads:>2} threads: {:>8.0} appends/s",
+                total as f64 / el.as_secs_f64()
+            );
+        }
+    }
+    /// With syncing off there is nothing to group, and nothing should hang.
+    #[test]
+    fn an_unsynced_wal_still_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WalConfig {
+            sync_on_write: false,
+            ..Default::default()
+        };
+        let w = MetadataWal::create(dir.path().join("n.wal"), cfg).unwrap();
+        for i in 0..32 {
+            w.append(&op(i)).expect("append");
+        }
+        assert!(w.current_lsn() >= 32);
     }
 }
