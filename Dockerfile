@@ -137,12 +137,22 @@ RUN set -ex && \
     echo "Native arch: $ARCH" && \
     # Determine features based on architecture
     CARGO_FEATURES="" && \
+    # io-uring on both: the image is always Linux, tokio-uring is pure Rust
+    # so it adds no build or runtime library, and it is the documented +25%
+    # throughput / -43% p99.9 on 4 MiB stripes. The image had never enabled it,
+    # so the helm deployment — the production path — was running a *less*
+    # optimised build than the standalone aio binary, which gets it.
+    #
+    # grep-pcre2 is deliberately not here: it links a C library, so it needs
+    # libpcre2-dev in this stage and libpcre2-8 in runtime-base. Enabling a
+    # feature whose shared library the runtime lacks is how the v0.0.1 binary
+    # shipped needing libhs.so.5 and failed to start.
     if [ "$TARGETARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then \
-        echo "Detected x86_64 - enabling ISA-L acceleration" && \
-        CARGO_FEATURES="isal"; \
+        echo "Detected x86_64 - enabling ISA-L acceleration + io_uring" && \
+        CARGO_FEATURES="isal,io-uring"; \
     elif [ "$TARGETARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
-        echo "Detected ARM64 - using pure Rust erasure coding" && \
-        CARGO_FEATURES=""; \
+        echo "Detected ARM64 - pure Rust erasure coding + io_uring" && \
+        CARGO_FEATURES="io-uring"; \
     else \
         echo "Unknown architecture: $ARCH - using default features"; \
     fi && \
