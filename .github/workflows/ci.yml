@@ -86,6 +86,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # aio embeds console/dist. build.rs creates it empty when absent so a
+      # clone still builds, but the e2e job should exercise the real thing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: build the console aio embeds
+        working-directory: console
+        run: npm ci && npm run build
       - name: build the aio binary the tests drive
         run: cargo build --bin objectio-aio
       - name: run
