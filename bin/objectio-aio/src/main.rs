@@ -70,9 +70,25 @@ struct Args {
     data: Option<PathBuf>,
 
     /// Number of OSDs to spawn. Defaults to 1 for the replication=1
-    /// quick-test pool; use 3+ for 2+1 EC.
+    /// quick-test pool. Pass `--ec-k`/`--ec-m` with at least k+m OSDs
+    /// to run erasure coding instead.
     #[arg(long, default_value_t = 1)]
     osds: usize,
+
+    /// Erasure-coding data shards. Set together with `--ec-m` to run EC
+    /// instead of replication — e.g. `--osds 6 --ec-k 4 --ec-m 2` for the
+    /// 4+2 scheme the docs call the default.
+    ///
+    /// This did nothing before: aio always passed `--replication 1` to meta,
+    /// and meta gives replication precedence over EC, so every aio cluster
+    /// was replication-1 no matter how many OSDs it span up — while
+    /// `--osds`'s own help advertised EC.
+    #[arg(long, default_value_t = 0)]
+    ec_k: u8,
+
+    /// Erasure-coding parity shards. See `--ec-k`.
+    #[arg(long, default_value_t = 0)]
+    ec_m: u8,
 
     /// Log level. Honored by RUST_LOG if present; otherwise this is
     /// used as the global default.
@@ -488,23 +504,44 @@ async fn main() -> Result<()> {
     // ------------------------------------------------------------
     let meta_data = data_root.join("meta");
     std::fs::create_dir_all(&meta_data)?;
-    let meta_args = <objectio_meta::Args as clap::Parser>::parse_from([
-        "objectio-meta",
-        "--node-id",
-        "1",
-        "--listen",
-        &format!("127.0.0.1:{meta_grpc}"),
-        "--replication",
-        "1",
-        "--data-dir",
-        &meta_data.display().to_string(),
-        "--metrics-port",
-        "0",
-        "--admin-port",
-        &meta_admin.to_string(),
-        "--log-level",
-        &args.log_level,
-    ]);
+    // Replication takes precedence over EC inside meta, so the two are
+    // mutually exclusive here: ask for EC and we simply do not pass
+    // `--replication`.
+    let use_ec = args.ec_k > 0 && args.ec_m > 0;
+    let mut meta_argv: Vec<String> = vec![
+        "objectio-meta".into(),
+        "--node-id".into(),
+        "1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{meta_grpc}"),
+        "--data-dir".into(),
+        meta_data.display().to_string(),
+        "--metrics-port".into(),
+        "0".into(),
+        "--admin-port".into(),
+        meta_admin.to_string(),
+        "--log-level".into(),
+        args.log_level.clone(),
+    ];
+    if use_ec {
+        let need = usize::from(args.ec_k) + usize::from(args.ec_m);
+        if args.osds < need {
+            return Err(anyhow!(
+                "--ec-k {} --ec-m {} needs at least {need} OSDs, but --osds is {}",
+                args.ec_k,
+                args.ec_m,
+                args.osds
+            ));
+        }
+        meta_argv.push("--ec-k".into());
+        meta_argv.push(args.ec_k.to_string());
+        meta_argv.push("--ec-m".into());
+        meta_argv.push(args.ec_m.to_string());
+    } else {
+        meta_argv.push("--replication".into());
+        meta_argv.push("1".into());
+    }
+    let meta_args = <objectio_meta::Args as clap::Parser>::parse_from(&meta_argv);
     let meta_handle: JoinHandle<Result<()>> = {
         let sd = sub_shutdown(&shutdown_tx);
         tokio::spawn(async move { objectio_meta::run(meta_args, sd).await })
