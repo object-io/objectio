@@ -47,6 +47,9 @@ pub struct Cluster {
     pub secret_key: String,
     #[allow(dead_code)]
     data_dir: tempfile::TempDir,
+    /// Kept so the cluster can be restarted on the same data and port.
+    port: u16,
+    osds: usize,
 }
 
 impl Drop for Cluster {
@@ -143,9 +146,50 @@ impl Cluster {
             access_key,
             secret_key,
             data_dir,
+            port,
+            osds,
         };
         cluster.wait_healthy();
         cluster
+    }
+
+    /// Stop the cluster and start it again on the same data directory and
+    /// port, the way a `systemctl restart` does.
+    ///
+    /// Returns once the gateway is serving again, so a test that reads
+    /// straight afterwards is asking the question a client would: is the
+    /// cluster usable the moment it says it is up?
+    pub fn restart(&mut self) {
+        self.restart_with_osds(self.osds);
+    }
+
+    /// Restart with a different number of OSDs than last time.
+    ///
+    /// Coming back with fewer leaves the departed ones registered in meta but
+    /// not running — a stale registration, which is exactly the state a live
+    /// cluster ends up in after an OSD is replaced or its identity is reset.
+    pub fn restart_with_osds(&mut self, osds: usize) {
+        self.osds = osds;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+
+        self.child = Command::new(aio_binary())
+            .arg("--data")
+            .arg(self.data_dir.path())
+            .arg("--port")
+            .arg(self.port.to_string())
+            .arg("--listen-addr")
+            .arg("127.0.0.1")
+            .arg("--strict-port")
+            .arg("--osds")
+            .arg(self.osds.to_string())
+            .arg("--auth")
+            .stdout(Self::log_target())
+            .stderr(Self::log_target())
+            .spawn()
+            .expect("respawn objectio-aio");
+
+        self.wait_healthy();
     }
 
     fn log_target() -> Stdio {

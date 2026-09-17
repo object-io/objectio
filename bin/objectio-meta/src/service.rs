@@ -539,6 +539,48 @@ fn pg_position_local_group(
 /// Note: Object metadata is stored on OSDs (primary OSD for each object).
 /// The meta service only stores cluster configuration (buckets, topology, policies).
 /// ListObjects uses scatter-gather to query OSDs directly.
+/// What status a node should carry in the placement topology.
+///
+/// Operator intent wins outright: Draining and Out are decisions, and
+/// `active_nodes()` skips both however the node is behaving. `In` only means
+/// the operator does not object, which is not the same as the node being
+/// there — so whether it counts as Active depends on whether anything has
+/// actually seen it.
+///
+/// `known` is the status it already carries, if it is already in the topology.
+fn topology_status(
+    admin: objectio_common::OsdAdminState,
+    evidence: NodeEvidence,
+    known: Option<NodeStatus>,
+) -> NodeStatus {
+    match admin {
+        objectio_common::OsdAdminState::Draining => NodeStatus::Draining,
+        objectio_common::OsdAdminState::Out => NodeStatus::Decommissioning,
+        objectio_common::OsdAdminState::In => match evidence {
+            NodeEvidence::Observed => NodeStatus::Active,
+            // Keep a node the prober has confirmed; otherwise make it earn its
+            // place. `Down` costs a live OSD one probe — the prober sweeps
+            // immediately at startup and restores on first success — and costs
+            // a dead one everything, which is the point.
+            NodeEvidence::FromStore => match known {
+                Some(NodeStatus::Active) => NodeStatus::Active,
+                _ => NodeStatus::Down,
+            },
+        },
+    }
+}
+
+/// Whether a topology update is backed by evidence that the node is reachable
+/// right now, or is only a record being replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeEvidence {
+    /// The node just registered — it opened a connection and identified itself.
+    Observed,
+    /// Loaded from the store, or swept up in a rebuild of every node. Says
+    /// nothing about whether the node is there.
+    FromStore,
+}
+
 pub struct MetaService {
     /// Bucket metadata: name -> BucketMeta
     buckets: RwLock<HashMap<String, BucketMeta>>,
@@ -1709,7 +1751,7 @@ impl MetaService {
         let snapshot = nodes.clone();
         drop(nodes);
         for osd in &snapshot {
-            self.update_topology_with_node(osd);
+            self.refresh_topology_node(osd);
         }
         Ok(())
     }
@@ -1809,9 +1851,12 @@ impl MetaService {
             let nodes = self.osd_nodes.read().clone();
             *self.topology.write() = Default::default();
             for node in &nodes {
-                self.update_topology_with_node(node);
+                self.refresh_topology_node(node);
             }
-            info!("Rebuilt topology from {} live OSD nodes", nodes.len());
+            info!(
+                "Rebuilt topology from {} stored OSD nodes (pending liveness probe)",
+                nodes.len()
+            );
         }
 
         // Users
@@ -2427,7 +2472,32 @@ impl MetaService {
     }
 
     /// Update CRUSH topology with a new OSD node
+    /// Whether a topology update is backed by evidence the node is reachable
+    /// *now*.
+    ///
+    /// An OSD that has just registered is: it opened a connection and said so.
+    /// A record read from the store at startup, or re-read during a
+    /// rebuild-everything pass, is not — it describes the cluster as it was
+    /// when meta last wrote it down.
+    ///
+    /// The distinction existed nowhere, so status was derived from
+    /// `admin_state` alone in every case. That is the exact defect the liveness
+    /// prober was written to fix, still present on these paths: a node the
+    /// prober had marked `Down` came back `Active` on the next restart or the
+    /// next admin-state change, and placement handed it out again. On the live
+    /// deployment that meant every restart served 500s for thirty seconds from
+    /// an address that had been dead for days.
     fn update_topology_with_node(&self, osd_node: &OsdNode) {
+        self.upsert_topology_node(osd_node, NodeEvidence::Observed);
+    }
+
+    /// As [`Self::update_topology_with_node`], for a node we have not heard
+    /// from — loaded from the store, or swept up in a rebuild of every node.
+    fn refresh_topology_node(&self, osd_node: &OsdNode) {
+        self.upsert_topology_node(osd_node, NodeEvidence::FromStore);
+    }
+
+    fn upsert_topology_node(&self, osd_node: &OsdNode, evidence: NodeEvidence) {
         // Prefer the 5-level `topology` when present; fall back to the
         // legacy 3-tuple for OsdNodes persisted before zone/host existed.
         let (region, zone, dc, rack, host) = osd_node
@@ -2466,14 +2536,12 @@ impl MetaService {
             })
             .collect();
 
-        // Merge operator intent (admin_state) with observed status. An
-        // OSD that's In is Active; Draining / Out map to the matching
-        // NodeStatus so placement's `active_nodes()` filter skips them.
-        let status = match osd_node.admin_state {
-            objectio_common::OsdAdminState::In => NodeStatus::Active,
-            objectio_common::OsdAdminState::Draining => NodeStatus::Draining,
-            objectio_common::OsdAdminState::Out => NodeStatus::Decommissioning,
-        };
+        // Merge operator intent (admin_state) with observed status. Draining
+        // and Out are intent and win outright, so placement's `active_nodes()`
+        // filter skips them either way. `In` means the operator does not
+        // object — which is not the same as the node being there.
+        let known = self.topology.read().get_node(node_id).map(|n| n.status);
+        let status = topology_status(osd_node.admin_state, evidence, known);
 
         let node_info = NodeInfo {
             id: node_id,
@@ -7165,7 +7233,7 @@ impl MetadataService for MetaService {
         if found && changed {
             let snapshot = self.osd_nodes.read().clone();
             for osd in &snapshot {
-                self.update_topology_with_node(osd);
+                self.refresh_topology_node(osd);
             }
             info!(
                 "OSD {} admin_state → {} (via Raft, log_id={:?})",
@@ -10737,5 +10805,100 @@ mod placement_tests {
     #[test]
     fn an_empty_cluster_is_empty() {
         assert!(eligible_disks(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod topology_status_tests {
+    use super::{NodeEvidence, topology_status};
+    use objectio_common::{NodeStatus, OsdAdminState};
+
+    /// A node that just registered is there — it opened a connection to say so.
+    #[test]
+    fn a_node_that_just_registered_is_active() {
+        assert_eq!(
+            topology_status(OsdAdminState::In, NodeEvidence::Observed, None),
+            NodeStatus::Active
+        );
+        // Even one previously written off: it is answering now.
+        assert_eq!(
+            topology_status(
+                OsdAdminState::In,
+                NodeEvidence::Observed,
+                Some(NodeStatus::Down)
+            ),
+            NodeStatus::Active
+        );
+    }
+
+    /// A record read from the store is not evidence of anything.
+    ///
+    /// This is the bug that made every restart serve 500s: a node the prober
+    /// had marked Down came back Active because status was derived from
+    /// `admin_state` alone, and placement handed out an address that had been
+    /// dead for days.
+    #[test]
+    fn a_node_only_read_from_the_store_must_earn_its_place() {
+        assert_eq!(
+            topology_status(OsdAdminState::In, NodeEvidence::FromStore, None),
+            NodeStatus::Down
+        );
+    }
+
+    #[test]
+    fn a_rebuild_does_not_resurrect_a_node_the_prober_wrote_off() {
+        // Changing any node's admin state rebuilds every node's topology
+        // entry. That pass used to reset liveness for all of them.
+        assert_eq!(
+            topology_status(
+                OsdAdminState::In,
+                NodeEvidence::FromStore,
+                Some(NodeStatus::Down)
+            ),
+            NodeStatus::Down
+        );
+    }
+
+    #[test]
+    fn a_rebuild_does_not_evict_a_node_the_prober_confirmed() {
+        // The counterpart: a healthy cluster must not lose every node to an
+        // unrelated admin-state change.
+        assert_eq!(
+            topology_status(
+                OsdAdminState::In,
+                NodeEvidence::FromStore,
+                Some(NodeStatus::Active)
+            ),
+            NodeStatus::Active
+        );
+    }
+
+    /// Operator intent wins over anything observed, in both directions.
+    #[test]
+    fn draining_and_out_are_decisions_not_observations() {
+        for evidence in [NodeEvidence::Observed, NodeEvidence::FromStore] {
+            assert_eq!(
+                topology_status(OsdAdminState::Draining, evidence, Some(NodeStatus::Active)),
+                NodeStatus::Draining
+            );
+            assert_eq!(
+                topology_status(OsdAdminState::Out, evidence, Some(NodeStatus::Active)),
+                NodeStatus::Decommissioning
+            );
+        }
+    }
+
+    /// Bringing a node back In does not make it Active on the strength of a
+    /// stale Decommissioning entry — the prober has to see it.
+    #[test]
+    fn a_node_marked_back_in_is_still_probed_first() {
+        assert_eq!(
+            topology_status(
+                OsdAdminState::In,
+                NodeEvidence::FromStore,
+                Some(NodeStatus::Decommissioning)
+            ),
+            NodeStatus::Down
+        );
     }
 }

@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use objectio_common::{NodeId, NodeStatus, OsdAdminState};
 use objectio_proto::storage::{GetStatusRequest, storage_service_client::StorageServiceClient};
-use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
 use crate::service::MetaService;
@@ -41,9 +40,40 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// write to.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Consecutive failures before a node is taken out of placement. At a 15s
-/// interval that is 45 seconds of silence.
+/// Consecutive failures before a node is taken out of placement.
 const FAILURES_BEFORE_DOWN: u32 = 3;
+
+/// Sweep interval for the first few rounds after meta starts.
+///
+/// Startup is the one moment when the node list is least trustworthy: it was
+/// read from the store, so it describes the cluster as it was when meta last
+/// wrote it down, not as it is now. Meanwhile placement treats every loaded
+/// node as live, so a registration for an OSD that has been gone for days is
+/// handed out for reads until this prober catches up.
+///
+/// At the steady-state interval that took 30 seconds, and it was visible in
+/// production: after every restart of a single-node deployment, object reads
+/// answered 500 `InternalError` for half a minute while the gateway tried a
+/// dead address. Sweeping quickly at first closes that to a few seconds
+/// without weakening the evidence required — it still takes
+/// `FAILURES_BEFORE_DOWN` consecutive misses, they just arrive sooner. A node
+/// that is merely slow to accept connections (every OSD rebooting alongside
+/// meta) is restored on its first success, 2 seconds later rather than 15.
+const STARTUP_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many sweeps run at the fast interval before settling down. Five covers
+/// the first ten seconds, which is longer than a dead node needs to be
+/// condemned and long enough for a live one to finish binding its port.
+const STARTUP_SWEEPS: u32 = 5;
+
+/// How long to wait before the next sweep, given how many have run.
+const fn probe_interval(sweeps_done: u32) -> Duration {
+    if sweeps_done < STARTUP_SWEEPS {
+        STARTUP_PROBE_INTERVAL
+    } else {
+        PROBE_INTERVAL
+    }
+}
 
 pub fn spawn(meta: Arc<MetaService>) {
     tokio::spawn(async move {
@@ -56,19 +86,20 @@ pub fn spawn(meta: Arc<MetaService>) {
 }
 
 async fn run(meta: Arc<MetaService>) {
-    let mut ticker = interval(PROBE_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Consecutive failure counts, keyed by node_id. Only nodes that have
     // missed at least once appear here.
     let mut misses: HashMap<[u8; 16], u32> = HashMap::new();
+    // Sweeps completed. Only used to pick the interval, so it stops mattering
+    // once it passes STARTUP_SWEEPS.
+    let mut sweeps: u32 = 0;
 
     loop {
-        ticker.tick().await;
         // Only the leader mutates topology; followers get it through Raft.
-        if !meta.is_raft_leader() {
-            continue;
+        if meta.is_raft_leader() {
+            sweep(&meta, &mut misses).await;
         }
-        sweep(&meta, &mut misses).await;
+        sweeps = sweeps.saturating_add(1);
+        tokio::time::sleep(probe_interval(sweeps)).await;
     }
 }
 
@@ -171,6 +202,49 @@ async fn probe(address: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dead node must be condemned in seconds after a restart, not half a
+    /// minute.
+    ///
+    /// The node list is loaded from the store, so at startup it describes the
+    /// cluster as it was, and placement treats every loaded node as live. On
+    /// the live deployment that meant object reads answered 500 for thirty
+    /// seconds after every restart while the gateway tried an address that had
+    /// been dead for days.
+    #[test]
+    fn a_dead_node_is_out_within_seconds_of_a_restart() {
+        // Sweeps run at t=0 and then after each interval, so the Nth miss
+        // lands at the sum of the first N-1 intervals.
+        let time_to_down: Duration = (1..u32::from(u8::try_from(FAILURES_BEFORE_DOWN).unwrap()))
+            .map(probe_interval)
+            .sum();
+        assert!(
+            time_to_down <= Duration::from_secs(5),
+            "a dead node stays in placement for {time_to_down:?} after a restart"
+        );
+    }
+
+    #[test]
+    fn sweeps_settle_to_the_steady_state_interval() {
+        // The fast schedule is for startup only — probing every 2s forever
+        // would be a status call per OSD per 2 seconds, for nothing.
+        assert_eq!(probe_interval(0), STARTUP_PROBE_INTERVAL);
+        assert_eq!(probe_interval(STARTUP_SWEEPS - 1), STARTUP_PROBE_INTERVAL);
+        assert_eq!(probe_interval(STARTUP_SWEEPS), PROBE_INTERVAL);
+        assert_eq!(probe_interval(u32::MAX), PROBE_INTERVAL);
+    }
+
+    /// The evidence required is unchanged — only how fast it arrives.
+    ///
+    /// Sweeping quickly must not become "condemn on the first miss": a node
+    /// that is slow to bind its port while meta restarts alongside it would
+    /// otherwise be taken out of placement for no reason.
+    #[test]
+    fn a_fast_schedule_still_needs_three_consecutive_misses() {
+        assert_eq!(decide(false, 1, OsdAdminState::In), None);
+        assert_eq!(decide(false, 2, OsdAdminState::In), None);
+        assert_eq!(decide(false, 3, OsdAdminState::In), Some(NodeStatus::Down));
+    }
 
     #[test]
     fn a_reachable_node_follows_operator_intent() {
