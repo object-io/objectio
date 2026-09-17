@@ -101,6 +101,32 @@ jobs:
       - name: run
         run: cargo test --package objectio-e2e -- --test-threads=1 --nocapture
 
+  image:
+    name: docker image
+    runs-on: ubuntu-latest
+    # The image build broke the moment tests/e2e became a workspace member —
+    # cargo would not read the workspace without its manifest, so `cargo fetch`
+    # failed before compiling anything — and stayed broken for five commits
+    # because nothing here ever built it. The test jobs above compile the
+    # workspace from a checkout; only this compiles it the way a release does,
+    # from the paths the Dockerfile chooses to COPY.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The builder stage is the one that can break: it compiles every
+          # binary. The runtime stages only copy the results out.
+          target: builder
+          push: false
+          # Layer cache across runs, so an unchanged dependency graph does not
+          # pay for a cold Rust build every time.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   console:
     name: console
     runs-on: ubuntu-latest

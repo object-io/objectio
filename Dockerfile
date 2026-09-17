@@ -19,7 +19,11 @@
 #   RUST_VERSION - Rust version (default: 1.92)
 #   FEATURES - Override cargo features (default: auto-detect based on arch)
 
-ARG RUST_VERSION=1.93
+# Match rust-toolchain.toml. The pin makes rustup fetch that exact toolchain on
+# the first cargo call regardless, so a stale value here only buys a download
+# on every build — and silently diverges the image from what CI and developers
+# actually compile with.
+ARG RUST_VERSION=1.94
 
 # =============================================================================
 # Stage 0: Console builder (React SPA → static /_console assets)
@@ -93,6 +97,12 @@ COPY bin ./bin
 # Community distribution where the directory has been removed and the
 # workspace members list trimmed.
 COPY enterprise ./enterprise
+# The end-to-end suite is a workspace member, so cargo refuses to read the
+# workspace at all without its manifest — `cargo fetch` failed with "failed to
+# load manifest for workspace member /build/tests/e2e" and took the whole image
+# build with it. Nothing caught that: CI runs the test suite but never builds
+# the image.
+COPY tests ./tests
 
 # Build dependencies only (this layer gets cached)
 RUN cargo fetch
