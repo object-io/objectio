@@ -1606,3 +1606,170 @@ impl StorageService for OsdService {
         }))
     }
 }
+
+#[cfg(test)]
+mod shard_index_tests {
+    use super::{OsdService, SHARD_LOC_PREFIX, ShardLocation};
+    use objectio_storage::metadata::{MetadataKey, MetadataStore, MetadataStoreConfig};
+
+    fn store() -> (tempfile::TempDir, MetadataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = MetadataStore::open_or_create(MetadataStoreConfig::with_data_dir(dir.path()))
+            .expect("open metadata store");
+        (dir, store)
+    }
+
+    fn loc(disk_idx: usize, block_num: u64) -> ShardLocation {
+        ShardLocation {
+            disk_idx,
+            block_num,
+            size: 64 * 1024,
+            crc32c: 0xDEAD_BEEF,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn a_shard_key_is_unique_per_object_stripe_and_position() {
+        let a = [1u8; 16];
+        let b = [2u8; 16];
+        let keys = [
+            OsdService::shard_key(&a, 0, 0),
+            OsdService::shard_key(&a, 0, 1),
+            OsdService::shard_key(&a, 1, 0),
+            OsdService::shard_key(&b, 0, 0),
+        ];
+        let mut unique: Vec<&String> = keys.iter().collect();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "two shards share one index key");
+    }
+
+    /// The object id is hex, so it is fixed-width and the `:` separators
+    /// cannot be confused with its contents. Without that, an id ending in a
+    /// digit and a stripe id could spell the same key as a different pair.
+    #[test]
+    fn a_shard_key_is_stable_and_readable() {
+        assert_eq!(
+            OsdService::shard_key(&[0xABu8; 4], 7, 3),
+            "abababab:7:3".to_string()
+        );
+    }
+
+    #[test]
+    fn the_metadata_key_carries_the_prefix_and_gives_the_shard_key_back() {
+        let sk = OsdService::shard_key(&[9u8; 16], 2, 5);
+        let mk = OsdService::shard_loc_meta_key(&sk);
+        let raw = mk.as_bytes();
+        assert!(raw.starts_with(SHARD_LOC_PREFIX));
+        assert_eq!(
+            std::str::from_utf8(raw.strip_prefix(SHARD_LOC_PREFIX).unwrap()).unwrap(),
+            sk
+        );
+    }
+
+    /// The restart path, end to end.
+    ///
+    /// Before the index was persisted at all, `shard_index` started empty on
+    /// every boot: the OSD reported zero shards to meta with a disk full of
+    /// real data, and the allocator handed out block 0 over the top of it.
+    /// This is the round trip that stops that.
+    #[test]
+    fn locations_written_before_a_restart_are_found_after_one() {
+        let (_dir, s) = store();
+        let written = [
+            (OsdService::shard_key(&[1u8; 16], 0, 0), loc(0, 100)),
+            (OsdService::shard_key(&[1u8; 16], 0, 1), loc(0, 101)),
+            (OsdService::shard_key(&[2u8; 16], 3, 4), loc(1, 7)),
+        ];
+        for (key, l) in &written {
+            OsdService::persist_shard_location(&s, key, l).expect("persist");
+        }
+
+        let rebuilt = OsdService::load_persisted_shard_index(&s);
+        assert_eq!(rebuilt.len(), written.len());
+        for (key, l) in &written {
+            let got = rebuilt.get(key).unwrap_or_else(|| panic!("{key} missing"));
+            assert_eq!(got.disk_idx, l.disk_idx);
+            assert_eq!(got.block_num, l.block_num);
+            assert_eq!(got.size, l.size);
+            assert_eq!(got.crc32c, l.crc32c);
+        }
+    }
+
+    /// A deleted shard must not come back on the next boot.
+    ///
+    /// It would re-mark its block used, so the block is never handed out
+    /// again — the space is leaked in a way that survives restarts.
+    #[test]
+    fn a_forgotten_location_stays_forgotten() {
+        let (_dir, s) = store();
+        let keep = OsdService::shard_key(&[1u8; 16], 0, 0);
+        let drop = OsdService::shard_key(&[1u8; 16], 0, 1);
+        OsdService::persist_shard_location(&s, &keep, &loc(0, 1)).unwrap();
+        OsdService::persist_shard_location(&s, &drop, &loc(0, 2)).unwrap();
+
+        OsdService::forget_shard_location(&s, &drop).expect("forget");
+
+        let rebuilt = OsdService::load_persisted_shard_index(&s);
+        assert!(rebuilt.contains_key(&keep));
+        assert!(
+            !rebuilt.contains_key(&drop),
+            "a deleted shard reappeared on reload and would re-mark its block used"
+        );
+    }
+
+    /// The prefix is a filter, not a suggestion.
+    ///
+    /// The object layer writes ShardMeta under its own keys in the same store.
+    /// If those were swept into the shard index, the OSD would mark blocks
+    /// used that it does not own — or fail to deserialize and lose the whole
+    /// scan.
+    #[test]
+    fn keys_belonging_to_another_family_are_not_read_as_shard_locations() {
+        let (_dir, s) = store();
+        let mine = OsdService::shard_key(&[1u8; 16], 0, 0);
+        OsdService::persist_shard_location(&s, &mine, &loc(0, 1)).unwrap();
+
+        for foreign in [&b"s:some-shard-meta"[..], b"osd_other:thing", b"zzz"] {
+            s.put(MetadataKey::from_bytes(foreign.to_vec()), vec![1, 2, 3])
+                .expect("put foreign key");
+        }
+
+        let rebuilt = OsdService::load_persisted_shard_index(&s);
+        assert_eq!(
+            rebuilt.len(),
+            1,
+            "the scan picked up keys outside its own prefix: {:?}",
+            rebuilt.keys().collect::<Vec<_>>()
+        );
+        assert!(rebuilt.contains_key(&mine));
+    }
+
+    /// One corrupt entry does not take the rest of the index with it.
+    ///
+    /// A boot that gives up on the whole scan reports zero shards, which is
+    /// the state that made the allocator overwrite live data.
+    #[test]
+    fn a_corrupt_entry_is_skipped_rather_than_abandoning_the_scan() {
+        let (_dir, s) = store();
+        for i in 0..3u8 {
+            let k = OsdService::shard_key(&[i; 16], 0, 0);
+            OsdService::persist_shard_location(&s, &k, &loc(0, u64::from(i))).unwrap();
+        }
+        s.put(
+            OsdService::shard_loc_meta_key("deadbeef:0:0"),
+            b"not bincode".to_vec(),
+        )
+        .expect("put corrupt entry");
+
+        let rebuilt = OsdService::load_persisted_shard_index(&s);
+        assert_eq!(rebuilt.len(), 3, "a corrupt entry cost the whole index");
+    }
+
+    #[test]
+    fn an_empty_store_rebuilds_to_an_empty_index() {
+        let (_dir, s) = store();
+        assert!(OsdService::load_persisted_shard_index(&s).is_empty());
+    }
+}

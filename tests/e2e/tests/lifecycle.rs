@@ -176,3 +176,51 @@ fn keys_needing_escaping_round_trip() {
         assert_eq!(got.text(), key, "round trip changed the body for {key:?}");
     }
 }
+
+/// A listing whose prefix is not ASCII must authenticate.
+///
+/// The gateway rebuilds the canonical query string by decoding each parameter
+/// and re-encoding it, and the decode step turned each byte into a `char`.
+/// Percent-encoding is a byte encoding: `%C3%A9` is two bytes that are one
+/// character, so `caf%C3%A9` came back out as `caf%C3%83%C2%A9`. The gateway
+/// signed a string the client never produced and answered
+/// `SignatureDoesNotMatch` — which reads like bad credentials rather than a
+/// prefix with an accent in it.
+///
+/// The harness escapes byte-wise, so it signs what a real SDK signs; only the
+/// gateway's half of the canonicalisation is under test here.
+#[test]
+fn a_listing_with_a_non_ascii_prefix_authenticates() {
+    let c = Cluster::start();
+    c.json("POST", "/_admin/buckets", json!({"name": "unicode"}))
+        .expect_ok();
+
+    for prefix in ["café/", "日本/", "📁/"] {
+        let r = c.request("GET", &format!("/unicode?prefix={prefix}&max-keys=10"), &[]);
+        assert_eq!(
+            r.status,
+            200,
+            "listing with prefix {prefix:?} was refused: {}",
+            r.text()
+        );
+    }
+}
+
+/// And an object whose key is not ASCII round-trips.
+///
+/// The path is signed and routed from the same escaping, so a mismatch here
+/// surfaces the same way — as a credential error on a perfectly good key.
+#[test]
+fn a_non_ascii_object_key_round_trips() {
+    let c = Cluster::start();
+    c.json("POST", "/_admin/buckets", json!({"name": "unicode-keys"}))
+        .expect_ok();
+
+    for key in ["café.txt", "日本語/ファイル.bin", "emoji-📁.txt"] {
+        let path = format!("/unicode-keys/{key}");
+        c.request("PUT", &path, key.as_bytes()).expect(200);
+        let got = c.request("GET", &path, &[]);
+        got.expect(200);
+        assert_eq!(got.text(), key, "round trip changed the body for {key:?}");
+    }
+}

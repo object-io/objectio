@@ -781,9 +781,7 @@ fn build_canonical_query_string(query: &str) -> String {
             let mut parts = param.splitn(2, '=');
             let key = parts.next()?;
             let value = parts.next().unwrap_or("");
-            let decoded_key = url_decode(key);
-            let decoded_value = url_decode(value);
-            Some((url_encode(&decoded_key), url_encode(&decoded_value)))
+            Some((url_encode(&url_decode(key)), url_encode(&url_decode(value))))
         })
         .collect();
 
@@ -834,41 +832,71 @@ fn hex_sha256(data: &[u8]) -> String {
 }
 
 /// URL encode a string (AWS style)
-fn url_encode(s: &str) -> String {
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
+/// Percent-encode bytes with AWS's unreserved set (`A-Za-z0-9-_.~`).
+///
+/// Takes bytes, not a string, because percent-encoding is a byte encoding.
+fn url_encode(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(b as char);
+            }
             _ => {
-                for byte in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", byte));
-                }
+                use std::fmt::Write as _;
+                let _ = write!(result, "%{b:02X}");
             }
         }
     }
     result
 }
 
-/// URL decode a string
-fn url_decode(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2
-                && let Ok(byte) = u8::from_str_radix(&hex, 16)
-            {
-                result.push(byte as char);
-                continue;
+/// Percent-decode to bytes.
+///
+/// This used to decode into a `String`, pushing each decoded byte as a `char`.
+/// Percent-encoding is a byte encoding: `%C3%A9` is two bytes that together
+/// are one character, and turning them into two `char`s and re-encoding gives
+/// four bytes. Canonicalising `caf%C3%A9` therefore produced
+/// `caf%C3%83%C2%A9`, so the gateway signed a different canonical query string
+/// than the client did and every request carrying a non-ASCII query parameter
+/// failed with `SignatureDoesNotMatch` — which reads like bad credentials
+/// rather than a listing whose prefix has an accent in it.
+///
+/// `+` still decodes to a space. That is the form-encoding convention rather
+/// than the URI one, and AWS SDKs send `%20`, but changing it would alter the
+/// canonical form of any request that does arrive with a bare `+`.
+fn url_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 3 <= bytes.len() => {
+                let hex = &bytes[i + 1..i + 3];
+                match std::str::from_utf8(hex)
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok())
+                {
+                    Some(byte) => {
+                        result.push(byte);
+                        i += 3;
+                    }
+                    // Not a valid escape — keep the literal `%` and carry on,
+                    // so a stray one does not swallow the next two bytes.
+                    None => {
+                        result.push(b'%');
+                        i += 1;
+                    }
+                }
             }
-            result.push('%');
-            result.push_str(&hex);
-        } else if c == '+' {
-            result.push(' ');
-        } else {
-            result.push(c);
+            b'+' => {
+                result.push(b' ');
+                i += 1;
+            }
+            b => {
+                result.push(b);
+                i += 1;
+            }
         }
     }
     result
@@ -956,5 +984,259 @@ pub trait AuthExt {
 impl<B> AuthExt for Request<B> {
     fn auth_result(&self) -> Option<&AuthResult> {
         self.extensions().get::<AuthResult>()
+    }
+}
+
+#[cfg(test)]
+mod sigv4_tests {
+    use super::{
+        ParsedAuth, build_canonical_query_string, build_string_to_sign, calculate_signature_v4,
+        constant_time_eq, derive_signing_key, hex_sha256, parse_authorization_header, url_decode,
+        url_encode,
+    };
+
+    // ── AWS's own published vectors ───────────────────────────────────────
+    //
+    // The signing chain had no tests at all. These are the worked example
+    // from the Signature Version 4 documentation, so they check this
+    // implementation against AWS rather than against itself.
+
+    const SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+    #[test]
+    fn the_signing_key_matches_awss_published_derivation() {
+        assert_eq!(
+            hex::encode(derive_signing_key(SECRET, "20150830", "us-east-1", "iam")),
+            "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+        );
+    }
+
+    #[test]
+    fn the_signature_matches_awss_worked_example() {
+        let canonical_request = [
+            "GET",
+            "/",
+            "Action=ListUsers&Version=2010-05-08",
+            "content-type:application/x-www-form-urlencoded; charset=utf-8",
+            "host:iam.amazonaws.com",
+            "x-amz-date:20150830T123600Z",
+            "",
+            "content-type;host;x-amz-date",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ]
+        .join("\n");
+
+        let sts = build_string_to_sign(
+            &canonical_request,
+            "20150830T123600Z",
+            "20150830/us-east-1/iam/aws4_request",
+        );
+        let key = derive_signing_key(SECRET, "20150830", "us-east-1", "iam");
+
+        assert_eq!(
+            calculate_signature_v4(&key, &sts),
+            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+        );
+    }
+
+    #[test]
+    fn the_empty_payload_hash_is_the_one_every_client_sends() {
+        assert_eq!(
+            hex_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// Each step of the derivation must actually depend on its input.
+    ///
+    /// A key that ignored the date would make every signature valid forever;
+    /// one that ignored the region or service would make a signature for any
+    /// other service valid here.
+    #[test]
+    fn every_element_of_the_scope_changes_the_signing_key() {
+        let base = derive_signing_key(SECRET, "20150830", "us-east-1", "s3");
+        for other in [
+            derive_signing_key(SECRET, "20150831", "us-east-1", "s3"),
+            derive_signing_key(SECRET, "20150830", "us-west-2", "s3"),
+            derive_signing_key(SECRET, "20150830", "us-east-1", "iam"),
+            derive_signing_key("another-secret", "20150830", "us-east-1", "s3"),
+        ] {
+            assert_ne!(base, other, "the signing key ignored part of its scope");
+        }
+    }
+
+    // ── Percent-coding ────────────────────────────────────────────────────
+
+    /// A non-ASCII query parameter must canonicalise to what the client signed.
+    ///
+    /// `url_decode` used to push each decoded byte as a `char`, so `%C3%A9` —
+    /// two bytes that are one character — became two characters and re-encoded
+    /// as four bytes. `caf%C3%A9` canonicalised to `caf%C3%83%C2%A9`, the
+    /// gateway signed a different string than the client, and
+    /// `aws s3 ls --prefix "café/"` came back `SignatureDoesNotMatch`.
+    #[test]
+    fn a_non_ascii_parameter_canonicalises_to_itself() {
+        for encoded in ["caf%C3%A9", "%E6%97%A5%E6%9C%AC", "%F0%9F%93%81"] {
+            assert_eq!(
+                url_encode(&url_decode(encoded)),
+                encoded,
+                "{encoded} did not survive canonicalisation"
+            );
+        }
+    }
+
+    #[test]
+    fn unreserved_characters_are_left_alone() {
+        let plain = "abcXYZ019-_.~";
+        assert_eq!(url_encode(plain.as_bytes()), plain);
+        assert_eq!(url_encode(&url_decode(plain)), plain);
+    }
+
+    #[test]
+    fn reserved_characters_are_escaped_uppercase() {
+        // AWS canonicalisation requires uppercase hex; %2f and %2F are the
+        // same byte but not the same string to sign.
+        assert_eq!(url_encode(b"/"), "%2F");
+        assert_eq!(url_encode(b" "), "%20");
+        assert_eq!(url_encode(b"="), "%3D");
+    }
+
+    #[test]
+    fn a_stray_percent_does_not_swallow_the_bytes_after_it() {
+        assert_eq!(url_decode("100%"), b"100%");
+        assert_eq!(url_decode("%zz"), b"%zz");
+        assert_eq!(url_decode("a%2"), b"a%2");
+    }
+
+    #[test]
+    fn an_encoded_percent_decodes_to_one_percent() {
+        assert_eq!(url_decode("100%25"), b"100%");
+        assert_eq!(url_encode(&url_decode("100%25")), "100%25");
+    }
+
+    // ── Canonical query string ────────────────────────────────────────────
+
+    #[test]
+    fn query_parameters_are_sorted_by_name() {
+        // The client sorts before signing; if the gateway does not, any
+        // request with more than one parameter fails.
+        assert_eq!(
+            build_canonical_query_string("version=2&action=list&bucket=b"),
+            "action=list&bucket=b&version=2"
+        );
+    }
+
+    #[test]
+    fn a_valueless_parameter_keeps_its_equals_sign() {
+        // `?uploads` is how multipart is initiated, and AWS canonicalises it
+        // as `uploads=`.
+        assert_eq!(build_canonical_query_string("uploads"), "uploads=");
+        assert_eq!(
+            build_canonical_query_string("uploads&partNumber=1"),
+            "partNumber=1&uploads="
+        );
+    }
+
+    #[test]
+    fn an_empty_query_is_an_empty_string() {
+        assert_eq!(build_canonical_query_string(""), "");
+    }
+
+    #[test]
+    fn a_non_ascii_prefix_survives_the_canonical_query_string() {
+        assert_eq!(
+            build_canonical_query_string("prefix=caf%C3%A9%2F&max-keys=100"),
+            "max-keys=100&prefix=caf%C3%A9%2F"
+        );
+    }
+
+    // ── Authorization header ──────────────────────────────────────────────
+
+    #[test]
+    fn a_sigv4_header_yields_its_key_headers_and_signature() {
+        let header = "AWS4-HMAC-SHA256 \
+                      Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
+                      SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+                      Signature=deadbeef";
+        match parse_authorization_header(header).expect("parse") {
+            ParsedAuth::V4 {
+                access_key_id,
+                signed_headers,
+                signature,
+            } => {
+                assert_eq!(access_key_id, "AKIDEXAMPLE");
+                assert_eq!(
+                    signed_headers,
+                    vec!["host", "x-amz-content-sha256", "x-amz-date"]
+                );
+                assert_eq!(signature, "deadbeef");
+            }
+            ParsedAuth::V2 { .. } => panic!("parsed a SigV4 header as SigV2"),
+        }
+    }
+
+    /// Signed header names are matched against the request case-insensitively,
+    /// so they are lowercased on the way in.
+    #[test]
+    fn signed_header_names_are_lowercased() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/s3/aws4_request, \
+                      SignedHeaders=Host;X-Amz-Date, Signature=abc123";
+        match parse_authorization_header(header).expect("parse") {
+            ParsedAuth::V4 { signed_headers, .. } => {
+                assert_eq!(signed_headers, vec!["host", "x-amz-date"]);
+            }
+            ParsedAuth::V2 { .. } => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_sigv2_header_splits_on_the_first_colon_only() {
+        // A secret-derived signature is base64 and can itself contain no
+        // colon, but the key id must not be allowed to eat one either.
+        match parse_authorization_header("AWS AKIDEXAMPLE:abc:def").expect("parse") {
+            ParsedAuth::V2 {
+                access_key_id,
+                signature,
+            } => {
+                assert_eq!(access_key_id, "AKIDEXAMPLE");
+                assert_eq!(signature, "abc:def");
+            }
+            ParsedAuth::V4 { .. } => panic!("parsed a SigV2 header as SigV4"),
+        }
+    }
+
+    #[test]
+    fn a_header_that_is_not_a_signature_is_refused() {
+        for header in [
+            "",
+            "Bearer token",
+            "Basic dXNlcjpwYXNz",
+            "AWS4-HMAC-SHA256 nonsense",
+            "AWS no-colon-here",
+        ] {
+            assert!(
+                parse_authorization_header(header).is_err(),
+                "{header:?} was accepted as an authorization header"
+            );
+        }
+    }
+
+    // ── Comparison ────────────────────────────────────────────────────────
+
+    #[test]
+    fn signatures_compare_equal_only_when_they_are_equal() {
+        let sig = "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7";
+        assert!(constant_time_eq(sig, sig));
+        assert!(!constant_time_eq(sig, &sig.replace("5d672d79", "5d672d78")));
+        assert!(!constant_time_eq(sig, &sig[..sig.len() - 1]));
+        assert!(!constant_time_eq(sig, ""));
+        assert!(constant_time_eq("", ""));
+    }
+
+    /// Case matters: hex signatures are lowercase, and treating the two as
+    /// equal would widen what counts as a valid signature.
+    #[test]
+    fn signature_comparison_is_case_sensitive() {
+        assert!(!constant_time_eq("deadbeef", "DEADBEEF"));
     }
 }
