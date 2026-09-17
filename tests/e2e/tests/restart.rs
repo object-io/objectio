@@ -132,3 +132,34 @@ fn repeated_restarts_stay_healthy() {
 // where it is pinned; these tests cover the other half — that requiring a
 // probe before a node counts as Active does not cost a healthy cluster
 // anything on the way back up.
+
+/// Erasure coding actually engages, and data survives it.
+///
+/// aio hardcoded `--replication 1` when building meta's args, and meta gives
+/// replication precedence over EC — so every aio cluster was replication-1 no
+/// matter how many OSDs it span up, while `--osds`'s own help advertised
+/// "use 3+ for 2+1 EC". There was no way to run the default 4+2 scheme at all.
+#[test]
+fn erasure_coded_objects_round_trip() {
+    let mut c = Cluster::start_with_ec(6, 4, 2);
+    c.json("POST", "/_admin/buckets", json!({"name": "ec"}))
+        .expect_ok();
+
+    // Larger than one 4 MB stripe, so this crosses stripe boundaries as well
+    // as shard boundaries.
+    let payload: Vec<u8> = (0..10u32 * 1024 * 1024)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    c.request("PUT", "/ec/big.bin", &payload).expect(200);
+
+    let got = c.request("GET", "/ec/big.bin", &[]);
+    got.expect(200);
+    assert_eq!(got.bytes, payload, "bytes changed going through 4+2 EC");
+
+    // And it survives a restart, which is where the shard index has to line
+    // back up across six OSDs rather than one.
+    c.restart();
+    let after = c.request("GET", "/ec/big.bin", &[]);
+    after.expect(200);
+    assert_eq!(after.bytes, payload, "EC object changed across a restart");
+}

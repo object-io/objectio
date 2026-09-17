@@ -50,6 +50,7 @@ pub struct Cluster {
     /// Kept so the cluster can be restarted on the same data and port.
     port: u16,
     osds: usize,
+    ec: Option<(u8, u8)>,
 }
 
 impl Drop for Cluster {
@@ -109,7 +110,16 @@ impl Cluster {
         Self::start_with_osds(1)
     }
 
+    /// Boot a cluster that erasure-codes rather than replicates.
+    pub fn start_with_ec(osds: usize, ec_k: u8, ec_m: u8) -> Self {
+        Self::boot(osds, Some((ec_k, ec_m)))
+    }
+
     pub fn start_with_osds(osds: usize) -> Self {
+        Self::boot(osds, None)
+    }
+
+    fn boot(osds: usize, ec: Option<(u8, u8)>) -> Self {
         let data_dir = tempfile::tempdir().expect("tempdir");
         let port = free_port();
 
@@ -123,6 +133,14 @@ impl Cluster {
             .arg("--strict-port")
             .arg("--osds")
             .arg(osds.to_string())
+            .args(ec.map_or_else(Vec::new, |(k, m)| {
+                vec![
+                    "--ec-k".to_string(),
+                    k.to_string(),
+                    "--ec-m".to_string(),
+                    m.to_string(),
+                ]
+            }))
             .arg("--auth")
             // Both discarded unless asked for. tracing writes to *stdout*
             // here, so an unread pipe wedges the child once its 64 KiB buffer
@@ -148,6 +166,7 @@ impl Cluster {
             data_dir,
             port,
             osds,
+            ec,
         };
         cluster.wait_healthy();
         cluster
@@ -183,6 +202,14 @@ impl Cluster {
             .arg("--strict-port")
             .arg("--osds")
             .arg(self.osds.to_string())
+            .args(self.ec.map_or_else(Vec::new, |(k, m)| {
+                vec![
+                    "--ec-k".to_string(),
+                    k.to_string(),
+                    "--ec-m".to_string(),
+                    m.to_string(),
+                ]
+            }))
             .arg("--auth")
             .stdout(Self::log_target())
             .stderr(Self::log_target())
