@@ -154,9 +154,19 @@ jobs:
             os: ubuntu-24.04
             # isal = x86 erasure-coding acceleration; io-uring = the
             # new async I/O backend (see storage-io-levels.md);
-            # grep-pcre2 + grep-hyperscan = the optional pattern
-            # engines. Hyperscan is Intel-specific — skipped on arm64.
-            features: "isal,io-uring,grep-pcre2,grep-hyperscan"
+            # grep-pcre2 = the optional PCRE2 pattern engine.
+            #
+            # grep-hyperscan is deliberately NOT here. It links
+            # libhs.so.5 dynamically, and nothing ships Hyperscan by
+            # default — so the v0.0.1 linux-amd64 binary downloaded
+            # from the release failed on startup with
+            #   error while loading shared libraries: libhs.so.5
+            # on any machine that had not installed libhyperscan-dev.
+            # It was the only NEEDED entry that differed from the
+            # arm64 build, which ran fine. A download nobody can run
+            # is worse than one without an optional accelerator;
+            # Hyperscan is still available when building from source.
+            features: "isal,io-uring,grep-pcre2"
           - platform: linux-arm64
             target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm

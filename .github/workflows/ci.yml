@@ -195,17 +195,36 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler pkg-config libpcre2-dev \
-            nasm autoconf automake libtool libclang-dev libhyperscan-dev
+            nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist; build.rs creates it empty when absent, which
-      # is enough to compile.
-      # `check` rather than `build`: this is here to catch feature-gated code
-      # that no longer compiles, and it still runs the build scripts, so the
-      # ISA-L C build is exercised too. The image job above does a real
-      # release-profile compile.
-      - name: cargo check with the release feature set
+      # is enough to compile. Debug profile: this links, which is the point,
+      # and the linkage is the same as release without paying for optimisation.
+      - name: build with the release feature set
         run: |
-          cargo check --bin objectio-aio \
-            --features isal,io-uring,grep-pcre2,grep-hyperscan
+          cargo build --bin objectio-aio \
+            --features isal,io-uring,grep-pcre2
+
+      # The release binary is downloaded and run on machines that are not this
+      # runner. v0.0.1's linux-amd64 build succeeded here and then failed on
+      # startup everywhere else with
+      #   error while loading shared libraries: libhs.so.5
+      # because --features grep-hyperscan links Hyperscan dynamically and
+      # nothing ships it. A build that passes is not the same as an artifact
+      # that runs, and only this distinguishes them.
+      - name: the binary links nothing exotic
+        run: |
+          set -euo pipefail
+          ALLOWED='libc|libm|libgcc_s|libpthread|libdl|librt|ld-linux|linux-vdso|libpcre2-8|libssl|libcrypto'
+          echo "--- ldd ---"; ldd target/debug/objectio-aio
+          bad=$(ldd target/debug/objectio-aio \
+                | awk '{print $1}' \
+                | grep -vE "^($ALLOWED)" \
+                | grep -E '^lib|^ld-' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::the release binary needs libraries a user will not have: $bad"
+            exit 1
+          fi
+          echo "only portable libraries — ok",grep-hyperscan
 
   console:
     name: console
