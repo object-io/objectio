@@ -187,7 +187,14 @@ pub async fn optional_auth_layer(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, AuthError> {
-    if request.headers().get("authorization").is_some() {
+    // A presigned URL carries its credentials in the query string and has no
+    // Authorization header by construction, so testing for the header alone
+    // let one through unauthenticated here.
+    let presigned = request
+        .uri()
+        .query()
+        .is_some_and(|q| parse_presigned_query(q).is_some());
+    if presigned || request.headers().get("authorization").is_some() {
         auth_layer(state, request, next).await
     } else {
         Ok(next.run(request).await)
@@ -204,6 +211,14 @@ pub async fn auth_layer(
     // Skip auth for health checks and metrics
     if path == "/health" || path == "/metrics" || path == "/_status" {
         return Ok(next.run(request).await);
+    }
+
+    // A presigned URL puts its credentials in the query string and cannot
+    // carry an Authorization header — the client is handed a URL, not a
+    // request. Check for one before concluding the request is unauthenticated.
+    if let Some(presigned) = request.uri().query().and_then(parse_presigned_query) {
+        let presigned = presigned?;
+        return run_presigned(auth_state, presigned, request, next).await;
     }
 
     // Parse authorization header to get access key ID
@@ -330,6 +345,332 @@ pub async fn auth_layer(
     // Store auth result in request extensions for handlers to access
     request.extensions_mut().insert(auth_result);
     Ok(next.run(request).await)
+}
+
+/// Authenticate a presigned request and run the handler.
+///
+/// Split out of `auth_layer` so the two credential sources stay legible; it
+/// resolves the key the same way the header path does, including STS session
+/// tokens, and hands the handler the same `AuthResult`. Everything downstream
+/// — bucket policy, credential scope, tenancy — therefore applies to a
+/// presigned request exactly as it does to a signed one.
+async fn run_presigned(
+    auth_state: Arc<AuthState>,
+    presigned: PresignedAuth,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let cred = if presigned.access_key_id.starts_with("ASIA") {
+        let token = presigned.session_token.as_deref().ok_or_else(|| {
+            AuthError::AccessDenied(
+                "temporary credentials require X-Amz-Security-Token".to_string(),
+            )
+        })?;
+        let sts = auth_state.sts_provider.as_ref().ok_or_else(|| {
+            AuthError::AccessDenied(
+                "STS credential vending is not configured on this gateway".to_string(),
+            )
+        })?;
+        let session = sts.validate(token).ok_or_else(|| {
+            AuthError::AccessDenied("invalid or expired session token".to_string())
+        })?;
+        CachedCredential {
+            access_key_id: presigned.access_key_id.clone(),
+            secret_access_key: sts.derive_secret(&presigned.access_key_id),
+            user_id: session.user_arn.clone(),
+            user_arn: session.user_arn.clone(),
+            tenant: String::new(),
+            scope: Some(CredentialScope {
+                scope: session.scope.clone(),
+                operation: session.operation,
+            }),
+            cached_at: std::time::Instant::now(),
+        }
+    } else {
+        auth_state
+            .lookup_credential(&presigned.access_key_id)
+            .await?
+    };
+
+    let mut auth_result = verify_presigned_v4(&request, &presigned, &cred)?;
+    if presigned.access_key_id.starts_with("ASIA") {
+        auth_result.auth_mode = objectio_auth::AuthMode::Sts;
+    }
+
+    let (g_arns, g_ids) = auth_state.lookup_user_groups(&auth_result.user_id).await;
+    auth_result.group_arns = g_arns;
+    auth_result.group_ids = g_ids;
+
+    debug!(
+        "Authenticated presigned request: {} (key: {})",
+        auth_result.user_id, auth_result.access_key_id
+    );
+
+    request.extensions_mut().insert(auth_result);
+    Ok(next.run(request).await)
+}
+
+/// A request authenticated by SigV4 query parameters — a presigned URL.
+///
+/// The gateway could already *generate* these (Delta Sharing hands them to
+/// recipients) but had no path to verify one, so every presigned URL it issued
+/// was refused by the server that issued it. Any client that is handed a URL
+/// rather than making a request — git-lfs, a browser, `curl -O` — has no way
+/// to send an `Authorization` header, so this is the only way bytes move
+/// without proxying them all through something that can sign.
+pub struct PresignedAuth {
+    pub access_key_id: String,
+    /// The scope exactly as the client signed it: `20260917/us-east-1/s3/aws4_request`.
+    pub credential_scope: String,
+    pub date_stamp: String,
+    pub region: String,
+    pub signed_headers: Vec<String>,
+    pub signature: String,
+    /// `X-Amz-Date`, in the `20260917T063018Z` form.
+    pub date_str: String,
+    pub expires_secs: i64,
+    pub session_token: Option<String>,
+}
+
+/// The longest link AWS will issue, and the longest this will honour.
+const MAX_PRESIGN_EXPIRY_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Pull one query parameter out, percent-decoded.
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        // Parameter *names* can be encoded too, though in practice these are
+        // not. Decode both sides so a conforming client is never turned away.
+        if String::from_utf8_lossy(&url_decode(k)).eq_ignore_ascii_case(name) {
+            Some(String::from_utf8_lossy(&url_decode(v)).into_owned())
+        } else {
+            None
+        }
+    })
+}
+
+/// Read SigV4 query-string credentials off a request.
+///
+/// `None` means this is not a presigned request and the caller should look for
+/// an `Authorization` header instead. `Some(Err(..))` means it announced itself
+/// as one and is malformed, which is worth saying rather than falling through
+/// to "missing authorization header".
+pub fn parse_presigned_query(query: &str) -> Option<Result<PresignedAuth, AuthError>> {
+    // `X-Amz-Signature` is the marker: `X-Amz-Algorithm` alone also appears in
+    // POST policy form uploads, which are a different mechanism.
+    let signature = query_param(query, "x-amz-signature")?;
+
+    Some((|| {
+        let algorithm = query_param(query, "x-amz-algorithm").ok_or_else(|| {
+            AuthError::AccessDenied("presigned URL is missing X-Amz-Algorithm".to_string())
+        })?;
+        if algorithm != "AWS4-HMAC-SHA256" {
+            return Err(AuthError::AccessDenied(format!(
+                "unsupported presigned algorithm: {algorithm}"
+            )));
+        }
+
+        let credential = query_param(query, "x-amz-credential").ok_or_else(|| {
+            AuthError::AccessDenied("presigned URL is missing X-Amz-Credential".to_string())
+        })?;
+        // `AKID/20260917/us-east-1/s3/aws4_request`. The access key id itself
+        // never contains a slash, so the first segment is unambiguous.
+        let parts: Vec<&str> = credential.split('/').collect();
+        if parts.len() != 5 || parts[4] != "aws4_request" || parts[3] != "s3" {
+            return Err(AuthError::AccessDenied(format!(
+                "malformed X-Amz-Credential: {credential}"
+            )));
+        }
+
+        let date_str = query_param(query, "x-amz-date").ok_or_else(|| {
+            AuthError::AccessDenied("presigned URL is missing X-Amz-Date".to_string())
+        })?;
+
+        // The scope's date must be the date it claims to have been signed on;
+        // otherwise a signature from one day could be replayed under another
+        // day's scope.
+        if !date_str.starts_with(parts[1]) {
+            return Err(AuthError::AccessDenied(
+                "X-Amz-Credential scope date does not match X-Amz-Date".to_string(),
+            ));
+        }
+
+        let expires_secs: i64 = query_param(query, "x-amz-expires")
+            .ok_or_else(|| {
+                AuthError::AccessDenied("presigned URL is missing X-Amz-Expires".to_string())
+            })?
+            .parse()
+            .map_err(|_| {
+                AuthError::AccessDenied("X-Amz-Expires is not a number of seconds".to_string())
+            })?;
+        if expires_secs <= 0 || expires_secs > MAX_PRESIGN_EXPIRY_SECS {
+            return Err(AuthError::AccessDenied(format!(
+                "X-Amz-Expires must be between 1 and {MAX_PRESIGN_EXPIRY_SECS} seconds"
+            )));
+        }
+
+        let signed_headers: Vec<String> = query_param(query, "x-amz-signedheaders")
+            .ok_or_else(|| {
+                AuthError::AccessDenied("presigned URL is missing X-Amz-SignedHeaders".to_string())
+            })?
+            .split(';')
+            .map(str::to_lowercase)
+            .filter(|h| !h.is_empty())
+            .collect();
+        if signed_headers.is_empty() {
+            return Err(AuthError::AccessDenied(
+                "X-Amz-SignedHeaders is empty".to_string(),
+            ));
+        }
+
+        Ok(PresignedAuth {
+            access_key_id: parts[0].to_string(),
+            credential_scope: parts[1..].join("/"),
+            date_stamp: parts[1].to_string(),
+            region: parts[2].to_string(),
+            signed_headers,
+            signature,
+            date_str,
+            expires_secs,
+            session_token: query_param(query, "x-amz-security-token"),
+        })
+    })())
+}
+
+/// Canonical query string for a presigned request.
+///
+/// Identical to the header case except that `X-Amz-Signature` is left out —
+/// it is the output of the computation, so it cannot also be an input.
+/// Everything else, `X-Amz-Algorithm` and friends included, is signed.
+fn build_canonical_query_string_presigned(query: &str) -> String {
+    let filtered: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(k, _)| k);
+            !name.eq_ignore_ascii_case("X-Amz-Signature")
+        })
+        .collect();
+    build_canonical_query_string(&filtered.join("&"))
+}
+
+/// Verify a presigned URL's signature and its expiry window.
+pub fn verify_presigned_v4<B>(
+    request: &Request<B>,
+    presigned: &PresignedAuth,
+    cred: &CachedCredential,
+) -> Result<AuthResult, AuthError> {
+    let signed_at = parse_date_v4(&presigned.date_str)?;
+    let now = Utc::now();
+
+    // A link is valid from when it was signed until `X-Amz-Expires` later.
+    // This is not the header path's 15-minute skew window — the whole point of
+    // a presigned URL is to outlive the moment it was made.
+    let age = now.signed_duration_since(signed_at);
+    if age.num_seconds() > presigned.expires_secs {
+        return Err(AuthError::ExpiredToken(format!(
+            "this presigned URL expired {} seconds ago",
+            age.num_seconds() - presigned.expires_secs
+        )));
+    }
+    // Allow a little skew the other way: a client whose clock runs fast would
+    // otherwise sign a URL the server considers not yet valid.
+    if age.num_minutes() < -15 {
+        return Err(AuthError::RequestTimeTooSkewed);
+    }
+
+    let uri = request.uri();
+    let path = uri.path();
+    let canonical_uri = if path.is_empty() { "/" } else { path };
+    let canonical_query = build_canonical_query_string_presigned(uri.query().unwrap_or(""));
+
+    let mut headers_map: BTreeMap<String, String> = BTreeMap::new();
+    for header_name in &presigned.signed_headers {
+        let value = request
+            .headers()
+            .get(header_name.as_str())
+            .ok_or_else(|| {
+                AuthError::AccessDenied(format!(
+                    "presigned URL signed header {header_name} is not on the request"
+                ))
+            })?
+            .to_str()
+            .map_err(|_| AuthError::AccessDenied("invalid header value".to_string()))?;
+        headers_map.insert(header_name.clone(), value.trim().to_string());
+    }
+    let canonical_headers: String = headers_map
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect();
+
+    // A presigned S3 request signs `UNSIGNED-PAYLOAD` rather than a body hash:
+    // the URL is built before the body exists, and for a GET there is no body
+    // at all. A client that chooses to sign the payload says so by putting
+    // x-amz-content-sha256 in SignedHeaders, and then its value is used.
+    let payload_hash = if presigned
+        .signed_headers
+        .iter()
+        .any(|h| h == "x-amz-content-sha256")
+    {
+        request
+            .headers()
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("UNSIGNED-PAYLOAD")
+            .to_string()
+    } else {
+        "UNSIGNED-PAYLOAD".to_string()
+    };
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        request.method().as_str(),
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        presigned.signed_headers.join(";"),
+        payload_hash
+    );
+
+    // The scope is used exactly as the client signed it. It is already pinned
+    // to `s3`/`aws4_request` by the parser and its date to X-Amz-Date; the
+    // region is the client's, because a signature made with a different region
+    // still proves possession of the secret, and refusing it only produces a
+    // failure that reads like bad credentials.
+    let string_to_sign = build_string_to_sign(
+        &canonical_request,
+        &presigned.date_str,
+        &presigned.credential_scope,
+    );
+    let signing_key = derive_signing_key(
+        &cred.secret_access_key,
+        &presigned.date_stamp,
+        &presigned.region,
+        "s3",
+    );
+    let calculated = calculate_signature_v4(&signing_key, &string_to_sign);
+
+    if !constant_time_eq(&calculated, &presigned.signature) {
+        warn!(
+            method = %request.method(),
+            uri = %request.uri(),
+            calculated = %calculated,
+            provided = %presigned.signature,
+            canonical_request = %canonical_request,
+            "presigned SigV4 mismatch"
+        );
+        return Err(AuthError::SignatureDoesNotMatch);
+    }
+
+    Ok(AuthResult {
+        user_id: cred.user_id.clone(),
+        user_arn: cred.user_arn.clone(),
+        access_key_id: cred.access_key_id.clone(),
+        group_arns: Vec::new(),
+        group_ids: Vec::new(),
+        tenant: cred.tenant.clone(),
+        auth_mode: objectio_auth::AuthMode::Permanent,
+        scope: cred.scope.clone(),
+    })
 }
 
 /// Parsed authorization header (supports both V4 and V2)
@@ -923,6 +1264,8 @@ pub enum AuthError {
     SignatureDoesNotMatch,
     /// Request has expired
     RequestTimeTooSkewed,
+    /// A presigned URL is past its `X-Amz-Expires` window
+    ExpiredToken(String),
     /// Internal error
     #[allow(dead_code)]
     InternalError,
@@ -944,6 +1287,10 @@ impl IntoResponse for AuthError {
                 "The difference between the request time and the server's time is too large."
                     .to_string(),
             ),
+            // AWS answers an expired presigned URL with this code, and clients
+            // key off it to decide whether to ask for a fresh link rather than
+            // to report a permissions problem.
+            AuthError::ExpiredToken(msg) => (StatusCode::FORBIDDEN, "ExpiredToken", msg),
             AuthError::InternalError => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",

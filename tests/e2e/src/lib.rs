@@ -222,6 +222,145 @@ impl Cluster {
         panic!("the gateway did not come up within 90s — {last}");
     }
 
+    /// Build a presigned URL: `SigV4` credentials in the query string, no
+    /// `Authorization` header, valid for `expires_secs`.
+    ///
+    /// Signed here rather than by calling the gateway's own code, so the tests
+    /// check the server against an independent implementation of the spec
+    /// rather than against itself.
+    pub fn presign(&self, method: &str, path: &str, expires_secs: u64) -> String {
+        self.presign_as(
+            method,
+            path,
+            expires_secs,
+            &self.access_key,
+            &self.secret_key,
+        )
+    }
+
+    /// As [`Self::presign`], with a chosen key, and with the signing time
+    /// shifted by `age_secs` into the past so an expired link can be built.
+    pub fn presign_at(&self, method: &str, path: &str, expires_secs: u64, age_secs: i64) -> String {
+        self.presign_inner(
+            method,
+            path,
+            expires_secs,
+            &self.access_key,
+            &self.secret_key,
+            age_secs,
+        )
+    }
+
+    pub fn presign_as(
+        &self,
+        method: &str,
+        path: &str,
+        expires_secs: u64,
+        access_key: &str,
+        secret_key: &str,
+    ) -> String {
+        self.presign_inner(method, path, expires_secs, access_key, secret_key, 0)
+    }
+
+    fn presign_inner(
+        &self,
+        method: &str,
+        path: &str,
+        expires_secs: u64,
+        access_key: &str,
+        secret_key: &str,
+        age_secs: i64,
+    ) -> String {
+        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let (path_only, extra_query) = match path.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (path, ""),
+        };
+        let escaped_path = escape_path(path_only);
+
+        let (amz_date, date_stamp) = time_at(-age_secs);
+        let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+        let credential = format!("{access_key}/{scope}");
+
+        // Every X-Amz-* parameter except the signature is part of what is
+        // signed, and the canonical query string is sorted by name.
+        let mut params: Vec<(String, String)> = vec![
+            ("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()),
+            ("X-Amz-Credential".into(), credential),
+            ("X-Amz-Date".into(), amz_date.clone()),
+            ("X-Amz-Expires".into(), expires_secs.to_string()),
+            ("X-Amz-SignedHeaders".into(), "host".into()),
+        ];
+        for pair in extra_query.split('&').filter(|p| !p.is_empty()) {
+            match pair.split_once('=') {
+                Some((k, v)) => params.push((k.to_string(), v.to_string())),
+                None => params.push((pair.to_string(), String::new())),
+            }
+        }
+        let mut encoded: Vec<(String, String)> = params
+            .into_iter()
+            .map(|(k, v)| (escape(&k), escape(&v)))
+            .collect();
+        encoded.sort();
+        let canonical_qs = encoded
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        // A presigned S3 request signs the literal `UNSIGNED-PAYLOAD`: the URL
+        // exists before the body does.
+        let canonical_request = format!(
+            "{method}\n{escaped_path}\n{canonical_qs}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD"
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+
+        let mut key = hmac(format!("AWS4{secret_key}").as_bytes(), &date_stamp);
+        key = hmac(&key, "us-east-1");
+        key = hmac(&key, "s3");
+        key = hmac(&key, "aws4_request");
+        let signature = hex::encode(hmac(&key, &string_to_sign));
+
+        format!(
+            "{}{escaped_path}?{canonical_qs}&X-Amz-Signature={signature}",
+            self.endpoint
+        )
+    }
+
+    /// Fetch a URL with no credentials of any kind — what a client handed a
+    /// presigned link actually does.
+    pub fn fetch(&self, method: &str, url: &str, body: &[u8]) -> Response {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let mut req = client.request(method.parse().expect("method"), url);
+        if !body.is_empty() {
+            req = req.body(body.to_vec());
+        }
+        let resp = req.send().expect("request");
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let bytes = resp.bytes().expect("body").to_vec();
+        Response {
+            status,
+            bytes,
+            headers,
+        }
+    }
+
     /// Signed request. `body` is sent as-is; pass `&[]` for none.
     pub fn request(&self, method: &str, path: &str, body: &[u8]) -> Response {
         self.request_as(method, path, body, &self.access_key, &self.secret_key)
@@ -419,10 +558,17 @@ fn hmac(key: &[u8], data: &str) -> Vec<u8> {
 
 /// `(amz_date, date_stamp)` in UTC, without pulling in chrono.
 fn time_now() -> (String, String) {
+    time_at(0)
+}
+
+/// As [`time_now`], `offset_secs` away from now. Negative is the past, which
+/// is how a test builds a link that has already expired.
+fn time_at(offset_secs: i64) -> (String, String) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+        .saturating_add_signed(offset_secs);
     let days = secs / 86_400;
     let tod = secs % 86_400;
     let (y, m, d) = civil_from_days(days as i64);

@@ -6771,10 +6771,55 @@ async fn put_object_retention_internal(
         }
     };
 
-    // Parse ISO 8601 date to unix timestamp
-    let retain_until = chrono::DateTime::parse_from_rfc3339(&req.retain_until_date)
-        .map(|dt| dt.timestamp() as u64)
-        .unwrap_or(0);
+    // Parse ISO 8601 date to unix timestamp.
+    //
+    // Three separate ways this went wrong, all from converting without
+    // checking:
+    //
+    //   - An unparseable date became `0` — "retain until the epoch", which is
+    //     no retention at all — and the request still answered 200. A client
+    //     setting a compliance lock got a success and no lock.
+    //   - A date before 1970 has a negative timestamp, and `as u64` wrapped it
+    //     to about 1.8e19, later than any `now` will ever be. Under
+    //     COMPLIANCE, which by definition cannot be lifted, that is an object
+    //     locked forever by a typo.
+    //   - A date merely in the past stored a retention that was already
+    //     expired, again reporting success for a control doing nothing.
+    //
+    // Silently succeeding is the wrong direction to fail for a compliance
+    // control, so all three are now `InvalidArgument`, which is what AWS
+    // answers.
+    let retain_until = match chrono::DateTime::parse_from_rfc3339(&req.retain_until_date) {
+        Ok(dt) => match u64::try_from(dt.timestamp()) {
+            Ok(secs) => secs,
+            Err(_) => {
+                return S3Error::xml_response(
+                    "InvalidArgument",
+                    "RetainUntilDate must not be before 1970-01-01T00:00:00Z",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+        Err(e) => {
+            return S3Error::xml_response(
+                "InvalidArgument",
+                &format!("RetainUntilDate is not a valid RFC 3339 date: {e}"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if retain_until <= now_secs {
+        return S3Error::xml_response(
+            "InvalidArgument",
+            "RetainUntilDate must be in the future",
+            StatusCode::BAD_REQUEST,
+        );
+    }
 
     let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
         Ok(n) => n,
@@ -6838,7 +6883,12 @@ async fn get_object_retention_internal(
                     RetentionMode::RetentionCompliance => "COMPLIANCE",
                     RetentionMode::RetentionNone => "COMPLIANCE",
                 };
-                let date = chrono::DateTime::from_timestamp(retention.retain_until_date as i64, 0)
+                // `as i64` mapped the upper half of u64 onto negative times,
+                // so a stored value that cannot be a real date rendered as one
+                // in 1969 — an expired lock — rather than as nothing.
+                let date = i64::try_from(retention.retain_until_date)
+                    .ok()
+                    .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
                     .map(|dt| dt.to_rfc3339())
                     .unwrap_or_default();
                 let result = RetentionResponse {
@@ -7088,7 +7138,9 @@ async fn list_object_versions_internal(
             Ok(resp) => {
                 let inner = resp.into_inner();
                 for obj in inner.versions {
-                    let last_modified = chrono::DateTime::from_timestamp(obj.modified_at as i64, 0)
+                    let last_modified = i64::try_from(obj.modified_at)
+                        .ok()
+                        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
                         .map(|dt| dt.to_rfc3339())
                         .unwrap_or_default();
 
