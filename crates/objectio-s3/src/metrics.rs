@@ -260,6 +260,32 @@ pub struct S3Metrics {
     start_time: Instant,
     /// Protection configuration for capacity calculations
     protection: RwLock<Option<ProtectionConfig>>,
+    /// Most recent per-OSD capacity reading, refreshed in the background.
+    ///
+    /// Capacity existed only on `/_admin/nodes`, which a bucket-scoped key is
+    /// refused, so the console could show a point-in-time number at best and
+    /// nothing at all to an operator whose key was scoped. Nothing was
+    /// exported to Prometheus, so there was no history either — no answer to
+    /// "am I filling up, and how fast", which for a storage product is the
+    /// question.
+    ///
+    /// Held rather than computed on scrape: gathering it means a `GetStatus`
+    /// to every OSD, and `/metrics` must stay fast and must not fail because
+    /// one disk is slow to answer.
+    capacity: RwLock<Vec<NodeCapacity>>,
+}
+
+/// One OSD's capacity as of the last refresh.
+#[derive(Debug, Clone)]
+pub struct NodeCapacity {
+    pub node_id: String,
+    pub address: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub shard_count: u64,
+    /// Whether the OSD answered the last poll. Exported too: a node missing
+    /// from the scrape and a node reporting zero are different problems.
+    pub reachable: bool,
 }
 
 impl S3Metrics {
@@ -274,6 +300,7 @@ impl S3Metrics {
             gateway: GatewayMetrics::default(),
             start_time: Instant::now(),
             protection: RwLock::new(None),
+            capacity: RwLock::new(Vec::new()),
         }
     }
 
@@ -388,8 +415,91 @@ impl S3Metrics {
     }
 
     /// Export metrics in Prometheus format
+    /// Replace the capacity snapshot. Called by the gateway's refresher.
+    pub fn set_capacity(&self, nodes: Vec<NodeCapacity>) {
+        if let Ok(mut guard) = self.capacity.write() {
+            *guard = nodes;
+        }
+    }
+
+    /// Render the capacity gauges.
+    ///
+    /// Cluster totals count only OSDs that answered: summing a node that did
+    /// not reply as zero would show capacity *dropping* when a disk goes
+    /// unreachable, which reads as data loss rather than a reachability
+    /// problem. `objectio_osd_up` is what distinguishes the two.
+    fn write_capacity(&self, output: &mut String) {
+        let Ok(nodes) = self.capacity.read() else {
+            return;
+        };
+
+        let reachable = nodes.iter().filter(|n| n.reachable);
+        let total: u64 = reachable.clone().map(|n| n.total_bytes).sum();
+        let used: u64 = reachable.clone().map(|n| n.used_bytes).sum();
+        let up = reachable.count();
+
+        for (name, help, value) in [
+            (
+                "objectio_cluster_capacity_bytes",
+                "Raw capacity across OSDs that answered the last poll",
+                total,
+            ),
+            (
+                "objectio_cluster_used_bytes",
+                "Raw bytes allocated across OSDs that answered the last poll",
+                used,
+            ),
+            (
+                "objectio_cluster_available_bytes",
+                "Raw bytes free across OSDs that answered the last poll",
+                total.saturating_sub(used),
+            ),
+            (
+                "objectio_cluster_osds_total",
+                "OSDs registered with the cluster",
+                nodes.len() as u64,
+            ),
+            (
+                "objectio_cluster_osds_up",
+                "OSDs that answered the last poll",
+                up as u64,
+            ),
+        ] {
+            writeln!(output, "# HELP {name} {help}").unwrap();
+            writeln!(output, "# TYPE {name} gauge").unwrap();
+            writeln!(output, "{name} {value}").unwrap();
+        }
+
+        // Per-OSD, so a single disk filling up is visible rather than hidden
+        // in a cluster total that still looks comfortable.
+        for (name, help) in [
+            ("objectio_osd_capacity_bytes", "Raw capacity of one OSD"),
+            ("objectio_osd_used_bytes", "Raw bytes allocated on one OSD"),
+            ("objectio_osd_shards", "Shards stored on one OSD"),
+            ("objectio_osd_up", "1 if the OSD answered the last poll"),
+        ] {
+            writeln!(output, "# HELP {name} {help}").unwrap();
+            writeln!(output, "# TYPE {name} gauge").unwrap();
+            for n in nodes.iter() {
+                let labels = format!(
+                    "node_id=\"{}\",address=\"{}\"",
+                    n.node_id,
+                    n.address.replace('"', "")
+                );
+                let v = match name {
+                    "objectio_osd_capacity_bytes" => n.total_bytes,
+                    "objectio_osd_used_bytes" => n.used_bytes,
+                    "objectio_osd_shards" => n.shard_count,
+                    _ => u64::from(n.reachable),
+                };
+                writeln!(output, "{name}{{{labels}}} {v}").unwrap();
+            }
+        }
+    }
+
     pub fn export_prometheus(&self) -> String {
         let mut output = String::with_capacity(8 * 1024);
+        self.write_capacity(&mut output);
 
         // Gateway uptime
         let uptime_secs = self.start_time.elapsed().as_secs();
@@ -1032,5 +1142,117 @@ mod tests {
         assert!(output.contains("objectio_s3_request_duration_seconds_bucket"));
         assert!(output.contains("le=\"0.001\"")); // 1ms bucket
         assert!(output.contains("le=\"0.05\"")); // 50ms bucket
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::{NodeCapacity, S3Metrics};
+
+    fn node(id: &str, total: u64, used: u64, reachable: bool) -> NodeCapacity {
+        NodeCapacity {
+            node_id: id.to_string(),
+            address: format!("http://{id}:9200"),
+            total_bytes: total,
+            used_bytes: used,
+            shard_count: 7,
+            reachable,
+        }
+    }
+
+    fn export(nodes: Vec<NodeCapacity>) -> String {
+        let m = S3Metrics::new();
+        m.set_capacity(nodes);
+        m.export_prometheus()
+    }
+
+    /// Capacity has to reach Prometheus at all — it previously existed only on
+    /// `/_admin/nodes`, so there was no history and nothing a scoped key could
+    /// read.
+    #[test]
+    fn cluster_totals_are_exported() {
+        let out = export(vec![node("a", 100, 40, true), node("b", 100, 10, true)]);
+        assert!(out.contains("objectio_cluster_capacity_bytes 200"), "{out}");
+        assert!(out.contains("objectio_cluster_used_bytes 50"), "{out}");
+        assert!(
+            out.contains("objectio_cluster_available_bytes 150"),
+            "{out}"
+        );
+        assert!(out.contains("objectio_cluster_osds_total 2"), "{out}");
+        assert!(out.contains("objectio_cluster_osds_up 2"), "{out}");
+    }
+
+    /// An unreachable OSD must not make the cluster look smaller.
+    ///
+    /// Summing a node that did not answer as zero would show capacity
+    /// *dropping* when a disk goes unreachable — indistinguishable from data
+    /// loss at a glance. It is excluded from the totals and surfaced as
+    /// `objectio_osd_up 0` instead, so the two cases read differently.
+    #[test]
+    fn an_unreachable_osd_is_excluded_from_totals_but_still_reported() {
+        let out = export(vec![node("a", 100, 40, true), node("gone", 100, 90, false)]);
+        assert!(out.contains("objectio_cluster_capacity_bytes 100"), "{out}");
+        assert!(out.contains("objectio_cluster_used_bytes 40"), "{out}");
+        assert!(out.contains("objectio_cluster_osds_total 2"), "{out}");
+        assert!(out.contains("objectio_cluster_osds_up 1"), "{out}");
+        assert!(
+            out.contains(r#"objectio_osd_up{node_id="gone",address="http://gone:9200"} 0"#),
+            "the down OSD is missing from the scrape entirely: {out}"
+        );
+    }
+
+    /// Per-OSD series, so one disk filling up is visible rather than averaged
+    /// away in a cluster total that still looks comfortable.
+    #[test]
+    fn each_osd_gets_its_own_series() {
+        let out = export(vec![node("hot", 100, 99, true), node("cold", 100, 1, true)]);
+        assert!(
+            out.contains(r#"objectio_osd_used_bytes{node_id="hot",address="http://hot:9200"} 99"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"objectio_osd_used_bytes{node_id="cold",address="http://cold:9200"} 1"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"objectio_osd_shards{node_id="hot""#),
+            "{out}"
+        );
+    }
+
+    /// Before the first poll completes there is nothing to report, and the
+    /// scrape must still be valid rather than absent or malformed.
+    #[test]
+    fn an_empty_snapshot_still_exports_valid_zeroes() {
+        let out = export(Vec::new());
+        assert!(out.contains("objectio_cluster_capacity_bytes 0"), "{out}");
+        assert!(out.contains("objectio_cluster_osds_total 0"), "{out}");
+        for line in out.lines().filter(|l| l.starts_with("objectio_cluster_")) {
+            assert_eq!(line.split_whitespace().count(), 2, "malformed: {line}");
+        }
+    }
+
+    /// Every gauge carries HELP and TYPE, which is what makes it legible in
+    /// Prometheus rather than an unexplained number.
+    #[test]
+    fn every_capacity_gauge_is_documented() {
+        let out = export(vec![node("a", 10, 1, true)]);
+        for name in [
+            "objectio_cluster_capacity_bytes",
+            "objectio_cluster_used_bytes",
+            "objectio_cluster_available_bytes",
+            "objectio_osd_capacity_bytes",
+            "objectio_osd_used_bytes",
+            "objectio_osd_up",
+        ] {
+            assert!(
+                out.contains(&format!("# HELP {name} ")),
+                "no HELP for {name}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE {name} gauge")),
+                "no TYPE for {name}"
+            );
+        }
     }
 }

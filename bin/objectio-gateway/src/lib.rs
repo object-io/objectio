@@ -130,6 +130,76 @@ async fn load_initial_license(
 }
 
 /// Prometheus metrics endpoint handler
+/// How often the capacity gauges are refreshed. Capacity moves on the scale of
+/// writes, not milliseconds, and each poll costs one `GetStatus` per OSD.
+const CAPACITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ask every registered OSD how full it is.
+///
+/// Best effort in both directions: a node meta does not know about is not
+/// reported, and a node that does not answer is reported with
+/// `reachable: false` rather than omitted. Dropping it would make capacity
+/// appear to shrink when a disk goes unreachable, which reads as data loss
+/// rather than as a node being down.
+async fn collect_capacity(
+    mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+) -> Vec<objectio_s3::metrics::NodeCapacity> {
+    use objectio_proto::metadata::GetListingNodesRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+
+    let Ok(resp) = meta
+        .get_listing_nodes(GetListingNodesRequest {
+            bucket: String::new(),
+            include_all_states: true,
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<(String, Vec<u8>)> = resp
+        .into_inner()
+        .nodes
+        .into_iter()
+        .filter(|n| seen.insert(n.address.clone()))
+        .map(|n| (n.address, n.node_id))
+        .collect();
+
+    let polls = targets.into_iter().map(|(addr, node_id)| async move {
+        let endpoint = if addr.starts_with("http") {
+            addr.clone()
+        } else {
+            format!("http://{addr}")
+        };
+        let status = async {
+            let mut c = StorageServiceClient::connect(endpoint).await.ok()?;
+            let s = c
+                .get_status(objectio_proto::storage::GetStatusRequest {})
+                .await
+                .ok()?
+                .into_inner();
+            Some((s.total_capacity, s.used_capacity, s.shard_count))
+        }
+        .await;
+
+        let (total, used, shards, reachable) =
+            status.map_or((0, 0, 0, false), |(t, u, s)| (t, u, s, true));
+        objectio_s3::metrics::NodeCapacity {
+            node_id: hex::encode(&node_id),
+            address: addr,
+            total_bytes: total,
+            used_bytes: used,
+            shard_count: shards,
+            reachable,
+        }
+    });
+
+    futures::future::join_all(polls).await
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     let metrics = s3_metrics().export_prometheus();
     (
@@ -1362,6 +1432,22 @@ pub async fn run(
 
     // Bind all listeners and serve concurrently. A shared broadcast channel
     // fans the user's shutdown future out to every axum::serve.
+    // Keep the capacity gauges fed. Polling here rather than computing on
+    // scrape: a reading costs a GetStatus to every OSD, and /metrics has to
+    // stay fast and must not fail because one disk is slow to answer.
+    {
+        let meta_client = state.meta_client.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CAPACITY_POLL_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let nodes = collect_capacity(meta_client.clone()).await;
+                s3_metrics().set_capacity(nodes);
+            }
+        });
+    }
+
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());
     for (addr, router, label) in listeners {
