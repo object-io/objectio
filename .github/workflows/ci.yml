@@ -224,7 +224,7 @@ jobs:
             echo "::error::the release binary needs libraries a user will not have: $bad"
             exit 1
           fi
-          echo "only portable libraries — ok",grep-hyperscan
+          echo "only portable libraries — ok"
 
   console:
     name: console
