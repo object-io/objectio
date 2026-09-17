@@ -40,6 +40,8 @@ sys-info = "0.9"
 
 [features]
 default = []
+# Forwards ISA-L erasure coding (x86_64) to objectio-erasure.
+isal = ["objectio-erasure/isal"]
 # Opt-in: route shard I/O through io_uring instead of spawn_blocking
 # + pread. Linux 5.6+ only; no-op on macOS / Windows. Measured +25%
 # throughput on 4 MiB stripes (see objectio-docs storage-io-levels).

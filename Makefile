@@ -190,7 +190,7 @@ kind-up:
 
 ## Create Kind cluster and deploy using pre-built GHCR images (no local build)
 kind-up-registry:
-	bash deploy/kind/setup.sh --registry ghcr.io/cloudomate
+	bash deploy/kind/setup.sh --registry ghcr.io/object-io
 
 ## Tear down the Kind cluster
 kind-down:

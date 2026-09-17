@@ -7,8 +7,12 @@
 # EC scheme: 4+2 (4 data + 2 parity shards, 6 OSDs required)
 
 global:
-  imageRegistry: ghcr.io/cloudomate
+  imageRegistry: ghcr.io/object-io
   imagePullPolicy: IfNotPresent
+  # kind builds and loads the per-service images by name
+  # (objectio-gateway, objectio-meta, ...), so opt out of the chart's
+  # single-image default and let each component use its own repository.
+  image: null
 
 gateway:
   image:

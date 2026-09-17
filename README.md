@@ -83,7 +83,7 @@ VERSION=v0.1.0
 OS=$(uname | tr '[:upper:]' '[:lower:]' | sed 's/darwin/darwin/;s/linux/linux/')
 ARCH=$(uname | tr '[:upper:]' '[:lower:]' | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/')
 curl -L -o objectio-aio \
-    "https://github.com/cloudomate/objectio/releases/download/${VERSION}/objectio-aio-${VERSION}-${OS}-${ARCH}"
+    "https://github.com/object-io/objectio/releases/download/${VERSION}/objectio-aio-${VERSION}-${OS}-${ARCH}"
 chmod +x objectio-aio
 sudo mv objectio-aio /usr/local/bin/
 objectio-aio
@@ -110,7 +110,7 @@ cleanly.
 ### Production — helm chart on Kubernetes
 
 ```sh
-helm install objectio oci://ghcr.io/cloudomate/charts/objectio \
+helm install objectio oci://ghcr.io/object-io/charts/objectio \
    --version 0.1.0 \
    -f your-values.yaml
 ```
@@ -118,11 +118,11 @@ helm install objectio oci://ghcr.io/cloudomate/charts/objectio \
 Or for a local-dev cluster that exercises the same chart against kind:
 
 ```sh
-git clone https://github.com/cloudomate/objectio
+git clone https://github.com/object-io/objectio
 cd objectio && make kind-up
 ```
 
-Both paths pull the universal image `ghcr.io/cloudomate/objectio:<tag>`
+Both paths pull the universal image `ghcr.io/object-io/objectio:<tag>`
 — one multi-arch image that every service container overrides the
 entrypoint on (gateway / meta / osd / block-gateway / cli).
 

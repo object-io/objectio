@@ -10,6 +10,6 @@ keywords:
   - s3
   - erasure-coding
   - block-storage
-home: https://github.com/cloudomate/objectio
+home: https://github.com/object-io/objectio
 sources:
-  - https://github.com/cloudomate/objectio
+  - https://github.com/object-io/objectio
