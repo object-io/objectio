@@ -142,6 +142,50 @@ fn ephemeral_port() -> Result<u16> {
     Ok(port)
 }
 
+/// Pick a free loopback port that none of `taken` already claims.
+///
+/// `bind(:0)` hands back any port free *at that instant*, including one this
+/// process has earmarked but not yet bound — and the gateway's port is chosen
+/// first and bound much later. A subsystem handed the gateway's port wins the
+/// race, and because meta and the OSD both serve `/health` on their metrics
+/// listeners, the result is a process answering health checks on the S3 port
+/// and returning a bare 404 to everything else. That is a confusing failure
+/// to chase: the server is plainly up, and only some routes exist.
+///
+/// Also used to keep the OSDs' derived ports clear, which were never checked
+/// against anything at all.
+fn ephemeral_port_excluding(taken: &[u16]) -> Result<u16> {
+    for _ in 0..64 {
+        let port = ephemeral_port()?;
+        if !taken.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err(anyhow!(
+        "could not find a free loopback port outside the {} already claimed",
+        taken.len()
+    ))
+}
+
+/// Pick a base for `count` consecutive OSD ports, none of which collide with
+/// `taken`. The OSDs take `base`, `base + 1`, ... so the whole run has to be
+/// clear, not just the first one.
+fn ephemeral_port_run(count: usize, taken: &[u16]) -> Result<u16> {
+    let count = u16::try_from(count.max(1)).unwrap_or(u16::MAX);
+    for _ in 0..64 {
+        let base = ephemeral_port()?;
+        let Some(last) = base.checked_add(count - 1) else {
+            continue;
+        };
+        if (base..=last).all(|p| !taken.contains(&p) && port_free("127.0.0.1", p)) {
+            return Ok(base);
+        }
+    }
+    Err(anyhow!(
+        "could not find {count} consecutive free loopback ports"
+    ))
+}
+
 fn port_free(addr: &str, port: u16) -> bool {
     StdTcpListener::bind((addr, port)).is_ok()
 }
@@ -347,9 +391,12 @@ async fn main() -> Result<()> {
         p
     };
 
-    let meta_grpc = ephemeral_port()?;
-    let meta_admin = ephemeral_port()?;
-    let osd_base = ephemeral_port()?;
+    // Every subsequent port must avoid the ones already spoken for. The
+    // gateway's is the one that matters most: it is claimed here and bound
+    // only once the whole stack is assembled.
+    let meta_grpc = ephemeral_port_excluding(&[gateway_port])?;
+    let meta_admin = ephemeral_port_excluding(&[gateway_port, meta_grpc])?;
+    let osd_base = ephemeral_port_run(args.osds, &[gateway_port, meta_grpc, meta_admin])?;
 
     // ------------------------------------------------------------
     // SSE master key. Gateway's bin logs a scary warning when this

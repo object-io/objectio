@@ -137,7 +137,7 @@ impl Cluster {
         let (access_key, secret_key) = Self::await_credentials(&creds_path);
 
         let endpoint = format!("http://127.0.0.1:{port}");
-        let cluster = Self {
+        let mut cluster = Self {
             child,
             endpoint,
             access_key,
@@ -185,18 +185,41 @@ impl Cluster {
         );
     }
 
-    fn wait_healthy(&self) {
+    /// Wait until the *gateway* is serving on this port.
+    ///
+    /// `/health` is not enough on its own: meta and the OSD each serve one on
+    /// their metrics listeners, so a 200 there proves only that some `ObjectIO`
+    /// process holds the port. When a subsystem was handed the gateway's port
+    /// this returned immediately and the first real request came back as a
+    /// bare 404 — which reads like a missing route rather than the wrong
+    /// server. Probe an admin route as well: unauthenticated it answers 401,
+    /// and only the gateway has it at all.
+    fn wait_healthy(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(90);
         let client = reqwest::blocking::Client::new();
+        let mut last = String::from("no response");
         while Instant::now() < deadline {
-            if let Ok(r) = client.get(format!("{}/health", self.endpoint)).send()
-                && r.status().is_success()
-            {
-                return;
+            // A child that has already exited will never become healthy.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "objectio-aio exited during startup with {status}; \
+                        set OBJECTIO_E2E_LOGS=1 to see why"
+                );
+            }
+            match client.get(format!("{}/_admin/nodes", self.endpoint)).send() {
+                Ok(r) if r.status() == 401 => return,
+                Ok(r) => {
+                    last = format!(
+                        "{} answered /_admin/nodes with {}",
+                        self.endpoint,
+                        r.status()
+                    );
+                }
+                Err(e) => last = e.to_string(),
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        panic!("cluster did not become healthy within 90s");
+        panic!("the gateway did not come up within 90s — {last}");
     }
 
     /// Signed request. `body` is sent as-is; pass `&[]` for none.

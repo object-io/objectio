@@ -622,6 +622,17 @@ struct ByteRange {
 
 /// Parse HTTP Range header (e.g., "bytes=0-99" or "bytes=100-" or "bytes=-50")
 fn parse_range_header(range_header: &str, total_size: u64) -> Option<ByteRange> {
+    // No range over a zero-length object is satisfiable, and every branch
+    // below computes `total_size - 1`. The suffix branch reached that with
+    // `total_size == 0` — `GET` with `Range: bytes=-5` on an empty object
+    // panicked on the underflow in a debug build and produced a range ending
+    // at `u64::MAX` in a release one. `None` here becomes the 416 the caller
+    // already returns for an unsatisfiable range, which is also what RFC 7233
+    // asks for.
+    if total_size == 0 {
+        return None;
+    }
+
     let range_header = range_header.trim();
     if !range_header.starts_with("bytes=") {
         return None;
@@ -643,7 +654,12 @@ fn parse_range_header(range_header: &str, total_size: u64) -> Option<ByteRange> 
     // Handle suffix range (bytes=-500 means last 500 bytes)
     if start_str.is_empty() {
         let suffix_len: u64 = end_str.parse().ok()?;
-        if suffix_len == 0 || suffix_len > total_size {
+        // `bytes=-0` asks for the last zero bytes. RFC 7233 calls that
+        // unsatisfiable; this used to answer it with the entire object.
+        if suffix_len == 0 {
+            return None;
+        }
+        if suffix_len > total_size {
             return Some(ByteRange {
                 start: 0,
                 end: total_size - 1,
@@ -1203,19 +1219,29 @@ pub struct CopyObjectResult {
     pub last_modified: String,
 }
 
+/// Render a Unix timestamp as the ISO 8601 form S3 clients parse.
+///
+/// `i64::try_from` rather than `as i64`: the cast wrapped the whole upper half
+/// of `u64` into negative times, so a timestamp that could not be a real date
+/// rendered as one in 1969 instead of reaching the fallback below. A client
+/// reading `LastModified` cannot tell a wrong date from a right one.
 fn timestamp_to_iso(ts: u64) -> String {
     use chrono::{DateTime, Utc};
-    // Convert Unix timestamp to ISO 8601 format
-    DateTime::<Utc>::from_timestamp(ts as i64, 0)
+    i64::try_from(ts)
+        .ok()
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
         .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
+/// Render a Unix timestamp as an RFC 7231 HTTP date, e.g.
+/// `Sun, 06 Nov 1994 08:49:37 GMT`. Same wrapping caveat as
+/// [`timestamp_to_iso`].
 fn timestamp_to_http_date(ts: u64) -> String {
     use chrono::{DateTime, Utc};
-    // Convert Unix timestamp to HTTP date format (RFC 7231)
-    // Example: "Sun, 06 Nov 1994 08:49:37 GMT"
-    DateTime::<Utc>::from_timestamp(ts as i64, 0)
+    i64::try_from(ts)
+        .ok()
+        .and_then(|secs| DateTime::<Utc>::from_timestamp(secs, 0))
         .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
         .unwrap_or_else(|| "Thu, 01 Jan 1970 00:00:00 GMT".to_string())
 }
@@ -7769,5 +7795,581 @@ pub async fn admin_delete_access_key(
                     .unwrap()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod s3_tests {
+    use super::{
+        ByteRange, CompleteMultipartUploadXml, DeleteObjectsRequest, ListBucketResult,
+        ObjectContent, Owner, S3Error, StripeMeta, add_metadata_headers, build_s3_arn,
+        extract_user_metadata, is_warehouse_bucket, overlapping_stripes, parse_range_header,
+        parse_sse_c_headers, sse_condition_vars, timestamp_to_http_date, timestamp_to_iso, to_xml,
+    };
+    use http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).expect("header name"),
+                HeaderValue::from_str(v).expect("header value"),
+            );
+        }
+        h
+    }
+
+    fn range(header: &str, size: u64) -> Option<(u64, u64)> {
+        parse_range_header(header, size).map(|ByteRange { start, end }| (start, end))
+    }
+
+    // ── Range header ──────────────────────────────────────────────────────
+    //
+    // This decides which bytes a GET returns. `None` becomes a 416.
+
+    #[test]
+    fn a_closed_range_is_taken_literally() {
+        assert_eq!(range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(range("bytes=100-199", 1000), Some((100, 199)));
+        assert_eq!(range("bytes=0-0", 1000), Some((0, 0)));
+        assert_eq!(range("bytes=999-999", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn an_open_ended_range_runs_to_the_last_byte() {
+        assert_eq!(range("bytes=100-", 1000), Some((100, 999)));
+        assert_eq!(range("bytes=0-", 1000), Some((0, 999)));
+        assert_eq!(range("bytes=999-", 1000), Some((999, 999)));
+    }
+
+    #[test]
+    fn a_suffix_range_counts_back_from_the_end() {
+        assert_eq!(range("bytes=-50", 1000), Some((950, 999)));
+        assert_eq!(range("bytes=-1", 1000), Some((999, 999)));
+        assert_eq!(range("bytes=-1000", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn a_suffix_longer_than_the_object_is_the_whole_object() {
+        assert_eq!(range("bytes=-5000", 1000), Some((0, 999)));
+    }
+
+    #[test]
+    fn an_end_past_the_object_is_clamped_rather_than_refused() {
+        // A client that asks for more than there is gets what there is; S3
+        // answers 206 with a short body, not 416.
+        assert_eq!(range("bytes=0-99999", 1000), Some((0, 999)));
+        assert_eq!(range("bytes=500-99999", 1000), Some((500, 999)));
+    }
+
+    /// A range over an empty object must not underflow.
+    ///
+    /// Every branch computes `total_size - 1`, and the suffix branch reached
+    /// that with `total_size == 0`: `Range: bytes=-5` on a zero-byte object
+    /// panicked on the subtraction in a debug build and produced a range
+    /// ending at `u64::MAX` in a release one. A zero-byte object is something
+    /// any client can create, so this was reachable by anyone who could PUT.
+    #[test]
+    fn no_range_over_an_empty_object_is_satisfiable() {
+        for header in [
+            "bytes=-5",
+            "bytes=0-0",
+            "bytes=0-",
+            "bytes=-1",
+            "bytes=0-10",
+        ] {
+            assert_eq!(
+                range(header, 0),
+                None,
+                "{header} on a zero-byte object should be unsatisfiable"
+            );
+        }
+    }
+
+    /// `bytes=-0` asks for the last zero bytes, which RFC 7233 calls
+    /// unsatisfiable. It used to answer with the entire object.
+    #[test]
+    fn a_zero_length_suffix_is_unsatisfiable() {
+        assert_eq!(range("bytes=-0", 1000), None);
+    }
+
+    #[test]
+    fn a_range_starting_past_the_end_is_refused() {
+        assert_eq!(range("bytes=1000-1099", 1000), None);
+        assert_eq!(range("bytes=1000-", 1000), None);
+        assert_eq!(range("bytes=5000-6000", 1000), None);
+    }
+
+    #[test]
+    fn a_backwards_range_is_refused() {
+        assert_eq!(range("bytes=99-0", 1000), None);
+    }
+
+    #[test]
+    fn a_unit_other_than_bytes_is_refused() {
+        // Refusing is right: honouring it as bytes would return the wrong
+        // region for a client that meant something else.
+        for header in ["items=0-99", "0-99", "seconds=0-99", ""] {
+            assert_eq!(range(header, 1000), None, "{header:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn malformed_ranges_are_refused_rather_than_guessed_at() {
+        for header in [
+            "bytes=",
+            "bytes=-",
+            "bytes=abc-def",
+            "bytes=0-99-199",
+            "bytes=0-99,200-299",
+            "bytes=--5",
+        ] {
+            assert_eq!(range(header, 1000), None, "{header:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_in_the_header_is_tolerated() {
+        assert_eq!(range("  bytes=0-99  ", 1000), Some((0, 99)));
+        assert_eq!(range("bytes= 0 - 99 ", 1000), Some((0, 99)));
+    }
+
+    // ── Stripe selection ──────────────────────────────────────────────────
+
+    fn stripes(sizes: &[u64]) -> Vec<StripeMeta> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &data_size)| StripeMeta {
+                stripe_id: i as u64,
+                data_size,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// A range must fetch every stripe it touches and nothing else.
+    ///
+    /// Fetching too few truncates the response; fetching too many costs a
+    /// round trip to an OSD per extra stripe on every ranged read.
+    #[test]
+    fn a_range_inside_one_stripe_fetches_only_that_stripe() {
+        let s = stripes(&[100, 100, 100]);
+        let picked = overlapping_stripes(
+            &s,
+            300,
+            &ByteRange {
+                start: 120,
+                end: 180,
+            },
+        );
+        assert_eq!(picked, vec![(1, 100)]);
+    }
+
+    #[test]
+    fn a_range_spanning_stripes_fetches_each_of_them_with_its_offset() {
+        let s = stripes(&[100, 100, 100]);
+        // The second element of each pair is the stripe's absolute start, which
+        // is how the caller slices the right bytes out of it.
+        assert_eq!(
+            overlapping_stripes(
+                &s,
+                300,
+                &ByteRange {
+                    start: 50,
+                    end: 250
+                }
+            ),
+            vec![(0, 0), (1, 100), (2, 200)]
+        );
+    }
+
+    #[test]
+    fn a_boundary_range_does_not_pull_in_the_neighbour() {
+        let s = stripes(&[100, 100, 100]);
+        // Ends on the last byte of stripe 0.
+        assert_eq!(
+            overlapping_stripes(&s, 300, &ByteRange { start: 0, end: 99 }),
+            vec![(0, 0)]
+        );
+        // Starts on the first byte of stripe 1.
+        assert_eq!(
+            overlapping_stripes(
+                &s,
+                300,
+                &ByteRange {
+                    start: 100,
+                    end: 199
+                }
+            ),
+            vec![(1, 100)]
+        );
+    }
+
+    #[test]
+    fn the_whole_object_fetches_every_stripe() {
+        let s = stripes(&[100, 100, 100]);
+        assert_eq!(
+            overlapping_stripes(&s, 300, &ByteRange { start: 0, end: 299 }),
+            vec![(0, 0), (1, 100), (2, 200)]
+        );
+    }
+
+    #[test]
+    fn a_single_stripe_without_a_recorded_size_falls_back_to_the_object_size() {
+        // Objects written before data_size was recorded per stripe.
+        let s = stripes(&[0]);
+        assert_eq!(
+            overlapping_stripes(&s, 500, &ByteRange { start: 10, end: 20 }),
+            vec![(0, 0)]
+        );
+    }
+
+    #[test]
+    fn stripes_of_uneven_size_still_report_their_true_offsets() {
+        let s = stripes(&[10, 250, 40]);
+        assert_eq!(
+            overlapping_stripes(&s, 300, &ByteRange { start: 5, end: 265 }),
+            vec![(0, 0), (1, 10), (2, 260)]
+        );
+    }
+
+    // ── User metadata ─────────────────────────────────────────────────────
+
+    #[test]
+    fn user_metadata_is_stored_without_its_prefix() {
+        let m = extract_user_metadata(&headers(&[
+            ("x-amz-meta-author", "yash"),
+            ("x-amz-meta-project", "objectio"),
+        ]));
+        assert_eq!(m.get("author").map(String::as_str), Some("yash"));
+        assert_eq!(m.get("project").map(String::as_str), Some("objectio"));
+    }
+
+    #[test]
+    fn header_names_are_matched_case_insensitively() {
+        // HTTP header names are case-insensitive and clients send every
+        // variant; a case-sensitive match would silently drop metadata.
+        let m = extract_user_metadata(&headers(&[("X-Amz-Meta-Author", "yash")]));
+        assert_eq!(m.get("author").map(String::as_str), Some("yash"));
+    }
+
+    #[test]
+    fn headers_that_are_not_user_metadata_are_left_out() {
+        let m = extract_user_metadata(&headers(&[
+            ("content-type", "text/plain"),
+            ("x-amz-date", "20260917T000000Z"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-meta-keep", "yes"),
+        ]));
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key("keep"));
+    }
+
+    #[test]
+    fn metadata_survives_a_round_trip_back_onto_a_response() {
+        let m = extract_user_metadata(&headers(&[("x-amz-meta-author", "yash")]));
+        let built = add_metadata_headers(http::Response::builder(), &m)
+            .body(())
+            .expect("response");
+        assert_eq!(
+            built.headers().get("x-amz-meta-author").unwrap(),
+            "yash",
+            "metadata did not come back out on the response"
+        );
+    }
+
+    // ── SSE-C ─────────────────────────────────────────────────────────────
+
+    /// A 32-byte key and the base64 of its MD5, which is the binding the
+    /// gateway checks.
+    fn sse_c_headers(key: &[u8; 32], md5_of: &[u8]) -> HeaderMap {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        headers(&[
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                &b64.encode(key),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-md5",
+                &b64.encode(md5::compute(md5_of).0),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_request_with_no_sse_c_headers_carries_no_key() {
+        assert!(
+            parse_sse_c_headers(&HeaderMap::new())
+                .expect("no headers is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_complete_and_consistent_sse_c_triple_is_accepted() {
+        let key = [7u8; 32];
+        let parsed = parse_sse_c_headers(&sse_c_headers(&key, &key))
+            .expect("valid triple")
+            .expect("a key");
+        assert_eq!(parsed.key, key);
+    }
+
+    /// Two of the three headers must not be accepted.
+    ///
+    /// Accepting a key with no MD5 would drop the binding that catches a
+    /// corrupted key header; accepting an MD5 with no key would leave the
+    /// object unencrypted while the client believed otherwise.
+    #[test]
+    fn a_partial_sse_c_triple_is_refused() {
+        let key = [7u8; 32];
+        let full = sse_c_headers(&key, &key);
+        for omit in [
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        ] {
+            let mut h = full.clone();
+            h.remove(omit);
+            assert!(
+                parse_sse_c_headers(&h).is_err(),
+                "SSE-C was accepted without {omit}"
+            );
+        }
+    }
+
+    /// The MD5 binds the key to the request.
+    ///
+    /// Without the check a corrupted key header decrypts to garbage on GET
+    /// with no error anywhere — the client gets bytes that are not its data.
+    #[test]
+    fn an_md5_that_does_not_match_the_key_is_refused() {
+        let key = [7u8; 32];
+        let wrong = [8u8; 32];
+        assert!(
+            parse_sse_c_headers(&sse_c_headers(&key, &wrong)).is_err(),
+            "a key whose MD5 belongs to a different key was accepted"
+        );
+    }
+
+    #[test]
+    fn an_algorithm_other_than_aes256_is_refused() {
+        let key = [7u8; 32];
+        let mut h = sse_c_headers(&key, &key);
+        h.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            HeaderValue::from_static("AES128"),
+        );
+        assert!(parse_sse_c_headers(&h).is_err());
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_length_is_refused() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let short = [7u8; 16];
+        let mut h = sse_c_headers(&[7u8; 32], &[7u8; 32]);
+        h.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&b64.encode(short)).unwrap(),
+        );
+        h.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&b64.encode(md5::compute(short).0)).unwrap(),
+        );
+        assert!(
+            parse_sse_c_headers(&h).is_err(),
+            "a 16-byte customer key was accepted for AES-256"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_not_base64_is_refused() {
+        let mut h = sse_c_headers(&[7u8; 32], &[7u8; 32]);
+        h.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_static("not base64!!"),
+        );
+        assert!(parse_sse_c_headers(&h).is_err());
+    }
+
+    // ── Policy condition variables ────────────────────────────────────────
+
+    #[test]
+    fn sse_headers_become_the_condition_keys_a_bucket_policy_reads() {
+        // A policy that denies unsealed PUTs matches on these names exactly.
+        let vars = sse_condition_vars(Some(&headers(&[
+            ("x-amz-server-side-encryption", "aws:kms"),
+            ("x-amz-server-side-encryption-aws-kms-key-id", "key-1"),
+        ])));
+        assert_eq!(
+            vars.get("s3:x-amz-server-side-encryption")
+                .map(String::as_str),
+            Some("aws:kms")
+        );
+        assert_eq!(
+            vars.get("s3:x-amz-server-side-encryption-aws-kms-key-id")
+                .map(String::as_str),
+            Some("key-1")
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_sse_headers_sets_no_sse_condition_keys() {
+        let vars = sse_condition_vars(Some(&HeaderMap::new()));
+        assert!(!vars.contains_key("s3:x-amz-server-side-encryption"));
+        // Absent must stay absent: a policy that denies on a value would
+        // otherwise match an empty string and refuse every plain PUT.
+        assert_eq!(
+            vars.get("aws:SecureTransport").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    // ── ARNs ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_arn_names_a_bucket_or_an_object_within_it() {
+        assert_eq!(build_s3_arn("b", None), "arn:obio:s3:::b");
+        assert_eq!(build_s3_arn("b", Some("k.txt")), "arn:obio:s3:::b/k.txt");
+        assert_eq!(
+            build_s3_arn("b", Some("nested/deep/k.txt")),
+            "arn:obio:s3:::b/nested/deep/k.txt"
+        );
+    }
+
+    #[test]
+    fn only_the_iceberg_prefix_marks_a_warehouse_bucket() {
+        assert!(is_warehouse_bucket("iceberg-analytics"));
+        assert!(!is_warehouse_bucket("analytics"));
+        assert!(!is_warehouse_bucket("my-iceberg-data"));
+    }
+
+    // ── XML the client sends ──────────────────────────────────────────────
+
+    #[test]
+    fn a_completion_body_yields_its_parts_in_order() {
+        let body = "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part>\
+            <Part><PartNumber>2</PartNumber><ETag>\"b\"</ETag></Part>\
+            </CompleteMultipartUpload>";
+        let parsed: CompleteMultipartUploadXml = quick_xml::de::from_str(body).expect("parse");
+        assert_eq!(parsed.parts.len(), 2);
+        assert_eq!(parsed.parts[0].part_number, 1);
+        assert_eq!(parsed.parts[1].etag, "\"b\"");
+    }
+
+    #[test]
+    fn a_completion_body_with_no_parts_parses_to_an_empty_list() {
+        let parsed: CompleteMultipartUploadXml =
+            quick_xml::de::from_str("<CompleteMultipartUpload></CompleteMultipartUpload>")
+                .expect("parse");
+        assert!(parsed.parts.is_empty());
+    }
+
+    #[test]
+    fn a_batch_delete_body_yields_its_keys() {
+        let body = "<Delete><Quiet>true</Quiet>\
+            <Object><Key>a.txt</Key></Object>\
+            <Object><Key>b.txt</Key><VersionId>v2</VersionId></Object>\
+            </Delete>";
+        let parsed: DeleteObjectsRequest = quick_xml::de::from_str(body).expect("parse");
+        assert!(parsed.quiet);
+        assert_eq!(parsed.objects.len(), 2);
+        assert_eq!(parsed.objects[0].key, "a.txt");
+        assert_eq!(parsed.objects[0].version_id, None);
+        assert_eq!(parsed.objects[1].version_id.as_deref(), Some("v2"));
+    }
+
+    // ── XML the gateway sends ─────────────────────────────────────────────
+
+    /// An object key is whatever the client named it, and it ends up inside a
+    /// listing's XML. If `<` and `&` are not escaped the listing stops being
+    /// parseable — and a key could close a tag and inject elements of its own.
+    #[test]
+    fn a_key_containing_markup_is_escaped_in_a_listing() {
+        let result = ListBucketResult {
+            name: "b".to_string(),
+            prefix: String::new(),
+            delimiter: None,
+            max_keys: 1000,
+            key_count: Some(1),
+            is_truncated: false,
+            next_continuation_token: None,
+            common_prefixes: Vec::new(),
+            contents: vec![ObjectContent {
+                key: "a<b>&c\"d'e.txt".to_string(),
+                last_modified: "1970-01-01T00:00:00.000Z".to_string(),
+                etag: "\"x\"".to_string(),
+                size: 1,
+                storage_class: "STANDARD".to_string(),
+            }],
+        };
+        let xml = to_xml(&result).expect("serialize");
+        assert!(
+            !xml.contains("a<b>"),
+            "an object key's markup reached the listing unescaped: {xml}"
+        );
+        assert!(xml.contains("&lt;"), "expected escaped markup in: {xml}");
+        assert!(
+            xml.contains("&amp;"),
+            "the ampersand in a key was not escaped: {xml}"
+        );
+    }
+
+    /// Error messages interpolate things the caller supplied.
+    #[test]
+    fn an_error_message_containing_markup_is_escaped() {
+        let err = S3Error {
+            code: "InvalidArgument".to_string(),
+            message: "bad key: </Message><Injected>x</Injected>".to_string(),
+            resource: None,
+            request_id: "req-1".to_string(),
+        };
+        let xml = to_xml(&err).expect("serialize");
+        assert!(
+            !xml.contains("<Injected>"),
+            "an error message closed its own tag: {xml}"
+        );
+    }
+
+    // ── Timestamps ────────────────────────────────────────────────────────
+
+    #[test]
+    fn iso_timestamps_are_the_shape_clients_parse() {
+        assert_eq!(timestamp_to_iso(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(timestamp_to_iso(1_700_000_000), "2023-11-14T22:13:20.000Z");
+    }
+
+    #[test]
+    fn http_dates_are_rfc_7231_shaped() {
+        assert_eq!(
+            timestamp_to_http_date(784_111_777),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
+        assert_eq!(timestamp_to_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    /// A timestamp chrono cannot represent falls back to the epoch rather than
+    /// panicking or emitting something a client cannot parse.
+    #[test]
+    fn an_impossible_timestamp_degrades_to_the_epoch() {
+        assert_eq!(timestamp_to_iso(u64::MAX), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            timestamp_to_http_date(u64::MAX),
+            "Thu, 01 Jan 1970 00:00:00 GMT"
+        );
+    }
+
+    #[test]
+    fn an_owner_renders_inside_a_listing() {
+        let xml = to_xml(&Owner {
+            id: "u-1".to_string(),
+            display_name: "yash".to_string(),
+        })
+        .expect("serialize");
+        assert!(xml.contains("u-1") && xml.contains("yash"), "{xml}");
     }
 }
