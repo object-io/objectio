@@ -500,7 +500,8 @@ impl OsdService {
                 );
                 continue;
             }
-            if let Err(e) = disks[loc.disk_idx].mark_block_used(loc.block_num) {
+            let blocks = disks[loc.disk_idx].blocks_for_len(loc.size as usize);
+            if let Err(e) = disks[loc.disk_idx].mark_extent_used(loc.block_num, blocks) {
                 warn!(
                     "Could not mark block {} on disk {} as used: {e}",
                     loc.block_num, loc.disk_idx
@@ -717,8 +718,8 @@ impl OsdService {
     /// therefore surfaced as `block 2718 exceeds total blocks 2303`, a 500
     /// from the gateway, rather than as "out of space".
     #[allow(clippy::result_large_err)]
-    fn allocate_block(&self, disk_idx: usize) -> Result<u64, Status> {
-        self.disks[disk_idx].allocate_block().map_err(|e| {
+    fn allocate_extent(&self, disk_idx: usize, blocks: u64) -> Result<u64, Status> {
+        self.disks[disk_idx].allocate_extent(blocks).map_err(|e| {
             // ResourceExhausted, not Internal: the caller can act on a full
             // disk — pick another OSD, alert, expand — and cannot act on an
             // internal error.
@@ -759,9 +760,16 @@ impl StorageService for OsdService {
             req.data.len()
         );
 
-        // Select disk and allocate block
+        // Select disk and allocate an extent sized to this shard.
+        //
+        // One shard used to take exactly one block, and the block was sized
+        // for the largest shard any EC scheme could produce — 4 MB — so a
+        // 4 KB object and a 4 MB object both cost 24 MB across a 4+2 stripe.
+        // Measured at 6144x and 6x amplification; the real capacity limit was
+        // an object count, not a byte count, and nothing reported it.
         let disk_idx = self.select_disk_for_write();
-        let block_num = self.allocate_block(disk_idx)?;
+        let blocks = self.disks[disk_idx].blocks_for_len(req.data.len());
+        let block_num = self.allocate_extent(disk_idx, blocks)?;
 
         let disk = &self.disks[disk_idx];
 
@@ -944,7 +952,10 @@ impl StorageService for OsdService {
             && loc.disk_idx < self.disks.len()
         {
             let disk = &self.disks[loc.disk_idx];
-            match disk.free_block(loc.block_num) {
+            // `size` is the shard's payload length, so the extent's length is
+            // derivable — which is why nothing had to be added to the index.
+            let blocks = disk.blocks_for_len(loc.size as usize);
+            match disk.free_extent(loc.block_num, blocks) {
                 Ok(()) => {
                     if let Err(e) = disk.persist_allocator() {
                         warn!(

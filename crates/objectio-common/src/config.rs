@@ -71,7 +71,12 @@ pub struct StorageConfig {
     pub disks: Vec<DiskConfig>,
     /// Default erasure coding configuration
     pub default_ec: ErasureConfig,
-    /// Block size for data (default: 4 MB)
+    /// Disk allocation granularity in bytes (default: 4 KiB).
+    ///
+    /// NOT the stripe size. This is the unit the on-disk block bitmap tracks —
+    /// Ceph's `bluestore_min_alloc_size`, not its RBD object size. It used to
+    /// be set to 4 MiB, the stripe size, so every shard occupied a whole 4 MiB
+    /// block whatever its length.
     pub block_size: usize,
     /// WAL configuration
     pub wal: WalConfig,
@@ -82,7 +87,7 @@ impl Default for StorageConfig {
         Self {
             disks: Vec::new(),
             default_ec: ErasureConfig::EC_4_2,
-            block_size: 4 * 1024 * 1024, // 4 MB
+            block_size: 4 * 1024, // 4 KiB — must match objectio_storage::DEFAULT_BLOCK_SIZE
             wal: WalConfig::default(),
         }
     }

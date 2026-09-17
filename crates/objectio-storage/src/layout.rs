@@ -30,7 +30,17 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const SUPERBLOCK_SIZE: u64 = 4096;
 
 /// Default block size (64KB)
-pub const DEFAULT_BLOCK_SIZE: u32 = 64 * 1024;
+/// Disk allocation granularity — the unit the block bitmap tracks.
+///
+/// 4 KiB, matching Ceph's `bluestore_min_alloc_size` on SSD and the O_DIRECT
+/// alignment, so a block is exactly one aligned device write.
+///
+/// Distinct from the 4 MiB *stripe*, which is the erasure-coding unit and the
+/// analogue of Ceph's RBD object size. Those two were conflated: the stripe
+/// size was written into the allocation slot, so every shard occupied a whole
+/// 4 MiB block however small it was. Ceph gets away with a 4 MiB object
+/// because RADOS objects are sparse; a padded block is not.
+pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024;
 
 /// Default WAL size (1GB)
 pub const DEFAULT_WAL_SIZE: u64 = 1024 * 1024 * 1024;
