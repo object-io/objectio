@@ -582,6 +582,15 @@ async fn main() -> Result<()> {
             &disk.display().to_string(),
             "--advertise-addr",
             &format!("http://127.0.0.1:{port}"),
+            // Every OSD defaulted to the same metrics port (9201), so with
+            // more than one the first bound it and the rest logged
+            // "Metrics server error: Address already in use" and exported
+            // nothing — five of six on a 4+2 cluster. Whichever won was
+            // arbitrary, which is worse than none: the numbers looked like
+            // the cluster's and were one disk's. aio's scrape target is the
+            // gateway's :9000/metrics, and meta is already given 0 here.
+            "--metrics-port",
+            "0",
             "--log-level",
             &args.log_level,
         ]);
