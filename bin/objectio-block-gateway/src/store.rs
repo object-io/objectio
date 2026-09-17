@@ -180,6 +180,26 @@ impl BlockStore {
         Ok(table.get(key.as_str())?.map(|v| v.value().to_string()))
     }
 
+    /// Every object key this volume has flushed.
+    ///
+    /// Volume delete needs this to hand the storage back: the refs are the
+    /// only record of which chunks were ever written, and dropping them first
+    /// (which is what used to happen) strands every shard behind them.
+    pub fn list_volume_chunks(&self, volume_id: &str) -> Result<Vec<String>> {
+        let prefix = format!("{volume_id}\x00");
+        let rtx = self.db.begin_read()?;
+        let table = rtx.open_table(CHUNKS)?;
+        let mut keys = Vec::new();
+        for entry in table.range(prefix.as_str()..)? {
+            let (k, v) = entry?;
+            if !k.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            keys.push(v.value().to_string());
+        }
+        Ok(keys)
+    }
+
     /// Delete all chunk refs for a volume (used on volume delete).
     pub fn delete_volume_chunks(&self, volume_id: &str) -> Result<()> {
         let prefix = format!("{volume_id}\x00");
@@ -213,4 +233,115 @@ impl BlockStore {
 
 fn chunk_db_key(volume_id: &str, chunk_id: u64) -> String {
     format!("{volume_id}\x00{chunk_id:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, BlockStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlockStore::open(dir.path().join("block.redb")).expect("open");
+        (dir, store)
+    }
+
+    #[test]
+    fn a_chunk_ref_survives_a_round_trip() {
+        let (_dir, s) = store();
+        s.put_chunk("vol-a", 7, "vol_vol-a/chunk_00000007").unwrap();
+        assert_eq!(
+            s.get_chunk("vol-a", 7).unwrap().as_deref(),
+            Some("vol_vol-a/chunk_00000007")
+        );
+    }
+
+    #[test]
+    fn an_unflushed_chunk_has_no_ref() {
+        let (_dir, s) = store();
+        assert!(s.get_chunk("vol-a", 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rewritten_chunk_keeps_one_ref() {
+        // Overwriting a chunk replaces the key rather than accumulating, which
+        // is what lets volume delete free exactly what is live.
+        let (_dir, s) = store();
+        s.put_chunk("vol-a", 3, "first").unwrap();
+        s.put_chunk("vol-a", 3, "second").unwrap();
+        assert_eq!(s.get_chunk("vol-a", 3).unwrap().as_deref(), Some("second"));
+        assert_eq!(s.list_volume_chunks("vol-a").unwrap(), vec!["second"]);
+    }
+
+    #[test]
+    fn listing_a_volume_returns_every_chunk_it_flushed() {
+        let (_dir, s) = store();
+        for id in [0u64, 1, 2, 300] {
+            s.put_chunk("vol-a", id, &format!("key-{id}")).unwrap();
+        }
+        let mut got = s.list_volume_chunks("vol-a").unwrap();
+        got.sort();
+        assert_eq!(got, vec!["key-0", "key-1", "key-2", "key-300"]);
+    }
+
+    /// The separator is the whole safety argument for the prefix scan.
+    ///
+    /// Keys are `"{volume_id}\0{chunk_id:016x}"`, so `vol1`'s range starts at
+    /// `"vol1\0"` and every `vol10` key sorts after it — `\0` is below every
+    /// printable byte. Without the NUL, `vol1` would sweep up `vol10`'s chunks
+    /// and volume delete would free another volume's live data.
+    #[test]
+    fn one_volume_never_sees_another_whose_id_it_prefixes() {
+        let (_dir, s) = store();
+        s.put_chunk("vol1", 0, "mine").unwrap();
+        s.put_chunk("vol10", 0, "theirs").unwrap();
+        s.put_chunk("vol1extra", 0, "also-theirs").unwrap();
+
+        assert_eq!(s.list_volume_chunks("vol1").unwrap(), vec!["mine"]);
+        assert_eq!(s.list_volume_chunks("vol10").unwrap(), vec!["theirs"]);
+
+        s.delete_volume_chunks("vol1").unwrap();
+        assert!(s.list_volume_chunks("vol1").unwrap().is_empty());
+        assert_eq!(
+            s.list_volume_chunks("vol10").unwrap(),
+            vec!["theirs"],
+            "deleting vol1 took vol10's chunk refs with it"
+        );
+        assert_eq!(
+            s.list_volume_chunks("vol1extra").unwrap(),
+            vec!["also-theirs"]
+        );
+    }
+
+    #[test]
+    fn deleting_a_volume_clears_its_chunk_refs() {
+        let (_dir, s) = store();
+        for id in 0..5u64 {
+            s.put_chunk("gone", id, &format!("key-{id}")).unwrap();
+        }
+        s.delete_volume("gone").unwrap();
+        assert!(s.list_volume_chunks("gone").unwrap().is_empty());
+        assert!(s.get_chunk("gone", 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn listing_an_unknown_volume_is_empty_rather_than_an_error() {
+        let (_dir, s) = store();
+        s.put_chunk("real", 0, "key").unwrap();
+        assert!(s.list_volume_chunks("missing").unwrap().is_empty());
+    }
+
+    /// Chunk ids are fixed-width hex so the range scan stays ordered.
+    ///
+    /// `{chunk_id:016x}` covers the whole u64; a narrower field would make
+    /// chunk 16 sort before chunk 2 and truncate the scan early.
+    #[test]
+    fn chunk_keys_sort_by_chunk_id() {
+        let mut keys: Vec<String> = [0u64, 2, 16, 255, u64::MAX]
+            .iter()
+            .map(|id| chunk_db_key("v", *id))
+            .collect();
+        let ordered = keys.clone();
+        keys.sort();
+        assert_eq!(keys, ordered, "chunk keys do not sort numerically");
+    }
 }

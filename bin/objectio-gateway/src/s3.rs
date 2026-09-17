@@ -5775,6 +5775,52 @@ async fn abort_multipart_upload_internal(
 ) -> Response {
     let mut client = state.meta_client.clone();
 
+    // Reclaim the parts already uploaded before dropping the record that says
+    // where they are. Abort used to tell meta to forget the upload and stop —
+    // so every part written before the abort stayed on the platter forever,
+    // with nothing left pointing at it. Same leak as object delete had, on a
+    // path that never went through it.
+    //
+    // Read the parts first: after `abort_multipart_upload` the stripe list is
+    // gone and the blocks are unreachable.
+    let parts = client
+        .list_parts(objectio_proto::metadata::ListPartsRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            part_number_marker: 0,
+            max_parts: 10_000,
+        })
+        .await
+        .map(|r| r.into_inner().parts)
+        .unwrap_or_default();
+
+    if !parts.is_empty()
+        && let Ok(placement) = client
+            .get_placement(GetPlacementRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                size: 0,
+                storage_class: "STANDARD".to_string(),
+            })
+            .await
+    {
+        let nodes = placement.into_inner().nodes;
+        for part in &parts {
+            // Best effort, like the object path: a shard that cannot be
+            // deleted is a leaked block, not a failed abort.
+            let failed =
+                crate::osd_pool::delete_shards_for_object(&state.osd_pool, &nodes, &part.stripes)
+                    .await;
+            if failed > 0 {
+                warn!(
+                    "{bucket}/{key} upload {upload_id}: {failed} shard deletes failed for part {}",
+                    part.part_number
+                );
+            }
+        }
+    }
+
     match client
         .abort_multipart_upload(AbortMultipartUploadRequest {
             bucket: bucket.clone(),

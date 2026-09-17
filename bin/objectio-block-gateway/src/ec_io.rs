@@ -20,8 +20,8 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::osd_pool::{
-    OsdPool, delete_object_meta_from_osd, get_object_meta_from_osd, put_object_meta_to_osd,
-    read_shard_from_osd, write_shard_to_osd,
+    OsdPool, delete_object_meta_from_osd, delete_shards_for_object, get_object_meta_from_osd,
+    put_object_meta_to_osd, read_shard_from_osd, write_shard_to_osd,
 };
 
 /// Bucket name reserved for all block chunks.
@@ -63,6 +63,25 @@ pub async fn write_chunk(
     if placement.nodes.is_empty() {
         return Err(anyhow!("no placement nodes returned for chunk {chunk_id}"));
     }
+
+    // Read the generation this write replaces, before the meta that points at
+    // it is overwritten. Every flush mints a fresh object_id below, so without
+    // this the previous stripe stays on the OSDs with nothing referencing it —
+    // and a block device rewrites the same chunk over and over, so the leak is
+    // proportional to write volume rather than to volume size.
+    //
+    // A read failure here is not fatal: the worst case is the leak this used
+    // to have unconditionally, and refusing the write instead would be worse.
+    let primary = &placement.nodes[0];
+    let superseded = match get_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, &object_key)
+        .await
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            warn!("chunk {chunk_id}: cannot read the meta being replaced, shards may leak: {e}");
+            None
+        }
+    };
 
     // EC encode
     let codec = ErasureCodec::new(ErasureConfig::new(ec_k as u8, ec_m as u8))
@@ -163,10 +182,20 @@ pub async fn write_chunk(
     };
 
     // Store object meta on primary OSD (position 0)
-    let primary = &placement.nodes[0];
     put_object_meta_to_osd(osd_pool, primary, BLOCK_BUCKET, &object_key, object_meta)
         .await
         .map_err(|e| anyhow!("put_object_meta failed: {e}"))?;
+
+    // Only now is the old stripe unreachable. Freeing it earlier would put a
+    // window between "old shards gone" and "new meta committed" in which a
+    // crash loses the chunk; this ordering leaks on a crash instead, which is
+    // recoverable and the old behaviour anyway.
+    if let Some(old) = superseded {
+        let failed = delete_shards_for_object(osd_pool, &placement.nodes, &old.stripes).await;
+        if failed > 0 {
+            warn!("chunk {chunk_id}: {failed} shard deletes failed for the superseded generation");
+        }
+    }
 
     Ok(object_key)
 }
@@ -275,8 +304,12 @@ pub async fn read_chunk(
     Ok(decoded)
 }
 
-/// Delete a chunk's object metadata from the OSD (for volume deletion).
-#[allow(dead_code)]
+/// Free a chunk: its shards first, then the metadata that names them.
+///
+/// This used to delete the metadata alone, which removed the only record of
+/// where the shards were without removing the shards — so deleting a volume
+/// turned its whole footprint into storage nothing could find or reclaim. It
+/// was also never called.
 pub async fn delete_chunk(
     meta_client: Arc<Mutex<MetadataServiceClient<Channel>>>,
     osd_pool: &Arc<OsdPool>,
@@ -295,11 +328,26 @@ pub async fn delete_chunk(
         .map_err(|e| anyhow!("GetPlacement failed: {e}"))?
         .into_inner();
 
-    if let Some(primary) = placement.nodes.first() {
-        delete_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key)
-            .await
-            .map_err(|e| anyhow!("delete_object_meta failed: {e}"))?;
+    let Some(primary) = placement.nodes.first() else {
+        return Ok(());
+    };
+
+    // Read before delete: after the metadata is gone the shard locations are
+    // gone with it.
+    match get_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key).await {
+        Ok(Some(meta)) => {
+            let failed = delete_shards_for_object(osd_pool, &placement.nodes, &meta.stripes).await;
+            if failed > 0 {
+                warn!("{object_key}: {failed} shard deletes failed");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!("{object_key}: cannot read meta, shards will leak: {e}"),
     }
+
+    delete_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key)
+        .await
+        .map_err(|e| anyhow!("delete_object_meta failed: {e}"))?;
 
     Ok(())
 }

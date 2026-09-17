@@ -152,6 +152,22 @@ fn decide(reachable: bool, consecutive_misses: u32, admin: OsdAdminState) -> Opt
     }
 }
 
+/// One status call. Any error — connect, timeout, or an error response — is a
+/// miss; this only asks "would a write to you have worked".
+async fn probe(address: &str) -> bool {
+    let endpoint = match tonic::transport::Endpoint::from_shared(address.to_string()) {
+        Ok(e) => e.connect_timeout(PROBE_TIMEOUT).timeout(PROBE_TIMEOUT),
+        Err(_) => return false,
+    };
+    let Ok(channel) = endpoint.connect().await else {
+        return false;
+    };
+    let mut client = StorageServiceClient::new(channel);
+    tokio::time::timeout(PROBE_TIMEOUT, client.get_status(GetStatusRequest {}))
+        .await
+        .is_ok_and(|r| r.is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,20 +218,4 @@ mod tests {
             "a node that answers should come straight back"
         );
     }
-}
-
-/// One status call. Any error — connect, timeout, or an error response — is a
-/// miss; this only asks "would a write to you have worked".
-async fn probe(address: &str) -> bool {
-    let endpoint = match tonic::transport::Endpoint::from_shared(address.to_string()) {
-        Ok(e) => e.connect_timeout(PROBE_TIMEOUT).timeout(PROBE_TIMEOUT),
-        Err(_) => return false,
-    };
-    let Ok(channel) = endpoint.connect().await else {
-        return false;
-    };
-    let mut client = StorageServiceClient::new(channel);
-    tokio::time::timeout(PROBE_TIMEOUT, client.get_status(GetStatusRequest {}))
-        .await
-        .is_ok_and(|r| r.is_ok())
 }

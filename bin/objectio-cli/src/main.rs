@@ -483,22 +483,31 @@ enum SnapshotCommands {
 }
 
 /// Parse a human-readable size string (e.g. "10G", "1T", "500M") into bytes.
+/// Parse a size like `10`, `512M`, `20G`, `2T` into bytes.
+///
+/// Suffixes are binary (GiB, not GB) and case-insensitive: `20g` used to be
+/// rejected as "Invalid size", which reads like the number is wrong rather
+/// than the letter.
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
-    let (num, multiplier) = if let Some(n) = s.strip_suffix('T') {
-        (n, 1024 * 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix('G') {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix('M') {
-        (n, 1024 * 1024)
-    } else {
+    let last = s.chars().last();
+    let (num, multiplier) = match last.map(|c| c.to_ascii_uppercase()) {
+        Some('T') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
+        Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('M') => (&s[..s.len() - 1], 1024 * 1024),
         // Assume bytes if no suffix
-        (s, 1)
+        _ => (s, 1),
     };
     let value: u64 = num
+        .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid size: '{s}'"))?;
-    Ok(value * multiplier)
+    // `value * multiplier` overflowed: a debug build panicked with "attempt to
+    // multiply with overflow" instead of saying what was wrong, and a release
+    // build wrapped and provisioned a volume of some unrelated size.
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("Size '{s}' is larger than 16 EiB"))
 }
 
 /// Format bytes as a human-readable size string.
@@ -1885,4 +1894,170 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// clap's own consistency check over the whole command tree.
+    ///
+    /// The CLI is fifteen subcommand enums deep and every one of them was
+    /// unverified: a duplicate long flag, a short flag used twice in one
+    /// command, or an argument referring to a group that does not exist are
+    /// all panics at first run of that subcommand, not build errors. This
+    /// walks the entire tree at test time instead of waiting for an operator
+    /// to be the one who finds it.
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn a_bare_number_is_bytes() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn binary_suffixes_are_powers_of_two() {
+        // Not GB-the-marketing-unit: a 20G volume is 20 GiB, and the block
+        // layer's chunk arithmetic assumes that.
+        assert_eq!(parse_size("512M").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_size("20G").unwrap(), 20 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("2T").unwrap(), 2 * 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn suffixes_are_case_insensitive() {
+        assert_eq!(parse_size("20g").unwrap(), parse_size("20G").unwrap());
+        assert_eq!(parse_size("1t").unwrap(), parse_size("1T").unwrap());
+        assert_eq!(parse_size("64m").unwrap(), parse_size("64M").unwrap());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(parse_size("  20G  ").unwrap(), 20 * 1024 * 1024 * 1024);
+    }
+
+    /// An oversized value is an error, not a panic and not a wrap.
+    ///
+    /// `value * multiplier` was unchecked: a debug build panicked with
+    /// "attempt to multiply with overflow", and a release build wrapped —
+    /// `16777216T` is exactly 2^64, so it came out as a zero-byte volume.
+    #[test]
+    fn a_size_past_u64_is_rejected() {
+        for s in ["16777216T", "99999999999T", "18446744073709551615G"] {
+            let err = parse_size(s).unwrap_err().to_string();
+            assert!(
+                err.contains("larger than"),
+                "{s} was not reported as too large: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonsense_is_rejected() {
+        for s in ["", "G", "abc", "1.5G", "-5G", "10GB", "10 G B"] {
+            assert!(parse_size(s).is_err(), "{s:?} was accepted as a size");
+        }
+    }
+
+    #[test]
+    fn exact_multiples_format_without_a_decimal_point() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(4 * 1024 * 1024), "4 MiB");
+        assert_eq!(format_size(20 * 1024 * 1024 * 1024), "20 GiB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024 * 1024), "2 TiB");
+    }
+
+    #[test]
+    fn inexact_sizes_keep_one_decimal_place() {
+        assert_eq!(format_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+        assert_eq!(format_size(1024 * 1024 * 1024 * 5 / 2 + 1), "2.5 GiB");
+    }
+
+    /// A size is shown in the largest unit that divides it exactly, so 2.5 GiB
+    /// prints as `2560 MiB` rather than a fraction. Deliberate: an operator
+    /// reading a capacity wants a number they can act on, and a fraction is
+    /// only reached when nothing divides evenly.
+    #[test]
+    fn an_exact_smaller_unit_beats_a_fractional_larger_one() {
+        assert_eq!(format_size(1024 * 1024 * 1024 * 5 / 2), "2560 MiB");
+        assert_eq!(format_size(1536 * 1024 * 1024 * 1024), "1536 GiB");
+    }
+
+    /// What the CLI prints must parse back to what it printed.
+    #[test]
+    fn exact_sizes_survive_a_round_trip_through_the_display_form() {
+        for bytes in [
+            1024 * 1024,
+            512 * 1024 * 1024,
+            20 * 1024 * 1024 * 1024,
+            3 * 1024 * 1024 * 1024 * 1024,
+        ] {
+            let shown = format_size(bytes);
+            let compact = shown
+                .replace(" TiB", "T")
+                .replace(" GiB", "G")
+                .replace(" MiB", "M");
+            assert_eq!(
+                parse_size(&compact).unwrap(),
+                bytes,
+                "{shown} did not round-trip"
+            );
+        }
+    }
+
+    /// Exactly one principal, or it is an error.
+    ///
+    /// Both set or neither set would otherwise reach the policy RPC as a pair
+    /// the server has to guess at.
+    #[test]
+    fn a_policy_principal_is_a_user_or_a_group_and_not_both() {
+        let u = Some("u-1".to_string());
+        let g = Some("g-1".to_string());
+
+        assert_eq!(
+            principal_args(&u, &None).unwrap(),
+            ("u-1".to_string(), String::new())
+        );
+        assert_eq!(
+            principal_args(&None, &g).unwrap(),
+            (String::new(), "g-1".to_string())
+        );
+        assert!(principal_args(&u, &g).is_err(), "both principals accepted");
+        assert!(
+            principal_args(&None, &None).is_err(),
+            "neither principal accepted"
+        );
+    }
+
+    #[test]
+    fn a_principal_is_labelled_by_whichever_half_is_set() {
+        assert_eq!(principal_label("u-1", ""), "user u-1");
+        assert_eq!(principal_label("", "g-1"), "group g-1");
+    }
+
+    /// Buckets predating recorded ownership must not look like they are owned
+    /// by a user called "default".
+    #[test]
+    fn a_missing_bucket_owner_reads_as_missing() {
+        assert_eq!(owner_label(""), "(none)");
+        assert_eq!(owner_label("default"), "(none - legacy)");
+        assert_eq!(owner_label("u-42"), "u-42");
+    }
+
+    #[test]
+    fn unknown_state_codes_do_not_panic() {
+        // These come off the wire as i32, so anything can arrive.
+        for state in [-1, 0, 99, i32::MAX, i32::MIN] {
+            assert!(!format_volume_state(state).is_empty());
+            assert!(!format_snapshot_state(state).is_empty());
+        }
+        assert_eq!(format_volume_state(3), "Attached");
+        assert_eq!(format_snapshot_state(2), "Available");
+    }
 }

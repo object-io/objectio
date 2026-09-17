@@ -1,0 +1,20 @@
+[package]
+name = "objectio-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The harness boots `objectio-aio` as a child process and drives it over
+# HTTP, so it deliberately does not depend on any workspace crate — it tests
+# the system the way a client sees it, not the way the code is arranged.
+[dependencies]
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -4,6 +4,8 @@ description = "ObjectIO all-in-one — single-command supervisor for meta + OSD 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+# Creates console/dist when missing so a fresh clone can build; see build.rs.
+build = "build.rs"
 
 [[bin]]
 name = "objectio-aio"

@@ -192,7 +192,7 @@ async fn sweep_once(meta: &Arc<MetaService>) -> anyhow::Result<()> {
         // Always update shard_count first — the auto-finalize check
         // depends on it. Progress mirrors the observed count so the
         // console shows "X of Y migrated" even when migration stalls.
-        let shards = match query_shard_count(&address).await {
+        let observed = match query_shard_count(&address).await {
             Ok(s) => {
                 meta.update_drain_progress(node_id, |p| {
                     if p.initial_shards == 0 {
@@ -202,7 +202,7 @@ async fn sweep_once(meta: &Arc<MetaService>) -> anyhow::Result<()> {
                     p.updated_at = now_unix();
                     p.last_error.clear();
                 });
-                s
+                Some(s)
             }
             Err(e) => {
                 // OSD offline → can't sweep. Record but don't abort
@@ -211,33 +211,37 @@ async fn sweep_once(meta: &Arc<MetaService>) -> anyhow::Result<()> {
                     p.last_error = format!("osd unreachable: {e}");
                     p.updated_at = now_unix();
                 });
-                continue;
+                None
             }
         };
 
         // Auto-finalise when empty. We do this BEFORE attempting to
         // migrate anything — if shard_count is already zero, nothing
         // to migrate.
-        if shards == 0 {
-            info!(
-                "drain observer: OSD {} has 0 shards at {address}; finalising → Out",
-                hex::encode(node_id)
-            );
-            match meta
-                .internal_set_osd_admin_state(
-                    node_id,
-                    objectio_common::OsdAdminState::Out,
-                    "drain-observer".into(),
-                )
-                .await
-            {
-                Ok(()) => meta.clear_drain_progress(&node_id),
-                Err(e) => warn!(
-                    "drain observer: failed to flip {} → Out: {e}",
+        match drain_step(observed) {
+            DrainStep::Wait => continue,
+            DrainStep::Migrate => {}
+            DrainStep::Finalise => {
+                info!(
+                    "drain observer: OSD {} has 0 shards at {address}; finalising → Out",
                     hex::encode(node_id)
-                ),
+                );
+                match meta
+                    .internal_set_osd_admin_state(
+                        node_id,
+                        objectio_common::OsdAdminState::Out,
+                        "drain-observer".into(),
+                    )
+                    .await
+                {
+                    Ok(()) => meta.clear_drain_progress(&node_id),
+                    Err(e) => warn!(
+                        "drain observer: failed to flip {} → Out: {e}",
+                        hex::encode(node_id)
+                    ),
+                }
+                continue;
             }
-            continue;
         }
 
         // Shards remain — migrate one per sweep.
@@ -661,11 +665,45 @@ async fn open_channel(address: &str) -> anyhow::Result<Channel> {
     Ok(channel)
 }
 
+/// Turn a registered OSD address into something `Channel::from_shared` takes.
+///
+/// The check was `starts_with("http")`, which also matches a host called
+/// `httpd:9200` or `http-osd-1` — those would be passed through without a
+/// scheme and fail to parse, taking the whole sweep for that OSD with them.
+/// Match the scheme, not the prefix.
 fn canonical_uri(address: &str) -> String {
-    if address.starts_with("http") {
+    if address.starts_with("http://") || address.starts_with("https://") {
         address.to_string()
     } else {
         format!("http://{address}")
+    }
+}
+
+/// What a sweep should do with one draining OSD, given what it could learn
+/// about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStep {
+    /// The OSD did not answer. Record the error and leave it Draining.
+    Wait,
+    /// The OSD reports no shards left. Flip it to Out.
+    Finalise,
+    /// Shards remain. Move some.
+    Migrate,
+}
+
+/// Decide the step, separately from performing it.
+///
+/// The property worth stating out loud: an OSD that cannot be reached is never
+/// finalised. Finalising flips it to Out, which is what the console shows the
+/// operator before they pull the drive — and an unreachable OSD is precisely
+/// the case where "how many shards are left" is unknown rather than zero.
+/// Reading a failed poll as an empty disk would turn a network blip into data
+/// loss.
+const fn drain_step(shard_count: Option<u64>) -> DrainStep {
+    match shard_count {
+        None => DrainStep::Wait,
+        Some(0) => DrainStep::Finalise,
+        Some(_) => DrainStep::Migrate,
     }
 }
 
@@ -937,4 +975,55 @@ async fn reconstruct_dangling_shard(
         hex::encode(target_node),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DrainStep, canonical_uri, drain_step};
+
+    /// An OSD that did not answer is never declared drained.
+    ///
+    /// Finalising sets the OSD to Out, which is what the console shows the
+    /// operator before they pull the drive. A failed poll means the shard
+    /// count is unknown, not zero — reading it as zero turns a network blip
+    /// into a drive pulled with live data on it.
+    #[test]
+    fn an_unreachable_osd_is_never_finalised() {
+        assert_eq!(drain_step(None), DrainStep::Wait);
+    }
+
+    #[test]
+    fn an_empty_osd_is_finalised() {
+        assert_eq!(drain_step(Some(0)), DrainStep::Finalise);
+    }
+
+    #[test]
+    fn an_osd_with_shards_left_keeps_migrating() {
+        assert_eq!(drain_step(Some(1)), DrainStep::Migrate);
+        assert_eq!(drain_step(Some(u64::MAX)), DrainStep::Migrate);
+    }
+
+    #[test]
+    fn an_address_without_a_scheme_gets_one() {
+        assert_eq!(canonical_uri("10.0.0.4:9200"), "http://10.0.0.4:9200");
+        assert_eq!(canonical_uri("osd-1:9200"), "http://osd-1:9200");
+    }
+
+    #[test]
+    fn an_address_that_already_has_a_scheme_is_left_alone() {
+        assert_eq!(canonical_uri("http://osd-1:9200"), "http://osd-1:9200");
+        assert_eq!(canonical_uri("https://osd-1:9200"), "https://osd-1:9200");
+    }
+
+    /// A hostname that merely begins with "http" is not a URL.
+    ///
+    /// The check used to be `starts_with("http")`, so a host called `httpd` or
+    /// `http-osd-1` was passed through with no scheme, failed to parse, and
+    /// took that OSD's whole sweep down with it.
+    #[test]
+    fn a_hostname_beginning_with_http_still_gets_a_scheme() {
+        assert_eq!(canonical_uri("httpd:9200"), "http://httpd:9200");
+        assert_eq!(canonical_uri("http-osd-1:9200"), "http://http-osd-1:9200");
+        assert_eq!(canonical_uri("https-gw:9200"), "http://https-gw:9200");
+    }
 }

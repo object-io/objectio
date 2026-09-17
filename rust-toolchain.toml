@@ -1,0 +1,9 @@
+# Pin the toolchain so a lint failure is reproducible.
+#
+# CI was installing "stable" while developers had whatever rustup last
+# fetched, so `cargo clippy` could pass locally and fail in CI on a lint that
+# had tightened in between — which is the least useful kind of red build.
+# Bump this deliberately, and fix the new lints in the same commit.
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
