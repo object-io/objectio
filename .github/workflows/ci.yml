@@ -127,6 +127,86 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  chart:
+    name: helm chart
+    runs-on: ubuntu-latest
+    # Nothing validated the chart. A broken template, a values key that no
+    # longer exists, or an image the registry does not carry were all
+    # discovered by `publish-chart` at the end of a release — after the
+    # version bump had already been committed and tagged.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: lint
+        run: helm lint deploy/helm/objectio --strict
+
+      # Render with the defaults a published install gets, and with the kind
+      # overlay, because the two take different branches of the image helper.
+      - name: render
+        run: |
+          set -euo pipefail
+          helm template objectio deploy/helm/objectio > /tmp/default.yaml
+          helm template objectio deploy/helm/objectio \
+            --values deploy/kind/values.yaml > /tmp/kind.yaml
+          for f in /tmp/default.yaml /tmp/kind.yaml; do
+            echo "$f: $(grep -c '^kind:' "$f") resources"
+          done
+
+      # The check that matters: a default install must only ask for images
+      # this project actually publishes. The release pushes exactly one —
+      # the Dockerfile's `all` target — and the chart shipped asking for
+      # per-service images (objectio-gateway, objectio-meta, objectio-osd)
+      # that have never existed in any registry, so `helm install` from the
+      # published chart sat in ImagePullBackOff.
+      - name: every own-registry image is one we publish
+        run: |
+          set -euo pipefail
+          OWNER='${{ github.repository_owner }}'
+          bad=0
+          while read -r img; do
+            case "$img" in
+              ghcr.io/$OWNER/objectio:*) ;;
+              ghcr.io/$OWNER/*)
+                echo "::error::default install references $img, which the release does not publish"
+                bad=1 ;;
+            esac
+          done < <(grep -oE 'image: \S+' /tmp/default.yaml | awk '{print $2}' | sort -u)
+          [ "$bad" -eq 0 ]
+
+      - name: package
+        run: helm package deploy/helm/objectio --destination /tmp/chart && ls -lh /tmp/chart
+
+  aio-release-build:
+    name: aio (release features)
+    runs-on: ubuntu-latest
+    # The release compiles objectio-aio with feature flags nothing else turns
+    # on — ISA-L erasure coding, io_uring, the PCRE2 and Hyperscan grep
+    # engines. A cfg-gated path that no longer compiles under those is
+    # invisible until a release is half-done: the version bump and tag land in
+    # `prepare`, and the binary build fails after.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libpcre2-dev \
+            nasm autoconf automake libtool libclang-dev libhyperscan-dev
+      # aio embeds console/dist; build.rs creates it empty when absent, which
+      # is enough to compile.
+      # `check` rather than `build`: this is here to catch feature-gated code
+      # that no longer compiles, and it still runs the build scripts, so the
+      # ISA-L C build is exercised too. The image job above does a real
+      # release-profile compile.
+      - name: cargo check with the release feature set
+        run: |
+          cargo check --bin objectio-aio \
+            --features isal,io-uring,grep-pcre2,grep-hyperscan
+
   console:
     name: console
     runs-on: ubuntu-latest

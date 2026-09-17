@@ -31,6 +31,11 @@ include_dir = "0.7"
 
 [features]
 default = []
+# ISA-L erasure coding on x86_64. The release builds aio by package
+# (`--bin objectio-aio --features isal`), which cannot reach a feature
+# declared only on objectio-erasure — so forward it through the two
+# binaries that do the encoding.
+isal = ["objectio-gateway/isal", "objectio-osd/isal"]
 # Propagates to objectio-osd → objectio-storage. Linux-only win; safe
 # no-op elsewhere. Enable on Linux release builds to get +25%
 # throughput + -43% p99.9 on 4 MiB object stripes.

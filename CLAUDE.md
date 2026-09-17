@@ -20,10 +20,17 @@ Single-crate operations:
 ```bash
 cargo test --package objectio-erasure --features isal
 cargo test --package objectio-auth -- test_name
-cargo clippy --package objectio-s3 --features isal -- -D warnings
+cargo clippy --package objectio-s3 -- -D warnings
 ```
 
 Build requires `protobuf-compiler` (protoc). The `isal` feature requires NASM + autoconf + automake + libtool + libclang-dev (x86_64 only; on ARM, omit `--features isal`).
+
+`isal` is declared on `objectio-erasure` and forwarded by `objectio-gateway`,
+`objectio-osd` and `objectio-aio`, so it can be enabled either workspace-wide
+(`--workspace --features isal`, which is what the Makefile targets do) or from
+one of those packages (`--bin objectio-aio --features isal`, which is what the
+release builds). A package that neither declares nor forwards it — say
+`objectio-s3` — will reject `--features isal` outright.
 
 ### Docker-based builds (no local Rust needed)
 
@@ -78,7 +85,7 @@ docker build --target cli     -t objectio-cli .
 ```
 
 The release workflow (`.github/workflows/release.yml`) publishes the
-`all` target as a multi-arch `ghcr.io/cloudomate/objectio:<tag>` —
+`all` target as a multi-arch `ghcr.io/object-io/objectio:<tag>` —
 same image helm consumes.
 
 ### Deploy directory layout

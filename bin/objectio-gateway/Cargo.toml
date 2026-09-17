@@ -88,6 +88,9 @@ k8s-openapi = { version = "0.23", default-features = false, features = ["v1_29"]
 
 [features]
 default = []
+# Forwards ISA-L erasure coding (x86_64) to objectio-erasure, so the
+# feature is addressable from a package-scoped build.
+isal = ["objectio-erasure/isal"]
 # Compile in the PCRE2 pattern backend so requests can select
 # `engine: "pcre2"`. Requires libpcre2-dev at build time.
 pcre2 = ["dep:pcre2"]

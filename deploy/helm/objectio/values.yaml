@@ -1,6 +1,20 @@
 global:
-  imageRegistry: ghcr.io/cloudomate
+  imageRegistry: ghcr.io/object-io
   imagePullPolicy: IfNotPresent
+  # One image carries every service; each container overrides the entrypoint
+  # (see `command:` in the templates). This is the only image the release
+  # publishes — `ghcr.io/object-io/objectio:<tag>`, the Dockerfile's `all`
+  # target — and the chart used to ask for per-service images
+  # (objectio-gateway, objectio-meta, objectio-osd) that have never been
+  # pushed to any registry, so a `helm install` from the published chart
+  # sat in ImagePullBackOff.
+  #
+  # Set `global.image: null` to fall back to each component's own
+  # `image.repository`, which is what a local build wants: `make kind-up`
+  # builds and loads the per-service images by those names.
+  image:
+    repository: objectio
+    tag: latest
 
 gateway:
   image:

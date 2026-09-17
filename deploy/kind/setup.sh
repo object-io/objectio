@@ -17,7 +17,7 @@
 # Usage:
 #   ./deploy/kind/setup.sh                  # create cluster + deploy
 #   ./deploy/kind/setup.sh --skip-build     # skip docker build, use existing images
-#   ./deploy/kind/setup.sh --registry ghcr.io/cloudomate  # pull from registry instead
+#   ./deploy/kind/setup.sh --registry ghcr.io/object-io  # pull from registry instead
 
 set -euo pipefail
 
@@ -117,7 +117,7 @@ deploy_helm() {
         --dry-run=client -o yaml | kubectl apply -f -
     fi
   else
-    IMAGE_REGISTRY="ghcr.io/cloudomate"   # placeholder — actual images are local
+    IMAGE_REGISTRY="ghcr.io/object-io"   # placeholder — actual images are local
   fi
 
   info "Deploying ObjectIO Helm chart..."
