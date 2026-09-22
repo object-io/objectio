@@ -118,10 +118,6 @@ pub struct AppState {
     /// Used by `/_admin/kms/*` key-management endpoints. External backends
     /// leave this `None` and those endpoints return `NotImplemented`.
     pub kms_local: parking_lot::RwLock<Option<Arc<crate::kms::LocalKmsProvider>>>,
-    /// Installed license, gating Enterprise features. No license → Community
-    /// tier (stored as `License::community()`). Held behind a `RwLock` so the
-    /// `PUT /_admin/license` endpoint can swap it without restart.
-    pub license: parking_lot::RwLock<Arc<objectio_license::License>>,
     /// The gateway's own failure-domain position. Drives locality-aware
     /// read routing (Phase 2): shards on OSDs that share enclosing levels
     /// are tried first. Fully-empty when not configured — routing then
@@ -165,23 +161,6 @@ impl AppState {
     ) {
         *self.kms.write() = kms;
         *self.kms_local.write() = kms_local;
-    }
-
-    /// Snapshot of the currently installed license. Cloned as an owned `Arc`
-    /// so callers can hold it across async work without blocking swaps.
-    pub fn license(&self) -> Arc<objectio_license::License> {
-        Arc::clone(&self.license.read())
-    }
-
-    /// Hot-swap the installed license — used at startup and by
-    /// `PUT /_admin/license`.
-    pub fn set_license(&self, license: Arc<objectio_license::License>) {
-        *self.license.write() = license;
-    }
-
-    /// Convenience: is a given Enterprise feature currently licensed?
-    pub fn has_feature(&self, feature: objectio_license::Feature) -> bool {
-        self.license().allows(feature)
     }
 }
 
@@ -508,16 +487,6 @@ async fn apply_put_sse(
             ))
         }
         SseAlgorithm::SseKms => {
-            // Enterprise gate. AWS returns 400 for unsupported encryption
-            // modes, so we match that shape — machine-readable detail is in
-            // the body.
-            if !state.has_feature(objectio_license::Feature::Kms) {
-                return Err(S3Error::xml_response(
-                    "EnterpriseLicenseRequired",
-                    "SSE-KMS requires an Enterprise license. Install one via PUT /_admin/license.",
-                    StatusCode::FORBIDDEN,
-                ));
-            }
             let Some(kms) = state.kms() else {
                 return Err(S3Error::xml_response(
                     "ServiceUnavailable",

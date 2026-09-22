@@ -580,8 +580,7 @@ impl OsdService {
     }
 
     /// Raw capacity of each managed disk, index-aligned with `disk_ids()`.
-    /// Used at registration time so meta can sum capacity across OSDs and
-    /// enforce the license's `max_raw_capacity_bytes` cap.
+    /// Used at registration time so meta can sum raw capacity across OSDs.
     pub fn disk_capacities(&self) -> Vec<u64> {
         self.disks.iter().map(|d| d.capacity()).collect()
     }

@@ -93,10 +93,6 @@ COPY Cargo.toml Cargo.lock ./
 # Create dummy source files to build dependencies
 COPY crates ./crates
 COPY bin ./bin
-# Enterprise crates live under enterprise/; this COPY becomes a no-op on a
-# Community distribution where the directory has been removed and the
-# workspace members list trimmed.
-COPY enterprise ./enterprise
 # The end-to-end suite is a workspace member, so cargo refuses to read the
 # workspace at all without its manifest — `cargo fetch` failed with "failed to
 # load manifest for workspace member /build/tests/e2e" and took the whole image

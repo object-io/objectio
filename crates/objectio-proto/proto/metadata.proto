@@ -736,10 +736,8 @@ message RegisterOsdRequest {
     string node_name = 5;               // Human-readable name (optional)
     double weight = 6;                  // Placement weight (default: 1.0)
     // Raw capacity of each disk in bytes, index-aligned with `disk_ids`.
-    // Meta sums these across OSDs to enforce the license's max_raw_capacity_bytes
-    // cap. Older OSDs that don't populate this leave the cap check with 0 for
-    // their disks, which is conservative (under-reports usage, never blocks
-    // an already-registered cluster from re-registering).
+    // Meta sums these across OSDs for cluster capacity accounting. Older OSDs
+    // that don't populate this report 0 for their disks.
     repeated uint64 disk_capacity_bytes = 7;
 }
 

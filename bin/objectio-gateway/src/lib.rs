@@ -13,7 +13,6 @@ pub mod grep_engine;
 pub mod host_provider;
 pub mod iceberg_auth;
 pub mod kms;
-pub mod license_gate;
 pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
@@ -47,87 +46,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
-
-/// Resolve the initial license at startup.
-///
-/// Order of precedence:
-/// 1. explicit `--license` flag path
-/// 2. `OBJECTIO_LICENSE` env var — either a path or inline JSON
-/// 3. meta config at `license/active` (what the console writes)
-///
-/// Any failure (missing file, bad signature, expired) logs a warning and
-/// degrades to Community tier. Startup never hard-fails on the license.
-async fn load_initial_license(
-    cli_path: Option<&str>,
-    meta_client: MetadataServiceClient<tonic::transport::Channel>,
-) -> objectio_license::License {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 0. Dev-mode escape hatch — `objectio-aio` and integration tests
-    //    set this so all Enterprise features are usable without needing
-    //    a signed license. Production deployments must NOT set this; it
-    //    bypasses every license-gated check.
-    if std::env::var("OBJECTIO_DEV_NO_LICENSE").is_ok_and(|v| !v.is_empty() && v != "0") {
-        warn!(
-            "OBJECTIO_DEV_NO_LICENSE is set — running with in-process Developer license. This is a development convenience and MUST NOT be used in production."
-        );
-        return objectio_license::License::developer_unsigned();
-    }
-
-    // 1. CLI flag
-    if let Some(path) = cli_path {
-        match std::fs::read(path) {
-            Ok(bytes) => match objectio_license::License::load_from_bytes(&bytes, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("--license {} rejected: {} — falling back", path, e),
-            },
-            Err(e) => warn!("--license {} unreadable: {} — falling back", path, e),
-        }
-    }
-
-    // 2. Environment variable — path or inline JSON
-    if let Ok(val) = std::env::var("OBJECTIO_LICENSE")
-        && !val.is_empty()
-    {
-        let bytes = if val.trim_start().starts_with('{') {
-            Some(val.into_bytes())
-        } else {
-            std::fs::read(&val).ok()
-        };
-        if let Some(bytes) = bytes {
-            match objectio_license::License::load_from_bytes(&bytes, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("OBJECTIO_LICENSE rejected: {} — falling back", e),
-            }
-        }
-    }
-
-    // 3. Meta config
-    let mut client = meta_client;
-    if let Ok(resp) = client
-        .get_config(objectio_proto::metadata::GetConfigRequest {
-            key: "license/active".to_string(),
-        })
-        .await
-    {
-        let inner = resp.into_inner();
-        if inner.found
-            && let Some(entry) = inner.entry
-            && !entry.value.is_empty()
-        {
-            match objectio_license::License::load_from_bytes(&entry.value, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("license in meta config rejected: {} — falling back", e),
-            }
-        }
-    }
-
-    objectio_license::License::community()
-}
 
 /// Prometheus metrics endpoint handler
 /// How often the capacity gauges are refreshed. Capacity moves on the scale of
@@ -403,12 +321,6 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub oidc_admin_roles: Vec<String>,
 
-    /// Path to an Enterprise license file. Falls back to `$OBJECTIO_LICENSE`,
-    /// then to the `license/active` key in meta config, then to Community
-    /// tier (no Enterprise features).
-    #[arg(long)]
-    pub license: Option<String>,
-
     /// Gateway's own topology position — used by locality-aware read routing
     /// to prefer shards on nearby OSDs (Phase 2). Empty string at any level
     /// means "inherit / unknown". Also configurable via
@@ -584,10 +496,8 @@ pub async fn run(
         args.external_endpoint.clone()
     };
 
-    // OIDC provider — used by both the Iceberg auth layer (Enterprise) and
-    // the console OIDC login flow (all tiers). Defined here so it stays in
-    // scope for the Community build even when the Iceberg block below is
-    // compiled out.
+    // OIDC provider — used by both the Iceberg auth layer and the console
+    // OIDC login flow.
     let oidc_provider = if let (Some(issuer_url), Some(client_id)) =
         (&args.oidc_issuer_url, &args.oidc_client_id)
     {
@@ -618,14 +528,11 @@ pub async fn run(
         None
     };
 
-    // Build Iceberg REST Catalog router and Delta Sharing router. Both are
-    // Enterprise features, gated at runtime by `feature_gate` middleware —
-    // without a valid Enterprise license the routers reject with 403.
+    // Build Iceberg REST Catalog router and Delta Sharing router.
     //
     // The Unity Catalog router (mounted at /api/2.1/unity-catalog/*) shares
-    // the same iceberg auth layer and is gated by the same Iceberg feature
-    // flag — there is no separate Feature::Unity, since Unity is just an
-    // alternate REST surface over the same catalog metadata.
+    // the same iceberg auth layer — Unity is just an alternate REST surface
+    // over the same catalog metadata.
     let iceberg_router = {
         let router = objectio_iceberg::router(
             meta_client.clone(),
@@ -668,7 +575,7 @@ pub async fn run(
     };
 
     // Unity Catalog REST router — same auth layer as Iceberg (SigV4 + OIDC
-    // bearer + session cookie), same Feature::Iceberg license gate. Mounted
+    // bearer + session cookie). Mounted
     // at the gateway root so its `/api/2.1/unity-catalog/*` paths land where
     // Databricks-style clients expect them.
     let unity_router = {
@@ -697,8 +604,7 @@ pub async fn run(
         ))
     };
 
-    // Warehouse prefix rewrite layer — harmless when the license gate
-    // rejects Iceberg: rewritten requests simply short-circuit with 403.
+    // Warehouse prefix rewrite layer.
     let warehouse_rewrite =
         tower::util::MapRequestLayer::new(|mut req: axum::http::Request<axum::body::Body>| {
             let path = req.uri().path().to_string();
@@ -813,25 +719,6 @@ pub async fn run(
     let (kms_local, kms) =
         kms::build_kms_provider(meta_client.clone(), master_key.as_ref(), &kms_config);
 
-    // Load license. Order of precedence: --license flag, OBJECTIO_LICENSE env,
-    // meta config at `license/active`. No license → Community tier (all
-    // Enterprise features remain gated). Parse/verify failures log a warning
-    // and fall back to Community — never hard-fail startup on a broken license.
-    let license = load_initial_license(args.license.as_deref(), meta_client.clone()).await;
-    match license.tier {
-        objectio_license::Tier::Enterprise => info!(
-            "License: Enterprise — licensee='{}' expires_at={} max_nodes={}",
-            license.licensee, license.expires_at, license.max_nodes
-        ),
-        objectio_license::Tier::Developer => info!(
-            "License: Developer — licensee='{}' expires_at={} max_nodes={} (single-host)",
-            license.licensee, license.expires_at, license.max_nodes
-        ),
-        objectio_license::Tier::Community => {
-            info!("License: Community — Enterprise features gated")
-        }
-    }
-
     // Build this gateway's self-topology from CLI flags / env so read
     // routing can prefer locally-adjacent OSDs.
     let self_topology = objectio_placement::FailureDomainInfo::new_full(
@@ -907,7 +794,6 @@ pub async fn run(
         master_key,
         kms: parking_lot::RwLock::new(kms),
         kms_local: parking_lot::RwLock::new(kms_local),
-        license: parking_lot::RwLock::new(Arc::new(license)),
         self_topology,
         host_provider,
         legacy_open_buckets: args.authz_legacy_open_buckets,
@@ -1119,10 +1005,6 @@ pub async fn run(
         .route("/_admin/kms/config", put(kms::admin_kms_put_config))
         .route("/_admin/kms/config", delete(kms::admin_kms_delete_config))
         .route("/_admin/kms/test", post(kms::admin_kms_test))
-        // License management
-        .route("/_admin/license", get(admin::admin_get_license))
-        .route("/_admin/license", put(admin::admin_put_license))
-        .route("/_admin/license", delete(admin::admin_delete_license))
         // Prometheus proxy. Sits with the other admin APIs so it inherits the
         // same optional SigV4 layer — a console session and a signed request
         // are both recognised. Inert when --prometheus-url is unset.
@@ -1203,25 +1085,6 @@ pub async fn run(
         info!("Admin API is ENABLED (no auth required in dev mode)");
     }
 
-    // License-gated wrappers — built once, cloned into each composite
-    // router that exposes them.
-    let iceberg_gated = iceberg_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::Iceberg),
-        license_gate::feature_gate,
-    ));
-    let unity_gated = unity_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::Iceberg),
-        license_gate::feature_gate,
-    ));
-    let delta_gated = delta_sharing_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::DeltaSharing),
-        license_gate::feature_gate,
-    ));
-    let delta_admin_gated = delta_sharing_admin_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::DeltaSharing),
-        license_gate::feature_gate,
-    ));
-
     // SPA dirs.
     //   OBJECTIO_CONSOLE_DIR        — legacy single-bundle (default for legacy mode)
     //   OBJECTIO_OPS_CONSOLE_DIR    — ops bundle for --ops-console-listen
@@ -1296,10 +1159,10 @@ pub async fn run(
             .merge(admin_routes.clone())
             .merge(console_api_routes.clone())
             .merge(console_oidc_routes.clone())
-            .nest("/iceberg", iceberg_gated.clone())
-            .merge(unity_gated.clone())
-            .nest("/delta-sharing", delta_gated.clone())
-            .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+            .nest("/iceberg", iceberg_router.clone())
+            .merge(unity_router.clone())
+            .nest("/delta-sharing", delta_sharing_router.clone())
+            .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
             // Path-mounted consoles. These are the addressable surfaces:
             // /_console/admin is the operator console, /_console/tenant the
             // self-service one. Each bundle is built with its own base, so the
@@ -1337,9 +1200,9 @@ pub async fn run(
         // Data plane only.
         let data_router = Router::new()
             .merge(build_s3_protected())
-            .nest("/iceberg", iceberg_gated.clone())
-            .merge(unity_gated.clone())
-            .nest("/delta-sharing", delta_gated.clone())
+            .nest("/iceberg", iceberg_router.clone())
+            .merge(unity_router.clone())
+            .nest("/delta-sharing", delta_sharing_router.clone())
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Data))
             .layer(TraceLayer::new_for_http());
@@ -1363,7 +1226,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .layer(Extension(ListenerKind::AdminApi))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, admin_only, "admin API + metrics"));
@@ -1383,7 +1246,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 // Same canonical path as the single-port mount, so one
                 // build serves both modes.
                 .nest_service("/_console/admin", console_service(&ops_console_dir))
@@ -1414,7 +1277,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .nest_service("/_console/tenant", console_service(&tenant_console_dir))
                 .route(
                     "/",

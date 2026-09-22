@@ -45,7 +45,6 @@ objectio-iceberg = { workspace = true }
 objectio-unity-catalog = { workspace = true }
 objectio-delta-sharing = { workspace = true }
 objectio-kms = { workspace = true }
-objectio-license = { workspace = true }
 objectio-placement = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }

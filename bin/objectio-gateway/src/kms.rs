@@ -1086,14 +1086,6 @@ pub async fn admin_kms_put_config(
             );
         }
     };
-    // External KMS backends (Vault) require an Enterprise license. The
-    // built-in Local backend is always available because it's what backs
-    // SSE-S3 on Community too.
-    if matches!(new_cfg, KmsBackendConfig::Vault { .. })
-        && let Err(r) = crate::license_gate::require_feature(&state, objectio_license::Feature::Kms)
-    {
-        return r;
-    }
     // Preserve existing Vault token when the payload omits it (empty string).
     if let KmsBackendConfig::Vault { token, .. } = &mut new_cfg
         && token.is_empty()

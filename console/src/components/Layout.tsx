@@ -14,11 +14,8 @@ import {
   Layers,
   Building2,
   KeyRound,
-  ScrollText,
   LogOut,
-  Lock,
 } from "lucide-react";
-import { useLicense, allows, type FeatureKey } from "../lib/license";
 import appIcon from "../assets/brand/app-icon.svg";
 
 interface NavItem {
@@ -26,10 +23,6 @@ interface NavItem {
   icon: typeof LayoutDashboard;
   label: string;
   adminOnly?: boolean;
-  /// If set, this nav item requires the named Enterprise feature. When the
-  /// feature is locked the item still appears but is disabled and links to
-  /// /license instead.
-  feature?: FeatureKey;
 }
 
 const nav: NavItem[] = [
@@ -40,16 +33,15 @@ const nav: NavItem[] = [
   // Balancing into a tabbed view. The legacy /pools, /topology,
   // /drives routes redirect here for bookmark back-compat.
   { to: "/cluster", icon: Layers, label: "Cluster", adminOnly: true },
-  { to: "/tenants", icon: Building2, label: "Tenants", adminOnly: true, feature: "multi_tenancy" },
+  { to: "/tenants", icon: Building2, label: "Tenants", adminOnly: true },
   { to: "/users", icon: Users, label: "Users" },
   { to: "/policies", icon: Shield, label: "Policies" },
-  { to: "/identity", icon: Fingerprint, label: "Identity", feature: "oidc" },
-  { to: "/iceberg", icon: Table2, label: "Tables", feature: "iceberg" },
-  { to: "/unity", icon: Database, label: "Unity Catalog", feature: "iceberg" },
-  { to: "/sharing", icon: Share2, label: "Table Sharing", feature: "delta_sharing" },
+  { to: "/identity", icon: Fingerprint, label: "Identity" },
+  { to: "/iceberg", icon: Table2, label: "Tables" },
+  { to: "/unity", icon: Database, label: "Unity Catalog" },
+  { to: "/sharing", icon: Share2, label: "Table Sharing" },
   { to: "/monitoring", icon: Activity, label: "Monitoring", adminOnly: true },
-  { to: "/encryption", icon: KeyRound, label: "Encryption", adminOnly: true, feature: "kms" },
-  { to: "/license", icon: ScrollText, label: "License", adminOnly: true },
+  { to: "/encryption", icon: KeyRound, label: "Encryption", adminOnly: true },
 ];
 
 interface Props {
@@ -60,7 +52,6 @@ interface Props {
 
 export default function Layout({ user, tenant, onLogout }: Props) {
   const isSystemAdmin = !tenant;
-  const license = useLicense();
   const visibleNav = nav.filter((n) => !n.adminOnly || isSystemAdmin);
 
   return (
@@ -88,35 +79,23 @@ export default function Layout({ user, tenant, onLogout }: Props) {
           </span>
         </div>
         <nav className="flex-1 px-2 py-2.5 space-y-0.5 overflow-y-auto">
-          {visibleNav.map(({ to, icon: Icon, label, feature }) => {
-            // A feature-gated nav item still renders when locked so users
-            // can see what Enterprise unlocks — but the link points to
-            // /license and shows a padlock instead of navigating to the
-            // gated page (which would just 403 anyway).
-            const locked = feature !== undefined && !allows(license, feature);
-            const target = locked ? "/license" : to;
-            return (
-              <NavLink
-                key={to}
-                to={target}
-                end={to === "/"}
-                title={locked ? `Requires Enterprise license — click to manage` : undefined}
-                className={({ isActive }) =>
-                  `flex items-center gap-2.5 px-3 h-9 rounded-[10px] text-[13px] transition-colors ${
-                    isActive && !locked
-                      ? "bg-accent-soft text-accent font-medium"
-                      : locked
-                        ? "text-faint hover:bg-surface-2"
-                        : "text-text hover:bg-surface-2"
-                  }`
-                }
-              >
-                <Icon size={16} className="shrink-0" />
-                <span className="flex-1 min-w-0 truncate">{label}</span>
-                {locked && <Lock size={11} className="text-faint shrink-0" />}
-              </NavLink>
-            );
-          })}
+          {visibleNav.map(({ to, icon: Icon, label }) => (
+            <NavLink
+              key={to}
+              to={to}
+              end={to === "/"}
+              className={({ isActive }) =>
+                `flex items-center gap-2.5 px-3 h-9 rounded-[10px] text-[13px] transition-colors ${
+                  isActive
+                    ? "bg-accent-soft text-accent font-medium"
+                    : "text-text hover:bg-surface-2"
+                }`
+              }
+            >
+              <Icon size={16} className="shrink-0" />
+              <span className="flex-1 min-w-0 truncate">{label}</span>
+            </NavLink>
+          ))}
         </nav>
         <div className="px-2 py-2 border-t border-border">
           {user && onLogout ? (

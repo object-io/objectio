@@ -14,7 +14,9 @@ members = [
     "crates/objectio-auth",
     "crates/objectio-block",
     "crates/objectio-kms",
-    "crates/objectio-license",
+    "crates/objectio-iceberg",
+    "crates/objectio-delta-sharing",
+    "crates/objectio-unity-catalog",
 
     # Binary crates
     "bin/objectio-gateway",
@@ -29,14 +31,6 @@ members = [
     "bin/objectio-aio",
     "bin/objectio-io-bench",
 
-    # Enterprise crates — source-available under BUSL-1.1 (see
-    # enterprise/LICENSE). They compile into the one `objectio-gateway`
-    # binary alongside Community crates; activation is decided at runtime
-    # by the installed license. The license signer itself lives in the
-    # separate private `objectio-enterprise` repo.
-    "enterprise/crates/objectio-iceberg",
-    "enterprise/crates/objectio-delta-sharing",
-    "enterprise/crates/objectio-unity-catalog",
 ]
 
 [workspace.package]
@@ -123,9 +117,6 @@ libc = "0.2"
 tempfile = "3.14"
 rand = "0.8"
 
-# Crypto
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
-
 # Internal crates
 objectio-common = { path = "crates/objectio-common" }
 objectio-proto = { path = "crates/objectio-proto" }
@@ -137,11 +128,10 @@ objectio-s3 = { path = "crates/objectio-s3" }
 objectio-client = { path = "crates/objectio-client" }
 objectio-auth = { path = "crates/objectio-auth" }
 objectio-block = { path = "crates/objectio-block" }
-objectio-iceberg = { path = "enterprise/crates/objectio-iceberg" }
-objectio-delta-sharing = { path = "enterprise/crates/objectio-delta-sharing" }
-objectio-unity-catalog = { path = "enterprise/crates/objectio-unity-catalog" }
+objectio-iceberg = { path = "crates/objectio-iceberg" }
+objectio-delta-sharing = { path = "crates/objectio-delta-sharing" }
+objectio-unity-catalog = { path = "crates/objectio-unity-catalog" }
 objectio-kms = { path = "crates/objectio-kms" }
-objectio-license = { path = "crates/objectio-license" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

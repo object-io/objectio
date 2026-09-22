@@ -665,11 +665,6 @@ pub struct MetaService {
     /// KMS keys (material already wrapped by gateway's service master key):
     /// key_id -> KmsKey
     kms_keys: RwLock<HashMap<String, KmsKey>>,
-    /// Active license — drives node-count + raw-capacity caps enforced on
-    /// `register_osd`. Default is Community (`0`/`0`, i.e. unlimited) so an
-    /// unconfigured meta never refuses registrations. Reload happens via
-    /// `set_config` when the `license/active` key changes.
-    license: RwLock<Arc<objectio_license::License>>,
     /// Persistent store (None = in-memory only)
     store: Option<Arc<MetaStore>>,
     /// Raft handle — set by main.rs after `Raft::new()` succeeds. Config
@@ -846,7 +841,6 @@ impl MetaService {
             kms_keys: RwLock::new(HashMap::new()),
             drain_statuses: RwLock::new(HashMap::new()),
             rebalance_progress: RwLock::new(RebalanceProgress::default()),
-            license: RwLock::new(Arc::new(objectio_license::License::community())),
             store: None,
             raft: RwLock::new(None),
         }
@@ -2026,26 +2020,6 @@ impl MetaService {
             self.config_version
                 .store(max_version, std::sync::atomic::Ordering::SeqCst);
             info!("Loaded {} config entries from store", map.len());
-            // Re-hydrate the license from `license/active` so caps are
-            // enforced from the first `register_osd` after restart. Stay
-            // on Community if the entry is missing, malformed, or expired
-            // — never hard-fail meta startup on a broken license.
-            if let Some(entry) = map.get("license/active") {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                match objectio_license::License::load_from_bytes(&entry.value, now) {
-                    Ok(l) => {
-                        info!(
-                            "meta license loaded: tier={} licensee={} max_nodes={} max_raw_capacity_bytes={}",
-                            l.tier, l.licensee, l.max_nodes, l.max_raw_capacity_bytes
-                        );
-                        *self.license.write() = Arc::new(l);
-                    }
-                    Err(e) => warn!("license/active rejected at meta startup: {}", e),
-                }
-            }
         }
 
         // Server pools
@@ -4112,88 +4086,6 @@ impl MetadataService for MetaService {
                 "disk_capacity_bytes length must match disk_ids",
             ));
         };
-
-        // License caps. Re-registrations of an already-known node_id never
-        // add to capacity accounting, so we only enforce for a truly new OSD.
-        let existing_node = self
-            .osd_nodes
-            .read()
-            .iter()
-            .find(|n| n.node_id == node_id)
-            .cloned();
-        if existing_node.is_none() {
-            let license = self.license.read().clone();
-            if license.max_nodes != 0 || license.max_raw_capacity_bytes != 0 {
-                let snapshot = self.osd_nodes.read();
-
-                // `max_nodes` counts unique *hosts*, not OSDs. One
-                // machine with 12 disks is one host (Developer tier
-                // allows it). An OSD that never declared `failure_domain.host`
-                // counts as its own distinct host so several of them
-                // don't collapse into the empty-string bucket.
-                let host_key_of = |n: &objectio_meta_store::types::OsdNode| -> String {
-                    let host = n
-                        .topology
-                        .as_ref()
-                        .map(|(_, _, _, _, h)| h.clone())
-                        .unwrap_or_default();
-                    if host.is_empty() {
-                        format!("__no_host__:{}", hex::encode(n.node_id))
-                    } else {
-                        host
-                    }
-                };
-                let mut hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for n in snapshot.iter() {
-                    hosts.insert(host_key_of(n));
-                }
-                let current_hosts = hosts.len() as u64;
-                let new_host_raw = req
-                    .failure_domain
-                    .as_ref()
-                    .map(|fd| fd.host.clone())
-                    .unwrap_or_default();
-                let new_host_key = if new_host_raw.is_empty() {
-                    format!("__no_host__:{}", hex::encode(node_id))
-                } else {
-                    new_host_raw.clone()
-                };
-                let adds_host = !hosts.contains(&new_host_key);
-                let projected_hosts = current_hosts + u64::from(adds_host);
-
-                let current_capacity: u64 = snapshot
-                    .iter()
-                    .flat_map(|n| n.disk_capacity_bytes.iter().copied())
-                    .sum();
-                let new_capacity: u64 = disk_capacity_bytes.iter().copied().sum();
-                drop(snapshot);
-
-                if license.max_nodes != 0 && projected_hosts > license.max_nodes {
-                    warn!(
-                        "register_osd refused: host cap {} reached (current_hosts={}, would-be {})",
-                        license.max_nodes, current_hosts, projected_hosts
-                    );
-                    return Err(Status::resource_exhausted(format!(
-                        "license host cap reached: registering this OSD would bring the cluster to {projected_hosts} host(s), cap is {}. \
-                         Current host count: {current_hosts}. Upgrade to a license with a higher max_nodes, or keep all OSDs on the same host (one machine = one host, any number of disks).",
-                        license.max_nodes
-                    )));
-                }
-                if license.max_raw_capacity_bytes != 0
-                    && current_capacity.saturating_add(new_capacity)
-                        > license.max_raw_capacity_bytes
-                {
-                    warn!(
-                        "register_osd refused: capacity cap {} B exceeded (current={} + new={})",
-                        license.max_raw_capacity_bytes, current_capacity, new_capacity
-                    );
-                    return Err(Status::resource_exhausted(format!(
-                        "license raw-capacity cap would be exceeded: current {} B + new OSD {} B > cap {} B. Install a license with a higher max_raw_capacity_bytes.",
-                        current_capacity, new_capacity, license.max_raw_capacity_bytes
-                    )));
-                }
-            }
-        }
 
         // Register the OSD. Pull failure-domain fields from the request
         // and persist both the legacy 3-tuple (back-compat) and the full
@@ -7024,28 +6916,6 @@ impl MetadataService for MetaService {
                     self.config_version
                         .store(version, std::sync::atomic::Ordering::SeqCst);
 
-                    // License hot-swap mirrors the pre-Raft behavior:
-                    // applying a new `license/active` value refreshes the
-                    // in-memory license used by `register_osd` caps.
-                    if req.key == "license/active" {
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        match objectio_license::License::load_from_bytes(&entry.value, now_secs) {
-                            Ok(l) => {
-                                info!(
-                                    "meta license reloaded: tier={} licensee={} max_nodes={} max_raw_capacity_bytes={}",
-                                    l.tier, l.licensee, l.max_nodes, l.max_raw_capacity_bytes
-                                );
-                                *self.license.write() = Arc::new(l);
-                            }
-                            Err(e) => {
-                                warn!("license/active rejected on set_config: {}", e);
-                            }
-                        }
-                    }
-
                     info!(
                         "Config set via Raft: key={} version={} log_id={:?}",
                         req.key, version, resp.log_id
@@ -7077,22 +6947,6 @@ impl MetadataService for MetaService {
         }
         self.config.write().insert(req.key.clone(), entry.clone());
 
-        if req.key == "license/active" {
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            match objectio_license::License::load_from_bytes(&entry.value, now_secs) {
-                Ok(l) => {
-                    info!(
-                        "meta license reloaded: tier={} licensee={} max_nodes={} max_raw_capacity_bytes={}",
-                        l.tier, l.licensee, l.max_nodes, l.max_raw_capacity_bytes
-                    );
-                    *self.license.write() = Arc::new(l);
-                }
-                Err(e) => warn!("license/active rejected on set_config: {}", e),
-            }
-        }
         info!(
             "Config set (legacy path): key={}, version={}",
             req.key, version
@@ -7120,11 +6974,6 @@ impl MetadataService for MetaService {
                     );
                     if existed {
                         self.config.write().remove(&req.key);
-                        if req.key == "license/active" {
-                            info!("meta license removed — reverting to Community tier");
-                            *self.license.write() =
-                                Arc::new(objectio_license::License::community());
-                        }
                         info!(
                             "Config deleted via Raft: key={} log_id={:?}",
                             req.key, resp.log_id
@@ -7141,10 +6990,6 @@ impl MetadataService for MetaService {
         if removed {
             if let Some(store) = &self.store {
                 store.delete_config(&req.key);
-            }
-            if req.key == "license/active" {
-                info!("meta license removed — reverting to Community tier");
-                *self.license.write() = Arc::new(objectio_license::License::community());
             }
             info!("Config deleted (legacy path): key={}", req.key);
         }

@@ -6,7 +6,6 @@
 //   - Tenants
 //   - Monitoring
 //   - Encryption (system KMS config)
-//   - License
 //
 // The /_admin/* HTTP surface is still mounted on this listener
 // server-side so tenant-scoped admin actions (e.g. add a tenant user,

@@ -573,7 +573,7 @@ async fn register_with_meta(
         .map_err(|e| format!("Failed to connect to metadata service: {}", e))?;
 
     // Call RegisterOsd RPC with failure domain + per-disk capacity (latter
-    // feeds meta's license-cap enforcement).
+    // feeds meta's cluster capacity accounting).
     let response = client
         .register_osd(RegisterOsdRequest {
             node_id: node_id.to_vec(),
