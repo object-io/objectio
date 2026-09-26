@@ -150,9 +150,13 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
+          # /_ready answers 503 until meta is reachable and enough OSDs are
+          # for a write to meet quorum, so a starting gateway takes no
+          # traffic it would fail. It stays 200 once reached (a startup
+          # gate, not a health check); liveness remains /health.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /_ready
               port: http
             initialDelaySeconds: 5
             periodSeconds: 5

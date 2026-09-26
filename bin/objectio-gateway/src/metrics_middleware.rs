@@ -187,7 +187,7 @@ pub async fn metrics_layer(request: Request<Body>, next: Next) -> Response {
     let query = uri.query();
 
     // Skip metrics and health endpoints
-    if path == "/metrics" || path == "/health" || path.starts_with("/_admin") {
+    if path == "/metrics" || path == "/health" || path == "/_ready" || path.starts_with("/_admin") {
         return next.run(request).await;
     }
 

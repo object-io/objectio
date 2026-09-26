@@ -91,7 +91,7 @@ pub fn classify(method: &Method, path: &str, query: &str) -> Authz {
 
     // `GET /` (ListAllMyBuckets) is already tenant-filtered by the handler and
     // has no bucket to evaluate against; `/health` is deliberately open.
-    if trimmed.is_empty() || trimmed == "health" {
+    if trimmed.is_empty() || trimmed == "health" || trimmed == "_ready" {
         return Authz::Skip;
     }
 
@@ -765,6 +765,7 @@ mod tests {
     fn service_routes_need_no_bucket_policy() {
         assert_eq!(classify(&Method::GET, "/", ""), Authz::Skip);
         assert_eq!(classify(&Method::GET, "/health", ""), Authz::Skip);
+        assert_eq!(classify(&Method::GET, "/_ready", ""), Authz::Skip);
     }
 
     #[test]

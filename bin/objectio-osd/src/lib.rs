@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
@@ -371,10 +372,19 @@ pub async fn run(
     let disk_capacities = osd_service.disk_capacities();
     info!("OSD managing {} disks", disk_ids.len());
 
-    // Parse listen address
-    let addr = listen
+    // Parse listen address and bind now, before registering: the address
+    // meta records must be one this process already holds. Port 0 lets the
+    // OS choose; picking a "free" port and binding it later raced with every
+    // other socket on the host, and an OSD that lost left meta pointing at
+    // an address something else answered.
+    let addr: SocketAddr = listen
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid listen address {}: {}", listen, e))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("OSD could not listen on {addr}: {e}"))?;
+    let bound = listener.local_addr()?;
+    info!("OSD listening on {bound}");
 
     // Determine the address to advertise to the metadata service
     // Priority: CLI --advertise-addr > config advertise_addr > derived from listen address
@@ -401,7 +411,17 @@ pub async fn run(
     } else {
         format!("http://{}", listen)
     };
+    // An advertised port of 0 means "whatever we were given".
+    let advertise_addr = match advertise_addr.strip_suffix(":0") {
+        Some(host) => format!("{host}:{}", bound.port()),
+        None => advertise_addr,
+    };
     info!("Advertising at: {}", advertise_addr);
+    // For a supervisor (aio) that let the OS pick the port.
+    let addr_file = PathBuf::from(&data_dir).join("osd.addr");
+    if let Err(e) = std::fs::write(&addr_file, &advertise_addr) {
+        warn!("could not write {}: {e}", addr_file.display());
+    }
 
     // Log failure domain configuration
     let failure_domain = config.osd.failure_domain.clone();
@@ -531,7 +551,7 @@ pub async fn run(
 
     let server_future = Server::builder()
         .add_service(storage_service)
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
             info!("Shutting down...");
         });

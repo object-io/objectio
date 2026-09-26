@@ -456,3 +456,167 @@ pub fn render_metrics() -> String {
         name.starts_with("objectio_cluster_")
     })
 }
+
+// ---------------------------------------------------------------------------
+// Readiness
+// ---------------------------------------------------------------------------
+
+/// How often readiness is re-checked while the gateway is starting.
+const READY_POLL: Duration = Duration::from_secs(1);
+
+#[derive(Default, Clone, Copy)]
+struct Readiness {
+    ready: bool,
+    osds_reachable: usize,
+    osds_registered: usize,
+    /// Write quorum: the default scheme's data shards.
+    osds_required: usize,
+    meta_reachable: bool,
+    /// Ready without every registered OSD, after [`DEGRADED_GRACE`].
+    degraded: bool,
+}
+
+/// How long to wait for the last OSDs once a write quorum is reachable.
+/// A write fails if *any* OSD in its placement is down (its metadata goes
+/// to all of them), so startup waits for all of them — but not forever: a
+/// disk that is simply dead must not keep the gateway out of service.
+const DEGRADED_GRACE: Duration = Duration::from_secs(30);
+
+static READINESS: LazyLock<RwLock<Readiness>> = LazyLock::new(|| RwLock::new(Readiness::default()));
+
+/// OSDs a write needs to reach: the default scheme's data shards (k), the
+/// write quorum. 1 for replication or before the scheme is known.
+fn osds_required() -> usize {
+    s3_metrics()
+        .protection_config()
+        .map_or(1, |p| p.data_shards.max(1) as usize)
+}
+
+/// (reachable, registered) OSDs: those meta lists and that answer a status
+/// call now *as the
+/// node meta says lives there*, out of all it lists. An address can be answered by some other
+/// OSD — a reused pod IP, or on one host an OSD port another process took
+/// first — and writes sent to it fail, so an answer from the wrong node
+/// does not count.
+async fn reachable_osds(mut meta: MetaClient) -> Option<(usize, usize)> {
+    let nodes = timed(meta.get_listing_nodes(GetListingNodesRequest {
+        bucket: String::new(),
+        include_all_states: false,
+    }))
+    .await?
+    .into_inner()
+    .nodes;
+    let mut seen = HashSet::new();
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|n| seen.insert(n.address.clone()))
+        .collect();
+    let registered = nodes.len();
+    let probes = nodes.into_iter().map(|n| async move {
+        let endpoint = if n.address.starts_with("http") {
+            n.address
+        } else {
+            format!("http://{}", n.address)
+        };
+        let expected = n.node_id;
+        let probe = async {
+            let mut c = StorageServiceClient::connect(endpoint).await.ok()?;
+            c.get_status(GetStatusRequest::default()).await.ok()
+        };
+        tokio::time::timeout(Duration::from_secs(3), probe)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.into_inner().node_id == expected)
+    });
+    let reachable = futures::future::join_all(probes)
+        .await
+        .into_iter()
+        .filter(|up| *up)
+        .count();
+    Some((reachable, registered))
+}
+
+/// Check once a second until meta answers and every registered OSD is
+/// reachable — or, after [`DEGRADED_GRACE`] with a write quorum reachable,
+/// the ones that are — then latch ready.
+///
+/// Latched on purpose: this is a startup gate. Were `/_ready` to drop when
+/// OSDs go away later, every gateway would leave the load balancer at
+/// once and reads that degraded EC could still serve would fail too.
+/// Losing OSDs after start is what `objectio_cluster_osds_up` and
+/// `objectio_objects_degraded` are for.
+pub fn spawn_readiness(meta: MetaClient) {
+    tokio::spawn(async move {
+        let mut quorum_since: Option<Instant> = None;
+        loop {
+            let required = osds_required();
+            let probe = reachable_osds(meta.clone()).await;
+            let (reachable, registered) = probe.unwrap_or((0, 0));
+            let quorum = reachable >= required;
+            if !quorum {
+                quorum_since = None;
+            } else if quorum_since.is_none() {
+                quorum_since = Some(Instant::now());
+            }
+            let all = quorum && reachable >= registered;
+            let degraded = !all && quorum_since.is_some_and(|t| t.elapsed() >= DEGRADED_GRACE);
+            let state = Readiness {
+                ready: all || degraded,
+                osds_reachable: reachable,
+                osds_registered: registered,
+                osds_required: required,
+                meta_reachable: probe.is_some(),
+                degraded,
+            };
+            if let Ok(mut r) = READINESS.write() {
+                *r = state;
+            }
+            if state.ready {
+                if degraded {
+                    tracing::warn!(
+                        "gateway ready without every OSD: {reachable} of {registered} reachable \
+                         after {}s; writes placed on the others will fail until they return",
+                        DEGRADED_GRACE.as_secs()
+                    );
+                } else {
+                    tracing::info!("gateway ready: all {registered} OSDs reachable");
+                }
+                return;
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
+    });
+}
+
+/// Whether the gateway can serve writes yet.
+#[must_use]
+pub fn is_ready() -> bool {
+    READINESS.read().is_ok_and(|r| r.ready)
+}
+
+/// `GET /_ready`: 200 once the gateway can serve writes, 503 with the
+/// reason until then. Unauthenticated, like `/health`, and named so it
+/// cannot shadow a bucket (bucket names cannot contain `_`).
+pub async fn ready_handler() -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let r = READINESS.read().map(|r| *r).unwrap_or_default();
+    let body = serde_json::json!({
+        "status": match (r.ready, r.degraded) {
+            (true, false) => "ready",
+            (true, true) => "ready_degraded",
+            _ => "starting",
+        },
+        "meta_reachable": r.meta_reachable,
+        "osds_reachable": r.osds_reachable,
+        "osds_registered": r.osds_registered,
+        "osds_required": r.osds_required,
+    });
+    let code = if r.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, axum::Json(body)).into_response()
+}
