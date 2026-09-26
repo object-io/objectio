@@ -1311,7 +1311,7 @@ pub async fn admin_delete_bucket(
     // reclaims correctly.
     match state
         .scatter_gather
-        .list_objects(&mut client.clone(), &name, "", 1, None)
+        .list_objects(&mut client.clone(), &name, "", 1, None, "")
         .await
     {
         Ok(result) if result.objects.iter().any(|o| !o.is_delete_marker) => {
@@ -1524,7 +1524,14 @@ pub async fn admin_list_objects(
     // Use the scatter-gather engine (same as the S3 list_objects handler)
     let all_objects = match state
         .scatter_gather
-        .list_objects(&mut meta_client, &bucket, &params.prefix, max_keys, None)
+        .list_objects(
+            &mut meta_client,
+            &bucket,
+            &params.prefix,
+            max_keys,
+            None,
+            "",
+        )
         .await
     {
         Ok(result) => result.objects,

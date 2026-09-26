@@ -2836,6 +2836,88 @@ impl MetaService {
     }
 }
 
+/// One page of a bucket listing, as the client sees it.
+struct ListingPage {
+    entries: Vec<ObjectListingEntry>,
+    common_prefixes: Vec<String>,
+    is_truncated: bool,
+    /// Where the next page starts (exclusive). Empty when not truncated.
+    next_token: String,
+}
+
+/// Sorts after every key that starts with the string it is appended to.
+const PAST_PREFIX: char = char::MAX;
+
+/// Page a listing in terms of what the client sees: `max_keys` counts
+/// keys *and* common prefixes, a common prefix appears once however many
+/// keys roll up into it, and a page never starts inside a prefix the
+/// previous page already returned.
+///
+/// `fetch(after, n)` returns up to `n` entries with keys strictly after
+/// `after` (and under the request prefix), and whether more exist.
+fn page_listing<F, E>(
+    mut fetch: F,
+    prefix: &str,
+    delimiter: &str,
+    start_after: &str,
+    max_keys: usize,
+) -> Result<ListingPage, E>
+where
+    F: FnMut(&str, usize) -> Result<(Vec<ObjectListingEntry>, bool), E>,
+{
+    let rolls_up = |key: &str| -> Option<String> {
+        if delimiter.is_empty() {
+            return None;
+        }
+        let tail = key.strip_prefix(prefix)?;
+        let idx = tail.find(delimiter)?;
+        Some(key[..prefix.len() + idx + delimiter.len()].to_string())
+    };
+
+    // Resuming from a common prefix (a V1 NextMarker, or our own token):
+    // skip everything under it, or the prefix comes back on every page.
+    let mut cursor = match rolls_up(start_after) {
+        Some(cp) if cp == start_after => format!("{cp}{PAST_PREFIX}"),
+        _ => start_after.to_string(),
+    };
+    let mut page = ListingPage {
+        entries: Vec::new(),
+        common_prefixes: Vec::new(),
+        is_truncated: false,
+        next_token: String::new(),
+    };
+    let emitted = |p: &ListingPage| p.entries.len() + p.common_prefixes.len();
+
+    'scan: loop {
+        let (batch, more) = fetch(&cursor, max_keys + 1)?;
+        let exhausted = batch.is_empty();
+        for e in batch {
+            let cp = rolls_up(&e.key);
+            if emitted(&page) >= max_keys {
+                page.is_truncated = true;
+                break 'scan;
+            }
+            if let Some(cp) = cp {
+                // Jump past the whole prefix: its other keys add nothing.
+                cursor = format!("{cp}{PAST_PREFIX}");
+                page.next_token.clone_from(&cp);
+                page.common_prefixes.push(cp);
+                continue 'scan;
+            }
+            cursor.clone_from(&e.key);
+            page.next_token.clone_from(&e.key);
+            page.entries.push(e);
+        }
+        if exhausted || !more {
+            break;
+        }
+    }
+    if !page.is_truncated {
+        page.next_token.clear();
+    }
+    Ok(page)
+}
+
 #[tonic::async_trait]
 impl MetadataService for MetaService {
     async fn get_metrics(
@@ -3222,44 +3304,36 @@ impl MetadataService for MetaService {
             // No persistent store = no Raft backend — return empty.
             return Ok(Response::new(ListObjectsResponse::default()));
         };
-        let (rows, is_truncated, next_token) = store
-            .list_object_listings(&req.bucket, &req.prefix, &start_after, max_keys)
-            .map_err(|e| {
-                error!("list_object_listings failed: {e}");
-                Status::internal(format!("list failed: {e}"))
-            })?;
-
-        let mut entries = Vec::with_capacity(rows.len());
-        for (_k, bytes) in rows {
-            match <ObjectListingEntry as prost::Message>::decode(bytes.as_slice()) {
-                Ok(e) => entries.push(e),
-                Err(err) => {
-                    warn!("decode ObjectListingEntry failed: {err}");
-                }
-            }
-        }
-
-        // Common prefixes (delimiter handling) — keep the existing
-        // shape the gateway expects. Our store scan returns fully
-        // expanded keys; applying the delimiter here keeps the client
-        // contract stable across the migration.
-        let mut common_prefixes: Vec<String> = Vec::new();
-        if !req.delimiter.is_empty() {
-            use std::collections::BTreeSet;
-            let mut prefixes: BTreeSet<String> = BTreeSet::new();
-            entries.retain(|e| {
-                let key = &e.key;
-                if let Some(tail) = key.strip_prefix(&req.prefix)
-                    && let Some(idx) = tail.find(&req.delimiter)
-                {
-                    let end = req.prefix.len() + idx + req.delimiter.len();
-                    prefixes.insert(key[..end].to_string());
-                    return false;
-                }
-                true
-            });
-            common_prefixes = prefixes.into_iter().collect();
-        }
+        let page = page_listing(
+            |after, n| {
+                let (rows, more, _) = store
+                    .list_object_listings(&req.bucket, &req.prefix, after, n)
+                    .map_err(|e| e.to_string())?;
+                let entries = rows
+                    .into_iter()
+                    .filter_map(|(_k, bytes)| {
+                        <ObjectListingEntry as prost::Message>::decode(bytes.as_slice())
+                            .inspect_err(|err| warn!("decode ObjectListingEntry failed: {err}"))
+                            .ok()
+                    })
+                    .collect();
+                Ok::<_, String>((entries, more))
+            },
+            &req.prefix,
+            &req.delimiter,
+            &start_after,
+            max_keys,
+        )
+        .map_err(|e| {
+            error!("list_object_listings failed: {e}");
+            Status::internal(format!("list failed: {e}"))
+        })?;
+        let (entries, common_prefixes, is_truncated, next_token) = (
+            page.entries,
+            page.common_prefixes,
+            page.is_truncated,
+            page.next_token,
+        );
 
         let key_count = entries.len() as u32 + common_prefixes.len() as u32;
         Ok(Response::new(ListObjectsResponse {
@@ -10821,5 +10895,94 @@ mod topology_status_tests {
             ),
             NodeStatus::Down
         );
+    }
+}
+
+#[cfg(test)]
+mod listing_page_tests {
+    use super::{ObjectListingEntry, page_listing};
+
+    /// An in-memory index: sorted keys, `fetch` returns keys strictly after
+    /// `after`, as the store does.
+    fn run(
+        keys: &[&str],
+        delimiter: &str,
+        start_after: &str,
+        max: usize,
+    ) -> (Vec<String>, bool, String) {
+        let mut keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        keys.sort();
+        let page = page_listing(
+            |after, n| {
+                let rest: Vec<_> = keys.iter().filter(|k| k.as_str() > after).collect();
+                let more = rest.len() > n;
+                Ok::<_, std::convert::Infallible>((
+                    rest.into_iter()
+                        .take(n)
+                        .map(|k| ObjectListingEntry {
+                            key: k.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    more,
+                ))
+            },
+            "",
+            delimiter,
+            start_after,
+            max,
+        )
+        .unwrap();
+        let mut out: Vec<String> = page.entries.into_iter().map(|e| e.key).collect();
+        out.extend(page.common_prefixes);
+        out.sort();
+        (out, page.is_truncated, page.next_token)
+    }
+
+    /// Page through to the end the way a V2 client does.
+    fn all_pages(keys: &[&str], delimiter: &str, max: usize) -> Vec<Vec<String>> {
+        let mut pages = Vec::new();
+        let mut token = String::new();
+        loop {
+            let (items, truncated, next) = run(keys, delimiter, &token, max);
+            pages.push(items);
+            if !truncated {
+                return pages;
+            }
+            token = next;
+        }
+    }
+
+    const KEYS: &[&str] = &["a", "b", "c", "dir/x", "dir/y", "e"];
+
+    #[test]
+    fn start_is_exclusive() {
+        let (items, _, _) = run(KEYS, "", "c", 100);
+        assert_eq!(items, ["dir/x", "dir/y", "e"]);
+    }
+
+    #[test]
+    fn pages_cover_every_key_once_and_the_last_is_not_truncated() {
+        let pages = all_pages(KEYS, "", 2);
+        assert_eq!(pages.concat(), ["a", "b", "c", "dir/x", "dir/y", "e"]);
+        assert_eq!(pages.len(), 3);
+        let (_, truncated, token) = run(KEYS, "", "", 100);
+        assert!(!truncated && token.is_empty());
+    }
+
+    /// max-keys counts common prefixes, and a prefix is returned once even
+    /// when its keys straddle a page boundary.
+    #[test]
+    fn a_common_prefix_appears_once_across_pages() {
+        let pages = all_pages(KEYS, "/", 2);
+        assert_eq!(pages.concat(), ["a", "b", "c", "dir/", "e"]);
+        assert!(pages.iter().all(|p| p.len() <= 2), "{pages:?}");
+    }
+
+    /// A V1 client resumes from NextMarker, which may be a common prefix.
+    #[test]
+    fn resuming_from_a_prefix_skips_its_keys() {
+        let (items, _, _) = run(KEYS, "/", "dir/", 100);
+        assert_eq!(items, ["e"]);
     }
 }
