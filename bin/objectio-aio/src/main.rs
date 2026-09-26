@@ -183,25 +183,6 @@ fn ephemeral_port_excluding(taken: &[u16]) -> Result<u16> {
     ))
 }
 
-/// Pick a base for `count` consecutive OSD ports, none of which collide with
-/// `taken`. The OSDs take `base`, `base + 1`, ... so the whole run has to be
-/// clear, not just the first one.
-fn ephemeral_port_run(count: usize, taken: &[u16]) -> Result<u16> {
-    let count = u16::try_from(count.max(1)).unwrap_or(u16::MAX);
-    for _ in 0..64 {
-        let base = ephemeral_port()?;
-        let Some(last) = base.checked_add(count - 1) else {
-            continue;
-        };
-        if (base..=last).all(|p| !taken.contains(&p) && port_free("127.0.0.1", p)) {
-            return Ok(base);
-        }
-    }
-    Err(anyhow!(
-        "could not find {count} consecutive free loopback ports"
-    ))
-}
-
 fn port_free(addr: &str, port: u16) -> bool {
     StdTcpListener::bind((addr, port)).is_ok()
 }
@@ -277,6 +258,43 @@ async fn wait_listening(port: u16, label: &str, max: u64) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(anyhow!("{label} did not listen on :{port} within {max}s"))
+}
+
+/// Wait for OSD `i` to write the address it bound, and return its port.
+async fn wait_osd_addr(path: &std::path::Path, i: usize, max: u64) -> Result<u16> {
+    for _ in 0..(max * 10) {
+        if let Ok(addr) = std::fs::read_to_string(path)
+            && let Some(port) = addr.trim().rsplit(':').next().and_then(|p| p.parse().ok())
+        {
+            return Ok(port);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "osd-{i} did not report its address in {} within {max}s",
+        path.display()
+    ))
+}
+
+/// Wait for the gateway's `/_ready` to answer 200. Gives up after `max`
+/// seconds with a warning rather than an error: the cluster may still
+/// become usable, and the banner is how the user finds out where it is.
+async fn wait_gateway_ready(port: u16, max: u64) {
+    for i in 0..(max * 4) {
+        if let Ok((status, _)) = http_oneshot(port, "GET", "/_ready", b"").await
+            && status.contains(" 200 ")
+        {
+            return;
+        }
+        if i % 8 == 0 {
+            info!("waiting for the gateway to reach its OSDs…");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    warn!(
+        "gateway on :{port} is not ready after {max}s — writes may fail until \
+         its OSDs are reachable; see http://127.0.0.1:{port}/_ready"
+    );
 }
 
 /// Minimal HTTP GET/POST over a one-shot TCP connection. Returns (status_line, body).
@@ -412,7 +430,6 @@ async fn main() -> Result<()> {
     // only once the whole stack is assembled.
     let meta_grpc = ephemeral_port_excluding(&[gateway_port])?;
     let meta_admin = ephemeral_port_excluding(&[gateway_port, meta_grpc])?;
-    let osd_base = ephemeral_port_run(args.osds, &[gateway_port, meta_grpc, meta_admin])?;
 
     // ------------------------------------------------------------
     // SSE master key. Gateway's bin logs a scary warning when this
@@ -563,17 +580,23 @@ async fn main() -> Result<()> {
     let mut osd_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
     let mut osd_ports: Vec<u16> = Vec::new();
     for i in 0..args.osds {
-        let port = osd_base + i as u16;
         let osd_dir = data_root.join(format!("osd-{i}"));
         std::fs::create_dir_all(osd_dir.join("disk0"))?;
         std::fs::create_dir_all(osd_dir.join("state"))?;
         let disk = osd_dir.join("disk0/disk.raw");
         let state = osd_dir.join("state");
+        // The OSD binds port 0 and writes the address it got here; a stale
+        // one from the last run must not be mistaken for it.
+        let addr_file = state.join("osd.addr");
+        let _ = std::fs::remove_file(&addr_file);
 
         let osd_args = <objectio_osd::Args as clap::Parser>::parse_from([
             "objectio-osd",
+            // Port 0: the OSD binds whatever the OS gives it and registers
+            // that. Choosing a free port here and binding it later lost the
+            // port to other sockets often enough to break startup.
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--meta-endpoint",
             &format!("http://127.0.0.1:{meta_grpc}"),
             "--data-dir",
@@ -581,7 +604,7 @@ async fn main() -> Result<()> {
             "--disks",
             &disk.display().to_string(),
             "--advertise-addr",
-            &format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:0",
             // Every OSD defaulted to the same metrics port (9201), so with
             // more than one the first bound it and the rest logged
             // "Metrics server error: Address already in use" and exported
@@ -598,6 +621,7 @@ async fn main() -> Result<()> {
         osd_handles.push(tokio::spawn(async move {
             objectio_osd::run(osd_args, sd).await
         }));
+        let port = wait_osd_addr(&addr_file, i, 20).await?;
         wait_listening(port, &format!("osd-{i}"), 20).await?;
         osd_ports.push(port);
     }
@@ -691,6 +715,25 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { objectio_gateway::run(gw_args, sd).await })
     };
     wait_listening(gateway_port, "gateway", 20).await?;
+    // Listening is not the same as able to write: the OSDs may not be
+    // registered or reachable yet, and a PUT then fails with "write quorum
+    // not met". Only announce ready once the gateway says it is.
+    wait_gateway_ready(gateway_port, 60).await;
+    // An OSD that could not start (typically: its port was taken between
+    // being picked and being bound) leaves meta pointing at an address
+    // something else answers. Running on like that fails writes in ways
+    // that are hard to trace back, so stop here and say why.
+    if let Some(i) = osd_handles.iter().position(JoinHandle::is_finished) {
+        let result = osd_handles.remove(i).await;
+        return Err(anyhow!(
+            "OSD {i} exited during startup: {}",
+            match result {
+                Ok(Ok(())) => "without an error".to_string(),
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => e.to_string(),
+            }
+        ));
+    }
 
     // Banner — show the address the caller can actually reach us at.
     let display_host = if args.listen_addr == "0.0.0.0" {

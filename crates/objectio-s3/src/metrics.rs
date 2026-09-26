@@ -332,6 +332,12 @@ impl S3Metrics {
         self.per_bucket_usage.store(enabled, Ordering::Relaxed);
     }
 
+    /// The default protection scheme, once the gateway has set it.
+    #[must_use]
+    pub fn protection_config(&self) -> Option<ProtectionConfig> {
+        self.protection.read().ok().and_then(|p| p.clone())
+    }
+
     /// Data shards / total shards of the default protection scheme.
     #[must_use]
     pub fn protection_efficiency(&self) -> Option<f64> {

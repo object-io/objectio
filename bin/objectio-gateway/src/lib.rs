@@ -827,6 +827,7 @@ pub async fn run(
         // (or the legacy combined router) — splitting it off lets
         // operators firewall metrics/admin together on a mgmt VLAN.
         .route("/health", get(s3::health_check))
+        .route("/_ready", get(cluster_poll::ready_handler))
         // Service endpoint (list buckets)
         .route("/", get(s3::list_buckets))
         // Bucket operations (including ?policy and ?uploads query params)
@@ -1238,6 +1239,7 @@ pub async fn run(
             }
             let admin_only = Router::new()
                 .route("/health", get(s3::health_check))
+                .route("/_ready", get(cluster_poll::ready_handler))
                 .route("/metrics", get(metrics_handler))
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
@@ -1259,6 +1261,7 @@ pub async fn run(
             info!("Ops console SPA: {}", ops_console_dir);
             let ops_router = Router::new()
                 .route("/health", get(s3::health_check))
+                .route("/_ready", get(cluster_poll::ready_handler))
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
@@ -1283,6 +1286,7 @@ pub async fn run(
             info!("Tenant console SPA: {}", tenant_console_dir);
             let tenant_router = Router::new()
                 .route("/health", get(s3::health_check))
+                .route("/_ready", get(cluster_poll::ready_handler))
                 // Tenant console mounts the same `/_admin/*` surface; the
                 // handlers themselves enforce per-tenant scoping
                 // (see `require_tenant_admin_access`). The bundle that
@@ -1315,6 +1319,7 @@ pub async fn run(
     // Polled rather than gathered on scrape: /metrics has to stay fast and
     // must not fail because one node is slow to answer.
     cluster_poll::spawn(state.meta_client.clone());
+    cluster_poll::spawn_readiness(state.meta_client.clone());
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());

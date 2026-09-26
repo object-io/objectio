@@ -209,7 +209,7 @@ pub async fn auth_layer(
     let path = request.uri().path();
 
     // Skip auth for health checks and metrics
-    if path == "/health" || path == "/metrics" || path == "/_status" {
+    if path == "/health" || path == "/_ready" || path == "/metrics" || path == "/_status" {
         return Ok(next.run(request).await);
     }
 

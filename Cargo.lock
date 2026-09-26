@@ -2503,6 +2503,7 @@ dependencies = [
  "sys-info",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tracing",
