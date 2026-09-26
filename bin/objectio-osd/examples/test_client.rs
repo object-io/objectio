@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 2: Get status
     println!("\n--- Node Status ---");
-    let response = client.get_status(GetStatusRequest {}).await?;
+    let response = client.get_status(GetStatusRequest::default()).await?;
     let status = response.into_inner();
     println!("Node ID: {}", hex::encode(&status.node_id));
     println!("Node Name: {}", status.node_name);
@@ -103,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 5: Get status again to see updated shard count
     println!("\n--- Updated Status ---");
-    let response = client.get_status(GetStatusRequest {}).await?;
+    let response = client.get_status(GetStatusRequest::default()).await?;
     let status = response.into_inner();
     println!("Shard Count: {}", status.shard_count);
 

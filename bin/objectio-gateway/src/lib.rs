@@ -7,7 +7,9 @@ pub mod admin;
 pub mod auth_middleware;
 pub mod authz;
 pub mod chunked_decode;
+pub mod cluster_poll;
 pub mod console_auth;
+pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;
 pub mod host_provider;
@@ -41,6 +43,7 @@ use objectio_s3::{ProtectionConfig, s3_metrics};
 use osd_pool::OsdPool;
 use s3::AppState;
 use scatter_gather::ScatterGatherEngine;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -48,85 +51,89 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 /// Prometheus metrics endpoint handler
-/// How often the capacity gauges are refreshed. Capacity moves on the scale of
-/// writes, not milliseconds, and each poll costs one `GetStatus` per OSD.
-const CAPACITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Ask every registered OSD how full it is.
-///
-/// Best effort in both directions: a node meta does not know about is not
-/// reported, and a node that does not answer is reported with
-/// `reachable: false` rather than omitted. Dropping it would make capacity
-/// appear to shrink when a disk goes unreachable, which reads as data loss
-/// rather than as a node being down.
-async fn collect_capacity(
+/// Join the per-OSD usage with meta's buckets and tenants. `None` when meta
+/// cannot be reached — the previous report is better than one in which
+/// every bucket has vanished.
+pub(crate) async fn build_usage_report(
     mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
         tonic::transport::Channel,
     >,
-) -> Vec<objectio_s3::metrics::NodeCapacity> {
-    use objectio_proto::metadata::GetListingNodesRequest;
-    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    nodes: &[objectio_s3::metrics::NodeCapacity],
+    usage: &HashMap<String, Vec<objectio_s3::usage::OsdBucketUsage>>,
+) -> Option<objectio_s3::usage::UsageReport> {
+    use objectio_proto::metadata::{ListBucketsRequest, ListTenantsRequest};
+    use objectio_s3::usage::{BucketInfo, ClusterUsage, TenantInfo, build_report};
 
-    let Ok(resp) = meta
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: true,
-        })
+    let buckets = meta
+        .list_buckets(ListBucketsRequest::default())
         .await
-    else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let targets: Vec<(String, Vec<u8>)> = resp
+        .ok()?
         .into_inner()
-        .nodes
+        .buckets
         .into_iter()
-        .filter(|n| seen.insert(n.address.clone()))
-        .map(|n| (n.address, n.node_id))
-        .collect();
+        .map(|b| BucketInfo {
+            name: b.name,
+            tenant: b.tenant,
+            owner: b.owner,
+            created_at: b.created_at,
+            pool: b.pool,
+            quota_bytes: b.quota_bytes,
+            quota_objects: b.quota_objects,
+        })
+        .collect::<Vec<_>>();
+    let tenants = meta
+        .list_tenants(ListTenantsRequest {})
+        .await
+        .map(|r| r.into_inner().tenants)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| TenantInfo {
+            name: t.name,
+            quota_bytes: t.quota_bytes,
+            quota_buckets: t.quota_buckets,
+            quota_objects: t.quota_objects,
+        })
+        .collect::<Vec<_>>();
 
-    let polls = targets.into_iter().map(|(addr, node_id)| async move {
-        let endpoint = if addr.starts_with("http") {
-            addr.clone()
-        } else {
-            format!("http://{addr}")
-        };
-        let status = async {
-            let mut c = StorageServiceClient::connect(endpoint).await.ok()?;
-            let s = c
-                .get_status(objectio_proto::storage::GetStatusRequest {})
-                .await
-                .ok()?
-                .into_inner();
-            Some((s.total_capacity, s.used_capacity, s.shard_count))
-        }
-        .await;
-
-        let (total, used, shards, reachable) =
-            status.map_or((0, 0, 0, false), |(t, u, s)| (t, u, s, true));
-        objectio_s3::metrics::NodeCapacity {
-            node_id: hex::encode(&node_id),
-            address: addr,
-            total_bytes: total,
-            used_bytes: used,
-            shard_count: shards,
-            reachable,
-        }
-    });
-
-    futures::future::join_all(polls).await
+    let up: Vec<_> = nodes.iter().filter(|n| n.reachable).collect();
+    let raw_capacity: u64 = up.iter().map(|n| n.total_bytes).sum();
+    let raw_used: u64 = up.iter().map(|n| n.used_bytes).sum();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let usable = s3_metrics()
+        .protection_efficiency()
+        .map_or(0, |e| (raw_capacity as f64 * e) as u64);
+    let cluster = ClusterUsage {
+        raw_capacity_bytes: raw_capacity,
+        raw_used_bytes: raw_used,
+        raw_available_bytes: raw_capacity.saturating_sub(raw_used),
+        usable_capacity_bytes: usable,
+        osds_total: nodes.len() as u64,
+        osds_up: up.len() as u64,
+        osds_stale: nodes
+            .iter()
+            .filter(|n| !n.reachable && usage.contains_key(&n.node_id))
+            .count() as u64,
+        ..Default::default()
+    };
+    let reports: Vec<_> = usage.values().cloned().collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Some(build_report(&reports, &buckets, &tenants, cluster, now))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
-    let metrics = s3_metrics().export_prometheus();
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        metrics,
+        cluster_poll::render_metrics(),
     )
 }
 
@@ -220,6 +227,13 @@ pub struct Args {
     /// scrape and says so.
     #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
     pub prometheus_url: String,
+
+    /// Leave the per-bucket usage series (`objectio_bucket_*`) out of
+    /// `/metrics`. They carry one series per bucket, which is fine into the
+    /// tens of thousands; beyond that, tenant and cluster totals are still
+    /// exported and `/_admin/usage` still has every bucket.
+    #[arg(long, env = "OBJECTIO_NO_BUCKET_METRICS", default_value_t = false)]
+    pub no_bucket_metrics: bool,
 
     /// Keep buckets that have no recorded owner accessible to any
     /// authenticated caller. Buckets created before ownership was tracked
@@ -435,6 +449,7 @@ pub async fn run(
         }
     };
     s3_metrics().set_protection_config(protection_config);
+    s3_metrics().set_per_bucket_usage(!args.no_bucket_metrics);
 
     // Connect to metadata service
     let meta_client = MetadataServiceClient::connect(args.meta_endpoint.clone())
@@ -879,6 +894,7 @@ pub async fn run(
             delete(admin::admin_remove_tenant_admin),
         )
         .route("/_admin/nodes", get(admin::admin_list_nodes))
+        .route("/_admin/usage", get(admin::admin_usage))
         .route(
             "/_admin/osds/{node_id}/admin-state",
             put(admin::admin_set_osd_state),
@@ -1295,21 +1311,10 @@ pub async fn run(
 
     // Bind all listeners and serve concurrently. A shared broadcast channel
     // fans the user's shutdown future out to every axum::serve.
-    // Keep the capacity gauges fed. Polling here rather than computing on
-    // scrape: a reading costs a GetStatus to every OSD, and /metrics has to
-    // stay fast and must not fail because one disk is slow to answer.
-    {
-        let meta_client = state.meta_client.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(CAPACITY_POLL_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let nodes = collect_capacity(meta_client.clone()).await;
-                s3_metrics().set_capacity(nodes);
-            }
-        });
-    }
+    // Keep capacity, usage, data-safety and the OSD / meta metrics fed.
+    // Polled rather than gathered on scrape: /metrics has to stay fast and
+    // must not fail because one node is slow to answer.
+    cluster_poll::spawn(state.meta_client.clone());
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());

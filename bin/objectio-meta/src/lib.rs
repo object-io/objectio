@@ -8,6 +8,7 @@ pub mod balancer;
 pub mod block_service;
 pub mod drain_observer;
 pub mod liveness;
+mod op_metrics;
 pub mod raft_admin;
 pub mod raft_rpc;
 pub mod service;
@@ -221,6 +222,15 @@ pub async fn run(
         start_time: std::time::Instant::now(),
     });
 
+    {
+        let weak = Arc::downgrade(&metrics_state);
+        meta_service.set_metrics_renderer(Box::new(move || {
+            weak.upgrade()
+                .map(|s| render_metrics(&s))
+                .unwrap_or_default()
+        }));
+    }
+
     // Start metrics server
     let metrics_port = args.metrics_port;
     let metrics_state_clone = metrics_state.clone();
@@ -329,6 +339,7 @@ pub async fn run(
     // Start gRPC server with metadata, block, and Raft RPC services.
     let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id);
     Server::builder()
+        .layer(op_metrics::OpTimerLayer)
         .add_service(MetadataServiceServer::from_arc(meta_service))
         .add_service(BlockServiceServer::from_arc(block_service))
         .add_service(objectio_proto::raft::raft_rpc_server::RaftRpcServer::new(
@@ -356,6 +367,19 @@ struct MetaMetricsState {
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<MetaMetricsState>>,
 ) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        render_metrics(&state),
+    )
+}
+
+/// This node's Prometheus exposition. Served on meta's own metrics port
+/// and, through `MetadataService.GetMetrics`, from the gateway's.
+fn render_metrics(state: &MetaMetricsState) -> String {
     let mut output = String::with_capacity(8 * 1024);
 
     // Meta service uptime
@@ -380,13 +404,8 @@ async fn metrics_handler(
     writeln!(output, "# TYPE objectio_meta_buckets_total gauge").unwrap();
     writeln!(output, "objectio_meta_buckets_total {}", stats.bucket_count).unwrap();
 
-    writeln!(
-        output,
-        "# HELP objectio_meta_objects_total Total number of objects"
-    )
-    .unwrap();
-    writeln!(output, "# TYPE objectio_meta_objects_total gauge").unwrap();
-    writeln!(output, "objectio_meta_objects_total {}", stats.object_count).unwrap();
+    // Object counts live on the OSDs, not here: the gateway sums them and
+    // exports `objectio_cluster_objects` / `objectio_bucket_objects`.
 
     // OSD counts
     writeln!(
@@ -636,14 +655,10 @@ async fn metrics_handler(
         .unwrap();
     }
 
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        output,
-    )
+    output.push_str(&op_metrics::render());
+    output.push_str(&state.meta_service.render_multipart_metrics());
+    output.push_str(&objectio_common::process_metrics::render(""));
+    output
 }
 
 /// Health check handler

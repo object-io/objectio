@@ -54,4 +54,4 @@ mod wal;
 pub use cache::{ArcCache, CacheStats as MetaCacheStats};
 pub use store::{MetadataStore, MetadataStoreConfig};
 pub use types::{MetadataEntry, MetadataKey, MetadataOp, ShardMeta};
-pub use wal::MetadataWal;
+pub use wal::{MetadataWal, WalSyncStats};

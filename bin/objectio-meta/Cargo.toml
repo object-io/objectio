@@ -25,6 +25,7 @@ futures = { workspace = true }
 openraft = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tower = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }

@@ -214,10 +214,26 @@ pub async fn metrics_layer(request: Request<Body>, next: Next) -> Response {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
 
+    let _in_flight = s3_operation.map(|op| {
+        if request_bytes > 0 {
+            crate::gateway_metrics::record_request_size(op.as_str(), request_bytes);
+        }
+        crate::gateway_metrics::InFlight::start(op.as_str())
+    });
+
     // Run the handler
     let response = next.run(request).await;
 
     let status_code = response.status().as_u16();
+    if let Some(op) = s3_operation
+        && status_code >= 400
+    {
+        let error = response
+            .extensions()
+            .get::<crate::gateway_metrics::S3ErrorCode>()
+            .map(|e| e.0.as_str());
+        crate::gateway_metrics::record_error(op.as_str(), status_code, error);
+    }
     let latency_us = start.elapsed().as_micros() as u64;
 
     // Record metrics for S3 or Iceberg operation

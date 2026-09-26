@@ -6,6 +6,8 @@
 pub mod checksum;
 pub mod config;
 pub mod error;
+pub mod histogram;
+pub mod process_metrics;
 pub mod types;
 
 pub use checksum::{Checksum, ChecksumCalculator};

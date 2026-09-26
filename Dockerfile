@@ -118,6 +118,11 @@ COPY --from=console-builder /build/console/dist /build/console/dist
 ARG TARGETARCH
 ARG TARGETPLATFORM
 ARG FEATURES=""
+# Baked into objectio_build_info. The release workflow passes the tag and
+# the commit; a local build reports the crate version and "unknown".
+ARG OBJECTIO_VERSION
+ARG OBJECTIO_GIT_COMMIT
+ENV OBJECTIO_VERSION=${OBJECTIO_VERSION} OBJECTIO_GIT_COMMIT=${OBJECTIO_GIT_COMMIT}
 
 # Determine features based on architecture
 # - x86_64/amd64: Enable ISA-L for hardware-accelerated erasure coding

@@ -33,6 +33,7 @@
 
 pub mod backend;
 pub mod codec;
+pub mod metrics;
 pub mod shard;
 
 // Re-exports from codec

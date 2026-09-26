@@ -667,6 +667,7 @@ fn is_legacy_unowned(owner: &str) -> bool {
 pub const LEGACY_BUCKET_OWNER: &str = "default";
 
 fn deny(message: &str) -> Response {
+    crate::gateway_metrics::record_auth_failure("policy");
     S3Error::xml_response("AccessDenied", message, StatusCode::FORBIDDEN)
 }
 

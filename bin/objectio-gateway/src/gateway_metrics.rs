@@ -1,0 +1,175 @@
+//! Request, auth and backend metrics recorded by the gateway itself, on
+//! top of the per-operation counters in `objectio_s3::metrics`.
+//!
+//! Label values are bounded: operations come from the S3 operation enum,
+//! HTTP codes and S3 error names are bucketed to known sets, and OSD
+//! addresses are bounded by the cluster size.
+
+use objectio_common::histogram::{
+    CounterVec, GaugeVec, HistogramVec, LATENCY_BUCKETS, SIZE_BUCKETS, label_value,
+};
+use std::sync::LazyLock;
+use std::time::Duration;
+
+/// The S3 error name carried on an error response, set by whoever built
+/// it, so the metrics layer can label the failure without parsing XML.
+#[derive(Clone, Debug)]
+pub struct S3ErrorCode(pub String);
+
+static REQUEST_ERRORS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static AUTH_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static IN_FLIGHT: LazyLock<GaugeVec> = LazyLock::new(GaugeVec::new);
+static REQUEST_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(SIZE_BUCKETS));
+static SHARD_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
+static OSD_ERRORS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+
+/// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
+const KNOWN_CODES: &[u16] = &[
+    400, 401, 403, 404, 405, 409, 411, 412, 413, 416, 429, 500, 501, 502, 503, 504,
+];
+
+fn code_label(status: u16) -> String {
+    if KNOWN_CODES.contains(&status) {
+        status.to_string()
+    } else {
+        format!("{}xx", status / 100)
+    }
+}
+
+/// S3 error names are CamelCase identifiers from a fixed vocabulary; keep
+/// anything else out of the label.
+fn error_label(name: Option<&str>) -> &str {
+    match name {
+        Some(n)
+            if !n.is_empty() && n.len() <= 48 && n.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            n
+        }
+        _ => "Unknown",
+    }
+}
+
+/// A failed S3 request: `code` is the HTTP status, `error` the S3 error
+/// name when the response carried one.
+pub fn record_error(operation: &str, status: u16, error: Option<&str>) {
+    REQUEST_ERRORS.inc(&format!(
+        "operation=\"{operation}\",code=\"{}\",error=\"{}\"",
+        code_label(status),
+        error_label(error)
+    ));
+}
+
+/// Why a request was refused before reaching its handler.
+pub fn record_auth_failure(reason: &str) {
+    AUTH_FAILURES.inc(&format!("reason=\"{reason}\""));
+}
+
+/// Tracks one in-flight request; decrements on drop, so a handler that
+/// panics or is cancelled still leaves the gauge right.
+pub struct InFlight(String);
+
+impl InFlight {
+    #[must_use]
+    pub fn start(operation: &str) -> Self {
+        let labels = format!("operation=\"{operation}\"");
+        IN_FLIGHT.add(&labels, 1);
+        Self(labels)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.add(&self.0, -1);
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+pub fn record_request_size(operation: &str, bytes: u64) {
+    REQUEST_SIZE.observe(&format!("operation=\"{operation}\""), bytes as f64);
+}
+
+/// One shard read or write to an OSD, successful or not.
+pub fn record_shard_io(address: &str, direction: &str, elapsed: Duration) {
+    SHARD_LATENCY.observe_duration(
+        &format!(
+            "address=\"{}\",direction=\"{direction}\"",
+            label_value(address)
+        ),
+        elapsed,
+    );
+}
+
+/// A failed call to an OSD. `kind` is `timeout`, `refused` (could not
+/// connect) or `error` (the OSD answered with an error).
+pub fn record_osd_error(address: &str, kind: &str) {
+    OSD_ERRORS.inc(&format!(
+        "address=\"{}\",kind=\"{kind}\"",
+        label_value(address)
+    ));
+}
+
+/// Everything above, plus erasure coding time, as Prometheus families.
+#[must_use]
+pub fn render() -> String {
+    let mut out = String::new();
+    REQUEST_ERRORS.render(
+        &mut out,
+        "objectio_s3_request_errors_total",
+        "Failed S3 requests by HTTP code and S3 error name",
+    );
+    AUTH_FAILURES.render(
+        &mut out,
+        "objectio_auth_failures_total",
+        "Requests refused by authentication or authorization, by reason",
+    );
+    IN_FLIGHT.render(
+        &mut out,
+        "objectio_s3_requests_in_flight",
+        "S3 requests currently being served",
+    );
+    REQUEST_SIZE.render(
+        &mut out,
+        "objectio_s3_request_size_bytes",
+        "Request body size (Content-Length) by operation",
+        "",
+    );
+    SHARD_LATENCY.render(
+        &mut out,
+        "objectio_gateway_shard_latency_seconds",
+        "Time for one shard read or write to an OSD, by OSD",
+        "",
+    );
+    OSD_ERRORS.render(
+        &mut out,
+        "objectio_gateway_osd_request_errors_total",
+        "Failed shard calls to an OSD, by kind",
+    );
+    objectio_erasure::metrics::render(&mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_stay_bounded() {
+        assert_eq!(code_label(404), "404");
+        assert_eq!(code_label(418), "4xx");
+        assert_eq!(
+            error_label(Some("SignatureDoesNotMatch")),
+            "SignatureDoesNotMatch"
+        );
+        assert_eq!(error_label(Some("x\" injected")), "Unknown");
+        assert_eq!(error_label(None), "Unknown");
+    }
+
+    #[test]
+    fn in_flight_returns_to_zero_on_drop() {
+        {
+            let _a = InFlight::start("TestOp");
+            assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 1"));
+        }
+        assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 0"));
+    }
+}

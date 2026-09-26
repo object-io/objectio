@@ -2202,7 +2202,7 @@ pub async fn admin_list_nodes(
         let status = match StorageServiceClient::connect(osd_addr).await {
             Ok(mut client) => {
                 match client
-                    .get_status(objectio_proto::storage::GetStatusRequest {})
+                    .get_status(objectio_proto::storage::GetStatusRequest::default())
                     .await
                 {
                     Ok(resp) => {
@@ -2479,7 +2479,7 @@ pub async fn admin_reboot_osd(
     };
     let pod_name = match StorageServiceClient::connect(osd_addr.clone()).await {
         Ok(mut client) => match client
-            .get_status(objectio_proto::storage::GetStatusRequest {})
+            .get_status(objectio_proto::storage::GetStatusRequest::default())
             .await
         {
             Ok(r) => r.into_inner().pod_name,
@@ -3186,6 +3186,46 @@ fn grpc_to_http(code: tonic::Code) -> u16 {
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => 403,
         _ => 500,
     }
+}
+
+// ============================================================================
+// Usage
+// ============================================================================
+
+/// Storage consumption per bucket and tenant, plus cluster capacity.
+///
+/// A system admin gets everything. A tenant caller gets only their own
+/// tenant's row and buckets, and no cluster section — raw capacity and
+/// other tenants' consumption are not theirs to see. Served from the
+/// gateway's background refresh, so it is at most one poll interval old
+/// (`updated_at` says exactly how old).
+pub async fn admin_usage(auth: Option<Extension<AuthResult>>, headers: HeaderMap) -> Response {
+    let full = require_system_admin(&auth, &headers);
+    let caller = extract_caller(&auth, &headers);
+    if full.is_some() && (!caller.authenticated || caller.tenant.is_empty()) {
+        return full.unwrap_or_else(|| StatusCode::FORBIDDEN.into_response());
+    }
+
+    let Some(mut report) = objectio_s3::s3_metrics().usage() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Usage has not been gathered yet; try again shortly",
+        )
+            .into_response();
+    };
+
+    if full.is_none() {
+        return Json(report).into_response();
+    }
+    report.buckets.retain(|b| b.tenant == caller.tenant);
+    report.tenants.retain(|t| t.tenant == caller.tenant);
+    Json(serde_json::json!({
+        "updated_at": report.updated_at,
+        "cluster": serde_json::Value::Null,
+        "tenants": report.tenants,
+        "buckets": report.buckets,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

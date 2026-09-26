@@ -260,7 +260,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_meta_objects_total",
+          "expr": "objectio_cluster_objects",
           "legendFormat": "Objects",
           "refId": "A"
         }

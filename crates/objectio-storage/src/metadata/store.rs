@@ -455,6 +455,11 @@ impl MetadataStore {
     }
 
     /// Get statistics
+    /// WAL fsync statistics for metrics.
+    pub fn wal_sync_stats(&self) -> &super::wal::WalSyncStats {
+        self.wal.sync_stats()
+    }
+
     pub fn stats(&self) -> MetadataStoreStats {
         MetadataStoreStats {
             entry_count: self.index.len(),

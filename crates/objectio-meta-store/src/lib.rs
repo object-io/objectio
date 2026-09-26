@@ -1,5 +1,6 @@
 //! ObjectIO Metadata Store — persistent metadata backed by redb.
 
+pub mod commit_metrics;
 pub mod raft;
 pub mod raft_network;
 pub mod raft_storage;

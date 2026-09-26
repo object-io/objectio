@@ -991,6 +991,7 @@ impl S3Error {
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/xml")
+            .extension(crate::gateway_metrics::S3ErrorCode(code.to_string()))
             .body(Body::from(xml))
             .unwrap()
     }
@@ -2505,6 +2506,7 @@ pub async fn put_object(
             encrypted_dek: sse_encrypted_dek.clone(),
             encryption_iv: sse_iv.clone(),
             encryption_context: sse_encryption_context.clone(),
+            usage_owner: Vec::new(), // filled in by put_object_meta_to_all
         };
 
         if let Err(e) = put_object_meta_to_all(
@@ -2814,6 +2816,7 @@ pub async fn put_object(
         encrypted_dek: sse_encrypted_dek,
         encryption_iv: sse_iv,
         encryption_context: sse_encryption_context,
+        usage_owner: Vec::new(), // filled in by put_object_meta_to_all
     };
 
     if let Err(e) = put_object_meta_to_all(
@@ -3922,6 +3925,21 @@ pub async fn delete_object(
                 &e.to_string(),
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
+        }
+
+        // The key no longer has a current version, so drop it from Meta's
+        // listing index; it stays reachable through ListObjectVersions.
+        {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            let _ = state
+                .meta_client
+                .clone()
+                .delete_object(MetaDelReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: String::new(),
+                })
+                .await;
         }
 
         info!(
@@ -5576,6 +5594,33 @@ async fn complete_multipart_upload_internal(
                         &format!("Failed to store object metadata: {}", e),
                         StatusCode::INTERNAL_SERVER_ERROR,
                     );
+                }
+
+                // Register with Meta's listing index, as a single-part PUT
+                // does. ListObjects reads that index first, so without this
+                // a multipart object was readable by key but missing from
+                // listings — or listed with the size of whatever single-part
+                // object last had that key.
+                {
+                    use objectio_proto::metadata::CreateObjectRequest;
+                    let req = CreateObjectRequest {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        size: object.size,
+                        content_type: object.content_type.clone(),
+                        etag: object.etag.clone(),
+                        user_metadata: object.user_metadata.clone(),
+                        stripes: object.stripes.clone(),
+                        object_id: object.object_id.clone(),
+                        pg_id: placement.pg_id,
+                        pool: placement.pool.clone(),
+                    };
+                    if let Err(e) = state.meta_client.clone().create_object(req).await {
+                        warn!(
+                            "create_object on meta failed ({e}); multipart object is \
+                             readable by key but will not appear in ListObjects",
+                        );
+                    }
                 }
 
                 let result = CompleteMultipartUploadResult {

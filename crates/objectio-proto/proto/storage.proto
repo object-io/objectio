@@ -60,6 +60,11 @@ service StorageService {
 
     // List all versions of objects in a bucket (for ListObjectVersions)
     rpc ListObjectVersionsMeta(ListObjectVersionsMetaRequest) returns (ListObjectVersionsMetaResponse);
+
+    // This OSD's Prometheus exposition (disk, SMART, gRPC, WAL, block), so
+    // the gateway can serve it from its /metrics. In the all-in-one binary
+    // the OSDs have no metrics port of their own.
+    rpc GetMetrics(objectio.metadata.GetMetricsRequest) returns (objectio.metadata.GetMetricsResponse);
 }
 
 // Shard identifier
@@ -161,7 +166,11 @@ message HealthCheckResponse {
 }
 
 // Node status
-message GetStatusRequest {}
+message GetStatusRequest {
+    // OSDs the caller currently sees as up. When non-empty, the OSD checks
+    // the objects it owns against it and fills `safety`. Empty = skip.
+    repeated bytes up_nodes = 1;
+}
 
 message GetStatusResponse {
     bytes node_id = 1;
@@ -179,6 +188,38 @@ message GetStatusResponse {
     uint64 cpu_cores = 12;          // Number of CPU cores
     uint64 memory_bytes = 13;       // Total RAM in bytes
     string version = 14;            // ObjectIO version
+    // Per-bucket usage of the objects this OSD is the `usage_owner` of.
+    // ObjectMeta is copied to every OSD in the key's placement and exactly
+    // one of them owns it, so a caller can sum across OSDs without counting
+    // any object more than once.
+    repeated BucketUsage bucket_usage = 15;
+    // Shard availability of the objects this OSD owns (see bucket_usage),
+    // judged against GetStatusRequest.up_nodes. Absent when up_nodes was
+    // empty.
+    ObjectSafety safety = 16;
+}
+
+// Nested counts: every unreadable object is also at risk, every at-risk
+// object is also degraded. Current versions and noncurrent versions both
+// count — both hold data.
+message ObjectSafety {
+    uint64 objects_checked = 1;
+    uint64 objects_degraded = 2;     // some shard is on a node that is not up
+    uint64 objects_at_risk = 3;      // fewer than k+1 shards reachable
+    uint64 objects_unreadable = 4;   // fewer than k shards reachable
+    uint64 bytes_degraded = 5;       // logical bytes of degraded objects
+    uint64 bytes_at_risk = 6;
+    uint64 bytes_unreadable = 7;
+}
+
+message BucketUsage {
+    string bucket = 1;
+    uint64 objects = 2;               // Current, non-delete-marker objects
+    uint64 logical_bytes = 3;         // Sum of their sizes as uploaded
+    uint64 stored_bytes = 4;          // On-disk bytes incl. EC parity, all versions
+    uint64 noncurrent_versions = 5;
+    uint64 noncurrent_bytes = 6;      // Logical bytes of noncurrent versions
+    uint64 last_modified = 7;         // Newest modified_at seen (unix secs)
 }
 
 message DiskStatus {

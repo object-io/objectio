@@ -582,6 +582,9 @@ enum NodeEvidence {
 }
 
 pub struct MetaService {
+    /// Renders this node's Prometheus exposition for `GetMetrics`. Set by
+    /// the binary once its metrics state exists.
+    metrics_renderer: std::sync::OnceLock<Box<dyn Fn() -> String + Send + Sync>>,
     /// Bucket metadata: name -> BucketMeta
     buckets: RwLock<HashMap<String, BucketMeta>>,
     /// Bucket policies: bucket_name -> policy_json
@@ -751,7 +754,6 @@ pub struct DrainProgress {
 #[derive(Debug, Clone, Default)]
 pub struct MetaStats {
     pub bucket_count: u64,
-    pub object_count: u64,
     pub osd_count: u64,
     pub user_count: u64,
 }
@@ -769,18 +771,79 @@ impl MetaService {
         Self::with_ec_config(EcConfig::default())
     }
 
+    /// Install the function `GetMetrics` serves. Later calls are ignored.
+    pub fn set_metrics_renderer(&self, f: Box<dyn Fn() -> String + Send + Sync>) {
+        let _ = self.metrics_renderer.set(f);
+    }
+
+    /// Open multipart uploads as Prometheus gauges. An abandoned upload
+    /// holds its parts' space until someone aborts it, so this reports how
+    /// many there are, how old, and how many bytes they hold.
+    pub fn render_multipart_metrics(&self) -> String {
+        use std::fmt::Write as _;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let uploads = self.multipart_uploads.read();
+        let ages: Vec<u64> = uploads
+            .values()
+            .map(|u| now.saturating_sub(u.initiated))
+            .collect();
+        let bytes: u64 = uploads
+            .values()
+            .flat_map(|u| u.parts.values())
+            .map(|p| p.size)
+            .sum();
+        drop(uploads);
+
+        let mut out = String::new();
+        let mut gauge = |name: &str, help: &str, samples: &[(&str, u64)]| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for (labels, v) in samples {
+                if labels.is_empty() {
+                    let _ = writeln!(out, "{name} {v}");
+                } else {
+                    let _ = writeln!(out, "{name}{{{labels}}} {v}");
+                }
+            }
+        };
+        gauge(
+            "objectio_multipart_uploads_open",
+            "Multipart uploads started and neither completed nor aborted",
+            &[("", ages.len() as u64)],
+        );
+        gauge(
+            "objectio_multipart_upload_oldest_age_seconds",
+            "Age of the oldest open multipart upload",
+            &[("", ages.iter().copied().max().unwrap_or(0))],
+        );
+        let older = |secs: u64| ages.iter().filter(|a| **a > secs).count() as u64;
+        gauge(
+            "objectio_multipart_uploads_older_than",
+            "Open multipart uploads older than the given age",
+            &[
+                ("age=\"1h\"", older(3600)),
+                ("age=\"1d\"", older(86_400)),
+                ("age=\"7d\"", older(604_800)),
+            ],
+        );
+        gauge(
+            "objectio_multipart_upload_parts_bytes",
+            "Bytes held by parts of open multipart uploads",
+            &[("", bytes)],
+        );
+        out
+    }
+
     /// Get statistics for metrics
     pub fn stats(&self) -> MetaStats {
         let bucket_count = self.buckets.read().len() as u64;
-        // Note: Object counts are tracked per-OSD, not in metadata service
-        // This would need to aggregate from OSD health reports in a full implementation
-        let object_count = 0u64;
         let osd_count = self.topology.read().all_nodes().count() as u64;
         let user_count = self.users.read().len() as u64;
 
         MetaStats {
             bucket_count,
-            object_count,
             osd_count,
             user_count,
         }
@@ -800,6 +863,7 @@ impl MetaService {
         };
 
         Self {
+            metrics_renderer: std::sync::OnceLock::new(),
             buckets: RwLock::new(HashMap::new()),
             bucket_policies: RwLock::new(HashMap::new()),
             multipart_uploads: RwLock::new(HashMap::new()),
@@ -2774,6 +2838,18 @@ impl MetaService {
 
 #[tonic::async_trait]
 impl MetadataService for MetaService {
+    async fn get_metrics(
+        &self,
+        _request: Request<objectio_proto::metadata::GetMetricsRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetMetricsResponse>, Status> {
+        Ok(Response::new(
+            objectio_proto::metadata::GetMetricsResponse {
+                text: self.metrics_renderer.get().map(|f| f()).unwrap_or_default(),
+                process_instance: objectio_common::process_metrics::instance_id().to_string(),
+            },
+        ))
+    }
+
     async fn create_bucket(
         &self,
         request: Request<CreateBucketRequest>,

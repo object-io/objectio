@@ -273,6 +273,11 @@ pub struct S3Metrics {
     /// to every OSD, and `/metrics` must stay fast and must not fail because
     /// one disk is slow to answer.
     capacity: RwLock<Vec<NodeCapacity>>,
+    /// Most recent per-bucket / per-tenant usage, refreshed alongside
+    /// capacity. `None` until the first refresh completes.
+    usage: RwLock<Option<crate::usage::UsageReport>>,
+    /// Whether to export `objectio_bucket_*` (one series per bucket).
+    per_bucket_usage: std::sync::atomic::AtomicBool,
 }
 
 /// One OSD's capacity as of the last refresh.
@@ -301,7 +306,37 @@ impl S3Metrics {
             start_time: Instant::now(),
             protection: RwLock::new(None),
             capacity: RwLock::new(Vec::new()),
+            usage: RwLock::new(None),
+            per_bucket_usage: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Replace the usage report. Called by the gateway's refresher.
+    pub fn set_usage(&self, report: crate::usage::UsageReport) {
+        if let Ok(mut guard) = self.usage.write() {
+            *guard = Some(report);
+        }
+    }
+
+    /// Latest usage report, if one has been gathered.
+    #[must_use]
+    pub fn usage(&self) -> Option<crate::usage::UsageReport> {
+        self.usage.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Turn the per-bucket series off for clusters with too many buckets
+    /// for one series each. Tenant and cluster totals are always exported.
+    pub fn set_per_bucket_usage(&self, enabled: bool) {
+        self.per_bucket_usage.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Data shards / total shards of the default protection scheme.
+    #[must_use]
+    pub fn protection_efficiency(&self) -> Option<f64> {
+        self.protection
+            .read()
+            .ok()
+            .and_then(|p| p.as_ref().map(|p| p.efficiency))
     }
 
     /// Set the protection configuration (called once at startup)
@@ -500,6 +535,11 @@ impl S3Metrics {
     pub fn export_prometheus(&self) -> String {
         let mut output = String::with_capacity(8 * 1024);
         self.write_capacity(&mut output);
+        if let Ok(guard) = self.usage.read()
+            && let Some(report) = guard.as_ref()
+        {
+            report.write_prometheus(&mut output, self.per_bucket_usage.load(Ordering::Relaxed));
+        }
 
         // Gateway uptime
         let uptime_secs = self.start_time.elapsed().as_secs();
