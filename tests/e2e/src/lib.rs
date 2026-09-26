@@ -94,9 +94,12 @@ fn aio_binary() -> PathBuf {
 
 /// Pick a free port by binding :0 and releasing it.
 ///
-/// Racy in principle, but aio is started immediately after and takes
-/// `--strict-port`, so a collision fails loudly rather than silently landing
-/// on a different port than the test then talks to.
+/// Racy: between the release and aio binding it, another cluster starting
+/// in parallel — or one of its own internal meta/OSD listeners, which also
+/// take ephemeral ports — can grab it. aio takes `--strict-port`, so that
+/// shows up as aio exiting during startup ("in use and --strict-port set")
+/// rather than landing on a port the test is not talking to, and
+/// [`Cluster::boot`] retries on a fresh port.
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
     let port = l.local_addr().unwrap().port();
@@ -119,13 +122,14 @@ impl Cluster {
         Self::boot(osds, None)
     }
 
-    fn boot(osds: usize, ec: Option<(u8, u8)>) -> Self {
-        let data_dir = tempfile::tempdir().expect("tempdir");
-        let port = free_port();
+    /// How many times a cluster is started before giving up, when aio
+    /// exits during startup. Covers losing the port race in [`free_port`].
+    const START_ATTEMPTS: usize = 5;
 
-        let child = Command::new(aio_binary())
+    fn spawn(data_dir: &std::path::Path, port: u16, osds: usize, ec: Option<(u8, u8)>) -> Child {
+        Command::new(aio_binary())
             .arg("--data")
-            .arg(data_dir.path())
+            .arg(data_dir)
             .arg("--port")
             .arg(port.to_string())
             .arg("--listen-addr")
@@ -149,27 +153,51 @@ impl Cluster {
             .stdout(Self::log_target())
             .stderr(Self::log_target())
             .spawn()
-            .expect("spawn objectio-aio");
+            .expect("spawn objectio-aio")
+    }
 
-        // Credentials come from the file meta writes, not from scraping the
-        // log. The banner is interleaved with tracing output and its format is
-        // presentational; admin-creds.env is a contract.
-        let creds_path = data_dir.path().join("meta").join("admin-creds.env");
-        let (access_key, secret_key) = Self::await_credentials(&creds_path);
+    fn boot(osds: usize, ec: Option<(u8, u8)>) -> Self {
+        let mut last = String::new();
+        for _ in 0..Self::START_ATTEMPTS {
+            // A fresh port and data directory each attempt: a half-started
+            // cluster may have written state for the port it lost.
+            let data_dir = tempfile::tempdir().expect("tempdir");
+            let port = free_port();
+            let mut child = Self::spawn(data_dir.path(), port, osds, ec);
 
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let mut cluster = Self {
-            child,
-            endpoint,
-            access_key,
-            secret_key,
-            data_dir,
-            port,
-            osds,
-            ec,
-        };
-        cluster.wait_healthy();
-        cluster
+            // Credentials come from the file meta writes, not from scraping
+            // the log. The banner is interleaved with tracing output and its
+            // format is presentational; admin-creds.env is a contract.
+            let creds_path = data_dir.path().join("meta").join("admin-creds.env");
+            let (access_key, secret_key) = match Self::await_credentials(&creds_path, &mut child) {
+                Ok(c) => c,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let mut cluster = Self {
+                child,
+                endpoint,
+                access_key,
+                secret_key,
+                data_dir,
+                port,
+                osds,
+                ec,
+            };
+            match cluster.wait_healthy() {
+                Ok(()) => return cluster,
+                Err(e) => last = e,
+            }
+        }
+        panic!(
+            "objectio-aio did not start in {} attempts; last: {last}; \
+             set OBJECTIO_E2E_LOGS=1 to see why",
+            Self::START_ATTEMPTS
+        );
     }
 
     /// Stop the cluster and start it again on the same data directory and
@@ -192,31 +220,22 @@ impl Cluster {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
-        self.child = Command::new(aio_binary())
-            .arg("--data")
-            .arg(self.data_dir.path())
-            .arg("--port")
-            .arg(self.port.to_string())
-            .arg("--listen-addr")
-            .arg("127.0.0.1")
-            .arg("--strict-port")
-            .arg("--osds")
-            .arg(self.osds.to_string())
-            .args(self.ec.map_or_else(Vec::new, |(k, m)| {
-                vec![
-                    "--ec-k".to_string(),
-                    k.to_string(),
-                    "--ec-m".to_string(),
-                    m.to_string(),
-                ]
-            }))
-            .arg("--auth")
-            .stdout(Self::log_target())
-            .stderr(Self::log_target())
-            .spawn()
-            .expect("respawn objectio-aio");
-
-        self.wait_healthy();
+        // A restart keeps its port and data — that is what is being tested
+        // — so on losing the port, wait for it and try the same one again.
+        let mut last = String::new();
+        for _ in 0..Self::START_ATTEMPTS {
+            self.child = Self::spawn(self.data_dir.path(), self.port, self.osds, self.ec);
+            match self.wait_healthy() {
+                Ok(()) => return,
+                Err(e) => last = e,
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        panic!(
+            "objectio-aio did not restart in {} attempts; last: {last}; \
+             set OBJECTIO_E2E_LOGS=1 to see why",
+            Self::START_ATTEMPTS
+        );
     }
 
     fn log_target() -> Stdio {
@@ -230,9 +249,15 @@ impl Cluster {
     /// Poll for `admin-creds.env` and parse the two keys out of it.
     ///
     /// Meta writes it on first boot as `export KEY=VALUE` lines.
-    fn await_credentials(path: &std::path::Path) -> (String, String) {
+    fn await_credentials(
+        path: &std::path::Path,
+        child: &mut Child,
+    ) -> Result<(String, String), String> {
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(format!("objectio-aio exited during startup with {status}"));
+            }
             if let Ok(text) = std::fs::read_to_string(path) {
                 let mut access = String::new();
                 let mut secret = String::new();
@@ -245,15 +270,17 @@ impl Cluster {
                     }
                 }
                 if !access.is_empty() && !secret.is_empty() {
-                    return (access, secret);
+                    return Ok((access, secret));
                 }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        panic!(
-            "admin credentials never appeared at {} — run with OBJECTIO_E2E_LOGS=1 to see why",
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(format!(
+            "admin credentials never appeared at {}",
             path.display()
-        );
+        ))
     }
 
     /// Wait until the *gateway* is serving on this port.
@@ -265,20 +292,17 @@ impl Cluster {
     /// bare 404 — which reads like a missing route rather than the wrong
     /// server. Probe an admin route as well: unauthenticated it answers 401,
     /// and only the gateway has it at all.
-    fn wait_healthy(&mut self) {
+    fn wait_healthy(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(90);
         let client = reqwest::blocking::Client::new();
         let mut last = String::from("no response");
         while Instant::now() < deadline {
             // A child that has already exited will never become healthy.
             if let Ok(Some(status)) = self.child.try_wait() {
-                panic!(
-                    "objectio-aio exited during startup with {status}; \
-                        set OBJECTIO_E2E_LOGS=1 to see why"
-                );
+                return Err(format!("objectio-aio exited during startup with {status}"));
             }
             match client.get(format!("{}/_admin/nodes", self.endpoint)).send() {
-                Ok(r) if r.status() == 401 => return,
+                Ok(r) if r.status() == 401 => return self.wait_osds_online(deadline),
                 Ok(r) => {
                     last = format!(
                         "{} answered /_admin/nodes with {}",
@@ -290,7 +314,40 @@ impl Cluster {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        panic!("the gateway did not come up within 90s — {last}");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Err(format!("the gateway did not come up within 90s — {last}"))
+    }
+
+    /// Wait until the gateway can reach every OSD this cluster runs.
+    ///
+    /// The gateway answers before its OSDs are registered and reachable, so
+    /// on a loaded machine the first erasure-coded PUT could find no OSD at
+    /// all ("Write quorum not met … 0 successful writes"). A client would
+    /// see the same, but a test that is about something else should not.
+    fn wait_osds_online(&mut self, deadline: Instant) -> Result<(), String> {
+        let mut last = String::from("no answer");
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!("objectio-aio exited during startup with {status}"));
+            }
+            let r = self.request("GET", "/_admin/nodes", &[]);
+            if r.status == 200 {
+                let online = r.json()["nodes"]
+                    .as_array()
+                    .map_or(0, |n| n.iter().filter(|n| n["online"] == true).count());
+                if online >= self.osds {
+                    return Ok(());
+                }
+                last = format!("{online} of {} OSDs online", self.osds);
+            } else {
+                last = format!("/_admin/nodes answered {}", r.status);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Err(format!("OSDs did not come online within 90s — {last}"))
     }
 
     /// Build a presigned URL: `SigV4` credentials in the query string, no
