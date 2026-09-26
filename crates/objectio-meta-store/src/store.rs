@@ -695,11 +695,6 @@ impl MetaStore {
 
         let bucket_prefix = format!("{bucket}\0");
         let full_prefix = format!("{bucket_prefix}{prefix}");
-        let start_exclusive = if start_after.is_empty() {
-            None
-        } else {
-            Some(format!("{bucket_prefix}{start_after}"))
-        };
 
         // Range: [full_prefix, bucket\0\xff) — iterate forward, stop on
         // either max_keys or when the key no longer starts with
@@ -715,19 +710,21 @@ impl MetaStore {
             if !k_str.starts_with(&full_prefix) {
                 break;
             }
-            if let Some(ref after) = start_exclusive
-                && k_str.as_str() <= after.as_str()
-            {
+            // Entries are `{bucket}\0{key}\0{version}`. Compare the object
+            // key alone: against the whole entry, `c\0…` sorts after `c`
+            // and a listing that should start after `c` returned `c`.
+            let key = listing_object_key(&k_str[bucket_prefix.len()..]);
+            if !start_after.is_empty() && key <= start_after {
                 continue;
             }
             if results.len() >= max_keys {
                 is_truncated = true;
-                // Strip the bucket prefix from the token for caller
-                // convenience — they pass it back as start_after which
-                // is in bucket-relative form.
+                // The object key of the last entry returned: callers hand
+                // it back as start_after, and it goes out in XML, which
+                // cannot carry the entry's NUL separators.
                 next_token = results
                     .last()
-                    .map(|(k, _)| k[bucket_prefix.len()..].to_string())
+                    .map(|(k, _)| listing_object_key(&k[bucket_prefix.len()..]).to_string())
                     .unwrap_or_default();
                 break;
             }
@@ -1520,4 +1517,10 @@ impl MetaStore {
         }
         result
     }
+}
+
+/// The object key of an OBJECT_LISTINGS entry with its bucket prefix
+/// already removed: `{key}\0{version}` → `{key}`.
+fn listing_object_key(entry: &str) -> &str {
+    entry.split('\0').next().unwrap_or(entry)
 }
