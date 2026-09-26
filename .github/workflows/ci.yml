@@ -17,9 +17,17 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # No run on push to main. The main ruleset requires these checks with
+  # "branches must be up to date before merging", so a PR is tested on
+  # exactly the tree that lands; testing the merge commit again only
+  # repeated work already done.
   pull_request:
+  # Nightly on main instead: GitHub Actions caches saved on main are the
+  # ones every PR can restore, so this keeps the Rust and Docker caches
+  # warm for new PRs, and catches anything that breaks without a code
+  # change (toolchain, base images, dependencies).
+  schedule:
+    - cron: "17 2 * * *"
   workflow_dispatch:
 
 concurrency:
