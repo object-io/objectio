@@ -299,12 +299,17 @@ impl Crush2 {
 
         // Group nodes by domain
         let domain_nodes = self.group_nodes_by_domain(FailureDomain::Rack);
+        let all_nodes: Vec<&NodeInfo> = self.topology.active_nodes().collect();
 
         // Step 2 & 3: Apply template with HRW hashing per domain
         let mut placements = Vec::with_capacity(template.total_shards() as usize);
 
-        // Track used nodes per domain to avoid duplicates
-        let mut used_nodes: HashMap<u8, Vec<NodeId>> = HashMap::new();
+        // Nodes already holding a shard of this stripe. Tracked across the
+        // whole stripe, not per domain slot: with fewer racks than slots
+        // (one rack is the common case) several slots map to the same rack,
+        // and per-slot tracking let every shard land on the same OSD — a
+        // 4+2 object that one disk failure destroys.
+        let mut used: Vec<NodeId> = Vec::with_capacity(template.shards.len());
 
         for shard in &template.shards {
             // Get the domain for this shard
@@ -318,9 +323,15 @@ impl Crush2 {
             // Get nodes in this domain
             let nodes = domain_nodes.get(&domain_key).cloned().unwrap_or_default();
 
-            // HRW selection: exclude already used nodes in this domain
-            let used = used_nodes.entry(shard.domain_slot).or_default();
-            let (node_id, score) = self.hrw_select(object_id, &nodes, used);
+            // Prefer an unused node in the shard's own domain, then an
+            // unused node anywhere (relaxing the domain beats doubling up on
+            // a disk), and only when every node already holds a shard —
+            // fewer OSDs than shards — reuse the least-loaded one.
+            let (node_id, score) = self
+                .hrw_pick(object_id, &nodes, &used)
+                .or_else(|| self.hrw_pick(object_id, &all_nodes, &used))
+                .or_else(|| self.least_used(object_id, &all_nodes, &used))
+                .unwrap_or_else(|| self.placeholder(object_id));
 
             used.push(node_id);
 
@@ -336,50 +347,57 @@ impl Crush2 {
         placements
     }
 
-    /// HRW (Highest Random Weight) / Rendezvous hashing
+    /// HRW score: `hash(object_id || node_id) * weight`.
+    fn hrw_score(&self, object_id: &ObjectId, node: &NodeInfo) -> u64 {
+        let node_hash = xxhash_rust::xxh64::xxh64(node.id.as_bytes(), self.hash_object(object_id));
+        // Apply weight (multiply by weight * 1000 for precision)
+        let weight_factor = (node.weight * 1000.0) as u64;
+        node_hash.wrapping_mul(weight_factor)
+    }
+
+    /// HRW (Highest Random Weight) / Rendezvous hashing: the highest-scoring
+    /// node not in `exclude`, or `None` when every node is excluded.
     ///
-    /// `score(node) = hash(object_id, node_id) * weight`
-    /// Pick the node with highest score, excluding already used nodes
-    fn hrw_select(
+    /// This used to fall back to `nodes[0]` when everything was excluded,
+    /// silently placing a second shard on a node that already had one.
+    fn hrw_pick(
         &self,
         object_id: &ObjectId,
         nodes: &[&NodeInfo],
         exclude: &[NodeId],
-    ) -> (NodeId, u64) {
-        if nodes.is_empty() {
-            // Fallback: generate deterministic placeholder
-            let hash = self.hash_object(object_id);
-            let mut bytes = [0u8; 16];
-            bytes[..8].copy_from_slice(&hash.to_le_bytes());
-            return (NodeId::from_bytes(bytes), 0);
-        }
+    ) -> Option<(NodeId, u64)> {
+        nodes
+            .iter()
+            .filter(|n| !exclude.contains(&n.id))
+            .map(|n| (n.id, self.hrw_score(object_id, n)))
+            .max_by_key(|(_, score)| *score)
+    }
 
-        let object_hash = self.hash_object(object_id);
+    /// When every node already holds a shard: the node holding the fewest,
+    /// ties broken by HRW score so the choice stays deterministic.
+    fn least_used(
+        &self,
+        object_id: &ObjectId,
+        nodes: &[&NodeInfo],
+        used: &[NodeId],
+    ) -> Option<(NodeId, u64)> {
+        nodes
+            .iter()
+            .map(|n| {
+                let count = used.iter().filter(|u| **u == n.id).count();
+                let score = self.hrw_score(object_id, n);
+                (n.id, score, count)
+            })
+            .min_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)))
+            .map(|(id, score, _)| (id, score))
+    }
 
-        // Calculate HRW score for each node
-        let mut best_node = nodes[0];
-        let mut best_score: u64 = 0;
-
-        for node in nodes {
-            // Skip excluded nodes
-            if exclude.contains(&node.id) {
-                continue;
-            }
-
-            // HRW score: hash(object_id || node_id) * weight
-            let node_hash = xxhash_rust::xxh64::xxh64(node.id.as_bytes(), object_hash);
-
-            // Apply weight (multiply by weight * 1000 for precision)
-            let weight_factor = (node.weight * 1000.0) as u64;
-            let score = node_hash.wrapping_mul(weight_factor);
-
-            if score > best_score {
-                best_score = score;
-                best_node = node;
-            }
-        }
-
-        (best_node.id, best_score)
+    /// No nodes at all: a deterministic placeholder, as before.
+    fn placeholder(&self, object_id: &ObjectId) -> (NodeId, u64) {
+        let hash = self.hash_object(object_id);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&hash.to_le_bytes());
+        (NodeId::from_bytes(bytes), 0)
     }
 
     /// Select multiple nodes using HRW (for simple replication/MDS)
@@ -554,6 +572,73 @@ mod tests {
         }
 
         topology
+    }
+
+    fn single_rack_topology(nodes: usize) -> ClusterTopology {
+        let mut topology = ClusterTopology::new();
+        for n in 0..nodes {
+            topology.upsert_node(NodeInfo {
+                id: NodeId::new(),
+                name: format!("node-{n}"),
+                address: format!("10.0.0.{n}:9002").parse().unwrap(),
+                failure_domain: FailureDomainInfo::new("us-east", "dc1", "rack0"),
+                status: NodeStatus::Active,
+                disks: vec![],
+                weight: 1.0,
+                last_heartbeat: 0,
+            });
+        }
+        topology
+    }
+
+    fn distinct_nodes(p: &[HrwPlacement]) -> usize {
+        p.iter()
+            .map(|x| x.node_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// One rack, six OSDs, 4+2: every shard of a stripe must be on a
+    /// different OSD. This placed all six on one OSD before, so losing that
+    /// disk lost the object.
+    #[test]
+    fn single_rack_spreads_a_stripe_over_distinct_osds() {
+        let crush = Crush2::new(single_rack_topology(6), 16);
+        let template = PlacementTemplate::mds(4, 2);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template);
+            assert_eq!(p.len(), 6);
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
+        }
+    }
+
+    /// Fewer OSDs than shards: reuse is unavoidable, but it must be even —
+    /// three OSDs take two shards each, not six on one.
+    #[test]
+    fn fewer_osds_than_shards_spreads_evenly() {
+        let crush = Crush2::new(single_rack_topology(3), 16);
+        let template = PlacementTemplate::mds(4, 2);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template);
+            let mut counts: HashMap<NodeId, usize> = HashMap::new();
+            for x in &p {
+                *counts.entry(x.node_id).or_default() += 1;
+            }
+            assert_eq!(counts.len(), 3, "{p:?}");
+            assert!(counts.values().all(|c| *c == 2), "{counts:?}");
+        }
+    }
+
+    /// The multi-rack layout the existing tests use keeps working: still
+    /// distinct OSDs.
+    #[test]
+    fn multi_rack_placement_stays_distinct() {
+        let crush = Crush2::new(create_test_topology(), 16);
+        let template = PlacementTemplate::mds(4, 2);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template);
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
+        }
     }
 
     #[test]
