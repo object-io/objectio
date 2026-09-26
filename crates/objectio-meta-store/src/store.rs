@@ -108,7 +108,7 @@ impl MetaStore {
             let _t = write_txn.open_table(tables::BUCKET_ENCRYPTION_CONFIGS)?;
             let _t = write_txn.open_table(tables::KMS_KEYS)?;
         }
-        write_txn.commit()?;
+        crate::commit_metrics::commit(write_txn)?;
 
         Ok(Self { db: Arc::new(db) })
     }
@@ -153,7 +153,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::BUCKET_POLICIES)?;
                 table.insert(bucket, policy_json.as_bytes())?;
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
             Ok(())
         })() {
             error!("Failed to persist bucket policy '{}': {}", bucket, e);
@@ -253,7 +253,7 @@ impl MetaStore {
                 let mut t2 = write_txn.open_table(tables::CLUSTER_TOPOLOGY)?;
                 t2.insert("topology", topo_bytes.as_slice())?;
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
             Ok(())
         })() {
             error!("Failed to persist OSD + topology '{}': {}", node_id_hex, e);
@@ -327,7 +327,7 @@ impl MetaStore {
                 let mut t2 = write_txn.open_table(tables::ACCESS_KEYS)?;
                 t2.insert(key.access_key_id.as_str(), key_bytes.as_slice())?;
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
             Ok(())
         })() {
             error!("Failed to persist admin user+key '{}': {}", user.user_id, e);
@@ -520,7 +520,7 @@ impl MetaStore {
             }
         };
         if swapped {
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
         }
         Ok(swapped)
     }
@@ -563,7 +563,7 @@ impl MetaStore {
                 table.insert(key.as_str(), new.as_slice())?;
             }
         }
-        write_txn.commit()?;
+        crate::commit_metrics::commit(write_txn)?;
         Ok(failed)
     }
 
@@ -845,7 +845,7 @@ impl MetaStore {
             let mut table = write_txn.open_table(table_def)?;
             table.insert(key, value)?;
         }
-        write_txn.commit()?;
+        crate::commit_metrics::commit(write_txn)?;
         Ok(())
     }
 
@@ -869,7 +869,7 @@ impl MetaStore {
             let mut table = write_txn.open_table(table_def)?;
             table.remove(key)?;
         }
-        write_txn.commit()?;
+        crate::commit_metrics::commit(write_txn)?;
         Ok(())
     }
 
@@ -920,7 +920,7 @@ impl MetaStore {
                     table.remove(key.as_str())?;
                 }
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
         }
         Ok(())
     }
@@ -1106,7 +1106,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::POLICY_ATTACHMENTS)?;
                 table.insert(key, policies.as_bytes())?;
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
             Ok(())
         })() {
             error!("Failed to persist policy attachment '{}': {}", key, e);
@@ -1120,7 +1120,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::POLICY_ATTACHMENTS)?;
                 table.remove(key)?;
             }
-            write_txn.commit()?;
+            crate::commit_metrics::commit(write_txn)?;
             Ok(())
         })() {
             error!("Failed to delete policy attachment '{}': {}", key, e);

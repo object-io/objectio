@@ -5,6 +5,7 @@
 
 pub mod discovery;
 pub mod service;
+mod usage;
 
 use anyhow::Result;
 use axum::{
@@ -483,6 +484,17 @@ pub async fn run(
         disk_devices: disk_devices.clone(),
     });
 
+    // Let the gateway pull the same exposition over gRPC. Weak, because
+    // the metrics state holds the service and this closure lives on it.
+    {
+        let weak = Arc::downgrade(&metrics_state);
+        osd_service.set_metrics_renderer(Box::new(move || {
+            weak.upgrade()
+                .map(|s| render_metrics(&s))
+                .unwrap_or_default()
+        }));
+    }
+
     // Start metrics server
     let metrics_port = args.metrics_port;
     let metrics_state_clone = metrics_state.clone();
@@ -573,7 +585,7 @@ async fn register_with_meta(
         .map_err(|e| format!("Failed to connect to metadata service: {}", e))?;
 
     // Call RegisterOsd RPC with failure domain + per-disk capacity (latter
-    // feeds meta's license-cap enforcement).
+    // feeds meta's cluster capacity accounting).
     let response = client
         .register_osd(RegisterOsdRequest {
             node_id: node_id.to_vec(),
@@ -638,6 +650,23 @@ struct OsdMetricsState {
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<OsdMetricsState>>,
 ) -> impl IntoResponse {
+    // SMART polling may shell out to smartctl.
+    let output = tokio::task::spawn_blocking(move || render_metrics(&state))
+        .await
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        output,
+    )
+}
+
+/// This OSD's full Prometheus exposition. Served on the OSD's own metrics
+/// port and, through `StorageService.GetMetrics`, from the gateway's.
+fn render_metrics(state: &OsdMetricsState) -> String {
     let mut output = String::with_capacity(16 * 1024);
 
     // OSD info
@@ -747,6 +776,76 @@ async fn metrics_handler(
         .unwrap();
     }
 
+    // Disk IO since the OSD started, as counted by the storage engine.
+    type DiskField = fn(&service::DiskStatusInfo) -> u64;
+    let io_families: [(&str, &str, &str, DiskField); 5] = [
+        (
+            "objectio_disk_available_bytes",
+            "gauge",
+            "Free bytes on the disk",
+            |d| d.capacity.saturating_sub(d.used),
+        ),
+        ("objectio_disk_reads_total", "counter", "Shard reads", |d| {
+            d.reads
+        }),
+        (
+            "objectio_disk_writes_total",
+            "counter",
+            "Shard writes",
+            |d| d.writes,
+        ),
+        (
+            "objectio_disk_read_bytes_total",
+            "counter",
+            "Bytes read",
+            |d| d.bytes_read,
+        ),
+        (
+            "objectio_disk_written_bytes_total",
+            "counter",
+            "Bytes written",
+            |d| d.bytes_written,
+        ),
+    ];
+    for (name, kind, help, f) in io_families {
+        writeln!(output, "# HELP {name} {help}").unwrap();
+        writeln!(output, "# TYPE {name} {kind}").unwrap();
+        for disk in &status.disks {
+            writeln!(
+                output,
+                "{name}{{osd_id=\"{}\",disk=\"{}\"}} {}",
+                state.osd_id,
+                disk.path,
+                f(disk)
+            )
+            .unwrap();
+        }
+    }
+    writeln!(
+        output,
+        "# HELP objectio_disk_errors_total IO errors and checksum mismatches"
+    )
+    .unwrap();
+    writeln!(output, "# TYPE objectio_disk_errors_total counter").unwrap();
+    for disk in &status.disks {
+        for (kind, v) in [
+            ("read", disk.read_errors),
+            ("write", disk.write_errors),
+            ("checksum", disk.checksum_errors),
+        ] {
+            writeln!(
+                output,
+                "objectio_disk_errors_total{{osd_id=\"{}\",disk=\"{}\",type=\"{kind}\"}} {v}",
+                state.osd_id, disk.path
+            )
+            .unwrap();
+        }
+    }
+
+    state
+        .osd_service
+        .render_wal_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
+
     // Export block metrics if available
     output.push_str(&state.exporter.export(&state.collector));
 
@@ -762,14 +861,11 @@ async fn metrics_handler(
     state.smart_monitor.check_if_needed(&state.disk_devices);
     output.push_str(&state.smart_monitor.export_prometheus());
 
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )],
-        output,
-    )
+    output.push_str(&objectio_common::process_metrics::render(&format!(
+        "osd_id=\"{}\"",
+        state.osd_id
+    )));
+    output
 }
 
 /// Health check handler

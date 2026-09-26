@@ -1271,8 +1271,36 @@ pub enum AuthError {
     InternalError,
 }
 
+impl AuthError {
+    /// Bounded reason for `objectio_auth_failures_total`.
+    fn metric_reason(&self) -> &'static str {
+        match self {
+            AuthError::AccessDenied(msg) => {
+                let m = msg.to_ascii_lowercase();
+                if m.contains("not found") {
+                    "unknown_key"
+                } else if m.contains("expired") || m.contains("session token") {
+                    "expired"
+                } else if m.contains("missing") {
+                    "missing_credentials"
+                } else if m.contains("invalid") || m.contains("format") {
+                    "malformed"
+                } else {
+                    "denied"
+                }
+            }
+            AuthError::SignatureDoesNotMatch => "signature",
+            AuthError::RequestTimeTooSkewed => "clock_skew",
+            AuthError::ExpiredToken(_) => "expired",
+            AuthError::InternalError => "internal",
+        }
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        // Every refusal from the auth layers ends up here.
+        crate::gateway_metrics::record_auth_failure(self.metric_reason());
         let (status, error_code, message) = match self {
             AuthError::AccessDenied(msg) => (StatusCode::FORBIDDEN, "AccessDenied", msg),
             AuthError::SignatureDoesNotMatch => (
@@ -1311,6 +1339,7 @@ impl IntoResponse for AuthError {
         Response::builder()
             .status(status)
             .header("Content-Type", "application/xml")
+            .extension(crate::gateway_metrics::S3ErrorCode(error_code.to_string()))
             .body(Body::from(xml))
             .unwrap_or_else(|_| {
                 Response::builder()

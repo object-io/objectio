@@ -119,7 +119,28 @@ impl WalRecord {
 }
 
 /// Metadata Write-Ahead Log
+/// What group commit is buying: records per fsync is `records / syncs`.
+pub struct WalSyncStats {
+    pub seconds: objectio_common::histogram::Histogram,
+    pub syncs: AtomicU64,
+    pub records: AtomicU64,
+}
+
+impl Default for WalSyncStats {
+    fn default() -> Self {
+        Self {
+            seconds: objectio_common::histogram::Histogram::new(
+                objectio_common::histogram::LATENCY_BUCKETS,
+            ),
+            syncs: AtomicU64::new(0),
+            records: AtomicU64::new(0),
+        }
+    }
+}
+
 pub struct MetadataWal {
+    /// fsync latency and how many records each fsync covered.
+    sync_stats: WalSyncStats,
     /// WAL file path
     path: PathBuf,
     /// File handle for writing
@@ -169,6 +190,7 @@ impl MetadataWal {
             config,
             written_lsn: AtomicU64::new(0),
             synced_lsn: AtomicU64::new(0),
+            sync_stats: WalSyncStats::default(),
             sync_lock: Mutex::new(()),
             sync_handle,
         })
@@ -201,6 +223,7 @@ impl MetadataWal {
             // Everything already on disk is durable by definition.
             written_lsn: AtomicU64::new(last_lsn),
             synced_lsn: AtomicU64::new(last_lsn),
+            sync_stats: WalSyncStats::default(),
             sync_lock: Mutex::new(()),
             sync_handle,
         })
@@ -330,10 +353,16 @@ impl MetadataWal {
         }
 
         let covered = self.written_lsn.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
         self.sync_handle
             .sync_data()
             .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))?;
-        self.synced_lsn.fetch_max(covered, Ordering::SeqCst);
+        self.sync_stats.seconds.observe_duration(started.elapsed());
+        let previous = self.synced_lsn.fetch_max(covered, Ordering::SeqCst);
+        self.sync_stats.syncs.fetch_add(1, Ordering::Relaxed);
+        self.sync_stats
+            .records
+            .fetch_add(covered.saturating_sub(previous), Ordering::Relaxed);
 
         Ok(())
     }
@@ -346,6 +375,11 @@ impl MetadataWal {
 
         let batch_op = MetadataOp::Batch { ops: ops.to_vec() };
         self.append(&batch_op)
+    }
+
+    /// fsync statistics for metrics.
+    pub fn sync_stats(&self) -> &WalSyncStats {
+        &self.sync_stats
     }
 
     /// Sync WAL to disk

@@ -636,13 +636,6 @@ async fn main() -> Result<()> {
         }
         format!("http://{host}:{gateway_port}")
     };
-    // aio is a single-process dev binary — every Enterprise feature should
-    // just work without obtaining a signed license. The gateway picks up
-    // this env var inside `load_initial_license` and runs as Developer.
-    if std::env::var_os("OBJECTIO_DEV_NO_LICENSE").is_none() {
-        // SAFETY: we set this before spawning any threads that read env vars.
-        unsafe { std::env::set_var("OBJECTIO_DEV_NO_LICENSE", "1") };
-    }
     let mut gw_argv: Vec<String> = vec![
         "objectio-gateway".into(),
         "--listen".into(),

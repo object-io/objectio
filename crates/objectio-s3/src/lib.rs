@@ -6,6 +6,8 @@ pub mod auth;
 pub mod error;
 pub mod handlers;
 pub mod metrics;
+pub mod metrics_merge;
+pub mod usage;
 pub mod xml;
 
 // Re-exports

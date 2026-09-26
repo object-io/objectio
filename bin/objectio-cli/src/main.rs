@@ -2,7 +2,7 @@
 //!
 //! This binary provides administrative commands for ObjectIO.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use objectio_proto::block::{
     CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest,
@@ -12,12 +12,12 @@ use objectio_proto::block::{
 use objectio_proto::metadata::{
     AddUserToGroupRequest, AttachPolicyRequest, CreateAccessKeyRequest, CreateGroupRequest,
     CreatePolicyRequest, CreateTenantRequest, CreateUserRequest, DeleteAccessKeyRequest,
-    DeleteConfigRequest, DeleteGroupRequest, DeletePolicyRequest, DeleteTenantRequest,
-    DeleteUserRequest, DetachPolicyRequest, GetBucketRequest, GetConfigRequest, GetPolicyRequest,
-    GetTenantRequest, GetUserGroupsRequest, ListAccessKeysRequest, ListAttachedPoliciesRequest,
-    ListBucketsRequest, ListGroupsRequest, ListPoliciesRequest, ListTenantsRequest,
-    ListUsersRequest, RemoveUserFromGroupRequest, SetBucketOwnerRequest, SetConfigRequest,
-    TenantConfig, UpdateTenantRequest, metadata_service_client::MetadataServiceClient,
+    DeleteGroupRequest, DeletePolicyRequest, DeleteTenantRequest, DeleteUserRequest,
+    DetachPolicyRequest, GetBucketRequest, GetPolicyRequest, GetTenantRequest,
+    GetUserGroupsRequest, ListAccessKeysRequest, ListAttachedPoliciesRequest, ListBucketsRequest,
+    ListGroupsRequest, ListPoliciesRequest, ListTenantsRequest, ListUsersRequest,
+    RemoveUserFromGroupRequest, SetBucketOwnerRequest, TenantConfig, UpdateTenantRequest,
+    metadata_service_client::MetadataServiceClient,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -95,11 +95,6 @@ enum Commands {
         #[command(subcommand)]
         action: TenantCommands,
     },
-    /// License operations (Enterprise tier)
-    License {
-        #[command(subcommand)]
-        action: LicenseCommands,
-    },
     /// Cluster topology inspection (region/zone/dc/rack/host hierarchy)
     Topology {
         #[command(subcommand)]
@@ -118,27 +113,6 @@ enum TopologyCommands {
         /// Pool name to validate
         pool: String,
     },
-}
-
-#[derive(Subcommand, Debug)]
-enum LicenseCommands {
-    /// Show the currently installed license (from meta `license/active`)
-    Show,
-    /// Install a signed license file. Verifies locally first, then writes
-    /// to meta config. Gateway picks up via hot-reload on next restart —
-    /// use `PUT /_admin/license` via console for live activation.
-    Install {
-        /// Path to the license JSON file
-        file: std::path::PathBuf,
-    },
-    /// Verify a license file offline, using the baked-in public key.
-    Verify {
-        /// Path to the license JSON file
-        file: std::path::PathBuf,
-    },
-    /// Remove the installed license; cluster reverts to Community on next
-    /// gateway restart (or immediately if you DELETE /_admin/license).
-    Remove,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1611,115 +1585,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 },
-            }
-        }
-        Commands::License { action } => {
-            let mut client = MetadataServiceClient::connect(args.endpoint.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect to metadata service: {}", e))?;
-
-            match action {
-                LicenseCommands::Show => {
-                    let resp = client
-                        .get_config(GetConfigRequest {
-                            key: "license/active".to_string(),
-                        })
-                        .await?
-                        .into_inner();
-                    if !resp.found || resp.entry.is_none() {
-                        println!("No license installed — cluster is running on Community tier.");
-                        return Ok(());
-                    }
-                    let bytes = resp.entry.unwrap().value;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    match objectio_license::License::load_from_bytes(&bytes, now) {
-                        Ok(l) => {
-                            println!("License: {}", l.tier);
-                            println!("  Licensee:   {}", l.licensee);
-                            println!("  Issued at:  {}", l.issued_at);
-                            println!(
-                                "  Expires at: {}",
-                                if l.expires_at == 0 {
-                                    "never".to_string()
-                                } else {
-                                    l.expires_at.to_string()
-                                }
-                            );
-                            if !l.features.is_empty() {
-                                println!("  Features:   {}", l.features.join(", "));
-                            } else if l.is_enterprise() {
-                                println!("  Features:   (all Enterprise features)");
-                            }
-                        }
-                        Err(e) => {
-                            println!("Stored license FAILED verification: {e}");
-                            println!("Cluster is effectively running on Community tier.");
-                        }
-                    }
-                }
-                LicenseCommands::Install { file } => {
-                    let bytes = std::fs::read(&file)
-                        .with_context(|| format!("reading {}", file.display()))?;
-                    // Local verify first so we fail fast on tampered files.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let license = objectio_license::License::load_from_bytes(&bytes, now)
-                        .map_err(|e| anyhow::anyhow!("license rejected: {e}"))?;
-                    client
-                        .set_config(SetConfigRequest {
-                            key: "license/active".to_string(),
-                            value: bytes,
-                            updated_by: "objectio-cli".to_string(),
-                        })
-                        .await?;
-                    println!(
-                        "License installed for '{}' (tier: {})",
-                        license.licensee, license.tier
-                    );
-                    println!(
-                        "Restart the gateway or PUT /_admin/license via console to activate \
-                         without waiting for restart."
-                    );
-                }
-                LicenseCommands::Verify { file } => {
-                    let bytes = std::fs::read(&file)
-                        .with_context(|| format!("reading {}", file.display()))?;
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    match objectio_license::License::load_from_bytes(&bytes, now) {
-                        Ok(l) => {
-                            println!("License VALID");
-                            println!("  Tier:       {}", l.tier);
-                            println!("  Licensee:   {}", l.licensee);
-                            println!(
-                                "  Expires at: {}",
-                                if l.expires_at == 0 {
-                                    "never".to_string()
-                                } else {
-                                    l.expires_at.to_string()
-                                }
-                            );
-                        }
-                        Err(e) => {
-                            anyhow::bail!("license INVALID: {e}");
-                        }
-                    }
-                }
-                LicenseCommands::Remove => {
-                    let _ = client
-                        .delete_config(DeleteConfigRequest {
-                            key: "license/active".to_string(),
-                        })
-                        .await?;
-                    println!("License removed from meta. Gateway will revert on next restart.");
-                }
             }
         }
         Commands::Topology { action } => {

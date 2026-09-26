@@ -7,13 +7,14 @@ pub mod admin;
 pub mod auth_middleware;
 pub mod authz;
 pub mod chunked_decode;
+pub mod cluster_poll;
 pub mod console_auth;
+pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;
 pub mod host_provider;
 pub mod iceberg_auth;
 pub mod kms;
-pub mod license_gate;
 pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
@@ -42,173 +43,97 @@ use objectio_s3::{ProtectionConfig, s3_metrics};
 use osd_pool::OsdPool;
 use s3::AppState;
 use scatter_gather::ScatterGatherEngine;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-/// Resolve the initial license at startup.
-///
-/// Order of precedence:
-/// 1. explicit `--license` flag path
-/// 2. `OBJECTIO_LICENSE` env var — either a path or inline JSON
-/// 3. meta config at `license/active` (what the console writes)
-///
-/// Any failure (missing file, bad signature, expired) logs a warning and
-/// degrades to Community tier. Startup never hard-fails on the license.
-async fn load_initial_license(
-    cli_path: Option<&str>,
-    meta_client: MetadataServiceClient<tonic::transport::Channel>,
-) -> objectio_license::License {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 0. Dev-mode escape hatch — `objectio-aio` and integration tests
-    //    set this so all Enterprise features are usable without needing
-    //    a signed license. Production deployments must NOT set this; it
-    //    bypasses every license-gated check.
-    if std::env::var("OBJECTIO_DEV_NO_LICENSE").is_ok_and(|v| !v.is_empty() && v != "0") {
-        warn!(
-            "OBJECTIO_DEV_NO_LICENSE is set — running with in-process Developer license. This is a development convenience and MUST NOT be used in production."
-        );
-        return objectio_license::License::developer_unsigned();
-    }
-
-    // 1. CLI flag
-    if let Some(path) = cli_path {
-        match std::fs::read(path) {
-            Ok(bytes) => match objectio_license::License::load_from_bytes(&bytes, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("--license {} rejected: {} — falling back", path, e),
-            },
-            Err(e) => warn!("--license {} unreadable: {} — falling back", path, e),
-        }
-    }
-
-    // 2. Environment variable — path or inline JSON
-    if let Ok(val) = std::env::var("OBJECTIO_LICENSE")
-        && !val.is_empty()
-    {
-        let bytes = if val.trim_start().starts_with('{') {
-            Some(val.into_bytes())
-        } else {
-            std::fs::read(&val).ok()
-        };
-        if let Some(bytes) = bytes {
-            match objectio_license::License::load_from_bytes(&bytes, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("OBJECTIO_LICENSE rejected: {} — falling back", e),
-            }
-        }
-    }
-
-    // 3. Meta config
-    let mut client = meta_client;
-    if let Ok(resp) = client
-        .get_config(objectio_proto::metadata::GetConfigRequest {
-            key: "license/active".to_string(),
-        })
-        .await
-    {
-        let inner = resp.into_inner();
-        if inner.found
-            && let Some(entry) = inner.entry
-            && !entry.value.is_empty()
-        {
-            match objectio_license::License::load_from_bytes(&entry.value, now) {
-                Ok(l) => return l,
-                Err(e) => warn!("license in meta config rejected: {} — falling back", e),
-            }
-        }
-    }
-
-    objectio_license::License::community()
-}
-
 /// Prometheus metrics endpoint handler
-/// How often the capacity gauges are refreshed. Capacity moves on the scale of
-/// writes, not milliseconds, and each poll costs one `GetStatus` per OSD.
-const CAPACITY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Ask every registered OSD how full it is.
-///
-/// Best effort in both directions: a node meta does not know about is not
-/// reported, and a node that does not answer is reported with
-/// `reachable: false` rather than omitted. Dropping it would make capacity
-/// appear to shrink when a disk goes unreachable, which reads as data loss
-/// rather than as a node being down.
-async fn collect_capacity(
+/// Join the per-OSD usage with meta's buckets and tenants. `None` when meta
+/// cannot be reached — the previous report is better than one in which
+/// every bucket has vanished.
+pub(crate) async fn build_usage_report(
     mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
         tonic::transport::Channel,
     >,
-) -> Vec<objectio_s3::metrics::NodeCapacity> {
-    use objectio_proto::metadata::GetListingNodesRequest;
-    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    nodes: &[objectio_s3::metrics::NodeCapacity],
+    usage: &HashMap<String, Vec<objectio_s3::usage::OsdBucketUsage>>,
+) -> Option<objectio_s3::usage::UsageReport> {
+    use objectio_proto::metadata::{ListBucketsRequest, ListTenantsRequest};
+    use objectio_s3::usage::{BucketInfo, ClusterUsage, TenantInfo, build_report};
 
-    let Ok(resp) = meta
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: true,
-        })
+    let buckets = meta
+        .list_buckets(ListBucketsRequest::default())
         .await
-    else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let targets: Vec<(String, Vec<u8>)> = resp
+        .ok()?
         .into_inner()
-        .nodes
+        .buckets
         .into_iter()
-        .filter(|n| seen.insert(n.address.clone()))
-        .map(|n| (n.address, n.node_id))
-        .collect();
+        .map(|b| BucketInfo {
+            name: b.name,
+            tenant: b.tenant,
+            owner: b.owner,
+            created_at: b.created_at,
+            pool: b.pool,
+            quota_bytes: b.quota_bytes,
+            quota_objects: b.quota_objects,
+        })
+        .collect::<Vec<_>>();
+    let tenants = meta
+        .list_tenants(ListTenantsRequest {})
+        .await
+        .map(|r| r.into_inner().tenants)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| TenantInfo {
+            name: t.name,
+            quota_bytes: t.quota_bytes,
+            quota_buckets: t.quota_buckets,
+            quota_objects: t.quota_objects,
+        })
+        .collect::<Vec<_>>();
 
-    let polls = targets.into_iter().map(|(addr, node_id)| async move {
-        let endpoint = if addr.starts_with("http") {
-            addr.clone()
-        } else {
-            format!("http://{addr}")
-        };
-        let status = async {
-            let mut c = StorageServiceClient::connect(endpoint).await.ok()?;
-            let s = c
-                .get_status(objectio_proto::storage::GetStatusRequest {})
-                .await
-                .ok()?
-                .into_inner();
-            Some((s.total_capacity, s.used_capacity, s.shard_count))
-        }
-        .await;
-
-        let (total, used, shards, reachable) =
-            status.map_or((0, 0, 0, false), |(t, u, s)| (t, u, s, true));
-        objectio_s3::metrics::NodeCapacity {
-            node_id: hex::encode(&node_id),
-            address: addr,
-            total_bytes: total,
-            used_bytes: used,
-            shard_count: shards,
-            reachable,
-        }
-    });
-
-    futures::future::join_all(polls).await
+    let up: Vec<_> = nodes.iter().filter(|n| n.reachable).collect();
+    let raw_capacity: u64 = up.iter().map(|n| n.total_bytes).sum();
+    let raw_used: u64 = up.iter().map(|n| n.used_bytes).sum();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let usable = s3_metrics()
+        .protection_efficiency()
+        .map_or(0, |e| (raw_capacity as f64 * e) as u64);
+    let cluster = ClusterUsage {
+        raw_capacity_bytes: raw_capacity,
+        raw_used_bytes: raw_used,
+        raw_available_bytes: raw_capacity.saturating_sub(raw_used),
+        usable_capacity_bytes: usable,
+        osds_total: nodes.len() as u64,
+        osds_up: up.len() as u64,
+        osds_stale: nodes
+            .iter()
+            .filter(|n| !n.reachable && usage.contains_key(&n.node_id))
+            .count() as u64,
+        ..Default::default()
+    };
+    let reports: Vec<_> = usage.values().cloned().collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    Some(build_report(&reports, &buckets, &tenants, cluster, now))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
-    let metrics = s3_metrics().export_prometheus();
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        metrics,
+        cluster_poll::render_metrics(),
     )
 }
 
@@ -302,6 +227,13 @@ pub struct Args {
     /// scrape and says so.
     #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
     pub prometheus_url: String,
+
+    /// Leave the per-bucket usage series (`objectio_bucket_*`) out of
+    /// `/metrics`. They carry one series per bucket, which is fine into the
+    /// tens of thousands; beyond that, tenant and cluster totals are still
+    /// exported and `/_admin/usage` still has every bucket.
+    #[arg(long, env = "OBJECTIO_NO_BUCKET_METRICS", default_value_t = false)]
+    pub no_bucket_metrics: bool,
 
     /// Keep buckets that have no recorded owner accessible to any
     /// authenticated caller. Buckets created before ownership was tracked
@@ -402,12 +334,6 @@ pub struct Args {
     /// Comma-separated. These are matched as ARNs: arn:obio:iam::oidc:group/<value>
     #[arg(long, value_delimiter = ',')]
     pub oidc_admin_roles: Vec<String>,
-
-    /// Path to an Enterprise license file. Falls back to `$OBJECTIO_LICENSE`,
-    /// then to the `license/active` key in meta config, then to Community
-    /// tier (no Enterprise features).
-    #[arg(long)]
-    pub license: Option<String>,
 
     /// Gateway's own topology position — used by locality-aware read routing
     /// to prefer shards on nearby OSDs (Phase 2). Empty string at any level
@@ -523,6 +449,7 @@ pub async fn run(
         }
     };
     s3_metrics().set_protection_config(protection_config);
+    s3_metrics().set_per_bucket_usage(!args.no_bucket_metrics);
 
     // Connect to metadata service
     let meta_client = MetadataServiceClient::connect(args.meta_endpoint.clone())
@@ -584,10 +511,8 @@ pub async fn run(
         args.external_endpoint.clone()
     };
 
-    // OIDC provider — used by both the Iceberg auth layer (Enterprise) and
-    // the console OIDC login flow (all tiers). Defined here so it stays in
-    // scope for the Community build even when the Iceberg block below is
-    // compiled out.
+    // OIDC provider — used by both the Iceberg auth layer and the console
+    // OIDC login flow.
     let oidc_provider = if let (Some(issuer_url), Some(client_id)) =
         (&args.oidc_issuer_url, &args.oidc_client_id)
     {
@@ -618,14 +543,11 @@ pub async fn run(
         None
     };
 
-    // Build Iceberg REST Catalog router and Delta Sharing router. Both are
-    // Enterprise features, gated at runtime by `feature_gate` middleware —
-    // without a valid Enterprise license the routers reject with 403.
+    // Build Iceberg REST Catalog router and Delta Sharing router.
     //
     // The Unity Catalog router (mounted at /api/2.1/unity-catalog/*) shares
-    // the same iceberg auth layer and is gated by the same Iceberg feature
-    // flag — there is no separate Feature::Unity, since Unity is just an
-    // alternate REST surface over the same catalog metadata.
+    // the same iceberg auth layer — Unity is just an alternate REST surface
+    // over the same catalog metadata.
     let iceberg_router = {
         let router = objectio_iceberg::router(
             meta_client.clone(),
@@ -668,7 +590,7 @@ pub async fn run(
     };
 
     // Unity Catalog REST router — same auth layer as Iceberg (SigV4 + OIDC
-    // bearer + session cookie), same Feature::Iceberg license gate. Mounted
+    // bearer + session cookie). Mounted
     // at the gateway root so its `/api/2.1/unity-catalog/*` paths land where
     // Databricks-style clients expect them.
     let unity_router = {
@@ -697,8 +619,7 @@ pub async fn run(
         ))
     };
 
-    // Warehouse prefix rewrite layer — harmless when the license gate
-    // rejects Iceberg: rewritten requests simply short-circuit with 403.
+    // Warehouse prefix rewrite layer.
     let warehouse_rewrite =
         tower::util::MapRequestLayer::new(|mut req: axum::http::Request<axum::body::Body>| {
             let path = req.uri().path().to_string();
@@ -813,25 +734,6 @@ pub async fn run(
     let (kms_local, kms) =
         kms::build_kms_provider(meta_client.clone(), master_key.as_ref(), &kms_config);
 
-    // Load license. Order of precedence: --license flag, OBJECTIO_LICENSE env,
-    // meta config at `license/active`. No license → Community tier (all
-    // Enterprise features remain gated). Parse/verify failures log a warning
-    // and fall back to Community — never hard-fail startup on a broken license.
-    let license = load_initial_license(args.license.as_deref(), meta_client.clone()).await;
-    match license.tier {
-        objectio_license::Tier::Enterprise => info!(
-            "License: Enterprise — licensee='{}' expires_at={} max_nodes={}",
-            license.licensee, license.expires_at, license.max_nodes
-        ),
-        objectio_license::Tier::Developer => info!(
-            "License: Developer — licensee='{}' expires_at={} max_nodes={} (single-host)",
-            license.licensee, license.expires_at, license.max_nodes
-        ),
-        objectio_license::Tier::Community => {
-            info!("License: Community — Enterprise features gated")
-        }
-    }
-
     // Build this gateway's self-topology from CLI flags / env so read
     // routing can prefer locally-adjacent OSDs.
     let self_topology = objectio_placement::FailureDomainInfo::new_full(
@@ -907,7 +809,6 @@ pub async fn run(
         master_key,
         kms: parking_lot::RwLock::new(kms),
         kms_local: parking_lot::RwLock::new(kms_local),
-        license: parking_lot::RwLock::new(Arc::new(license)),
         self_topology,
         host_provider,
         legacy_open_buckets: args.authz_legacy_open_buckets,
@@ -993,6 +894,7 @@ pub async fn run(
             delete(admin::admin_remove_tenant_admin),
         )
         .route("/_admin/nodes", get(admin::admin_list_nodes))
+        .route("/_admin/usage", get(admin::admin_usage))
         .route(
             "/_admin/osds/{node_id}/admin-state",
             put(admin::admin_set_osd_state),
@@ -1119,10 +1021,6 @@ pub async fn run(
         .route("/_admin/kms/config", put(kms::admin_kms_put_config))
         .route("/_admin/kms/config", delete(kms::admin_kms_delete_config))
         .route("/_admin/kms/test", post(kms::admin_kms_test))
-        // License management
-        .route("/_admin/license", get(admin::admin_get_license))
-        .route("/_admin/license", put(admin::admin_put_license))
-        .route("/_admin/license", delete(admin::admin_delete_license))
         // Prometheus proxy. Sits with the other admin APIs so it inherits the
         // same optional SigV4 layer — a console session and a signed request
         // are both recognised. Inert when --prometheus-url is unset.
@@ -1203,25 +1101,6 @@ pub async fn run(
         info!("Admin API is ENABLED (no auth required in dev mode)");
     }
 
-    // License-gated wrappers — built once, cloned into each composite
-    // router that exposes them.
-    let iceberg_gated = iceberg_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::Iceberg),
-        license_gate::feature_gate,
-    ));
-    let unity_gated = unity_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::Iceberg),
-        license_gate::feature_gate,
-    ));
-    let delta_gated = delta_sharing_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::DeltaSharing),
-        license_gate::feature_gate,
-    ));
-    let delta_admin_gated = delta_sharing_admin_router.layer(middleware::from_fn_with_state(
-        (Arc::clone(&state), objectio_license::Feature::DeltaSharing),
-        license_gate::feature_gate,
-    ));
-
     // SPA dirs.
     //   OBJECTIO_CONSOLE_DIR        — legacy single-bundle (default for legacy mode)
     //   OBJECTIO_OPS_CONSOLE_DIR    — ops bundle for --ops-console-listen
@@ -1296,10 +1175,10 @@ pub async fn run(
             .merge(admin_routes.clone())
             .merge(console_api_routes.clone())
             .merge(console_oidc_routes.clone())
-            .nest("/iceberg", iceberg_gated.clone())
-            .merge(unity_gated.clone())
-            .nest("/delta-sharing", delta_gated.clone())
-            .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+            .nest("/iceberg", iceberg_router.clone())
+            .merge(unity_router.clone())
+            .nest("/delta-sharing", delta_sharing_router.clone())
+            .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
             // Path-mounted consoles. These are the addressable surfaces:
             // /_console/admin is the operator console, /_console/tenant the
             // self-service one. Each bundle is built with its own base, so the
@@ -1337,9 +1216,9 @@ pub async fn run(
         // Data plane only.
         let data_router = Router::new()
             .merge(build_s3_protected())
-            .nest("/iceberg", iceberg_gated.clone())
-            .merge(unity_gated.clone())
-            .nest("/delta-sharing", delta_gated.clone())
+            .nest("/iceberg", iceberg_router.clone())
+            .merge(unity_router.clone())
+            .nest("/delta-sharing", delta_sharing_router.clone())
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Data))
             .layer(TraceLayer::new_for_http());
@@ -1363,7 +1242,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .layer(Extension(ListenerKind::AdminApi))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, admin_only, "admin API + metrics"));
@@ -1383,7 +1262,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 // Same canonical path as the single-port mount, so one
                 // build serves both modes.
                 .nest_service("/_console/admin", console_service(&ops_console_dir))
@@ -1414,7 +1293,7 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_admin_gated.clone())
+                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .nest_service("/_console/tenant", console_service(&tenant_console_dir))
                 .route(
                     "/",
@@ -1432,21 +1311,10 @@ pub async fn run(
 
     // Bind all listeners and serve concurrently. A shared broadcast channel
     // fans the user's shutdown future out to every axum::serve.
-    // Keep the capacity gauges fed. Polling here rather than computing on
-    // scrape: a reading costs a GetStatus to every OSD, and /metrics has to
-    // stay fast and must not fail because one disk is slow to answer.
-    {
-        let meta_client = state.meta_client.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(CAPACITY_POLL_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let nodes = collect_capacity(meta_client.clone()).await;
-                s3_metrics().set_capacity(nodes);
-            }
-        });
-    }
+    // Keep capacity, usage, data-safety and the OSD / meta metrics fed.
+    // Polled rather than gathered on scrape: /metrics has to stay fast and
+    // must not fail because one node is slow to answer.
+    cluster_poll::spawn(state.meta_client.clone());
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());

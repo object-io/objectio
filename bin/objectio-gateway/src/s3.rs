@@ -118,10 +118,6 @@ pub struct AppState {
     /// Used by `/_admin/kms/*` key-management endpoints. External backends
     /// leave this `None` and those endpoints return `NotImplemented`.
     pub kms_local: parking_lot::RwLock<Option<Arc<crate::kms::LocalKmsProvider>>>,
-    /// Installed license, gating Enterprise features. No license → Community
-    /// tier (stored as `License::community()`). Held behind a `RwLock` so the
-    /// `PUT /_admin/license` endpoint can swap it without restart.
-    pub license: parking_lot::RwLock<Arc<objectio_license::License>>,
     /// The gateway's own failure-domain position. Drives locality-aware
     /// read routing (Phase 2): shards on OSDs that share enclosing levels
     /// are tried first. Fully-empty when not configured — routing then
@@ -165,23 +161,6 @@ impl AppState {
     ) {
         *self.kms.write() = kms;
         *self.kms_local.write() = kms_local;
-    }
-
-    /// Snapshot of the currently installed license. Cloned as an owned `Arc`
-    /// so callers can hold it across async work without blocking swaps.
-    pub fn license(&self) -> Arc<objectio_license::License> {
-        Arc::clone(&self.license.read())
-    }
-
-    /// Hot-swap the installed license — used at startup and by
-    /// `PUT /_admin/license`.
-    pub fn set_license(&self, license: Arc<objectio_license::License>) {
-        *self.license.write() = license;
-    }
-
-    /// Convenience: is a given Enterprise feature currently licensed?
-    pub fn has_feature(&self, feature: objectio_license::Feature) -> bool {
-        self.license().allows(feature)
     }
 }
 
@@ -508,16 +487,6 @@ async fn apply_put_sse(
             ))
         }
         SseAlgorithm::SseKms => {
-            // Enterprise gate. AWS returns 400 for unsupported encryption
-            // modes, so we match that shape — machine-readable detail is in
-            // the body.
-            if !state.has_feature(objectio_license::Feature::Kms) {
-                return Err(S3Error::xml_response(
-                    "EnterpriseLicenseRequired",
-                    "SSE-KMS requires an Enterprise license. Install one via PUT /_admin/license.",
-                    StatusCode::FORBIDDEN,
-                ));
-            }
             let Some(kms) = state.kms() else {
                 return Err(S3Error::xml_response(
                     "ServiceUnavailable",
@@ -1022,6 +991,7 @@ impl S3Error {
         Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/xml")
+            .extension(crate::gateway_metrics::S3ErrorCode(code.to_string()))
             .body(Body::from(xml))
             .unwrap()
     }
@@ -2536,6 +2506,7 @@ pub async fn put_object(
             encrypted_dek: sse_encrypted_dek.clone(),
             encryption_iv: sse_iv.clone(),
             encryption_context: sse_encryption_context.clone(),
+            usage_owner: Vec::new(), // filled in by put_object_meta_to_all
         };
 
         if let Err(e) = put_object_meta_to_all(
@@ -2845,6 +2816,7 @@ pub async fn put_object(
         encrypted_dek: sse_encrypted_dek,
         encryption_iv: sse_iv,
         encryption_context: sse_encryption_context,
+        usage_owner: Vec::new(), // filled in by put_object_meta_to_all
     };
 
     if let Err(e) = put_object_meta_to_all(
@@ -3953,6 +3925,21 @@ pub async fn delete_object(
                 &e.to_string(),
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
+        }
+
+        // The key no longer has a current version, so drop it from Meta's
+        // listing index; it stays reachable through ListObjectVersions.
+        {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            let _ = state
+                .meta_client
+                .clone()
+                .delete_object(MetaDelReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: String::new(),
+                })
+                .await;
         }
 
         info!(
@@ -5607,6 +5594,33 @@ async fn complete_multipart_upload_internal(
                         &format!("Failed to store object metadata: {}", e),
                         StatusCode::INTERNAL_SERVER_ERROR,
                     );
+                }
+
+                // Register with Meta's listing index, as a single-part PUT
+                // does. ListObjects reads that index first, so without this
+                // a multipart object was readable by key but missing from
+                // listings — or listed with the size of whatever single-part
+                // object last had that key.
+                {
+                    use objectio_proto::metadata::CreateObjectRequest;
+                    let req = CreateObjectRequest {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        size: object.size,
+                        content_type: object.content_type.clone(),
+                        etag: object.etag.clone(),
+                        user_metadata: object.user_metadata.clone(),
+                        stripes: object.stripes.clone(),
+                        object_id: object.object_id.clone(),
+                        pg_id: placement.pg_id,
+                        pool: placement.pool.clone(),
+                    };
+                    if let Err(e) = state.meta_client.clone().create_object(req).await {
+                        warn!(
+                            "create_object on meta failed ({e}); multipart object is \
+                             readable by key but will not appear in ListObjects",
+                        );
+                    }
                 }
 
                 let result = CompleteMultipartUploadResult {

@@ -161,20 +161,7 @@ cargo build --workspace --release --features isal    # omit --features on ARM
 
 ## License
 
-This repository uses a split licensing model:
-
-- **Apache 2.0** — everything outside `enterprise/`; fully open-source,
-  free to use, modify, and distribute
-- **BUSL 1.1** — `enterprise/crates/objectio-iceberg`,
-    `enterprise/crates/objectio-delta-sharing`, and
-    `enterprise/crates/objectio-unity-catalog`; source-available with
-  an additional-use grant (you may run it internally), but you may not
-  offer it as a competing paid managed service
-
-On **2030-04-18** the BUSL-licensed files automatically convert to
-Apache 2.0 under the BUSL change-license clause.
-
-Enterprise features are also gated at runtime by an Ed25519-signed
-license file; without one, those endpoints return `403
-EnterpriseLicenseRequired`. Install a license through the console or
-`PUT /_admin/license`.
+ObjectIO is licensed under the [Apache License 2.0](./LICENSE). Every
+feature — S3, Iceberg REST Catalog, Unity Catalog, Delta Sharing,
+SSE-KMS, multi-tenancy, OIDC, LRC erasure codes, block storage — is
+fully open source, with no license keys, tiers or usage caps.

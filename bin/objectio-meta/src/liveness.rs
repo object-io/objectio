@@ -194,9 +194,12 @@ async fn probe(address: &str) -> bool {
         return false;
     };
     let mut client = StorageServiceClient::new(channel);
-    tokio::time::timeout(PROBE_TIMEOUT, client.get_status(GetStatusRequest {}))
-        .await
-        .is_ok_and(|r| r.is_ok())
+    tokio::time::timeout(
+        PROBE_TIMEOUT,
+        client.get_status(GetStatusRequest::default()),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
 }
 
 #[cfg(test)]

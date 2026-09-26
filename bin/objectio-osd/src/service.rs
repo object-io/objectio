@@ -56,6 +56,8 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::usage::{EntryKind, UsageTracker};
+
 /// gRPC method metrics
 #[derive(Debug, Default)]
 pub struct GrpcMethodMetrics {
@@ -221,6 +223,11 @@ pub struct DiskStatusInfo {
     pub status: String,
     pub read_errors: u64,
     pub write_errors: u64,
+    pub checksum_errors: u64,
+    pub reads: u64,
+    pub writes: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
 }
 
 /// OSD status information for metrics
@@ -268,7 +275,14 @@ pub struct OsdService {
     next_disk: RwLock<usize>,
     /// gRPC metrics collector
     grpc_metrics: Arc<GrpcMetrics>,
+    /// Per-bucket usage of the objects this OSD is primary for
+    usage: UsageTracker,
+    /// Renders this OSD's Prometheus exposition for `GetMetrics`. Set once
+    /// the metrics state exists, which is after the service is built.
+    metrics_renderer: std::sync::OnceLock<MetricsRenderer>,
 }
+
+type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
 
 /// Resolve the OSD's stable node_id + cluster_uuid from (in priority order):
 ///
@@ -521,6 +535,20 @@ impl OsdService {
                 reclaimed_check[idx]
             );
         }
+        let usage = UsageTracker::new(node_id);
+        let started = Instant::now();
+        usage.rebuild(
+            meta_store
+                .scan_prefix(&MetadataKey::all_object_meta_prefix())
+                .into_iter()
+                .chain(meta_store.scan_prefix(&MetadataKey::from_bytes(vec![b'v']))),
+        );
+        info!(
+            "Rebuilt usage for {} buckets in {:?}",
+            usage.snapshot().len(),
+            started.elapsed()
+        );
+
         Ok(Self {
             node_id,
             disks,
@@ -530,7 +558,53 @@ impl OsdService {
             start_time: Instant::now(),
             next_disk: RwLock::new(0),
             grpc_metrics: Arc::new(GrpcMetrics::default()),
+            usage,
+            metrics_renderer: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the function `GetMetrics` serves. Later calls are ignored.
+    pub fn set_metrics_renderer(&self, f: MetricsRenderer) {
+        let _ = self.metrics_renderer.set(f);
+    }
+
+    /// Metadata WAL fsync latency and batching, as Prometheus families.
+    pub fn render_wal_metrics(&self, out: &mut String, osd_label: &str) {
+        let st = self.meta_store.wal_sync_stats();
+        st.seconds.render(
+            out,
+            "objectio_osd_wal_fsync_seconds",
+            "Time for one metadata WAL fdatasync",
+            osd_label,
+        );
+        for (name, help, v) in [
+            (
+                "objectio_osd_wal_syncs_total",
+                "Metadata WAL fdatasyncs",
+                st.syncs.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_wal_records_synced_total",
+                "Metadata WAL records made durable; divide by syncs for records per fsync",
+                st.records.load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
+        }
+    }
+
+    /// Per-bucket usage of the objects this OSD is primary for.
+    pub fn bucket_usage(&self) -> Vec<objectio_proto::storage::BucketUsage> {
+        self.usage.snapshot()
+    }
+
+    /// Decoded ObjectMeta currently stored under `key`, if any.
+    fn stored_meta(&self, key: &MetadataKey) -> Option<ObjectMeta> {
+        self.meta_store
+            .get(key)
+            .and_then(|v| ObjectMeta::decode(&v[..]).ok())
     }
 
     /// Get gRPC metrics
@@ -580,8 +654,7 @@ impl OsdService {
     }
 
     /// Raw capacity of each managed disk, index-aligned with `disk_ids()`.
-    /// Used at registration time so meta can sum capacity across OSDs and
-    /// enforce the license's `max_raw_capacity_bytes` cap.
+    /// Used at registration time so meta can sum raw capacity across OSDs.
     pub fn disk_capacities(&self) -> Vec<u64> {
         self.disks.iter().map(|d| d.capacity()).collect()
     }
@@ -615,16 +688,30 @@ impl OsdService {
             total_used += used;
             total_shards += shard_count;
 
+            let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            let read_errors = load(&stats.read_errors);
+            let write_errors = load(&stats.write_errors);
+            let checksum_errors = load(&stats.checksum_errors);
+            // A disk that has returned bad data or failed an IO since start
+            // is not healthy, even though it is still serving requests.
+            let status = if read_errors + write_errors + checksum_errors > 0 {
+                "degraded"
+            } else {
+                "healthy"
+            };
             disks.push(DiskStatusInfo {
                 path: disk.path().to_string(),
                 capacity,
                 used,
                 shard_count,
-                status: "healthy".to_string(), // TODO: Check actual health
-                read_errors: stats.read_errors.load(std::sync::atomic::Ordering::Relaxed),
-                write_errors: stats
-                    .write_errors
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                status: status.to_string(),
+                read_errors,
+                write_errors,
+                checksum_errors,
+                reads: load(&stats.reads),
+                writes: load(&stats.writes),
+                bytes_read: load(&stats.bytes_read),
+                bytes_written: load(&stats.bytes_written),
             });
         }
 
@@ -738,6 +825,28 @@ impl OsdService {
 
 #[tonic::async_trait]
 impl StorageService for OsdService {
+    async fn get_metrics(
+        &self,
+        _request: Request<objectio_proto::metadata::GetMetricsRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetMetricsResponse>, Status> {
+        let render = || self.metrics_renderer.get().map(|f| f()).unwrap_or_default();
+        // SMART polling may shell out to smartctl; don't stall a runtime
+        // worker on it where the runtime allows moving off.
+        let text = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(render)
+        } else {
+            render()
+        };
+        Ok(Response::new(
+            objectio_proto::metadata::GetMetricsResponse {
+                text,
+                process_instance: objectio_common::process_metrics::instance_id().to_string(),
+            },
+        ))
+    }
+
     async fn write_shard(
         &self,
         request: Request<WriteShardRequest>,
@@ -1095,8 +1204,37 @@ impl StorageService for OsdService {
 
     async fn get_status(
         &self,
-        _request: Request<GetStatusRequest>,
+        request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
+        let up_nodes = request.into_inner().up_nodes;
+        let safety = if up_nodes.is_empty() {
+            None
+        } else {
+            let up: std::collections::HashSet<Vec<u8>> = up_nodes.into_iter().collect();
+            // A scan of every ObjectMeta this OSD holds; keep it off the
+            // async worker where the runtime allows.
+            let scan = || {
+                self.usage.safety(
+                    self.meta_store
+                        .scan_prefix(&MetadataKey::all_object_meta_prefix())
+                        .into_iter()
+                        .chain(
+                            self.meta_store
+                                .scan_prefix(&MetadataKey::from_bytes(vec![b'v'])),
+                        ),
+                    &up,
+                )
+            };
+            Some(
+                if tokio::runtime::Handle::current().runtime_flavor()
+                    == tokio::runtime::RuntimeFlavor::MultiThread
+                {
+                    tokio::task::block_in_place(scan)
+                } else {
+                    scan()
+                },
+            )
+        };
         let mut total_capacity = 0u64;
         let mut used_capacity = 0u64;
         let mut disk_statuses = Vec::new();
@@ -1165,6 +1303,8 @@ impl StorageService for OsdService {
             cpu_cores,
             memory_bytes,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            bucket_usage: self.usage.snapshot(),
+            safety,
         }))
     }
 
@@ -1185,19 +1325,27 @@ impl StorageService for OsdService {
         // Serialize ObjectMeta to bytes using protobuf
         let value = object.encode_to_vec();
 
+        let _guard = self.usage.lock_key(&req.bucket, &req.key);
+
         // Always store as current version at m:{bucket}\0{key}
         let key = MetadataKey::object_meta(&req.bucket, &req.key);
+        let old = self.stored_meta(&key);
         self.meta_store
             .put(key, value.clone())
             .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
+        self.usage
+            .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
 
         // If versioning is enabled and version_id is set, also store version entry
         if req.versioning_enabled && !object.version_id.is_empty() {
             let version_key =
                 MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
+            let old = self.stored_meta(&version_key);
             self.meta_store
                 .put(version_key, value)
                 .map_err(|e| Status::internal(format!("failed to store version entry: {}", e)))?;
+            self.usage
+                .apply(&req.bucket, EntryKind::Version, old.as_ref(), Some(&object));
         }
 
         let timestamp = Self::current_timestamp();
@@ -1258,19 +1406,27 @@ impl StorageService for OsdService {
     ) -> Result<Response<DeleteObjectMetaResponse>, Status> {
         let req = request.into_inner();
 
+        let _guard = self.usage.lock_key(&req.bucket, &req.key);
+
         if req.version_id.is_empty() {
             // Delete current version entry
             let key = MetadataKey::object_meta(&req.bucket, &req.key);
+            let old = self.stored_meta(&key);
             self.meta_store.delete(&key).map_err(|e| {
                 Status::internal(format!("failed to delete object metadata: {}", e))
             })?;
+            self.usage
+                .apply(&req.bucket, EntryKind::Current, old.as_ref(), None);
             info!("Deleted object metadata: {}/{}", req.bucket, req.key);
         } else {
             // Delete specific version entry
             let version_key = MetadataKey::object_version(&req.bucket, &req.key, &req.version_id);
+            let old = self.stored_meta(&version_key);
             self.meta_store
                 .delete(&version_key)
                 .map_err(|e| Status::internal(format!("failed to delete version entry: {}", e)))?;
+            self.usage
+                .apply(&req.bucket, EntryKind::Version, old.as_ref(), None);
             info!(
                 "Deleted version: {}/{} (version={})",
                 req.bucket, req.key, req.version_id
@@ -1474,11 +1630,19 @@ impl StorageService for OsdService {
         object.etag = format!("{:x}", Uuid::new_v4().as_u128());
 
         // Write dest ObjectMeta
+        let _guard = self.usage.lock_key(&req.dest_bucket, &req.dest_key);
         let dst_key = MetadataKey::object_meta(&req.dest_bucket, &req.dest_key);
+        let old = self.stored_meta(&dst_key);
         let dest_bytes = object.encode_to_vec();
         self.meta_store
             .put(dst_key, dest_bytes)
             .map_err(|e| Status::internal(format!("failed to store dest object metadata: {e}")))?;
+        self.usage.apply(
+            &req.dest_bucket,
+            EntryKind::Current,
+            old.as_ref(),
+            Some(&object),
+        );
 
         info!(
             "Copied object metadata: {}/{} -> {}/{}",

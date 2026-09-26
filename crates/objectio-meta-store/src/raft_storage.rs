@@ -132,7 +132,7 @@ impl MetaRaftStorage {
             let encoded = serde_json::to_vec(state).map_err(|e| encode_err("raft_state", e))?;
             t.insert("state", encoded.as_slice()).map_err(write_err)?;
         }
-        txn.commit().map_err(write_err)
+        crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
     /// Apply a committed [`MetaCommand`] inside the same txn that moves
@@ -169,7 +169,7 @@ impl MetaRaftStorage {
                     t.insert(key.as_str(), bytes.as_slice())
                         .map_err(write_err)?;
                 }
-                txn.commit().map_err(write_err)?;
+                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
                 Ok(MetaResponse::ConfigSet { version })
             }
@@ -179,7 +179,7 @@ impl MetaRaftStorage {
                     let mut t = txn.open_table(tables::CONFIG).map_err(write_err)?;
                     t.remove(key.as_str()).map_err(write_err)?.is_some()
                 };
-                txn.commit().map_err(write_err)?;
+                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
                 Ok(MetaResponse::ConfigDeleted { existed })
             }
@@ -222,7 +222,7 @@ impl MetaRaftStorage {
                         None => (false, false),
                     }
                 };
-                txn.commit().map_err(write_err)?;
+                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
                 Ok(MetaResponse::OsdAdminStateSet { changed, found })
             }
@@ -291,7 +291,7 @@ fn apply_multi_cas(
         let mut s_state = state.clone();
         s_state.last_applied = Some(log_id);
         *state = s_state;
-        commit_txn.commit().map_err(write_err)?;
+        crate::commit_metrics::commit(commit_txn).map_err(write_err)?;
         // Only persist `last_applied` here so follower replay sees the
         // same committed position. The failed indices go back to the
         // client so they can refresh and retry.
@@ -314,7 +314,7 @@ fn apply_multi_cas(
         }
     }
 
-    txn.commit().map_err(write_err)?;
+    crate::commit_metrics::commit(txn).map_err(write_err)?;
     state.last_applied = Some(log_id);
 
     // Fan out apply events after the commit lands on disk. Send is
@@ -513,7 +513,7 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
             let bytes = serde_json::to_vec(vote).map_err(|e| encode_err("raft_vote", e))?;
             t.insert("vote", bytes.as_slice()).map_err(write_err)?;
         }
-        txn.commit().map_err(write_err)?;
+        crate::commit_metrics::commit(txn).map_err(write_err)?;
         Ok(())
     }
 
@@ -586,7 +586,7 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                     .map_err(write_err)?;
             }
         }
-        txn.commit().map_err(write_err)
+        crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
     async fn delete_conflict_logs_since(
@@ -607,7 +607,7 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                 t.remove(idx).map_err(write_err)?;
             }
         }
-        txn.commit().map_err(write_err)
+        crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
@@ -624,7 +624,7 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                 t.remove(idx).map_err(write_err)?;
             }
         }
-        txn.commit().map_err(write_err)?;
+        crate::commit_metrics::commit(txn).map_err(write_err)?;
         let mut state = self.load_state()?;
         state.last_purged = Some(log_id);
         self.save_state(&state)

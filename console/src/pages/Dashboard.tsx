@@ -98,7 +98,6 @@ export default function Dashboard() {
   const [healthy, setHealthy] = useState<boolean | null>(null);
   const [nodeList, setNodeList] = useState<NodeInfo[]>([]);
   const [pools, setPools] = useState<{ name: string; scheme?: string; used?: number; total?: number }[]>([]);
-  const [license, setLicense] = useState<{ tier?: string; licensee?: string } | null>(null);
   const [rebalance, setRebalance] = useState<string>("");
   const [rates, setRates] = useState<{ req: number; err: number; bytes: number }>({ req: 0, err: 0, bytes: 0 });
   const [spark, setSpark] = useState<Record<string, Spark[]>>({ req: [], err: [], bytes: [] });
@@ -117,7 +116,6 @@ export default function Dashboard() {
       .then((r) => r.json())
       .then((d) => setPools(Array.isArray(d) ? d : (d.pools ?? [])))
       .catch(() => setPools([]));
-    fetch("/_admin/license").then((r) => r.json()).then(setLicense).catch(() => setLicense(null));
     fetch("/_admin/rebalance-status")
       .then((r) => r.json())
       .then((d) => setRebalance(d.running ? "rebalancing" : "idle"))
@@ -251,7 +249,6 @@ export default function Dashboard() {
         title={healthy === false ? "Gateway is not answering health checks" : "All systems operational"}
       >
         {[
-          license?.tier ? `license ${license.tier}` : null,
           rebalance ? `balancer ${rebalance}` : null,
           `${online}/${nodeList.length || 0} OSDs online`,
         ]

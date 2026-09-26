@@ -134,7 +134,7 @@ Migration order that keeps the app shippable at every step:
 3. Layout + Login
 4. Dashboard, Monitoring (ChartCard, StatTile, RangePills)
 5. Cluster tabs (Topology, Drives, Pools, Balancing)
-6. Tenants, Users, Buckets, Objects, Tables, then the rest (Policies, Identity, Unity, Sharing, Encryption, License, MyAccount) using the same primitives
+6. Tenants, Users, Buckets, Objects, Tables, then the rest (Policies, Identity, Unity, Sharing, Encryption, MyAccount) using the same primitives
 7. dark theme toggle in the user block
 
 ## 6. Charts (Recharts)

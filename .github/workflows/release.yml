@@ -229,6 +229,9 @@ jobs:
 
       - name: Cargo build (aio only)
         shell: bash
+        env:
+          OBJECTIO_VERSION: ${{ inputs.version }}
+          OBJECTIO_GIT_COMMIT: ${{ github.sha }}
         run: |
           FEAT=""
           if [ -n "${{ matrix.features }}" ]; then FEAT="--features ${{ matrix.features }}"; fi
@@ -295,6 +298,9 @@ jobs:
           context: .
           target: all
           platforms: linux/${{ matrix.arch }}
+          build-args: |
+            OBJECTIO_VERSION=${{ inputs.version }}
+            OBJECTIO_GIT_COMMIT=${{ github.sha }}
           push: true
           # Push by digest only — no tag here. The manifest job below
           # stitches the per-arch digests into the version + latest tags.

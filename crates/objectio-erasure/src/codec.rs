@@ -159,6 +159,13 @@ impl ErasureCodec {
     ///
     /// For LRC mode, this includes both local and global parity shards.
     pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let started = std::time::Instant::now();
+        let res = self.encode_inner(data);
+        crate::metrics::ENCODE_SECONDS.observe_duration(started.elapsed());
+        res
+    }
+
+    fn encode_inner(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let k = self.data_shards();
 
         // Calculate shard size: must be a multiple of 64 for SIMD alignment
@@ -200,6 +207,25 @@ impl ErasureCodec {
     /// For LRC mode, this will attempt local recovery first (using only the
     /// local parity group) before falling back to global recovery.
     pub fn decode(&self, shards: &mut [Option<Vec<u8>>], original_size: usize) -> Result<Vec<u8>> {
+        // "reconstruct" when a data shard is missing and parity has to be
+        // used — the slow path, and a sign of a degraded read.
+        let k = self.data_shards();
+        let path = if shards.iter().take(k).all(Option::is_some) {
+            "path=\"fast\""
+        } else {
+            "path=\"reconstruct\""
+        };
+        let started = std::time::Instant::now();
+        let res = self.decode_inner(shards, original_size);
+        crate::metrics::DECODE_SECONDS.observe_duration(path, started.elapsed());
+        res
+    }
+
+    fn decode_inner(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        original_size: usize,
+    ) -> Result<Vec<u8>> {
         let k = self.data_shards();
 
         // Count available shards

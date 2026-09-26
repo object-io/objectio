@@ -1,6 +1,6 @@
 // Ops console — full system-admin surface.
 // Bound to `--ops-console-listen` in split-mode deployments. The bundle
-// imports every page including pools/OSDs/balancer/license/tenants —
+// imports every page including pools/OSDs/balancer/tenants —
 // pages that should NEVER be reachable from the public-facing tenant
 // console (which ships from a separate bundle).
 //
@@ -25,7 +25,6 @@ import DeltaSharing from "../../pages/DeltaSharing";
 import Monitoring from "../../pages/Monitoring";
 import Policies from "../../pages/Policies";
 import Encryption from "../../pages/Encryption";
-import LicensePage from "../../pages/License";
 import Cluster from "../../pages/Cluster";
 import PoolPlacement from "../../pages/PoolPlacement";
 import MyAccount from "../../pages/MyAccount";
@@ -89,7 +88,6 @@ export default function OpsApp() {
         <Route path="sharing" element={<DeltaSharing />} />
         <Route path="monitoring" element={<Monitoring />} />
         <Route path="encryption" element={<Encryption />} />
-        <Route path="license" element={<LicensePage />} />
         <Route path="cluster" element={<Cluster />} />
         <Route path="cluster/pools/:name" element={<PoolPlacement />} />
         <Route path="cluster/:tab" element={<Cluster />} />

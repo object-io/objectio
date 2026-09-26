@@ -226,6 +226,18 @@ impl Default for OsdPool {
     }
 }
 
+/// Client for a shard call, counting a failure to connect as `refused`.
+async fn connect_for_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
+    pool.get_client_for_placement(placement)
+        .await
+        .inspect_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "refused");
+        })
+}
+
 /// Helper to write a shard to the appropriate OSD
 #[allow(clippy::too_many_arguments)]
 pub async fn write_shard_to_osd(
@@ -240,7 +252,7 @@ pub async fn write_shard_to_osd(
 ) -> Result<objectio_proto::storage::BlockLocation, OsdPoolError> {
     use objectio_proto::storage::{Checksum, ShardId, WriteShardRequest};
 
-    let mut client = pool.get_client_for_placement(placement).await?;
+    let mut client = connect_for_shard(pool, placement).await?;
 
     let request = WriteShardRequest {
         shard_id: Some(ShardId {
@@ -260,9 +272,12 @@ pub async fn write_shard_to_osd(
 
     // Add timeout to prevent hanging indefinitely
     let write_future = client.write_shard(request);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(30), write_future)
-        .await
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), write_future).await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "write", started.elapsed());
+    let response = result
         .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
             error!(
                 "Timeout writing shard {} to OSD {}",
                 position, placement.node_address
@@ -270,6 +285,7 @@ pub async fn write_shard_to_osd(
             OsdPoolError::ConnectionFailed("write timeout".to_string())
         })?
         .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
             error!(
                 "Failed to write shard to OSD {}: {}",
                 placement.node_address, e
@@ -293,7 +309,7 @@ pub async fn read_shard_from_osd(
 ) -> Result<Vec<u8>, OsdPoolError> {
     use objectio_proto::storage::{ReadShardRequest, ShardId};
 
-    let mut client = pool.get_client_for_placement(placement).await?;
+    let mut client = connect_for_shard(pool, placement).await?;
 
     let request = ReadShardRequest {
         shard_id: Some(ShardId {
@@ -307,9 +323,12 @@ pub async fn read_shard_from_osd(
 
     // Add timeout to prevent hanging indefinitely
     let read_future = client.read_shard(request);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), read_future)
-        .await
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), read_future).await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "read", started.elapsed());
+    let response = result
         .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
             error!(
                 "Timeout reading shard {} from OSD {}",
                 position, placement.node_address
@@ -317,6 +336,7 @@ pub async fn read_shard_from_osd(
             OsdPoolError::ConnectionFailed("read timeout".to_string())
         })?
         .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
             warn!(
                 "Failed to read shard from OSD {}: {}",
                 placement.node_address, e
@@ -369,6 +389,13 @@ pub async fn put_object_meta_to_all(
     if targets.is_empty() {
         return Err(OsdPoolError::NoNodesAvailable);
     }
+
+    // Exactly one replica counts the object in usage. Chosen from the
+    // key's placement rather than the stripes: a multipart object's
+    // stripes live wherever its parts were placed, which need not be any
+    // of the OSDs holding this ObjectMeta.
+    let mut object_meta = object_meta;
+    object_meta.usage_owner.clone_from(&targets[0].node_id);
 
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {

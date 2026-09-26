@@ -15,7 +15,6 @@ import DeltaSharing from "./pages/DeltaSharing";
 import Monitoring from "./pages/Monitoring";
 import Policies from "./pages/Policies";
 import Encryption from "./pages/Encryption";
-import LicensePage from "./pages/License";
 import Cluster from "./pages/Cluster";
 import PoolPlacement from "./pages/PoolPlacement";
 import MyAccount from "./pages/MyAccount";
@@ -85,7 +84,6 @@ export default function App() {
         <Route path="sharing" element={<DeltaSharing />} />
         {isSystemAdmin && <Route path="monitoring" element={<Monitoring />} />}
         {isSystemAdmin && <Route path="encryption" element={<Encryption />} />}
-        {isSystemAdmin && <Route path="license" element={<LicensePage />} />}
         {/* Unified cluster page — Topology / Nodes & Drives / Pools /
             Balancing tabs. Old routes redirect so deep links stay live. */}
         {isSystemAdmin && <Route path="cluster" element={<Cluster />} />}

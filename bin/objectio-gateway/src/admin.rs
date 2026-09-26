@@ -282,16 +282,6 @@ pub async fn admin_set_config(
         }
     }
 
-    // Enterprise gates on specific config keys. `identity/openid/*` controls
-    // OIDC provider registration; gating here stops Community users from
-    // wiring Keycloak/Entra as an identity source.
-    if section.starts_with("identity/openid/")
-        && let Err(r) =
-            crate::license_gate::require_feature(&state, objectio_license::Feature::Oidc)
-    {
-        return r;
-    }
-
     // Validate JSON
     if serde_json::from_slice::<serde_json::Value>(&body).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
@@ -742,16 +732,6 @@ pub async fn admin_create_pool(
         return deny;
     }
     let pool = json_to_pool(&body);
-    // LRC (ec_type = 1, ERASURE_LRC) is Enterprise-only. MDS and replication
-    // stay available on Community.
-    if pool.ec_type == objectio_proto::metadata::ErasureType::ErasureLrc as i32
-        && let Err(r) = crate::license_gate::require_feature(&state, objectio_license::Feature::Lrc)
-    {
-        return r;
-    }
-    // Note: no node-count gate here. A pool is a logical placement policy,
-    // not an addition of storage nodes. Node-count enforcement lives at
-    // meta's RegisterOsd path, where new nodes actually join the cluster.
     let mut client = state.meta_client.clone();
     match client
         .create_pool(CreatePoolRequest { pool: Some(pool) })
@@ -863,11 +843,6 @@ pub async fn admin_update_pool(
         return deny;
     }
     let mut pool = json_to_pool(&body);
-    if pool.ec_type == objectio_proto::metadata::ErasureType::ErasureLrc as i32
-        && let Err(r) = crate::license_gate::require_feature(&state, objectio_license::Feature::Lrc)
-    {
-        return r;
-    }
     pool.name = name;
     let mut client = state.meta_client.clone();
     match client
@@ -936,11 +911,6 @@ pub async fn admin_create_tenant(
 ) -> Response {
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
-    }
-    if let Err(r) =
-        crate::license_gate::require_feature(&state, objectio_license::Feature::MultiTenancy)
-    {
-        return r;
     }
     let tenant = json_to_tenant(&body);
     let mut client = state.meta_client.clone();
@@ -2232,7 +2202,7 @@ pub async fn admin_list_nodes(
         let status = match StorageServiceClient::connect(osd_addr).await {
             Ok(mut client) => {
                 match client
-                    .get_status(objectio_proto::storage::GetStatusRequest {})
+                    .get_status(objectio_proto::storage::GetStatusRequest::default())
                     .await
                 {
                     Ok(resp) => {
@@ -2509,7 +2479,7 @@ pub async fn admin_reboot_osd(
     };
     let pod_name = match StorageServiceClient::connect(osd_addr.clone()).await {
         Ok(mut client) => match client
-            .get_status(objectio_proto::storage::GetStatusRequest {})
+            .get_status(objectio_proto::storage::GetStatusRequest::default())
             .await
         {
             Ok(r) => r.into_inner().pod_name,
@@ -2694,181 +2664,6 @@ pub async fn admin_host_provider_info(
         "supports_reboot": state.host_provider.name() != "noop",
     }))
     .into_response()
-}
-
-// ============================================================================
-// License management
-// ============================================================================
-
-const LICENSE_CONFIG_KEY: &str = "license/active";
-
-/// Snapshot of cluster-wide usage counted against license caps.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ClusterUsage {
-    pub node_count: u64,
-    pub raw_capacity_bytes: u64,
-}
-
-/// Walk every OSD, sum its reported disk total_capacity, and count distinct
-/// OSD addresses. Used by the license page and by the scale-up-block gates.
-///
-/// Best-effort: nodes we can't reach are skipped (counted as 0 bytes).
-/// An OSD that's offline briefly shouldn't open a path to exceed the cap.
-pub async fn compute_cluster_usage(state: &AppState) -> ClusterUsage {
-    let mut meta = state.meta_client.clone();
-    let Ok(resp) = meta
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: false,
-        })
-        .await
-    else {
-        return ClusterUsage::default();
-    };
-    let nodes = resp.into_inner().nodes;
-    let mut seen_addrs = std::collections::HashSet::new();
-    let mut raw_capacity_bytes: u64 = 0;
-    for node in &nodes {
-        if !seen_addrs.insert(node.address.clone()) {
-            continue;
-        }
-        let osd_addr = if node.address.starts_with("http") {
-            node.address.clone()
-        } else {
-            format!("http://{}", node.address)
-        };
-        if let Ok(mut client) = StorageServiceClient::connect(osd_addr).await
-            && let Ok(status) = client
-                .get_status(objectio_proto::storage::GetStatusRequest {})
-                .await
-        {
-            raw_capacity_bytes =
-                raw_capacity_bytes.saturating_add(status.into_inner().total_capacity);
-        }
-    }
-    ClusterUsage {
-        node_count: seen_addrs.len() as u64,
-        raw_capacity_bytes,
-    }
-}
-
-/// GET /_admin/license — currently installed license summary.
-/// Always returns 200, even for Community tier, so the console can render
-/// the "install license" CTA without a second request.
-pub async fn admin_get_license(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
-        return deny;
-    }
-    let license = state.license();
-    // Gather current usage so the console can render vs-limit bars.
-    let usage = compute_cluster_usage(&state).await;
-    Json(serde_json::json!({
-        "tier": license.tier.as_str(),
-        "licensee": license.licensee,
-        "issued_at": license.issued_at,
-        "expires_at": license.expires_at,
-        "features": license.features,
-        "enabled_features": objectio_license::Feature::all()
-            .iter()
-            .filter(|f| license.allows(**f))
-            .map(|f| f.as_str())
-            .collect::<Vec<_>>(),
-        "limits": {
-            "max_nodes": license.max_nodes,
-            "max_raw_capacity_bytes": license.max_raw_capacity_bytes,
-        },
-        "usage": {
-            "node_count": usage.node_count,
-            "raw_capacity_bytes": usage.raw_capacity_bytes,
-        },
-    }))
-    .into_response()
-}
-
-/// PUT /_admin/license — install a signed license file.
-/// Body: raw license JSON (what `objectio-license-gen issue` produces).
-/// The license is verified before persistence; on success the hot-swap takes
-/// effect immediately and gated routers unlock without a restart.
-pub async fn admin_put_license(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let license = match objectio_license::License::load_from_bytes(&body, now) {
-        Ok(l) => l,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "InvalidLicense",
-                    "message": e.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    // Persist to meta config so the license survives gateway restarts.
-    let actor = auth
-        .as_ref()
-        .map(|Extension(a)| a.user_arn.clone())
-        .unwrap_or_else(|| "console".to_string());
-    let mut client = state.meta_client.clone();
-    if let Err(e) = client
-        .set_config(SetConfigRequest {
-            key: LICENSE_CONFIG_KEY.to_string(),
-            value: body.to_vec(),
-            updated_by: actor,
-        })
-        .await
-    {
-        warn!("failed to persist license to meta: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
-    }
-    state.set_license(Arc::new(license.clone()));
-    info!(
-        "license installed: tier={} licensee={}",
-        license.tier, license.licensee
-    );
-    Json(serde_json::json!({
-        "tier": license.tier.as_str(),
-        "licensee": license.licensee,
-        "expires_at": license.expires_at,
-    }))
-    .into_response()
-}
-
-/// DELETE /_admin/license — remove the installed license and revert to
-/// Community tier. Gated routers start returning 403 again immediately.
-pub async fn admin_delete_license(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    let _ = client
-        .delete_config(DeleteConfigRequest {
-            key: LICENSE_CONFIG_KEY.to_string(),
-        })
-        .await;
-    state.set_license(Arc::new(objectio_license::License::community()));
-    info!("license removed — reverted to Community tier");
-    StatusCode::NO_CONTENT.into_response()
 }
 
 // ============================================================================
@@ -3391,6 +3186,46 @@ fn grpc_to_http(code: tonic::Code) -> u16 {
         tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => 403,
         _ => 500,
     }
+}
+
+// ============================================================================
+// Usage
+// ============================================================================
+
+/// Storage consumption per bucket and tenant, plus cluster capacity.
+///
+/// A system admin gets everything. A tenant caller gets only their own
+/// tenant's row and buckets, and no cluster section — raw capacity and
+/// other tenants' consumption are not theirs to see. Served from the
+/// gateway's background refresh, so it is at most one poll interval old
+/// (`updated_at` says exactly how old).
+pub async fn admin_usage(auth: Option<Extension<AuthResult>>, headers: HeaderMap) -> Response {
+    let full = require_system_admin(&auth, &headers);
+    let caller = extract_caller(&auth, &headers);
+    if full.is_some() && (!caller.authenticated || caller.tenant.is_empty()) {
+        return full.unwrap_or_else(|| StatusCode::FORBIDDEN.into_response());
+    }
+
+    let Some(mut report) = objectio_s3::s3_metrics().usage() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Usage has not been gathered yet; try again shortly",
+        )
+            .into_response();
+    };
+
+    if full.is_none() {
+        return Json(report).into_response();
+    }
+    report.buckets.retain(|b| b.tenant == caller.tenant);
+    report.tenants.retain(|t| t.tenant == caller.tenant);
+    Json(serde_json::json!({
+        "updated_at": report.updated_at,
+        "cluster": serde_json::Value::Null,
+        "tenants": report.tenants,
+        "buckets": report.buckets,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

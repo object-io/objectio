@@ -37,5 +37,4 @@ __pycache__/
 # Node
 node_modules/
 console/dist/
-enterprise/.license-signing/
 .claude/

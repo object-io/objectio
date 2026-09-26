@@ -222,6 +222,20 @@ service MetadataService {
     rpc AttachPolicy(AttachPolicyRequest) returns (AttachPolicyResponse);
     rpc DetachPolicy(DetachPolicyRequest) returns (DetachPolicyResponse);
     rpc ListAttachedPolicies(ListAttachedPoliciesRequest) returns (ListAttachedPoliciesResponse);
+
+    // This node's Prometheus exposition, so the gateway can serve it from
+    // its own /metrics instead of every meta node needing a scrape target.
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+}
+
+// Shared by MetadataService.GetMetrics and StorageService.GetMetrics.
+message GetMetricsRequest {}
+message GetMetricsResponse {
+    string text = 1;    // Prometheus text exposition format 0.0.4
+    // objectio_common::process_metrics::instance_id() of the responding
+    // process. The gateway drops `process_*` from a response that came
+    // from its own process (the all-in-one binary) instead of repeating it.
+    string process_instance = 2;
 }
 
 // Bucket metadata
@@ -289,6 +303,14 @@ message ObjectMeta {
     bytes encrypted_dek = 18;                      // DEK wrapped by master/KMS key
     bytes encryption_iv = 19;                      // Base IV; per-chunk IVs derived deterministically
     map<string, string> encryption_context = 20;   // AWS KMS encryption context
+
+    // Node that counts this object in usage accounting. ObjectMeta is
+    // written to every OSD in the key's placement; exactly one of them —
+    // this one — reports it, so per-OSD usage sums without double
+    // counting. Set by the gateway on write. Empty on objects written
+    // before it existed; OSDs then fall back to the holder of shard 0 of
+    // stripe 0, which is the same node for single-part PUTs.
+    bytes usage_owner = 21;
 }
 
 // Stripe metadata (EC group)
@@ -736,10 +758,8 @@ message RegisterOsdRequest {
     string node_name = 5;               // Human-readable name (optional)
     double weight = 6;                  // Placement weight (default: 1.0)
     // Raw capacity of each disk in bytes, index-aligned with `disk_ids`.
-    // Meta sums these across OSDs to enforce the license's max_raw_capacity_bytes
-    // cap. Older OSDs that don't populate this leave the cap check with 0 for
-    // their disks, which is conservative (under-reports usage, never blocks
-    // an already-registered cluster from re-registering).
+    // Meta sums these across OSDs for cluster capacity accounting. Older OSDs
+    // that don't populate this report 0 for their disks.
     repeated uint64 disk_capacity_bytes = 7;
 }
 

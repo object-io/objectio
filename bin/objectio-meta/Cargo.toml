@@ -17,7 +17,6 @@ objectio-common = { workspace = true }
 objectio-meta-store = { workspace = true }
 objectio-placement = { workspace = true }
 objectio-proto = { workspace = true }
-objectio-license = { workspace = true }
 # EC reconstruction path (Phase 4c): when an ObjectMeta references an
 # unregistered OSD, read surviving shards and regenerate the missing
 # one instead of failing the whole object.
@@ -26,6 +25,7 @@ futures = { workspace = true }
 openraft = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tower = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
