@@ -1915,25 +1915,18 @@ pub async fn list_objects(
 }
 
 /// Put object (PUT /{bucket}/{key})
-/// Outcome of comparing a CopyObject's source SSE state against the
-/// destination SSE decision resolved from the request + dest bucket.
-struct CopyDecision {
-    needs_reencrypt: bool,
-}
-
-/// Decide whether a CopyObject can stay on the metadata-only fast path.
-///
-/// Returns `Err(Response)` when either side uses SSE-C (not yet supported)
-/// or when reading the source / resolving the dest decision fails.
+/// Refuse a CopyObject whose source or destination uses SSE-C, which needs
+/// copy-source customer-key headers not wired through yet; and one whose
+/// source is not there. Everything else is copied by `copy_object_data`.
 #[allow(clippy::result_large_err)]
-async fn copy_sse_decision(
+async fn check_copy_sse(
     state: &Arc<AppState>,
     meta_client: &mut MetadataServiceClient<Channel>,
     source_bucket: &str,
     source_key: &str,
     dest_bucket: &str,
     copy_headers: &HeaderMap,
-) -> Result<CopyDecision, Response> {
+) -> Result<(), Response> {
     // Peek source's SSE state via its ObjectMeta. We need the primary OSD
     // for the source to read the meta; do a cheap GetPlacement.
     let src_placement = meta_client
@@ -2005,30 +1998,23 @@ async fn copy_sse_decision(
         ));
     }
 
-    // Fast-path eligibility: source and destination share exactly the same
-    // SSE parameters. Otherwise the bytes need to be re-encrypted.
-    let needs_reencrypt = match (src_algo, dst_decision.as_ref()) {
-        (SseAlgorithm::SseNone, None) => false,
-        (SseAlgorithm::SseS3, Some(d)) if d.algorithm == SseAlgorithm::SseS3 => false,
-        (SseAlgorithm::SseKms, Some(d))
-            if d.algorithm == SseAlgorithm::SseKms && d.kms_key_id == source_meta.kms_key_id =>
-        {
-            false
-        }
-        _ => true,
-    };
-
-    Ok(CopyDecision { needs_reencrypt })
+    Ok(())
 }
 
-/// Slow-path CopyObject: decrypt the source through the GET handler, then
-/// re-PUT through the normal PUT handler so the destination bucket's SSE
-/// settings (or request headers) control the re-encryption.
+/// CopyObject: read the source through the GET handler (reconstruction and
+/// decryption included), then write it through the PUT handler, so the copy
+/// has stripes of its own and the destination's SSE settings apply.
 ///
-/// Cheap and correct but buffers the object in memory — same shape as the
-/// rest of our PUT path (which is also `body: Bytes`). Streaming copies are
-/// a separate future improvement.
-async fn copy_object_reencrypt(
+/// Always this, never a metadata-only copy: a copy that shared the source's
+/// shards lost its data when the source was deleted, since nothing counted
+/// who else pointed at them -- and a rename through an S3 FUSE mount is a
+/// copy then a delete. Buffers the object in memory, as the rest of the PUT
+/// path does; streaming copies are a separate improvement.
+///
+/// Metadata follows S3's `x-amz-metadata-directive`: COPY (the default) keeps
+/// the source's content type, standard headers and user metadata; REPLACE
+/// takes them from the request.
+async fn copy_object_data(
     state: Arc<AppState>,
     dest_bucket: String,
     dest_key: String,
@@ -2038,7 +2024,7 @@ async fn copy_object_reencrypt(
     copy_headers: HeaderMap,
 ) -> Response {
     debug!(
-        "CopyObject re-encrypt: {}/{} -> {}/{}",
+        "CopyObject: {}/{} -> {}/{}",
         source_bucket, source_key, dest_bucket, dest_key
     );
 
@@ -2054,29 +2040,44 @@ async fn copy_object_reencrypt(
     if !get_resp.status().is_success() {
         return get_resp;
     }
-    let (_parts, body) = get_resp.into_parts();
+    let (source_parts, body) = get_resp.into_parts();
     let plaintext = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
-            error!("CopyObject re-encrypt: failed to buffer source: {e}");
+            error!("CopyObject: failed to buffer source: {e}");
             return S3Error::xml_response(
                 "InternalError",
-                "Failed to buffer source object for re-encryption",
+                "Failed to buffer the source object",
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
     };
 
-    // 2. Build headers for the destination PUT — carry over SSE settings
-    //    and content-type from the copy request, drop x-amz-copy-source so
-    //    the PUT handler doesn't recurse back into CopyObject.
+    // 2. Build headers for the destination PUT. SSE settings come from the
+    //    copy request; the object's own metadata from the source unless the
+    //    request says REPLACE. x-amz-copy-source is left out, so the PUT
+    //    handler does not recurse back into CopyObject.
+    let replace = copy_headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"));
+    let metadata_from = if replace {
+        &copy_headers
+    } else {
+        &source_parts.headers
+    };
     let mut put_headers = HeaderMap::new();
     for (name, value) in copy_headers.iter() {
-        let lower = name.as_str().to_lowercase();
-        if lower.starts_with("x-amz-server-side-encryption")
-            || lower == "content-type"
-            || lower.starts_with("x-amz-meta-")
+        if name
+            .as_str()
+            .to_lowercase()
+            .starts_with("x-amz-server-side-encryption")
         {
+            put_headers.insert(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in metadata_from.iter() {
+        if is_object_metadata_header(name.as_str()) {
             put_headers.insert(name.clone(), value.clone());
         }
     }
@@ -2084,6 +2085,7 @@ async fn copy_object_reencrypt(
     // 3. Re-PUT through the regular handler. Encryption/erasure-coding/
     //    metadata writing all happen through the same code path single-part
     //    PUTs use, so SSE transitions "just work".
+    let copied_bytes = plaintext.len();
     let put_resp = put_object(
         State(Arc::clone(&state)),
         Path((dest_bucket.clone(), dest_key.clone())),
@@ -2125,12 +2127,8 @@ async fn copy_object_reencrypt(
         .unwrap_or_default()
     );
     info!(
-        "CopyObject re-encrypt: {}/{} -> {}/{} ({} bytes)",
-        source_bucket,
-        source_key,
-        dest_bucket,
-        dest_key,
-        plaintext_len_hint(&put_resp),
+        "CopyObject: {}/{} -> {}/{} ({} bytes, copied)",
+        source_bucket, source_key, dest_bucket, dest_key, copied_bytes,
     );
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -2142,13 +2140,20 @@ async fn copy_object_reencrypt(
     builder.body(Body::from(xml)).unwrap()
 }
 
-/// Best-effort size hint for logging — parses `Content-Length` if present.
-fn plaintext_len_hint(resp: &Response) -> u64 {
-    resp.headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// Whether a header is part of what an object carries -- what a copy keeps
+/// from its source, or takes from the request under REPLACE.
+fn is_object_metadata_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("x-amz-meta-")
+        || matches!(
+            lower.as_str(),
+            "content-type"
+                | "content-encoding"
+                | "content-disposition"
+                | "content-language"
+                | "cache-control"
+                | "expires"
+        )
 }
 
 pub async fn put_object(
@@ -2168,10 +2173,10 @@ pub async fn put_object(
             decoded.trim_start_matches('/').to_string()
         });
 
-    // CopyObject: metadata-only fast path when source and destination SSE
-    // match; decrypt→re-encrypt slow path when they differ. SSE-C on either
-    // side is deliberately unsupported (requires a separate set of
-    // copy-source-* customer-key headers that we don't wire through yet).
+    // CopyObject: the source is read and written again as the destination
+    // (copy_object_data). SSE-C on either side is deliberately unsupported
+    // (requires a separate set of copy-source-* customer-key headers that we
+    // don't wire through yet).
     if let Some(ref source) = copy_source {
         // Parse source bucket/key (format: "bucket/key" or "/bucket/key")
         let parts: Vec<&str> = source.splitn(2, '/').collect();
@@ -2208,11 +2213,8 @@ pub async fn put_object(
 
         let mut meta_client = state.meta_client.clone();
 
-        // Pre-flight: peek at the source object's SSE state + resolve the
-        // destination SSE decision from headers/bucket-default. If they
-        // match, stay on the metadata-only fast path below. If they differ
-        // (and neither side is SSE-C), take the re-encrypting slow path.
-        let copy_decision = match copy_sse_decision(
+        // SSE-C on either side is refused; a missing source is NoSuchKey.
+        if let Err(resp) = check_copy_sse(
             &state,
             &mut meta_client,
             source_bucket,
@@ -2222,172 +2224,21 @@ pub async fn put_object(
         )
         .await
         {
-            Ok(d) => d,
-            Err(resp) => return resp,
-        };
-        if copy_decision.needs_reencrypt {
-            // Box-pin to break the `put_object ↔ copy_object_reencrypt`
-            // async recursion. The cycle is infrequent (only on
-            // SSE-transition copies) so the boxed allocation is fine.
-            return Box::pin(copy_object_reencrypt(
-                state.clone(),
-                bucket.clone(),
-                key.clone(),
-                source_bucket.to_string(),
-                source_key.to_string(),
-                auth.clone(),
-                headers.clone(),
-            ))
-            .await;
+            return resp;
         }
 
-        debug!(
-            "CopyObject fast-path: {}/{} -> {}/{}",
-            source_bucket, source_key, bucket, key
-        );
-
-        // Get source OSD via CRUSH placement
-        let src_placement = match meta_client
-            .get_placement(GetPlacementRequest {
-                bucket: source_bucket.to_string(),
-                key: source_key.to_string(),
-                size: 0,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-        {
-            Ok(resp) => resp.into_inner(),
-            Err(e) => {
-                error!("CopyObject: failed to get source placement: {}", e);
-                return S3Error::xml_response(
-                    "NoSuchKey",
-                    "The specified key does not exist",
-                    StatusCode::NOT_FOUND,
-                );
-            }
-        };
-
-        if src_placement.nodes.is_empty() {
-            return S3Error::xml_response(
-                "InternalError",
-                "No storage nodes available for source",
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-
-        // Get dest OSD via CRUSH placement
-        let dst_placement = match meta_client
-            .get_placement(GetPlacementRequest {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                size: 0,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-        {
-            Ok(resp) => resp.into_inner(),
-            Err(e) => {
-                error!("CopyObject: failed to get dest placement: {}", e);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
-        };
-
-        if dst_placement.nodes.is_empty() {
-            return S3Error::xml_response(
-                "InternalError",
-                "No storage nodes available for destination",
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-
-        // With ObjectMeta replicated on every shard-carrying OSD, CopyObject is
-        // always read-any + write-all. The old "same OSD fast path" using
-        // copy_object_meta_on_osd is no longer safe — it would leave the other
-        // replicas without the dest meta.
-        let dest_meta = {
-            let source_meta = match get_object_meta_from_any(
-                &state.osd_pool,
-                &src_placement.nodes,
-                source_bucket,
-                source_key,
-            )
-            .await
-            {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    return S3Error::xml_response(
-                        "NoSuchKey",
-                        "The specified key does not exist",
-                        StatusCode::NOT_FOUND,
-                    );
-                }
-                Err(e) => {
-                    error!("CopyObject: failed to read source meta: {}", e);
-                    return S3Error::xml_response(
-                        "InternalError",
-                        &e.to_string(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
-            };
-
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let new_etag = format!("{:x}", Uuid::new_v4().as_u128());
-            let dest_meta = ObjectMeta {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                etag: new_etag,
-                created_at: now,
-                modified_at: now,
-                ..source_meta
-            };
-
-            if let Err(e) = put_object_meta_to_all(
-                &state.osd_pool,
-                &dst_placement.nodes,
-                &bucket,
-                &key,
-                dest_meta.clone(),
-                false,
-            )
-            .await
-            {
-                error!("CopyObject: failed to write dest meta: {}", e);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
-            dest_meta
-        };
-
-        info!(
-            "CopyObject fast-path: {}/{} -> {}/{} ({} bytes, no data I/O)",
-            source_bucket, source_key, bucket, key, dest_meta.size
-        );
-
-        let xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-            to_xml(&CopyObjectResult {
-                etag: dest_meta.etag.clone(),
-                last_modified: timestamp_to_iso(dest_meta.modified_at),
-            })
-            .unwrap_or_default()
-        );
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/xml")
-            .header("ETag", dest_meta.etag)
-            .body(Body::from(xml))
-            .unwrap();
+        // Box-pin to break the `put_object ↔ copy_object_data` async
+        // recursion: the copy writes through this handler.
+        return Box::pin(copy_object_data(
+            state.clone(),
+            bucket.clone(),
+            key.clone(),
+            source_bucket.to_string(),
+            source_key.to_string(),
+            auth.clone(),
+            headers.clone(),
+        ))
+        .await;
     }
 
     debug!(
