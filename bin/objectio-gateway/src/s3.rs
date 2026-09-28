@@ -2085,6 +2085,7 @@ async fn copy_object_data(
     // 3. Re-PUT through the regular handler. Encryption/erasure-coding/
     //    metadata writing all happen through the same code path single-part
     //    PUTs use, so SSE transitions "just work".
+    let copied_bytes = plaintext.len();
     let put_resp = put_object(
         State(Arc::clone(&state)),
         Path((dest_bucket.clone(), dest_key.clone())),
@@ -2127,11 +2128,7 @@ async fn copy_object_data(
     );
     info!(
         "CopyObject: {}/{} -> {}/{} ({} bytes, copied)",
-        source_bucket,
-        source_key,
-        dest_bucket,
-        dest_key,
-        plaintext_len_hint(&put_resp),
+        source_bucket, source_key, dest_bucket, dest_key, copied_bytes,
     );
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -2157,15 +2154,6 @@ fn is_object_metadata_header(name: &str) -> bool {
                 | "cache-control"
                 | "expires"
         )
-}
-
-/// Best-effort size hint for logging — parses `Content-Length` if present.
-fn plaintext_len_hint(resp: &Response) -> u64 {
-    resp.headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }
 
 pub async fn put_object(
