@@ -1,6 +1,6 @@
 //! What a copy is: a second object, independent of the first.
 //!
-//! CopyObject used to take a "fast path" that wrote the destination's
+//! `CopyObject` used to take a "fast path" that wrote the destination's
 //! metadata as a clone of the source's -- the same stripes, the same shards --
 //! and copied no data. Nothing counted references, so deleting the source
 //! deleted the shards the copy still pointed at. A rename through an S3
@@ -48,7 +48,9 @@ fn a_large_copy_outlives_its_source() {
     let c = Cluster::start();
     c.json("POST", "/_admin/buckets", json!({"name": "big-renames"}))
         .expect_ok();
-    let payload: Vec<u8> = (0..(9 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..(9 * 1024 * 1024_u32))
+        .map(|i| (i % 251) as u8)
+        .collect();
     c.request("PUT", "/big-renames/a.bin", &payload).expect(200);
 
     copy(&c, "/big-renames/a.bin", "/big-renames/b.bin", &[]);
