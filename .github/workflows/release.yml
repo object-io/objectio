@@ -1,14 +1,22 @@
 # Manual release pipeline.
 #
 # How to run:
-#   GitHub UI → Actions → "Release" → "Run workflow"
-#     - version:    semver, no leading 'v' (e.g. 0.1.1)
-#     - prerelease: tick if this is an RC / beta
+#   main takes changes only through a pull request, so the version bump
+#   goes in first, as one:
+#     1. A PR "chore: release v<version>" setting [workspace.package].version
+#        in Cargo.toml, with the Cargo.lock that `cargo update --workspace`
+#        writes. Merge it.
+#   2. GitHub UI → Actions → "Release" → "Run workflow" (or
+#      `gh workflow run release.yml -f version=<version>`)
+#        - version:    semver, no leading 'v' (e.g. 0.1.1)
+#        - prerelease: tick if this is an RC / beta
+#   Dispatching without step 1 fails at the push: the bump commit it would
+#   make is refused by main's rules, and nothing is tagged or built.
 #
 # What it does:
-#   1. Validates the version, bumps [workspace.package].version in
-#      Cargo.toml on main, commits "chore: release v<version>",
-#      creates tag v<version>, pushes both.
+#   1. Validates the version and checks Cargo.toml on main already carries
+#      it (bumping and pushing it itself only where main allows that),
+#      creates tag v<version> on main's head and pushes it.
 #   2. Matrix-builds binaries for:
 #        linux-x86_64 (with ISA-L)
 #        linux-aarch64
