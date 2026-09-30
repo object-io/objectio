@@ -42,7 +42,7 @@ spec:
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: meta
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["objectio-meta"]
     args: ["--node-id", "1", "--listen", "$(HOST_IP):19100", "--admin-port", "19101",
            "--metrics-port", "0", "--data-dir", "/data/meta", "--ec-k", "4", "--ec-m", "2"]
@@ -69,7 +69,7 @@ spec:
       imagePullSecrets: [{name: ghcr-kvbench}]
       containers:
       - name: init
-        image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+        image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
         command: ["curl", "-sS", "--retry", "30", "--retry-connrefused", "--retry-delay", "2",
                   "-X", "POST", "-d", "{}", "-w", "\nHTTP %{http_code}\n",
                   "http://obio-meta.obio-rdma-test.svc.cluster.local:19101/init"]
@@ -88,7 +88,7 @@ spec:
   containers:
   - &osd
     name: osd-0
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["objectio-osd"]
     args: ["--listen", "$(HOST_IP):19200", "--advertise-addr", "http://$(HOST_IP):19200",
            "--meta-endpoint", "http://$(HOST_IP):19100",
@@ -168,7 +168,7 @@ spec:
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: gateway
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["objectio-gateway"]
     args: ["--listen", "127.0.0.1:19000", "--no-auth", "--ec-k", "4", "--ec-m", "2",
            "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
@@ -201,7 +201,7 @@ spec:
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: gateway
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["objectio-gateway"]
     args: ["--listen", "127.0.0.1:19010", "--no-auth", "--ec-k", "4", "--ec-m", "2",
            "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",

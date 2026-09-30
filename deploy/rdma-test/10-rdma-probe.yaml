@@ -23,7 +23,7 @@ spec:
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: probe
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["sleep", "infinity"]
     env:
     - name: HOST_IP
@@ -53,7 +53,7 @@ spec:
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: probe
-    image: ghcr.io/infinia-technology/objectio-rdma-test:e2829e1
+    image: ghcr.io/infinia-technology/objectio-rdma-test:734e730
     command: ["sleep", "infinity"]
     env:
     - name: HOST_IP
