@@ -22,6 +22,9 @@ RUN cmake -S . -B build -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
       -DWITH_P2P_STORE=OFF -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
       -DUSE_ETCD=OFF -DUSE_CUDA=OFF -DWITH_RUST_EXAMPLE=OFF \
  && cmake --build build -j"$(nproc)"
+# ISA-L erasure coding (x86_64): built by erasure-isa-l, which needs these.
+# A layer of its own, after Mooncake, so Mooncake's cached layers survive.
+RUN apt-get install -y nasm autoconf automake libtool
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 ENV PATH=/root/.cargo/bin:$PATH \
     MOONCAKE_BUILD_DIR=/mooncake/build \
@@ -30,8 +33,8 @@ COPY . /src
 WORKDIR /src
 RUN cargo build --release \
       -p objectio-meta -p objectio-s3-bench \
-      -p objectio-osd --features objectio-osd/rdma \
-      -p objectio-gateway --features objectio-gateway/rdma \
+      -p objectio-osd --features objectio-osd/rdma,objectio-osd/isal \
+      -p objectio-gateway --features objectio-gateway/rdma,objectio-gateway/isal \
  && cargo build --release -p objectio-transport-te --features te --example te-bench \
  && mkdir -p /out/bin /out/lib \
  && cp target/release/objectio-meta target/release/objectio-osd \
