@@ -7,7 +7,8 @@
 # The fabric is rail-optimised: every process must use the same rail. mlx5_0
 # (rdma/hca_gpu0) is the one kvbench's RDMA gate measured at ~391 Gb/s on all
 # node pairs. No Multus, so RoCE needs hostNetwork plus the rdma/hca_gpu*
-# resource. Low priority, so production workloads always win.
+# resource — the only thing requested: no priority class and no CPU or
+# memory requests, so these pods can never preempt anything (see README).
 apiVersion: v1
 kind: Pod
 metadata:
@@ -17,7 +18,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   restartPolicy: Never
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
   imagePullSecrets: [{name: ghcr-kvbench}]
@@ -34,8 +34,8 @@ spec:
     - name: MC_TCP_BIND_ADDRESS
       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
     resources:
-      requests: {cpu: "4", memory: 8Gi, rdma/hca_gpu0: "1"}
-      limits: {memory: 8Gi, rdma/hca_gpu0: "1"}
+      requests: {rdma/hca_gpu0: "1"}
+      limits: {rdma/hca_gpu0: "1"}
     securityContext:
       capabilities: {add: [IPC_LOCK]}
 ---
@@ -48,7 +48,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   restartPolicy: Never
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
   imagePullSecrets: [{name: ghcr-kvbench}]
@@ -65,7 +64,7 @@ spec:
     - name: MC_TCP_BIND_ADDRESS
       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
     resources:
-      requests: {cpu: "4", memory: 8Gi, rdma/hca_gpu0: "1"}
-      limits: {memory: 8Gi, rdma/hca_gpu0: "1"}
+      requests: {rdma/hca_gpu0: "1"}
+      limits: {rdma/hca_gpu0: "1"}
     securityContext:
       capabilities: {add: [IPC_LOCK]}

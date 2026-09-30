@@ -38,7 +38,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
@@ -50,9 +49,6 @@ spec:
     env:
     - name: HOST_IP
       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
-    resources:
-      requests: {cpu: "2", memory: 4Gi}
-      limits: {memory: 4Gi}
     volumeMounts: [{name: meta-data, mountPath: /data}]
   volumes:
   - {name: meta-data, emptyDir: {}}
@@ -70,7 +66,6 @@ spec:
   template:
     spec:
       restartPolicy: OnFailure
-      priorityClassName: build-preemptible
       imagePullSecrets: [{name: ghcr-kvbench}]
       containers:
       - name: init
@@ -88,7 +83,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
@@ -98,7 +92,7 @@ spec:
     command: ["objectio-osd"]
     args: ["--listen", "$(HOST_IP):19200", "--advertise-addr", "http://$(HOST_IP):19200",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-0/state", "--disks", "/data/osd-0/disk.raw",
+           "--data-dir", "/data/osd-0", "--disks", "/data/osd-0/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
     env: &osd-env
@@ -110,44 +104,51 @@ spec:
     - name: MC_TCP_BIND_ADDRESS
       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
     resources: &osd-resources
-      requests: {cpu: "2", memory: 4Gi, rdma/hca_gpu0: "1"}
-      limits: {memory: 4Gi, rdma/hca_gpu0: "1"}
+      requests: {rdma/hca_gpu0: "1"}
+      limits: {rdma/hca_gpu0: "1"}
     securityContext: &ipc-lock
       capabilities: {add: [IPC_LOCK]}
-    volumeMounts: [{name: osd-data, mountPath: /data}]
+    # Each OSD gets its own sub-directory, which the kubelet creates: the
+    # OSD does not create a missing parent directory for its disk file.
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-0, subPath: osd-0}]
   - <<: *osd
     name: osd-1
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-1, subPath: osd-1}]
     args: ["--listen", "$(HOST_IP):19201", "--advertise-addr", "http://$(HOST_IP):19201",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-1/state", "--disks", "/data/osd-1/disk.raw",
+           "--data-dir", "/data/osd-1", "--disks", "/data/osd-1/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
   - <<: *osd
     name: osd-2
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-2, subPath: osd-2}]
     args: ["--listen", "$(HOST_IP):19202", "--advertise-addr", "http://$(HOST_IP):19202",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-2/state", "--disks", "/data/osd-2/disk.raw",
+           "--data-dir", "/data/osd-2", "--disks", "/data/osd-2/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
   - <<: *osd
     name: osd-3
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-3, subPath: osd-3}]
     args: ["--listen", "$(HOST_IP):19203", "--advertise-addr", "http://$(HOST_IP):19203",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-3/state", "--disks", "/data/osd-3/disk.raw",
+           "--data-dir", "/data/osd-3", "--disks", "/data/osd-3/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
   - <<: *osd
     name: osd-4
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-4, subPath: osd-4}]
     args: ["--listen", "$(HOST_IP):19204", "--advertise-addr", "http://$(HOST_IP):19204",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-4/state", "--disks", "/data/osd-4/disk.raw",
+           "--data-dir", "/data/osd-4", "--disks", "/data/osd-4/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
   - <<: *osd
     name: osd-5
+    volumeMounts: [{name: osd-data, mountPath: /data/osd-5, subPath: osd-5}]
     args: ["--listen", "$(HOST_IP):19205", "--advertise-addr", "http://$(HOST_IP):19205",
            "--meta-endpoint", "http://$(HOST_IP):19100",
-           "--data-dir", "/data/osd-5/state", "--disks", "/data/osd-5/disk.raw",
+           "--data-dir", "/data/osd-5", "--disks", "/data/osd-5/disk.raw",
            "--metrics-port", "0",
            "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
   volumes:
@@ -163,7 +164,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
@@ -183,8 +183,8 @@ spec:
     - name: MC_TCP_BIND_ADDRESS
       valueFrom: {fieldRef: {fieldPath: status.hostIP}}
     resources:
-      requests: {cpu: "8", memory: 16Gi, rdma/hca_gpu0: "1"}
-      limits: {memory: 16Gi, rdma/hca_gpu0: "1"}
+      requests: {rdma/hca_gpu0: "1"}
+      limits: {rdma/hca_gpu0: "1"}
     securityContext:
       capabilities: {add: [IPC_LOCK]}
 ---
@@ -197,7 +197,6 @@ metadata:
 spec:
   hostNetwork: true
   dnsPolicy: ClusterFirstWithHostNet
-  priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
   imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
@@ -207,6 +206,3 @@ spec:
     args: ["--listen", "127.0.0.1:19010", "--no-auth", "--ec-k", "4", "--ec-m", "2",
            "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
            "--external-endpoint", "http://127.0.0.1:19010"]
-    resources:
-      requests: {cpu: "8", memory: 16Gi}
-      limits: {memory: 16Gi}

@@ -7,7 +7,13 @@ with production:
 
 - **Only `obio-rdma-test` is ours.** Never apply to, or delete from, any other
   namespace.
-- Every pod is `build-preemptible`, so production workloads always win.
+- **No priority class and no CPU or memory requests** on any pod — only the
+  `rdma/hca_gpu0` device slot the RDMA containers need. At priority 0 and
+  best-effort, these pods can never preempt anything; if a node is full they
+  wait in Pending, and they are the first evicted under pressure.
+  (A first attempt used `build-preemptible`, priority 75. Production pods here
+  mostly have no priority class — 0 — so the 12-CPU OSD pod, not fitting on a
+  node whose CPU was 90% requested, preempted a vLLM deployment. Never again.)
 - The API gateway rejects shell text (`bash -c`, redirections, `/proc`). Nothing
   here uses a shell: manifests pass arguments directly, `$(VAR)` is expanded by
   Kubernetes, and every `kubectl exec` below runs a binary with plain arguments.
