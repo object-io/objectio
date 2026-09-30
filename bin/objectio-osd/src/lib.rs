@@ -4,6 +4,8 @@
 //! in-process by `bin/objectio-aio`.
 
 pub mod discovery;
+#[cfg(feature = "rdma")]
+pub mod rdma;
 pub mod service;
 mod usage;
 
@@ -92,6 +94,25 @@ pub struct Args {
     /// Metrics server port (Prometheus)
     #[arg(long, default_value = "9201")]
     pub metrics_port: u16,
+
+    /// Accept shard transfers over Mooncake Transfer Engine: `rdma`, or
+    /// `tcp` to develop without RDMA hardware. Unset: gRPC bytes only.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    pub rdma: Option<String>,
+
+    /// Address Transfer Engine binds and advertises — one on the storage
+    /// network, never a public one. Defaults to the host of
+    /// --advertise-addr.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    pub rdma_host: Option<String>,
+
+    /// 4 MiB staging slots, which bound concurrent RDMA shard transfers.
+    /// When they are all busy the gateway sends the shard over gRPC.
+    #[cfg(feature = "rdma")]
+    #[arg(long, default_value_t = 64)]
+    pub rdma_staging_slots: usize,
 }
 
 /// Configuration file structure
@@ -416,6 +437,24 @@ pub async fn run(
         None => advertise_addr,
     };
     info!("Advertising at: {}", advertise_addr);
+
+    // Before registering, so the segment goes to meta with the address.
+    #[cfg(feature = "rdma")]
+    if let Some(protocol) = args.rdma.as_deref() {
+        let protocol = rdma::parse_protocol(protocol).map_err(|e| anyhow::anyhow!(e))?;
+        let host = args
+            .rdma_host
+            .clone()
+            .unwrap_or_else(|| host_of(&advertise_addr).to_string());
+        let staging = rdma::RdmaStaging::start(protocol, &host, args.rdma_staging_slots)
+            .map_err(|e| anyhow::anyhow!("rdma ({protocol:?} on {host}): {e}"))?;
+        info!(
+            "Transfer Engine ({protocol:?}) segment {}, {} staging slots",
+            staging.segment(),
+            args.rdma_staging_slots
+        );
+        osd_service.enable_rdma(staging);
+    }
     // For a supervisor (aio) that let the OS pick the port.
     let addr_file = PathBuf::from(&data_dir).join("osd.addr");
     if let Err(e) = std::fs::write(&addr_file, &advertise_addr) {
@@ -626,8 +665,7 @@ async fn register_with_meta(
             node_name: node_name.unwrap_or_default().to_string(),
             weight,
             disk_capacity_bytes: disk_capacity_bytes.to_vec(),
-            // Set once the OSD runs a Transfer Engine (feature `rdma`).
-            te_segment: String::new(),
+            te_segment: osd_service.te_segment(),
         })
         .await
         .map_err(|e| format!("Failed to register OSD: {}", e))?;
@@ -944,4 +982,14 @@ async fn heartbeat_loop(meta_endpoint: &str, node_id: &[u8; 16], _disk_ids: &[Ve
             meta_endpoint
         );
     }
+}
+
+/// The host part of an `http://host:port` address.
+#[cfg(feature = "rdma")]
+fn host_of(addr: &str) -> &str {
+    let rest = addr
+        .strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .unwrap_or(addr);
+    rest.rsplit_once(':').map_or(rest, |(host, _)| host)
 }

@@ -133,6 +133,7 @@ objectio-iceberg = { path = "crates/objectio-iceberg" }
 objectio-delta-sharing = { path = "crates/objectio-delta-sharing" }
 objectio-unity-catalog = { path = "crates/objectio-unity-catalog" }
 objectio-kms = { path = "crates/objectio-kms" }
+objectio-transport-te = { path = "crates/objectio-transport-te" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -129,9 +129,10 @@ message ReadShardRequest {
 }
 
 message ReadShardResponse {
-    bytes data = 1;
+    bytes data = 1;         // Empty when the request carried `rdma_dest`
     Checksum checksum = 2;
     uint64 timestamp = 3;
+    uint64 rdma_len = 4;    // Bytes written to `rdma_dest`, when it was set
 }
 
 // Delete shard request
