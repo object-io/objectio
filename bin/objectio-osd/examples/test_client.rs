@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let write_response = client
         .write_shard(WriteShardRequest {
+            rdma: None,
             shard_id: Some(ShardId {
                 object_id: object_id.to_vec(),
                 stripe_id: 0,
@@ -85,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Read Shard ---");
     let read_response = client
         .read_shard(ReadShardRequest {
+            rdma_dest: None,
             shard_id: Some(ShardId {
                 object_id: object_id.to_vec(),
                 stripe_id: 0,

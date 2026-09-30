@@ -3236,6 +3236,7 @@ pub async fn get_object(
                 )
                 .await;
                 let node_placement = objectio_proto::metadata::NodePlacement {
+                    te_segment: String::new(),
                     position: shard_loc.position,
                     node_id: shard_loc.node_id.clone(),
                     node_address: node_addr,
@@ -3396,6 +3397,7 @@ pub async fn get_object(
                 )
                 .await;
                 let node_placement = objectio_proto::metadata::NodePlacement {
+                    te_segment: String::new(),
                     position: shard_loc.position,
                     node_id: shard_loc.node_id.clone(),
                     node_address: node_addr,

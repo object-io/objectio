@@ -456,6 +456,7 @@ async fn migrate_shard_one(
     let read_result = tokio::time::timeout(
         PER_OSD_TIMEOUT,
         source.read_shard(ReadShardRequest {
+            rdma_dest: None,
             shard_id: Some(shard_id.clone()),
             offset: 0,
             length: 0,
@@ -516,6 +517,7 @@ async fn migrate_shard_one(
     let write_resp = tokio::time::timeout(
         PER_OSD_TIMEOUT,
         target.write_shard(WriteShardRequest {
+            rdma: None,
             shard_id: Some(shard_id.clone()),
             data: bytes,
             ec_k: 0, // Not inspected by OSD; kept for wire-compat.
@@ -795,6 +797,7 @@ async fn reconstruct_dangling_shard(
             let bytes = tokio::time::timeout(
                 PER_OSD_TIMEOUT,
                 client.read_shard(ReadShardRequest {
+                    rdma_dest: None,
                     shard_id: Some(ShardId {
                         object_id,
                         stripe_id,
@@ -901,6 +904,7 @@ async fn reconstruct_dangling_shard(
     let write_resp = tokio::time::timeout(
         PER_OSD_TIMEOUT,
         target.write_shard(WriteShardRequest {
+            rdma: None,
             shard_id: Some(shard_id),
             data: reconstructed.into(),
             ec_k: ec_k as u32,

@@ -191,6 +191,7 @@ pub async fn run(
                 topology: None,
                 disk_capacity_bytes: vec![0],
                 admin_state: objectio_common::OsdAdminState::default(),
+                te_segment: String::new(),
             };
             meta_service.register_osd(node);
         }

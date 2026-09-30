@@ -626,6 +626,8 @@ async fn register_with_meta(
             node_name: node_name.unwrap_or_default().to_string(),
             weight,
             disk_capacity_bytes: disk_capacity_bytes.to_vec(),
+            // Set once the OSD runs a Transfer Engine (feature `rdma`).
+            te_segment: String::new(),
         })
         .await
         .map_err(|e| format!("Failed to register OSD: {}", e))?;
