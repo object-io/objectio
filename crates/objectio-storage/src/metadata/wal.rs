@@ -18,7 +18,7 @@ use super::types::{MetadataEntry, MetadataOp};
 use objectio_common::{Error, Result};
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -165,6 +165,53 @@ pub struct MetadataWal {
     sync_handle: File,
 }
 
+/// The whole records of a WAL file, in order. Ends at the end of the file
+/// or at the first record that is torn or corrupt, whatever its size.
+struct Records {
+    reader: BufReader<File>,
+    /// Bytes in the file.
+    len: u64,
+    /// Where the last whole record read so far ends.
+    end: u64,
+}
+
+impl Records {
+    fn new(file: File) -> Self {
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Self {
+            reader: BufReader::with_capacity(64 * 1024, file),
+            len,
+            end: 0,
+        }
+    }
+}
+
+impl Iterator for Records {
+    type Item = WalRecord;
+
+    fn next(&mut self) -> Option<WalRecord> {
+        let mut header = [0u8; RECORD_HEADER_SIZE];
+        self.reader.read_exact(&mut header).ok()?;
+        if u32::from_le_bytes(header[0..4].try_into().unwrap()) != WAL_MAGIC {
+            return None;
+        }
+        let data_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let total = RECORD_HEADER_SIZE + data_len + 4;
+        // A corrupt length must not make us allocate more than the file holds.
+        if self.end + total as u64 > self.len {
+            return None;
+        }
+        let mut buf = vec![0u8; total];
+        buf[..RECORD_HEADER_SIZE].copy_from_slice(&header);
+        self.reader
+            .read_exact(&mut buf[RECORD_HEADER_SIZE..])
+            .ok()?;
+        let (record, size) = WalRecord::from_bytes(&buf).ok()?;
+        self.end += size as u64;
+        Some(record)
+    }
+}
+
 impl MetadataWal {
     /// Create a new WAL file
     pub fn create(path: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
@@ -209,6 +256,21 @@ impl MetadataWal {
             .open(&path)
             .map_err(|e| Error::Storage(format!("failed to open WAL: {}", e)))?;
 
+        // Appends go at the end of the file. Left in place, a torn tail would
+        // sit between the log and them, and the next scan, stopping at the
+        // tail, would never reach them.
+        let on_disk = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if on_disk > file_size {
+            tracing::warn!(
+                "WAL {}: cutting off {} bytes after the last whole record (LSN {last_lsn})",
+                path.display(),
+                on_disk - file_size
+            );
+            file.set_len(file_size)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| Error::Storage(format!("failed to cut off WAL tail: {}", e)))?;
+        }
+
         let sync_handle = file
             .try_clone()
             .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {}", e)))?;
@@ -229,7 +291,10 @@ impl MetadataWal {
         })
     }
 
-    /// Scan WAL to find last LSN and file size
+    /// Scan the WAL for its last LSN and where its last whole record ends.
+    ///
+    /// Anything after that — a record torn by a crash mid-append, or bytes
+    /// that are not a record — is not part of the log.
     fn scan_wal(path: &Path) -> Result<(u64, u64)> {
         let file = match File::open(path) {
             Ok(f) => f,
@@ -240,47 +305,12 @@ impl MetadataWal {
                 return Err(Error::Storage(format!("failed to open WAL: {}", e)));
             }
         };
-
-        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if file_size == 0 {
-            return Ok((0, 0));
-        }
-
-        let mut reader = BufReader::new(file);
-        let mut buf = vec![0u8; 64 * 1024]; // 64KB read buffer
+        let mut records = Records::new(file);
         let mut last_lsn = 0u64;
-        let mut pos = 0u64;
-
-        loop {
-            // Read chunk
-            let bytes_read = reader.read(&mut buf).unwrap_or(0);
-            if bytes_read == 0 {
-                break;
-            }
-
-            // Parse records from chunk
-            let mut offset = 0;
-            while offset + RECORD_HEADER_SIZE + 4 <= bytes_read {
-                match WalRecord::from_bytes(&buf[offset..bytes_read]) {
-                    Ok((record, size)) => {
-                        last_lsn = record.lsn;
-                        offset += size;
-                        pos += size as u64;
-                    }
-                    Err(_) => {
-                        // Partial or corrupted record - stop here
-                        break;
-                    }
-                }
-            }
-
-            // If we didn't consume the whole buffer, seek back
-            if offset < bytes_read {
-                let _ = reader.seek(SeekFrom::Current(-((bytes_read - offset) as i64)));
-            }
+        for record in &mut records {
+            last_lsn = record.lsn;
         }
-
-        Ok((last_lsn, pos))
+        Ok((last_lsn, records.end))
     }
 
     /// Append a metadata operation to the WAL.
@@ -402,35 +432,14 @@ impl MetadataWal {
         let file = File::open(&self.path)
             .map_err(|e| Error::Storage(format!("failed to open WAL for replay: {}", e)))?;
 
-        let mut reader = BufReader::new(file);
-        let mut buf = vec![0u8; 64 * 1024];
         let mut last_lsn = from_lsn.saturating_sub(1);
-
-        loop {
-            let bytes_read = reader.read(&mut buf).unwrap_or(0);
-            if bytes_read == 0 {
-                break;
+        for record in Records::new(file) {
+            if record.lsn >= from_lsn
+                && let Some(op) = MetadataOp::from_bytes(&record.data)
+            {
+                callback(record.lsn, op)?;
             }
-
-            let mut offset = 0;
-            while offset + RECORD_HEADER_SIZE + 4 <= bytes_read {
-                match WalRecord::from_bytes(&buf[offset..bytes_read]) {
-                    Ok((record, size)) => {
-                        if record.lsn >= from_lsn
-                            && let Some(op) = MetadataOp::from_bytes(&record.data)
-                        {
-                            callback(record.lsn, op)?;
-                        }
-                        last_lsn = record.lsn;
-                        offset += size;
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if offset < bytes_read {
-                let _ = reader.seek(SeekFrom::Current(-((bytes_read - offset) as i64)));
-            }
+            last_lsn = record.lsn;
         }
 
         Ok(last_lsn)
@@ -861,5 +870,113 @@ mod group_commit_tests {
             w.append(&op(i)).expect("append");
         }
         assert!(w.current_lsn() >= 32);
+    }
+
+    /// Every key and value the WAL at `path` replays, in order.
+    fn replayed(path: &Path) -> Vec<(u64, Vec<u8>)> {
+        let wal = MetadataWal::open(path, WalConfig::default()).unwrap();
+        let mut out = Vec::new();
+        wal.replay(0, |lsn, op| {
+            if let MetadataOp::Put { value, .. } = op {
+                out.push((lsn, value));
+            }
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn put(wal: &MetadataWal, n: u64, value: Vec<u8>) -> u64 {
+        wal.append(&MetadataOp::Put {
+            key: MetadataKey::block(n),
+            value,
+        })
+        .unwrap()
+    }
+
+    /// Scanning read the log in 64 KiB chunks and, on a record that did not
+    /// fit in one, seeked back and read the same chunk again, forever: the
+    /// OSD hung opening its metadata store. The ObjectMeta of an object of
+    /// a few GiB — a couple of hundred stripes — is such a record.
+    #[test]
+    fn records_larger_than_the_read_buffer_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.wal");
+        let big = vec![7u8; 1024 * 1024];
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            put(&wal, 1, b"small".to_vec());
+            put(&wal, 2, big.clone());
+            put(&wal, 3, b"after".to_vec());
+        }
+        assert_eq!(
+            replayed(&path),
+            vec![(1, b"small".to_vec()), (2, big), (3, b"after".to_vec())]
+        );
+    }
+
+    /// A crash mid-append leaves a torn record at the end. The log ends at
+    /// the last whole record — and appends after the restart go there, not
+    /// after the torn bytes, where the next restart would never reach them.
+    #[test]
+    fn a_torn_last_record_is_cut_off_and_later_appends_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.wal");
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            put(&wal, 1, b"one".to_vec());
+            put(&wal, 2, b"two".to_vec());
+        }
+        let len = std::fs::metadata(&path).unwrap().len();
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(len - 3).unwrap();
+        drop(f);
+
+        {
+            let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+            assert_eq!(wal.current_lsn(), 1);
+            assert_eq!(put(&wal, 2, b"two again".to_vec()), 2);
+        }
+        assert_eq!(
+            replayed(&path),
+            vec![(1, b"one".to_vec()), (2, b"two again".to_vec())]
+        );
+    }
+
+    /// The same for bytes that are not a record at all, including a header
+    /// whose length field claims more than the file holds.
+    #[test]
+    fn garbage_after_the_last_record_is_cut_off() {
+        for garbage in [
+            vec![0xAB; 5],
+            vec![0u8; 100],
+            [
+                &WAL_MAGIC.to_le_bytes()[..],
+                &9u64.to_le_bytes(),
+                &u32::MAX.to_le_bytes(),
+            ]
+            .concat(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("junk.wal");
+            {
+                let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+                put(&wal, 1, b"one".to_vec());
+            }
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&garbage).unwrap();
+            drop(f);
+
+            {
+                let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+                assert_eq!(put(&wal, 2, b"two".to_vec()), 2);
+            }
+            assert_eq!(
+                replayed(&path),
+                vec![(1, b"one".to_vec()), (2, b"two".to_vec())],
+                "after {} bytes of garbage",
+                garbage.len()
+            );
+        }
     }
 }
