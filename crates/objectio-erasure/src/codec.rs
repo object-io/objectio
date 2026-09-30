@@ -26,6 +26,7 @@
 //! ```
 
 use crate::backend::{BackendConfig, BackendFactory, ErasureBackend, LrcBackend};
+use bytes::Bytes;
 use objectio_common::{ErasureConfig, ErasureType, Error as CommonError, Result};
 use std::sync::Arc;
 use thiserror::Error;
@@ -165,13 +166,60 @@ impl ErasureCodec {
         res
     }
 
+    /// Shard size for `len` bytes over `k` data shards.
+    ///
+    /// Must be a multiple of 64 for SIMD alignment (reed-solomon-simd
+    /// requires at least a multiple of 2, we use 64 for performance).
+    fn shard_size_for(len: usize, k: usize) -> usize {
+        len.div_ceil(k).next_multiple_of(64).max(64)
+    }
+
+    /// As [`encode`](Self::encode), with every shard a slice of one buffer.
+    ///
+    /// The data is copied once into a buffer laid out as k data shards then
+    /// m parity shards, parity is computed in place, and each returned shard
+    /// is a zero-copy view of it — so fanning shards out to OSDs, or handing
+    /// them to gRPC, never copies them again.
+    pub fn encode_bytes(&self, data: &[u8]) -> Result<Vec<Bytes>> {
+        let started = std::time::Instant::now();
+        let res = self.encode_bytes_inner(data);
+        crate::metrics::ENCODE_SECONDS.observe_duration(started.elapsed());
+        res
+    }
+
+    fn encode_bytes_inner(&self, data: &[u8]) -> Result<Vec<Bytes>> {
+        // LRC shards come back from the backend already owned; wrapping a
+        // Vec in Bytes takes it over without copying.
+        let CodecBackend::Mds(backend) = &self.backend else {
+            return Ok(self
+                .encode_inner(data)?
+                .into_iter()
+                .map(Bytes::from)
+                .collect());
+        };
+
+        let k = self.data_shards();
+        let total = self.total_shards();
+        let shard_size = Self::shard_size_for(data.len(), k);
+
+        let mut stripe = vec![0u8; shard_size * total];
+        stripe[..data.len()].copy_from_slice(data);
+        let (data_part, parity_part) = stripe.split_at_mut(shard_size * k);
+        let data_shards: Vec<&[u8]> = data_part.chunks_exact(shard_size).collect();
+        let mut parity: Vec<&mut [u8]> = parity_part.chunks_exact_mut(shard_size).collect();
+        backend
+            .encode_parity_into(&data_shards, &mut parity, shard_size)
+            .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
+
+        let stripe = Bytes::from(stripe);
+        Ok((0..total)
+            .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
+            .collect())
+    }
+
     fn encode_inner(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
         let k = self.data_shards();
-
-        // Calculate shard size: must be a multiple of 64 for SIMD alignment
-        // (reed-solomon-simd requires at least multiple of 2, we use 64 for performance)
-        let raw_shard_size = data.len().div_ceil(k);
-        let shard_size = raw_shard_size.next_multiple_of(64).max(64);
+        let shard_size = Self::shard_size_for(data.len(), k);
         let padded_size = shard_size * k;
 
         // Create padded data
@@ -201,12 +249,17 @@ impl ErasureCodec {
 
     /// Decode shards back to original data
     ///
-    /// Takes a vector of Option<Vec<u8>> where None represents missing shards.
-    /// At least k shards must be present to reconstruct the data.
+    /// Takes one slot per shard, `None` for a missing one; a shard can be
+    /// any byte container (`Vec<u8>`, `Bytes`). At least k shards must be
+    /// present to reconstruct the data.
     ///
     /// For LRC mode, this will attempt local recovery first (using only the
     /// local parity group) before falling back to global recovery.
-    pub fn decode(&self, shards: &mut [Option<Vec<u8>>], original_size: usize) -> Result<Vec<u8>> {
+    pub fn decode<S: AsRef<[u8]>>(
+        &self,
+        shards: &mut [Option<S>],
+        original_size: usize,
+    ) -> Result<Vec<u8>> {
         // "reconstruct" when a data shard is missing and parity has to be
         // used — the slow path, and a sign of a degraded read.
         let k = self.data_shards();
@@ -221,9 +274,9 @@ impl ErasureCodec {
         res
     }
 
-    fn decode_inner(
+    fn decode_inner<S: AsRef<[u8]>>(
         &self,
-        shards: &mut [Option<Vec<u8>>],
+        shards: &mut [Option<S>],
         original_size: usize,
     ) -> Result<Vec<u8>> {
         let k = self.data_shards();
@@ -241,7 +294,7 @@ impl ErasureCodec {
         // Get shard size from first available shard
         let shard_size = shards
             .iter()
-            .find_map(|s| s.as_ref().map(|v| v.len()))
+            .find_map(|s| s.as_ref().map(|v| v.as_ref().len()))
             .ok_or(ErasureError::InsufficientShards {
                 available: 0,
                 required: k,
@@ -252,7 +305,7 @@ impl ErasureCodec {
         if data_shards_ok {
             let mut result = Vec::with_capacity(k * shard_size);
             for data in shards.iter().take(k).flatten() {
-                result.extend_from_slice(data);
+                result.extend_from_slice(data.as_ref());
             }
             result.truncate(original_size);
             return Ok(result);
@@ -270,7 +323,7 @@ impl ErasureCodec {
             CodecBackend::Mds(backend) => {
                 let shard_refs: Vec<Option<&[u8]>> = shards
                     .iter()
-                    .map(|s| s.as_ref().map(|v| v.as_slice()))
+                    .map(|s| s.as_ref().map(AsRef::as_ref))
                     .collect();
                 backend
                     .decode(&shard_refs, shard_size, &missing_indices)
@@ -291,7 +344,7 @@ impl ErasureCodec {
                                 if let Some(ref rec) = recovered_shards[i] {
                                     Some(rec.as_slice())
                                 } else {
-                                    shards[i].as_deref()
+                                    shards[i].as_ref().map(AsRef::as_ref)
                                 }
                             })
                             .collect();
@@ -312,7 +365,7 @@ impl ErasureCodec {
                         if let Some(ref rec) = recovered_shards[i] {
                             Some(rec.as_slice())
                         } else {
-                            shards[i].as_deref()
+                            shards[i].as_ref().map(AsRef::as_ref)
                         }
                     })
                     .collect();
@@ -329,7 +382,7 @@ impl ErasureCodec {
                             if let Some(rec) = recovered_shards[i].take() {
                                 rec
                             } else if let Some(ref orig) = shards[i] {
-                                orig.clone()
+                                orig.as_ref().to_vec()
                             } else {
                                 vec![0u8; shard_size]
                             }
@@ -477,6 +530,42 @@ impl Default for ErasureCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_bytes_matches_encode() {
+        // Sizes that pad (not a multiple of k * 64) and ones that do not.
+        let data: Vec<u8> = (0..1_000_003u32).map(|i| (i * 7 + 3) as u8).collect();
+        for config in [
+            ErasureConfig::new(4, 2),
+            ErasureConfig::new(8, 3),
+            ErasureConfig::lrc(6, 2, 2),
+        ] {
+            let codec = ErasureCodec::new(config).unwrap();
+            for len in [1, 63, 4096, 1_000_003] {
+                let owned = codec.encode(&data[..len]).unwrap();
+                let bytes = codec.encode_bytes(&data[..len]).unwrap();
+                assert_eq!(owned.len(), bytes.len());
+                for (a, b) in owned.iter().zip(&bytes) {
+                    assert_eq!(a.as_slice(), b.as_ref(), "{config:?} len={len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_accepts_bytes_and_recovers_from_parity() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let mut shards: Vec<Option<Bytes>> = codec
+            .encode_bytes(&data)
+            .unwrap()
+            .into_iter()
+            .map(Some)
+            .collect();
+        shards[0] = None;
+        shards[3] = None;
+        assert_eq!(codec.decode(&mut shards, data.len()).unwrap(), data);
+    }
 
     #[test]
     fn test_encode_decode_mds() {

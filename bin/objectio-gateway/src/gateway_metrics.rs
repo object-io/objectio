@@ -9,7 +9,7 @@ use objectio_common::histogram::{
     CounterVec, GaugeVec, HistogramVec, LATENCY_BUCKETS, SIZE_BUCKETS, label_value,
 };
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The S3 error name carried on an error response, set by whoever built
 /// it, so the metrics layer can label the failure without parsing XML.
@@ -22,6 +22,7 @@ static IN_FLIGHT: LazyLock<GaugeVec> = LazyLock::new(GaugeVec::new);
 static REQUEST_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(SIZE_BUCKETS));
 static SHARD_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static OSD_ERRORS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
 const KNOWN_CODES: &[u16] = &[
@@ -108,6 +109,37 @@ pub fn record_osd_error(address: &str, kind: &str) {
     ));
 }
 
+/// Splits one request's time into consecutive phases. Each [`mark`] records
+/// the time since the previous one, so the phases of a request add up to the
+/// part of it the handler spent between the first and last mark.
+///
+/// [`mark`]: Self::mark
+pub struct PhaseTimer {
+    operation: &'static str,
+    last: Instant,
+}
+
+impl PhaseTimer {
+    #[must_use]
+    pub fn start(operation: &'static str) -> Self {
+        Self {
+            operation,
+            last: Instant::now(),
+        }
+    }
+
+    /// End the current phase and name it. `phase` is a fixed identifier
+    /// from the handler, never request data.
+    pub fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        PHASE_LATENCY.observe_duration(
+            &format!("operation=\"{}\",phase=\"{phase}\"", self.operation),
+            now - self.last,
+        );
+        self.last = now;
+    }
+}
+
 /// Everything above, plus erasure coding time, as Prometheus families.
 #[must_use]
 pub fn render() -> String {
@@ -137,6 +169,12 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_shard_latency_seconds",
         "Time for one shard read or write to an OSD, by OSD",
+        "",
+    );
+    PHASE_LATENCY.render(
+        &mut out,
+        "objectio_gateway_request_phase_seconds",
+        "Time spent in each phase of a request, by operation and phase",
         "",
     );
     OSD_ERRORS.render(
@@ -171,5 +209,18 @@ mod tests {
             assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 1"));
         }
         assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 0"));
+    }
+
+    #[test]
+    fn phase_timer_records_each_phase_once() {
+        let mut t = PhaseTimer::start("PhaseTestOp");
+        t.mark("first");
+        t.mark("second");
+        let out = render();
+        for phase in ["first", "second"] {
+            assert!(out.contains(&format!(
+                "objectio_gateway_request_phase_seconds_count{{operation=\"PhaseTestOp\",phase=\"{phase}\"}} 1"
+            )));
+        }
     }
 }

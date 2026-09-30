@@ -88,7 +88,7 @@ pub async fn write_chunk(
         .map_err(|e| anyhow!("erasure codec init: {e}"))?;
 
     let shards = codec
-        .encode(data)
+        .encode_bytes(data)
         .map_err(|e| anyhow!("erasure encode: {e}"))?;
 
     // Generate a unique object ID for this write

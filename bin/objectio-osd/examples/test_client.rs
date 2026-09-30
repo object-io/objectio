@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stripe_id: 0,
                 position: 0,
             }),
-            data: test_data.to_vec(),
+            data: test_data.to_vec().into(),
             ec_k: 4,
             ec_m: 2,
             checksum: Some(Checksum {
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let read_result = read_response.into_inner();
     let read_data = &read_result.data;
     println!("Read {} bytes", read_data.len());
-    println!("Data matches: {}", read_data == test_data);
+    println!("Data matches: {}", read_data[..] == test_data[..]);
     println!("Content: {}", String::from_utf8_lossy(read_data));
 
     // Test 5: Get status again to see updated shard count
