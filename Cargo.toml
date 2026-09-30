@@ -30,6 +30,7 @@ members = [
     "bin/objectio-block-gateway",
     "bin/objectio-aio",
     "bin/objectio-io-bench",
+    "bin/objectio-s3-bench",
 
 ]
 

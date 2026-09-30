@@ -2254,9 +2254,11 @@ pub async fn put_object(
 
     // Generate object ID and ETag (MD5 of the *plaintext* body — matches AWS
     // SSE-S3/SSE-KMS ETag semantics; computed before we possibly encrypt).
+    let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
     let object_id = *Uuid::new_v4().as_bytes();
     let etag = format!("\"{:x}\"", md5::compute(&body));
     let original_size = body.len() as u64;
+    phases.mark("etag");
 
     // SSE: if the request header or bucket default asks for encryption,
     // encrypt the body before it enters the erasure-coding path. Shards
@@ -2274,6 +2276,7 @@ pub async fn put_object(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    phases.mark("sse");
 
     // Check bucket versioning state
     let versioning_enabled = match meta_client
@@ -2311,6 +2314,7 @@ pub async fn put_object(
             );
         }
     };
+    phases.mark("meta_lookup");
 
     let ec_k = placement.ec_k;
     let ec_m = placement.ec_m;
@@ -2448,6 +2452,7 @@ pub async fn put_object(
                 ..Default::default()
             });
         }
+        phases.mark("shards");
 
         // Store object metadata on primary OSD
         let content_type = headers
@@ -2502,6 +2507,7 @@ pub async fn put_object(
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
+        phases.mark("object_meta");
 
         info!(
             "Created object (replication): {}/{}, size={}, stripes={}, replicas_written={}",
@@ -2764,6 +2770,7 @@ pub async fn put_object(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
+    phases.mark("shards");
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2812,6 +2819,7 @@ pub async fn put_object(
             StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
+    phases.mark("object_meta");
 
     // Register with Meta's serializable listing index. After this Raft
     // commit the object is visible to ListObjects; without it the data
@@ -2840,6 +2848,7 @@ pub async fn put_object(
             );
         }
     }
+    phases.mark("listing_commit");
 
     info!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
@@ -2890,6 +2899,7 @@ pub async fn get_object(
     // Parse Range header if present
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
+    let mut phases = crate::gateway_metrics::PhaseTimer::start("GetObject");
     let mut meta_client = state.meta_client.clone();
 
     // Get placement to find primary OSD (CRUSH is deterministic)
@@ -2962,6 +2972,7 @@ pub async fn get_object(
     // If we have stored shard locations pointing to nodes not in placement
     // (e.g. topology changed), fetch all active nodes as fallback
     // This is done lazily below only if a node_id is missing from the map.
+    phases.mark("meta_lookup");
 
     let object = match get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
         .await
@@ -2979,6 +2990,7 @@ pub async fn get_object(
             );
         }
     };
+    phases.mark("object_meta");
 
     // A zero-byte object legitimately has no stripes — there are no bytes to
     // erasure-code, so nothing was ever written to an OSD. It used to fall
@@ -3509,6 +3521,7 @@ pub async fn get_object(
         }
         all_data.extend(slice);
     }
+    phases.mark("shards");
 
     info!(
         "Read object: {}/{}, size={}, stripes_fetched={}/{}{}",

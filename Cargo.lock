@@ -2557,6 +2557,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-s3-bench"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "futures",
+ "hex",
+ "hmac",
+ "rand 0.8.5",
+ "reqwest",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "objectio-storage"
 version = "0.2.2"
 dependencies = [
