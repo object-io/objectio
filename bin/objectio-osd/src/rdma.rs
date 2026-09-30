@@ -57,12 +57,21 @@ impl RdmaStaging {
     pub async fn pull(&self, src: &RdmaBuffer, crc32c: u32) -> Result<(Slot, usize), Status> {
         let len = shard_len(src)?;
         let slot = self.slot()?;
+        let started = std::time::Instant::now();
         let slot = self
             .engine
             .read(slot, 0, remote(src))
             .await
             .map_err(|e| Status::unavailable(format!("rdma read from {}: {e}", src.segment)))?;
+        let read = started.elapsed();
         let got = crc32c::crc32c(&slot.as_slice()[..len]);
+        tracing::debug!(
+            target: "objectio_osd::rdma",
+            read_us = read.as_micros(),
+            crc_us = (started.elapsed() - read).as_micros(),
+            len,
+            "rdma pull"
+        );
         if got != crc32c {
             return Err(Status::data_loss(format!(
                 "shard read over rdma has crc32c {got:08x}, expected {crc32c:08x}"
