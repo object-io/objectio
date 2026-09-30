@@ -410,19 +410,25 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    //! Run in TCP mode, so they need a Mooncake build but no RDMA hardware:
-    //! `cargo test -p objectio-transport-te --features te`.
+    //! Run in TCP mode by default, so they need a Mooncake build but no RDMA
+    //! hardware: `cargo test -p objectio-transport-te --features te`.
+    //!
+    //! To run them over RDMA (a real RNIC, or `SoftRoCE`), set
+    //! `OBJECTIO_TE_TEST_PROTOCOL=rdma` and `OBJECTIO_TE_TEST_HOST` to an
+    //! address on the RDMA device's interface.
 
     use super::*;
 
     const MIB: usize = 1024 * 1024;
 
-    fn tcp_engine() -> Arc<Engine> {
-        Engine::start(&EngineConfig {
-            protocol: Protocol::Tcp,
-            host: "127.0.0.1".into(),
-        })
-        .expect("start transfer engine")
+    fn test_engine() -> Arc<Engine> {
+        let protocol = match std::env::var("OBJECTIO_TE_TEST_PROTOCOL").as_deref() {
+            Ok("rdma") => Protocol::Rdma,
+            Ok("tcp") | Err(_) => Protocol::Tcp,
+            Ok(other) => panic!("OBJECTIO_TE_TEST_PROTOCOL={other}: expected tcp or rdma"),
+        };
+        let host = std::env::var("OBJECTIO_TE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        Engine::start(&EngineConfig { protocol, host }).expect("start transfer engine")
     }
 
     fn pattern(seed: u8, len: usize) -> Vec<u8> {
@@ -442,8 +448,8 @@ mod tests {
     }
 
     fn pair(slots: usize) -> Pair {
-        let gateway = tcp_engine();
-        let osd = tcp_engine();
+        let gateway = test_engine();
+        let osd = test_engine();
         let gateway_pool = SlotPool::new(MIB, slots).unwrap();
         let osd_pool = SlotPool::new(MIB, slots).unwrap();
         let registrations = vec![
