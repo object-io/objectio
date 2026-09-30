@@ -9,6 +9,7 @@ pub mod authz;
 pub mod chunked_decode;
 pub mod cluster_poll;
 pub mod console_auth;
+pub mod digest;
 pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;

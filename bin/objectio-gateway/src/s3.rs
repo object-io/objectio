@@ -334,8 +334,8 @@ fn parse_sse_c_headers(headers: &HeaderMap) -> Result<Option<SseCKey>, Response>
             }
             // MD5 binding — catches key-header corruption and prevents a
             // wrong key from silently producing garbage plaintext on GET.
-            let computed = md5::compute(&key_bytes);
-            let computed_b64 = base64::engine::general_purpose::STANDARD.encode(computed.0);
+            let computed = crate::digest::md5(&key_bytes);
+            let computed_b64 = base64::engine::general_purpose::STANDARD.encode(computed);
             if computed_b64 != m {
                 return Err(S3Error::xml_response(
                     "InvalidArgument",
@@ -2256,12 +2256,19 @@ pub async fn put_object(
     let mut meta_client = state.meta_client.clone();
 
     // Generate object ID and ETag (MD5 of the *plaintext* body — matches AWS
-    // SSE-S3/SSE-KMS ETag semantics; computed before we possibly encrypt).
+    // SSE-S3/SSE-KMS ETag semantics; taken before we possibly encrypt).
+    //
+    // Nothing needs the ETag until the object's metadata is built, so it is
+    // computed on a blocking thread while the body is encrypted, erasure-coded
+    // and written, instead of in front of all of that. The `etag` phase is the
+    // time still spent waiting for it afterwards.
     let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
     let object_id = *Uuid::new_v4().as_bytes();
-    let etag = format!("\"{:x}\"", md5::compute(&body));
+    let etag_task = {
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || format!("\"{}\"", crate::digest::md5_hex(&body)))
+    };
     let original_size = body.len() as u64;
-    phases.mark("etag");
 
     // SSE: if the request header or bucket default asks for encryption,
     // encrypt the body before it enters the erasure-coding path. Shards
@@ -2464,6 +2471,20 @@ pub async fn put_object(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
+
+        // The ETag has been computing alongside the stripes; collect it.
+        let etag = match etag_task.await {
+            Ok(etag) => etag,
+            Err(e) => {
+                error!("ETag computation failed: {e}");
+                return S3Error::xml_response(
+                    "InternalError",
+                    "ETag computation failed",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
+        phases.mark("etag");
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2814,6 +2835,20 @@ pub async fn put_object(
         .unwrap_or("application/octet-stream")
         .to_string();
     phases.mark("shards");
+
+    // The ETag has been computing alongside the stripes; collect it.
+    let etag = match etag_task.await {
+        Ok(etag) => etag,
+        Err(e) => {
+            error!("ETag computation failed: {e}");
+            return S3Error::xml_response(
+                "InternalError",
+                "ETag computation failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    phases.mark("etag");
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5035,7 +5070,7 @@ async fn upload_part_internal(
     // Calculate ETag for this part — AWS semantics for SSE-S3/SSE-KMS:
     // part ETag is the MD5 of the *plaintext*. Compute before we possibly
     // encrypt below.
-    let etag = format!("\"{:x}\"", md5::compute(&body));
+    let etag = format!("\"{}\"", crate::digest::md5_hex(&body));
     let part_size = body.len() as u64;
 
     let mut meta_client = state.meta_client.clone();
@@ -8278,7 +8313,7 @@ mod s3_tests {
             ),
             (
                 "x-amz-server-side-encryption-customer-key-md5",
-                &b64.encode(md5::compute(md5_of).0),
+                &b64.encode(crate::digest::md5(md5_of)),
             ),
         ])
     }
@@ -8361,7 +8396,7 @@ mod s3_tests {
         );
         h.insert(
             "x-amz-server-side-encryption-customer-key-md5",
-            HeaderValue::from_str(&b64.encode(md5::compute(short).0)).unwrap(),
+            HeaderValue::from_str(&b64.encode(crate::digest::md5(&short[..]))).unwrap(),
         );
         assert!(
             parse_sse_c_headers(&h).is_err(),
