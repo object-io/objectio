@@ -78,6 +78,27 @@ pub trait ErasureBackend: Send + Sync {
     /// Vector of k+m shards (data shards copied, parity shards computed)
     fn encode(&self, data_shards: &[&[u8]], shard_size: usize) -> BackendResult<Vec<Vec<u8>>>;
 
+    /// Compute the m parity shards into caller-owned buffers
+    ///
+    /// `parity` holds m buffers of `shard_size` bytes each. Lets a caller
+    /// lay out a whole stripe in one allocation and encode it in place.
+    ///
+    /// The default goes through [`encode`](Self::encode) and copies the
+    /// parity out; backends that can write parity directly override it.
+    fn encode_parity_into(
+        &self,
+        data_shards: &[&[u8]],
+        parity: &mut [&mut [u8]],
+        shard_size: usize,
+    ) -> BackendResult<()> {
+        check_parity_buffers(parity, self.parity_shards(), shard_size)?;
+        let shards = self.encode(data_shards, shard_size)?;
+        for (dst, src) in parity.iter_mut().zip(&shards[self.data_shards()..]) {
+            dst.copy_from_slice(src);
+        }
+        Ok(())
+    }
+
     /// Decode/reconstruct missing shards
     ///
     /// Given available shards (some may be missing), reconstruct the specified
@@ -101,6 +122,24 @@ pub trait ErasureBackend: Send + Sync {
     ///
     /// Re-encodes the data shards and compares with provided parity shards.
     fn verify(&self, shards: &[&[u8]]) -> BackendResult<bool>;
+}
+
+/// Check that `parity` is m buffers of `shard_size` bytes.
+pub(crate) fn check_parity_buffers(
+    parity: &[&mut [u8]],
+    m: usize,
+    shard_size: usize,
+) -> BackendResult<()> {
+    if parity.len() != m {
+        return Err(ErasureError::InvalidConfig(format!(
+            "expected {m} parity buffers, got {}",
+            parity.len()
+        )));
+    }
+    if parity.iter().any(|p| p.len() != shard_size) {
+        return Err(ErasureError::ShardSizeMismatch);
+    }
+    Ok(())
 }
 
 /// LRC (Locally Repairable Codes) configuration

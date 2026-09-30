@@ -88,32 +88,46 @@ impl ErasureBackend for RustSimdBackend {
             }
         }
 
+        let mut parity = vec![vec![0u8; shard_size]; m];
+        let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(Vec::as_mut_slice).collect();
+        self.encode_parity_into(data_shards, &mut parity_refs, shard_size)?;
+
+        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k + m);
+        shards.extend(data_shards.iter().map(|s| s.to_vec()));
+        shards.extend(parity);
+        Ok(shards)
+    }
+
+    fn encode_parity_into(
+        &self,
+        data_shards: &[&[u8]],
+        parity: &mut [&mut [u8]],
+        shard_size: usize,
+    ) -> BackendResult<()> {
+        let k = self.data_shards as usize;
+        let m = self.parity_shards as usize;
+        super::check_parity_buffers(parity, m, shard_size)?;
+        if data_shards.len() != k || data_shards.iter().any(|s| s.len() != shard_size) {
+            return Err(ErasureError::ShardSizeMismatch);
+        }
+
         let mut encoder = ReedSolomonEncoder::new(k, m, shard_size)
             .map_err(|e| ErasureError::InvalidConfig(e.to_string()))?;
-
         for shard in data_shards {
             encoder
                 .add_original_shard(shard)
                 .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
         }
-
         let result = encoder
             .encode()
             .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
 
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k + m);
-
-        // Add data shards
-        for shard in data_shards {
-            shards.push(shard.to_vec());
+        // reed-solomon-simd computes into its own work buffer, so parity is
+        // copied out once; the data shards are never copied.
+        for (dst, src) in parity.iter_mut().zip(result.recovery_iter()) {
+            dst.copy_from_slice(src);
         }
-
-        // Add parity shards
-        for parity in result.recovery_iter() {
-            shards.push(parity.to_vec());
-        }
-
-        Ok(shards)
+        Ok(())
     }
 
     fn decode(

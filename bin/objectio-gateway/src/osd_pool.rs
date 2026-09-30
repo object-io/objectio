@@ -2,6 +2,7 @@
 //!
 //! Manages connections to multiple OSD nodes for distributed storage operations.
 
+use bytes::Bytes;
 use objectio_proto::metadata::NodePlacement;
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 use std::collections::HashMap;
@@ -246,7 +247,7 @@ pub async fn write_shard_to_osd(
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
-    data: Vec<u8>,
+    data: Bytes,
     ec_k: u32,
     ec_m: u32,
 ) -> Result<objectio_proto::storage::BlockLocation, OsdPoolError> {
@@ -260,7 +261,6 @@ pub async fn write_shard_to_osd(
             stripe_id,
             position,
         }),
-        data: data.clone(),
         ec_k,
         ec_m,
         checksum: Some(Checksum {
@@ -268,6 +268,7 @@ pub async fn write_shard_to_osd(
             xxhash64: 0,
             sha256: vec![],
         }),
+        data,
     };
 
     // Add timeout to prevent hanging indefinitely
@@ -306,7 +307,7 @@ pub async fn read_shard_from_osd(
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
-) -> Result<Vec<u8>, OsdPoolError> {
+) -> Result<Bytes, OsdPoolError> {
     use objectio_proto::storage::{ReadShardRequest, ShardId};
 
     let mut client = connect_for_shard(pool, placement).await?;

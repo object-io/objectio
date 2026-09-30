@@ -808,7 +808,7 @@ async fn reconstruct_dangling_shard(
             .map_err(|_| anyhow::anyhow!("read timeout"))??
             .into_inner()
             .data;
-            Ok::<(u32, Vec<u8>), anyhow::Error>((pos, bytes))
+            Ok::<(u32, Vec<u8>), anyhow::Error>((pos, bytes.into()))
         });
     }
 
@@ -902,7 +902,7 @@ async fn reconstruct_dangling_shard(
         PER_OSD_TIMEOUT,
         target.write_shard(WriteShardRequest {
             shard_id: Some(shard_id),
-            data: reconstructed,
+            data: reconstructed.into(),
             ec_k: ec_k as u32,
             ec_m: ec_m as u32,
             checksum: None,

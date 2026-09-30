@@ -117,6 +117,22 @@ impl ErasureBackend for IsalBackend {
         Ok(result)
     }
 
+    fn encode_parity_into(
+        &self,
+        data_shards: &[&[u8]],
+        parity: &mut [&mut [u8]],
+        shard_size: usize,
+    ) -> BackendResult<()> {
+        crate::backend::check_parity_buffers(parity, self.m, shard_size)?;
+        if data_shards.len() != self.k || data_shards.iter().any(|s| s.len() != shard_size) {
+            return Err(ErasureError::ShardSizeMismatch);
+        }
+        // ISA-L writes parity straight into the caller's buffers.
+        self.encoder
+            .encode(data_shards, parity)
+            .map_err(|e| ErasureError::EncodingFailed(format!("ISA-L encode failed: {e}")))
+    }
+
     fn decode(
         &self,
         shards: &[Option<&[u8]>],

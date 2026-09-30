@@ -2345,7 +2345,7 @@ pub async fn put_object(
         for stripe_idx in 0..num_stripes {
             let stripe_start = stripe_idx * stripe_size;
             let stripe_end = std::cmp::min(stripe_start + stripe_size, body.len());
-            let stripe_data = &body[stripe_start..stripe_end];
+            let stripe_data = body.slice(stripe_start..stripe_end);
             let stripe_data_size = stripe_data.len() as u64;
 
             // Write this stripe to all replicas
@@ -2366,7 +2366,7 @@ pub async fn put_object(
 
                 let pool = state.osd_pool.clone();
                 let obj_id = object_id;
-                let shard_data = stripe_data.to_vec();
+                let shard_data = stripe_data.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
 
@@ -2570,7 +2570,7 @@ pub async fn put_object(
         let stripe_data_size = stripe_data.len() as u64;
 
         // Encode this stripe with erasure coding - use LRC if specified
-        let shards: Vec<Vec<u8>> = match ec_type {
+        let shards: Vec<Bytes> = match ec_type {
             ErasureType::ErasureLrc => {
                 // Use LRC backend with local parity groups
                 let lrc_config = LrcConfig::new(
@@ -2601,7 +2601,7 @@ pub async fn put_object(
                     padded_data.chunks(shard_size).take(ec_k as usize).collect();
 
                 match backend.encode_lrc(&data_shards, shard_size) {
-                    Ok(encoded) => encoded.all_shards(),
+                    Ok(encoded) => encoded.all_shards().into_iter().map(Bytes::from).collect(),
                     Err(e) => {
                         error!("Failed to encode stripe {} with LRC: {}", stripe_idx, e);
                         return S3Error::xml_response(
@@ -2626,8 +2626,8 @@ pub async fn put_object(
                     }
                 };
 
-                match codec.encode(stripe_data) {
-                    Ok(s) => s.into_iter().map(|s| s.to_vec()).collect(),
+                match codec.encode_bytes(stripe_data) {
+                    Ok(s) => s,
                     Err(e) => {
                         error!("Failed to encode stripe {}: {}", stripe_idx, e);
                         return S3Error::xml_response(
@@ -3271,7 +3271,7 @@ pub async fn get_object(
                         let actual_data = if data.len() > stripe_data_size {
                             data[..stripe_data_size].to_vec()
                         } else {
-                            data
+                            Vec::from(data)
                         };
                         let (mut slice, slice_start_in_stripe): (Vec<u8>, u64) =
                             if let Some(ref range) = resolved_range {
@@ -3337,7 +3337,7 @@ pub async fn get_object(
         );
 
         // Read shards from OSDs - we need at least k shards
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
+        let mut shards: Vec<Option<Bytes>> = vec![None; total_shards];
         let mut read_count = 0;
 
         // Create a map of position -> shard location for quick lookup
@@ -5153,6 +5153,7 @@ async fn upload_part_internal(
             } else {
                 Vec::new()
             };
+            let stripe_bytes = Bytes::from(stripe_bytes);
             let stripe_data_size = stripe_bytes.len() as u64;
 
             let mut write_futures = Vec::with_capacity(total_replicas);
@@ -5305,8 +5306,8 @@ async fn upload_part_internal(
             };
             let stripe_data_size = stripe_bytes.len() as u64;
 
-            let shards: Vec<Vec<u8>> = match codec.encode(&stripe_bytes) {
-                Ok(s) => s.into_iter().map(|s| s.to_vec()).collect(),
+            let shards: Vec<Bytes> = match codec.encode_bytes(&stripe_bytes) {
+                Ok(s) => s,
                 Err(e) => {
                     error!("Failed to encode stripe {} data: {}", stripe_idx, e);
                     return S3Error::xml_response(

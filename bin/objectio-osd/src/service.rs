@@ -1009,7 +1009,7 @@ impl StorageService for OsdService {
         let timestamp = Self::current_timestamp();
 
         let resp = ReadShardResponse {
-            data,
+            data: data.into(),
             checksum: Some(Checksum {
                 crc32c: location.crc32c,
                 xxhash64: 0,
