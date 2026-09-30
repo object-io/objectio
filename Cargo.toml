@@ -31,7 +31,7 @@ members = [
     "bin/objectio-aio",
     "bin/objectio-io-bench",
     "bin/objectio-s3-bench",
-
+    "crates/objectio-transport-te",
 ]
 
 [workspace.package]

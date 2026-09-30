@@ -382,6 +382,26 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
@@ -395,7 +415,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "shlex",
  "syn 2.0.114",
 ]
@@ -939,7 +959,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ed6054108d48f6cc7605beb5a75b7d3997d3f05597f666e0e3a742f0dd8b6e"
 dependencies = [
  "autotools",
- "bindgen",
+ "bindgen 0.71.1",
  "pkg-config",
 ]
 
@@ -2599,6 +2619,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-transport-te"
+version = "0.2.2"
+dependencies = [
+ "bytes",
+ "futures",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "transfer_engine_rust",
+]
+
+[[package]]
 name = "objectio-unity-catalog"
 version = "0.2.2"
 dependencies = [
@@ -3052,7 +3084,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "rustls",
  "socket2 0.6.1",
  "thiserror 2.0.18",
@@ -3072,7 +3104,7 @@ dependencies = [
  "lru-slab",
  "rand 0.9.4",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
  "slab",
@@ -3396,6 +3428,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -4406,6 +4444,14 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "transfer_engine_rust"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.70.1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

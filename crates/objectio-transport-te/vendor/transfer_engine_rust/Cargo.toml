@@ -1,0 +1,28 @@
+# Vendored from Mooncake (see VENDORED.md). Kept as close to upstream as
+# possible; the differences are listed there.
+[package]
+name = "transfer_engine_rust"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Rust bindings for the Mooncake Transfer Engine"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "transfer_engine_rust"
+crate-type = ["rlib"]
+
+[features]
+# Bind and link Mooncake. Without it this crate is empty (see build.rs).
+link = ["dep:bindgen"]
+
+[dependencies]
+thiserror = "2.0"
+
+[build-dependencies]
+bindgen = { version = "0.70", optional = true }
+
+# Upstream code, kept byte-for-byte: our workspace's clippy settings are not
+# applied to it, or `cargo clippy -- -D warnings` fails on upstream style.
+[lints.clippy]
+all = "allow"
