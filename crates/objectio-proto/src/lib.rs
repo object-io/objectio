@@ -47,3 +47,8 @@ pub mod block {
 pub mod raft {
     tonic::include_proto!("objectio.raft");
 }
+
+/// HTTP/2 settings for servers that receive shards. Hand-written, so it
+/// keeps the workspace lints the generated modules opt out of.
+#[warn(clippy::pedantic, clippy::nursery)]
+pub mod transport;

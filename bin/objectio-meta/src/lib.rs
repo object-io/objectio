@@ -31,7 +31,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tonic::transport::Server;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
@@ -339,7 +338,7 @@ pub async fn run(
 
     // Start gRPC server with metadata, block, and Raft RPC services.
     let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id);
-    Server::builder()
+    objectio_proto::transport::server()
         .layer(op_metrics::OpTimerLayer)
         .add_service(MetadataServiceServer::from_arc(meta_service))
         .add_service(BlockServiceServer::from_arc(block_service))
