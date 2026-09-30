@@ -3362,34 +3362,56 @@ pub async fn get_object(
             .collect();
         ranked_positions.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-        for (pos, dist) in ranked_positions {
-            if read_count >= ec_k {
-                break;
-            }
-            let Some(shard_loc) = shard_map.get(&pos) else {
-                continue;
-            };
-            let node_addr =
-                resolve_node_address(&mut node_address_map, &mut meta_client, &shard_loc.node_id)
+        // Read the nearest k shards at once, not one after another: a stripe
+        // then costs one shard round trip instead of k. Each failed read is
+        // replaced by the next-nearest position, so a degraded stripe still
+        // ends up with k shards if k survive, and no more than k reads are
+        // ever in flight.
+        let mut candidates = ranked_positions.into_iter();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        loop {
+            while read_count + in_flight.len() < ec_k {
+                let Some((pos, dist)) = candidates.next() else {
+                    break;
+                };
+                let Some(shard_loc) = shard_map.get(&pos) else {
+                    continue;
+                };
+                let node_addr = resolve_node_address(
+                    &mut node_address_map,
+                    &mut meta_client,
+                    &shard_loc.node_id,
+                )
+                .await;
+                let node_placement = objectio_proto::metadata::NodePlacement {
+                    position: shard_loc.position,
+                    node_id: shard_loc.node_id.clone(),
+                    node_address: node_addr,
+                    disk_id: shard_loc.disk_id.clone(),
+                    shard_type: shard_loc.shard_type,
+                    local_group: shard_loc.local_group,
+                };
+                let pool = &state.osd_pool;
+                let stripe_id = stripe.stripe_id;
+                in_flight.push(async move {
+                    let result = read_shard_from_osd(
+                        pool,
+                        &node_placement,
+                        ec_shard_object_id,
+                        stripe_id,
+                        pos,
+                    )
                     .await;
-            let node_placement = objectio_proto::metadata::NodePlacement {
-                position: shard_loc.position,
-                node_id: shard_loc.node_id.clone(),
-                node_address: node_addr,
-                disk_id: shard_loc.disk_id.clone(),
-                shard_type: shard_loc.shard_type,
-                local_group: shard_loc.local_group,
-            };
+                    (pos, dist, result)
+                });
+            }
 
-            match read_shard_from_osd(
-                &state.osd_pool,
-                &node_placement,
-                ec_shard_object_id,
-                stripe.stripe_id,
-                pos,
-            )
-            .await
-            {
+            // Nothing in flight means k shards are in hand, or every
+            // position has been tried.
+            let Some((pos, dist, result)) = futures::StreamExt::next(&mut in_flight).await else {
+                break;
+            };
+            match result {
                 Ok(data) => {
                     let bytes = data.len();
                     debug!("Read shard {} ({} bytes, {})", pos, bytes, dist.as_str());

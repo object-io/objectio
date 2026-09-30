@@ -238,6 +238,28 @@ impl Cluster {
         );
     }
 
+    /// Restart with OSD `index`'s disk destroyed but its identity kept: it
+    /// comes back registered, reachable and empty, so every read of a shard
+    /// it held fails. With erasure coding that leaves each affected stripe
+    /// one shard short — a degraded read, which [`Self::restart_with_osds`]
+    /// cannot produce because aio refuses to run fewer OSDs than k+m.
+    ///
+    /// Removing the whole OSD directory would not do: the OSD would return
+    /// under a new identity, and the gateway ranks the unknown old one last,
+    /// so it never even tries the missing shards.
+    pub fn restart_with_lost_disk(&mut self, index: usize) {
+        assert!(
+            index < self.osds,
+            "no OSD {index} in a {}-OSD cluster",
+            self.osds
+        );
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let disk = self.data_dir.path().join(format!("osd-{index}/disk0"));
+        std::fs::remove_dir_all(&disk).unwrap_or_else(|e| panic!("remove {}: {e}", disk.display()));
+        self.restart_with_osds(self.osds);
+    }
+
     fn log_target() -> Stdio {
         if std::env::var_os("OBJECTIO_E2E_LOGS").is_some() {
             Stdio::inherit()
