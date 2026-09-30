@@ -101,6 +101,11 @@ pub struct OsdNode {
     /// `#[serde(default)]` so existing serialized OSDs load as `In`.
     #[serde(default)]
     pub admin_state: objectio_common::OsdAdminState,
+    /// Transfer Engine segment (`ip:port`) the OSD accepts shard transfers
+    /// on, from its registration. Empty when it has none — gateways then
+    /// move its shards as gRPC bytes.
+    #[serde(default)]
+    pub te_segment: String,
 }
 
 /// EC configuration for a storage class

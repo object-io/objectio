@@ -198,6 +198,7 @@ pub async fn write_shard_to_osd(
             sha256: vec![],
         }),
         data,
+        rdma: None,
     };
 
     let write_future = client.write_shard(request);
@@ -244,6 +245,7 @@ pub async fn read_shard_from_osd(
         }),
         offset: 0,
         length: 0,
+        rdma_dest: None,
     };
 
     let read_future = client.read_shard(request);

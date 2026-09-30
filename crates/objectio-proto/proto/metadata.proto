@@ -558,6 +558,7 @@ message NodePlacement {
     // LRC-specific fields
     ShardType shard_type = 5;       // Type of shard
     uint32 local_group = 6;         // Local group index (for LRC)
+    string te_segment = 7;          // OSD's Transfer Engine segment; empty if none
 }
 
 // Multipart upload
@@ -761,6 +762,9 @@ message RegisterOsdRequest {
     // Meta sums these across OSDs for cluster capacity accounting. Older OSDs
     // that don't populate this report 0 for their disks.
     repeated uint64 disk_capacity_bytes = 7;
+    // Transfer Engine segment ("ip:port") this OSD accepts shard transfers
+    // on. Empty when it has none; gateways then use gRPC bytes.
+    string te_segment = 8;
 }
 
 message RegisterOsdResponse {
@@ -855,6 +859,8 @@ message ListingNode {
     // Operator-declared state. Defaults to OSD_ADMIN_IN on meta servers
     // that predate this field, which is the same as "no admin override".
     OsdAdminState admin_state = 5;
+    // Transfer Engine segment ("ip:port"); empty when the OSD has none.
+    string te_segment = 6;
 }
 
 // ============ IAM Messages ============

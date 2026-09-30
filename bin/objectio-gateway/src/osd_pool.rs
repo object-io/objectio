@@ -256,6 +256,7 @@ pub async fn write_shard_to_osd(
     let mut client = connect_for_shard(pool, placement).await?;
 
     let request = WriteShardRequest {
+        rdma: None,
         shard_id: Some(ShardId {
             object_id: object_id.to_vec(),
             stripe_id,
@@ -313,6 +314,7 @@ pub async fn read_shard_from_osd(
     let mut client = connect_for_shard(pool, placement).await?;
 
     let request = ReadShardRequest {
+        rdma_dest: None,
         shard_id: Some(ShardId {
             object_id: object_id.to_vec(),
             stripe_id,

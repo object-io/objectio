@@ -277,6 +277,8 @@ pub async fn read_chunk(
             disk_id: shard_loc.disk_id.clone(),
             shard_type: shard_loc.shard_type,
             local_group: shard_loc.local_group,
+            // The block gateway moves shards over gRPC only (for now).
+            te_segment: String::new(),
         };
         match read_shard_from_osd(osd_pool, &node_placement, object_id, 0, shard_loc.position).await
         {

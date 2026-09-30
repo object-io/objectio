@@ -2751,6 +2751,7 @@ impl MetaService {
                     position: pos_u32,
                     node_id: node.node_id.to_vec(),
                     node_address: node.address.clone(),
+                    te_segment: node.te_segment.clone(),
                     disk_id: disk_id.to_vec(),
                     shard_type: if pos_u32 < self.default_ec_k {
                         ShardType::ShardData.into()
@@ -2776,6 +2777,7 @@ impl MetaService {
                         position: pos,
                         node_id: node.node_id.to_vec(),
                         node_address: node.address.clone(),
+                        te_segment: node.te_segment.clone(),
                         disk_id: disk_id.to_vec(),
                         shard_type: if pos < self.default_ec_k {
                             ShardType::ShardData.into()
@@ -2797,6 +2799,7 @@ impl MetaService {
                     position: pos,
                     node_id: node.node_id.to_vec(),
                     node_address: node.address.clone(),
+                    te_segment: node.te_segment.clone(),
                     disk_id: disk_id.to_vec(),
                     shard_type: if pos < self.default_ec_k {
                         ShardType::ShardData.into()
@@ -3515,6 +3518,7 @@ impl MetadataService for MetaService {
                                 ),
                                 None => (String::new(), vec![0u8; 16]),
                             };
+                            let te_segment = node.map(|n| n.te_segment.clone()).unwrap_or_default();
                             let shard_type = pg_position_shard_type(
                                 ec_type,
                                 pos,
@@ -3536,6 +3540,7 @@ impl MetadataService for MetaService {
                                 disk_id,
                                 shard_type: shard_type.into(),
                                 local_group,
+                                te_segment,
                             }
                         })
                         .collect();
@@ -3603,6 +3608,8 @@ impl MetadataService for MetaService {
                     }
                 };
 
+                let te_segment = node.map(|n| n.te_segment.clone()).unwrap_or_default();
+
                 let shard_type = match hrw.role {
                     ShardRole::Data => ShardType::ShardData.into(),
                     ShardRole::LocalParity => ShardType::ShardLocalParity.into(),
@@ -3616,6 +3623,7 @@ impl MetadataService for MetaService {
                     disk_id,
                     shard_type,
                     local_group: hrw.local_group.unwrap_or(0) as u32,
+                    te_segment,
                 }
             })
             .collect();
@@ -4275,6 +4283,7 @@ impl MetadataService for MetaService {
             topology: topology_tuple,
             disk_capacity_bytes,
             admin_state: prev_admin_state,
+            te_segment: req.te_segment.clone(),
         };
 
         // Check if node already exists and update, or add new. We dedupe
@@ -4290,6 +4299,7 @@ impl MetadataService for MetaService {
             existing.disk_capacity_bytes = node.disk_capacity_bytes.clone();
             existing.failure_domain = node.failure_domain.clone();
             existing.topology = node.topology.clone();
+            existing.te_segment = node.te_segment.clone();
             info!(
                 "Updated OSD registration: {} at {}",
                 hex::encode(node_id),
@@ -4414,6 +4424,10 @@ impl MetadataService for MetaService {
             .iter()
             .map(|n| (n.node_id, n.address.clone()))
             .collect();
+        let te_segment_by_id: std::collections::HashMap<[u8; 16], String> = osd_nodes
+            .iter()
+            .map(|n| (n.node_id, n.te_segment.clone()))
+            .collect();
 
         let mut nodes: Vec<ListingNode> = topology_iter
             .enumerate()
@@ -4442,6 +4456,7 @@ impl MetadataService for MetaService {
                         host: node.failure_domain.host.clone(),
                     }),
                     admin_state: admin_state_proto(admin_state),
+                    te_segment: te_segment_by_id.get(&id_bytes).cloned().unwrap_or_default(),
                 }
             })
             .collect();
@@ -4467,6 +4482,7 @@ impl MetadataService for MetaService {
                         shard_id: idx as u32,
                         failure_domain: fd,
                         admin_state: admin_state_proto(node.admin_state),
+                        te_segment: node.te_segment.clone(),
                     }
                 })
                 .collect();
@@ -10737,6 +10753,7 @@ mod placement_tests {
             topology: None,
             disk_capacity_bytes: vec![1_000_000_000; disks],
             admin_state,
+            te_segment: String::new(),
         }
     }
 
@@ -10984,5 +11001,72 @@ mod listing_page_tests {
     fn resuming_from_a_prefix_skips_its_keys() {
         let (items, _, _) = run(KEYS, "/", "dir/", 100);
         assert_eq!(items, ["e"]);
+    }
+}
+
+#[cfg(test)]
+mod te_segment_tests {
+    //! An OSD's Transfer Engine segment travels from its registration to the
+    //! gateways that will move shards to it.
+
+    use super::MetaService;
+    use objectio_proto::metadata::metadata_service_server::MetadataService;
+    use objectio_proto::metadata::{GetListingNodesRequest, RegisterOsdRequest};
+    use tonic::Request;
+
+    fn registration(id: u8, te_segment: &str) -> RegisterOsdRequest {
+        RegisterOsdRequest {
+            node_id: vec![id; 16],
+            address: format!("http://10.0.0.{id}:9200"),
+            disk_ids: vec![vec![id; 16]],
+            disk_capacity_bytes: vec![1 << 30],
+            te_segment: te_segment.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The gRPC handler — `MetaService` also has an inherent `register_osd`
+    /// that takes an `OsdNode`, which would shadow it.
+    async fn register(svc: &MetaService, req: RegisterOsdRequest) {
+        MetadataService::register_osd(svc, Request::new(req))
+            .await
+            .unwrap();
+    }
+
+    async fn listed_segments(svc: &MetaService) -> Vec<(u8, String)> {
+        let mut out: Vec<(u8, String)> = svc
+            .get_listing_nodes(Request::new(GetListingNodesRequest {
+                bucket: String::new(),
+                include_all_states: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .nodes
+            .into_iter()
+            .map(|n| (n.node_id[0], n.te_segment))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn listing_carries_each_osds_segment_and_follows_re_registration() {
+        let svc = MetaService::new();
+        register(&svc, registration(1, "10.0.0.1:15001")).await;
+        register(&svc, registration(2, "")).await;
+        assert_eq!(
+            listed_segments(&svc).await,
+            [(1, "10.0.0.1:15001".to_string()), (2, String::new())]
+        );
+
+        // Restarting with RDMA turned on — or off — must be picked up, not
+        // leave gateways sending transfers to a segment that is gone.
+        register(&svc, registration(1, "")).await;
+        register(&svc, registration(2, "10.0.0.2:15002")).await;
+        assert_eq!(
+            listed_segments(&svc).await,
+            [(1, String::new()), (2, "10.0.0.2:15002".to_string())]
+        );
     }
 }

@@ -92,10 +92,23 @@ message Checksum {
 // Write shard request
 message WriteShardRequest {
     ShardId shard_id = 1;
-    bytes data = 2;
+    bytes data = 2;         // Empty when `rdma` is set
     uint32 ec_k = 3;        // Data shard count
     uint32 ec_m = 4;        // Parity shard count
-    Checksum checksum = 5;
+    Checksum checksum = 5;  // Required when `rdma` is set
+    // Where the OSD reads the shard from over Transfer Engine, instead of
+    // `data`. Only sent to OSDs that advertised a `te_segment`.
+    RdmaBuffer rdma = 6;
+}
+
+// Memory in another process that a shard moves through over Mooncake
+// Transfer Engine (RDMA, or TCP in development). The OSD always initiates:
+// it reads PUT shards from here and writes GET shards to here. See
+// objectio-docs architecture/design/rdma-data-plane.md.
+message RdmaBuffer {
+    string segment = 1;     // Owning process's Transfer Engine segment, "ip:port"
+    uint64 addr = 2;        // Start address in that process
+    uint64 len = 3;
 }
 
 message WriteShardResponse {
@@ -109,6 +122,10 @@ message ReadShardRequest {
     // Optional: read only a range
     uint64 offset = 2;
     uint32 length = 3;
+    // If set, the OSD writes the shard here over Transfer Engine and
+    // ReadShardResponse.data is empty. Only sent to OSDs that advertised a
+    // `te_segment`.
+    RdmaBuffer rdma_dest = 4;
 }
 
 message ReadShardResponse {
