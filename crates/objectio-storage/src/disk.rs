@@ -48,6 +48,16 @@ pub struct DiskManager {
     /// the device, and it could never reuse a block, so deleting an object
     /// freed nothing.
     allocator: BlockBitmap,
+    /// Group commit for data writes, as the metadata WAL does for its
+    /// records. `writes_done` counts writes whose I/O has returned;
+    /// `synced_writes` is the highest count a completed `fdatasync` covers.
+    /// See [`Self::sync_through`].
+    writes_done: AtomicU64,
+    synced_writes: AtomicU64,
+    /// Held only across the sync itself, so writers never wait on it.
+    sync_lock: parking_lot::Mutex<()>,
+    /// Data fdatasync latency, and how many writes each covered.
+    sync_stats: crate::metadata::WalSyncStats,
     /// Statistics
     stats: DiskStats,
 }
@@ -100,6 +110,10 @@ impl DiskManager {
             superblock: RwLock::new(superblock),
             sequence: AtomicU64::new(1),
             allocator,
+            writes_done: AtomicU64::new(0),
+            synced_writes: AtomicU64::new(0),
+            sync_lock: parking_lot::Mutex::new(()),
+            sync_stats: crate::metadata::WalSyncStats::default(),
             stats: DiskStats::default(),
         })
     }
@@ -132,6 +146,10 @@ impl DiskManager {
             superblock: RwLock::new(superblock),
             sequence: AtomicU64::new(1),
             allocator,
+            writes_done: AtomicU64::new(0),
+            synced_writes: AtomicU64::new(0),
+            sync_lock: parking_lot::Mutex::new(()),
+            sync_stats: crate::metadata::WalSyncStats::default(),
             stats: DiskStats::default(),
         })
     }
@@ -612,6 +630,51 @@ impl DiskManager {
         self.file.sync()
     }
 
+    /// Record that a write's I/O has returned, and get the number to pass to
+    /// [`Self::sync_through`] to make it durable.
+    pub fn write_completed(&self) -> u64 {
+        self.writes_done.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Block until an `fdatasync` covering write `done` (from
+    /// [`Self::write_completed`]) has finished.
+    ///
+    /// Group commit: the first caller syncs every write completed so far and
+    /// publishes how far it got; a caller already covered returns at once.
+    /// Concurrent fsyncs of one file queue behind each other anyway, so one
+    /// per shard made each shard wait for every sync ahead of it. The
+    /// watermark is sampled *before* syncing, so a write that completes
+    /// during the sync is never claimed.
+    ///
+    /// `fdatasync` rather than `fsync`: the data and whatever metadata is
+    /// needed to read it back (block allocation in a sparse file) are made
+    /// durable, but not timestamps. It acts on the inode, so it covers writes
+    /// made through the async I/O backend's own descriptor too.
+    pub fn sync_through(&self, done: u64) -> Result<()> {
+        if self.synced_writes.load(Ordering::SeqCst) >= done {
+            return Ok(());
+        }
+        let _guard = self.sync_lock.lock();
+        if self.synced_writes.load(Ordering::SeqCst) >= done {
+            return Ok(());
+        }
+        let covered = self.writes_done.load(Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        self.file.sync_data()?;
+        self.sync_stats.seconds.observe_duration(started.elapsed());
+        let previous = self.synced_writes.fetch_max(covered, Ordering::SeqCst);
+        self.sync_stats.syncs.fetch_add(1, Ordering::Relaxed);
+        self.sync_stats
+            .records
+            .fetch_add(covered.saturating_sub(previous), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Data fdatasync latency, and writes covered per sync.
+    pub fn data_sync_stats(&self) -> &crate::metadata::WalSyncStats {
+        &self.sync_stats
+    }
+
     /// Update superblock on disk
     pub fn update_superblock(&self) -> Result<()> {
         let mut sb = self.superblock.write();
@@ -920,5 +983,73 @@ mod extent_tests {
         d.write_block(start, [1u8; 16], 0, &payload).unwrap();
         let (_, got) = d.read_block(start).unwrap();
         assert_eq!(got, payload);
+    }
+
+    fn test_disk() -> (tempfile::TempDir, DiskManager) {
+        let dir = tempfile::tempdir().unwrap();
+        // DiskManager::init refuses anything under 1 GiB.
+        let disk = DiskManager::init(dir.path().join("d.raw"), 1024 * 1024 * 1024, None).unwrap();
+        (dir, disk)
+    }
+
+    /// One fdatasync covers every write that completed before it started,
+    /// and a write it covered never pays for another.
+    #[test]
+    fn one_data_sync_covers_every_write_completed_before_it() {
+        let (_dir, disk) = test_disk();
+        let done: Vec<u64> = (0..10).map(|_| disk.write_completed()).collect();
+        disk.sync_through(done[0]).unwrap();
+        for &d in &done {
+            disk.sync_through(d).unwrap();
+        }
+        let st = disk.data_sync_stats();
+        assert_eq!(
+            st.syncs.load(Ordering::Relaxed),
+            1,
+            "a covered write synced again"
+        );
+        assert_eq!(st.records.load(Ordering::Relaxed), 10);
+    }
+
+    /// A write that completes after a sync sampled the watermark is not
+    /// claimed by that sync: it gets one of its own.
+    #[test]
+    fn a_write_completed_after_a_sync_needs_its_own() {
+        let (_dir, disk) = test_disk();
+        let first = disk.write_completed();
+        disk.sync_through(first).unwrap();
+        let second = disk.write_completed();
+        disk.sync_through(second).unwrap();
+        assert_eq!(disk.data_sync_stats().syncs.load(Ordering::Relaxed), 2);
+    }
+
+    /// Concurrent writers each wait for durability; all of them are covered,
+    /// and no more syncs run than there were writes.
+    #[test]
+    fn concurrent_writers_are_all_covered() {
+        let (_dir, disk) = test_disk();
+        let disk = Arc::new(disk);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let disk = Arc::clone(&disk);
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let d = disk.write_completed();
+                        disk.sync_through(d).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let st = disk.data_sync_stats();
+        assert_eq!(
+            st.records.load(Ordering::Relaxed),
+            200,
+            "a write was never covered"
+        );
+        assert!(st.syncs.load(Ordering::Relaxed) <= 200);
+        assert_eq!(disk.synced_writes.load(Ordering::SeqCst), 200);
     }
 }

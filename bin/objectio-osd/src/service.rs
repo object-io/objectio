@@ -265,7 +265,8 @@ const SHARD_LOC_PREFIX: &[u8] = b"osd_loc:";
 /// OSD service state
 pub struct OsdService {
     node_id: [u8; 16],
-    disks: Vec<DiskManager>,
+    /// `Arc` so a blocking task can hold one while it syncs.
+    disks: Vec<Arc<DiskManager>>,
     disk_ids: Vec<[u8; 16]>,
     /// Shard index: object_id:stripe_id:position -> location (in-memory cache)
     shard_index: RwLock<HashMap<String, ShardLocation>>,
@@ -306,7 +307,7 @@ type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
 /// tells the caller to persist the identity to every disk (the
 /// Ceph/Rook-style activation flow).
 fn resolve_node_identity(
-    disks: &[objectio_storage::DiskManager],
+    disks: &[Arc<objectio_storage::DiskManager>],
     id_path: &std::path::Path,
 ) -> Result<([u8; 16], Uuid, bool), String> {
     // Check every disk first — even one claimed disk wins over the
@@ -445,7 +446,7 @@ impl OsdService {
             };
 
             disk_ids.push(*disk.id().as_bytes());
-            disks.push(disk);
+            disks.push(Arc::new(disk));
         }
 
         if disks.is_empty() {
@@ -637,6 +638,7 @@ impl OsdService {
 
     /// Metadata WAL fsync latency and batching, as Prometheus families.
     pub fn render_wal_metrics(&self, out: &mut String, osd_label: &str) {
+        self.render_data_sync_metrics(out, osd_label);
         let st = self.meta_store.wal_sync_stats();
         st.seconds.render(
             out,
@@ -659,6 +661,44 @@ impl OsdService {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} counter");
             let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
+        }
+    }
+
+    /// Shard data fdatasync latency and how many writes each covered, per
+    /// disk: the data-side counterpart of the WAL families.
+    fn render_data_sync_metrics(&self, out: &mut String, osd_label: &str) {
+        let label = |i: usize| format!("{osd_label},disk=\"{i}\"");
+        let name = "objectio_osd_data_fsync_seconds";
+        let _ = writeln!(out, "# HELP {name} Time for one shard data fdatasync");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        for (i, disk) in self.disks.iter().enumerate() {
+            disk.data_sync_stats()
+                .seconds
+                .write_samples(out, name, &label(i));
+        }
+        for (name, help, get) in [
+            (
+                "objectio_osd_data_syncs_total",
+                "Shard data fdatasyncs",
+                (|st: &objectio_storage::metadata::WalSyncStats| st.syncs.load(Ordering::Relaxed))
+                    as fn(&objectio_storage::metadata::WalSyncStats) -> u64,
+            ),
+            (
+                "objectio_osd_data_writes_synced_total",
+                "Shard writes made durable; divide by syncs for writes per fsync",
+                |st| st.records.load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            for (i, disk) in self.disks.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "{name}{{{}}} {}",
+                    label(i),
+                    get(disk.data_sync_stats())
+                );
+            }
         }
     }
 
@@ -985,7 +1025,15 @@ impl StorageService for OsdService {
             .await
             .map_err(|e| Status::internal(format!("write failed: {}", e)))?;
 
-        disk.sync()
+        // Durable before it is indexed. Group commit: one fdatasync covers
+        // every shard write on this disk that completed before it started,
+        // instead of each shard queueing behind everyone else's fsync. Run on
+        // the blocking pool, not a runtime worker.
+        let written = disk.write_completed();
+        let syncing = Arc::clone(&self.disks[disk_idx]);
+        tokio::task::spawn_blocking(move || syncing.sync_through(written))
+            .await
+            .map_err(|e| Status::internal(format!("sync task failed: {e}")))?
             .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
 
         // Calculate checksum
@@ -1007,7 +1055,17 @@ impl StorageService for OsdService {
         // stays accurate to what's actually recoverable. A failure
         // here is non-fatal (the shard bytes are on disk); log loud
         // so we notice the drift.
-        if let Err(e) = Self::persist_shard_location(&self.meta_store, &key, &loc) {
+        // The WAL append blocks until its (group-committed) fdatasync.
+        let persisted = {
+            let meta_store = Arc::clone(&self.meta_store);
+            let (key, loc) = (key.clone(), loc.clone());
+            tokio::task::spawn_blocking(move || {
+                Self::persist_shard_location(&meta_store, &key, &loc)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("persist task failed: {e}")))
+        };
+        if let Err(e) = persisted {
             warn!(
                 "Failed to persist shard_location for {key}: {e} — \
                  in-memory only, will be lost on restart"
