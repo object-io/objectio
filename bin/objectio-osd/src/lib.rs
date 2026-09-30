@@ -29,7 +29,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
@@ -549,9 +548,15 @@ pub async fn run(
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
 
+    // tonic sets TCP_NODELAY only on listeners it binds itself; a listener
+    // handed in is served as-is, with Nagle on. Nagle holding back the tail
+    // of a response while the peer delays its ACK stalled idle requests by
+    // ~40 ms on Linux.
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .map_err(|e| anyhow::anyhow!("OSD listener: {e}"))?;
     let server_future = Server::builder()
         .add_service(storage_service)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             shutdown.await;
             info!("Shutting down...");
         });
