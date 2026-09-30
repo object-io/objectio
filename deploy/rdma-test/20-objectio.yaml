@@ -1,0 +1,212 @@
+# Step 2: ObjectIO split across the GPU nodes, so shards cross the fabric.
+#
+#   ihc-gpu-compute-07: meta + 6 OSDs (4+2), OSDs serving over Transfer Engine
+#   ihc-gpu-compute-05: two gateways against the same OSDs —
+#       obio-gw-rdma  (--rdma rdma): shards over RDMA on mlx5_0
+#       obio-gw-grpc  (no --rdma):   shards as gRPC bytes
+#   so objectio-s3-bench against each is an A/B on identical storage.
+#
+# Security, on a shared cluster:
+# - Gateways run without auth and listen on 127.0.0.1 only; the benchmark
+#   runs inside each gateway pod (kubectl exec), so S3 is never exposed.
+# - Meta and OSDs bind to the node IP (the gateways on the other node must
+#   reach them); like any ObjectIO deployment, OSD gRPC is not authenticated.
+# - Transfer Engine uses rail mlx5_0 only (MC_TE_FILTERS).
+#
+# OSD data is an emptyDir (the node's ephemeral disk). For NVMe numbers, point
+# `osd-data` at a hostPath on the node's NVMe instead — see README.md.
+#
+# No shell anywhere: $(VAR) in args is expanded by Kubernetes, not a shell.
+apiVersion: v1
+kind: Service
+metadata:
+  name: obio-meta
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test}
+spec:
+  selector: {app.kubernetes.io/name: obio-meta}
+  ports:
+  - {name: grpc, port: 19100, targetPort: 19100}
+  - {name: admin, port: 19101, targetPort: 19101}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-meta
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: obio-meta}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - name: meta
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["objectio-meta"]
+    args: ["--node-id", "1", "--listen", "$(HOST_IP):19100", "--admin-port", "19101",
+           "--metrics-port", "0", "--data-dir", "/data/meta", "--ec-k", "4", "--ec-m", "2"]
+    env:
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    resources:
+      requests: {cpu: "2", memory: 4Gi}
+      limits: {memory: 4Gi}
+    volumeMounts: [{name: meta-data, mountPath: /data}]
+  volumes:
+  - {name: meta-data, emptyDir: {}}
+---
+# Raft needs one POST /init once meta is up. A Job rather than `kubectl exec`
+# keeps it declarative. 200 = initialised; 409 = already was.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: obio-meta-init
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test}
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      priorityClassName: build-preemptible
+      imagePullSecrets: [{name: REPLACE-pull-secret}]
+      containers:
+      - name: init
+        image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+        command: ["curl", "-sS", "--retry", "30", "--retry-connrefused", "--retry-delay", "2",
+                  "-X", "POST", "-d", "{}", "-w", "\nHTTP %{http_code}\n",
+                  "http://obio-meta.obio-rdma-test.svc.cluster.local:19101/init"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-osds
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: obio-osds}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - &osd
+    name: osd-0
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["objectio-osd"]
+    args: ["--listen", "$(HOST_IP):19200", "--advertise-addr", "http://$(HOST_IP):19200",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-0/state", "--disks", "/data/osd-0/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+    env: &osd-env
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - {name: MC_TE_FILTERS, value: mlx5_0}
+    - name: MC_RDMA_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - name: MC_TCP_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    resources: &osd-resources
+      requests: {cpu: "2", memory: 4Gi, rdma/hca_gpu0: "1"}
+      limits: {memory: 4Gi, rdma/hca_gpu0: "1"}
+    securityContext: &ipc-lock
+      capabilities: {add: [IPC_LOCK]}
+    volumeMounts: [{name: osd-data, mountPath: /data}]
+  - <<: *osd
+    name: osd-1
+    args: ["--listen", "$(HOST_IP):19201", "--advertise-addr", "http://$(HOST_IP):19201",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-1/state", "--disks", "/data/osd-1/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+  - <<: *osd
+    name: osd-2
+    args: ["--listen", "$(HOST_IP):19202", "--advertise-addr", "http://$(HOST_IP):19202",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-2/state", "--disks", "/data/osd-2/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+  - <<: *osd
+    name: osd-3
+    args: ["--listen", "$(HOST_IP):19203", "--advertise-addr", "http://$(HOST_IP):19203",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-3/state", "--disks", "/data/osd-3/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+  - <<: *osd
+    name: osd-4
+    args: ["--listen", "$(HOST_IP):19204", "--advertise-addr", "http://$(HOST_IP):19204",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-4/state", "--disks", "/data/osd-4/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+  - <<: *osd
+    name: osd-5
+    args: ["--listen", "$(HOST_IP):19205", "--advertise-addr", "http://$(HOST_IP):19205",
+           "--meta-endpoint", "http://$(HOST_IP):19100",
+           "--data-dir", "/data/osd-5/state", "--disks", "/data/osd-5/disk.raw",
+           "--metrics-port", "0",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)", "--rdma-staging-slots", "64"]
+  volumes:
+  - name: osd-data
+    emptyDir: {sizeLimit: 200Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-gw-rdma
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: obio-gateway}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - name: gateway
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["objectio-gateway"]
+    args: ["--listen", "127.0.0.1:19000", "--no-auth", "--ec-k", "4", "--ec-m", "2",
+           "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
+           "--external-endpoint", "http://127.0.0.1:19000",
+           "--rdma", "rdma", "--rdma-host", "$(HOST_IP)"]
+    env:
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - {name: MC_TE_FILTERS, value: mlx5_0}
+    - name: MC_RDMA_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - name: MC_TCP_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    resources:
+      requests: {cpu: "8", memory: 16Gi, rdma/hca_gpu0: "1"}
+      limits: {memory: 16Gi, rdma/hca_gpu0: "1"}
+    securityContext:
+      capabilities: {add: [IPC_LOCK]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-gw-grpc
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: obio-gateway}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - name: gateway
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["objectio-gateway"]
+    args: ["--listen", "127.0.0.1:19010", "--no-auth", "--ec-k", "4", "--ec-m", "2",
+           "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
+           "--external-endpoint", "http://127.0.0.1:19010"]
+    resources:
+      requests: {cpu: "8", memory: 16Gi}
+      limits: {memory: 16Gi}

@@ -1,0 +1,71 @@
+# Step 1: two idle probe pods, one per GPU node, for raw measurements before
+# ObjectIO runs — perftest on the rail, then te-bench over Transfer Engine
+# (RDMA, then TCP) between the nodes. Commands are run with `kubectl exec`
+# (see README.md); the pods themselves only sleep, with no shell in the
+# manifest (this cluster's API gateway rejects shell text).
+#
+# The fabric is rail-optimised: every process must use the same rail. mlx5_0
+# (rdma/hca_gpu0) is the one kvbench's RDMA gate measured at ~391 Gb/s on all
+# node pairs. No Multus, so RoCE needs hostNetwork plus the rdma/hca_gpu*
+# resource. Low priority, so production workloads always win.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-te-a
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: te-probe}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - name: probe
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["sleep", "infinity"]
+    env:
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - {name: MC_TE_FILTERS, value: mlx5_0}
+    - name: MC_RDMA_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - name: MC_TCP_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    resources:
+      requests: {cpu: "4", memory: 8Gi, rdma/hca_gpu0: "1"}
+      limits: {memory: 8Gi, rdma/hca_gpu0: "1"}
+    securityContext:
+      capabilities: {add: [IPC_LOCK]}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: obio-te-b
+  namespace: obio-rdma-test
+  labels: {app.kubernetes.io/part-of: objectio-rdma-test, app.kubernetes.io/name: te-probe}
+spec:
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  priorityClassName: build-preemptible
+  restartPolicy: Never
+  nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
+  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  containers:
+  - name: probe
+    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    command: ["sleep", "infinity"]
+    env:
+    - name: HOST_IP
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - {name: MC_TE_FILTERS, value: mlx5_0}
+    - name: MC_RDMA_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    - name: MC_TCP_BIND_ADDRESS
+      valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+    resources:
+      requests: {cpu: "4", memory: 8Gi, rdma/hca_gpu0: "1"}
+      limits: {memory: 8Gi, rdma/hca_gpu0: "1"}
+    securityContext:
+      capabilities: {add: [IPC_LOCK]}

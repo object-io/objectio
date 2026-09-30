@@ -24,5 +24,9 @@ transfer_engine_rust = { path = "vendor/transfer_engine_rust", optional = true }
 [dev-dependencies]
 futures = { workspace = true }
 
+[[example]]
+name = "te-bench"
+required-features = ["te"]
+
 [lints]
 workspace = true

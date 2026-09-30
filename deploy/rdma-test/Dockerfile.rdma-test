@@ -1,0 +1,53 @@
+# Image for the RDMA tests in deploy/rdma-test: ObjectIO's meta, OSD and
+# gateway built with `rdma`, objectio-s3-bench, te-bench (raw Transfer Engine
+# between two pods), and perftest for checking a rail. From the repository
+# root:
+#
+#   docker build -f deploy/rdma-test/Dockerfile.rdma-test -t <registry>/objectio-rdma-test:<tag> .
+#
+# Test-only: not a release image.
+
+# ---- build: Mooncake Transfer Engine at the vendored bindings' commit, then
+# ---- ObjectIO against it.
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y git curl ca-certificates sudo pkg-config libclang-dev clang \
+    protobuf-compiler
+ARG MOONCAKE_REF=c3fa13ecaf1038df933dcb784ff8ffe026381100
+RUN git clone https://github.com/kvcache-ai/Mooncake /mooncake && cd /mooncake \
+ && git checkout ${MOONCAKE_REF} && git submodule update --init --recursive
+WORKDIR /mooncake
+RUN bash dependencies.sh -y
+RUN cmake -S . -B build -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+      -DWITH_P2P_STORE=OFF -DBUILD_UNIT_TESTS=OFF -DBUILD_BENCHMARK=OFF \
+      -DUSE_ETCD=OFF -DUSE_CUDA=OFF -DWITH_RUST_EXAMPLE=OFF \
+ && cmake --build build -j"$(nproc)"
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+ENV PATH=/root/.cargo/bin:$PATH \
+    MOONCAKE_BUILD_DIR=/mooncake/build \
+    MOONCAKE_TE_INCLUDE_DIR=/mooncake/mooncake-transfer-engine/include
+COPY . /src
+WORKDIR /src
+RUN cargo build --release \
+      -p objectio-meta -p objectio-s3-bench \
+      -p objectio-osd --features objectio-osd/rdma \
+      -p objectio-gateway --features objectio-gateway/rdma \
+ && cargo build --release -p objectio-transport-te --features te --example te-bench \
+ && mkdir -p /out/bin /out/lib \
+ && cp target/release/objectio-meta target/release/objectio-osd \
+       target/release/objectio-gateway target/release/objectio-s3-bench \
+       target/release/examples/te-bench /out/bin/ \
+ && cp /mooncake/build/mooncake-common/libasio.so /out/lib/
+
+# ---- runtime: the libraries Transfer Engine needs at run time, perftest for
+# ---- rail checks, and curl for the one-shot Raft bootstrap.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl rdma-core ibverbs-utils perftest \
+      libgoogle-glog0v6 libgflags2.2 libnuma1 libjsoncpp25 libcurl4t64 libunwind8 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bin/ /opt/objectio/bin/
+COPY --from=build /out/lib/ /opt/objectio/lib/
+ENV PATH=/opt/objectio/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/objectio/lib

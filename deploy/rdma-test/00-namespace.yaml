@@ -1,0 +1,15 @@
+# Test namespace for ObjectIO's RDMA data plane on the HGX nodes.
+#
+# Privileged pod security, like the `mooncake` namespace: RoCE here needs
+# hostNetwork (there is no Multus) and IPC_LOCK to pin registered memory.
+# Everything ObjectIO runs for these tests lives in this namespace and is
+# labelled app.kubernetes.io/part-of=objectio-rdma-test; deleting the
+# namespace removes all of it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: obio-rdma-test
+  labels:
+    app.kubernetes.io/part-of: objectio-rdma-test
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
