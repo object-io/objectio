@@ -21,7 +21,7 @@ with production:
   (`rdma/hca_gpu0`, `MC_TE_FILTERS=mlx5_0`); mismatched rails fail with
   "transport retry counter exceeded".
 
-Nodes: `ihc-gpu-compute-05` (gateways, `obio-te-a`) and `ihc-gpu-compute-07`
+Nodes: `gpu-compute-05` (gateways, `obio-te-a`) and `gpu-compute-07`
 (meta, OSDs, `obio-te-b`).
 
 ```bash
@@ -115,7 +115,7 @@ $K exec obio-gw-rdma -- curl -s http://127.0.0.1:19000/metrics   # look for:
 
 **NVMe.** `osd-data` is a hostPath, `/mnt/kvcache/obio-rdma-test`, on
 compute-07's Mooncake spill drive (a PM1733a; the node's other seven are
-Longhorn's). Use it only while `mooncake-store-ihc-gpu-compute-07` is scaled to
+Longhorn's). Use it only while `mooncake-store-gpu-compute-07` is scaled to
 zero, and remove the directory before the store comes back (see below). The
 store's check refuses to start unless the drive has 12 TiB free.
 
