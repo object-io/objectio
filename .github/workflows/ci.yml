@@ -135,6 +135,38 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  rdma:
+    name: rdma (transfer engine, tcp)
+    runs-on: ubuntu-latest
+    # The Transfer Engine code paths (objectio-transport-te, and the OSD's,
+    # gateway's and aio's `rdma` features) only build against a Mooncake build,
+    # so the jobs above never compile them. This builds Mooncake at the pinned
+    # commit in an image — cached across runs, so only a Mooncake bump pays for
+    # it — and runs every test that needs it with Transfer Engine in TCP mode,
+    # including the e2e suite against aio --rdma tcp. No RDMA hardware needed.
+    timeout-minutes: 90
+    steps:
+      # Mooncake's dependencies plus the Rust builds do not fit next to what
+      # the runner image ships with.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build the Mooncake test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/objectio-transport-te/test.Dockerfile
+          load: true
+          tags: objectio-te-test
+          cache-from: type=gha,scope=te-test
+          cache-to: type=gha,scope=te-test,mode=max
+      - name: test
+        run: docker run --rm objectio-te-test
+
   chart:
     name: helm chart
     runs-on: ubuntu-latest

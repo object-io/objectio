@@ -51,6 +51,8 @@ pub struct Cluster {
     port: u16,
     osds: usize,
     ec: Option<(u8, u8)>,
+    /// Further aio flags, passed on every start and restart.
+    extra_args: Vec<String>,
 }
 
 impl Drop for Cluster {
@@ -115,18 +117,33 @@ impl Cluster {
 
     /// Boot a cluster that erasure-codes rather than replicates.
     pub fn start_with_ec(osds: usize, ec_k: u8, ec_m: u8) -> Self {
-        Self::boot(osds, Some((ec_k, ec_m)))
+        Self::boot(osds, Some((ec_k, ec_m)), Vec::new())
+    }
+
+    /// As [`Self::start_with_ec`], with further aio flags — kept for restarts.
+    pub fn start_with_ec_and_args(osds: usize, ec_k: u8, ec_m: u8, args: &[&str]) -> Self {
+        Self::boot(
+            osds,
+            Some((ec_k, ec_m)),
+            args.iter().map(ToString::to_string).collect(),
+        )
     }
 
     pub fn start_with_osds(osds: usize) -> Self {
-        Self::boot(osds, None)
+        Self::boot(osds, None, Vec::new())
     }
 
     /// How many times a cluster is started before giving up, when aio
     /// exits during startup. Covers losing the port race in [`free_port`].
     const START_ATTEMPTS: usize = 5;
 
-    fn spawn(data_dir: &std::path::Path, port: u16, osds: usize, ec: Option<(u8, u8)>) -> Child {
+    fn spawn(
+        data_dir: &std::path::Path,
+        port: u16,
+        osds: usize,
+        ec: Option<(u8, u8)>,
+        extra_args: &[String],
+    ) -> Child {
         Command::new(aio_binary())
             .arg("--data")
             .arg(data_dir)
@@ -146,6 +163,7 @@ impl Cluster {
                 ]
             }))
             .arg("--auth")
+            .args(extra_args)
             // Both discarded unless asked for. tracing writes to *stdout*
             // here, so an unread pipe wedges the child once its 64 KiB buffer
             // fills — which presents as the cluster hanging at startup with no
@@ -156,14 +174,14 @@ impl Cluster {
             .expect("spawn objectio-aio")
     }
 
-    fn boot(osds: usize, ec: Option<(u8, u8)>) -> Self {
+    fn boot(osds: usize, ec: Option<(u8, u8)>, extra_args: Vec<String>) -> Self {
         let mut last = String::new();
         for _ in 0..Self::START_ATTEMPTS {
             // A fresh port and data directory each attempt: a half-started
             // cluster may have written state for the port it lost.
             let data_dir = tempfile::tempdir().expect("tempdir");
             let port = free_port();
-            let mut child = Self::spawn(data_dir.path(), port, osds, ec);
+            let mut child = Self::spawn(data_dir.path(), port, osds, ec, &extra_args);
 
             // Credentials come from the file meta writes, not from scraping
             // the log. The banner is interleaved with tracing output and its
@@ -187,6 +205,7 @@ impl Cluster {
                 port,
                 osds,
                 ec,
+                extra_args: extra_args.clone(),
             };
             match cluster.wait_healthy() {
                 Ok(()) => return cluster,
@@ -224,7 +243,13 @@ impl Cluster {
         // — so on losing the port, wait for it and try the same one again.
         let mut last = String::new();
         for _ in 0..Self::START_ATTEMPTS {
-            self.child = Self::spawn(self.data_dir.path(), self.port, self.osds, self.ec);
+            self.child = Self::spawn(
+                self.data_dir.path(),
+                self.port,
+                self.osds,
+                self.ec,
+                &self.extra_args,
+            );
             match self.wait_healthy() {
                 Ok(()) => return,
                 Err(e) => last = e,
