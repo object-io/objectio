@@ -156,6 +156,11 @@ struct Args {
     #[cfg(feature = "rdma")]
     #[arg(long)]
     rdma: Option<String>,
+
+    /// Objects of at most this many bytes are stored inside their metadata
+    /// record instead of in shards. Forwarded to the gateway; 0 turns it off.
+    #[arg(long, default_value_t = 4096)]
+    inline_max_size: usize,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -694,6 +699,8 @@ async fn main() -> Result<()> {
     if let Some(protocol) = &args.rdma {
         gw_argv.extend(["--rdma", protocol, "--rdma-host", "127.0.0.1"].map(str::to_string));
     }
+    gw_argv.push("--inline-max-size".into());
+    gw_argv.push(args.inline_max_size.to_string());
     if !args.prometheus_url.is_empty() {
         gw_argv.push("--prometheus-url".into());
         gw_argv.push(args.prometheus_url.trim_end_matches('/').to_string());

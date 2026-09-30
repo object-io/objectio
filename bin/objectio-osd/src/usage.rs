@@ -92,10 +92,14 @@ impl Counters {
 /// `ceil(data_size / k)` bytes and `m` parity shards of the same length.
 ///
 /// Stripes that predate `data_size` report 0; the object's size is then
-/// spread by the first stripe's scheme instead. An object with no stripes
-/// (a delete marker) occupies nothing.
+/// spread by the first stripe's scheme instead. An inline object has no
+/// shards: its bytes live in its metadata record, counted once. Any other
+/// object with no stripes (a delete marker) occupies nothing.
 #[must_use]
 pub fn stored_bytes(o: &ObjectMeta) -> u64 {
+    if !o.inline_data.is_empty() {
+        return o.inline_data.len() as u64;
+    }
     let per_stripe: u64 = o
         .stripes
         .iter()
@@ -407,6 +411,16 @@ mod tests {
         // Shards round up: 5 bytes over k=4 is four 2-byte data shards.
         assert_eq!(stored_bytes(&obj(5, ME, "", 0)), 12);
         assert_eq!(stored_bytes(&ObjectMeta::default()), 0);
+    }
+
+    #[test]
+    fn an_inline_object_is_its_bytes() {
+        let o = ObjectMeta {
+            size: 100,
+            inline_data: vec![0; 100],
+            ..Default::default()
+        };
+        assert_eq!(stored_bytes(&o), 100);
     }
 
     /// The same ObjectMeta lands on all six shard holders. Only the primary

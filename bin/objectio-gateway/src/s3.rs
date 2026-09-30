@@ -139,6 +139,9 @@ pub struct AppState {
     /// Transfer Engine and the pools OSDs move shards through, when started
     /// with `--rdma` (feature `rdma`). `None`: every shard goes over gRPC.
     pub rdma: Option<Arc<crate::rdma::GatewayRdma>>,
+    /// Objects of at most this many bytes are stored inline in their
+    /// ObjectMeta rather than in shards (`--inline-max-size`; 0 = never).
+    pub inline_max_size: usize,
 }
 
 impl AppState {
@@ -2369,9 +2372,15 @@ pub async fn put_object(
     let ec_type = ErasureType::try_from(placement.ec_type).unwrap_or(ErasureType::ErasureMds);
     let replication_count = placement.replication_count;
 
+    // A small object goes into its ObjectMeta, whole, on every OSD in the
+    // placement: no stripes, no shard writes. It takes the EC path below
+    // with zero stripes, whatever the protection scheme — replicating the
+    // record is what protects it.
+    let inline = !body.is_empty() && body.len() <= state.inline_max_size;
+
     // Replication mode: no EC, just write raw data to each replica
     // For large files, split into multiple stripes (each stripe <= MAX_SHARD_SIZE)
-    if ec_type == ErasureType::ErasureReplication {
+    if ec_type == ErasureType::ErasureReplication && !inline {
         let total_replicas = replication_count.max(1) as usize;
 
         // Split data into stripes (each stripe must fit in a block)
@@ -2551,6 +2560,7 @@ pub async fn put_object(
             encryption_iv: sse_iv.clone(),
             encryption_context: sse_encryption_context.clone(),
             usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+            inline_data: Vec::new(),
         };
 
         if let Err(e) = put_object_meta_to_all(
@@ -2611,7 +2621,11 @@ pub async fn put_object(
     // shard_size = stripe_data_size / ec_k (approximately)
     // So max_stripe_data_size = MAX_SHARD_SIZE * ec_k
     let max_stripe_data_size = MAX_SHARD_SIZE * ec_k as usize;
-    let num_stripes = body.len().div_ceil(max_stripe_data_size);
+    let num_stripes = if inline {
+        0
+    } else {
+        body.len().div_ceil(max_stripe_data_size)
+    };
 
     debug!(
         "EC mode: encoding {}/{} ({} bytes) into {} stripes with {}+{} shards each",
@@ -2916,6 +2930,7 @@ pub async fn put_object(
         encryption_iv: sse_iv,
         encryption_context: sse_encryption_context,
         usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+        inline_data: if inline { body.to_vec() } else { Vec::new() },
     };
 
     // Two commits make the object, at the same time: see `commit_object`.
@@ -3162,7 +3177,7 @@ pub async fn get_object(
     }
 
     // Check for stripes
-    if object.stripes.is_empty() {
+    if object.stripes.is_empty() && object.inline_data.is_empty() {
         error!(
             "Object has no stripe metadata: {}/{} (size {})",
             bucket, key, object.size
@@ -3330,6 +3345,14 @@ pub async fn get_object(
         object.size as usize
     };
     let mut all_data = Vec::with_capacity(capacity);
+
+    // An inline object is all here already; its stripe plan is empty.
+    if !object.inline_data.is_empty() {
+        match inline_slice(&object, resolved_range.as_ref(), get_sse_dek.as_ref()) {
+            Ok(data) => all_data = data,
+            Err(resp) => return resp,
+        }
+    }
 
     for &(stripe_idx, stripe_byte_offset) in &stripe_plan {
         let stripe = &object.stripes[stripe_idx];
@@ -3764,6 +3787,37 @@ pub async fn get_object(
 
         builder.body(Body::from(all_data)).unwrap()
     }
+}
+
+/// The bytes of an inline object a GET asked for: all of them, or `range`,
+/// decrypted when the object is encrypted.
+#[allow(clippy::result_large_err)]
+fn inline_slice(
+    object: &ObjectMeta,
+    range: Option<&ByteRange>,
+    dek: Option<&[u8; objectio_kms::DEK_LEN]>,
+) -> Result<Vec<u8>, Response> {
+    if object.inline_data.len() as u64 != object.size {
+        error!(
+            "Inline object {}/{} holds {} bytes but its size is {}",
+            object.bucket,
+            object.key,
+            object.inline_data.len(),
+            object.size
+        );
+        return Err(S3Error::xml_response(
+            "InternalError",
+            "Object metadata is inconsistent (inline size)",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    let (start, end) = range.map_or((0, object.size), |r| (r.start, r.end + 1));
+    let mut data = object.inline_data[start as usize..end as usize].to_vec();
+    if let Some(dek) = dek {
+        // Stored like a single stripe starting at byte 0 of the object.
+        decrypt_stripe_slice(dek, &StripeMeta::default(), object, 0, start, &mut data)?;
+    }
+    Ok(data)
 }
 
 /// Decrypt `buf` — one stripe's contribution to the GET response.
