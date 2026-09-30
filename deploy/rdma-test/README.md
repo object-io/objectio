@@ -113,13 +113,17 @@ $K exec obio-gw-rdma -- curl -s http://127.0.0.1:19000/metrics   # look for:
 #   objectio_gateway_rdma_fallbacks_total                                 absent or 0
 ```
 
-**NVMe.** `osd-data` is an `emptyDir` on the node's ephemeral disk. For
-numbers comparable to datacore's, replace it in `20-objectio.yaml` with a
-`hostPath` on compute-07's NVMe — a directory of its own, agreed with whoever
-owns that disk (the Mooncake stores spill to NVMe on these nodes too).
+**NVMe.** `osd-data` is a hostPath, `/mnt/kvcache/obio-rdma-test`, on
+compute-07's Mooncake spill drive (a PM1733a; the node's other seven are
+Longhorn's). Use it only while `mooncake-store-ihc-gpu-compute-07` is scaled to
+zero, and remove the directory before the store comes back (see below). The
+store's check refuses to start unless the drive has 12 TiB free.
 
 ## 4. Tear down
 
 ```bash
 kubectl --context prod-k8s delete ns obio-rdma-test
 ```
+
+Deleting the namespace leaves the OSD disk files in
+`/mnt/kvcache/obio-rdma-test` on compute-07; clear that directory too.
