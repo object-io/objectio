@@ -40,6 +40,9 @@ isal = ["objectio-gateway/isal", "objectio-osd/isal"]
 # no-op elsewhere. Enable on Linux release builds to get +25%
 # throughput + -43% p99.9 on 4 MiB object stripes.
 io-uring = ["objectio-osd/io-uring"]
+# Shard transfers over Mooncake Transfer Engine between the embedded gateway
+# and OSDs, turned on with `--rdma`. Linux only; needs a Mooncake build.
+rdma = ["objectio-gateway/rdma", "objectio-osd/rdma"]
 # Pluggable grep engines — propagate into the embedded gateway.
 # pcre2 needs libpcre2-dev at build time; hyperscan needs
 # libhyperscan-dev (Linux x86_64 primary). Off by default so

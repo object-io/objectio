@@ -22,6 +22,8 @@ static IN_FLIGHT: LazyLock<GaugeVec> = LazyLock::new(GaugeVec::new);
 static REQUEST_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(SIZE_BUCKETS));
 static SHARD_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static OSD_ERRORS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static SHARD_TRANSFERS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static RDMA_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
@@ -109,6 +111,22 @@ pub fn record_osd_error(address: &str, kind: &str) {
     ));
 }
 
+/// A shard moved to or from an OSD. `direction` is `write` or `read`;
+/// `transport` is `rdma` (Transfer Engine) or `grpc` (bytes in the message).
+pub fn record_shard_transfer(direction: &str, transport: &str) {
+    SHARD_TRANSFERS.inc(&format!(
+        "direction=\"{direction}\",transport=\"{transport}\""
+    ));
+}
+
+/// A shard that could have used Transfer Engine went over gRPC instead.
+pub fn record_rdma_fallback(direction: &str, reason: crate::rdma::Fallback) {
+    RDMA_FALLBACKS.inc(&format!(
+        "direction=\"{direction}\",reason=\"{}\"",
+        reason.label()
+    ));
+}
+
 /// Splits one request's time into consecutive phases. Each [`mark`] records
 /// the time since the previous one, so the phases of a request add up to the
 /// part of it the handler spent between the first and last mark.
@@ -181,6 +199,16 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_osd_request_errors_total",
         "Failed shard calls to an OSD, by kind",
+    );
+    SHARD_TRANSFERS.render(
+        &mut out,
+        "objectio_gateway_shard_transfers_total",
+        "Shards moved to or from OSDs, by direction and transport (rdma or grpc)",
+    );
+    RDMA_FALLBACKS.render(
+        &mut out,
+        "objectio_gateway_rdma_fallbacks_total",
+        "Shards sent over gRPC to an OSD that offers Transfer Engine, by reason",
     );
     objectio_erasure::metrics::render(&mut out);
     out

@@ -136,6 +136,9 @@ pub struct AppState {
     /// Base URL of a Prometheus that scrapes this cluster. Empty = the
     /// console falls back to scraping /metrics live.
     pub prometheus_url: String,
+    /// Transfer Engine and the pools OSDs move shards through, when started
+    /// with `--rdma` (feature `rdma`). `None`: every shard goes over gRPC.
+    pub rdma: Option<Arc<crate::rdma::GatewayRdma>>,
 }
 
 impl AppState {
@@ -2378,8 +2381,9 @@ pub async fn put_object(
                         s_idx, // stripe_id
                         pos,
                         shard_data,
-                        1, // ec_k=1 for replication (full data)
-                        0, // ec_m=0 for replication (no parity)
+                        1,    // ec_k=1 for replication (full data)
+                        0,    // ec_m=0 for replication (no parity)
+                        None, // Replicated stripes go over gRPC.
                     )
                     .await;
                     (pos, result, placement_node)
@@ -2569,6 +2573,10 @@ pub async fn put_object(
         let stripe_data = &body[stripe_start..stripe_end];
         let stripe_data_size = stripe_data.len() as u64;
 
+        // Where the encoded stripe starts in registered memory, when it was
+        // encoded into a Transfer Engine stripe slot.
+        let mut rdma_base: Option<u64> = None;
+
         // Encode this stripe with erasure coding - use LRC if specified
         let shards: Vec<Bytes> = match ec_type {
             ErasureType::ErasureLrc => {
@@ -2626,7 +2634,28 @@ pub async fn put_object(
                     }
                 };
 
-                match codec.encode_bytes(stripe_data) {
+                // With Transfer Engine, encode straight into a registered
+                // stripe slot: OSDs then read their shards out of it.
+                let slot = state
+                    .rdma
+                    .as_deref()
+                    .and_then(|r| r.stripe_slot(codec.stripe_len(stripe_data.len())));
+                let encoded = match slot {
+                    Some(mut slot) => {
+                        let base = slot.addr();
+                        codec
+                            .encode_into(stripe_data, slot.as_mut_slice())
+                            .map(|shard_size| {
+                                rdma_base = Some(base);
+                                let stripe = slot.into_bytes(shard_size * total_shards);
+                                (0..total_shards)
+                                    .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
+                                    .collect()
+                            })
+                    }
+                    None => codec.encode_bytes(stripe_data),
+                };
+                match encoded {
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to encode stripe {}: {}", stripe_idx, e);
@@ -2672,8 +2701,21 @@ pub async fn put_object(
             let shard_data = shard.clone();
             let pos = i as u32;
             let s_idx = stripe_idx as u64;
+            let rdma = state.rdma.clone();
+            let shard_addr = rdma_base.map(|base| base + (i * shard_data.len()) as u64);
+            // Transfer Engine was on offer, but no stripe slot was free.
+            if rdma.is_some() && shard_addr.is_none() && !placement_node.te_segment.is_empty() {
+                crate::gateway_metrics::record_rdma_fallback(
+                    "write",
+                    crate::rdma::Fallback::NoSlot,
+                );
+            }
 
             write_futures.push(async move {
+                let source = rdma
+                    .as_deref()
+                    .zip(shard_addr)
+                    .map(|(rdma, addr)| crate::osd_pool::RdmaSource { rdma, addr });
                 let result = write_shard_to_osd(
                     &pool,
                     &placement_node,
@@ -2683,6 +2725,7 @@ pub async fn put_object(
                     shard_data,
                     ec_k,
                     ec_m,
+                    source,
                 )
                 .await;
                 (pos, result, placement_node)
@@ -2944,6 +2987,13 @@ pub async fn get_object(
     // that don't carry failure_domain in ListingNode — in that case every
     // node ranks as `Unknown` distance and the ranked sort is a no-op.
     let mut node_topo_map: HashMap<Vec<u8>, objectio_placement::FailureDomainInfo> = HashMap::new();
+    // node_id → Transfer Engine segment, for shard reads over RDMA. The
+    // listing is the more current source, so it wins over the placement.
+    let mut node_te_map: HashMap<Vec<u8>, String> = placement
+        .nodes
+        .iter()
+        .map(|n| (n.node_id.clone(), n.te_segment.clone()))
+        .collect();
     if let Ok(resp) = meta_client
         .get_listing_nodes(GetListingNodesRequest {
             bucket: String::new(),
@@ -2955,6 +3005,7 @@ pub async fn get_object(
             node_address_map
                 .entry(n.node_id.clone())
                 .or_insert_with(|| n.address.clone());
+            node_te_map.insert(n.node_id.clone(), n.te_segment.clone());
             let fd = n.failure_domain.unwrap_or_default();
             node_topo_map.insert(
                 n.node_id,
@@ -3259,6 +3310,7 @@ pub async fn get_object(
                     shard_object_id,
                     stripe.stripe_id,
                     shard_loc.position,
+                    None, // Replicated stripes go over gRPC.
                 )
                 .await
                 {
@@ -3397,7 +3449,10 @@ pub async fn get_object(
                 )
                 .await;
                 let node_placement = objectio_proto::metadata::NodePlacement {
-                    te_segment: String::new(),
+                    te_segment: node_te_map
+                        .get(&shard_loc.node_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     position: shard_loc.position,
                     node_id: shard_loc.node_id.clone(),
                     node_address: node_addr,
@@ -3406,6 +3461,7 @@ pub async fn get_object(
                     local_group: shard_loc.local_group,
                 };
                 let pool = &state.osd_pool;
+                let rdma = state.rdma.as_deref();
                 let stripe_id = stripe.stripe_id;
                 in_flight.push(async move {
                     let result = read_shard_from_osd(
@@ -3414,6 +3470,7 @@ pub async fn get_object(
                         ec_shard_object_id,
                         stripe_id,
                         pos,
+                        rdma,
                     )
                     .await;
                     (pos, dist, result)
@@ -5188,8 +5245,9 @@ async fn upload_part_internal(
                         s_idx, // stripe_id
                         pos,
                         shard_data,
-                        1, // ec_k=1 for replication
-                        0, // ec_m=0 for replication
+                        1,    // ec_k=1 for replication
+                        0,    // ec_m=0 for replication
+                        None, // Replicated stripes go over gRPC.
                     )
                     .await;
                     (pos, result, placement_node)
@@ -5351,6 +5409,7 @@ async fn upload_part_internal(
                         shard_data,
                         ec_k,
                         ec_m,
+                        None, // Multipart parts go over gRPC (for now).
                     )
                     .await;
                     (pos, result, placement_node)
