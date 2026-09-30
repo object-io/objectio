@@ -163,3 +163,53 @@ fn erasure_coded_objects_round_trip() {
     after.expect(200);
     assert_eq!(after.bytes, payload, "EC object changed across a restart");
 }
+
+/// A 4+2 stripe that has lost a shard still reads, and reads correctly.
+///
+/// GET fetches the nearest k shards in parallel and replaces each failed
+/// read with the next-nearest position. Losing one disk of six takes one
+/// shard of every object with it — for some objects a data shard, whose
+/// read fails and must be replaced by a parity shard.
+#[test]
+fn erasure_coded_reads_survive_a_lost_disk() {
+    let mut c = Cluster::start_with_ec(6, 4, 2);
+    c.json("POST", "/_admin/buckets", json!({"name": "degraded"}))
+        .expect_ok();
+
+    let objects: Vec<(String, Vec<u8>)> = (0..8u32)
+        .map(|n| {
+            let payload = (0..(1024 * 1024 + 4099 * n))
+                .map(|i| u8::try_from((i + n) % 251).unwrap())
+                .collect();
+            (format!("/degraded/obj-{n}.bin"), payload)
+        })
+        .collect();
+    for (path, payload) in &objects {
+        c.request("PUT", path, payload).expect(200);
+    }
+
+    c.restart_with_lost_disk(4);
+
+    for (path, payload) in &objects {
+        let got = c.request("GET", path, &[]);
+        got.expect(200);
+        assert_eq!(&got.bytes, payload, "{path} changed after losing a shard");
+    }
+
+    // Some shard reads must have failed — otherwise every object was read
+    // from intact shards and the replacement reads this test exists for
+    // never ran. Each failed read is counted by the gateway.
+    let metrics = c.request("GET", "/metrics", &[]).text();
+    let failed_reads: f64 = metrics
+        .lines()
+        .filter(|l| {
+            l.starts_with("objectio_gateway_osd_request_errors_total")
+                && l.contains("kind=\"error\"")
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum();
+    assert!(
+        failed_reads > 0.0,
+        "no shard read failed; the lost disk held no data shard"
+    );
+}
