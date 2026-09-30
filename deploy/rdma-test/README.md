@@ -30,13 +30,17 @@ K="kubectl --context prod-k8s -n obio-rdma-test"
 
 ## 1. Image and pull secret
 
+The manifests use `ghcr.io/infinia-technology/objectio-rdma-test:<commit>`
+and the pull secret `ghcr-kvbench`, copied into `obio-rdma-test` from
+`dynamo-poc`. To rebuild after a change:
+
 ```bash
-docker build -f deploy/rdma-test/Dockerfile.rdma-test -t <registry>/objectio-rdma-test:<tag> .
-docker push <registry>/objectio-rdma-test:<tag>
+docker build -f deploy/rdma-test/Dockerfile.rdma-test \
+  -t ghcr.io/infinia-technology/objectio-rdma-test:$(git rev-parse --short HEAD) .
+docker push ghcr.io/infinia-technology/objectio-rdma-test:$(git rev-parse --short HEAD)
 ```
 
-Create a pull secret for that registry in `obio-rdma-test`, then set the
-image and secret name in `10-*.yaml` and `20-*.yaml` (the `REPLACE-…` values).
+and update the tag in `10-*.yaml` and `20-*.yaml`.
 
 ## 2. The fabric, raw
 

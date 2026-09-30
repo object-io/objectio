@@ -20,10 +20,10 @@ spec:
   priorityClassName: build-preemptible
   restartPolicy: Never
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: probe
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["sleep", "infinity"]
     env:
     - name: HOST_IP
@@ -51,10 +51,10 @@ spec:
   priorityClassName: build-preemptible
   restartPolicy: Never
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: probe
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["sleep", "infinity"]
     env:
     - name: HOST_IP

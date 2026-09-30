@@ -40,10 +40,10 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: meta
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["objectio-meta"]
     args: ["--node-id", "1", "--listen", "$(HOST_IP):19100", "--admin-port", "19101",
            "--metrics-port", "0", "--data-dir", "/data/meta", "--ec-k", "4", "--ec-m", "2"]
@@ -71,10 +71,10 @@ spec:
     spec:
       restartPolicy: OnFailure
       priorityClassName: build-preemptible
-      imagePullSecrets: [{name: REPLACE-pull-secret}]
+      imagePullSecrets: [{name: ghcr-kvbench}]
       containers:
       - name: init
-        image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+        image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
         command: ["curl", "-sS", "--retry", "30", "--retry-connrefused", "--retry-delay", "2",
                   "-X", "POST", "-d", "{}", "-w", "\nHTTP %{http_code}\n",
                   "http://obio-meta.obio-rdma-test.svc.cluster.local:19101/init"]
@@ -90,11 +90,11 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-07}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - &osd
     name: osd-0
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["objectio-osd"]
     args: ["--listen", "$(HOST_IP):19200", "--advertise-addr", "http://$(HOST_IP):19200",
            "--meta-endpoint", "http://$(HOST_IP):19100",
@@ -165,10 +165,10 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: gateway
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["objectio-gateway"]
     args: ["--listen", "127.0.0.1:19000", "--no-auth", "--ec-k", "4", "--ec-m", "2",
            "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
@@ -199,10 +199,10 @@ spec:
   dnsPolicy: ClusterFirstWithHostNet
   priorityClassName: build-preemptible
   nodeSelector: {kubernetes.io/hostname: ihc-gpu-compute-05}
-  imagePullSecrets: [{name: REPLACE-pull-secret}]
+  imagePullSecrets: [{name: ghcr-kvbench}]
   containers:
   - name: gateway
-    image: REPLACE-registry/objectio-rdma-test:REPLACE-tag
+    image: ghcr.io/infinia-technology/objectio-rdma-test:c75e814
     command: ["objectio-gateway"]
     args: ["--listen", "127.0.0.1:19010", "--no-auth", "--ec-k", "4", "--ec-m", "2",
            "--meta-endpoint", "http://obio-meta.obio-rdma-test.svc.cluster.local:19100",
