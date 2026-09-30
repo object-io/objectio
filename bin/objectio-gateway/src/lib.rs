@@ -24,6 +24,7 @@ pub mod scatter_gather;
 
 use anyhow::Result;
 use auth_middleware::{AuthState, auth_layer, optional_auth_layer};
+use axum::serve::ListenerExt as _;
 use axum::{
     Extension, Router,
     extract::DefaultBodyLimit,
@@ -48,7 +49,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Prometheus metrics endpoint handler
 /// Join the per-OSD usage with meta's buckets and tenants. `None` when meta
@@ -1324,7 +1325,14 @@ pub async fn run(
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());
     for (addr, router, label) in listeners {
-        let listener = TcpListener::bind(addr).await?;
+        // axum serves accepted sockets with Nagle on unless told otherwise;
+        // Nagle holding back the tail of a response while the client delays
+        // its ACK stalls a lone request by ~40 ms on Linux.
+        let listener = TcpListener::bind(addr).await?.tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                debug!("TCP_NODELAY on accepted connection: {e}");
+            }
+        });
         info!("Listener: {label} on {addr}");
         // Iceberg path rewrite (`/iceberg/v1/ws/{wh}/...` →
         // `/iceberg/v1/...?warehouse={wh}`) is harmless on listeners
