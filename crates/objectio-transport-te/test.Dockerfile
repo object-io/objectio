@@ -1,5 +1,7 @@
-# Runs objectio-transport-te's Transfer Engine tests (TCP mode: no RDMA
-# hardware needed). From the repository root:
+# Runs every test that needs Transfer Engine, in TCP mode (no RDMA hardware
+# needed): this crate's, the OSD's and gateway's `rdma` tests, and the e2e
+# tests against an aio built with `rdma` (ci-test.sh). From the repository
+# root:
 #
 #   docker build -f crates/objectio-transport-te/test.Dockerfile -t te-test .
 #   docker run --rm te-test
@@ -7,7 +9,8 @@
 # Mooncake is pinned to the commit the bindings in vendor/ were copied from.
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y git curl ca-certificates sudo pkg-config libclang-dev clang
+RUN apt-get update && apt-get install -y git curl ca-certificates sudo pkg-config libclang-dev clang \
+    protobuf-compiler
 ARG MOONCAKE_REF=c3fa13ecaf1038df933dcb784ff8ffe026381100
 RUN git clone https://github.com/kvcache-ai/Mooncake /mooncake && cd /mooncake \
  && git checkout ${MOONCAKE_REF} && git submodule update --init --recursive
@@ -23,8 +26,10 @@ ENV PATH=/root/.cargo/bin:$PATH \
     MOONCAKE_BUILD_DIR=/mooncake/build \
     MOONCAKE_TE_INCLUDE_DIR=/mooncake/mooncake-transfer-engine/include \
     LD_LIBRARY_PATH=/mooncake/build/mooncake-common
-COPY . /src
+# rust-toolchain.toml pins the compiler; installing it before COPY keeps it in
+# a cached layer while the sources change.
+COPY rust-toolchain.toml /src/
 WORKDIR /src
-# rust-toolchain.toml pins the compiler; building here caches it in the image.
-RUN cargo test -p objectio-transport-te --features te --no-run
-CMD ["cargo", "test", "-p", "objectio-transport-te", "--features", "te"]
+RUN cargo --version
+COPY . /src
+CMD ["crates/objectio-transport-te/ci-test.sh"]
