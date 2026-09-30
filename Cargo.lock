@@ -2517,6 +2517,7 @@ dependencies = [
  "objectio-erasure",
  "objectio-proto",
  "objectio-storage",
+ "objectio-transport-te",
  "parking_lot",
  "prost",
  "serde",

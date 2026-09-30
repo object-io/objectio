@@ -18,6 +18,7 @@ objectio-storage = { workspace = true }
 objectio-erasure = { workspace = true }
 objectio-proto = { workspace = true }
 objectio-block = { workspace = true }
+objectio-transport-te = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { workspace = true }
@@ -47,6 +48,10 @@ isal = ["objectio-erasure/isal"]
 # + pread. Linux 5.6+ only; no-op on macOS / Windows. Measured +25%
 # throughput on 4 MiB stripes (see objectio-docs storage-io-levels).
 io-uring = ["objectio-storage/io-uring"]
+# Accept shard transfers over Mooncake Transfer Engine (RDMA, or TCP in
+# development). Linux only, and needs a Mooncake build — see
+# crates/objectio-transport-te. Enabled at run time with `--rdma`.
+rdma = ["objectio-transport-te/te"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -34,6 +34,7 @@ use objectio_proto::storage::{
     // Object metadata RPCs
     PutObjectMetaRequest,
     PutObjectMetaResponse,
+    RdmaBuffer,
     ReadShardRequest,
     ReadShardResponse,
     WriteShardRequest,
@@ -280,6 +281,10 @@ pub struct OsdService {
     /// Renders this OSD's Prometheus exposition for `GetMetrics`. Set once
     /// the metrics state exists, which is after the service is built.
     metrics_renderer: std::sync::OnceLock<MetricsRenderer>,
+    /// Transfer Engine and staging pool, once enabled at startup. Without it
+    /// every shard arrives and leaves as gRPC bytes.
+    #[cfg(feature = "rdma")]
+    rdma: std::sync::OnceLock<crate::rdma::RdmaStaging>,
 }
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
@@ -560,12 +565,74 @@ impl OsdService {
             grpc_metrics: Arc::new(GrpcMetrics::default()),
             usage,
             metrics_renderer: std::sync::OnceLock::new(),
+            #[cfg(feature = "rdma")]
+            rdma: std::sync::OnceLock::new(),
         })
     }
 
     /// Install the function `GetMetrics` serves. Later calls are ignored.
     pub fn set_metrics_renderer(&self, f: MetricsRenderer) {
         let _ = self.metrics_renderer.set(f);
+    }
+
+    /// The Transfer Engine segment to register with meta; empty unless
+    /// rdma is enabled.
+    #[must_use]
+    pub fn te_segment(&self) -> String {
+        #[cfg(feature = "rdma")]
+        if let Some(staging) = self.rdma.get() {
+            return staging.segment().to_string();
+        }
+        String::new()
+    }
+
+    /// Accept shard transfers over Transfer Engine from now on.
+    #[cfg(feature = "rdma")]
+    pub fn enable_rdma(&self, staging: crate::rdma::RdmaStaging) {
+        let _ = self.rdma.set(staging);
+    }
+
+    /// Read a PUT shard from the gateway's buffer into a staging slot.
+    #[cfg_attr(not(feature = "rdma"), allow(clippy::unused_async))]
+    async fn pull_shard(
+        &self,
+        src: &RdmaBuffer,
+        checksum: Option<&Checksum>,
+    ) -> Result<(objectio_transport_te::Slot, usize), Status> {
+        #[cfg(feature = "rdma")]
+        {
+            let staging = self
+                .rdma
+                .get()
+                .ok_or_else(|| Status::failed_precondition("rdma is not enabled on this OSD"))?;
+            let crc32c = checksum.map(|c| c.crc32c).ok_or_else(|| {
+                Status::invalid_argument("a shard sent over rdma needs a checksum")
+            })?;
+            staging.pull(src, crc32c).await
+        }
+        #[cfg(not(feature = "rdma"))]
+        {
+            let _ = (src, checksum);
+            Err(Status::unimplemented("this OSD was built without rdma"))
+        }
+    }
+
+    /// Write a GET shard into the gateway's buffer.
+    #[cfg_attr(not(feature = "rdma"), allow(clippy::unused_async))]
+    async fn push_shard(&self, data: &[u8], dest: &RdmaBuffer) -> Result<(), Status> {
+        #[cfg(feature = "rdma")]
+        {
+            let staging = self
+                .rdma
+                .get()
+                .ok_or_else(|| Status::failed_precondition("rdma is not enabled on this OSD"))?;
+            staging.push(data, dest).await
+        }
+        #[cfg(not(feature = "rdma"))]
+        {
+            let _ = (data, dest);
+            Err(Status::unimplemented("this OSD was built without rdma"))
+        }
     }
 
     /// Metadata WAL fsync latency and batching, as Prometheus families.
@@ -853,7 +920,6 @@ impl StorageService for OsdService {
     ) -> Result<Response<WriteShardResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
-        let bytes_in = req.data.len() as u64;
         let shard_id = req.shard_id.ok_or_else(|| {
             self.grpc_metrics
                 .write_shard
@@ -861,12 +927,36 @@ impl StorageService for OsdService {
             Status::invalid_argument("missing shard_id")
         })?;
 
+        // The shard is either in the request, or in the gateway's memory to
+        // be read over Transfer Engine into a staging slot held until it is
+        // on disk.
+        let staged = match req.rdma.as_ref() {
+            Some(src) => Some(
+                self.pull_shard(src, req.checksum.as_ref())
+                    .await
+                    .inspect_err(|_| {
+                        self.grpc_metrics.write_shard.record(
+                            false,
+                            start.elapsed().as_micros() as u64,
+                            0,
+                            0,
+                        );
+                    })?,
+            ),
+            None => None,
+        };
+        let data: &[u8] = match &staged {
+            Some((slot, len)) => &slot.as_slice()[..*len],
+            None => &req.data,
+        };
+        let bytes_in = data.len() as u64;
+
         debug!(
             "WriteShard: object={}, stripe={}, pos={}, size={}",
             hex::encode(&shard_id.object_id),
             shard_id.stripe_id,
             shard_id.position,
-            req.data.len()
+            data.len()
         );
 
         // Select disk and allocate an extent sized to this shard.
@@ -877,7 +967,7 @@ impl StorageService for OsdService {
         // Measured at 6144x and 6x amplification; the real capacity limit was
         // an object count, not a byte count, and nothing reported it.
         let disk_idx = self.select_disk_for_write();
-        let blocks = self.disks[disk_idx].blocks_for_len(req.data.len());
+        let blocks = self.disks[disk_idx].blocks_for_len(data.len());
         let block_num = self.allocate_extent(disk_idx, blocks)?;
 
         let disk = &self.disks[disk_idx];
@@ -891,7 +981,7 @@ impl StorageService for OsdService {
         // reactor stays free during the syscall / io_uring wait. On
         // Linux + --features io-uring this is +25% throughput on
         // 4 MiB stripes vs the old sync path (see storage-io-levels.md).
-        disk.write_block_async(block_num, object_id, shard_id.stripe_id, &req.data)
+        disk.write_block_async(block_num, object_id, shard_id.stripe_id, data)
             .await
             .map_err(|e| Status::internal(format!("write failed: {}", e)))?;
 
@@ -899,7 +989,7 @@ impl StorageService for OsdService {
             .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
 
         // Calculate checksum
-        let crc32c = crc32c::crc32c(&req.data);
+        let crc32c = crc32c::crc32c(data);
 
         // Store location in index
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
@@ -908,7 +998,7 @@ impl StorageService for OsdService {
         let loc = ShardLocation {
             disk_idx,
             block_num,
-            size: req.data.len() as u32,
+            size: data.len() as u32,
             crc32c,
             created_at: timestamp,
         };
@@ -929,7 +1019,7 @@ impl StorageService for OsdService {
             "Wrote shard: disk={}, block={}, size={}, crc32c={:08x}",
             disk_idx,
             block_num,
-            req.data.len(),
+            data.len(),
             crc32c
         );
 
@@ -938,7 +1028,7 @@ impl StorageService for OsdService {
                 node_id: self.node_id.to_vec(),
                 disk_id: self.disk_ids[disk_idx].to_vec(),
                 offset: block_num * disk.block_size() as u64,
-                size: req.data.len() as u32,
+                size: data.len() as u32,
             }),
             timestamp,
         };
@@ -1008,6 +1098,24 @@ impl StorageService for OsdService {
 
         let timestamp = Self::current_timestamp();
 
+        // Either the shard goes back in the response, or it is written into
+        // the gateway's buffer over Transfer Engine and the response only
+        // says how much landed there.
+        let (data, rdma_len) = match req.rdma_dest.as_ref() {
+            Some(dest) => {
+                self.push_shard(&data, dest).await.inspect_err(|_| {
+                    self.grpc_metrics.read_shard.record(
+                        false,
+                        start.elapsed().as_micros() as u64,
+                        bytes_in,
+                        0,
+                    );
+                })?;
+                (Vec::new(), data.len() as u64)
+            }
+            None => (data, 0),
+        };
+        let bytes_out = data.len() as u64 + rdma_len;
         let resp = ReadShardResponse {
             data: data.into(),
             checksum: Some(Checksum {
@@ -1016,8 +1124,8 @@ impl StorageService for OsdService {
                 sha256: vec![],
             }),
             timestamp,
+            rdma_len,
         };
-        let bytes_out = resp.data.len() as u64;
         self.grpc_metrics.read_shard.record(
             true,
             start.elapsed().as_micros() as u64,
@@ -1946,5 +2054,184 @@ mod shard_index_tests {
     fn an_empty_store_rebuilds_to_an_empty_index() {
         let (_dir, s) = store();
         assert!(OsdService::load_persisted_shard_index(&s).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "rdma"))]
+mod rdma_tests {
+    //! Shards in and out of a real `OsdService` over Transfer Engine. TCP
+    //! mode by default; `OBJECTIO_TE_TEST_PROTOCOL=rdma` with
+    //! `OBJECTIO_TE_TEST_HOST=<address on the RDMA interface>` runs them over
+    //! verbs.
+
+    use super::*;
+    use crate::rdma::RdmaStaging;
+    use objectio_proto::storage::ShardId;
+    use objectio_proto::storage::storage_service_server::StorageService;
+    use objectio_transport_te::{Engine, EngineConfig, Protocol, Registration, SlotPool};
+
+    const MIB: usize = 1024 * 1024;
+
+    fn protocol_and_host() -> (Protocol, String) {
+        let protocol = match std::env::var("OBJECTIO_TE_TEST_PROTOCOL").as_deref() {
+            Ok("rdma") => Protocol::Rdma,
+            _ => Protocol::Tcp,
+        };
+        let host = std::env::var("OBJECTIO_TE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        (protocol, host)
+    }
+
+    /// An OSD with rdma enabled, and a "gateway": an engine with a
+    /// remote-accessible pool that shards move out of and into.
+    struct Rig {
+        _dir: tempfile::TempDir,
+        osd: OsdService,
+        gateway: Arc<Engine>,
+        pool: SlotPool,
+        _registration: Registration,
+    }
+
+    fn rig() -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap();
+        let (protocol, host) = protocol_and_host();
+        osd.enable_rdma(RdmaStaging::start(protocol, &host, 4).unwrap());
+        let gateway = Engine::start(&EngineConfig { protocol, host }).unwrap();
+        let pool = SlotPool::new(4 * MIB, 2).unwrap();
+        let registration = gateway.register(&pool, true).unwrap();
+        Rig {
+            _dir: dir,
+            osd,
+            gateway,
+            pool,
+            _registration: registration,
+        }
+    }
+
+    fn shard(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    fn shard_id() -> ShardId {
+        ShardId {
+            object_id: vec![7; 16],
+            stripe_id: 0,
+            position: 2,
+        }
+    }
+
+    fn write_request(
+        rig: &Rig,
+        src: &objectio_transport_te::Slot,
+        data: &[u8],
+        crc: Option<u32>,
+    ) -> WriteShardRequest {
+        WriteShardRequest {
+            shard_id: Some(shard_id()),
+            ec_k: 4,
+            ec_m: 2,
+            checksum: crc.map(|crc32c| Checksum {
+                crc32c,
+                ..Default::default()
+            }),
+            rdma: Some(RdmaBuffer {
+                segment: rig.gateway.segment().to_string(),
+                addr: src.addr(),
+                len: data.len() as u64,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_goes_in_and_comes_back_out_over_transfer_engine() {
+        let rig = rig();
+        assert!(!rig.osd.te_segment().is_empty());
+
+        // An odd length, so nothing lines up with a block by accident.
+        let data = shard(MIB + 123);
+        let mut src = rig.pool.acquire().unwrap();
+        src.as_mut_slice()[..data.len()].copy_from_slice(&data);
+        let req = write_request(&rig, &src, &data, Some(crc32c::crc32c(&data)));
+        rig.osd.write_shard(Request::new(req)).await.unwrap();
+
+        // Stored intact: read it back as gRPC bytes.
+        let resp = rig
+            .osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(shard_id()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&resp.data[..], &data[..]);
+
+        // And read it back into the gateway over Transfer Engine.
+        let dest = rig.pool.acquire().unwrap();
+        let resp = rig
+            .osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(shard_id()),
+                rdma_dest: Some(RdmaBuffer {
+                    segment: rig.gateway.segment().to_string(),
+                    addr: dest.addr(),
+                    len: dest.capacity() as u64,
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.data.is_empty());
+        assert_eq!(resp.rdma_len, data.len() as u64);
+        assert_eq!(&dest.as_slice()[..data.len()], &data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shard_that_does_not_match_its_checksum_is_refused_and_not_stored() {
+        let rig = rig();
+        let data = shard(64 * 1024);
+        let mut src = rig.pool.acquire().unwrap();
+        src.as_mut_slice()[..data.len()].copy_from_slice(&data);
+        let wrong = crc32c::crc32c(&data) ^ 1;
+        let err = rig
+            .osd
+            .write_shard(Request::new(write_request(&rig, &src, &data, Some(wrong))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+
+        let err = rig
+            .osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(shard_id()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::NotFound,
+            "a refused shard was indexed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_rdma_write_without_a_checksum_is_refused() {
+        let rig = rig();
+        let data = shard(4096);
+        let src = rig.pool.acquire().unwrap();
+        let err = rig
+            .osd
+            .write_shard(Request::new(write_request(&rig, &src, &data, None)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
     }
 }
