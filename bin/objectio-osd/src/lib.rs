@@ -30,7 +30,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -549,7 +548,7 @@ pub async fn run(
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
 
-    let server_future = Server::builder()
+    let server_future = objectio_proto::transport::server()
         .add_service(storage_service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;

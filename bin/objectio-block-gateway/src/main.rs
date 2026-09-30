@@ -21,7 +21,6 @@ use objectio_block::chunk::ChunkMapper;
 use objectio_block::{CacheConfig, VolumeManager, WriteCache};
 use objectio_proto::block::block_service_server::BlockServiceServer;
 use tokio::sync::Mutex;
-use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -198,7 +197,7 @@ async fn main() -> Result<()> {
     info!("NBD server on {nbd_addr}");
 
     let svc = service::BlockGatewayService::new(Arc::clone(&state));
-    Server::builder()
+    objectio_proto::transport::server()
         .add_service(BlockServiceServer::new(svc))
         .serve(grpc_addr)
         .await
