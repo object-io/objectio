@@ -148,6 +148,14 @@ struct Args {
     /// minutes — and carries no per-instance labels. Leave empty for that.
     #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
     prometheus_url: String,
+
+    /// Move shards between the gateway and the OSDs over Mooncake Transfer
+    /// Engine: `rdma`, or `tcp` to exercise the same path without RDMA
+    /// hardware. Unset: gRPC bytes. Everything is on 127.0.0.1, so `rdma`
+    /// needs an RDMA device on loopback's address — in practice `tcp`.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    rdma: Option<String>,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -590,7 +598,8 @@ async fn main() -> Result<()> {
         let addr_file = state.join("osd.addr");
         let _ = std::fs::remove_file(&addr_file);
 
-        let osd_args = <objectio_osd::Args as clap::Parser>::parse_from([
+        #[allow(unused_mut)]
+        let mut osd_argv: Vec<String> = [
             "objectio-osd",
             // Port 0: the OSD binds whatever the OS gives it and registers
             // that. Choosing a free port here and binding it later lost the
@@ -616,7 +625,14 @@ async fn main() -> Result<()> {
             "0",
             "--log-level",
             &args.log_level,
-        ]);
+        ]
+        .map(str::to_string)
+        .to_vec();
+        #[cfg(feature = "rdma")]
+        if let Some(protocol) = &args.rdma {
+            osd_argv.extend(["--rdma", protocol, "--rdma-host", "127.0.0.1"].map(str::to_string));
+        }
+        let osd_args = <objectio_osd::Args as clap::Parser>::parse_from(&osd_argv);
         let sd = sub_shutdown(&shutdown_tx);
         osd_handles.push(tokio::spawn(async move {
             objectio_osd::run(osd_args, sd).await
@@ -673,6 +689,10 @@ async fn main() -> Result<()> {
     ];
     if !args.auth {
         gw_argv.push("--no-auth".into());
+    }
+    #[cfg(feature = "rdma")]
+    if let Some(protocol) = &args.rdma {
+        gw_argv.extend(["--rdma", protocol, "--rdma-host", "127.0.0.1"].map(str::to_string));
     }
     if !args.prometheus_url.is_empty() {
         gw_argv.push("--prometheus-url".into());

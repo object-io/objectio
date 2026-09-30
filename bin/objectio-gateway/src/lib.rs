@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
 pub mod prom;
+pub mod rdma;
 pub mod s3;
 pub mod scatter_gather;
 
@@ -228,6 +229,32 @@ pub struct Args {
     /// scrape and says so.
     #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
     pub prometheus_url: String,
+
+    /// Move shards over Mooncake Transfer Engine to OSDs that offer it:
+    /// `rdma`, or `tcp` to develop without RDMA hardware. Unset: gRPC bytes
+    /// only.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    pub rdma: Option<String>,
+
+    /// Address Transfer Engine binds and advertises — one on the storage
+    /// network, never a public one. Defaults to the host of --listen, which
+    /// must then not be a wildcard.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    pub rdma_host: Option<String>,
+
+    /// Registered slots of one encoded stripe each: bounds PUT stripes in
+    /// flight over Transfer Engine. Beyond that a stripe goes over gRPC.
+    #[cfg(feature = "rdma")]
+    #[arg(long, default_value_t = 16)]
+    pub rdma_stripe_slots: usize,
+
+    /// Registered slots of one shard each: bounds GET shard reads in flight
+    /// over Transfer Engine. Beyond that a shard is read over gRPC.
+    #[cfg(feature = "rdma")]
+    #[arg(long, default_value_t = 64)]
+    pub rdma_read_slots: usize,
 
     /// Leave the per-bucket usage series (`objectio_bucket_*`) out of
     /// `/metrics`. They carry one series per bucket, which is fine into the
@@ -796,6 +823,14 @@ pub async fn run(
         }
     };
 
+    #[cfg(feature = "rdma")]
+    let rdma = match args.rdma.as_deref() {
+        None => None,
+        Some(protocol) => Some(Arc::new(start_rdma(&args, protocol)?)),
+    };
+    #[cfg(not(feature = "rdma"))]
+    let rdma = None;
+
     // Create application state. KMS fields are held behind RwLocks so
     // `PUT /_admin/kms/config` can hot-swap the backend at runtime; we seed
     // them here with whatever the CLI flag + env / meta config resolved to.
@@ -814,6 +849,7 @@ pub async fn run(
         host_provider,
         legacy_open_buckets: args.authz_legacy_open_buckets,
         prometheus_url: args.prometheus_url.clone(),
+        rdma,
     });
 
     // Build router
@@ -1366,4 +1402,51 @@ pub async fn run(
     info!("Gateway shut down gracefully");
 
     Ok(())
+}
+
+/// Start Transfer Engine and register the pools OSDs move shards through.
+#[cfg(feature = "rdma")]
+fn start_rdma(args: &Args, protocol: &str) -> Result<rdma::GatewayRdma> {
+    use objectio_transport_te::Protocol;
+    let protocol = match protocol {
+        "rdma" => Protocol::Rdma,
+        "tcp" => Protocol::Tcp,
+        other => anyhow::bail!("--rdma {other}: expected rdma or tcp"),
+    };
+    let host = match &args.rdma_host {
+        Some(host) => host.clone(),
+        None => {
+            let host = args
+                .listen
+                .rsplit_once(':')
+                .map_or(args.listen.as_str(), |(host, _)| host);
+            if host.is_empty() || host == "0.0.0.0" || host == "[::]" {
+                anyhow::bail!(
+                    "--rdma needs --rdma-host: --listen {} does not name one address",
+                    args.listen
+                );
+            }
+            host.to_string()
+        }
+    };
+    // One slot holds a whole encoded stripe: every shard of the widest scheme
+    // this gateway writes, and at least 4+2.
+    let shards = usize::try_from(args.ec_k + args.ec_m).unwrap_or(6).max(6);
+    let stripe_slot_size = shards * rdma::SHARD_SLOT_SIZE;
+    let rdma = rdma::GatewayRdma::start(
+        protocol,
+        &host,
+        stripe_slot_size,
+        args.rdma_stripe_slots,
+        args.rdma_read_slots,
+    )
+    .map_err(|e| anyhow::anyhow!("rdma ({protocol:?} on {host}): {e}"))?;
+    info!(
+        "Transfer Engine ({protocol:?}) segment {}: {} stripe slots of {} MiB, {} read slots",
+        rdma.segment(),
+        args.rdma_stripe_slots,
+        stripe_slot_size >> 20,
+        args.rdma_read_slots
+    );
+    Ok(rdma)
 }

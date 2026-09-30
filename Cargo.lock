@@ -2357,6 +2357,7 @@ dependencies = [
  "objectio-placement",
  "objectio-proto",
  "objectio-s3",
+ "objectio-transport-te",
  "objectio-unity-catalog",
  "parking_lot",
  "pcre2",

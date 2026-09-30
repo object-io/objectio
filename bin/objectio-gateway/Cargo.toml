@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 objectio-common = { workspace = true }
 objectio-erasure = { workspace = true }
+objectio-transport-te = { workspace = true }
 objectio-s3 = { workspace = true }
 objectio-client = { workspace = true }
 objectio-proto = { workspace = true }
@@ -90,6 +91,10 @@ default = []
 # Forwards ISA-L erasure coding (x86_64) to objectio-erasure, so the
 # feature is addressable from a package-scoped build.
 isal = ["objectio-erasure/isal"]
+# Move shards over Mooncake Transfer Engine (RDMA, or TCP in development) to
+# OSDs that offer it. Linux only, and needs a Mooncake build — see
+# crates/objectio-transport-te. Enabled at run time with `--rdma`.
+rdma = ["objectio-transport-te/te"]
 # Compile in the PCRE2 pattern backend so requests can select
 # `engine: "pcre2"`. Requires libpcre2-dev at build time.
 pcre2 = ["dep:pcre2"]

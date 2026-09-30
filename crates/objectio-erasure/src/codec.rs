@@ -190,31 +190,67 @@ impl ErasureCodec {
     fn encode_bytes_inner(&self, data: &[u8]) -> Result<Vec<Bytes>> {
         // LRC shards come back from the backend already owned; wrapping a
         // Vec in Bytes takes it over without copying.
-        let CodecBackend::Mds(backend) = &self.backend else {
+        if self.is_lrc() {
             return Ok(self
                 .encode_inner(data)?
                 .into_iter()
                 .map(Bytes::from)
                 .collect());
+        }
+        let mut stripe = vec![0u8; self.stripe_len(data.len())];
+        let shard_size = self.encode_into_inner(data, &mut stripe)?;
+        let stripe = Bytes::from(stripe);
+        Ok((0..self.total_shards())
+            .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
+            .collect())
+    }
+
+    /// Bytes a stripe of `data_len` bytes takes once encoded: k + m shards
+    /// of equal size, laid out one after another.
+    #[must_use]
+    pub fn stripe_len(&self, data_len: usize) -> usize {
+        Self::shard_size_for(data_len, self.data_shards()) * self.total_shards()
+    }
+
+    /// Encode `data` into `stripe` — k data shards then m parity shards,
+    /// contiguous — and return the shard size. Lets a caller encode straight
+    /// into memory it owns, such as a slot registered with a NIC. Only the
+    /// first [`stripe_len`](Self::stripe_len) bytes of `stripe` are written;
+    /// the padding after `data` is zeroed, so a reused buffer is safe.
+    ///
+    /// MDS only: LRC stripes are not laid out this way.
+    ///
+    /// # Errors
+    /// For an LRC codec, or a `stripe` shorter than `stripe_len(data.len())`.
+    pub fn encode_into(&self, data: &[u8], stripe: &mut [u8]) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let res = self.encode_into_inner(data, stripe);
+        crate::metrics::ENCODE_SECONDS.observe_duration(started.elapsed());
+        res
+    }
+
+    fn encode_into_inner(&self, data: &[u8], stripe: &mut [u8]) -> Result<usize> {
+        let CodecBackend::Mds(backend) = &self.backend else {
+            return Err(
+                ErasureError::InvalidConfig("encode_into needs an MDS codec".into()).into(),
+            );
         };
-
         let k = self.data_shards();
-        let total = self.total_shards();
         let shard_size = Self::shard_size_for(data.len(), k);
+        let len = shard_size * self.total_shards();
+        let stripe = stripe
+            .get_mut(..len)
+            .ok_or(ErasureError::ShardSizeMismatch)?;
 
-        let mut stripe = vec![0u8; shard_size * total];
         stripe[..data.len()].copy_from_slice(data);
+        stripe[data.len()..shard_size * k].fill(0);
         let (data_part, parity_part) = stripe.split_at_mut(shard_size * k);
         let data_shards: Vec<&[u8]> = data_part.chunks_exact(shard_size).collect();
         let mut parity: Vec<&mut [u8]> = parity_part.chunks_exact_mut(shard_size).collect();
         backend
             .encode_parity_into(&data_shards, &mut parity, shard_size)
             .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
-
-        let stripe = Bytes::from(stripe);
-        Ok((0..total)
-            .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
-            .collect())
+        Ok(shard_size)
     }
 
     fn encode_inner(&self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -550,6 +586,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn encode_into_a_dirty_buffer_matches_a_fresh_encode() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data: Vec<u8> = (0..70_003u32).map(|i| (i % 253) as u8).collect();
+        // A reused slot still holds the last stripe's bytes.
+        let mut slot = vec![0xAAu8; codec.stripe_len(data.len()) + 4096];
+        let shard_size = codec.encode_into(&data, &mut slot).unwrap();
+        for (i, want) in codec.encode(&data).unwrap().iter().enumerate() {
+            assert_eq!(
+                &slot[i * shard_size..(i + 1) * shard_size],
+                want.as_slice(),
+                "shard {i}"
+            );
+        }
+        assert!(
+            slot[codec.stripe_len(data.len())..]
+                .iter()
+                .all(|&b| b == 0xAA)
+        );
+    }
+
+    #[test]
+    fn encode_into_refuses_short_buffers_and_lrc() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let mut short = vec![0u8; codec.stripe_len(1000) - 1];
+        assert!(codec.encode_into(&[1; 1000], &mut short).is_err());
+        let lrc = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        assert!(lrc.encode_into(&[1; 1000], &mut buf).is_err());
     }
 
     #[test]

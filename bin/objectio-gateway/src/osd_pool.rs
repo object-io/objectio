@@ -239,7 +239,136 @@ async fn connect_for_shard(
         })
 }
 
-/// Helper to write a shard to the appropriate OSD
+/// A PUT shard's place in the gateway's registered memory, so an OSD can
+/// read it over Transfer Engine instead of receiving it as bytes.
+#[derive(Clone, Copy)]
+pub struct RdmaSource<'a> {
+    pub rdma: &'a crate::rdma::GatewayRdma,
+    /// Address of the shard's first byte in this process.
+    pub addr: u64,
+}
+
+/// A shard call that did not succeed.
+enum ShardCallError {
+    Connect(OsdPoolError),
+    Timeout,
+    Status(tonic::Status),
+}
+
+impl From<ShardCallError> for OsdPoolError {
+    fn from(e: ShardCallError) -> Self {
+        match e {
+            ShardCallError::Connect(e) => e,
+            ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
+            ShardCallError::Status(s) => Self::ConnectionFailed(s.to_string()),
+        }
+    }
+}
+
+/// Why a Transfer Engine attempt failed, and what to do about the OSD. A
+/// busy OSD refused before touching the gateway's memory; anything else
+/// means the path is suspect, so the OSD cools down.
+fn rdma_failure(
+    rdma: &crate::rdma::GatewayRdma,
+    te_segment: &str,
+    e: &ShardCallError,
+) -> crate::rdma::Fallback {
+    use crate::rdma::Fallback;
+    let reason = match e {
+        ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
+            return Fallback::OsdBusy;
+        }
+        ShardCallError::Status(s) if s.code() == tonic::Code::DataLoss => Fallback::Checksum,
+        _ => Fallback::Error,
+    };
+    rdma.cool_down(te_segment);
+    reason
+}
+
+/// One WriteShard call, with the gateway's timeout and error accounting.
+async fn call_write_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::WriteShardRequest,
+) -> Result<objectio_proto::storage::BlockLocation, ShardCallError> {
+    let mut client = connect_for_shard(pool, placement)
+        .await
+        .map_err(ShardCallError::Connect)?;
+    let position = request.shard_id.as_ref().map_or(0, |s| s.position);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.write_shard(request),
+    )
+    .await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "write", started.elapsed());
+    let response = result
+        .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            error!(
+                "Timeout writing shard {} to OSD {}",
+                position, placement.node_address
+            );
+            ShardCallError::Timeout
+        })?
+        .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            error!(
+                "Failed to write shard to OSD {}: {}",
+                placement.node_address, e
+            );
+            ShardCallError::Status(e)
+        })?;
+    response.into_inner().location.ok_or_else(|| {
+        ShardCallError::Connect(OsdPoolError::ConnectionFailed(
+            "no location returned".to_string(),
+        ))
+    })
+}
+
+/// One ReadShard call, with the gateway's timeout and error accounting.
+async fn call_read_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::ReadShardRequest,
+) -> Result<objectio_proto::storage::ReadShardResponse, ShardCallError> {
+    let mut client = connect_for_shard(pool, placement)
+        .await
+        .map_err(ShardCallError::Connect)?;
+    let position = request.shard_id.as_ref().map_or(0, |s| s.position);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.read_shard(request),
+    )
+    .await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "read", started.elapsed());
+    let response = result
+        .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            error!(
+                "Timeout reading shard {} from OSD {}",
+                position, placement.node_address
+            );
+            ShardCallError::Timeout
+        })?
+        .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            warn!(
+                "Failed to read shard from OSD {}: {}",
+                placement.node_address, e
+            );
+            ShardCallError::Status(e)
+        })?;
+    Ok(response.into_inner())
+}
+
+/// Write a shard to the OSD in `placement`.
+///
+/// With `rdma`, and an OSD that offers Transfer Engine, the OSD reads the
+/// shard out of the gateway's memory; if that fails for any reason the same
+/// shard is sent again as bytes. `data` is the shard either way — for the
+/// checksum, and for the fallback.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_shard_to_osd(
     pool: &OsdPool,
@@ -250,104 +379,162 @@ pub async fn write_shard_to_osd(
     data: Bytes,
     ec_k: u32,
     ec_m: u32,
+    rdma: Option<RdmaSource<'_>>,
 ) -> Result<objectio_proto::storage::BlockLocation, OsdPoolError> {
-    use objectio_proto::storage::{Checksum, ShardId, WriteShardRequest};
+    use objectio_proto::storage::{Checksum, RdmaBuffer, ShardId, WriteShardRequest};
 
-    let mut client = connect_for_shard(pool, placement).await?;
-
-    let request = WriteShardRequest {
-        rdma: None,
-        shard_id: Some(ShardId {
-            object_id: object_id.to_vec(),
-            stripe_id,
-            position,
-        }),
-        ec_k,
-        ec_m,
-        checksum: Some(Checksum {
-            crc32c: crc32c::crc32c(&data),
-            xxhash64: 0,
-            sha256: vec![],
-        }),
-        data,
+    let shard_id = ShardId {
+        object_id: object_id.to_vec(),
+        stripe_id,
+        position,
+    };
+    let checksum = Checksum {
+        crc32c: crc32c::crc32c(&data),
+        xxhash64: 0,
+        sha256: vec![],
     };
 
-    // Add timeout to prevent hanging indefinitely
-    let write_future = client.write_shard(request);
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), write_future).await;
-    crate::gateway_metrics::record_shard_io(&placement.node_address, "write", started.elapsed());
-    let response = result
-        .map_err(|_| {
-            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
-            error!(
-                "Timeout writing shard {} to OSD {}",
-                position, placement.node_address
-            );
-            OsdPoolError::ConnectionFailed("write timeout".to_string())
-        })?
-        .map_err(|e| {
-            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
-            error!(
-                "Failed to write shard to OSD {}: {}",
-                placement.node_address, e
-            );
-            OsdPoolError::ConnectionFailed(e.to_string())
-        })?;
+    if let Some(src) = rdma {
+        match src.rdma.check(&placement.te_segment) {
+            Ok(()) => {
+                let request = WriteShardRequest {
+                    shard_id: Some(shard_id.clone()),
+                    data: Bytes::new(),
+                    ec_k,
+                    ec_m,
+                    checksum: Some(checksum.clone()),
+                    rdma: Some(RdmaBuffer {
+                        segment: src.rdma.segment().to_string(),
+                        addr: src.addr,
+                        len: data.len() as u64,
+                    }),
+                };
+                match call_write_shard(pool, placement, request).await {
+                    Ok(location) => {
+                        crate::gateway_metrics::record_shard_transfer("write", "rdma");
+                        return Ok(location);
+                    }
+                    Err(e) => {
+                        let reason = rdma_failure(src.rdma, &placement.te_segment, &e);
+                        crate::gateway_metrics::record_rdma_fallback("write", reason);
+                        // The OSD may still be reading this memory.
+                        if reason != crate::rdma::Fallback::OsdBusy {
+                            src.rdma.quarantine(data.clone());
+                        }
+                        warn!(
+                            "shard {position} to {} over rdma: {}; sending it over gRPC",
+                            placement.node_address,
+                            reason.label()
+                        );
+                    }
+                }
+            }
+            Err(Some(reason)) => crate::gateway_metrics::record_rdma_fallback("write", reason),
+            Err(None) => {}
+        }
+    }
 
-    response
-        .into_inner()
-        .location
-        .ok_or_else(|| OsdPoolError::ConnectionFailed("no location returned".to_string()))
+    let request = WriteShardRequest {
+        shard_id: Some(shard_id),
+        ec_k,
+        ec_m,
+        checksum: Some(checksum),
+        data,
+        rdma: None,
+    };
+    let location = call_write_shard(pool, placement, request).await?;
+    crate::gateway_metrics::record_shard_transfer("write", "grpc");
+    Ok(location)
 }
 
-/// Helper to read a shard from the appropriate OSD
+/// Read a shard from the OSD in `placement`.
+///
+/// With `rdma`, and an OSD that offers Transfer Engine, the OSD writes the
+/// shard into one of the gateway's read slots and the returned `Bytes` is a
+/// view of that slot — checked against the OSD's checksum. Any failure reads
+/// the shard again as bytes.
 pub async fn read_shard_from_osd(
     pool: &OsdPool,
     placement: &NodePlacement,
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
+    rdma: Option<&crate::rdma::GatewayRdma>,
 ) -> Result<Bytes, OsdPoolError> {
-    use objectio_proto::storage::{ReadShardRequest, ShardId};
+    use crate::rdma::Fallback;
+    use objectio_proto::storage::{RdmaBuffer, ReadShardRequest, ShardId};
 
-    let mut client = connect_for_shard(pool, placement).await?;
+    let shard_id = ShardId {
+        object_id: object_id.to_vec(),
+        stripe_id,
+        position,
+    };
+
+    if let Some(r) = rdma {
+        match r.check(&placement.te_segment) {
+            Ok(()) => match r.read_slot() {
+                None => crate::gateway_metrics::record_rdma_fallback("read", Fallback::NoSlot),
+                Some(slot) => {
+                    let request = ReadShardRequest {
+                        shard_id: Some(shard_id.clone()),
+                        offset: 0,
+                        length: 0,
+                        rdma_dest: Some(RdmaBuffer {
+                            segment: r.segment().to_string(),
+                            addr: slot.addr(),
+                            len: slot.capacity() as u64,
+                        }),
+                    };
+                    let reason = match call_read_shard(pool, placement, request).await {
+                        Ok(resp) => {
+                            let len = usize::try_from(resp.rdma_len).unwrap_or(usize::MAX);
+                            if len > slot.capacity() {
+                                r.quarantine(slot.into_bytes(0));
+                                r.cool_down(&placement.te_segment);
+                                Fallback::Error
+                            } else {
+                                let bytes = slot.into_bytes(len);
+                                let expected = resp.checksum.map(|c| c.crc32c);
+                                if expected.is_none_or(|c| c == crc32c::crc32c(&bytes)) {
+                                    crate::gateway_metrics::record_shard_transfer("read", "rdma");
+                                    return Ok(bytes);
+                                }
+                                r.quarantine(bytes);
+                                r.cool_down(&placement.te_segment);
+                                Fallback::Checksum
+                            }
+                        }
+                        Err(e) => {
+                            let reason = rdma_failure(r, &placement.te_segment, &e);
+                            // The OSD may still be writing into this slot.
+                            if reason != Fallback::OsdBusy {
+                                r.quarantine(slot.into_bytes(0));
+                            }
+                            reason
+                        }
+                    };
+                    crate::gateway_metrics::record_rdma_fallback("read", reason);
+                    warn!(
+                        "shard {position} from {} over rdma: {}; reading it over gRPC",
+                        placement.node_address,
+                        reason.label()
+                    );
+                }
+            },
+            Err(Some(reason)) => crate::gateway_metrics::record_rdma_fallback("read", reason),
+            Err(None) => {}
+        }
+    }
 
     let request = ReadShardRequest {
         rdma_dest: None,
-        shard_id: Some(ShardId {
-            object_id: object_id.to_vec(),
-            stripe_id,
-            position,
-        }),
+        shard_id: Some(shard_id),
         offset: 0,
         length: 0, // 0 means read all
     };
-
-    // Add timeout to prevent hanging indefinitely
-    let read_future = client.read_shard(request);
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), read_future).await;
-    crate::gateway_metrics::record_shard_io(&placement.node_address, "read", started.elapsed());
-    let response = result
-        .map_err(|_| {
-            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
-            error!(
-                "Timeout reading shard {} from OSD {}",
-                position, placement.node_address
-            );
-            OsdPoolError::ConnectionFailed("read timeout".to_string())
-        })?
-        .map_err(|e| {
-            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
-            warn!(
-                "Failed to read shard from OSD {}: {}",
-                placement.node_address, e
-            );
-            OsdPoolError::ConnectionFailed(e.to_string())
-        })?;
-
-    Ok(response.into_inner().data)
+    let response = call_read_shard(pool, placement, request).await?;
+    crate::gateway_metrics::record_shard_transfer("read", "grpc");
+    Ok(response.data)
 }
 
 // ============================================================================
