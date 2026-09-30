@@ -2159,6 +2159,44 @@ fn is_object_metadata_header(name: &str) -> bool {
         )
 }
 
+/// How a PUT's two commits ended, when the one that decides it succeeded.
+#[derive(Debug, PartialEq, Eq)]
+enum Committed<E> {
+    /// Readable by key and listed.
+    Both,
+    /// Readable by key, but not in `ListObjects` until repair: the listing
+    /// commit failed with this.
+    Unlisted(E),
+}
+
+/// Run a PUT's two commits at the same time: the object's ObjectMeta on the
+/// OSDs (what GET reads) and its entry in Meta's Raft listing index (what
+/// `ListObjects` reads). Neither needs the other.
+///
+/// The ObjectMeta commit decides the outcome. If it fails the PUT fails, and
+/// a listing entry that did land is taken out again with `unlist`, so the
+/// listing never shows an object GET cannot read. A failed listing commit
+/// alone does not fail the PUT: the data landed and is readable by key.
+async fn commit_object<ME, LE, U>(
+    object_meta: impl Future<Output = Result<(), ME>>,
+    listing: impl Future<Output = Result<(), LE>>,
+    unlist: impl FnOnce() -> U,
+) -> Result<Committed<LE>, ME>
+where
+    U: Future<Output = ()>,
+{
+    match tokio::join!(object_meta, listing) {
+        (Ok(()), Ok(())) => Ok(Committed::Both),
+        (Ok(()), Err(e)) => Ok(Committed::Unlisted(e)),
+        (Err(e), listed) => {
+            if listed.is_ok() {
+                unlist().await;
+            }
+            Err(e)
+        }
+    }
+}
+
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -2880,53 +2918,66 @@ pub async fn put_object(
         usage_owner: Vec::new(), // filled in by put_object_meta_to_all
     };
 
-    if let Err(e) = put_object_meta_to_all(
-        &state.osd_pool,
-        &placement.nodes,
-        &bucket,
-        &key,
-        object_meta.clone(),
-        versioning_enabled,
-    )
-    .await
-    {
-        error!("Failed to store object metadata on OSDs: {}", e);
-        return S3Error::xml_response(
-            "InternalError",
-            &format!("Failed to store object metadata: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-    phases.mark("object_meta");
-
-    // Register with Meta's serializable listing index. After this Raft
-    // commit the object is visible to ListObjects; without it the data
-    // is still readable by key but doesn't show up in a listing.
-    // Failure here leaves a "visible by direct GET only" window — log
-    // and return success since the data landed.
-    {
+    // Two commits make the object, at the same time: see `commit_object`.
+    let listing_req = {
         use objectio_proto::metadata::CreateObjectRequest;
-        let mut meta_client = state.meta_client.clone();
-        let req = CreateObjectRequest {
+        CreateObjectRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             size: original_size,
-            content_type: content_type.clone(),
+            content_type,
             etag: etag.clone(),
             user_metadata: object_meta.user_metadata.clone(),
             stripes: object_meta.stripes.clone(),
             object_id: object_id.to_vec(),
             pg_id: placement.pg_id,
             pool: placement.pool.clone(),
-        };
-        if let Err(e) = meta_client.create_object(req).await {
-            warn!(
-                "create_object on meta failed ({e}); object is readable by key \
-                 but will not appear in ListObjects until repair",
+        }
+    };
+    let mut listing_client = state.meta_client.clone();
+    let mut unlist_client = state.meta_client.clone();
+    let committed = commit_object(
+        put_object_meta_to_all(
+            &state.osd_pool,
+            &placement.nodes,
+            &bucket,
+            &key,
+            object_meta,
+            versioning_enabled,
+        ),
+        async { listing_client.create_object(listing_req).await.map(drop) },
+        || async {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            if let Err(e) = unlist_client
+                .delete_object(MetaDelReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: String::new(),
+                })
+                .await
+            {
+                warn!("could not take {bucket}/{key} out of the listing after a failed PUT: {e}");
+            }
+        },
+    )
+    .await;
+    phases.mark("commit");
+
+    match committed {
+        Ok(Committed::Both) => {}
+        Ok(Committed::Unlisted(e)) => warn!(
+            "create_object on meta failed ({e}); object is readable by key \
+             but will not appear in ListObjects until repair",
+        ),
+        Err(e) => {
+            error!("Failed to store object metadata on OSDs: {}", e);
+            return S3Error::xml_response(
+                "InternalError",
+                &format!("Failed to store object metadata: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
     }
-    phases.mark("listing_commit");
 
     info!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
@@ -8765,5 +8816,69 @@ mod list_uploads_tests {
         let xml = to_xml(&result).expect("result should serialize");
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("NextKeyMarker"));
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::{Committed, commit_object};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    async fn after(ms: u64, r: Result<(), &'static str>) -> Result<(), &'static str> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        r
+    }
+
+    #[tokio::test]
+    async fn the_two_commits_run_at_the_same_time() {
+        let start = std::time::Instant::now();
+        let r = commit_object(after(200, Ok(())), after(200, Ok(())), || async {}).await;
+        assert_eq!(r, Ok(Committed::Both));
+        assert!(
+            start.elapsed() < Duration::from_millis(350),
+            "the commits ran one after the other: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_commit_does_not_fail_the_put() {
+        let unlisted = AtomicBool::new(false);
+        let r = commit_object(after(0, Ok(())), after(0, Err("raft")), || async {
+            unlisted.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(r, Ok(Committed::Unlisted("raft")));
+        assert!(
+            !unlisted.load(Ordering::SeqCst),
+            "took a readable object out of the listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_object_meta_commit_takes_the_object_out_of_the_listing() {
+        let unlisted = AtomicBool::new(false);
+        let r: Result<Committed<&str>, _> =
+            commit_object(after(0, Err("osd")), after(0, Ok(())), || async {
+                unlisted.store(true, Ordering::SeqCst);
+            })
+            .await;
+        assert_eq!(r, Err("osd"));
+        assert!(
+            unlisted.load(Ordering::SeqCst),
+            "the listing shows an object GET cannot read"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_both_fail_there_is_nothing_to_take_out() {
+        let unlisted = AtomicBool::new(false);
+        let r = commit_object(after(0, Err("osd")), after(0, Err("raft")), || async {
+            unlisted.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(r, Err("osd"));
+        assert!(!unlisted.load(Ordering::SeqCst));
     }
 }
