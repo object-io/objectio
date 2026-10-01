@@ -6,6 +6,8 @@ use objectio_proto::storage::{
     AffectedObject,
     AffectedShardRef,
     BlockLocation,
+    CheckShardsRequest,
+    CheckShardsResponse,
     Checksum,
     CopyObjectMetaRequest,
     CopyObjectMetaResponse,
@@ -37,6 +39,7 @@ use objectio_proto::storage::{
     RdmaBuffer,
     ReadShardRequest,
     ReadShardResponse,
+    ShardState,
     WriteShardRequest,
     WriteShardResponse,
     health_check_response::Status as HealthStatus,
@@ -281,6 +284,12 @@ pub struct OsdService {
     /// Renders this OSD's Prometheus exposition for `GetMetrics`. Set once
     /// the metrics state exists, which is after the service is built.
     metrics_renderer: std::sync::OnceLock<MetricsRenderer>,
+    /// Shards whose bytes failed their checksum, found by the scrubber or a
+    /// read. Kept until the shard is rewritten; reported through
+    /// `CheckShards` so Meta's repairer rebuilds them. In memory only: after
+    /// a restart the next scrub pass finds them again.
+    corrupt: RwLock<std::collections::HashSet<String>>,
+    scrub: ScrubStats,
     /// Transfer Engine and staging pool, once enabled at startup. Without it
     /// every shard arrives and leaves as gRPC bytes.
     #[cfg(feature = "rdma")]
@@ -288,6 +297,21 @@ pub struct OsdService {
 }
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
+
+/// What the scrubber has done since the OSD started.
+#[derive(Default)]
+struct ScrubStats {
+    passes: AtomicU64,
+    shards: AtomicU64,
+    bytes: AtomicU64,
+    corrupt: AtomicU64,
+}
+
+/// Whether a storage error is a block failing its checksum, as opposed to
+/// the read itself failing.
+fn is_checksum_error(e: &objectio_common::Error) -> bool {
+    matches!(e, objectio_common::Error::Storage(msg) if msg.contains("checksum"))
+}
 
 /// Resolve the OSD's stable node_id + cluster_uuid from (in priority order):
 ///
@@ -565,6 +589,8 @@ impl OsdService {
             grpc_metrics: Arc::new(GrpcMetrics::default()),
             usage,
             metrics_renderer: std::sync::OnceLock::new(),
+            corrupt: RwLock::new(std::collections::HashSet::new()),
+            scrub: ScrubStats::default(),
             #[cfg(feature = "rdma")]
             rdma: std::sync::OnceLock::new(),
         })
@@ -665,6 +691,137 @@ impl OsdService {
     /// Per-bucket usage of the objects this OSD is primary for.
     pub fn bucket_usage(&self) -> Vec<objectio_proto::storage::BucketUsage> {
         self.usage.snapshot()
+    }
+
+    /// Return a shard's blocks to the pool. The index entry must already be
+    /// gone, so a crash in between leaks a block rather than handing a live
+    /// shard's block to the next write.
+    fn free_location(&self, loc: &ShardLocation) {
+        if loc.disk_idx >= self.disks.len() {
+            return;
+        }
+        let disk = &self.disks[loc.disk_idx];
+        // `size` is the shard's payload length, so the extent's length is
+        // derivable — which is why nothing had to be added to the index.
+        let blocks = disk.blocks_for_len(loc.size as usize);
+        match disk.free_extent(loc.block_num, blocks) {
+            Ok(()) => {
+                if let Err(e) = disk.persist_allocator() {
+                    warn!(
+                        "Freed block {} on disk {} but could not persist the bitmap: {e}",
+                        loc.block_num, loc.disk_idx
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "Could not free block {} on disk {}: {e}",
+                loc.block_num, loc.disk_idx
+            ),
+        }
+    }
+
+    /// Record that the shard under `key`, at `block_num`, failed its
+    /// checksum — unless it has been rewritten or deleted since it was read.
+    fn mark_corrupt(&self, key: &str, block_num: u64) {
+        let still_there = self
+            .shard_index
+            .read()
+            .get(key)
+            .is_some_and(|l| l.block_num == block_num);
+        if still_there && self.corrupt.write().insert(key.to_string()) {
+            self.scrub.corrupt.fetch_add(1, Ordering::Relaxed);
+            warn!("shard {key} (block {block_num}) is corrupt; Meta's repairer will rebuild it");
+        }
+    }
+
+    /// One scrub pass: read every shard on this OSD and check its blocks'
+    /// checksums, at no more than `bytes_per_sec`, so a shard that rots on
+    /// disk is found even if nobody reads it. Corrupt shards are recorded
+    /// for the repairer.
+    pub async fn scrub_pass(&self, bytes_per_sec: u64) {
+        let shards: Vec<(String, ShardLocation)> = self
+            .shard_index
+            .read()
+            .iter()
+            .map(|(k, l)| (k.clone(), l.clone()))
+            .collect();
+        let started = Instant::now();
+        let mut bytes = 0u64;
+        for (key, loc) in shards {
+            if loc.disk_idx >= self.disks.len() {
+                continue;
+            }
+            match self.disks[loc.disk_idx]
+                .read_block_async(loc.block_num)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) if is_checksum_error(&e) => self.mark_corrupt(&key, loc.block_num),
+                // Freed and reused since the snapshot, or an I/O error that a
+                // read will report on its own. Neither is rot.
+                Err(e) => debug!("scrub: could not read {key}: {e}"),
+            }
+            bytes += u64::from(loc.size);
+            self.scrub.shards.fetch_add(1, Ordering::Relaxed);
+            self.scrub
+                .bytes
+                .fetch_add(u64::from(loc.size), Ordering::Relaxed);
+            // Pace to the rate: wait until this many bytes are due.
+            if bytes_per_sec > 0 {
+                let due = std::time::Duration::from_secs_f64(bytes as f64 / bytes_per_sec as f64);
+                if let Some(wait) = due.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+        self.scrub.passes.fetch_add(1, Ordering::Relaxed);
+        info!(
+            "scrub pass done: {} bytes in {:.1}s, {} shard(s) corrupt",
+            bytes,
+            started.elapsed().as_secs_f64(),
+            self.corrupt.read().len()
+        );
+    }
+
+    /// Scrub progress as Prometheus families.
+    pub fn render_scrub_metrics(&self, out: &mut String, osd_label: &str) {
+        let corrupt_now = self.corrupt.read().len() as u64;
+        for (name, kind, help, v) in [
+            (
+                "objectio_osd_scrub_passes_total",
+                "counter",
+                "Completed scrub passes",
+                self.scrub.passes.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_scrub_shards_total",
+                "counter",
+                "Shards read and checked by the scrubber",
+                self.scrub.shards.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_scrub_bytes_total",
+                "counter",
+                "Bytes read and checked by the scrubber",
+                self.scrub.bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_corrupt_shards_found_total",
+                "counter",
+                "Shards found failing their checksum, by the scrubber or a read",
+                self.scrub.corrupt.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_corrupt_shards",
+                "gauge",
+                "Corrupt shards on this OSD not yet rebuilt",
+                corrupt_now,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
+        }
     }
 
     /// Decoded ObjectMeta currently stored under `key`, if any.
@@ -900,6 +1057,31 @@ fn for_listing(mut object: ObjectMeta) -> ObjectMeta {
 
 #[tonic::async_trait]
 impl StorageService for OsdService {
+    async fn check_shards(
+        &self,
+        request: Request<CheckShardsRequest>,
+    ) -> Result<Response<CheckShardsResponse>, Status> {
+        let req = request.into_inner();
+        let index = self.shard_index.read();
+        let corrupt = self.corrupt.read();
+        let states = req
+            .shards
+            .iter()
+            .map(|id| {
+                let key = Self::shard_key(&id.object_id, id.stripe_id, id.position);
+                let state = if corrupt.contains(&key) {
+                    ShardState::Corrupt
+                } else if index.contains_key(&key) {
+                    ShardState::Ok
+                } else {
+                    ShardState::Missing
+                };
+                state as i32
+            })
+            .collect();
+        Ok(Response::new(CheckShardsResponse { states }))
+    }
+
     async fn get_metrics(
         &self,
         _request: Request<objectio_proto::metadata::GetMetricsRequest>,
@@ -1036,7 +1218,14 @@ impl StorageService for OsdService {
                  in-memory only, will be lost on restart"
             );
         }
-        self.shard_index.write().insert(key.clone(), loc);
+        let replaced = self.shard_index.write().insert(key.clone(), loc);
+        // Rewriting a shard that is already here — the repairer replacing a
+        // corrupt copy — gets new blocks; the old ones go back to the pool
+        // now that the index no longer points at them.
+        if let Some(old) = replaced {
+            self.free_location(&old);
+        }
+        self.corrupt.write().remove(&key);
 
         info!(
             "Wrote shard: disk={}, block={}, size={}, crc32c={:08x}",
@@ -1108,6 +1297,10 @@ impl StorageService for OsdService {
                     bytes_in,
                     0,
                 );
+                if is_checksum_error(&e) {
+                    self.mark_corrupt(&key, location.block_num);
+                    return Status::data_loss(format!("shard is corrupt: {e}"));
+                }
                 Status::internal(format!("read failed: {}", e))
             })?;
 
@@ -1188,28 +1381,10 @@ impl StorageService for OsdService {
         // Order matters: the index entry goes first, so a crash between the
         // two leaks a block rather than handing a live shard's block to the
         // next write.
-        if let Some(loc) = removed.as_ref()
-            && loc.disk_idx < self.disks.len()
-        {
-            let disk = &self.disks[loc.disk_idx];
-            // `size` is the shard's payload length, so the extent's length is
-            // derivable — which is why nothing had to be added to the index.
-            let blocks = disk.blocks_for_len(loc.size as usize);
-            match disk.free_extent(loc.block_num, blocks) {
-                Ok(()) => {
-                    if let Err(e) = disk.persist_allocator() {
-                        warn!(
-                            "Freed block {} on disk {} but could not persist the bitmap: {e}",
-                            loc.block_num, loc.disk_idx
-                        );
-                    }
-                }
-                Err(e) => warn!(
-                    "Could not free block {} on disk {}: {e}",
-                    loc.block_num, loc.disk_idx
-                ),
-            }
+        if let Some(loc) = removed.as_ref() {
+            self.free_location(loc);
         }
+        self.corrupt.write().remove(&key);
 
         Ok(Response::new(DeleteShardResponse {
             success: removed.is_some(),
@@ -1461,6 +1636,15 @@ impl StorageService for OsdService {
         // Always store as current version at m:{bucket}\0{key}
         let key = MetadataKey::object_meta(&req.bucket, &req.key);
         let old = self.stored_meta(&key);
+        if !req.expected_object_id.is_empty()
+            && old.as_ref().map(|o| o.object_id.as_slice())
+                != Some(req.expected_object_id.as_slice())
+        {
+            return Err(Status::failed_precondition(format!(
+                "{}/{} is no longer the object it was",
+                req.bucket, req.key
+            )));
+        }
         self.meta_store
             .put(key, value.clone())
             .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
@@ -2191,6 +2375,212 @@ mod grpc_write_tests {
         let resp = read_back(&osd).await.unwrap();
         assert_eq!(&resp.data[..], &data[..]);
         assert_eq!(resp.checksum.unwrap().crc32c, crc32c::crc32c(&data));
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    //! Finding damaged shards (scrub, reads), reporting them, and replacing
+    //! them; and the compare-and-set on ObjectMeta.
+
+    use super::*;
+    use objectio_proto::storage::ShardId;
+    use objectio_proto::storage::storage_service_server::StorageService;
+
+    fn osd() -> (tempfile::TempDir, OsdService) {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap();
+        (dir, osd)
+    }
+
+    fn id(position: u32) -> ShardId {
+        ShardId {
+            object_id: vec![7; 16],
+            stripe_id: 0,
+            position,
+        }
+    }
+
+    async fn write(osd: &OsdService, position: u32, data: &[u8]) {
+        osd.write_shard(Request::new(WriteShardRequest {
+            shard_id: Some(id(position)),
+            data: data.to_vec().into(),
+            ec_k: 4,
+            ec_m: 2,
+            checksum: Some(Checksum {
+                crc32c: crc32c::crc32c(data),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+
+    async fn states(osd: &OsdService, positions: &[u32]) -> Vec<ShardState> {
+        osd.check_shards(Request::new(CheckShardsRequest {
+            shards: positions.iter().map(|p| id(*p)).collect(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .states
+        .into_iter()
+        .map(|s| ShardState::try_from(s).unwrap())
+        .collect()
+    }
+
+    /// Flip one byte of `needle` where shard `position` lies in the disk
+    /// file, the way a bad sector would.
+    fn rot(dir: &tempfile::TempDir, osd: &OsdService, position: u32, needle: &[u8]) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let loc = osd.shard_index.read()[&OsdService::shard_key(&[7; 16], 0, position)].clone();
+        let block = u64::from(osd.disks[0].block_size());
+        let start = osd.disks[0].block_offset(loc.block_num);
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("disk.raw"))
+            .unwrap();
+        let mut bytes = vec![0; usize::try_from(block).unwrap() * 4];
+        f.seek(SeekFrom::Start(start)).unwrap();
+        f.read_exact(&mut bytes).unwrap();
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("shard bytes not found on disk");
+        let at = start + (at + needle.len() / 2) as u64;
+        let mut byte = [0u8];
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[byte[0] ^ 0xff]).unwrap();
+    }
+
+    fn payload(seed: u8) -> Vec<u8> {
+        (0..50_000u32).map(|i| (i % 241) as u8 ^ seed).collect()
+    }
+
+    #[tokio::test]
+    async fn shards_are_reported_ok_or_missing() {
+        let (_dir, osd) = osd();
+        write(&osd, 0, &payload(1)).await;
+        assert_eq!(
+            states(&osd, &[0, 1]).await,
+            vec![ShardState::Ok, ShardState::Missing]
+        );
+    }
+
+    /// Rot that nobody reads is found by the scrubber; the shard is then
+    /// refused to readers and reported for repair, and rewriting it clears
+    /// that and gives its old blocks back.
+    #[tokio::test]
+    async fn the_scrubber_finds_rot_and_a_rewrite_repairs_it() {
+        let (dir, osd) = osd();
+        let data = payload(2);
+        write(&osd, 0, &data).await;
+        write(&osd, 1, &payload(3)).await;
+        rot(&dir, &osd, 0, &data[1000..1064]);
+
+        osd.scrub_pass(0).await;
+        assert_eq!(
+            states(&osd, &[0, 1]).await,
+            vec![ShardState::Corrupt, ShardState::Ok]
+        );
+        let err = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(0)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+
+        let free_before = osd.disks[0].free_space();
+        write(&osd, 0, &data).await;
+        assert_eq!(states(&osd, &[0]).await, vec![ShardState::Ok]);
+        assert_eq!(
+            osd.disks[0].free_space(),
+            free_before,
+            "the corrupt copy's blocks were not given back"
+        );
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(0)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
+    }
+
+    /// A read that hits rot reports it too, without waiting for a scrub.
+    #[tokio::test]
+    async fn a_read_that_hits_rot_reports_it() {
+        let (dir, osd) = osd();
+        let data = payload(4);
+        write(&osd, 2, &data).await;
+        rot(&dir, &osd, 2, &data[2000..2064]);
+        let _ = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(2)),
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(states(&osd, &[2]).await, vec![ShardState::Corrupt]);
+    }
+
+    fn meta(object_id: u8) -> ObjectMeta {
+        ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            object_id: vec![object_id; 16],
+            ..Default::default()
+        }
+    }
+
+    async fn put(
+        osd: &OsdService,
+        object: ObjectMeta,
+        expected: &[u8],
+    ) -> Result<(), tonic::Status> {
+        osd.put_object_meta(Request::new(PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(object),
+            versioning_enabled: false,
+            expected_object_id: expected.to_vec(),
+        }))
+        .await
+        .map(drop)
+    }
+
+    /// The repairer's update must not undo a PUT that replaced the object
+    /// after the repairer read it.
+    #[tokio::test]
+    async fn object_meta_is_only_replaced_if_it_is_still_the_expected_object() {
+        let (_dir, osd) = osd();
+        put(&osd, meta(1), &[]).await.unwrap();
+        put(&osd, meta(2), &[]).await.unwrap(); // a PUT replaces it
+
+        let err = put(&osd, meta(1), &[1; 16]).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let stored = osd
+            .stored_meta(&MetadataKey::object_meta("b", "k"))
+            .unwrap();
+        assert_eq!(
+            stored.object_id,
+            vec![2; 16],
+            "the newer object was rolled back"
+        );
+
+        put(&osd, meta(2), &[2; 16]).await.unwrap();
     }
 }
 

@@ -620,6 +620,7 @@ pub async fn put_object_meta_to_all(
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
         let req = PutObjectMetaRequest {
+            expected_object_id: Vec::new(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             object: Some(object_meta.clone()),

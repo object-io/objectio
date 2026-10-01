@@ -304,6 +304,7 @@ pub async fn put_object_meta_to_osd(
     let mut client = pool.get_client_for_placement(primary_placement).await?;
 
     let request = PutObjectMetaRequest {
+        expected_object_id: Vec::new(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         object: Some(object_meta),

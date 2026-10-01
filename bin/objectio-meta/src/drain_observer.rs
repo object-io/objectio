@@ -95,6 +95,7 @@ async fn fanout_put_object_meta(
     for addr in &addrs {
         let addr = addr.clone();
         let req = PutObjectMetaRequest {
+            expected_object_id: Vec::new(),
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             object: Some(object.clone()),
