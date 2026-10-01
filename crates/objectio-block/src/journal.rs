@@ -456,10 +456,10 @@ impl WriteJournal {
             .seek(SeekFrom::Start(28)) // 8 + 4 + 8 + 8 bytes
             .map_err(|e| BlockError::Journal(format!("failed to seek past header: {}", e)))?;
 
-        let mut all_entries = Vec::new();
-        let mut last_checkpoint_seq = self.last_checkpoint.load(Ordering::SeqCst);
-
-        // Scan all entries, tracking the last checkpoint seen on disk
+        // Writes after the last checkpoint, in file order. Sequence numbers
+        // are not compared: they restart whenever the journal is reopened,
+        // so filtering on them dropped writes made since a restart.
+        let mut entries = Vec::new();
         while let Ok(entry) = JournalEntry::deserialize(&mut reader) {
             if !entry.verify() {
                 warn!(
@@ -468,18 +468,12 @@ impl WriteJournal {
                 );
                 break;
             }
-            if entry.entry_type == EntryType::Checkpoint {
-                last_checkpoint_seq = entry.sequence;
-            } else {
-                all_entries.push(entry);
+            match entry.entry_type {
+                EntryType::Checkpoint => entries.clear(),
+                EntryType::Write => entries.push(entry),
+                EntryType::Flush => {}
             }
         }
-
-        // Only keep write entries after the last checkpoint
-        let entries: Vec<_> = all_entries
-            .into_iter()
-            .filter(|e| e.sequence > last_checkpoint_seq && e.entry_type == EntryType::Write)
-            .collect();
 
         info!("Recovered {} journal entries", entries.len());
         Ok(entries)

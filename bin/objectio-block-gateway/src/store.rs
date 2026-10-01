@@ -115,19 +115,23 @@ impl BlockStore {
             let (_, value) = entry?;
             let rec: VolumeRecord = serde_json::from_str(value.value())?;
 
-            // Reconstruct via create_volume (sets Available state) then patch state
-            let result = vm.create_volume(rec.name.clone(), rec.size_bytes, rec.pool.clone());
-
-            // If name already exists (idempotent restart) just continue
-            if let Err(objectio_block::error::BlockError::VolumeExists(_)) = &result {
-                continue;
-            }
-            let vol = result?;
-
-            // Restore non-Available state
-            let state = VolumeState::from(rec.state);
-            if state != VolumeState::Available {
-                vm.set_volume_state(&vol.volume_id, state)?;
+            let volume = Volume {
+                volume_id: rec.volume_id,
+                name: rec.name,
+                size_bytes: rec.size_bytes,
+                used_bytes: 0,
+                pool: rec.pool,
+                state: VolumeState::from(rec.state),
+                created_at: rec.created_at,
+                updated_at: rec.updated_at,
+                parent_snapshot_id: rec.parent_snapshot_id,
+                chunk_size: rec.chunk_size,
+                metadata: std::collections::HashMap::new(),
+            };
+            match vm.restore_volume(volume) {
+                // Already restored (idempotent restart).
+                Ok(()) | Err(objectio_block::error::BlockError::VolumeExists(_)) => {}
+                Err(e) => return Err(e.into()),
             }
         }
         Ok(())

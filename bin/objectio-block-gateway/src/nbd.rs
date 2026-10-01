@@ -104,6 +104,22 @@ fn reply_offset(
 }
 
 impl NbdServer {
+    /// See [`crate::ec_io::load_for_partial_write`].
+    async fn load_for_write(&self, volume_id: &str, offset: u64, len: u32) -> anyhow::Result<()> {
+        crate::ec_io::load_for_partial_write(
+            &self.cache,
+            &self.store,
+            &self.meta_client,
+            &self.osd_pool,
+            self.ec_k,
+            self.ec_m,
+            volume_id,
+            offset,
+            u64::from(len),
+        )
+        .await
+    }
+
     pub fn new(
         cache: Arc<objectio_block::WriteCache>,
         store: Arc<BlockStore>,
@@ -422,7 +438,10 @@ impl NbdServer {
                     let mut data = vec![0u8; length as usize];
                     stream.read_exact(&mut data).await?;
 
-                    let error = if let Err(e) = self.cache.write(vol_id, offset, &data) {
+                    let error = if let Err(e) = self.load_for_write(vol_id, offset, length).await {
+                        warn!("NBD write for {peer}: {e}");
+                        5u32 // EIO
+                    } else if let Err(e) = self.cache.write(vol_id, offset, &data) {
                         warn!("NBD write cache error for {peer}: {e}");
                         5u32 // EIO
                     } else {
@@ -432,19 +451,27 @@ impl NbdServer {
                 }
 
                 NBD_CMD_FLUSH => {
-                    // Inline flush — need a temporary state reference
-                    // We can't call flush_volume_all here without the full state.
-                    // Drain the cache's queue without a background state reference.
-                    // (Full EC flush happens in background loop; NBD FLUSH ensures
-                    //  dirty cache data is at least checkpointed.)
-                    self.send_reply(stream, handle, 0).await?;
+                    // Every write is already fsynced to the journal when it
+                    // is acknowledged; syncing again here is belt and braces.
+                    // (This used to acknowledge without doing anything.)
+                    let error = match self.cache.sync() {
+                        Ok(()) => 0u32,
+                        Err(e) => {
+                            warn!("NBD flush for {peer}: {e}");
+                            5u32 // EIO
+                        }
+                    };
+                    self.send_reply(stream, handle, error).await?;
                 }
 
                 NBD_CMD_TRIM => {
                     // Zero-fill trimmed range
                     let zeros = vec![0u8; length as usize];
-                    let _ = self.cache.write(vol_id, offset, &zeros);
-                    self.send_reply(stream, handle, 0).await?;
+                    let error = match self.load_for_write(vol_id, offset, length).await {
+                        Ok(()) if self.cache.write(vol_id, offset, &zeros).is_ok() => 0u32,
+                        _ => 5u32, // EIO
+                    };
+                    self.send_reply(stream, handle, error).await?;
                 }
 
                 NBD_CMD_DISC => {

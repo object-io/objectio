@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "objectio_block_gateway"
+path = "src/lib.rs"
+
 [[bin]]
 name = "objectio-block-gateway"
 path = "src/main.rs"

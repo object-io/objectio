@@ -24,6 +24,9 @@ pub struct DirtyChunk {
     pub dirty_since: Instant,
     /// When the chunk was last modified
     pub last_modified: Instant,
+    /// Bumped by every write to the chunk, so a flush can tell whether the
+    /// bytes it wrote out are still the latest.
+    pub version: u64,
 }
 
 /// Write cache configuration
@@ -60,6 +63,8 @@ struct VolumeCache {
     dirty_bytes: u64,
     /// Total clean bytes
     clean_bytes: u64,
+    /// Source of `DirtyChunk::version`.
+    next_version: u64,
 }
 
 impl VolumeCache {
@@ -69,6 +74,7 @@ impl VolumeCache {
             clean_chunks: BTreeMap::new(),
             dirty_bytes: 0,
             clean_bytes: 0,
+            next_version: 0,
         }
     }
 }
@@ -161,15 +167,23 @@ impl WriteCache {
 
     /// Write data to the cache
     ///
-    /// This updates the in-memory cache and marks chunks as dirty.
-    /// If journaling is enabled, the write is logged before acknowledging.
-    /// The actual flush to storage happens asynchronously.
+    /// This updates the in-memory cache and marks chunks as dirty. With a
+    /// journal, the write is logged and the journal fsynced before this
+    /// returns, so it is durable when acknowledged. Erasure-coding it out to
+    /// the OSDs happens later.
     pub fn write(&self, volume_id: &str, offset: u64, data: &[u8]) -> BlockResult<()> {
         if data.is_empty() {
             return Ok(());
         }
 
-        // Log to journal first for durability (write-ahead logging)
+        let mut caches = self.caches.write();
+        if !caches.contains_key(volume_id) {
+            return Err(BlockError::VolumeNotFound(volume_id.to_string()));
+        }
+        // Log to the journal before acknowledging (write-ahead), under the
+        // cache lock: the journal's order is then the order writes are
+        // applied, and it cannot be reset between a write being logged and
+        // that write becoming dirty.
         if let Some(ref journal) = self.journal {
             journal.log_write(
                 volume_id,
@@ -178,14 +192,41 @@ impl WriteCache {
                 Bytes::copy_from_slice(data),
             )?;
         }
+        self.apply(&mut caches, volume_id, offset, data)?;
+        drop(caches);
+        // Acknowledged means on stable storage: the journal is fsynced
+        // before the write returns, not only on an explicit flush, so a
+        // power cut cannot lose a write the client was told succeeded.
+        // Outside the cache lock, so other writes proceed meanwhile.
+        if let Some(ref journal) = self.journal {
+            journal.sync()?;
+        }
+        Ok(())
+    }
 
+    /// Re-apply a write recovered from the journal: as [`Self::write`],
+    /// without logging it again (it is still in the journal).
+    pub fn replay(&self, volume_id: &str, offset: u64, data: &[u8]) -> BlockResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut caches = self.caches.write();
+        self.apply(&mut caches, volume_id, offset, data)
+    }
+
+    fn apply(
+        &self,
+        caches: &mut BTreeMap<String, VolumeCache>,
+        volume_id: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> BlockResult<()> {
         // Calculate affected chunks
         let chunk_ranges = self
             .chunk_mapper
             .byte_range_to_chunks(offset, data.len() as u64);
         let chunk_size = self.chunk_mapper.chunk_size() as usize;
 
-        let mut caches = self.caches.write();
         let cache = caches
             .get_mut(volume_id)
             .ok_or_else(|| BlockError::VolumeNotFound(volume_id.to_string()))?;
@@ -221,7 +262,9 @@ impl WriteCache {
 
             // Store as dirty
             let was_dirty = cache.dirty_chunks.contains_key(&range.chunk_id);
+            cache.next_version += 1;
             let dirty_chunk = DirtyChunk {
+                version: cache.next_version,
                 data: Bytes::from(chunk_data),
                 dirty_since: if was_dirty {
                     cache.dirty_chunks.get(&range.chunk_id).unwrap().dirty_since
@@ -292,6 +335,13 @@ impl WriteCache {
         Some(result)
     }
 
+    /// Whether the cache holds `chunk_id` of `volume_id`, dirty or clean.
+    pub fn holds_chunk(&self, volume_id: &str, chunk_id: ChunkId) -> bool {
+        self.caches.read().get(volume_id).is_some_and(|c| {
+            c.dirty_chunks.contains_key(&chunk_id) || c.clean_chunks.contains_key(&chunk_id)
+        })
+    }
+
     /// Add a clean chunk to the read cache
     pub fn add_clean(&self, volume_id: &str, chunk_id: ChunkId, data: Bytes) {
         let mut caches = self.caches.write();
@@ -309,7 +359,7 @@ impl WriteCache {
     /// Returns chunks that are either:
     /// - Older than max_dirty_age
     /// - Need to be flushed due to cache pressure
-    pub fn get_chunks_to_flush(&self, volume_id: &str) -> Vec<(ChunkId, Bytes)> {
+    pub fn get_chunks_to_flush(&self, volume_id: &str) -> Vec<(ChunkId, Bytes, u64)> {
         let caches = self.caches.read();
         let cache = match caches.get(volume_id) {
             Some(c) => c,
@@ -322,40 +372,52 @@ impl WriteCache {
         for (chunk_id, dirty) in &cache.dirty_chunks {
             let age = now.duration_since(dirty.dirty_since);
             if age >= self.config.max_dirty_age || self.should_flush() {
-                to_flush.push((*chunk_id, dirty.data.clone()));
+                to_flush.push((*chunk_id, dirty.data.clone(), dirty.version));
             }
         }
 
         to_flush
     }
 
-    /// Mark chunks as flushed (no longer dirty)
-    ///
-    /// Logs the flush completion to the journal if enabled.
-    pub fn mark_flushed(&self, volume_id: &str, chunk_ids: &[ChunkId]) {
-        // Log flush completion to journal
-        if let Some(ref journal) = self.journal {
-            for chunk_id in chunk_ids {
-                if let Err(e) = journal.log_flush(volume_id, *chunk_id) {
-                    warn!("Failed to log flush to journal: {}", e);
-                }
-            }
-        }
-
+    /// Mark chunks as flushed: each `(chunk, version)` stops being dirty if
+    /// it is still the version that was written out. A chunk written again
+    /// while its flush was in flight stays dirty — marking it clean dropped
+    /// that newer write.
+    pub fn mark_flushed(&self, volume_id: &str, flushed: &[(ChunkId, u64)]) {
         let mut caches = self.caches.write();
         if let Some(cache) = caches.get_mut(volume_id) {
-            for chunk_id in chunk_ids {
-                if let Some(dirty) = cache.dirty_chunks.remove(chunk_id) {
+            for (chunk_id, version) in flushed {
+                if cache
+                    .dirty_chunks
+                    .get(chunk_id)
+                    .is_some_and(|d| d.version == *version)
+                    && let Some(dirty) = cache.dirty_chunks.remove(chunk_id)
+                {
                     let chunk_size = dirty.data.len() as u64;
                     cache.dirty_bytes = cache.dirty_bytes.saturating_sub(chunk_size);
                     *self.total_dirty_bytes.write() -= chunk_size;
-
-                    // Move to clean cache
                     cache.clean_bytes += chunk_size;
                     cache.clean_chunks.insert(*chunk_id, dirty.data);
                 }
             }
         }
+    }
+
+    /// Empty the journal if nothing in the cache is dirty: everything it
+    /// recorded is then on the OSDs. Without this it grew forever, and a
+    /// restart would have replayed all of it. Returns whether it did.
+    pub fn reset_journal_if_clean(&self) -> BlockResult<bool> {
+        let Some(ref journal) = self.journal else {
+            return Ok(false);
+        };
+        // Held across the rotation, so no write is logged in between.
+        let caches = self.caches.write();
+        if caches.values().any(|c| !c.dirty_chunks.is_empty()) {
+            return Ok(false);
+        }
+        journal.rotate()?;
+        drop(caches);
+        Ok(true)
     }
 
     /// Create a checkpoint in the journal
@@ -397,25 +459,20 @@ impl WriteCache {
         Ok(())
     }
 
-    /// Flush all dirty data for a volume
-    pub fn flush_volume(&self, volume_id: &str) -> Vec<(ChunkId, Bytes)> {
-        let mut caches = self.caches.write();
-        if let Some(cache) = caches.get_mut(volume_id) {
-            // Use std::mem::take to efficiently drain the BTreeMap
-            let dirty_chunks = std::mem::take(&mut cache.dirty_chunks);
-            let dirty: Vec<_> = dirty_chunks
-                .into_iter()
-                .map(|(id, d)| (id, d.data))
-                .collect();
-
-            let flushed_bytes = cache.dirty_bytes;
-            *self.total_dirty_bytes.write() -= flushed_bytes;
-            cache.dirty_bytes = 0;
-
-            dirty
-        } else {
-            Vec::new()
-        }
+    /// Every dirty chunk of a volume with its version, to flush now. They
+    /// stay dirty until [`Self::mark_flushed`], so a chunk whose flush fails
+    /// is retried rather than dropped.
+    pub fn dirty_chunks(&self, volume_id: &str) -> Vec<(ChunkId, Bytes, u64)> {
+        self.caches
+            .read()
+            .get(volume_id)
+            .map(|c| {
+                c.dirty_chunks
+                    .iter()
+                    .map(|(id, d)| (*id, d.data.clone(), d.version))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Check if we should trigger a flush due to cache pressure
@@ -508,10 +565,11 @@ mod tests {
         let data = vec![0xEFu8; 4096];
         cache.write("vol1", 0, &data).unwrap();
 
-        // Flush should return the dirty chunk
-        let flushed = cache.flush_volume("vol1");
-        assert_eq!(flushed.len(), 1);
-        assert_eq!(flushed[0].0, 0); // Chunk ID 0
+        // The dirty chunk is offered for flushing, and clean once flushed
+        let dirty = cache.dirty_chunks("vol1");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, 0); // Chunk ID 0
+        cache.mark_flushed("vol1", &[(dirty[0].0, dirty[0].2)]);
 
         // After flush, stats should show no dirty data
         let stats = cache.stats();
@@ -527,5 +585,50 @@ mod tests {
         // Reading without writing should return None (cache miss)
         let read = cache.read("vol1", 0, 4096);
         assert!(read.is_none());
+    }
+
+    /// A write that lands while its chunk is being flushed must not be
+    /// marked clean with the older bytes the flush wrote out.
+    #[test]
+    fn a_write_during_a_flush_stays_dirty() {
+        let cache = test_cache();
+        cache.init_volume("vol1");
+        cache.write("vol1", 0, &[1u8; 4096]).unwrap();
+        let in_flight = cache.dirty_chunks("vol1");
+
+        cache.write("vol1", 4096, &[2u8; 4096]).unwrap(); // during the flush
+        cache.mark_flushed("vol1", &[(in_flight[0].0, in_flight[0].2)]);
+
+        let still = cache.dirty_chunks("vol1");
+        assert_eq!(still.len(), 1, "the newer write was dropped");
+        assert_eq!(&still[0].1[4096..8192], &[2u8; 4096]);
+    }
+
+    /// Writes logged since the journal was reopened are recovered, and
+    /// resetting it once clean leaves nothing to replay.
+    #[test]
+    fn the_journal_recovers_writes_across_a_reopen_and_empties_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block.journal");
+        let mapper = Arc::new(ChunkMapper::default());
+        {
+            let cache = WriteCache::with_journal(Arc::clone(&mapper), &path);
+            cache.init_volume("vol1");
+            cache.write("vol1", 0, b"first").unwrap();
+        }
+        let cache = WriteCache::with_journal(Arc::clone(&mapper), &path);
+        cache.init_volume("vol1");
+        cache.write("vol1", 4096, b"after a reopen").unwrap();
+        let recovered: Vec<_> = cache.recover().unwrap().into_iter().map(|w| w.3).collect();
+        assert_eq!(recovered, vec![&b"first"[..], &b"after a reopen"[..]]);
+
+        let dirty = cache.dirty_chunks("vol1");
+        assert!(
+            !cache.reset_journal_if_clean().unwrap(),
+            "reset with dirty data"
+        );
+        cache.mark_flushed("vol1", &[(dirty[0].0, dirty[0].2)]);
+        assert!(cache.reset_journal_if_clean().unwrap());
+        assert!(cache.recover().unwrap().is_empty());
     }
 }

@@ -172,6 +172,15 @@ struct Args {
     /// checksums. Forwarded to every OSD; 0 turns it off.
     #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
     scrub_interval_secs: u64,
+
+    /// Run the block gateway too, with its gRPC BlockService on this port.
+    /// 0 (the default) leaves block storage off.
+    #[arg(long, default_value_t = 0)]
+    block_port: u16,
+
+    /// NBD port for the block gateway, when --block-port is set.
+    #[arg(long, default_value_t = 10809)]
+    nbd_port: u16,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -761,6 +770,28 @@ async fn main() -> Result<()> {
     // registered or reachable yet, and a PUT then fails with "write quorum
     // not met". Only announce ready once the gateway says it is.
     wait_gateway_ready(gateway_port, 60).await;
+    if args.block_port != 0 {
+        let block_data = data_root.join("block");
+        let block_args = <objectio_block_gateway::Args as clap::Parser>::parse_from([
+            "objectio-block-gateway".to_string(),
+            "--listen".into(),
+            format!("{}:{}", args.listen_addr, args.block_port),
+            "--nbd-listen".into(),
+            format!("{}:{}", args.listen_addr, args.nbd_port),
+            "--meta-endpoint".into(),
+            format!("http://127.0.0.1:{meta_grpc}"),
+            "--data-dir".into(),
+            block_data.display().to_string(),
+            "--log-level".into(),
+            args.log_level.clone(),
+        ]);
+        tokio::spawn(async move {
+            if let Err(e) = objectio_block_gateway::run(block_args).await {
+                tracing::error!("block gateway stopped: {e:#}");
+            }
+        });
+        wait_listening(args.block_port, "block gateway", 20).await?;
+    }
     // An OSD that could not start (typically: its port was taken between
     // being picked and being bound) leaves meta pointing at an address
     // something else answers. Running on like that fails writes in ways
