@@ -170,7 +170,10 @@ impl ErasureCodec {
     ///
     /// Must be a multiple of 64 for SIMD alignment (reed-solomon-simd
     /// requires at least a multiple of 2, we use 64 for performance).
-    fn shard_size_for(len: usize, k: usize) -> usize {
+    /// Bytes per shard when `len` bytes are split over `k` data shards:
+    /// data byte `p` is in shard `p / shard` at offset `p % shard`.
+    #[must_use]
+    pub fn shard_size_for(len: usize, k: usize) -> usize {
         len.div_ceil(k).next_multiple_of(64).max(64)
     }
 
