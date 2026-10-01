@@ -2162,6 +2162,25 @@ fn is_object_metadata_header(name: &str) -> bool {
         )
 }
 
+/// Shards of a k+m stripe that must be on disk before a write is
+/// acknowledged: k+1, or all of them when there is no parity.
+///
+/// k is enough to read the stripe back, but an object acknowledged with
+/// exactly k has no redundancy left: one more failure loses it. One spare
+/// shard means a write still succeeds with an OSD down, and what it stores
+/// survives one further failure until the repairer restores the rest.
+const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
+    let k = ec_k as usize;
+    if ec_m == 0 { k } else { k + 1 }
+}
+
+/// Replicas that must be written before a replicated write is
+/// acknowledged: two — the copy and a spare — or one in a pool that keeps
+/// only one. Same reasoning as [`write_quorum`].
+const fn replica_quorum(replicas: usize) -> usize {
+    if replicas < 2 { replicas } else { 2 }
+}
+
 /// How a PUT's two commits ended, when the one that decides it succeeded.
 #[derive(Debug, PartialEq, Eq)]
 enum Committed<E> {
@@ -2477,19 +2496,19 @@ pub async fn put_object(
                 }
             }
 
-            // For replication, we need at least 1 successful write per stripe
-            if success_count < 1 {
+            let quorum = replica_quorum(total_replicas);
+            if success_count < quorum {
                 error!(
-                    "Replication failed for stripe {}: {} successful writes, need at least 1",
-                    stripe_idx, success_count
+                    "Replication failed for stripe {}: {} successful writes, need {}",
+                    stripe_idx, success_count, quorum
                 );
                 return S3Error::xml_response(
-                    "InternalError",
+                    "ServiceUnavailable",
                     &format!(
-                        "Replication failed for stripe {}: {} successful writes, need 1",
-                        stripe_idx, success_count
+                        "Replication failed for stripe {}: {} successful writes, need {}",
+                        stripe_idx, success_count, quorum
                     ),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
 
@@ -2841,20 +2860,19 @@ pub async fn put_object(
             }
         }
 
-        // Check write quorum - need at least k shards to reconstruct data
-        let quorum = ec_k as usize;
+        let quorum = write_quorum(ec_k, ec_m);
         if success_count < quorum {
             error!(
                 "Write quorum not met for stripe {}: {} successful, need {} (ec_k={}, ec_m={}, total_shards={})",
                 stripe_idx, success_count, quorum, ec_k, ec_m, total_shards
             );
             return S3Error::xml_response(
-                "InternalError",
+                "ServiceUnavailable",
                 &format!(
                     "Write quorum not met for stripe {}: {} successful writes, need {}",
                     stripe_idx, success_count, quorum
                 ),
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
             );
         }
 
@@ -5583,20 +5601,19 @@ async fn upload_part_internal(
                 }
             }
 
-            // Check write quorum - need at least k shards to reconstruct data
-            let quorum = ec_k as usize;
+            let quorum = write_quorum(ec_k, ec_m);
             if success < quorum {
                 error!(
                     "Write quorum not met for part stripe {}: {} successful, need {} (ec_k={}, ec_m={})",
                     stripe_idx, success, quorum, ec_k, ec_m
                 );
                 return S3Error::xml_response(
-                    "InternalError",
+                    "ServiceUnavailable",
                     &format!(
                         "Write quorum not met for stripe {}: {} successful writes, need {}",
                         stripe_idx, success, quorum
                     ),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
 
@@ -8934,5 +8951,31 @@ mod commit_tests {
         .await;
         assert_eq!(r, Err("osd"));
         assert!(!unlisted.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod write_quorum_tests {
+    use super::write_quorum;
+
+    #[test]
+    fn a_write_keeps_one_spare_shard() {
+        assert_eq!(write_quorum(4, 2), 5);
+        assert_eq!(write_quorum(8, 3), 9);
+        assert_eq!(write_quorum(2, 1), 3, "with m = 1 that is every shard");
+    }
+
+    #[test]
+    fn a_replicated_write_keeps_one_spare_copy() {
+        use super::replica_quorum;
+        assert_eq!(replica_quorum(3), 2);
+        assert_eq!(replica_quorum(2), 2);
+        assert_eq!(replica_quorum(1), 1);
+    }
+
+    #[test]
+    fn without_parity_every_shard_is_needed() {
+        assert_eq!(write_quorum(1, 0), 1);
+        assert_eq!(write_quorum(4, 0), 4);
     }
 }

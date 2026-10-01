@@ -1,0 +1,754 @@
+//! Repairer: finds objects that have lost redundancy and restores it.
+//!
+//! An object can be left with fewer than k+m good shards in three ways: a
+//! PUT acknowledged with only some of them written (the write quorum is
+//! k+1), a shard that rotted on disk (found by an OSD's scrubber or a
+//! read), and a disk that was replaced, taking its shards with it. Left
+//! alone, each one is a failure closer to loss.
+//!
+//! Every `--repair-interval-secs` the Raft leader walks every object, a page
+//! of ObjectMetas per OSD at a time, each object once (from the OSD that
+//! counts it in usage). For each erasure-coded stripe it asks the shard
+//! holders, in one `CheckShards` call per OSD per page, whether each shard
+//! is there and intact. A shard that is missing or corrupt, or a position
+//! the ObjectMeta has no location for, is rebuilt from k good shards:
+//!
+//! - in place, on the OSD that should hold it, for a shard it lost or that
+//!   rotted — the ObjectMeta already points there;
+//! - on the position's placement OSD for one that was never written; the
+//!   new location is then added to the ObjectMeta with a compare-and-set,
+//!   so a PUT that replaced the object meanwhile is never rolled back.
+//!
+//! The same walk restores entries missing from Meta's listing index (a
+//! PUT's listing commit that failed while its ObjectMeta landed), so such
+//! objects show up in ListObjects again.
+//!
+//! Out of scope here: replicated and LRC stripes, shards on OSDs that do
+//! not answer (they may be rebooting; drain handles OSDs that are gone),
+//! and version entries other than the current one.
+
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use objectio_proto::metadata::metadata_service_server::MetadataService;
+use objectio_proto::metadata::{
+    CreateObjectRequest, ErasureType, GetPlacementRequest, NodePlacement, ObjectMeta,
+    ShardLocation, StripeMeta,
+};
+use objectio_proto::storage::{
+    CheckShardsRequest, GetObjectMetaRequest, ListObjectsMetaRequest, PutObjectMetaRequest,
+    ReadShardRequest, ShardId, ShardState, WriteShardRequest,
+    storage_service_client::StorageServiceClient,
+};
+use tracing::{debug, info, warn};
+
+use crate::drain_observer::{checksum_of, open_channel, verified_shard};
+use crate::service::MetaService;
+
+/// ObjectMetas fetched from an OSD per page.
+const PAGE: u32 = 200;
+
+/// Per-RPC timeout. Shard reads and writes move up to 4 MiB.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What the repairer has done since this node started.
+#[derive(Default)]
+struct Stats {
+    passes: AtomicU64,
+    objects: AtomicU64,
+    rebuilt_missing: AtomicU64,
+    rebuilt_corrupt: AtomicU64,
+    unrecoverable: AtomicU64,
+    listings_restored: AtomicU64,
+    errors: AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    passes: AtomicU64::new(0),
+    objects: AtomicU64::new(0),
+    rebuilt_missing: AtomicU64::new(0),
+    rebuilt_corrupt: AtomicU64::new(0),
+    unrecoverable: AtomicU64::new(0),
+    listings_restored: AtomicU64::new(0),
+    errors: AtomicU64::new(0),
+};
+
+/// Start the repairer: a full pass every `interval`, on the Raft leader
+/// only. A zero interval leaves it off.
+pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
+    if interval.is_zero() {
+        info!("Repairer off");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            if meta.is_raft_leader() {
+                pass(&meta).await;
+            }
+        }
+    });
+    info!("Repairer spawned (a pass every {interval:?})");
+}
+
+/// Repairer metrics as Prometheus families.
+pub fn render_metrics(out: &mut String) {
+    let s = &STATS;
+    for (name, help, v) in [
+        (
+            "objectio_meta_repair_passes_total",
+            "Completed repair passes",
+            &s.passes,
+        ),
+        (
+            "objectio_meta_repair_objects_checked_total",
+            "Objects checked by the repairer",
+            &s.objects,
+        ),
+        (
+            "objectio_meta_repair_unrecoverable_stripes_total",
+            "Stripes found with fewer than k good shards",
+            &s.unrecoverable,
+        ),
+        (
+            "objectio_meta_repair_listings_restored_total",
+            "Listing entries restored for objects missing from ListObjects",
+            &s.listings_restored,
+        ),
+        (
+            "objectio_meta_repair_errors_total",
+            "Repairs that failed and will be retried next pass",
+            &s.errors,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} counter");
+        let _ = writeln!(out, "{name} {}", v.load(Ordering::Relaxed));
+    }
+    let name = "objectio_meta_repair_shards_rebuilt_total";
+    let _ = writeln!(
+        out,
+        "# HELP {name} Shards rebuilt from the rest of their stripe"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(
+        out,
+        "{name}{{reason=\"missing\"}} {}",
+        s.rebuilt_missing.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "{name}{{reason=\"corrupt\"}} {}",
+        s.rebuilt_corrupt.load(Ordering::Relaxed)
+    );
+}
+
+/// One full pass over every object on every OSD that is not Out.
+pub async fn pass(meta: &Arc<MetaService>) {
+    let osds: Vec<([u8; 16], String)> = meta
+        .osd_nodes_snapshot()
+        .into_iter()
+        .filter(|n| n.admin_state != objectio_common::OsdAdminState::Out)
+        .map(|n| (n.node_id, n.address))
+        .collect();
+    for (node_id, address) in osds {
+        let mut cursor = String::new();
+        loop {
+            if !meta.is_raft_leader() {
+                return;
+            }
+            let (page, next) = match list_page(&address, &cursor).await {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("repair: cannot list {address}: {e}");
+                    break;
+                }
+            };
+            let owned: Vec<ObjectMeta> = page
+                .into_iter()
+                .filter(|o| owner(o) == Some(node_id.as_slice()))
+                .collect();
+            audit(meta, &address, &owned).await;
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    STATS.passes.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The node that answers for this object: the one that counts it in usage,
+/// or for objects written before that existed, the holder of its first
+/// shard. Walking only the objects a node owns visits each object once.
+fn owner(o: &ObjectMeta) -> Option<&[u8]> {
+    if !o.usage_owner.is_empty() {
+        return Some(&o.usage_owner);
+    }
+    o.stripes
+        .first()
+        .and_then(|s| s.shards.first())
+        .map(|s| s.node_id.as_slice())
+}
+
+/// A page of the ObjectMetas an OSD holds, and the cursor for the next one
+/// (empty after the last page).
+async fn list_page(address: &str, cursor: &str) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
+    let mut client = StorageServiceClient::new(open_channel(address).await?)
+        .max_decoding_message_size(100 * 1024 * 1024);
+    let resp = tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.list_objects_meta(ListObjectsMetaRequest {
+            bucket: String::new(),
+            start_after: cursor.to_string(),
+            max_keys: PAGE,
+            ..Default::default()
+        }),
+    )
+    .await??
+    .into_inner();
+    let next = if resp.is_truncated {
+        resp.next_continuation_token
+    } else {
+        String::new()
+    };
+    Ok((resp.objects, next))
+}
+
+/// Where a shard stands, as far as this pass could tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    Ok,
+    /// Missing or corrupt on the OSD the ObjectMeta names.
+    Lost {
+        corrupt: bool,
+    },
+    /// The ObjectMeta has no location for this position.
+    Unplaced,
+    /// Its OSD did not answer.
+    Unknown,
+}
+
+/// What to do with one stripe, given where its shards stand.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    Healthy,
+    /// Rebuild these positions from the good ones.
+    Rebuild {
+        bad: Vec<usize>,
+        good: Vec<usize>,
+    },
+    /// Fewer than k good shards: nothing to rebuild from.
+    Unrecoverable {
+        good: usize,
+    },
+}
+
+fn verdict(seen: &[Seen], k: usize) -> Verdict {
+    let good: Vec<usize> = (0..seen.len()).filter(|&p| seen[p] == Seen::Ok).collect();
+    let bad: Vec<usize> = (0..seen.len())
+        .filter(|&p| matches!(seen[p], Seen::Lost { .. } | Seen::Unplaced))
+        .collect();
+    if bad.is_empty() {
+        Verdict::Healthy
+    } else if good.len() < k {
+        Verdict::Unrecoverable { good: good.len() }
+    } else {
+        Verdict::Rebuild { bad, good }
+    }
+}
+
+/// Stripes this pass can repair: erasure-coded with parity.
+fn repairable(stripe: &StripeMeta) -> bool {
+    let ec = ErasureType::try_from(stripe.ec_type).unwrap_or(ErasureType::ErasureMds);
+    ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0
+}
+
+fn shard_object_id<'a>(object: &'a ObjectMeta, stripe: &'a StripeMeta) -> &'a [u8] {
+    if stripe.object_id.is_empty() {
+        &object.object_id
+    } else {
+        &stripe.object_id
+    }
+}
+
+async fn audit(meta: &Arc<MetaService>, owner_addr: &str, objects: &[ObjectMeta]) {
+    // Every listed shard of every repairable stripe, grouped by node, so
+    // each node is asked once for the whole page.
+    let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
+    for (oi, o) in objects.iter().enumerate() {
+        for (si, s) in o.stripes.iter().enumerate() {
+            if repairable(s) {
+                for loc in &s.shards {
+                    asks.entry(loc.node_id.clone())
+                        .or_default()
+                        .push((oi, si, loc.position));
+                }
+            }
+        }
+    }
+    let mut states: HashMap<(usize, usize, u32), Seen> = HashMap::new();
+    for (node, refs) in asks {
+        let answer = match node_address(meta, &node) {
+            Some(addr) => check_shards(&addr, objects, &refs).await,
+            None => Err(anyhow::anyhow!("node not registered")),
+        };
+        match answer {
+            Ok(got) => {
+                for (r, st) in refs.into_iter().zip(got) {
+                    states.insert(r, st);
+                }
+            }
+            Err(e) => {
+                debug!("repair: check_shards on {}: {e}", hex::encode(&node));
+                for r in refs {
+                    states.insert(r, Seen::Unknown);
+                }
+            }
+        }
+    }
+
+    for (oi, object) in objects.iter().enumerate() {
+        STATS.objects.fetch_add(1, Ordering::Relaxed);
+        for (si, stripe) in object.stripes.iter().enumerate() {
+            if !repairable(stripe) {
+                continue;
+            }
+            let total = (stripe.ec_k + stripe.ec_m) as usize;
+            let mut seen = vec![Seen::Unplaced; total];
+            for loc in &stripe.shards {
+                if let Some(slot) = seen.get_mut(loc.position as usize) {
+                    *slot = states
+                        .get(&(oi, si, loc.position))
+                        .copied()
+                        .unwrap_or(Seen::Unknown);
+                }
+            }
+            match verdict(&seen, stripe.ec_k as usize) {
+                Verdict::Healthy => {}
+                Verdict::Unrecoverable { good } => {
+                    STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "repair: {}/{} stripe {} has {good} good shards, needs {}",
+                        object.bucket, object.key, stripe.stripe_id, stripe.ec_k
+                    );
+                }
+                Verdict::Rebuild { bad, good } => {
+                    if let Err(e) =
+                        rebuild(meta, owner_addr, object, stripe, &seen, &bad, &good).await
+                    {
+                        STATS.errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "repair: {}/{} stripe {}: {e}",
+                            object.bucket, object.key, stripe.stripe_id
+                        );
+                    }
+                }
+            }
+        }
+        if let Err(e) = restore_listing(meta, owner_addr, object).await {
+            STATS.errors.fetch_add(1, Ordering::Relaxed);
+            warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
+        }
+    }
+}
+
+fn node_address(meta: &MetaService, node_id: &[u8]) -> Option<String> {
+    let id = <[u8; 16]>::try_from(node_id).ok()?;
+    meta.osd_address_by_id(&id)
+}
+
+async fn check_shards(
+    address: &str,
+    objects: &[ObjectMeta],
+    refs: &[(usize, usize, u32)],
+) -> anyhow::Result<Vec<Seen>> {
+    let shards = refs
+        .iter()
+        .map(|&(oi, si, position)| {
+            let (o, s) = (&objects[oi], &objects[oi].stripes[si]);
+            ShardId {
+                object_id: shard_object_id(o, s).to_vec(),
+                stripe_id: s.stripe_id,
+                position,
+            }
+        })
+        .collect();
+    let mut client = StorageServiceClient::new(open_channel(address).await?);
+    let states = tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.check_shards(CheckShardsRequest { shards }),
+    )
+    .await??
+    .into_inner()
+    .states;
+    if states.len() != refs.len() {
+        return Err(anyhow::anyhow!(
+            "asked about {} shards, told about {}",
+            refs.len(),
+            states.len()
+        ));
+    }
+    Ok(states
+        .into_iter()
+        .map(|s| match ShardState::try_from(s) {
+            Ok(ShardState::Ok) => Seen::Ok,
+            Ok(ShardState::Missing) => Seen::Lost { corrupt: false },
+            Ok(ShardState::Corrupt) => Seen::Lost { corrupt: true },
+            Err(_) => Seen::Unknown,
+        })
+        .collect())
+}
+
+/// Rebuild a stripe's `bad` positions from its `good` ones and write them
+/// where they belong.
+async fn rebuild(
+    meta: &Arc<MetaService>,
+    owner_addr: &str,
+    object: &ObjectMeta,
+    stripe: &StripeMeta,
+    seen: &[Seen],
+    bad: &[usize],
+    good: &[usize],
+) -> anyhow::Result<()> {
+    let k = stripe.ec_k as usize;
+    let total = seen.len();
+    let id = shard_object_id(object, stripe).to_vec();
+    let located: HashMap<u32, &ShardLocation> =
+        stripe.shards.iter().map(|l| (l.position, l)).collect();
+
+    // k good shards, verified against their checksums.
+    let mut survivors: Vec<Option<Vec<u8>>> = vec![None; total];
+    let mut have = 0;
+    for &p in good {
+        if have == k {
+            break;
+        }
+        let Some(addr) = located
+            .get(&(p as u32))
+            .and_then(|l| node_address(meta, &l.node_id))
+        else {
+            continue;
+        };
+        match read_shard(&addr, &id, stripe.stripe_id, p as u32).await {
+            Ok(bytes) => {
+                survivors[p] = Some(bytes);
+                have += 1;
+            }
+            Err(e) => debug!("repair: read of position {p} from {addr}: {e}"),
+        }
+    }
+    if have < k {
+        return Err(anyhow::anyhow!("read {have} good shards, need {k}"));
+    }
+
+    let codec = objectio_erasure::ErasureCodec::new(objectio_common::ErasureConfig::new(
+        stripe.ec_k as u8,
+        stripe.ec_m as u8,
+    ))
+    .map_err(|e| anyhow::anyhow!("codec: {e}"))?;
+    let rebuilt = codec
+        .reconstruct_shards(&survivors, bad)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+
+    // Positions with no location go to their placement OSD.
+    let placement = if bad.iter().any(|&p| seen[p] == Seen::Unplaced) {
+        Some(placement_of(meta, object).await?)
+    } else {
+        None
+    };
+
+    let mut added = Vec::new();
+    for (&p, bytes) in bad.iter().zip(rebuilt) {
+        let position = p as u32;
+        let (node_id, addr, shard_type) = match (seen[p], located.get(&position)) {
+            (Seen::Lost { .. }, Some(loc)) => (
+                loc.node_id.clone(),
+                node_address(meta, &loc.node_id)
+                    .ok_or_else(|| anyhow::anyhow!("holder of position {p} not registered"))?,
+                loc.shard_type,
+            ),
+            _ => {
+                let target = placement
+                    .as_ref()
+                    .and_then(|nodes| nodes.iter().find(|n| n.position == position))
+                    .ok_or_else(|| anyhow::anyhow!("no placement for position {p}"))?;
+                (
+                    target.node_id.clone(),
+                    target.node_address.clone(),
+                    target.shard_type,
+                )
+            }
+        };
+        let location = write_shard(&addr, &id, stripe, position, bytes).await?;
+        match seen[p] {
+            Seen::Lost { corrupt: true } => STATS.rebuilt_corrupt.fetch_add(1, Ordering::Relaxed),
+            _ => STATS.rebuilt_missing.fetch_add(1, Ordering::Relaxed),
+        };
+        info!(
+            "repair: rebuilt {}/{} stripe {} position {p} on {addr}",
+            object.bucket, object.key, stripe.stripe_id
+        );
+        if seen[p] == Seen::Unplaced {
+            added.push(ShardLocation {
+                position,
+                node_id,
+                disk_id: location.disk_id,
+                offset: location.offset,
+                shard_type,
+                local_group: 0,
+            });
+        }
+    }
+
+    if !added.is_empty() {
+        record_locations(meta, owner_addr, object, stripe.stripe_id, added).await?;
+    }
+    Ok(())
+}
+
+async fn read_shard(
+    address: &str,
+    object_id: &[u8],
+    stripe_id: u64,
+    position: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut client = StorageServiceClient::new(open_channel(address).await?)
+        .max_decoding_message_size(100 * 1024 * 1024);
+    let resp = tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.read_shard(ReadShardRequest {
+            shard_id: Some(ShardId {
+                object_id: object_id.to_vec(),
+                stripe_id,
+                position,
+            }),
+            ..Default::default()
+        }),
+    )
+    .await??
+    .into_inner();
+    Ok(verified_shard(resp)?.to_vec())
+}
+
+async fn write_shard(
+    address: &str,
+    object_id: &[u8],
+    stripe: &StripeMeta,
+    position: u32,
+    bytes: Vec<u8>,
+) -> anyhow::Result<objectio_proto::storage::BlockLocation> {
+    let mut client = StorageServiceClient::new(open_channel(address).await?)
+        .max_encoding_message_size(100 * 1024 * 1024);
+    let checksum = Some(checksum_of(&bytes));
+    tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.write_shard(WriteShardRequest {
+            shard_id: Some(ShardId {
+                object_id: object_id.to_vec(),
+                stripe_id: stripe.stripe_id,
+                position,
+            }),
+            data: bytes.into(),
+            ec_k: stripe.ec_k,
+            ec_m: stripe.ec_m,
+            checksum,
+            rdma: None,
+        }),
+    )
+    .await??
+    .into_inner()
+    .location
+    .ok_or_else(|| anyhow::anyhow!("write_shard returned no location"))
+}
+
+async fn placement_of(
+    meta: &Arc<MetaService>,
+    object: &ObjectMeta,
+) -> anyhow::Result<Vec<NodePlacement>> {
+    let resp = MetadataService::get_placement(
+        meta.as_ref(),
+        tonic::Request::new(GetPlacementRequest {
+            bucket: object.bucket.clone(),
+            key: object.key.clone(),
+            size: object.size,
+            storage_class: "STANDARD".into(),
+        }),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("placement: {e}"))?;
+    Ok(resp.into_inner().nodes)
+}
+
+/// Add rebuilt shards' locations to the object's ObjectMeta on every node
+/// that holds a copy — only if the key still holds this object.
+async fn record_locations(
+    meta: &Arc<MetaService>,
+    owner_addr: &str,
+    object: &ObjectMeta,
+    stripe_id: u64,
+    added: Vec<ShardLocation>,
+) -> anyhow::Result<()> {
+    let Some(mut fresh) = get_object_meta(owner_addr, object).await? else {
+        return Err(anyhow::anyhow!("object is gone"));
+    };
+    if fresh.object_id != object.object_id {
+        return Err(anyhow::anyhow!("object was replaced meanwhile"));
+    }
+    let stripe = fresh
+        .stripes
+        .iter_mut()
+        .find(|s| s.stripe_id == stripe_id)
+        .ok_or_else(|| anyhow::anyhow!("stripe {stripe_id} is gone"))?;
+    for loc in added {
+        if stripe.shards.iter().all(|l| l.position != loc.position) {
+            stripe.shards.push(loc);
+        }
+    }
+    stripe.shards.sort_by_key(|l| l.position);
+
+    // Every copy: the key's placement, plus anyone holding a shard.
+    let mut targets: BTreeSet<String> = placement_of(meta, object)
+        .await?
+        .into_iter()
+        .map(|n| n.node_address)
+        .collect();
+    for s in &fresh.stripes {
+        for l in &s.shards {
+            if let Some(a) = node_address(meta, &l.node_id) {
+                targets.insert(a);
+            }
+        }
+    }
+    let mut stored_on_owner = false;
+    for addr in targets {
+        let req = PutObjectMetaRequest {
+            bucket: fresh.bucket.clone(),
+            key: fresh.key.clone(),
+            object: Some(fresh.clone()),
+            versioning_enabled: false,
+            expected_object_id: fresh.object_id.clone(),
+        };
+        let result = async {
+            let mut client = StorageServiceClient::new(open_channel(&addr).await?);
+            tokio::time::timeout(RPC_TIMEOUT, client.put_object_meta(req)).await??;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => stored_on_owner |= addr == owner_addr,
+            // A copy that no longer holds this object, or a node that is
+            // down: the next pass looks again.
+            Err(e) => debug!("repair: ObjectMeta update on {addr}: {e}"),
+        }
+    }
+    if stored_on_owner {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("could not update the owner's ObjectMeta"))
+    }
+}
+
+async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<Option<ObjectMeta>> {
+    let mut client = StorageServiceClient::new(open_channel(address).await?)
+        .max_decoding_message_size(100 * 1024 * 1024);
+    let resp = tokio::time::timeout(
+        RPC_TIMEOUT,
+        client.get_object_meta(GetObjectMetaRequest {
+            bucket: object.bucket.clone(),
+            key: object.key.clone(),
+            version_id: String::new(),
+        }),
+    )
+    .await??
+    .into_inner();
+    Ok(resp.object.filter(|_| resp.found))
+}
+
+/// Put an object missing from Meta's listing index back, so ListObjects
+/// shows it. Checked against the owner first: an object deleted since the
+/// page was read must not come back.
+async fn restore_listing(
+    meta: &Arc<MetaService>,
+    owner_addr: &str,
+    object: &ObjectMeta,
+) -> anyhow::Result<()> {
+    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
+        return Ok(());
+    }
+    match get_object_meta(owner_addr, object).await? {
+        Some(fresh) if fresh.object_id == object.object_id => {}
+        _ => return Ok(()),
+    }
+    MetadataService::create_object(
+        meta.as_ref(),
+        tonic::Request::new(CreateObjectRequest {
+            bucket: object.bucket.clone(),
+            key: object.key.clone(),
+            size: object.size,
+            content_type: object.content_type.clone(),
+            etag: object.etag.clone(),
+            user_metadata: object.user_metadata.clone(),
+            stripes: object.stripes.clone(),
+            object_id: object.object_id.clone(),
+            pg_id: 0,
+            pool: String::new(),
+        }),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("create_object: {e}"))?;
+    STATS.listings_restored.fetch_add(1, Ordering::Relaxed);
+    info!(
+        "repair: restored the listing entry of {}/{}",
+        object.bucket, object.key
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Seen, Verdict, verdict};
+
+    const LOST: Seen = Seen::Lost { corrupt: false };
+    const ROT: Seen = Seen::Lost { corrupt: true };
+
+    #[test]
+    fn a_full_stripe_is_healthy() {
+        assert_eq!(verdict(&[Seen::Ok; 6], 4), Verdict::Healthy);
+    }
+
+    #[test]
+    fn lost_rotted_and_unplaced_shards_are_rebuilt_from_the_good_ones() {
+        let seen = [Seen::Ok, LOST, Seen::Ok, ROT, Seen::Ok, Seen::Unplaced];
+        assert_eq!(
+            verdict(&seen, 3),
+            Verdict::Rebuild {
+                bad: vec![1, 3, 5],
+                good: vec![0, 2, 4]
+            }
+        );
+    }
+
+    /// A shard whose OSD did not answer is neither: it may be rebooting.
+    #[test]
+    fn shards_on_silent_osds_are_left_alone() {
+        let seen = [
+            Seen::Ok,
+            Seen::Ok,
+            Seen::Ok,
+            Seen::Ok,
+            Seen::Unknown,
+            Seen::Unknown,
+        ];
+        assert_eq!(verdict(&seen, 4), Verdict::Healthy);
+    }
+
+    #[test]
+    fn fewer_than_k_good_shards_cannot_be_rebuilt_from() {
+        let seen = [Seen::Ok, Seen::Ok, Seen::Ok, LOST, Seen::Unknown, ROT];
+        assert_eq!(verdict(&seen, 4), Verdict::Unrecoverable { good: 3 });
+    }
+}

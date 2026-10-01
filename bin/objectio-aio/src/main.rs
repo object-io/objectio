@@ -161,6 +161,17 @@ struct Args {
     /// record instead of in shards. Forwarded to the gateway; 0 turns it off.
     #[arg(long, default_value_t = 4096)]
     inline_max_size: usize,
+
+    /// Seconds between repair passes, which rebuild missing or corrupt
+    /// shards and restore missing listing entries. Forwarded to meta; 0
+    /// turns it off.
+    #[arg(long, default_value_t = 3600)]
+    repair_interval_secs: u64,
+
+    /// Seconds between scrub passes, which read every shard and check its
+    /// checksums. Forwarded to every OSD; 0 turns it off.
+    #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+    scrub_interval_secs: u64,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -552,6 +563,8 @@ async fn main() -> Result<()> {
         meta_admin.to_string(),
         "--log-level".into(),
         args.log_level.clone(),
+        "--repair-interval-secs".into(),
+        args.repair_interval_secs.to_string(),
     ];
     if use_ec {
         let need = usize::from(args.ec_k) + usize::from(args.ec_m);
@@ -630,6 +643,8 @@ async fn main() -> Result<()> {
             "0",
             "--log-level",
             &args.log_level,
+            "--scrub-interval-secs",
+            &args.scrub_interval_secs.to_string(),
         ]
         .map(str::to_string)
         .to_vec();
