@@ -165,7 +165,10 @@ export default function Drives({ embedded = false }: Props = {}) {
         if (cancelled || !c.prometheus) return;
         setPromReady(true);
         const s = await queryRange(
-          "histogram_quantile(0.99, sum by (instance) (rate(objectio_osd_grpc_latency_seconds_bucket[5m])))",
+          // `le` must survive the sum, or there is no histogram left to
+          // take a quantile of. Through the gateway every OSD's series
+          // share one `instance`; `osd_id` tells them apart.
+          'histogram_quantile(0.99, sum by (osd_id, le) (rate(objectio_osd_grpc_latency_seconds_bucket{method="WriteShard"}[5m])))',
           3600
         ).catch(() => [] as Series[]);
         if (!cancelled) setLatency(s);
@@ -279,7 +282,7 @@ export default function Drives({ embedded = false }: Props = {}) {
     { key: "actions", label: "", className: "w-12" },
   ];
 
-  const latencyNames = (latency ?? []).map((s) => s.labels.instance ?? "osd");
+  const latencyNames = (latency ?? []).map((s) => (s.labels.osd_id ?? "osd").slice(0, 8));
   const latencyRows = useMemo(() => {
     const byTime = new Map<number, Record<string, number | string>>();
     (latency ?? []).forEach((s, i) => {
@@ -418,8 +421,8 @@ export default function Drives({ embedded = false }: Props = {}) {
               </code>
               <p className="text-[11px] text-muted max-w-xs">
                 {promReady
-                  ? "Prometheus is configured but has no series for this — each OSD exports on its own :9201, and a single-process deployment only publishes the gateway's own metrics."
-                  : "This needs Prometheus. Per-OSD latency is a histogram on each OSD's :9201 endpoint, which a browser cannot reach."}
+                  ? "No shard writes in the last hour, or Prometheus has not scraped the gateway yet (it re-exports every OSD's metrics)."
+                  : "This needs Prometheus: the console charts history from it, and none is configured (--prometheus-url)."}
               </p>
             </div>
           )}

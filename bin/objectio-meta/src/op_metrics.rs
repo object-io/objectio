@@ -1,75 +1,99 @@
-//! Latency of every gRPC call meta serves, and of its redb commits.
-//!
-//! Timed at the transport, so a new RPC is covered without touching its
-//! handler. The label is the method name from the request path
-//! (`/objectio.metadata.MetadataService/CreateBucket` → `CreateBucket`),
-//! which is bounded by the service definitions.
+//! Meta's gRPC calls (counts by status, and latency, every method, via
+//! the transport layer in `objectio_proto::rpc_metrics`) and its redb
+//! commits.
 
-use objectio_common::histogram::{HistogramVec, LATENCY_BUCKETS, label_value};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::LazyLock;
-use std::task::{Context, Poll};
-use std::time::Instant;
-use tonic::codegen::http;
 
-static OP_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
+use objectio_proto::rpc_metrics::RpcMetrics;
+
+/// Every gRPC call meta serves, Raft's included.
+pub static RPC_METRICS: LazyLock<RpcMetrics> = LazyLock::new(RpcMetrics::default);
 
 /// Everything meta's metrics endpoint adds for operations and storage.
 pub fn render() -> String {
     let mut out = String::new();
-    OP_SECONDS.render(
-        &mut out,
-        "objectio_meta_op_seconds",
-        "Time to serve one meta gRPC call, by method",
-        "",
-    );
+    RPC_METRICS.render(&mut out, "objectio_meta_grpc", "meta", "");
     objectio_meta_store::commit_metrics::render(&mut out);
     out
 }
 
-#[derive(Clone, Copy)]
-pub struct OpTimerLayer;
-
-impl<S> tower::Layer<S> for OpTimerLayer {
-    type Service = OpTimer<S>;
-    fn layer(&self, inner: S) -> Self::Service {
-        OpTimer { inner }
-    }
-}
-
-#[derive(Clone)]
-pub struct OpTimer<S> {
-    inner: S,
-}
-
-impl<S, B> tower::Service<http::Request<B>> for OpTimer<S>
-where
-    S: tower::Service<http::Request<B>>,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: http::Request<B>) -> Self::Future {
-        let op = req
-            .uri()
-            .path()
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        let started = Instant::now();
-        let fut = self.inner.call(req);
-        Box::pin(async move {
-            let res = fut.await;
-            OP_SECONDS.observe_duration(&format!("op=\"{}\"", label_value(&op)), started.elapsed());
-            res
-        })
+/// This node's view of Raft: role, term, log positions, and on the leader
+/// how far each follower has replicated.
+pub fn render_raft(meta: &crate::service::MetaService, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(raft) = meta.raft_handle() else {
+        return;
+    };
+    let m = raft.metrics().borrow().clone();
+    let gauge = |out: &mut String, name: &str, help: &str, v: u64| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
+    };
+    let leader = m.current_leader == Some(m.id);
+    gauge(
+        out,
+        "objectio_meta_raft_is_leader",
+        "1 on the Raft leader, 0 elsewhere",
+        u64::from(leader),
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_has_leader",
+        "1 while this node knows a leader; 0 means no writes can commit",
+        u64::from(m.current_leader.is_some()),
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_term",
+        "Current Raft term; a rising term means elections",
+        m.current_term,
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_last_log_index",
+        "Index of the last entry in this node's Raft log",
+        m.last_log_index.unwrap_or(0),
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_applied_index",
+        "Index of the last entry applied to this node's state",
+        m.last_applied.map_or(0, |l| l.index),
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_snapshot_index",
+        "Index the last snapshot covers",
+        m.snapshot.map_or(0, |l| l.index),
+    );
+    gauge(
+        out,
+        "objectio_meta_raft_purged_index",
+        "Index up to which the log has been compacted away",
+        m.purged.map_or(0, |l| l.index),
+    );
+    let voters = m.membership_config.membership().voter_ids().count();
+    gauge(
+        out,
+        "objectio_meta_raft_voters",
+        "Voting members of the Raft cluster",
+        voters as u64,
+    );
+    if let (true, Some(replication)) = (leader, m.replication.as_ref()) {
+        let last = m.last_log_index.unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "# HELP objectio_meta_raft_replication_lag_entries Entries a follower is behind the leader's log (leader only)\n\
+             # TYPE objectio_meta_raft_replication_lag_entries gauge"
+        );
+        for (peer, matched) in replication {
+            if *peer == m.id {
+                continue;
+            }
+            let lag = last.saturating_sub(matched.map_or(0, |l| l.index));
+            let _ = writeln!(
+                out,
+                "objectio_meta_raft_replication_lag_entries{{peer=\"{peer}\"}} {lag}"
+            );
+        }
     }
 }

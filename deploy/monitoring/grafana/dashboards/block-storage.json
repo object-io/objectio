@@ -132,12 +132,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_attachments_total",
-          "legendFormat": "Attachments",
+          "expr": "sum(objectio_block_volumes_by_state{state=\"attached\"})",
+          "legendFormat": "Attached",
           "refId": "A"
         }
       ],
-      "title": "Active Attachments",
+      "title": "Attached Volumes",
       "type": "stat"
     },
     {
@@ -255,12 +255,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_snapshots_space_bytes",
-          "legendFormat": "Snapshot Space",
+          "expr": "sum(objectio_block_snapshot_chunks) * 4194304",
+          "legendFormat": "Captured",
           "refId": "A"
         }
       ],
-      "title": "Snapshot Space",
+      "title": "Captured by Snapshots",
       "type": "stat"
     },
     {
@@ -268,7 +268,7 @@
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
       "id": 101,
       "panels": [],
-      "title": "Volumes by State & Attachments by Type",
+      "title": "Volumes by State & I/O by Protocol",
       "type": "row"
     },
     {
@@ -347,12 +347,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_attachments_by_type > 0",
-          "legendFormat": "{{type}}",
+          "expr": "sum by (protocol) (rate(objectio_block_io_bytes_total[5m])) > 0",
+          "legendFormat": "{{protocol}}",
           "refId": "A"
         }
       ],
-      "title": "Attachments by Type",
+      "title": "Block I/O by Protocol",
       "type": "piechart"
     },
     {
@@ -594,7 +594,7 @@
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
       "id": 104,
       "panels": [],
-      "title": "Volume QoS Configuration",
+      "title": "Block I/O",
       "type": "row"
     },
     {
@@ -639,24 +639,24 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_volume_qos_max_iops",
-          "legendFormat": "{{name}} max",
+          "expr": "sum by (op) (rate(objectio_block_io_seconds_count[5m]))",
+          "legendFormat": "{{op}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_volume_qos_min_iops",
-          "legendFormat": "{{name}} min",
+          "expr": "sum by (op) (rate(objectio_block_io_errors_total[5m]))",
+          "legendFormat": "{{op}} errors",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_volume_qos_burst_iops",
-          "legendFormat": "{{name}} burst",
+          "expr": "sum(rate(objectio_block_chunks_flushed_total[5m]))",
+          "legendFormat": "chunk flushes",
           "refId": "C"
         }
       ],
-      "title": "QoS IOPS Limits",
+      "title": "Block operations/s",
       "type": "timeseries"
     },
     {
@@ -701,12 +701,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_volume_qos_max_bandwidth_bps",
-          "legendFormat": "{{name}}",
+          "expr": "sum by (op) (rate(objectio_block_io_bytes_total[5m]))",
+          "legendFormat": "{{op}}",
           "refId": "A"
         }
       ],
-      "title": "QoS Bandwidth Limits",
+      "title": "Block throughput",
       "type": "timeseries"
     },
     {
@@ -801,12 +801,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_block_snapshot_size_bytes > 0",
+          "expr": "objectio_block_snapshot_chunks * 4194304 > 0",
           "legendFormat": "{{name}}",
           "refId": "A"
         }
       ],
-      "title": "Snapshot Size Distribution",
+      "title": "Captured per Snapshot",
       "type": "piechart"
     }
   ],

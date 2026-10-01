@@ -259,7 +259,13 @@ impl CounterVec {
 
     /// Render as one counter family; nothing when empty.
     pub fn render(&self, out: &mut String, name: &str, help: &str) {
-        render_scalar(out, name, help, "counter", &self.series, |c| {
+        self.render_with(out, name, help, "");
+    }
+
+    /// As [`Self::render`], with `extra` (e.g. `osd_id="…"`) prepended to
+    /// each series' labels.
+    pub fn render_with(&self, out: &mut String, name: &str, help: &str, extra: &str) {
+        render_scalar(out, name, help, "counter", &self.series, extra, |c| {
             c.load(Ordering::Relaxed).to_string()
         });
     }
@@ -293,7 +299,7 @@ impl GaugeVec {
 
     /// Render as one gauge family; nothing when empty.
     pub fn render(&self, out: &mut String, name: &str, help: &str) {
-        render_scalar(out, name, help, "gauge", &self.series, |c| {
+        render_scalar(out, name, help, "gauge", &self.series, "", |c| {
             c.load(Ordering::Relaxed).to_string()
         });
     }
@@ -305,6 +311,7 @@ fn render_scalar<T>(
     help: &str,
     kind: &str,
     series: &RwLock<HashMap<String, T>>,
+    extra: &str,
     value: impl Fn(&T) -> String,
 ) {
     let Ok(g) = series.read() else { return };
@@ -316,10 +323,15 @@ fn render_scalar<T>(
     let mut keys: Vec<&String> = g.keys().collect();
     keys.sort();
     for k in keys {
-        if k.is_empty() {
+        let labels = match (extra.is_empty(), k.is_empty()) {
+            (true, _) => k.clone(),
+            (false, true) => extra.to_string(),
+            (false, false) => format!("{extra},{k}"),
+        };
+        if labels.is_empty() {
             writeln!(out, "{name} {}", value(&g[k])).unwrap();
         } else {
-            writeln!(out, "{name}{{{k}}} {}", value(&g[k])).unwrap();
+            writeln!(out, "{name}{{{labels}}} {}", value(&g[k])).unwrap();
         }
     }
 }

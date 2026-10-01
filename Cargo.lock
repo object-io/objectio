@@ -2279,6 +2279,7 @@ name = "objectio-block-gateway"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
  "bytes",
  "chrono",
  "clap",
@@ -2382,6 +2383,7 @@ version = "0.4.0"
 dependencies = [
  "hex",
  "hmac",
+ "objectio-common",
  "objectio-proto",
  "reqwest",
  "serde_json",
@@ -2633,11 +2635,13 @@ dependencies = [
 name = "objectio-proto"
 version = "0.4.0"
 dependencies = [
+ "objectio-common",
  "prost",
  "prost-types",
  "serde_json",
  "tonic",
  "tonic-build",
+ "tower 0.5.3",
 ]
 
 [[package]]

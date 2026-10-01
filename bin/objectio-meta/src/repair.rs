@@ -69,6 +69,9 @@ struct Stats {
     unrecoverable: AtomicU64,
     listings_restored: AtomicU64,
     errors: AtomicU64,
+    block_stripes: AtomicU64,
+    last_pass_ms: AtomicU64,
+    last_pass_end: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -79,6 +82,9 @@ static STATS: Stats = Stats {
     unrecoverable: AtomicU64::new(0),
     listings_restored: AtomicU64::new(0),
     errors: AtomicU64::new(0),
+    block_stripes: AtomicU64::new(0),
+    last_pass_ms: AtomicU64::new(0),
+    last_pass_end: AtomicU64::new(0),
 };
 
 /// Start the repairer: a full pass every `interval`, on the Raft leader
@@ -102,6 +108,20 @@ pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
 /// Repairer metrics as Prometheus families.
 pub fn render_metrics(out: &mut String) {
     let s = &STATS;
+    for (name, help, v) in [
+        (
+            "objectio_meta_repair_last_pass_seconds",
+            "How long the last completed repair pass took (on the node that ran it)",
+            s.last_pass_ms.load(Ordering::Relaxed) as f64 / 1000.0,
+        ),
+        (
+            "objectio_meta_repair_last_pass_timestamp_seconds",
+            "When the last repair pass completed (Unix time; 0: none yet on this node)",
+            s.last_pass_end.load(Ordering::Relaxed) as f64,
+        ),
+    ] {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
+    }
     for (name, help, v) in [
         (
             "objectio_meta_repair_passes_total",
@@ -128,6 +148,11 @@ pub fn render_metrics(out: &mut String) {
             "Repairs that failed and will be retried next pass",
             &s.errors,
         ),
+        (
+            "objectio_meta_repair_block_stripes_checked_total",
+            "Block chunk stripes checked by the repairer (also counted in objects checked)",
+            &s.block_stripes,
+        ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} counter");
@@ -153,6 +178,7 @@ pub fn render_metrics(out: &mut String) {
 
 /// One full pass over every object on every OSD that is not Out.
 pub async fn pass(meta: &Arc<MetaService>) {
+    let started = std::time::Instant::now();
     let osds: Vec<([u8; 16], String)> = meta
         .osd_nodes_snapshot()
         .into_iter()
@@ -188,9 +214,22 @@ pub async fn pass(meta: &Arc<MetaService>) {
             return;
         }
         let objects: Vec<ObjectMeta> = page.iter().cloned().map(block_object).collect();
+        STATS
+            .block_stripes
+            .fetch_add(objects.len() as u64, Ordering::Relaxed);
         audit(meta, Source::Block, &objects).await;
     }
     STATS.passes.fetch_add(1, Ordering::Relaxed);
+    STATS.last_pass_ms.store(
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    STATS.last_pass_end.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        Ordering::Relaxed,
+    );
 }
 
 /// Where the objects being audited are recorded, and so where a rebuilt

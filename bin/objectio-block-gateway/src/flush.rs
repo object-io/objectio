@@ -24,6 +24,26 @@ async fn flush_one(
     chunk_id: ChunkId,
     data: &[u8],
 ) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let result = store_chunk(state, vol_id, chunk_id, data).await;
+    let outcome = match &result {
+        Ok(()) => "stored",
+        Err(e) if e.to_string() == CHANGED => "conflict",
+        Err(_) => "failed",
+    };
+    crate::metrics::flushed(outcome, started.elapsed());
+    result
+}
+
+/// The error a flush ends with when the chunk changed meanwhile.
+const CHANGED: &str = "the chunk changed meanwhile";
+
+async fn store_chunk(
+    state: &BlockGatewayState,
+    vol_id: &str,
+    chunk_id: ChunkId,
+    data: &[u8],
+) -> anyhow::Result<()> {
     let current = state.meta.chunk(vol_id, chunk_id).await?;
     let expected = current.map(|s| s.object_id).unwrap_or_default();
     let stripe = write_chunk(
@@ -43,6 +63,7 @@ async fn flush_one(
     {
         Ok(Commit::Done(freeable)) => {
             let failed = free_stripes(&state.meta, &state.osd_pool, &freeable).await;
+            crate::metrics::stripes_freed("overwrite", freeable.len(), failed);
             if failed > 0 {
                 warn!("chunk {chunk_id} of {vol_id}: {failed} shard deletes failed");
             }
@@ -51,7 +72,7 @@ async fn flush_one(
         Ok(Commit::Conflict) => {
             // Certainly not recorded: nothing refers to the new stripe.
             free_stripes(&state.meta, &state.osd_pool, &[stripe]).await;
-            Err(anyhow!("the chunk changed meanwhile"))
+            Err(anyhow!(CHANGED))
         }
         // It may have been recorded (a lost reply), so the new stripe is
         // kept: at worst a leak, never a chunk pointing at deleted shards.

@@ -53,30 +53,71 @@ fn has_query_flag(query: &str, name: &str) -> bool {
         .any(|pair| pair.split('=').next() == Some(name))
 }
 
-/// Refine operation type based on query parameters
-fn refine_operation(op: S3Operation, query: Option<&str>) -> S3Operation {
-    let query = match query {
-        Some(q) if !q.is_empty() => q,
-        _ => return op,
-    };
+/// S3's sub-resources: a request naming one reads or sets that part of
+/// a bucket or object (`?policy`, `?tagging`…) rather than its data or
+/// listing. Anything else in a query (list parameters, `versionId`,
+/// presigned-URL signatures, `response-*` overrides) leaves the operation
+/// as it is.
+const SUBRESOURCES: &[&str] = &[
+    "accelerate",
+    "acl",
+    "analytics",
+    "attributes",
+    "cors",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "legal-hold",
+    "lifecycle",
+    "location",
+    "logging",
+    "metrics",
+    "notification",
+    "object-lock",
+    "ownershipControls",
+    "policy",
+    "policyStatus",
+    "publicAccessBlock",
+    "replication",
+    "requestPayment",
+    "restore",
+    "retention",
+    "tagging",
+    "versioning",
+    "website",
+];
 
+/// Whether `query` names a sub-resource.
+fn names_subresource(query: &str) -> bool {
+    SUBRESOURCES.iter().any(|r| has_query_flag(query, r))
+}
+
+/// Refine operation type from the query, and from whether the request
+/// names a copy source (`x-amz-copy-source`).
+fn refine_operation(op: S3Operation, query: Option<&str>, copy: bool) -> S3Operation {
+    let query = query.unwrap_or_default();
+    let multipart = has_query_flag(query, "uploadId");
     match op {
+        S3Operation::PutObject if multipart && copy => S3Operation::UploadPartCopy,
+        S3Operation::PutObject if multipart => S3Operation::UploadPart,
+        S3Operation::PutObject if names_subresource(query) => S3Operation::PutObjectConfig,
+        S3Operation::PutObject if copy => S3Operation::CopyObject,
+        S3Operation::GetObject if multipart => S3Operation::ListParts,
+        S3Operation::GetObject if names_subresource(query) => S3Operation::GetObjectConfig,
+        S3Operation::HeadObject if names_subresource(query) => S3Operation::GetObjectConfig,
+        S3Operation::DeleteObject if multipart => S3Operation::AbortMultipartUpload,
+        S3Operation::DeleteObject if names_subresource(query) => S3Operation::DeleteObjectConfig,
+        S3Operation::InitiateMultipartUpload if multipart => S3Operation::CompleteMultipartUpload,
         S3Operation::ListObjects if has_query_flag(query, "uploads") => {
             S3Operation::ListMultipartUploads
         }
-        S3Operation::PutObject if query.contains("uploadId") && query.contains("partNumber") => {
-            S3Operation::UploadPart
+        S3Operation::ListObjects if has_query_flag(query, "versions") => {
+            S3Operation::ListObjectVersions
         }
-        S3Operation::GetObject if query.contains("uploadId") => S3Operation::ListParts,
-        S3Operation::DeleteObject if query.contains("uploadId") => {
-            S3Operation::AbortMultipartUpload
-        }
-        S3Operation::InitiateMultipartUpload if query.contains("uploads") => {
-            S3Operation::InitiateMultipartUpload
-        }
-        S3Operation::InitiateMultipartUpload if query.contains("uploadId") => {
-            S3Operation::CompleteMultipartUpload
-        }
+        S3Operation::ListObjects if names_subresource(query) => S3Operation::GetBucketConfig,
+        S3Operation::CreateBucket if names_subresource(query) => S3Operation::PutBucketConfig,
+        S3Operation::DeleteBucket if names_subresource(query) => S3Operation::DeleteBucketConfig,
+        S3Operation::DeleteObjects if !has_query_flag(query, "delete") => S3Operation::PostObject,
         _ => op,
     }
 }
@@ -215,7 +256,8 @@ pub async fn metrics_layer(request: Request<Body>, next: Next) -> Response {
     let s3_operation = if is_catalog {
         None
     } else {
-        extract_operation(&method, path).map(|op| refine_operation(op, query))
+        let copy = request.headers().contains_key("x-amz-copy-source");
+        extract_operation(&method, path).map(|op| refine_operation(op, query, copy))
     };
 
     // Get request body size from Content-Length header
@@ -265,4 +307,52 @@ pub async fn metrics_layer(request: Request<Body>, next: Next) -> Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(method: &Method, uri: &str, copy: bool) -> &'static str {
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        refine_operation(extract_operation(method, path).unwrap(), Some(query), copy).as_str()
+    }
+
+    #[test]
+    fn requests_are_named_as_s3_names_them() {
+        let (get, put, post, del) = (&Method::GET, &Method::PUT, &Method::POST, &Method::DELETE);
+        assert_eq!(op(put, "/b/k", false), "PutObject");
+        assert_eq!(op(put, "/b/k", true), "CopyObject");
+        assert_eq!(op(put, "/b/k?partNumber=1&uploadId=u", false), "UploadPart");
+        assert_eq!(
+            op(put, "/b/k?partNumber=1&uploadId=u", true),
+            "UploadPartCopy"
+        );
+        assert_eq!(op(put, "/b/k?tagging", false), "PutObjectConfig");
+        assert_eq!(op(get, "/b/k?uploadId=u", false), "ListParts");
+        assert_eq!(op(get, "/b/k?versionId=v", false), "GetObject");
+        assert_eq!(
+            op(get, "/b/k?X-Amz-Signature=s&response-content-type=t", false),
+            "GetObject"
+        );
+        assert_eq!(op(get, "/b/k?tagging", false), "GetObjectConfig");
+        assert_eq!(op(del, "/b/k?uploadId=u", false), "AbortMultipartUpload");
+        assert_eq!(op(post, "/b/k?uploads", false), "InitiateMultipartUpload");
+        assert_eq!(
+            op(post, "/b/k?uploadId=u", false),
+            "CompleteMultipartUpload"
+        );
+        assert_eq!(op(post, "/b?delete", false), "DeleteObjects");
+        assert_eq!(op(post, "/b", false), "PostObject");
+        assert_eq!(
+            op(get, "/b?list-type=2&prefix=uploads/", false),
+            "ListObjects"
+        );
+        assert_eq!(op(get, "/b?uploads", false), "ListMultipartUploads");
+        assert_eq!(op(get, "/b?versions", false), "ListObjectVersions");
+        assert_eq!(op(get, "/b?policy", false), "GetBucketConfig");
+        assert_eq!(op(put, "/b?versioning", false), "PutBucketConfig");
+        assert_eq!(op(put, "/b", false), "CreateBucket");
+        assert_eq!(op(del, "/b?lifecycle", false), "DeleteBucketConfig");
+    }
 }

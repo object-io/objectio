@@ -58,12 +58,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_gateway_active_connections",
-          "legendFormat": "Active",
+          "expr": "sum(objectio_s3_requests_in_flight)",
+          "legendFormat": "In flight",
           "refId": "A"
         }
       ],
-      "title": "Active Connections",
+      "title": "Requests in flight",
       "type": "stat"
     },
     {
@@ -93,12 +93,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "objectio_gateway_connections_total",
-          "legendFormat": "Total",
+          "expr": "sum(rate(objectio_s3_requests_total[5m]))",
+          "legendFormat": "Requests/s",
           "refId": "A"
         }
       ],
-      "title": "Total Connections",
+      "title": "Request rate",
       "type": "stat"
     },
     {

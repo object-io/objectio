@@ -180,8 +180,14 @@ pub async fn read_chunk(
     chunk_size: usize,
 ) -> Result<Vec<u8>> {
     match meta.chunk(volume_id, chunk_id).await? {
-        Some(stripe) => read_stripe(meta, osd_pool, &stripe).await,
-        None => Ok(vec![0u8; chunk_size]),
+        Some(stripe) => {
+            crate::metrics::chunk_read("stored");
+            read_stripe(meta, osd_pool, &stripe).await
+        }
+        None => {
+            crate::metrics::chunk_read("unwritten");
+            Ok(vec![0u8; chunk_size])
+        }
     }
 }
 

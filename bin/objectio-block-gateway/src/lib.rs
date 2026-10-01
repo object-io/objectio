@@ -8,6 +8,7 @@
 mod ec_io;
 mod flush;
 mod meta_blocks;
+pub mod metrics;
 mod nbd;
 mod osd_pool;
 mod service;
@@ -50,6 +51,11 @@ pub struct Args {
     /// Host advertised in NBD attachment URLs (defaults to listen host)
     #[arg(long, default_value = "")]
     pub advertise_host: String,
+
+    /// Prometheus `/metrics` address; empty serves none. (aio leaves it
+    /// empty and serves these on the gateway's `/metrics` instead.)
+    #[arg(long, default_value = "0.0.0.0:9301")]
+    pub metrics_listen: String,
 
     /// Meta service endpoint
     #[arg(long, default_value = "http://localhost:9100")]
@@ -104,6 +110,33 @@ pub async fn run(args: Args) -> Result<()> {
     };
     let chunk_mapper = Arc::new(ChunkMapper::default());
     let cache = Arc::new(WriteCache::new(chunk_mapper, cache_config));
+    metrics::register(Arc::clone(&cache));
+    if !args.metrics_listen.is_empty() {
+        let addr: SocketAddr = args
+            .metrics_listen
+            .parse()
+            .context("parse metrics listen address")?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind metrics on {addr}"))?;
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(|| async {
+                // Erasure coding and process stats too: under aio the
+                // gateway exports these for the whole process already.
+                let mut out = objectio_common::metrics_registry::render_registered();
+                objectio_erasure::metrics::render(&mut out);
+                out.push_str(&objectio_common::process_metrics::render(""));
+                out
+            }),
+        );
+        info!("Block gateway metrics on {addr}/metrics");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("block gateway metrics server stopped: {e}");
+            }
+        });
+    }
 
     // ── Meta gRPC client ──────────────────────────────────────────────────────
     let meta_channel = tonic::transport::Endpoint::new(args.meta_endpoint.clone())

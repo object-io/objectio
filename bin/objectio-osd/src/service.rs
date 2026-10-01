@@ -111,111 +111,38 @@ pub struct GrpcMetrics {
 }
 
 impl GrpcMetrics {
-    /// Export metrics in Prometheus format
+    /// Shard bytes moved, in Prometheus format. Request counts and latency
+    /// for every method come from the transport layer (`RPC_METRICS`).
     pub fn export_prometheus(&self, osd_id: &str) -> String {
-        let mut output = String::with_capacity(4 * 1024);
-
-        // Requests total by method and status
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_requests_total Total gRPC requests by method and status"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_osd_grpc_requests_total counter").unwrap();
-
+        let mut output = String::with_capacity(1024);
         let methods = [
             ("WriteShard", &self.write_shard),
             ("ReadShard", &self.read_shard),
-            ("DeleteShard", &self.delete_shard),
-            ("GetShardMeta", &self.get_shard_meta),
-            ("ListShards", &self.list_shards),
-            ("PutObjectMeta", &self.put_object_meta),
-            ("GetObjectMeta", &self.get_object_meta),
-            ("DeleteObjectMeta", &self.delete_object_meta),
-            ("ListObjectsMeta", &self.list_objects_meta),
-            ("HealthCheck", &self.health_check),
-            ("GetStatus", &self.get_status),
         ];
-
-        for (method, metrics) in methods.iter() {
-            let success = metrics.requests_success.load(Ordering::Relaxed);
-            let error = metrics.requests_error.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "objectio_osd_grpc_requests_total{{osd_id=\"{}\",method=\"{}\",status=\"success\"}} {}",
-                osd_id, method, success
-            ).unwrap();
-            writeln!(
-                output,
-                "objectio_osd_grpc_requests_total{{osd_id=\"{}\",method=\"{}\",status=\"error\"}} {}",
-                osd_id, method, error
-            ).unwrap();
-        }
-
-        // Latency sum (for calculating average)
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_latency_seconds_sum Sum of gRPC request latencies"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "# TYPE objectio_osd_grpc_latency_seconds_sum counter"
-        )
-        .unwrap();
-        for (method, metrics) in methods.iter() {
-            let sum_us = metrics.latency_sum_us.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "objectio_osd_grpc_latency_seconds_sum{{osd_id=\"{}\",method=\"{}\"}} {}",
-                osd_id,
-                method,
-                sum_us as f64 / 1_000_000.0
-            )
-            .unwrap();
-        }
-
-        // Bytes sent/received
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_bytes_received_total Total bytes received via gRPC"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "# TYPE objectio_osd_grpc_bytes_received_total counter"
-        )
-        .unwrap();
-        for (method, metrics) in methods.iter() {
-            let bytes = metrics.bytes_received.load(Ordering::Relaxed);
-            if bytes > 0 {
+        for (name, help, load) in [
+            (
+                "objectio_osd_grpc_bytes_received_total",
+                "Bytes of shard requests received, by method",
+                (|m: &GrpcMethodMetrics| m.bytes_received.load(Ordering::Relaxed))
+                    as fn(&GrpcMethodMetrics) -> u64,
+            ),
+            (
+                "objectio_osd_grpc_bytes_sent_total",
+                "Bytes of shard responses sent, by method",
+                |m: &GrpcMethodMetrics| m.bytes_sent.load(Ordering::Relaxed),
+            ),
+        ] {
+            writeln!(output, "# HELP {name} {help}").unwrap();
+            writeln!(output, "# TYPE {name} counter").unwrap();
+            for (method, metrics) in &methods {
                 writeln!(
                     output,
-                    "objectio_osd_grpc_bytes_received_total{{osd_id=\"{}\",method=\"{}\"}} {}",
-                    osd_id, method, bytes
+                    "{name}{{osd_id=\"{osd_id}\",method=\"{method}\"}} {}",
+                    load(metrics)
                 )
                 .unwrap();
             }
         }
-
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_bytes_sent_total Total bytes sent via gRPC"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_osd_grpc_bytes_sent_total counter").unwrap();
-        for (method, metrics) in methods.iter() {
-            let bytes = metrics.bytes_sent.load(Ordering::Relaxed);
-            if bytes > 0 {
-                writeln!(
-                    output,
-                    "objectio_osd_grpc_bytes_sent_total{{osd_id=\"{}\",method=\"{}\"}} {}",
-                    osd_id, method, bytes
-                )
-                .unwrap();
-            }
-        }
-
         output
     }
 }
@@ -310,6 +237,23 @@ pub struct OsdService {
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
 
+/// Time of each shard's disk operation on this OSD: `write` (the block),
+/// `sync` (making it durable before the write is acknowledged), `read`.
+static DISK_SECONDS: std::sync::LazyLock<objectio_common::histogram::HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        objectio_common::histogram::HistogramVec::new(objectio_common::histogram::LATENCY_BUCKETS)
+    });
+
+/// Disk operation latency, as a Prometheus family.
+pub fn render_disk_metrics(out: &mut String, osd_label: &str) {
+    DISK_SECONDS.render(
+        out,
+        "objectio_osd_disk_seconds",
+        "Time of one shard disk operation: write, sync (before the write is acknowledged), read",
+        osd_label,
+    );
+}
+
 /// What the scrubber has done since the OSD started.
 #[derive(Default)]
 struct ScrubStats {
@@ -317,6 +261,8 @@ struct ScrubStats {
     shards: AtomicU64,
     bytes: AtomicU64,
     corrupt: AtomicU64,
+    last_pass_ms: AtomicU64,
+    last_pass_end: AtomicU64,
 }
 
 /// Resolve the OSD's stable node_id + cluster_uuid from (in priority order):
@@ -806,6 +752,16 @@ impl OsdService {
             }
         }
         self.scrub.passes.fetch_add(1, Ordering::Relaxed);
+        self.scrub.last_pass_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.scrub.last_pass_end.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            Ordering::Relaxed,
+        );
         info!(
             "scrub pass done: {} bytes in {:.1}s, {} shard(s) corrupt",
             bytes,
@@ -851,6 +807,21 @@ impl OsdService {
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
+        }
+        for (name, help, v) in [
+            (
+                "objectio_osd_scrub_last_pass_seconds",
+                "How long the last completed scrub pass took",
+                self.scrub.last_pass_ms.load(Ordering::Relaxed) as f64 / 1000.0,
+            ),
+            (
+                "objectio_osd_scrub_last_pass_timestamp_seconds",
+                "When the last scrub pass completed (Unix time; 0: none yet)",
+                self.scrub.last_pass_end.load(Ordering::Relaxed) as f64,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
             let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
         }
     }
@@ -1305,12 +1276,16 @@ impl StorageService for OsdService {
         // reactor stays free during the syscall / io_uring wait. On
         // Linux + --features io-uring this is +25% throughput on
         // 4 MiB stripes vs the old sync path (see storage-io-levels.md).
+        let started = Instant::now();
         disk.write_block_async(block_num, object_id, shard_id.stripe_id, data)
             .await
             .map_err(|e| Status::internal(format!("write failed: {}", e)))?;
+        DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
 
+        let started = Instant::now();
         disk.sync()
             .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
+        DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
 
         // Store location in index
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
@@ -1403,20 +1378,20 @@ impl StorageService for OsdService {
         let disk = &self.disks[location.disk_idx];
 
         // Async read — same semantics, reactor stays free during I/O.
-        let (_header, data) = disk
-            .read_block_async(location.block_num)
-            .await
-            .map_err(|e| {
-                self.grpc_metrics.read_shard.record(
-                    false,
-                    start.elapsed().as_micros() as u64,
-                    bytes_in,
-                    0,
-                );
-                // Unreadable is as good as gone: report it for rebuilding.
-                self.mark_corrupt(&key, location.block_num);
-                Status::data_loss(format!("shard is unreadable: {e}"))
-            })?;
+        let read_started = Instant::now();
+        let read = disk.read_block_async(location.block_num).await;
+        DISK_SECONDS.observe_duration("op=\"read\"", read_started.elapsed());
+        let (_header, data) = read.map_err(|e| {
+            self.grpc_metrics.read_shard.record(
+                false,
+                start.elapsed().as_micros() as u64,
+                bytes_in,
+                0,
+            );
+            // Unreadable is as good as gone: report it for rebuilding.
+            self.mark_corrupt(&key, location.block_num);
+            Status::data_loss(format!("shard is unreadable: {e}"))
+        })?;
 
         debug!(
             "ReadShard: object={}, stripe={}, pos={}, size={}",

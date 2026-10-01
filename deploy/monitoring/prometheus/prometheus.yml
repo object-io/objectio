@@ -19,6 +19,12 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  # Each series must come from one place. Either scrape every gateway
+  # with --no-reexport-metrics plus meta and the OSDs directly (as below,
+  # and as the helm chart does), or scrape a single gateway alone: by
+  # default it re-exports every OSD's and meta node's metrics, and
+  # scraping those directly as well counts everything twice.
+
   # ObjectIO Gateway (S3 API metrics)
   - job_name: 'objectio-gateway'
     static_configs:

@@ -23,6 +23,11 @@ gateway:
   # Gateway is stateless — two replicas is the HA floor. Production
   # should sit at ≥ 3; dev/kind can drop to 1 via --set gateway.replicas=1.
   replicas: 2
+  # Re-export every OSD's and meta node's metrics on the gateway's
+  # /metrics. Off here: with several gateways each would export a copy,
+  # and the chart's Prometheus scrapes meta (:9101) and the OSDs (:9201)
+  # directly. Turn on only for a single gateway scraped alone.
+  reexportMetrics: false
   # Autoscale the gateway tier based on CPU. Opt-in because the default
   # install shouldn't create K8s objects the cluster may not support.
   autoscaling:

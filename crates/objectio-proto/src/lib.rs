@@ -51,6 +51,7 @@ pub mod raft {
 /// HTTP/2 settings for servers that receive shards. Hand-written, so it
 /// keeps the workspace lints the generated modules opt out of.
 #[warn(clippy::pedantic, clippy::nursery)]
+pub mod rpc_metrics;
 pub mod transport;
 
 /// Deduplication policy resolution, shared by meta and the gateway.

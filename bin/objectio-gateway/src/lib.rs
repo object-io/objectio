@@ -274,6 +274,14 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_NO_BUCKET_METRICS", default_value_t = false)]
     pub no_bucket_metrics: bool,
 
+    /// Leave the OSDs' and meta's metrics out of `/metrics`. By default the
+    /// gateway polls them every 30 s and re-exports them, so one scrape
+    /// target covers the cluster (aio, one gateway). With several gateways,
+    /// or Prometheus scraping each OSD (:9201) and meta node (:9101), set
+    /// this: otherwise every gateway exports a copy and sums multiply.
+    #[arg(long, env = "OBJECTIO_NO_REEXPORT_METRICS", default_value_t = false)]
+    pub no_reexport_metrics: bool,
+
     /// Keep buckets that have no recorded owner accessible to any
     /// authenticated caller. Buckets created before ownership was tracked
     /// carry no owner, so enforcing owner-only on them would lock an existing
@@ -489,6 +497,7 @@ pub async fn run(
     };
     s3_metrics().set_protection_config(protection_config);
     s3_metrics().set_per_bucket_usage(!args.no_bucket_metrics);
+    cluster_poll::set_reexport(!args.no_reexport_metrics);
 
     // Connect to metadata service
     let meta_client = MetadataServiceClient::connect(args.meta_endpoint.clone())

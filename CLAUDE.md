@@ -240,8 +240,8 @@ Design docs and user-facing reference live in a separate sibling repo `../object
 | Gateway       | 9000        | 9000 `/metrics`  |
 | Meta          | 9100        | 9101             |
 | OSD           | 9200        | 9201             |
-| Block Gateway | 9300 (gRPC) | —                |
-| Block Gateway | 10809 (NBD) | —                |
+| Block Gateway | 9300 (gRPC) | 9301 `/metrics`  |
+| Block Gateway | 10809 (NBD) | 9301 `/metrics`  |
 
 ### Gateway listener split (optional)
 

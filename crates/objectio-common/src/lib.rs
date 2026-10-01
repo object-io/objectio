@@ -6,7 +6,9 @@
 pub mod checksum;
 pub mod config;
 pub mod error;
+pub mod exposition;
 pub mod histogram;
+pub mod metrics_registry;
 pub mod process_metrics;
 pub mod types;
 
