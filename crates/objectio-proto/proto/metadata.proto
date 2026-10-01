@@ -392,6 +392,13 @@ message StripeMeta {
     // `ObjectMeta.encryption_iv` only (fall back to that if unset).
     // Multipart objects populate this per stripe.
     bytes encryption_iv = 11;
+
+    // This object's bytes are [slice_offset, slice_offset + slice_length)
+    // of the stripe's data: the stripe is a pack shared by several small
+    // objects (see objectio-docs architecture/design/small-object-packing.md).
+    // slice_length 0: the whole stripe is this object's.
+    uint64 slice_offset = 14;
+    uint64 slice_length = 15;
 }
 
 // Shard location

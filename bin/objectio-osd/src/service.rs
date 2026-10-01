@@ -1403,6 +1403,26 @@ impl StorageService for OsdService {
 
         let timestamp = Self::current_timestamp();
 
+        // A ranged read (a packed object's slice): the whole shard is
+        // checked against its stored checksum first, as the gateway checks
+        // a whole shard, and only the range goes back, with a checksum of
+        // its own. A shard that fails the check is reported for rebuilding.
+        let (data, crc32c) = if req.length > 0 {
+            if crc32c::crc32c(&data) != location.crc32c {
+                self.mark_corrupt(&key, location.block_num);
+                return Err(Status::data_loss("shard failed its checksum"));
+            }
+            let start = usize::try_from(req.offset)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            let end = start.saturating_add(req.length as usize).min(data.len());
+            let slice = data[start..end].to_vec();
+            let crc = crc32c::crc32c(&slice);
+            (slice, crc)
+        } else {
+            (data, location.crc32c)
+        };
+
         // Either the shard goes back in the response, or it is written into
         // the gateway's buffer over Transfer Engine and the response only
         // says how much landed there.
@@ -1424,7 +1444,7 @@ impl StorageService for OsdService {
         let resp = ReadShardResponse {
             data: data.into(),
             checksum: Some(Checksum {
-                crc32c: location.crc32c,
+                crc32c,
                 xxhash64: 0,
                 sha256: vec![],
             }),
