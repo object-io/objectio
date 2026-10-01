@@ -11,6 +11,7 @@ mod meta_blocks;
 pub mod metrics;
 mod nbd;
 mod osd_pool;
+mod resolve;
 mod service;
 
 use std::net::SocketAddr;
@@ -189,10 +190,14 @@ pub async fn run(args: Args) -> Result<()> {
         .unwrap_or(10809);
 
     // ── NBD server ────────────────────────────────────────────────────────────
-    let nbd_server = Arc::new(nbd::NbdServer::new(
+    let resolver = Arc::new(resolve::Resolver::new(
         Arc::clone(&cache),
         Arc::clone(&meta),
         Arc::clone(&osd_pool),
+    ));
+    let nbd_server = Arc::new(nbd::NbdServer::new(
+        Arc::clone(&cache),
+        Arc::clone(&resolver),
     ));
 
     // ── Gateway state ─────────────────────────────────────────────────────────
@@ -202,6 +207,7 @@ pub async fn run(args: Args) -> Result<()> {
         cache,
         volume_manager,
         nbd_server: Arc::clone(&nbd_server),
+        resolver,
         advertise_host,
         nbd_port,
         ec_k: args.ec_k,
@@ -261,16 +267,8 @@ async fn replay_journal(state: &BlockGatewayState) -> Result<()> {
             continue; // deleted since
         }
         let offset = chunk_id * chunk_size + offset_in_chunk;
-        ec_io::load_for_partial_write(
-            &state.cache,
-            &state.meta,
-            &state.osd_pool,
-            &volume_id,
-            offset,
-            data.len() as u64,
-        )
-        .await
-        .with_context(|| format!("load chunk {chunk_id} of {volume_id} to replay into"))?;
+        // A chunk not cached comes back pending; its stored bytes are
+        // merged in before it is read whole or flushed.
         state
             .cache
             .replay(&volume_id, offset, &data)

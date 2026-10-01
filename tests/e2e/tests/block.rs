@@ -7,8 +7,9 @@ use objectio_proto::block::block_service_client::BlockServiceClient;
 use std::time::{Duration, Instant};
 
 use objectio_proto::block::{
-    CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest,
-    DeleteVolumeRequest, FlushRequest, ListVolumesRequest, ReadRequest, WriteRequest,
+    AttachVolumeRequest, CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
+    DeleteSnapshotRequest, DeleteVolumeRequest, FlushRequest, ListVolumesRequest, ReadRequest,
+    TargetType, WriteRequest,
 };
 use tonic::transport::Channel;
 
@@ -26,6 +27,7 @@ fn free_port() -> u16 {
 struct Block {
     cluster: Cluster,
     port: u16,
+    nbd_port: u16,
     rt: tokio::runtime::Runtime,
 }
 
@@ -42,7 +44,12 @@ impl Block {
         args.extend_from_slice(extra);
         let cluster = Cluster::start_with_ec_and_args(6, 4, 2, &args);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        Self { cluster, port, rt }
+        Self {
+            cluster,
+            port,
+            nbd_port: nbd,
+            rt,
+        }
     }
 
     fn client(&self) -> BlockServiceClient<Channel> {
@@ -411,4 +418,173 @@ fn a_lost_disk_is_rebuilt_for_block_chunks_too() {
         data,
         "unreadable with two more disks lost"
     );
+}
+
+/// A minimal NBD client: fixed-newstyle handshake and `NBD_OPT_GO`, as the
+/// kernel's client does, then raw requests.
+mod nbd {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    pub const READ: u16 = 0;
+    pub const WRITE: u16 = 1;
+    pub const FLUSH: u16 = 3;
+
+    pub fn connect(port: u16, export: &str) -> TcpStream {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_nodelay(true).unwrap();
+        let mut hello = [0u8; 18];
+        s.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello[..8], b"NBDMAGIC");
+        // Client flags: fixed newstyle, no zeroes.
+        s.write_all(&3u32.to_be_bytes()).unwrap();
+        // NBD_OPT_GO (7): name length, name, no info requests.
+        let mut opt = Vec::new();
+        opt.extend_from_slice(&0x4948_4156_454f_5054u64.to_be_bytes());
+        opt.extend_from_slice(&7u32.to_be_bytes());
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::try_from(export.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(export.as_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        opt.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        opt.extend_from_slice(&data);
+        s.write_all(&opt).unwrap();
+        // Option replies until ACK (1).
+        loop {
+            let mut h = [0u8; 20];
+            s.read_exact(&mut h).unwrap();
+            let kind = u32::from_be_bytes(h[12..16].try_into().unwrap());
+            let len = u32::from_be_bytes(h[16..20].try_into().unwrap());
+            let mut body = vec![0u8; len as usize];
+            s.read_exact(&mut body).unwrap();
+            assert!(kind < 0x8000_0000, "option error {kind:#x}");
+            if kind == 1 {
+                return s;
+            }
+        }
+    }
+
+    pub fn request(cmd: u16, handle: u64, offset: u64, data: &[u8], length: u32) -> Vec<u8> {
+        let mut r = Vec::with_capacity(28 + data.len());
+        r.extend_from_slice(&0x2560_9513u32.to_be_bytes());
+        r.extend_from_slice(&0u16.to_be_bytes());
+        r.extend_from_slice(&cmd.to_be_bytes());
+        r.extend_from_slice(&handle.to_be_bytes());
+        r.extend_from_slice(&offset.to_be_bytes());
+        r.extend_from_slice(&length.to_be_bytes());
+        r.extend_from_slice(data);
+        r
+    }
+
+    /// One simple reply: (error, handle).
+    pub fn reply(s: &mut TcpStream) -> (u32, u64) {
+        let mut h = [0u8; 16];
+        s.read_exact(&mut h).unwrap();
+        assert_eq!(u32::from_be_bytes(h[..4].try_into().unwrap()), 0x6744_6698);
+        (
+            u32::from_be_bytes(h[4..8].try_into().unwrap()),
+            u64::from_be_bytes(h[8..].try_into().unwrap()),
+        )
+    }
+}
+
+/// Requests pipelined on one NBD connection are served concurrently and
+/// each answered once, under its own handle, in whatever order they
+/// finish; the data comes back as written.
+#[test]
+fn pipelined_nbd_requests_are_each_answered_and_the_data_is_right() {
+    use std::collections::HashSet;
+    use std::io::{Read, Write};
+
+    const N: u64 = 32;
+    const BS: u32 = 4096;
+    let b = Block::start();
+    let vol = b.create("nbd", 64 * MIB);
+    b.rt.block_on(b.client().attach_volume(AttachVolumeRequest {
+        volume_id: vol.clone(),
+        target_type: TargetType::Nbd.into(),
+        ..Default::default()
+    }))
+    .unwrap();
+    let mut s = nbd::connect(b.nbd_port, &vol);
+
+    // 32 writes, spread over chunks and within them, sent before any reply
+    // is read.
+    let offset = |i: u64| (i % 8) * CHUNK + (i / 8) * 65_536;
+    let block = |i: u64| pattern(u64::from(BS), u8::try_from(i).unwrap());
+    let mut burst = Vec::new();
+    for i in 0..N {
+        burst.extend(nbd::request(nbd::WRITE, 1000 + i, offset(i), &block(i), BS));
+    }
+    s.write_all(&burst).unwrap();
+    let mut answered = HashSet::new();
+    for _ in 0..N {
+        let (err, handle) = nbd::reply(&mut s);
+        assert_eq!(err, 0, "write {handle} failed");
+        assert!(answered.insert(handle), "{handle} answered twice");
+    }
+    assert_eq!(answered.len() as u64, N);
+
+    s.write_all(&nbd::request(nbd::FLUSH, 1, 0, &[], 0))
+        .unwrap();
+    assert_eq!(nbd::reply(&mut s), (0, 1));
+
+    // And 32 reads back, also pipelined.
+    let mut burst = Vec::new();
+    for i in 0..N {
+        burst.extend(nbd::request(nbd::READ, 2000 + i, offset(i), &[], BS));
+    }
+    s.write_all(&burst).unwrap();
+    for _ in 0..N {
+        let (err, handle) = nbd::reply(&mut s);
+        assert_eq!(err, 0, "read {handle} failed");
+        let mut data = vec![0u8; BS as usize];
+        s.read_exact(&mut data).unwrap();
+        assert_eq!(
+            data,
+            block(handle - 2000),
+            "read {handle} returned the wrong data"
+        );
+    }
+}
+
+/// A read spanning a chunk with writes not yet stored and one the gateway
+/// has not cached sees those writes. It used to fetch both chunks from the
+/// OSDs, returning stale bytes for the first.
+#[test]
+fn a_read_across_chunks_sees_writes_not_yet_stored() {
+    let b = Block::start();
+    let vol = b.create("span", 4 * CHUNK);
+    let tail = pattern(4096, 9);
+    b.write(&vol, CHUNK - 4096, &tail);
+    // Not flushed; chunk 1 never written.
+    let read = b.read(&vol, CHUNK - 4096, 8192);
+    assert_eq!(&read[..4096], &tail[..], "the unflushed write was not read");
+    assert_eq!(&read[4096..], &[0u8; 4096][..]);
+}
+
+/// A partial write into a stored chunk the gateway has not cached is taken
+/// at once; the chunk's stored bytes are merged in behind it, and a
+/// snapshot taken then holds the merged chunk.
+#[test]
+fn a_snapshot_holds_a_partial_write_merged_into_its_stored_chunk() {
+    let mut b = Block::start();
+    let vol = b.create("merge", 2 * CHUNK);
+    let base = pattern(CHUNK, 10);
+    b.write(&vol, 0, &base);
+    b.flush(&vol);
+    b.restart(); // nothing cached
+    let vol = b.id_of("merge");
+    let patch = pattern(4096, 11);
+    b.write(&vol, 8192, &patch);
+    let snap = b.snapshot(&vol, "s");
+    let clone = b.clone_of(&snap, "c");
+    let mut want = base;
+    want[8192..8192 + 4096].copy_from_slice(&patch);
+    assert_eq!(
+        b.read(&clone, 0, CHUNK),
+        want,
+        "the snapshot lost the stored bytes or the write"
+    );
+    assert_eq!(b.read(&vol, 0, CHUNK), want);
 }

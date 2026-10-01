@@ -141,36 +141,6 @@ async fn shard_target(meta: &MetaBlocks, loc: &ShardLocation) -> Result<NodePlac
     })
 }
 
-/// Load into `cache`, as clean, every stored chunk that a write of `len`
-/// bytes at `offset` only partly covers and that the cache does not hold.
-///
-/// The cache keeps whole chunks and writes a chunk back whole, so a write
-/// into a chunk it does not hold must start from that chunk's stored bytes.
-/// A chunk that cannot be read fails the write rather than zeroing the
-/// rest of it.
-pub async fn load_for_partial_write(
-    cache: &objectio_block::WriteCache,
-    meta: &MetaBlocks,
-    osd_pool: &Arc<OsdPool>,
-    volume_id: &str,
-    offset: u64,
-    len: u64,
-) -> Result<()> {
-    let mapper = cache.chunk_mapper();
-    let chunk_size = mapper.chunk_size();
-    for range in mapper.byte_range_to_chunks(offset, len) {
-        let whole = range.offset_in_chunk == 0 && range.length == chunk_size;
-        if whole || cache.holds_chunk(volume_id, range.chunk_id) {
-            continue;
-        }
-        if let Some(stripe) = meta.chunk(volume_id, range.chunk_id).await? {
-            let data = read_stripe(meta, osd_pool, &stripe).await?;
-            cache.add_clean(volume_id, range.chunk_id, bytes::Bytes::from(data));
-        }
-    }
-    Ok(())
-}
-
 /// A chunk's bytes: zeros if it was never written.
 pub async fn read_chunk(
     meta: &MetaBlocks,
