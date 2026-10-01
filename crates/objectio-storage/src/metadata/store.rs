@@ -575,6 +575,24 @@ mod tests {
         assert_eq!(store.get(&MetadataKey::block(5)), Some(b"value_5".to_vec()));
     }
 
+    /// What an OSD restart does with the ObjectMeta of a multi-GiB object:
+    /// a value bigger than the WAL's read buffer. Opening used to hang.
+    #[test]
+    fn a_store_with_a_large_value_reopens() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let big = vec![3u8; 512 * 1024];
+        {
+            let store = MetadataStore::create(config.clone()).unwrap();
+            store.put(MetadataKey::block(1), big.clone()).unwrap();
+            store.put(MetadataKey::block(2), b"next".to_vec()).unwrap();
+            store.sync().unwrap();
+        }
+        let store = MetadataStore::open(config).unwrap();
+        assert_eq!(store.get(&MetadataKey::block(1)), Some(big));
+        assert_eq!(store.get(&MetadataKey::block(2)), Some(b"next".to_vec()));
+    }
+
     #[test]
     fn test_store_recovery() {
         let dir = tempdir().unwrap();
