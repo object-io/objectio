@@ -69,6 +69,12 @@ service StorageService {
     // Whether this OSD holds each shard, and whether it is intact: missing,
     // or found corrupt by the scrubber or a read. Asked by Meta's repairer.
     rpc CheckShards(CheckShardsRequest) returns (CheckShardsResponse);
+
+    // Dedup dry-run: record chunk fingerprints this OSD is primary for and
+    // say which it had already seen; and forget them all, to start a new
+    // measurement window.
+    rpc NoteChunks(NoteChunksRequest) returns (NoteChunksResponse);
+    rpc ResetChunkNotes(ResetChunkNotesRequest) returns (ResetChunkNotesResponse);
 }
 
 // Shard identifier
@@ -407,4 +413,16 @@ enum ShardState {
 
 message CheckShardsResponse {
     repeated ShardState states = 1;   // one per requested shard, in order
+}
+
+
+message NoteChunksRequest {
+    repeated bytes fingerprints = 1;
+}
+message NoteChunksResponse {
+    repeated bool seen = 1;   // per fingerprint, in order
+}
+message ResetChunkNotesRequest {}
+message ResetChunkNotesResponse {
+    uint64 forgotten = 1;
 }

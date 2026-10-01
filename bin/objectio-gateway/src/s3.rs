@@ -145,6 +145,8 @@ pub struct AppState {
     /// Objects of at most this many bytes are stored inline in their
     /// ObjectMeta rather than in shards (`--inline-max-size`; 0 = never).
     pub inline_max_size: usize,
+    /// Dedup dry-run queue (objectio-docs `architecture/design/dedup.md`).
+    pub dedup: crate::dedup::DryRun,
 }
 
 impl AppState {
@@ -2200,6 +2202,32 @@ const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
     if ec_m == 0 { k } else { k + 1 }
 }
 
+/// Hand a body just written to `bucket` to the dedup dry-run, when the
+/// bucket's policy asks for one. Encrypted bodies never deduplicate (their
+/// ciphertext differs per object by design), and inline-sized ones are not
+/// what dedup is for; both are counted as skipped.
+fn dedup_dry_run(
+    state: &AppState,
+    bucket: &str,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+    body: &Bytes,
+    encrypted: bool,
+) {
+    use objectio_proto::metadata::DedupMode;
+    if !matches!(placement.dedup_mode(), DedupMode::DryRun | DedupMode::On) || body.is_empty() {
+        return;
+    }
+    if encrypted {
+        crate::gateway_metrics::record_dedup_skipped("encrypted");
+    } else if body.len() <= state.inline_max_size {
+        crate::gateway_metrics::record_dedup_skipped("inline");
+    } else {
+        state
+            .dedup
+            .submit(bucket, &placement.dedup_domain, body.clone());
+    }
+}
+
 /// Replicas that must be written before a replicated write is
 /// acknowledged: two — the copy and a spare — or one in a pool that keeps
 /// only one. Same reasoning as [`write_quorum`].
@@ -2768,6 +2796,13 @@ pub async fn put_object(
         }
         phases.mark("object_meta");
 
+        dedup_dry_run(
+            &state,
+            &bucket,
+            &placement,
+            &body,
+            sse_algorithm != SseAlgorithm::SseNone,
+        );
         info!(
             "Created object (replication): {}/{}, size={}, stripes={}, replicas_written={}",
             bucket, key, original_size, num_stripes, total_success,
@@ -3196,6 +3231,13 @@ pub async fn put_object(
         }
     }
 
+    dedup_dry_run(
+        &state,
+        &bucket,
+        &placement,
+        &body,
+        sse_algorithm != SseAlgorithm::SseNone,
+    );
     info!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
         bucket,
@@ -5913,6 +5955,7 @@ async fn upload_part_internal(
                 Reclaim::ReplacedPart,
                 what,
             );
+            dedup_dry_run(&state, &bucket, &placement, &body, mpu_dek.is_some());
 
             let mut builder = Response::builder()
                 .status(StatusCode::OK)

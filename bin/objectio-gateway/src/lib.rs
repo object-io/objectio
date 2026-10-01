@@ -10,6 +10,7 @@ pub mod checksum;
 pub mod chunked_decode;
 pub mod cluster_poll;
 pub mod console_auth;
+pub mod dedup;
 pub mod digest;
 pub mod gateway_metrics;
 pub mod grep;
@@ -841,6 +842,8 @@ pub async fn run(
     #[cfg(not(feature = "rdma"))]
     let rdma = None;
 
+    let dedup_meta = meta_client.clone();
+    let dedup_pool = Arc::clone(&osd_pool);
     // Create application state. KMS fields are held behind RwLocks so
     // `PUT /_admin/kms/config` can hot-swap the backend at runtime; we seed
     // them here with whatever the CLI flag + env / meta config resolved to.
@@ -861,6 +864,7 @@ pub async fn run(
         prometheus_url: args.prometheus_url.clone(),
         rdma,
         inline_max_size: args.inline_max_size,
+        dedup: dedup::DryRun::start(dedup_meta, Arc::clone(&dedup_pool)),
     });
 
     // Build router
@@ -1020,6 +1024,20 @@ pub async fn run(
         .route(
             "/_admin/warehouses/{name}",
             delete(admin::admin_delete_warehouse),
+        )
+        .route(
+            "/_admin/dedup",
+            get(admin::admin_get_dedup).put(admin::admin_put_dedup),
+        )
+        .route(
+            "/_admin/dedup/dry-run/reset",
+            post(admin::admin_reset_dedup_dry_run),
+        )
+        .route(
+            "/_admin/buckets/{name}/dedup",
+            get(admin::admin_get_bucket_dedup)
+                .put(admin::admin_put_bucket_dedup)
+                .delete(admin::admin_delete_bucket_dedup),
         )
         .route("/_admin/buckets", get(admin::admin_list_buckets))
         .route("/_admin/buckets", post(admin::admin_create_bucket))
