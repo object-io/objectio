@@ -443,13 +443,16 @@ fn print_stages(stages: &[Stage], before: &Samples, after: &Samples) {
 fn print_phases(operation: &str, before: &Samples, after: &Samples) {
     const SUM: &str = "objectio_gateway_request_phase_seconds_sum";
     const COUNT: &str = "objectio_gateway_request_phase_seconds_count";
+    // PutObject: sse, meta_lookup, shards, then waiting for the ETag (computed
+    // alongside the shards), commit (ObjectMeta on the OSDs and the listing
+    // entry in Meta, concurrently). GetObject: meta_lookup, object_meta, shards.
     const ORDER: &[&str] = &[
-        "etag",
         "sse",
         "meta_lookup",
-        "object_meta",
         "shards",
-        "listing_commit",
+        "etag",
+        "commit",
+        "object_meta",
     ];
     let op = format!("operation=\"{operation}\"");
     let mut phases: Vec<String> = after

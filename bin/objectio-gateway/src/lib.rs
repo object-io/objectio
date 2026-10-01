@@ -9,6 +9,7 @@ pub mod authz;
 pub mod chunked_decode;
 pub mod cluster_poll;
 pub mod console_auth;
+pub mod digest;
 pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;
@@ -229,6 +230,14 @@ pub struct Args {
     /// scrape and says so.
     #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
     pub prometheus_url: String,
+
+    /// Objects of at most this many bytes are stored inside their metadata
+    /// record, on every OSD in their placement, instead of erasure-coded
+    /// into shards: a PUT makes one round to the OSDs instead of two, and a
+    /// GET one instead of two. The record lives in each OSD's memory, so
+    /// keep it small. 0 turns it off.
+    #[arg(long, default_value_t = 4096)]
+    pub inline_max_size: usize,
 
     /// Move shards over Mooncake Transfer Engine to OSDs that offer it:
     /// `rdma`, or `tcp` to develop without RDMA hardware. Unset: gRPC bytes
@@ -850,6 +859,7 @@ pub async fn run(
         legacy_open_buckets: args.authz_legacy_open_buckets,
         prometheus_url: args.prometheus_url.clone(),
         rdma,
+        inline_max_size: args.inline_max_size,
     });
 
     // Build router

@@ -890,6 +890,14 @@ impl OsdService {
     }
 }
 
+/// An ObjectMeta as listings return it: without an inline object's bytes.
+/// Listing callers want keys, sizes and ETags, and a page of 1000 inline
+/// objects would otherwise carry megabytes of data nobody asked for.
+fn for_listing(mut object: ObjectMeta) -> ObjectMeta {
+    object.inline_data = Vec::new();
+    object
+}
+
 #[tonic::async_trait]
 impl StorageService for OsdService {
     async fn get_metrics(
@@ -1609,7 +1617,7 @@ impl StorageService for OsdService {
                 // Decode object metadata
                 if let Ok(object) = ObjectMeta::decode(&value[..]) {
                     last_key = cursor;
-                    objects.push(object);
+                    objects.push(for_listing(object));
                     count += 1;
                 }
             }
@@ -1793,7 +1801,7 @@ impl StorageService for OsdService {
                 }
 
                 if let Ok(object) = ObjectMeta::decode(&value[..]) {
-                    batch.push(object);
+                    batch.push(for_listing(object));
 
                     if batch.len() >= CHUNK_SIZE {
                         let cursor = key.clone();
@@ -1865,7 +1873,7 @@ impl StorageService for OsdService {
                 if let Ok(object) = ObjectMeta::decode(&value[..]) {
                     last_key = key;
                     last_version_id = version_id;
-                    versions.push(object);
+                    versions.push(for_listing(object));
                     count += 1;
                 }
             }

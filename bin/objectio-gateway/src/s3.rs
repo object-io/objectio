@@ -139,6 +139,9 @@ pub struct AppState {
     /// Transfer Engine and the pools OSDs move shards through, when started
     /// with `--rdma` (feature `rdma`). `None`: every shard goes over gRPC.
     pub rdma: Option<Arc<crate::rdma::GatewayRdma>>,
+    /// Objects of at most this many bytes are stored inline in their
+    /// ObjectMeta rather than in shards (`--inline-max-size`; 0 = never).
+    pub inline_max_size: usize,
 }
 
 impl AppState {
@@ -334,8 +337,8 @@ fn parse_sse_c_headers(headers: &HeaderMap) -> Result<Option<SseCKey>, Response>
             }
             // MD5 binding — catches key-header corruption and prevents a
             // wrong key from silently producing garbage plaintext on GET.
-            let computed = md5::compute(&key_bytes);
-            let computed_b64 = base64::engine::general_purpose::STANDARD.encode(computed.0);
+            let computed = crate::digest::md5(&key_bytes);
+            let computed_b64 = base64::engine::general_purpose::STANDARD.encode(computed);
             if computed_b64 != m {
                 return Err(S3Error::xml_response(
                     "InvalidArgument",
@@ -2159,6 +2162,44 @@ fn is_object_metadata_header(name: &str) -> bool {
         )
 }
 
+/// How a PUT's two commits ended, when the one that decides it succeeded.
+#[derive(Debug, PartialEq, Eq)]
+enum Committed<E> {
+    /// Readable by key and listed.
+    Both,
+    /// Readable by key, but not in `ListObjects` until repair: the listing
+    /// commit failed with this.
+    Unlisted(E),
+}
+
+/// Run a PUT's two commits at the same time: the object's ObjectMeta on the
+/// OSDs (what GET reads) and its entry in Meta's Raft listing index (what
+/// `ListObjects` reads). Neither needs the other.
+///
+/// The ObjectMeta commit decides the outcome. If it fails the PUT fails, and
+/// a listing entry that did land is taken out again with `unlist`, so the
+/// listing never shows an object GET cannot read. A failed listing commit
+/// alone does not fail the PUT: the data landed and is readable by key.
+async fn commit_object<ME, LE, U>(
+    object_meta: impl Future<Output = Result<(), ME>>,
+    listing: impl Future<Output = Result<(), LE>>,
+    unlist: impl FnOnce() -> U,
+) -> Result<Committed<LE>, ME>
+where
+    U: Future<Output = ()>,
+{
+    match tokio::join!(object_meta, listing) {
+        (Ok(()), Ok(())) => Ok(Committed::Both),
+        (Ok(()), Err(e)) => Ok(Committed::Unlisted(e)),
+        (Err(e), listed) => {
+            if listed.is_ok() {
+                unlist().await;
+            }
+            Err(e)
+        }
+    }
+}
+
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -2256,12 +2297,19 @@ pub async fn put_object(
     let mut meta_client = state.meta_client.clone();
 
     // Generate object ID and ETag (MD5 of the *plaintext* body — matches AWS
-    // SSE-S3/SSE-KMS ETag semantics; computed before we possibly encrypt).
+    // SSE-S3/SSE-KMS ETag semantics; taken before we possibly encrypt).
+    //
+    // Nothing needs the ETag until the object's metadata is built, so it is
+    // computed on a blocking thread while the body is encrypted, erasure-coded
+    // and written, instead of in front of all of that. The `etag` phase is the
+    // time still spent waiting for it afterwards.
     let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
     let object_id = *Uuid::new_v4().as_bytes();
-    let etag = format!("\"{:x}\"", md5::compute(&body));
+    let etag_task = {
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || format!("\"{}\"", crate::digest::md5_hex(&body)))
+    };
     let original_size = body.len() as u64;
-    phases.mark("etag");
 
     // SSE: if the request header or bucket default asks for encryption,
     // encrypt the body before it enters the erasure-coding path. Shards
@@ -2324,9 +2372,15 @@ pub async fn put_object(
     let ec_type = ErasureType::try_from(placement.ec_type).unwrap_or(ErasureType::ErasureMds);
     let replication_count = placement.replication_count;
 
+    // A small object goes into its ObjectMeta, whole, on every OSD in the
+    // placement: no stripes, no shard writes. It takes the EC path below
+    // with zero stripes, whatever the protection scheme — replicating the
+    // record is what protects it.
+    let inline = !body.is_empty() && body.len() <= state.inline_max_size;
+
     // Replication mode: no EC, just write raw data to each replica
     // For large files, split into multiple stripes (each stripe <= MAX_SHARD_SIZE)
-    if ec_type == ErasureType::ErasureReplication {
+    if ec_type == ErasureType::ErasureReplication && !inline {
         let total_replicas = replication_count.max(1) as usize;
 
         // Split data into stripes (each stripe must fit in a block)
@@ -2465,6 +2519,20 @@ pub async fn put_object(
             .unwrap_or("application/octet-stream")
             .to_string();
 
+        // The ETag has been computing alongside the stripes; collect it.
+        let etag = match etag_task.await {
+            Ok(etag) => etag,
+            Err(e) => {
+                error!("ETag computation failed: {e}");
+                return S3Error::xml_response(
+                    "InternalError",
+                    "ETag computation failed",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
+        phases.mark("etag");
+
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2492,6 +2560,7 @@ pub async fn put_object(
             encryption_iv: sse_iv.clone(),
             encryption_context: sse_encryption_context.clone(),
             usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+            inline_data: Vec::new(),
         };
 
         if let Err(e) = put_object_meta_to_all(
@@ -2552,7 +2621,11 @@ pub async fn put_object(
     // shard_size = stripe_data_size / ec_k (approximately)
     // So max_stripe_data_size = MAX_SHARD_SIZE * ec_k
     let max_stripe_data_size = MAX_SHARD_SIZE * ec_k as usize;
-    let num_stripes = body.len().div_ceil(max_stripe_data_size);
+    let num_stripes = if inline {
+        0
+    } else {
+        body.len().div_ceil(max_stripe_data_size)
+    };
 
     debug!(
         "EC mode: encoding {}/{} ({} bytes) into {} stripes with {}+{} shards each",
@@ -2815,6 +2888,20 @@ pub async fn put_object(
         .to_string();
     phases.mark("shards");
 
+    // The ETag has been computing alongside the stripes; collect it.
+    let etag = match etag_task.await {
+        Ok(etag) => etag,
+        Err(e) => {
+            error!("ETag computation failed: {e}");
+            return S3Error::xml_response(
+                "InternalError",
+                "ETag computation failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    phases.mark("etag");
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2843,55 +2930,69 @@ pub async fn put_object(
         encryption_iv: sse_iv,
         encryption_context: sse_encryption_context,
         usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+        inline_data: if inline { body.to_vec() } else { Vec::new() },
     };
 
-    if let Err(e) = put_object_meta_to_all(
-        &state.osd_pool,
-        &placement.nodes,
-        &bucket,
-        &key,
-        object_meta.clone(),
-        versioning_enabled,
-    )
-    .await
-    {
-        error!("Failed to store object metadata on OSDs: {}", e);
-        return S3Error::xml_response(
-            "InternalError",
-            &format!("Failed to store object metadata: {}", e),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-    phases.mark("object_meta");
-
-    // Register with Meta's serializable listing index. After this Raft
-    // commit the object is visible to ListObjects; without it the data
-    // is still readable by key but doesn't show up in a listing.
-    // Failure here leaves a "visible by direct GET only" window — log
-    // and return success since the data landed.
-    {
+    // Two commits make the object, at the same time: see `commit_object`.
+    let listing_req = {
         use objectio_proto::metadata::CreateObjectRequest;
-        let mut meta_client = state.meta_client.clone();
-        let req = CreateObjectRequest {
+        CreateObjectRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             size: original_size,
-            content_type: content_type.clone(),
+            content_type,
             etag: etag.clone(),
             user_metadata: object_meta.user_metadata.clone(),
             stripes: object_meta.stripes.clone(),
             object_id: object_id.to_vec(),
             pg_id: placement.pg_id,
             pool: placement.pool.clone(),
-        };
-        if let Err(e) = meta_client.create_object(req).await {
-            warn!(
-                "create_object on meta failed ({e}); object is readable by key \
-                 but will not appear in ListObjects until repair",
+        }
+    };
+    let mut listing_client = state.meta_client.clone();
+    let mut unlist_client = state.meta_client.clone();
+    let committed = commit_object(
+        put_object_meta_to_all(
+            &state.osd_pool,
+            &placement.nodes,
+            &bucket,
+            &key,
+            object_meta,
+            versioning_enabled,
+        ),
+        async { listing_client.create_object(listing_req).await.map(drop) },
+        || async {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            if let Err(e) = unlist_client
+                .delete_object(MetaDelReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: String::new(),
+                })
+                .await
+            {
+                warn!("could not take {bucket}/{key} out of the listing after a failed PUT: {e}");
+            }
+        },
+    )
+    .await;
+    phases.mark("commit");
+
+    match committed {
+        Ok(Committed::Both) => {}
+        Ok(Committed::Unlisted(e)) => warn!(
+            "create_object on meta failed ({e}); object is readable by key \
+             but will not appear in ListObjects until repair",
+        ),
+        Err(e) => {
+            error!("Failed to store object metadata on OSDs: {}", e);
+            return S3Error::xml_response(
+                "InternalError",
+                &format!("Failed to store object metadata: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
     }
-    phases.mark("listing_commit");
 
     info!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
@@ -3076,7 +3177,7 @@ pub async fn get_object(
     }
 
     // Check for stripes
-    if object.stripes.is_empty() {
+    if object.stripes.is_empty() && object.inline_data.is_empty() {
         error!(
             "Object has no stripe metadata: {}/{} (size {})",
             bucket, key, object.size
@@ -3244,6 +3345,14 @@ pub async fn get_object(
         object.size as usize
     };
     let mut all_data = Vec::with_capacity(capacity);
+
+    // An inline object is all here already; its stripe plan is empty.
+    if !object.inline_data.is_empty() {
+        match inline_slice(&object, resolved_range.as_ref(), get_sse_dek.as_ref()) {
+            Ok(data) => all_data = data,
+            Err(resp) => return resp,
+        }
+    }
 
     for &(stripe_idx, stripe_byte_offset) in &stripe_plan {
         let stripe = &object.stripes[stripe_idx];
@@ -3678,6 +3787,37 @@ pub async fn get_object(
 
         builder.body(Body::from(all_data)).unwrap()
     }
+}
+
+/// The bytes of an inline object a GET asked for: all of them, or `range`,
+/// decrypted when the object is encrypted.
+#[allow(clippy::result_large_err)]
+fn inline_slice(
+    object: &ObjectMeta,
+    range: Option<&ByteRange>,
+    dek: Option<&[u8; objectio_kms::DEK_LEN]>,
+) -> Result<Vec<u8>, Response> {
+    if object.inline_data.len() as u64 != object.size {
+        error!(
+            "Inline object {}/{} holds {} bytes but its size is {}",
+            object.bucket,
+            object.key,
+            object.inline_data.len(),
+            object.size
+        );
+        return Err(S3Error::xml_response(
+            "InternalError",
+            "Object metadata is inconsistent (inline size)",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    let (start, end) = range.map_or((0, object.size), |r| (r.start, r.end + 1));
+    let mut data = object.inline_data[start as usize..end as usize].to_vec();
+    if let Some(dek) = dek {
+        // Stored like a single stripe starting at byte 0 of the object.
+        decrypt_stripe_slice(dek, &StripeMeta::default(), object, 0, start, &mut data)?;
+    }
+    Ok(data)
 }
 
 /// Decrypt `buf` — one stripe's contribution to the GET response.
@@ -5035,7 +5175,7 @@ async fn upload_part_internal(
     // Calculate ETag for this part — AWS semantics for SSE-S3/SSE-KMS:
     // part ETag is the MD5 of the *plaintext*. Compute before we possibly
     // encrypt below.
-    let etag = format!("\"{:x}\"", md5::compute(&body));
+    let etag = format!("\"{}\"", crate::digest::md5_hex(&body));
     let part_size = body.len() as u64;
 
     let mut meta_client = state.meta_client.clone();
@@ -8278,7 +8418,7 @@ mod s3_tests {
             ),
             (
                 "x-amz-server-side-encryption-customer-key-md5",
-                &b64.encode(md5::compute(md5_of).0),
+                &b64.encode(crate::digest::md5(md5_of)),
             ),
         ])
     }
@@ -8361,7 +8501,7 @@ mod s3_tests {
         );
         h.insert(
             "x-amz-server-side-encryption-customer-key-md5",
-            HeaderValue::from_str(&b64.encode(md5::compute(short).0)).unwrap(),
+            HeaderValue::from_str(&b64.encode(crate::digest::md5(&short[..]))).unwrap(),
         );
         assert!(
             parse_sse_c_headers(&h).is_err(),
@@ -8730,5 +8870,69 @@ mod list_uploads_tests {
         let xml = to_xml(&result).expect("result should serialize");
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("NextKeyMarker"));
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::{Committed, commit_object};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    async fn after(ms: u64, r: Result<(), &'static str>) -> Result<(), &'static str> {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        r
+    }
+
+    #[tokio::test]
+    async fn the_two_commits_run_at_the_same_time() {
+        let start = std::time::Instant::now();
+        let r = commit_object(after(200, Ok(())), after(200, Ok(())), || async {}).await;
+        assert_eq!(r, Ok(Committed::Both));
+        assert!(
+            start.elapsed() < Duration::from_millis(350),
+            "the commits ran one after the other: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_commit_does_not_fail_the_put() {
+        let unlisted = AtomicBool::new(false);
+        let r = commit_object(after(0, Ok(())), after(0, Err("raft")), || async {
+            unlisted.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(r, Ok(Committed::Unlisted("raft")));
+        assert!(
+            !unlisted.load(Ordering::SeqCst),
+            "took a readable object out of the listing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_object_meta_commit_takes_the_object_out_of_the_listing() {
+        let unlisted = AtomicBool::new(false);
+        let r: Result<Committed<&str>, _> =
+            commit_object(after(0, Err("osd")), after(0, Ok(())), || async {
+                unlisted.store(true, Ordering::SeqCst);
+            })
+            .await;
+        assert_eq!(r, Err("osd"));
+        assert!(
+            unlisted.load(Ordering::SeqCst),
+            "the listing shows an object GET cannot read"
+        );
+    }
+
+    #[tokio::test]
+    async fn when_both_fail_there_is_nothing_to_take_out() {
+        let unlisted = AtomicBool::new(false);
+        let r = commit_object(after(0, Err("osd")), after(0, Err("raft")), || async {
+            unlisted.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(r, Err("osd"));
+        assert!(!unlisted.load(Ordering::SeqCst));
     }
 }

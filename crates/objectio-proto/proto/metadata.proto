@@ -311,6 +311,13 @@ message ObjectMeta {
     // before it existed; OSDs then fall back to the holder of shard 0 of
     // stripe 0, which is the same node for single-part PUTs.
     bytes usage_owner = 21;
+
+    // The object's bytes, for a small object stored in this record instead
+    // of in shards: `stripes` is then empty. As stored — ciphertext when the
+    // object is encrypted. Written whole to every OSD in the key's
+    // placement, so any one of them can serve it. Empty for every other
+    // object, and in listings, which never carry it.
+    bytes inline_data = 22;
 }
 
 // Stripe metadata (EC group)

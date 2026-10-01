@@ -37,7 +37,7 @@ hex = { workspace = true }
 quick-xml = { workspace = true }
 bytes = { workspace = true }
 http-body-util = "0.1"
-md5 = "0.7"
+md-5 = { workspace = true }
 crc32c = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -102,3 +102,7 @@ pcre2 = ["dep:pcre2"]
 # `engine: "hyperscan"`. Requires the Hyperscan system library
 # (`libhs-dev` on Debian) at build time. Linux-primary.
 hyperscan = ["dep:hyperscan"]
+
+# MD5 (ETags): the assembly implementation where there is one.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+md-5 = { workspace = true, features = ["asm"] }
