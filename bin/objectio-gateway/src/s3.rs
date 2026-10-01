@@ -1648,6 +1648,13 @@ pub struct DeletedObject {
     #[serde(rename = "VersionId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
+    /// The delete added a marker, or removed one.
+    #[serde(rename = "DeleteMarker")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub delete_marker: bool,
+    #[serde(rename = "DeleteMarkerVersionId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_marker_version_id: Option<String>,
 }
 
 /// Error deleting object
@@ -1699,11 +1706,6 @@ async fn upload_part_copy_internal(
             StatusCode::BAD_REQUEST,
         );
     };
-    if let Some(refused) =
-        unless_current(&state, source_bucket, source_key, source_version.as_deref()).await
-    {
-        return refused;
-    }
 
     // The middleware authorized writing the destination; reading the
     // source is checked here, as CopyObject does.
@@ -1730,6 +1732,7 @@ async fn upload_part_copy_internal(
         &mut meta_client,
         source_bucket,
         source_key,
+        source_version.as_deref(),
         &bucket,
         &headers,
     )
@@ -1743,10 +1746,12 @@ async fn upload_part_copy_internal(
     if let Some(range) = headers.get("x-amz-copy-source-range") {
         get_headers.insert(header::RANGE, range.clone());
     }
-    let got = get_object(
-        State(Arc::clone(&state)),
-        Path((source_bucket.to_string(), source_key.to_string())),
-        auth,
+    let _ = auth;
+    let got = get_object_version(
+        Arc::clone(&state),
+        source_bucket.to_string(),
+        source_key.to_string(),
+        source_version.clone(),
         get_headers,
     )
     .await;
@@ -2483,6 +2488,7 @@ async fn check_copy_sse(
     meta_client: &mut MetadataServiceClient<Channel>,
     source_bucket: &str,
     source_key: &str,
+    source_version: Option<&str>,
     dest_bucket: &str,
     copy_headers: &HeaderMap,
 ) -> Result<(), Response> {
@@ -2511,14 +2517,28 @@ async fn check_copy_sse(
             StatusCode::SERVICE_UNAVAILABLE,
         ));
     }
-    let source_meta = match get_object_meta_from_any(
-        &state.osd_pool,
-        &src_placement.nodes,
-        source_bucket,
-        source_key,
-    )
-    .await
-    {
+    let found = match source_version {
+        Some(v) => {
+            find_version(
+                &state.osd_pool,
+                &src_placement.nodes,
+                source_bucket,
+                source_key,
+                v,
+            )
+            .await
+        }
+        None => {
+            get_object_meta_from_any(
+                &state.osd_pool,
+                &src_placement.nodes,
+                source_bucket,
+                source_key,
+            )
+            .await
+        }
+    };
+    let source_meta = match found {
         Ok(Some(m)) => m,
         Ok(None) => {
             return Err(S3Error::xml_response(
@@ -2872,35 +2892,43 @@ async fn copy_object_data(
     state: Arc<AppState>,
     dest_bucket: String,
     dest_key: String,
-    source_bucket: String,
-    source_key: String,
+    source: CopySource,
     auth: Option<Extension<AuthResult>>,
     copy_headers: HeaderMap,
 ) -> Response {
+    let CopySource {
+        bucket: source_bucket,
+        key: source_key,
+        version: source_version,
+    } = source;
     debug!(
         "CopyObject: {}/{} -> {}/{}",
         source_bucket, source_key, dest_bucket, dest_key
     );
 
-    if let Some(resp) = copy_by_reference(
-        &state,
-        &dest_bucket,
-        &dest_key,
-        &source_bucket,
-        &source_key,
-        &copy_headers,
-    )
-    .await
+    // By reference only from the current version: it re-reads the source's
+    // current object to know the stripes are still held.
+    if source_version.is_none()
+        && let Some(resp) = copy_by_reference(
+            &state,
+            &dest_bucket,
+            &dest_key,
+            &source_bucket,
+            &source_key,
+            &copy_headers,
+        )
+        .await
     {
         return resp;
     }
 
     // 1. Read the source object as plaintext. The existing GET handler takes
     //    care of reconstruction + decryption.
-    let get_resp = get_object(
-        State(Arc::clone(&state)),
-        Path((source_bucket.clone(), source_key.clone())),
-        auth.clone(),
+    let get_resp = get_object_version(
+        Arc::clone(&state),
+        source_bucket.clone(),
+        source_key.clone(),
+        source_version.clone(),
         HeaderMap::new(),
     )
     .await;
@@ -2953,7 +2981,27 @@ async fn copy_object_data(
     let tagging = if replaces_tags(&copy_headers) {
         copy_headers.get("x-amz-tagging").cloned()
     } else {
-        match object_meta_for_update(&state, &source_bucket, &source_key).await {
+        let source_meta = match &source_version {
+            Some(v) => {
+                match get_placement_nodes_for_object(&state, &source_bucket, &source_key).await {
+                    Ok(nodes) => {
+                        match find_version(&state.osd_pool, &nodes, &source_bucket, &source_key, v)
+                            .await
+                        {
+                            Ok(Some(m)) => Ok((m, nodes)),
+                            _ => Err(S3Error::xml_response(
+                                "NoSuchVersion",
+                                "The specified version does not exist.",
+                                StatusCode::NOT_FOUND,
+                            )),
+                        }
+                    }
+                    Err(resp) => Err(resp),
+                }
+            }
+            None => object_meta_for_update(&state, &source_bucket, &source_key).await,
+        };
+        match source_meta {
             Ok((src, _)) if !src.tags.is_empty() => {
                 http::HeaderValue::from_str(&encode_tagging(&src.tags)).ok()
             }
@@ -3261,16 +3309,6 @@ pub async fn put_object(
         }
         let source_bucket = parts[0];
         let source_key = parts[1];
-        if let Some(refused) = unless_current(
-            &state,
-            source_bucket,
-            source_key,
-            copy_source_version.as_deref(),
-        )
-        .await
-        {
-            return refused;
-        }
 
         // CopyObject reads the source as well as writing the destination.
         // The middleware authorized the destination; the source is a
@@ -3301,6 +3339,7 @@ pub async fn put_object(
             &mut meta_client,
             source_bucket,
             source_key,
+            copy_source_version.as_deref(),
             &bucket,
             &headers,
         )
@@ -3315,8 +3354,11 @@ pub async fn put_object(
             state.clone(),
             bucket.clone(),
             key.clone(),
-            source_bucket.to_string(),
-            source_key.to_string(),
+            CopySource {
+                bucket: source_bucket.to_string(),
+                key: source_key.to_string(),
+                version: copy_source_version.clone(),
+            },
             auth.clone(),
             headers.clone(),
         ))
@@ -5276,11 +5318,18 @@ async fn object_to_read(
                 &o,
             )),
             Ok(Some(o)) => Ok(o),
-            Ok(None) => Err(S3Error::xml_response(
-                "NoSuchKey",
-                "The specified key does not exist.",
-                StatusCode::NOT_FOUND,
-            )),
+            Ok(None) => {
+                let mut resp = S3Error::xml_response(
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                    StatusCode::NOT_FOUND,
+                );
+                resp.headers_mut().insert(
+                    "x-amz-delete-marker",
+                    header::HeaderValue::from_static("false"),
+                );
+                Err(resp)
+            }
             Err(e) => Err(failed(e)),
         };
     };
@@ -5362,7 +5411,22 @@ async fn delete_version(
     }
     if is_current {
         let mut meta_client = state.meta_client.clone();
-        match newest_version(pool, nodes, bucket, key, &version).await {
+        // The listing leaves out inline data: read the version whole.
+        let next = match newest_version(pool, nodes, bucket, key, &version).await {
+            Ok(Some(listed)) => get_object_version_meta_from_any(
+                pool,
+                nodes,
+                bucket,
+                key,
+                version_label(&listed.version_id),
+            )
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|v| v.ok_or_else(|| "it went while being read".to_string()))
+            .map(Some),
+            other => other,
+        };
+        match next {
             Ok(Some(next)) => {
                 if let Err(e) = put_object_meta_to_all(
                     pool,
@@ -5484,6 +5548,13 @@ async fn newest_version(
         }
     }
     Err(last)
+}
+
+/// What a copy reads: an object, at a version or the current one.
+struct CopySource {
+    bucket: String,
+    key: String,
+    version: Option<String>,
 }
 
 /// `x-amz-copy-source`: "bucket/key", URL-decoded, and the version it
@@ -5917,15 +5988,19 @@ pub async fn delete_objects(
         )
         .await;
         if resp.status().is_success() {
-            let version_id = resp
+            let header_version = resp
                 .headers()
                 .get("x-amz-version-id")
                 .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-                .or(obj.version_id);
+                .map(str::to_string);
+            let delete_marker = resp.headers().contains_key("x-amz-delete-marker");
             deleted.push(DeletedObject {
                 key: obj.key,
-                version_id,
+                // A version deleted by id is named; a marker just added is
+                // named as the marker.
+                version_id: obj.version_id.clone(),
+                delete_marker,
+                delete_marker_version_id: if delete_marker { header_version } else { None },
             });
         } else {
             let code = resp
@@ -8010,6 +8085,15 @@ async fn put_bucket_versioning_internal(
             .status(StatusCode::OK)
             .body(Body::empty())
             .unwrap(),
+        // Meta refuses to suspend versioning on a bucket with object lock.
+        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+            S3Error::xml_response("InvalidBucketState", e.message(), StatusCode::CONFLICT)
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        ),
         Err(e) => {
             error!("Failed to set versioning for {}: {}", bucket, e);
             S3Error::xml_response(

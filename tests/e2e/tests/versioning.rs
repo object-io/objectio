@@ -185,7 +185,9 @@ fn a_delete_leaves_a_marker_and_deleting_the_marker_brings_the_object_back() {
 fn deleting_the_current_version_makes_the_previous_one_current() {
     let c = Cluster::start_with_ec(6, 4, 2);
     versioned(&c, "v");
-    let (a, b) = (body(4, 50_000), body(5, 70_000));
+    // One erasure-coded, one small enough to be stored inline: promotion
+    // must carry an inline object's bytes.
+    let (a, b) = (body(4, 900), body(5, 70_000));
     let empty = c.total_used_bytes();
     let va = put(&c, "/v/k", &a);
     let vb = put(&c, "/v/k", &b);
@@ -371,7 +373,7 @@ fn a_multipart_upload_is_a_new_version() {
 }
 
 #[test]
-fn version_sub_resources_answer_for_the_version_named_or_refuse() {
+fn version_sub_resources_and_copies_use_the_version_named() {
     let c = Cluster::start_with_ec(6, 4, 2);
     versioned(&c, "v");
     let a = body(10, 2_000);
@@ -393,24 +395,17 @@ fn version_sub_resources_answer_for_the_version_named_or_refuse() {
         404
     );
 
-    // Copying the current version by id works; an older one is refused.
-    c.request_with_headers(
-        "PUT",
-        "/v/copy",
-        &[],
-        &[("x-amz-copy-source", &format!("/v/k?versionId={vb}"))],
-    )
-    .expect(200);
-    assert_eq!(
+    // A copy reads the version named, the current one or an older one.
+    for (version, want) in [(&vb, body(11, 2_000)), (&va, a)] {
         c.request_with_headers(
             "PUT",
-            "/v/old",
+            "/v/copy",
             &[],
-            &[("x-amz-copy-source", &format!("/v/k?versionId={va}"))],
+            &[("x-amz-copy-source", &format!("/v/k?versionId={version}"))],
         )
-        .status,
-        501
-    );
+        .expect(200);
+        expect_bytes(&c.request("GET", "/v/copy", &[]), &want, "the copy");
+    }
 }
 
 /// A lock protects the version it is on: deleting that version by id is
