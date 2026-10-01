@@ -72,10 +72,8 @@ pub async fn write_chunk(
     //
     // A read failure here is not fatal: the worst case is the leak this used
     // to have unconditionally, and refusing the write instead would be worse.
-    let primary = &placement.nodes[0];
-    let superseded = match get_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, &object_key)
-        .await
-    {
+    let meta_nodes = unique_nodes(&placement.nodes);
+    let superseded = match get_meta_anywhere(osd_pool, &meta_nodes, &object_key).await {
         Ok(meta) => meta,
         Err(e) => {
             warn!("chunk {chunk_id}: cannot read the meta being replaced, shards may leak: {e}");
@@ -112,41 +110,52 @@ pub async fn write_chunk(
             let sdata = shard_data.clone();
             let pool = Arc::clone(osd_pool);
             async move {
-                write_shard_to_osd(&pool, &node_placement, &oid, 0, i as u32, sdata, ec_k, ec_m)
-                    .await
+                let result = write_shard_to_osd(
+                    &pool,
+                    &node_placement,
+                    &oid,
+                    0,
+                    i as u32,
+                    sdata,
+                    ec_k,
+                    ec_m,
+                )
+                .await;
+                (i as u32, node_placement, result)
             }
         })
         .collect();
 
     let results = join_all(shard_futs).await;
 
-    let mut success_count = 0u32;
-    for (i, res) in results.iter().enumerate() {
-        match res {
-            Ok(_) => success_count += 1,
-            Err(e) => error!("Failed to write shard {i} for chunk {chunk_id}: {e}"),
+    // Only shards actually written are recorded, each at the position and
+    // node it went to. (All placement nodes used to be recorded whether or
+    // not their write succeeded.)
+    let mut stripe_shards: Vec<ShardLocation> = Vec::with_capacity(total_shards);
+    for (position, node, result) in results {
+        match result {
+            Ok(_) => stripe_shards.push(ShardLocation {
+                position,
+                node_id: node.node_id.clone(),
+                disk_id: node.disk_id.clone(),
+                offset: 0,
+                shard_type: node.shard_type,
+                local_group: node.local_group,
+            }),
+            Err(e) => error!("Failed to write shard {position} for chunk {chunk_id}: {e}"),
         }
     }
 
-    if success_count < ec_k {
+    // A spare shard beyond k before the chunk counts as stored: with only k
+    // it would have no redundancy left. Failing here leaves the chunk dirty
+    // (and journaled) for the next flush to retry.
+    let quorum = write_quorum(ec_k, ec_m);
+    if stripe_shards.len() < quorum {
         return Err(anyhow!(
-            "only {success_count}/{total_shards} shards written for chunk {chunk_id}, need {ec_k}"
+            "only {}/{total_shards} shards written for chunk {chunk_id}, need {quorum}",
+            stripe_shards.len()
         ));
     }
-
-    // Build shard location list from placement nodes
-    let stripe_shards: Vec<ShardLocation> = placement
-        .nodes
-        .iter()
-        .map(|n| ShardLocation {
-            position: n.position,
-            node_id: n.node_id.clone(),
-            disk_id: n.disk_id.clone(),
-            offset: 0,
-            shard_type: n.shard_type,
-            local_group: n.local_group,
-        })
-        .collect();
 
     let now = chrono::Utc::now().timestamp_millis() as u64;
 
@@ -181,10 +190,10 @@ pub async fn write_chunk(
         ..Default::default()
     };
 
-    // Store object meta on primary OSD (position 0)
-    put_object_meta_to_osd(osd_pool, primary, BLOCK_BUCKET, &object_key, object_meta)
-        .await
-        .map_err(|e| anyhow!("put_object_meta failed: {e}"))?;
+    // The chunk's metadata on every OSD in its placement, not only the
+    // first: it is the only record of where the shards are, and one copy
+    // made that OSD's metadata a single point of loss for the chunk.
+    put_meta_everywhere(osd_pool, &meta_nodes, &object_key, &object_meta).await?;
 
     // Only now is the old stripe unreachable. Freeing it earlier would put a
     // window between "old shards gone" and "new meta committed" in which a
@@ -198,6 +207,70 @@ pub async fn write_chunk(
     }
 
     Ok(object_key)
+}
+
+/// Shards of a k+m chunk that must be written for it to count as stored:
+/// k+1, so it still has redundancy (k when there is no parity).
+const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
+    let k = ec_k as usize;
+    if ec_m == 0 { k } else { k + 1 }
+}
+
+/// Placement nodes, each once (a small cluster can place several shards on
+/// one node).
+fn unique_nodes(nodes: &[NodePlacement]) -> Vec<NodePlacement> {
+    let mut seen = std::collections::HashSet::new();
+    nodes
+        .iter()
+        .filter(|n| seen.insert(n.node_id.clone()))
+        .cloned()
+        .collect()
+}
+
+/// Write a chunk's metadata to every node; all must accept, or the flush
+/// fails and is retried.
+async fn put_meta_everywhere(
+    osd_pool: &Arc<OsdPool>,
+    nodes: &[NodePlacement],
+    object_key: &str,
+    meta: &ObjectMeta,
+) -> Result<()> {
+    let results = join_all(
+        nodes
+            .iter()
+            .map(|n| put_object_meta_to_osd(osd_pool, n, BLOCK_BUCKET, object_key, meta.clone())),
+    )
+    .await;
+    for (n, r) in nodes.iter().zip(results) {
+        r.map_err(|e| anyhow!("put_object_meta to {} failed: {e}", n.node_address))?;
+    }
+    Ok(())
+}
+
+/// A chunk's metadata from the first node that has it. `None` when every
+/// node that answered has none; an error only when none answered.
+async fn get_meta_anywhere(
+    osd_pool: &Arc<OsdPool>,
+    nodes: &[NodePlacement],
+    object_key: &str,
+) -> Result<Option<ObjectMeta>> {
+    let mut answered = false;
+    let mut last_err = None;
+    for n in nodes {
+        match get_object_meta_from_osd(osd_pool, n, BLOCK_BUCKET, object_key).await {
+            Ok(Some(meta)) => return Ok(Some(meta)),
+            Ok(None) => answered = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if answered {
+        Ok(None)
+    } else {
+        Err(anyhow!(
+            "no OSD answered for {object_key}: {}",
+            last_err.map_or_else(|| "no nodes".to_string(), |e| e.to_string())
+        ))
+    }
 }
 
 /// Load into `cache`, as clean, every stored chunk that a write of `len`
@@ -263,18 +336,16 @@ pub async fn read_chunk(
         return Err(anyhow!("no placement nodes for {object_key}"));
     }
 
-    // Build position → node_address map
-    let addr_map: HashMap<u32, NodePlacement> = placement
+    // Shards are found by the node they were written to, not by position
+    // in today's placement, which may have moved since.
+    let addr_by_node: HashMap<Vec<u8>, String> = placement
         .nodes
         .iter()
-        .map(|n| (n.position, n.clone()))
+        .map(|n| (n.node_id.clone(), n.node_address.clone()))
         .collect();
 
-    // Fetch ObjectMeta from the primary OSD
-    let primary = &placement.nodes[0];
-    let object_meta = get_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key)
-        .await
-        .map_err(|e| anyhow!("get_object_meta failed: {e}"))?
+    let object_meta = get_meta_anywhere(osd_pool, &unique_nodes(&placement.nodes), object_key)
+        .await?
         .ok_or_else(|| anyhow!("object meta not found for {object_key}"))?;
 
     let stripe = object_meta
@@ -302,13 +373,13 @@ pub async fn read_chunk(
         if pos >= total {
             continue;
         }
-        let Some(node) = addr_map.get(&shard_loc.position) else {
+        let Some(address) = addr_by_node.get(&shard_loc.node_id) else {
             continue;
         };
         let node_placement = NodePlacement {
             position: shard_loc.position,
             node_id: shard_loc.node_id.clone(),
-            node_address: node.node_address.clone(),
+            node_address: address.clone(),
             disk_id: shard_loc.disk_id.clone(),
             shard_type: shard_loc.shard_type,
             local_group: shard_loc.local_group,
@@ -387,4 +458,28 @@ pub async fn delete_chunk(
         .map_err(|e| anyhow!("delete_object_meta failed: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_chunk_keeps_a_spare_shard() {
+        assert_eq!(write_quorum(4, 2), 5);
+        assert_eq!(write_quorum(2, 1), 3);
+        assert_eq!(write_quorum(1, 0), 1);
+    }
+
+    #[test]
+    fn each_node_gets_the_metadata_once() {
+        let node = |id: u8, pos: u32| NodePlacement {
+            node_id: vec![id; 16],
+            position: pos,
+            ..Default::default()
+        };
+        let nodes = [node(1, 0), node(2, 1), node(1, 2), node(3, 3)];
+        let ids: Vec<u8> = unique_nodes(&nodes).iter().map(|n| n.node_id[0]).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
 }
