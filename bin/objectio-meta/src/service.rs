@@ -1011,6 +1011,7 @@ impl MetaService {
                         CasTable::Config => {
                             svc.apply_config_event(&key, new_value.as_deref());
                         }
+                        CasTable::Tenants => svc.apply_tenant_event(&key, new_value.as_deref()),
                         // Tables not yet covered by a cache refresh:
                         // writers are responsible for mirroring their
                         // own writes on the leader, and followers still
@@ -1044,6 +1045,57 @@ impl MetaService {
                 map.remove(key);
             }
         }
+    }
+
+    /// Mirror a committed tenant write, so every replica — not only the
+    /// leader that served it — sees a tenant's settings (its dedup policy
+    /// among them) change.
+    fn apply_tenant_event(&self, key: &str, new_value: Option<&[u8]>) {
+        use prost::Message;
+        let mut tenants = self.tenants.write();
+        match new_value {
+            Some(bytes) => match TenantConfig::decode(bytes) {
+                Ok(t) => {
+                    tenants.insert(key.to_string(), t);
+                }
+                Err(e) => warn!("apply: decode TenantConfig('{key}') failed: {e}"),
+            },
+            None => {
+                tenants.remove(key);
+            }
+        }
+    }
+
+    /// The dedup policy `bucket` resolves to: its own, then its tenant's,
+    /// then the cluster default. In-memory only, so `GetPlacement` can
+    /// return it at no cost.
+    pub fn effective_dedup(&self, bucket: &str) -> objectio_proto::dedup::Effective {
+        let (bucket_policy, tenant_name) = self
+            .buckets
+            .read()
+            .get(bucket)
+            .map(|b| (b.dedup, b.tenant.clone()))
+            .unwrap_or_default();
+        let tenant_policy = self.tenants.read().get(&tenant_name).and_then(|t| t.dedup);
+        let cluster = self
+            .config
+            .read()
+            .get(objectio_proto::dedup::CLUSTER_KEY)
+            .and_then(|e| objectio_proto::dedup::cluster_from_config(&e.value));
+        objectio_proto::dedup::resolve(
+            bucket,
+            &tenant_name,
+            bucket_policy.as_ref(),
+            tenant_policy.as_ref(),
+            cluster.as_ref(),
+        )
+    }
+
+    fn with_dedup(&self, bucket: &str, mut resp: GetPlacementResponse) -> GetPlacementResponse {
+        let e = self.effective_dedup(bucket);
+        resp.set_dedup_mode(e.mode);
+        resp.dedup_domain = e.domain;
+        resp
     }
 
     fn apply_bucket_event(&self, key: &str, new_value: Option<&[u8]>) {
@@ -2829,21 +2881,26 @@ impl MetaService {
             used_nodes.len()
         );
 
-        Ok(Response::new(GetPlacementResponse {
-            storage_class: "STANDARD".to_string(),
-            ec_k: self.default_ec_k,
-            ec_m: self.default_ec_m,
-            nodes: placements,
-            ec_type: ec_type.into(),
-            ec_local_parity: 0,
-            ec_global_parity: self.default_ec_m,
-            local_group_size: 0,
-            replication_count,
-            // Legacy path: no PG, pool blank. Phase 3 fills these.
-            pg_id: 0,
-            pg_version: 0,
-            pool: String::new(),
-        }))
+        Ok(Response::new(self.with_dedup(
+            &req.bucket,
+            GetPlacementResponse {
+                storage_class: "STANDARD".to_string(),
+                ec_k: self.default_ec_k,
+                ec_m: self.default_ec_m,
+                nodes: placements,
+                ec_type: ec_type.into(),
+                ec_local_parity: 0,
+                ec_global_parity: self.default_ec_m,
+                local_group_size: 0,
+                replication_count,
+                // Legacy path: no PG, pool blank. Phase 3 fills these.
+                pg_id: 0,
+                pg_version: 0,
+                pool: String::new(),
+                dedup_mode: 0,
+                dedup_domain: String::new(),
+            },
+        )))
     }
 }
 
@@ -2984,6 +3041,7 @@ impl MetadataService for MetaService {
         }
 
         let bucket = BucketMeta {
+            dedup: None,
             name: req.name.clone(),
             owner: req.owner,
             created_at: Self::current_timestamp(),
@@ -3560,20 +3618,25 @@ impl MetadataService for MetaService {
                         pg_id,
                         placements.len()
                     );
-                    return Ok(Response::new(GetPlacementResponse {
-                        storage_class: req.storage_class.clone(),
-                        ec_k,
-                        ec_m: ec_local_parity + ec_global_parity,
-                        nodes: placements,
-                        ec_type: ec_type.into(),
-                        ec_local_parity,
-                        ec_global_parity,
-                        local_group_size,
-                        replication_count,
-                        pg_id,
-                        pg_version: pg.version,
-                        pool: pool_name.clone(),
-                    }));
+                    return Ok(Response::new(self.with_dedup(
+                        &req.bucket,
+                        GetPlacementResponse {
+                            storage_class: req.storage_class.clone(),
+                            ec_k,
+                            ec_m: ec_local_parity + ec_global_parity,
+                            nodes: placements,
+                            ec_type: ec_type.into(),
+                            ec_local_parity,
+                            ec_global_parity,
+                            local_group_size,
+                            replication_count,
+                            pg_id,
+                            pg_version: pg.version,
+                            pool: pool_name.clone(),
+                            dedup_mode: 0,
+                            dedup_domain: String::new(),
+                        },
+                    )));
                 }
                 warn!(
                     "PG {}/{}: osd_ids={} doesn't match expected shards={}; falling back to CRUSH",
@@ -3644,23 +3707,28 @@ impl MetadataService for MetaService {
             ec_type
         );
 
-        Ok(Response::new(GetPlacementResponse {
-            storage_class: req.storage_class.clone(),
-            ec_k,
-            ec_m: ec_local_parity + ec_global_parity,
-            nodes: placements,
-            ec_type: ec_type.into(),
-            ec_local_parity,
-            ec_global_parity,
-            local_group_size,
-            replication_count,
-            // Filled by Phase 3 once the PG lookup replaces
-            // per-object CRUSH. Leaving zeros keeps pre-migration
-            // clients safe (gateway treats 0 as legacy).
-            pg_id: 0,
-            pg_version: 0,
-            pool: String::new(),
-        }))
+        Ok(Response::new(self.with_dedup(
+            &req.bucket,
+            GetPlacementResponse {
+                storage_class: req.storage_class.clone(),
+                ec_k,
+                ec_m: ec_local_parity + ec_global_parity,
+                nodes: placements,
+                ec_type: ec_type.into(),
+                ec_local_parity,
+                ec_global_parity,
+                local_group_size,
+                replication_count,
+                // Filled by Phase 3 once the PG lookup replaces
+                // per-object CRUSH. Leaving zeros keeps pre-migration
+                // clients safe (gateway treats 0 as legacy).
+                pg_id: 0,
+                pg_version: 0,
+                pool: String::new(),
+                dedup_mode: 0,
+                dedup_domain: String::new(),
+            },
+        )))
     }
 
     async fn create_multipart_upload(
@@ -7847,6 +7915,7 @@ impl MetadataService for MetaService {
         }
 
         let bucket = BucketMeta {
+            dedup: None,
             name: bucket_name.clone(),
             owner: "system".to_string(),
             created_at: now,
@@ -8048,6 +8117,7 @@ impl MetadataService for MetaService {
         }
 
         let bucket = BucketMeta {
+            dedup: None,
             name: bucket_name.clone(),
             owner: if req.owner.is_empty() {
                 "system".to_string()
@@ -9849,6 +9919,171 @@ impl MetadataService for MetaService {
             req.state()
         );
         Ok(Response::new(PutBucketVersioningResponse { success: true }))
+    }
+
+    async fn set_bucket_dedup(
+        &self,
+        request: Request<objectio_proto::metadata::SetBucketDedupRequest>,
+    ) -> Result<Response<objectio_proto::metadata::SetBucketDedupResponse>, Status> {
+        use objectio_proto::metadata::{DedupMode, DedupScope};
+        let req = request.into_inner();
+        // All-unset is no policy at all: the bucket inherits.
+        let policy = req
+            .policy
+            .filter(|p| p.mode() != DedupMode::Unset || p.scope() != DedupScope::Unset);
+        if let Some(p) = &policy {
+            objectio_proto::dedup::validate(p).map_err(Status::invalid_argument)?;
+        }
+
+        let (expected_bytes, new_bucket, new_bytes) = {
+            let buckets = self.buckets.read();
+            let current = buckets
+                .get(&req.bucket)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("bucket '{}' not found", req.bucket)))?;
+            let expected = current.encode_to_vec();
+            let mut new_bucket = current;
+            new_bucket.dedup = policy;
+            let new_bytes = new_bucket.encode_to_vec();
+            (expected, new_bucket, new_bytes)
+        };
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Buckets,
+                    key: req.bucket.clone(),
+                    expected: Some(expected_bytes),
+                    new_value: Some(new_bytes),
+                }],
+                requested_by: "set-bucket-dedup".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("bucket changed since read; retry"));
+                    }
+                    other => {
+                        error!("unexpected raft response for set_bucket_dedup: {other:?}");
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.put_bucket(&req.bucket, &new_bucket);
+        }
+
+        self.buckets.write().insert(req.bucket.clone(), new_bucket);
+        info!("Set dedup policy for bucket '{}'", req.bucket);
+        Ok(Response::new(
+            objectio_proto::metadata::SetBucketDedupResponse {},
+        ))
+    }
+
+    async fn get_dedup_policy(
+        &self,
+        request: Request<objectio_proto::metadata::GetDedupPolicyRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetDedupPolicyResponse>, Status> {
+        let req = request.into_inner();
+        let cluster = self
+            .config
+            .read()
+            .get(objectio_proto::dedup::CLUSTER_KEY)
+            .and_then(|e| objectio_proto::dedup::cluster_from_config(&e.value));
+        let (bucket, tenant_name) = if req.bucket.is_empty() {
+            (None, String::new())
+        } else {
+            let buckets = self.buckets.read();
+            let b = buckets
+                .get(&req.bucket)
+                .ok_or_else(|| Status::not_found(format!("bucket '{}' not found", req.bucket)))?;
+            (b.dedup, b.tenant.clone())
+        };
+        let tenant = if req.bucket.is_empty() {
+            None
+        } else {
+            self.tenants.read().get(&tenant_name).and_then(|t| t.dedup)
+        };
+        let e = objectio_proto::dedup::resolve(
+            &req.bucket,
+            &tenant_name,
+            bucket.as_ref(),
+            tenant.as_ref(),
+            cluster.as_ref(),
+        );
+        let mut resp = objectio_proto::metadata::GetDedupPolicyResponse {
+            bucket,
+            tenant,
+            cluster,
+            tenant_name,
+            effective_domain: e.domain,
+            mode_from: e.mode_from.into(),
+            scope_from: e.scope_from.into(),
+            ..Default::default()
+        };
+        resp.set_effective_mode(e.mode);
+        resp.set_effective_scope(e.scope);
+        Ok(Response::new(resp))
+    }
+
+    async fn locate_chunks(
+        &self,
+        request: Request<objectio_proto::metadata::LocateChunksRequest>,
+    ) -> Result<Response<objectio_proto::metadata::LocateChunksResponse>, Status> {
+        let req = request.into_inner();
+        let pool = self
+            .buckets
+            .read()
+            .get(&req.bucket)
+            .map(|b| b.pool.clone())
+            .unwrap_or_default();
+        let pg_count = if pool.is_empty() {
+            0
+        } else {
+            self.pools.read().get(&pool).map_or(0, |p| p.pg_count)
+        };
+        // Without placement groups (today's default buckets), chunks map by
+        // jump hash over the OSDs in placement — stable while membership is.
+        let mut in_placement: Vec<([u8; 16], String)> = self
+            .osd_nodes
+            .read()
+            .iter()
+            .filter(|n| n.admin_state == objectio_common::OsdAdminState::In)
+            .map(|n| (n.node_id, n.address.clone()))
+            .collect();
+        in_placement.sort();
+
+        let (addresses, node_ids) = req
+            .fingerprints
+            .iter()
+            .map(|fp| {
+                let h = xxhash_rust::xxh64::xxh64(fp, 0);
+                if pg_count > 0 {
+                    let pg_id = objectio_placement::jump_consistent_hash(h, pg_count as i32) as u32;
+                    return self
+                        .placement_group(&pool, pg_id)
+                        .and_then(|pg| pg.osd_ids.first().cloned())
+                        .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+                        .and_then(|id| self.osd_address_by_id(&id).map(|a| (a, id.to_vec())))
+                        .unwrap_or_default();
+                }
+                if in_placement.is_empty() {
+                    return (String::new(), Vec::new());
+                }
+                let i = objectio_placement::jump_consistent_hash(h, in_placement.len() as i32);
+                let (id, addr) = &in_placement[i as usize];
+                (addr.clone(), id.to_vec())
+            })
+            .unzip();
+        Ok(Response::new(
+            objectio_proto::metadata::LocateChunksResponse {
+                addresses,
+                node_ids,
+            },
+        ))
     }
 
     async fn set_bucket_owner(

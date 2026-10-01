@@ -285,6 +285,24 @@ impl MetadataStore {
         Ok(lsn)
     }
 
+    /// Delete many keys with one WAL record.
+    pub fn batch_delete(&self, keys: &[MetadataKey]) -> Result<u64> {
+        if keys.is_empty() {
+            return Ok(self.wal.current_lsn());
+        }
+        let ops: Vec<MetadataOp> = keys
+            .iter()
+            .map(|k| MetadataOp::Delete { key: k.clone() })
+            .collect();
+        let lsn = self.wal.append_batch(&ops)?;
+        for key in keys {
+            self.index.delete(key, lsn);
+            self.cache.remove(key);
+        }
+        debug!("batch_delete: {} entries, lsn={}", keys.len(), lsn);
+        Ok(lsn)
+    }
+
     /// Scan entries with a key prefix
     pub fn scan_prefix(&self, prefix: &MetadataKey) -> Vec<(MetadataKey, Vec<u8>)> {
         self.index.scan_prefix(prefix)

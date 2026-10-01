@@ -13,6 +13,8 @@ name = "objectio-gateway"
 path = "src/main.rs"
 
 [dependencies]
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
 objectio-common = { workspace = true }
 objectio-erasure = { workspace = true }
 objectio-transport-te = { workspace = true }

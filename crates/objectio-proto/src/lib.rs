@@ -52,3 +52,7 @@ pub mod raft {
 /// keeps the workspace lints the generated modules opt out of.
 #[warn(clippy::pedantic, clippy::nursery)]
 pub mod transport;
+
+/// Deduplication policy resolution, shared by meta and the gateway.
+#[warn(clippy::pedantic, clippy::nursery)]
+pub mod dedup;
