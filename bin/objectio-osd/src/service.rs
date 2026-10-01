@@ -1986,6 +1986,11 @@ impl StorageService for OsdService {
                         shards.push(AffectedShardRef {
                             stripe_id: stripe.stripe_id,
                             position: shard.position,
+                            shard_object_id: if stripe.object_id.is_empty() {
+                                object.object_id.clone()
+                            } else {
+                                stripe.object_id.clone()
+                            },
                         });
                     }
                 }
