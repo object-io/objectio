@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package objectio.metadata;
 
+import "block.proto";
+
 // Metadata service for bucket and object operations
 service MetadataService {
     // Bucket operations
@@ -202,6 +204,23 @@ service MetadataService {
     // later block snapshots and dedup). Unshared stripes have no entry.
     rpc ShareStripes(ShareStripesRequest) returns (ShareStripesResponse);
     rpc ReleaseStripes(ReleaseStripesRequest) returns (ReleaseStripesResponse);
+
+    // Block storage metadata, replicated through Raft: volumes, each
+    // volume's chunk map, snapshots, clones. The block gateway keeps none
+    // of its own. Chunks shared with snapshots and clones are counted in
+    // the shared-stripe registry, so each frees only what it alone used.
+    rpc BlockCreateVolume(BlockCreateVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockGetVolume(BlockGetVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockListVolumes(BlockListVolumesRequest) returns (BlockListVolumesResponse);
+    rpc BlockUpdateVolume(BlockUpdateVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockDeleteVolume(BlockDeleteVolumeRequest) returns (BlockReleaseResponse);
+    rpc BlockGetChunks(BlockGetChunksRequest) returns (BlockGetChunksResponse);
+    rpc BlockCommitChunks(BlockCommitChunksRequest) returns (BlockReleaseResponse);
+    rpc BlockCreateSnapshot(BlockCreateSnapshotRequest) returns (BlockSnapshotResponse);
+    rpc BlockGetSnapshot(BlockGetSnapshotRequest) returns (BlockSnapshotResponse);
+    rpc BlockListSnapshots(BlockListSnapshotsRequest) returns (BlockListSnapshotsResponse);
+    rpc BlockDeleteSnapshot(BlockDeleteSnapshotRequest) returns (BlockReleaseResponse);
+    rpc BlockCloneVolume(BlockCloneVolumeRequest) returns (BlockVolumeResponse);
 
     // Object lock configuration
     rpc PutObjectLockConfiguration(PutObjectLockConfigRequest) returns (PutObjectLockConfigResponse);
@@ -2585,4 +2604,100 @@ message ReleaseStripesRequest {
 }
 message ReleaseStripesResponse {
     repeated bytes freeable = 1;
+}
+
+// ---- Block storage metadata ----
+
+// One chunk of a volume or snapshot: the erasure-coded stripe holding its
+// bytes, and the referrer it holds that stripe as in the shared-stripe
+// registry (the stripe's own id for a chunk the volume wrote itself, the
+// snapshot's id, or a clone's volume id for a chunk it inherited).
+message BlockChunkRef {
+    uint64 chunk_id = 1;
+    StripeMeta stripe = 2;
+    bytes owner = 3;
+}
+
+message BlockCreateVolumeRequest {
+    string name = 1;
+    uint64 size_bytes = 2;
+    string pool = 3;
+    uint32 chunk_size_bytes = 4;   // 0 = 4 MiB
+    map<string, string> metadata = 5;
+}
+message BlockVolumeResponse {
+    objectio.block.Volume volume = 1;
+}
+// By id, or by name when the id is empty.
+message BlockGetVolumeRequest {
+    string volume_id = 1;
+    string name = 2;
+}
+message BlockListVolumesRequest {}
+message BlockListVolumesResponse {
+    repeated objectio.block.Volume volumes = 1;
+}
+// Grow the volume (0 = unchanged) and/or set its state (UNKNOWN = unchanged).
+message BlockUpdateVolumeRequest {
+    string volume_id = 1;
+    uint64 size_bytes = 2;
+    objectio.block.VolumeState state = 3;
+}
+message BlockDeleteVolumeRequest {
+    string volume_id = 1;
+}
+// Stripes no volume, snapshot or clone references any more: the caller
+// deletes their shards.
+message BlockReleaseResponse {
+    repeated StripeMeta freeable = 1;
+}
+
+// Chunks [start, start + count) that are stored; unwritten ones are absent.
+message BlockGetChunksRequest {
+    string volume_id = 1;
+    uint64 start_chunk = 2;
+    uint64 count = 3;
+}
+message BlockGetChunksResponse {
+    repeated BlockChunkRef chunks = 1;
+}
+
+// Point chunks at newly written stripes. Each update names the stripe it
+// replaces (expected_object_id, empty for none), so a stale writer cannot
+// overwrite a newer one: ABORTED if any does not match, and nothing is
+// changed. The replaced stripes are released; those now unreferenced are
+// returned to free.
+message BlockChunkUpdate {
+    uint64 chunk_id = 1;
+    bytes expected_object_id = 2;
+    StripeMeta stripe = 3;         // absent: the chunk is unwritten again (trim)
+}
+message BlockCommitChunksRequest {
+    string volume_id = 1;
+    repeated BlockChunkUpdate updates = 2;
+}
+
+message BlockCreateSnapshotRequest {
+    string volume_id = 1;
+    string name = 2;
+}
+message BlockSnapshotResponse {
+    objectio.block.Snapshot snapshot = 1;
+}
+message BlockGetSnapshotRequest {
+    string snapshot_id = 1;
+}
+// All snapshots, or a volume's when volume_id is set.
+message BlockListSnapshotsRequest {
+    string volume_id = 1;
+}
+message BlockListSnapshotsResponse {
+    repeated objectio.block.Snapshot snapshots = 1;
+}
+message BlockDeleteSnapshotRequest {
+    string snapshot_id = 1;
+}
+message BlockCloneVolumeRequest {
+    string snapshot_id = 1;
+    string name = 2;
 }
