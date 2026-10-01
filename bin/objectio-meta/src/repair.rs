@@ -23,6 +23,11 @@
 //! PUT's listing commit that failed while its ObjectMeta landed), so such
 //! objects show up in ListObjects again.
 //!
+//! Block storage chunks are walked too, from meta's own block tables (the
+//! only record of where a chunk's shards are): a lost shard is rebuilt in
+//! place, and one never written is rebuilt on its placement OSD and its
+//! location added to every chunk record holding the stripe.
+//!
 //! Out of scope here: replicated and LRC stripes, shards on OSDs that do
 //! not answer (they may be rebooting; drain handles OSDs that are gone),
 //! and version entries other than the current one.
@@ -171,15 +176,48 @@ pub async fn pass(meta: &Arc<MetaService>) {
                 .into_iter()
                 .filter(|o| owner(o) == Some(node_id.as_slice()))
                 .collect();
-            audit(meta, &address, &owned).await;
+            audit(meta, Source::Osd(&address), &owned).await;
             if next.is_empty() {
                 break;
             }
             cursor = next;
         }
     }
+    for page in meta.block_stripes().chunks(PAGE as usize) {
+        if !meta.is_raft_leader() {
+            return;
+        }
+        let objects: Vec<ObjectMeta> = page.iter().cloned().map(block_object).collect();
+        audit(meta, Source::Block, &objects).await;
+    }
     STATS.passes.fetch_add(1, Ordering::Relaxed);
 }
+
+/// Where the objects being audited are recorded, and so where a rebuilt
+/// shard's new location goes.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// ObjectMetas listed from the OSD at this address, which owns them.
+    Osd(&'a str),
+    /// Block chunk stripes, recorded in meta's block tables.
+    Block,
+}
+
+/// A block stripe in the shape `audit` takes. The key is only a name for
+/// logs and placement.
+fn block_object(stripe: StripeMeta) -> ObjectMeta {
+    ObjectMeta {
+        bucket: BLOCK_BUCKET.into(),
+        key: hex::encode(&stripe.object_id),
+        object_id: stripe.object_id.clone(),
+        size: stripe.data_size,
+        stripes: vec![stripe],
+        ..Default::default()
+    }
+}
+
+/// Bucket name block chunks are placed under.
+const BLOCK_BUCKET: &str = "__block__";
 
 /// The node that answers for this object: the one that counts it in usage,
 /// or for objects written before that existed, the holder of its first
@@ -275,7 +313,7 @@ fn shard_object_id<'a>(object: &'a ObjectMeta, stripe: &'a StripeMeta) -> &'a [u
     }
 }
 
-async fn audit(meta: &Arc<MetaService>, owner_addr: &str, objects: &[ObjectMeta]) {
+async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMeta]) {
     // Every listed shard of every repairable stripe, grouped by node, so
     // each node is asked once for the whole page.
     let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
@@ -337,8 +375,7 @@ async fn audit(meta: &Arc<MetaService>, owner_addr: &str, objects: &[ObjectMeta]
                     );
                 }
                 Verdict::Rebuild { bad, good } => {
-                    if let Err(e) =
-                        rebuild(meta, owner_addr, object, stripe, &seen, &bad, &good).await
+                    if let Err(e) = rebuild(meta, source, object, stripe, &seen, &bad, &good).await
                     {
                         STATS.errors.fetch_add(1, Ordering::Relaxed);
                         warn!(
@@ -349,6 +386,9 @@ async fn audit(meta: &Arc<MetaService>, owner_addr: &str, objects: &[ObjectMeta]
                 }
             }
         }
+        let Source::Osd(owner_addr) = source else {
+            continue;
+        };
         if let Err(e) = restore_listing(meta, owner_addr, object).await {
             STATS.errors.fetch_add(1, Ordering::Relaxed);
             warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
@@ -407,7 +447,7 @@ async fn check_shards(
 /// where they belong.
 async fn rebuild(
     meta: &Arc<MetaService>,
-    owner_addr: &str,
+    source: Source<'_>,
     object: &ObjectMeta,
     stripe: &StripeMeta,
     seen: &[Seen],
@@ -505,7 +545,16 @@ async fn rebuild(
     }
 
     if !added.is_empty() {
-        record_locations(meta, owner_addr, object, stripe.stripe_id, added).await?;
+        match source {
+            Source::Osd(owner_addr) => {
+                record_locations(meta, owner_addr, object, stripe.stripe_id, added).await?;
+            }
+            Source::Block => {
+                meta.block_add_shard_locations(&object.object_id, &added)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("record block shard locations: {e}"))?;
+            }
+        }
     }
     Ok(())
 }

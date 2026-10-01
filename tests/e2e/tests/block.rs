@@ -4,14 +4,18 @@
 
 use objectio_e2e::Cluster;
 use objectio_proto::block::block_service_client::BlockServiceClient;
+use std::time::{Duration, Instant};
+
 use objectio_proto::block::{
-    CreateVolumeRequest, FlushRequest, ListVolumesRequest, ReadRequest, WriteRequest,
+    CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest,
+    DeleteVolumeRequest, FlushRequest, ListVolumesRequest, ReadRequest, WriteRequest,
 };
 use tonic::transport::Channel;
 
 const MIB: u64 = 1024 * 1024;
 /// The block layer's chunk: the unit it caches, erasure-codes and stores.
 const CHUNK: u64 = 4 * MIB;
+const CHUNK_LEN: usize = 4 << 20;
 
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -27,19 +31,16 @@ struct Block {
 
 impl Block {
     fn start() -> Self {
+        Self::start_with_args(&[])
+    }
+
+    fn start_with_args(extra: &[&str]) -> Self {
         let port = free_port();
         let nbd = free_port();
-        let cluster = Cluster::start_with_ec_and_args(
-            6,
-            4,
-            2,
-            &[
-                "--block-port",
-                &port.to_string(),
-                "--nbd-port",
-                &nbd.to_string(),
-            ],
-        );
+        let (port_s, nbd_s) = (port.to_string(), nbd.to_string());
+        let mut args = vec!["--block-port", &port_s, "--nbd-port", &nbd_s];
+        args.extend_from_slice(extra);
+        let cluster = Cluster::start_with_ec_and_args(6, 4, 2, &args);
         let rt = tokio::runtime::Runtime::new().unwrap();
         Self { cluster, port, rt }
     }
@@ -116,6 +117,51 @@ impl Block {
 
     fn restart(&mut self) {
         self.cluster.restart();
+    }
+
+    fn snapshot(&self, vol: &str, name: &str) -> String {
+        self.rt
+            .block_on(self.client().create_snapshot(CreateSnapshotRequest {
+                volume_id: vol.into(),
+                name: name.into(),
+                ..Default::default()
+            }))
+            .unwrap()
+            .into_inner()
+            .snapshot
+            .unwrap()
+            .snapshot_id
+    }
+
+    fn clone_of(&self, snapshot: &str, name: &str) -> String {
+        self.rt
+            .block_on(self.client().clone_volume(CloneVolumeRequest {
+                snapshot_id: snapshot.into(),
+                name: name.into(),
+                ..Default::default()
+            }))
+            .unwrap()
+            .into_inner()
+            .volume
+            .unwrap()
+            .volume_id
+    }
+
+    fn delete_volume(&self, vol: &str) {
+        self.rt
+            .block_on(self.client().delete_volume(DeleteVolumeRequest {
+                volume_id: vol.into(),
+                force: false,
+            }))
+            .unwrap();
+    }
+
+    fn delete_snapshot(&self, snapshot: &str) {
+        self.rt
+            .block_on(self.client().delete_snapshot(DeleteSnapshotRequest {
+                snapshot_id: snapshot.into(),
+            }))
+            .unwrap();
     }
 }
 
@@ -209,4 +255,160 @@ fn io_past_the_end_of_a_volume_is_refused() {
         length_bytes: 512,
     }));
     assert_eq!(read.unwrap_err().code(), tonic::Code::OutOfRange);
+}
+
+/// What snapshots are for: the volume moves on, the snapshot does not, and
+/// a clone starts from the snapshot and then goes its own way — all of it
+/// still so after a restart.
+#[test]
+fn a_snapshot_keeps_its_point_in_time_and_a_clone_starts_from_it() {
+    let mut b = Block::start();
+    let vol = b.create("base", 4 * CHUNK);
+    let before = pattern(2 * CHUNK, 1);
+    b.write(&vol, 0, &before);
+    // Not flushed: taking the snapshot stores what was written first.
+    let snap = b.snapshot(&vol, "s1");
+
+    let after = pattern(CHUNK, 2);
+    b.write(&vol, 0, &after);
+    b.flush(&vol);
+    let clone = b.clone_of(&snap, "copy");
+    assert_eq!(
+        b.read(&clone, 0, 2 * CHUNK),
+        before,
+        "the clone is not the snapshot"
+    );
+
+    let own = pattern(4096, 3);
+    b.write(&clone, CHUNK + 512, &own);
+    b.flush(&clone);
+
+    let check = |b: &Block, when: &str| {
+        let (vol, clone) = (b.id_of("base"), b.id_of("copy"));
+        assert_eq!(
+            b.read(&vol, 0, CHUNK),
+            after,
+            "the volume lost its write {when}"
+        );
+        assert_eq!(
+            b.read(&vol, CHUNK, CHUNK),
+            before[CHUNK_LEN..],
+            "the volume's untouched chunk changed {when}"
+        );
+        let mut want = before.clone();
+        want[CHUNK_LEN + 512..CHUNK_LEN + 512 + own.len()].copy_from_slice(&own);
+        assert_eq!(
+            b.read(&clone, 0, 2 * CHUNK),
+            want,
+            "the clone is wrong {when}"
+        );
+    };
+    check(&b, "");
+    b.restart();
+    check(&b, "after a restart");
+}
+
+/// Deleting gives back exactly what nothing else uses: a snapshot keeps the
+/// chunks it shares alive past its volume, and the space comes back when
+/// the last holder goes.
+#[test]
+fn deleting_frees_only_what_nothing_else_uses() {
+    let b = Block::start();
+    let empty = b.cluster.total_used_bytes();
+    let vol = b.create("v", 2 * CHUNK);
+    let first = pattern(CHUNK, 4);
+    b.write(&vol, 0, &first);
+    b.flush(&vol);
+    let one_chunk = b
+        .cluster
+        .await_total_used_bytes(b.cluster.total_used_bytes());
+    assert!(one_chunk > empty);
+
+    let snap = b.snapshot(&vol, "keep");
+    b.write(&vol, 0, &pattern(CHUNK, 5));
+    b.flush(&vol);
+    let two_chunks = b.cluster.total_used_bytes();
+    assert!(
+        two_chunks > one_chunk,
+        "the overwrite freed the snapshot's chunk"
+    );
+
+    // The volume's own chunk goes; the snapshot's stays readable.
+    b.delete_volume(&vol);
+    assert_eq!(b.cluster.await_total_used_bytes(one_chunk), one_chunk);
+    let clone = b.clone_of(&snap, "from-snapshot");
+    assert_eq!(b.read(&clone, 0, CHUNK), first);
+
+    b.delete_snapshot(&snap);
+    assert_eq!(
+        b.cluster.total_used_bytes(),
+        one_chunk,
+        "the clone still uses it"
+    );
+    b.delete_volume(&clone);
+    assert_eq!(b.cluster.await_total_used_bytes(empty), empty);
+}
+
+/// The gateway keeps nothing a volume depends on: losing its whole
+/// directory loses no volume and no flushed data.
+#[test]
+fn volumes_survive_the_loss_of_the_gateways_own_disk() {
+    let mut b = Block::start();
+    let vol = b.create("v", 2 * CHUNK);
+    let data = pattern(CHUNK + 4096, 6);
+    b.write(&vol, 0, &data);
+    b.flush(&vol);
+
+    b.cluster.restart_without("block");
+    let vol = b.id_of("v");
+    assert_eq!(b.read(&vol, 0, CHUNK + 4096), data);
+}
+
+/// Sum of every sample of `name` whose labels contain all of `labels`.
+fn metric(c: &Cluster, name: &str, labels: &[&str]) -> u64 {
+    c.request("GET", "/metrics", &[])
+        .text()
+        .lines()
+        .filter(|l| {
+            l.split(['{', ' ']).next() == Some(name) && labels.iter().all(|want| l.contains(want))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// Block chunks are repaired like objects: after a disk is lost and its
+/// shards rebuilt, a volume survives two more lost disks.
+#[test]
+fn a_lost_disk_is_rebuilt_for_block_chunks_too() {
+    let mut b = Block::start_with_args(&["--repair-interval-secs", "1"]);
+    let vol = b.create("v", 2 * CHUNK);
+    let data = pattern(2 * CHUNK, 7);
+    b.write(&vol, 0, &data);
+    b.flush(&vol);
+
+    b.cluster.restart_with_lost_disk(0);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let rebuilt = |b: &Block| {
+        metric(
+            &b.cluster,
+            "objectio_meta_repair_shards_rebuilt_total",
+            &["reason=\"missing\""],
+        )
+    };
+    while rebuilt(&b) < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the block chunks were not rebuilt"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    b.cluster.restart_with_lost_disks(&[1, 2]);
+    let vol2 = b.id_of("v");
+    assert_eq!(vol2, vol);
+    assert_eq!(
+        b.read(&vol, 0, 2 * CHUNK),
+        data,
+        "unreadable with two more disks lost"
+    );
 }

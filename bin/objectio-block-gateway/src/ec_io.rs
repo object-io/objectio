@@ -1,58 +1,48 @@
 //! Erasure-coded chunk I/O
 //!
-//! Encodes/decodes 4 MB chunks using the same EC path as the S3 gateway:
-//!   GetPlacement → WriteShard/ReadShard per shard → PutObjectMeta
+//! A chunk is written as one erasure-coded stripe under a fresh object id:
+//! GetPlacement → WriteShard per shard. Meta records the stripe in the
+//! volume's chunk map (see `meta_blocks`); reads take the stripe from
+//! there and fetch the shards from the nodes it names.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use objectio_common::ErasureConfig;
 use objectio_erasure::ErasureCodec;
-use objectio_proto::metadata::{
-    GetPlacementRequest, NodePlacement, ObjectMeta, ShardLocation, StripeMeta,
-    metadata_service_client::MetadataServiceClient,
-};
-use tokio::sync::Mutex;
-use tonic::transport::Channel;
+use objectio_proto::metadata::{GetPlacementRequest, NodePlacement, ShardLocation, StripeMeta};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::osd_pool::{
-    OsdPool, delete_object_meta_from_osd, delete_shards_for_object, get_object_meta_from_osd,
-    put_object_meta_to_osd, read_shard_from_osd, write_shard_to_osd,
-};
+use crate::meta_blocks::MetaBlocks;
+use crate::osd_pool::{OsdPool, OsdPoolError, read_shard_from_osd, write_shard_to_osd};
 
-/// Bucket name reserved for all block chunks.
+/// Bucket name block chunks are placed under.
 pub const BLOCK_BUCKET: &str = "__block__";
 
-/// Derive the object key for a volume chunk.
+/// Derive the placement key for a volume chunk.
 pub fn chunk_object_key(volume_id: &str, chunk_id: u64) -> String {
     format!("vol_{volume_id}/chunk_{chunk_id:08x}")
 }
 
-/// Write `data` as an EC chunk to the OSD cluster.
-///
-/// Returns the object key stored in `__block__/<object_key>`.
+/// Write `data` as a new erasure-coded stripe and return it, for meta to
+/// record. Fails unless a write quorum of shards was stored.
 pub async fn write_chunk(
-    meta_client: Arc<Mutex<MetadataServiceClient<Channel>>>,
+    meta: &MetaBlocks,
     osd_pool: &Arc<OsdPool>,
     volume_id: &str,
     chunk_id: u64,
     data: &[u8],
     ec_k: u32,
     ec_m: u32,
-) -> Result<String> {
-    let object_key = chunk_object_key(volume_id, chunk_id);
-
-    // Get placement for this chunk
-    let placement = meta_client
-        .lock()
+) -> Result<StripeMeta> {
+    let placement = meta
+        .client()
         .await
         .get_placement(GetPlacementRequest {
             bucket: BLOCK_BUCKET.to_string(),
-            key: object_key.clone(),
+            key: chunk_object_key(volume_id, chunk_id),
             size: data.len() as u64,
             storage_class: String::new(),
         })
@@ -64,81 +54,40 @@ pub async fn write_chunk(
         return Err(anyhow!("no placement nodes returned for chunk {chunk_id}"));
     }
 
-    // Read the generation this write replaces, before the meta that points at
-    // it is overwritten. Every flush mints a fresh object_id below, so without
-    // this the previous stripe stays on the OSDs with nothing referencing it —
-    // and a block device rewrites the same chunk over and over, so the leak is
-    // proportional to write volume rather than to volume size.
-    //
-    // A read failure here is not fatal: the worst case is the leak this used
-    // to have unconditionally, and refusing the write instead would be worse.
-    let meta_nodes = unique_nodes(&placement.nodes);
-    let superseded = match get_meta_anywhere(osd_pool, &meta_nodes, &object_key).await {
-        Ok(meta) => meta,
-        Err(e) => {
-            warn!("chunk {chunk_id}: cannot read the meta being replaced, shards may leak: {e}");
-            None
-        }
-    };
-
-    // EC encode
     let codec = ErasureCodec::new(ErasureConfig::new(ec_k as u8, ec_m as u8))
         .map_err(|e| anyhow!("erasure codec init: {e}"))?;
-
     let shards = codec
         .encode_bytes(data)
         .map_err(|e| anyhow!("erasure encode: {e}"))?;
 
-    // Generate a unique object ID for this write
-    let object_id = Uuid::new_v4();
-    let object_id_bytes: Vec<u8> = object_id.as_bytes().to_vec();
-
+    // Every write is a new stripe under its own id: the one it replaces
+    // stays intact until meta has recorded this one, and is freed only
+    // once nothing (a snapshot, a clone) uses it.
+    let object_id = Uuid::new_v4().as_bytes().to_vec();
     let total_shards = (ec_k + ec_m) as usize;
 
-    // Write all shards in parallel
-    let shard_futs: Vec<_> = shards
-        .iter()
-        .enumerate()
-        .map(|(i, shard_data)| {
-            let node_placement = if i < placement.nodes.len() {
-                placement.nodes[i].clone()
-            } else {
-                // Fall back to round-robin if fewer placements than shards
-                placement.nodes[i % placement.nodes.len()].clone()
-            };
-            let oid = object_id_bytes.clone();
-            let sdata = shard_data.clone();
-            let pool = Arc::clone(osd_pool);
-            async move {
-                let result = write_shard_to_osd(
-                    &pool,
-                    &node_placement,
-                    &oid,
-                    0,
-                    i as u32,
-                    sdata,
-                    ec_k,
-                    ec_m,
-                )
-                .await;
-                (i as u32, node_placement, result)
-            }
-        })
-        .collect();
+    let results = join_all(shards.iter().enumerate().map(|(i, shard_data)| {
+        let node = placement.nodes[i % placement.nodes.len()].clone();
+        let oid = object_id.clone();
+        let sdata = shard_data.clone();
+        let pool = Arc::clone(osd_pool);
+        async move {
+            let result =
+                write_shard_to_osd(&pool, &node, &oid, 0, i as u32, sdata, ec_k, ec_m).await;
+            (i as u32, node, result)
+        }
+    }))
+    .await;
 
-    let results = join_all(shard_futs).await;
-
-    // Only shards actually written are recorded, each at the position and
-    // node it went to. (All placement nodes used to be recorded whether or
-    // not their write succeeded.)
+    // Only shards actually written are recorded, each where it went.
     let mut stripe_shards: Vec<ShardLocation> = Vec::with_capacity(total_shards);
     for (position, node, result) in results {
         match result {
-            Ok(_) => stripe_shards.push(ShardLocation {
+            Ok(location) => stripe_shards.push(ShardLocation {
                 position,
                 node_id: node.node_id.clone(),
-                disk_id: node.disk_id.clone(),
-                offset: 0,
+                disk_id: location.disk_id,
+                offset: location.offset,
                 shard_type: node.shard_type,
                 local_group: node.local_group,
             }),
@@ -146,67 +95,29 @@ pub async fn write_chunk(
         }
     }
 
+    let stripe = StripeMeta {
+        stripe_id: 0,
+        ec_k,
+        ec_m,
+        shards: stripe_shards,
+        ec_type: 0, // ErasureMds
+        data_size: data.len() as u64,
+        object_id,
+        ..Default::default()
+    };
+
     // A spare shard beyond k before the chunk counts as stored: with only k
     // it would have no redundancy left. Failing here leaves the chunk dirty
     // (and journaled) for the next flush to retry.
     let quorum = write_quorum(ec_k, ec_m);
-    if stripe_shards.len() < quorum {
+    if stripe.shards.len() < quorum {
+        let written = stripe.shards.len();
+        free_stripes(meta, osd_pool, std::slice::from_ref(&stripe)).await;
         return Err(anyhow!(
-            "only {}/{total_shards} shards written for chunk {chunk_id}, need {quorum}",
-            stripe_shards.len()
+            "only {written}/{total_shards} shards written for chunk {chunk_id}, need {quorum}"
         ));
     }
-
-    let now = chrono::Utc::now().timestamp_millis() as u64;
-
-    let object_meta = ObjectMeta {
-        bucket: BLOCK_BUCKET.to_string(),
-        key: object_key.clone(),
-        object_id: object_id_bytes.clone(),
-        size: data.len() as u64,
-        etag: hex::encode(uuid::Uuid::new_v4().as_bytes()), // simple unique etag
-        content_type: "application/octet-stream".to_string(),
-        created_at: now,
-        modified_at: now,
-        storage_class: String::new(),
-        user_metadata: HashMap::new(),
-        version_id: String::new(),
-        is_delete_marker: false,
-        retention: None,
-        legal_hold: None,
-        stripes: vec![StripeMeta {
-            stripe_id: 0,
-            ec_k,
-            ec_m,
-            shards: stripe_shards,
-            ec_type: 0, // ErasureMds
-            ec_local_parity: 0,
-            ec_global_parity: 0,
-            local_group_size: 0,
-            data_size: data.len() as u64,
-            object_id: object_id_bytes,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    // The chunk's metadata on every OSD in its placement, not only the
-    // first: it is the only record of where the shards are, and one copy
-    // made that OSD's metadata a single point of loss for the chunk.
-    put_meta_everywhere(osd_pool, &meta_nodes, &object_key, &object_meta).await?;
-
-    // Only now is the old stripe unreachable. Freeing it earlier would put a
-    // window between "old shards gone" and "new meta committed" in which a
-    // crash loses the chunk; this ordering leaks on a crash instead, which is
-    // recoverable and the old behaviour anyway.
-    if let Some(old) = superseded {
-        let failed = delete_shards_for_object(osd_pool, &placement.nodes, &old.stripes).await;
-        if failed > 0 {
-            warn!("chunk {chunk_id}: {failed} shard deletes failed for the superseded generation");
-        }
-    }
-
-    Ok(object_key)
+    Ok(stripe)
 }
 
 /// Shards of a k+m chunk that must be written for it to count as stored:
@@ -216,61 +127,18 @@ const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
     if ec_m == 0 { k } else { k + 1 }
 }
 
-/// Placement nodes, each once (a small cluster can place several shards on
-/// one node).
-fn unique_nodes(nodes: &[NodePlacement]) -> Vec<NodePlacement> {
-    let mut seen = std::collections::HashSet::new();
-    nodes
-        .iter()
-        .filter(|n| seen.insert(n.node_id.clone()))
-        .cloned()
-        .collect()
-}
-
-/// Write a chunk's metadata to every node; all must accept, or the flush
-/// fails and is retried.
-async fn put_meta_everywhere(
-    osd_pool: &Arc<OsdPool>,
-    nodes: &[NodePlacement],
-    object_key: &str,
-    meta: &ObjectMeta,
-) -> Result<()> {
-    let results = join_all(
-        nodes
-            .iter()
-            .map(|n| put_object_meta_to_osd(osd_pool, n, BLOCK_BUCKET, object_key, meta.clone())),
-    )
-    .await;
-    for (n, r) in nodes.iter().zip(results) {
-        r.map_err(|e| anyhow!("put_object_meta to {} failed: {e}", n.node_address))?;
-    }
-    Ok(())
-}
-
-/// A chunk's metadata from the first node that has it. `None` when every
-/// node that answered has none; an error only when none answered.
-async fn get_meta_anywhere(
-    osd_pool: &Arc<OsdPool>,
-    nodes: &[NodePlacement],
-    object_key: &str,
-) -> Result<Option<ObjectMeta>> {
-    let mut answered = false;
-    let mut last_err = None;
-    for n in nodes {
-        match get_object_meta_from_osd(osd_pool, n, BLOCK_BUCKET, object_key).await {
-            Ok(Some(meta)) => return Ok(Some(meta)),
-            Ok(None) => answered = true,
-            Err(e) => last_err = Some(e),
-        }
-    }
-    if answered {
-        Ok(None)
-    } else {
-        Err(anyhow!(
-            "no OSD answered for {object_key}: {}",
-            last_err.map_or_else(|| "no nodes".to_string(), |e| e.to_string())
-        ))
-    }
+/// Where a shard is: enough to reach its OSD.
+async fn shard_target(meta: &MetaBlocks, loc: &ShardLocation) -> Result<NodePlacement> {
+    Ok(NodePlacement {
+        position: loc.position,
+        node_id: loc.node_id.clone(),
+        node_address: meta.address(&loc.node_id).await?,
+        disk_id: loc.disk_id.clone(),
+        shard_type: loc.shard_type,
+        local_group: loc.local_group,
+        // The block gateway moves shards over gRPC only (for now).
+        te_segment: String::new(),
+    })
 }
 
 /// Load into `cache`, as clean, every stored chunk that a write of `len`
@@ -278,17 +146,12 @@ async fn get_meta_anywhere(
 ///
 /// The cache keeps whole chunks and writes a chunk back whole, so a write
 /// into a chunk it does not hold must start from that chunk's stored bytes.
-/// It used to start from zeros: after a restart, or for any chunk not read
-/// since, a 4 KiB write wiped the other 4 MiB of its chunk at the next
-/// flush. A chunk that cannot be read fails the write rather than doing that.
-#[allow(clippy::too_many_arguments)]
+/// A chunk that cannot be read fails the write rather than zeroing the
+/// rest of it.
 pub async fn load_for_partial_write(
     cache: &objectio_block::WriteCache,
-    store: &crate::store::BlockStore,
-    meta_client: &Arc<Mutex<MetadataServiceClient<Channel>>>,
+    meta: &MetaBlocks,
     osd_pool: &Arc<OsdPool>,
-    ec_k: u32,
-    ec_m: u32,
     volume_id: &str,
     offset: u64,
     len: u64,
@@ -300,164 +163,120 @@ pub async fn load_for_partial_write(
         if whole || cache.holds_chunk(volume_id, range.chunk_id) {
             continue;
         }
-        if let Some(key) = store.get_chunk(volume_id, range.chunk_id)? {
-            let data = read_chunk(Arc::clone(meta_client), osd_pool, &key, ec_k, ec_m).await?;
+        if let Some(stripe) = meta.chunk(volume_id, range.chunk_id).await? {
+            let data = read_stripe(meta, osd_pool, &stripe).await?;
             cache.add_clean(volume_id, range.chunk_id, bytes::Bytes::from(data));
         }
     }
     Ok(())
 }
 
-/// Read and reconstruct a chunk from the OSD cluster.
-///
-/// `object_key` is the value previously returned by `write_chunk`.
+/// A chunk's bytes: zeros if it was never written.
 pub async fn read_chunk(
-    meta_client: Arc<Mutex<MetadataServiceClient<Channel>>>,
+    meta: &MetaBlocks,
     osd_pool: &Arc<OsdPool>,
-    object_key: &str,
-    ec_k: u32,
-    ec_m: u32,
+    volume_id: &str,
+    chunk_id: u64,
+    chunk_size: usize,
 ) -> Result<Vec<u8>> {
-    // Deterministic placement: same key → same nodes
-    let placement = meta_client
-        .lock()
-        .await
-        .get_placement(GetPlacementRequest {
-            bucket: BLOCK_BUCKET.to_string(),
-            key: object_key.to_string(),
-            size: 0,
-            storage_class: String::new(),
-        })
-        .await
-        .map_err(|e| anyhow!("GetPlacement failed: {e}"))?
-        .into_inner();
-
-    if placement.nodes.is_empty() {
-        return Err(anyhow!("no placement nodes for {object_key}"));
+    match meta.chunk(volume_id, chunk_id).await? {
+        Some(stripe) => read_stripe(meta, osd_pool, &stripe).await,
+        None => Ok(vec![0u8; chunk_size]),
     }
+}
 
-    // Shards are found by the node they were written to, not by position
-    // in today's placement, which may have moved since.
-    let addr_by_node: HashMap<Vec<u8>, String> = placement
-        .nodes
-        .iter()
-        .map(|n| (n.node_id.clone(), n.node_address.clone()))
-        .collect();
-
-    let object_meta = get_meta_anywhere(osd_pool, &unique_nodes(&placement.nodes), object_key)
-        .await?
-        .ok_or_else(|| anyhow!("object meta not found for {object_key}"))?;
-
-    let stripe = object_meta
-        .stripes
-        .first()
-        .ok_or_else(|| anyhow!("no stripes in object meta for {object_key}"))?;
-
-    let object_id: &[u8] = if !stripe.object_id.is_empty() {
-        &stripe.object_id
-    } else {
-        &object_meta.object_id
-    };
-
-    let original_size = stripe.data_size as usize;
-    let total = (ec_k + ec_m) as usize;
+/// Read and decode a stripe from the shards it names.
+pub async fn read_stripe(
+    meta: &MetaBlocks,
+    osd_pool: &Arc<OsdPool>,
+    stripe: &StripeMeta,
+) -> Result<Vec<u8>> {
+    let (k, m) = (stripe.ec_k as usize, stripe.ec_m as usize);
+    let id = hex::encode(&stripe.object_id);
+    let total = k + m;
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
     let mut read_count = 0usize;
 
-    // Try to read at least ec_k shards (data shards first)
-    for shard_loc in &stripe.shards {
-        if read_count >= ec_k as usize {
+    // Data shards first; a parity shard only for one that fails.
+    let mut locations: Vec<&ShardLocation> = stripe.shards.iter().collect();
+    locations.sort_by_key(|l| l.position);
+    for loc in locations {
+        if read_count >= k {
             break;
         }
-        let pos = shard_loc.position as usize;
+        let pos = loc.position as usize;
         if pos >= total {
             continue;
         }
-        let Some(address) = addr_by_node.get(&shard_loc.node_id) else {
-            continue;
-        };
-        let node_placement = NodePlacement {
-            position: shard_loc.position,
-            node_id: shard_loc.node_id.clone(),
-            node_address: address.clone(),
-            disk_id: shard_loc.disk_id.clone(),
-            shard_type: shard_loc.shard_type,
-            local_group: shard_loc.local_group,
-            // The block gateway moves shards over gRPC only (for now).
-            te_segment: String::new(),
-        };
-        match read_shard_from_osd(osd_pool, &node_placement, object_id, 0, shard_loc.position).await
-        {
+        let result = async {
+            let target = shard_target(meta, loc).await?;
+            read_shard_from_osd(
+                osd_pool,
+                &target,
+                &stripe.object_id,
+                stripe.stripe_id,
+                loc.position,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+        }
+        .await;
+        match result {
             Ok(data) => {
                 shards[pos] = Some(data);
                 read_count += 1;
             }
-            Err(e) => warn!("Failed to read shard {pos} for {object_key}: {e}"),
+            Err(e) => warn!("Failed to read shard {pos} of stripe {id}: {e}"),
         }
     }
 
-    if read_count < ec_k as usize {
+    if read_count < k {
         return Err(anyhow!(
-            "insufficient shards for {object_key}: have {read_count}, need {ec_k}"
+            "insufficient shards for stripe {id}: have {read_count}, need {k}"
         ));
     }
 
-    let codec = ErasureCodec::new(ErasureConfig::new(ec_k as u8, ec_m as u8))
+    let codec = ErasureCodec::new(ErasureConfig::new(k as u8, m as u8))
         .map_err(|e| anyhow!("erasure codec init: {e}"))?;
-
-    let decoded = codec
-        .decode(&mut shards, original_size)
-        .map_err(|e| anyhow!("erasure decode: {e}"))?;
-
-    Ok(decoded)
+    codec
+        .decode(&mut shards, stripe.data_size as usize)
+        .map_err(|e| anyhow!("erasure decode: {e}"))
 }
 
-/// Free a chunk: its shards first, then the metadata that names them.
+/// Delete the shards of stripes nothing uses any more, each on the node
+/// that holds it.
 ///
-/// This used to delete the metadata alone, which removed the only record of
-/// where the shards were without removing the shards — so deleting a volume
-/// turned its whole footprint into storage nothing could find or reclaim. It
-/// was also never called.
-pub async fn delete_chunk(
-    meta_client: Arc<Mutex<MetadataServiceClient<Channel>>>,
-    osd_pool: &Arc<OsdPool>,
-    object_key: &str,
-) -> Result<()> {
-    let placement = meta_client
-        .lock()
-        .await
-        .get_placement(GetPlacementRequest {
-            bucket: BLOCK_BUCKET.to_string(),
-            key: object_key.to_string(),
-            size: 0,
-            storage_class: String::new(),
+/// Best effort: a shard that will not delete is leaked space, not lost
+/// data. Returns how many deletes failed.
+pub async fn free_stripes(meta: &MetaBlocks, pool: &OsdPool, stripes: &[StripeMeta]) -> usize {
+    use objectio_proto::storage::{DeleteShardRequest, ShardId};
+
+    let futs = stripes.iter().flat_map(|stripe| {
+        stripe.shards.iter().map(move |loc| async move {
+            let target = shard_target(meta, loc).await?;
+            let mut client = pool.get_client_for_placement(&target).await?;
+            let req = DeleteShardRequest {
+                shard_id: Some(ShardId {
+                    object_id: stripe.object_id.clone(),
+                    stripe_id: stripe.stripe_id,
+                    position: loc.position,
+                }),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.delete_shard(req))
+                .await
+                .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            Ok::<_, anyhow::Error>(())
         })
-        .await
-        .map_err(|e| anyhow!("GetPlacement failed: {e}"))?
-        .into_inner();
-
-    let Some(primary) = placement.nodes.first() else {
-        return Ok(());
-    };
-
-    // Read before delete: after the metadata is gone the shard locations are
-    // gone with it.
-    match get_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key).await {
-        Ok(Some(meta)) => {
-            let failed = delete_shards_for_object(osd_pool, &placement.nodes, &meta.stripes).await;
-            if failed > 0 {
-                warn!("{object_key}: {failed} shard deletes failed");
-            }
+    });
+    let mut failed = 0;
+    for r in join_all(futs).await {
+        if let Err(e) = r {
+            failed += 1;
+            warn!("delete_shard failed: {e}");
         }
-        Ok(None) => {}
-        Err(e) => warn!("{object_key}: cannot read meta, shards will leak: {e}"),
     }
-
-    delete_object_meta_from_osd(osd_pool, primary, BLOCK_BUCKET, object_key)
-        .await
-        .map_err(|e| anyhow!("delete_object_meta failed: {e}"))?;
-
-    Ok(())
+    failed
 }
 
 #[cfg(test)]
@@ -469,17 +288,5 @@ mod tests {
         assert_eq!(write_quorum(4, 2), 5);
         assert_eq!(write_quorum(2, 1), 3);
         assert_eq!(write_quorum(1, 0), 1);
-    }
-
-    #[test]
-    fn each_node_gets_the_metadata_once() {
-        let node = |id: u8, pos: u32| NodePlacement {
-            node_id: vec![id; 16],
-            position: pos,
-            ..Default::default()
-        };
-        let nodes = [node(1, 0), node(2, 1), node(1, 2), node(3, 3)];
-        let ids: Vec<u8> = unique_nodes(&nodes).iter().map(|n| n.node_id[0]).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
