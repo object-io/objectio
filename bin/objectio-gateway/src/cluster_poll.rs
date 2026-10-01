@@ -418,8 +418,18 @@ fn render_local(s: &Snapshot) -> String {
     out
 }
 
+/// Whether `/metrics` carries the OSDs' and meta's metrics too.
+static REEXPORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Stop re-exporting OSD and meta metrics (`--no-reexport-metrics`): for
+/// deployments that scrape every OSD and meta node directly, and with
+/// several gateways, where each would otherwise export a copy of them all.
+pub fn set_reexport(on: bool) {
+    REEXPORT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The full `/metrics` body: the gateway's own families, the poll's, and
-/// the merged OSD and meta expositions.
+/// (unless turned off) the merged OSD and meta expositions.
 #[must_use]
 pub fn render_metrics() -> String {
     let mut base = s3_metrics().export_prometheus();
@@ -430,6 +440,9 @@ pub fn render_metrics() -> String {
         return base;
     };
     base.push_str(&render_local(&s));
+    if !REEXPORT.load(std::sync::atomic::Ordering::Relaxed) {
+        return base;
+    }
 
     let own = objectio_common::process_metrics::instance_id();
     let mut sources: Vec<Source<'_>> = s

@@ -43,6 +43,9 @@ spec:
             {{- if .Values.gateway.noAuth }}
             - "--no-auth"
             {{- end }}
+            {{- if not .Values.gateway.reexportMetrics }}
+            - "--no-reexport-metrics"
+            {{- end }}
             - "--external-endpoint"
             {{- /*
               gateway.externalUrl is the canonical key — the public URL the

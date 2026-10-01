@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import {
   Building2,
   Plus,
@@ -21,7 +30,9 @@ import {
   Table,
   Row,
   Cell,
+  seriesColor,
 } from "../components/ui";
+import { capabilities, queryRange, type Series } from "../api/metrics";
 
 interface Tenant {
   name: string;
@@ -221,13 +232,8 @@ export default function Tenants() {
       />
 
       <div className="grid lg:grid-cols-2 gap-4 mb-4">
-        <ChartCard title="Storage by tenant" subtitle="used bytes over time">
-          <NeedsSeries
-            metric="objectio_tenant_used_bytes"
-            reason="Nothing accounts for storage per tenant yet. Bucket and object
-              records carry a tenant, but nothing sums them into a usage figure,
-              so there is no series for Prometheus to keep history of."
-          />
+        <ChartCard title="Storage by tenant" subtitle="stored bytes · last 7 days">
+          <TenantStorageChart />
         </ChartCard>
         <ChartCard title="Requests by tenant" subtitle="requests per hour">
           <NeedsSeries
@@ -544,5 +550,91 @@ function NeedsSeries({ metric, reason }: { metric: string; reason: string }) {
       </code>
       <p className="text-[11px] text-muted max-w-sm">{reason}</p>
     </div>
+  );
+}
+
+const WEEK = 7 * 86400;
+const AXIS = { fontSize: 10, fontFamily: "var(--oio-font-mono)", fill: "var(--oio-faint)" };
+
+function formatStored(b: number): string {
+  if (!b) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(b) / Math.log(1024)));
+  const v = b / 1024 ** i;
+  return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+}
+
+/// Bytes each tenant stores (after erasure coding), from the gateway's
+/// usage poll, as Prometheus kept it.
+function TenantStorageChart() {
+  const [series, setSeries] = useState<Series[] | null>(null);
+  const [promReady, setPromReady] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    capabilities()
+      .then(async (c) => {
+        if (cancelled || !c.prometheus) return;
+        setPromReady(true);
+        const s = await queryRange(
+          "sum by (tenant) (objectio_tenant_stored_bytes)",
+          WEEK
+        ).catch(() => [] as Series[]);
+        if (!cancelled) setSeries(s);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const names = (series ?? []).slice(0, 6).map((s) => s.labels.tenant || "(none)");
+  const rows = useMemo(() => {
+    const byTime = new Map<number, Record<string, number | string>>();
+    (series ?? []).slice(0, 6).forEach((s, i) => {
+      for (const p of s.points) {
+        const row = byTime.get(p.t) ?? {
+          t: p.t,
+          time: new Date(p.t).toLocaleDateString([], { month: "short", day: "numeric" }),
+        };
+        row[names[i]] = p.v;
+        byTime.set(p.t, row);
+      }
+    });
+    return [...byTime.values()].sort((a, b) => Number(a.t) - Number(b.t));
+  }, [series, names]);
+
+  if (rows.length === 0) {
+    return (
+      <NeedsSeries
+        metric="objectio_tenant_stored_bytes"
+        reason={
+          promReady
+            ? "No usage recorded yet: the gateway publishes it after its first usage poll (every 30 s)."
+            : "This needs Prometheus: the console charts history from it, and none is configured (--prometheus-url)."
+        }
+      />
+    );
+  }
+  return (
+    <ResponsiveContainer width="100%" height={200}>
+      <LineChart data={rows} margin={{ top: 4, right: 4, left: 8, bottom: 0 }}>
+        <CartesianGrid stroke="var(--oio-border)" vertical={false} />
+        <XAxis dataKey="time" tick={AXIS} tickLine={false} axisLine={false} minTickGap={40} />
+        <YAxis tick={AXIS} tickLine={false} axisLine={false} width={56} tickFormatter={formatStored} />
+        <Tooltip formatter={(v) => formatStored(Number(v))} />
+        {names.map((n, i) => (
+          <Line
+            key={n}
+            type="monotone"
+            dataKey={n}
+            stroke={seriesColor(i)}
+            strokeWidth={2}
+            dot={false}
+            isAnimationActive={false}
+          />
+        ))}
+      </LineChart>
+    </ResponsiveContainer>
   );
 }

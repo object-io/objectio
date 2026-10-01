@@ -382,12 +382,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rate(objectio_osd_grpc_requests_total{osd_id=~\"$osd\",status=\"success\"}[5m])",
+          "expr": "sum by (method) (rate(objectio_osd_grpc_requests_total{osd_id=~\"$osd\",code=\"OK\"}[5m]))",
           "legendFormat": "{{method}}",
           "refId": "A"
         }
       ],
-      "title": "gRPC Success Rate",
+      "title": "gRPC requests/s (OK)",
       "type": "timeseries"
     },
     {
@@ -429,12 +429,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rate(objectio_osd_grpc_latency_seconds_sum{osd_id=~\"$osd\"}[5m]) / rate(objectio_osd_grpc_requests_total{osd_id=~\"$osd\",status=\"success\"}[5m])",
+          "expr": "histogram_quantile(0.99, sum by (method, le) (rate(objectio_osd_grpc_latency_seconds_bucket{osd_id=~\"$osd\"}[5m])))",
           "legendFormat": "{{method}}",
           "refId": "A"
         }
       ],
-      "title": "gRPC Latency (avg)",
+      "title": "gRPC latency p99",
       "type": "timeseries"
     },
     {
@@ -529,7 +529,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "increase(objectio_osd_grpc_requests_total{osd_id=~\"$osd\",status=\"error\"}[5m])",
+          "expr": "sum by (method) (increase(objectio_osd_grpc_requests_total{osd_id=~\"$osd\",code!=\"OK\"}[5m]))",
           "legendFormat": "{{method}} errors",
           "refId": "A"
         }

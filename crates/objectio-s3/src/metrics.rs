@@ -132,6 +132,18 @@ pub enum S3Operation {
     ListParts,
     ListMultipartUploads,
     DeleteObjects,
+    UploadPartCopy,
+    ListObjectVersions,
+    /// A bucket sub-resource read: `?policy`, `?versioning`, `?lifecycle`…
+    GetBucketConfig,
+    PutBucketConfig,
+    DeleteBucketConfig,
+    /// An object sub-resource: `?tagging`, `?retention`, `?legal-hold`…
+    GetObjectConfig,
+    PutObjectConfig,
+    DeleteObjectConfig,
+    /// POST to a bucket other than `?delete` (browser form upload).
+    PostObject,
 }
 
 impl S3Operation {
@@ -154,6 +166,15 @@ impl S3Operation {
             S3Operation::ListParts => "ListParts",
             S3Operation::ListMultipartUploads => "ListMultipartUploads",
             S3Operation::DeleteObjects => "DeleteObjects",
+            S3Operation::UploadPartCopy => "UploadPartCopy",
+            S3Operation::ListObjectVersions => "ListObjectVersions",
+            S3Operation::GetBucketConfig => "GetBucketConfig",
+            S3Operation::PutBucketConfig => "PutBucketConfig",
+            S3Operation::DeleteBucketConfig => "DeleteBucketConfig",
+            S3Operation::GetObjectConfig => "GetObjectConfig",
+            S3Operation::PutObjectConfig => "PutObjectConfig",
+            S3Operation::DeleteObjectConfig => "DeleteObjectConfig",
+            S3Operation::PostObject => "PostObject",
         }
     }
 }
@@ -216,28 +237,6 @@ impl OperationMetrics {
     }
 }
 
-/// Gateway-level metrics
-#[derive(Debug, Default)]
-struct GatewayMetrics {
-    /// Active connections
-    active_connections: AtomicU64,
-    /// Total connections
-    total_connections: AtomicU64,
-    /// OSD pool connections per OSD
-    osd_connections: RwLock<HashMap<String, u64>>,
-    /// Scatter-gather operations
-    scatter_gather_ops: AtomicU64,
-    /// Scatter-gather latency sum
-    scatter_gather_latency_us: AtomicU64,
-}
-
-/// Iceberg policy decision tracking key
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PolicyDecisionKey {
-    action: String,
-    decision: String,
-}
-
 /// S3 metrics collector
 #[derive(Debug)]
 pub struct S3Metrics {
@@ -247,8 +246,6 @@ pub struct S3Metrics {
     iceberg_operations: RwLock<HashMap<IcebergOperation, OperationMetrics>>,
     /// Per-Unity-Catalog-operation metrics
     unity_operations: RwLock<HashMap<UnityOperation, OperationMetrics>>,
-    /// Iceberg policy decision counters
-    iceberg_policy_decisions: RwLock<HashMap<PolicyDecisionKey, AtomicU64>>,
     /// Bytes pulled during EC shard reads, partitioned by topological
     /// distance between the gateway and the serving OSD. Rendered as
     /// `objectio_read_locality_bytes_total{locality="..."}` in the
@@ -256,8 +253,6 @@ pub struct S3Metrics {
     /// `TopologyDistance::as_str()` (same-host, same-rack, same-datacenter,
     /// same-zone, same-region, remote, unknown).
     locality_read_bytes: RwLock<HashMap<String, AtomicU64>>,
-    /// Gateway metrics
-    gateway: GatewayMetrics,
     /// Start time for uptime calculation
     start_time: Instant,
     /// Protection configuration for capacity calculations
@@ -302,9 +297,7 @@ impl S3Metrics {
             operations: RwLock::new(HashMap::new()),
             iceberg_operations: RwLock::new(HashMap::new()),
             unity_operations: RwLock::new(HashMap::new()),
-            iceberg_policy_decisions: RwLock::new(HashMap::new()),
             locality_read_bytes: RwLock::new(HashMap::new()),
-            gateway: GatewayMetrics::default(),
             start_time: Instant::now(),
             protection: RwLock::new(None),
             capacity: RwLock::new(Vec::new()),
@@ -389,19 +382,6 @@ impl S3Metrics {
         self.record_operation(op, status_code, 0, 0, latency_us);
     }
 
-    /// Record an Iceberg policy decision
-    pub fn record_iceberg_policy_decision(&self, action: &str, decision: &str) {
-        let key = PolicyDecisionKey {
-            action: action.to_string(),
-            decision: decision.to_string(),
-        };
-        let mut decisions = self.iceberg_policy_decisions.write().unwrap();
-        decisions
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Record an Iceberg operation
     pub fn record_iceberg_operation(
         &self,
@@ -421,43 +401,6 @@ impl S3Metrics {
         metrics.record(status_code, 0, 0, latency_us);
     }
 
-    /// Increment active connections
-    pub fn connection_opened(&self) {
-        self.gateway
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-        self.gateway
-            .total_connections
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Decrement active connections
-    pub fn connection_closed(&self) {
-        self.gateway
-            .active_connections
-            .fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Update OSD connection count
-    pub fn update_osd_connections(&self, osd_id: &str, count: u64) {
-        self.gateway
-            .osd_connections
-            .write()
-            .unwrap()
-            .insert(osd_id.to_string(), count);
-    }
-
-    /// Record scatter-gather operation
-    pub fn record_scatter_gather(&self, latency_us: u64) {
-        self.gateway
-            .scatter_gather_ops
-            .fetch_add(1, Ordering::Relaxed);
-        self.gateway
-            .scatter_gather_latency_us
-            .fetch_add(latency_us, Ordering::Relaxed);
-    }
-
-    /// Export metrics in Prometheus format
     /// Replace the capacity snapshot. Called by the gateway's refresher.
     pub fn set_capacity(&self, nodes: Vec<NodeCapacity>) {
         if let Ok(mut guard) = self.capacity.write() {
@@ -525,7 +468,7 @@ impl S3Metrics {
             writeln!(output, "# TYPE {name} gauge").unwrap();
             for n in nodes.iter() {
                 let labels = format!(
-                    "node_id=\"{}\",address=\"{}\"",
+                    "osd_id=\"{}\",address=\"{}\"",
                     n.node_id,
                     n.address.replace('"', "")
                 );
@@ -558,86 +501,6 @@ impl S3Metrics {
         .unwrap();
         writeln!(output, "# TYPE objectio_gateway_uptime_seconds counter").unwrap();
         writeln!(output, "objectio_gateway_uptime_seconds {}", uptime_secs).unwrap();
-
-        // Active connections
-        writeln!(
-            output,
-            "# HELP objectio_gateway_active_connections Current active connections"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_gateway_active_connections gauge").unwrap();
-        writeln!(
-            output,
-            "objectio_gateway_active_connections {}",
-            self.gateway.active_connections.load(Ordering::Relaxed)
-        )
-        .unwrap();
-
-        // Total connections
-        writeln!(
-            output,
-            "# HELP objectio_gateway_connections_total Total connections since start"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_gateway_connections_total counter").unwrap();
-        writeln!(
-            output,
-            "objectio_gateway_connections_total {}",
-            self.gateway.total_connections.load(Ordering::Relaxed)
-        )
-        .unwrap();
-
-        // OSD connections
-        let osd_conns = self.gateway.osd_connections.read().unwrap();
-        if !osd_conns.is_empty() {
-            writeln!(
-                output,
-                "# HELP objectio_gateway_osd_connections Connections to each OSD"
-            )
-            .unwrap();
-            writeln!(output, "# TYPE objectio_gateway_osd_connections gauge").unwrap();
-            for (osd_id, count) in osd_conns.iter() {
-                writeln!(
-                    output,
-                    "objectio_gateway_osd_connections{{osd_id=\"{}\"}} {}",
-                    osd_id, count
-                )
-                .unwrap();
-            }
-        }
-
-        // Scatter-gather metrics
-        let sg_ops = self.gateway.scatter_gather_ops.load(Ordering::Relaxed);
-        if sg_ops > 0 {
-            writeln!(
-                output,
-                "# HELP objectio_gateway_scatter_gather_total Total scatter-gather operations"
-            )
-            .unwrap();
-            writeln!(
-                output,
-                "# TYPE objectio_gateway_scatter_gather_total counter"
-            )
-            .unwrap();
-            writeln!(output, "objectio_gateway_scatter_gather_total {}", sg_ops).unwrap();
-
-            let sg_latency = self
-                .gateway
-                .scatter_gather_latency_us
-                .load(Ordering::Relaxed);
-            writeln!(output, "# HELP objectio_gateway_scatter_gather_latency_seconds_sum Sum of scatter-gather latencies").unwrap();
-            writeln!(
-                output,
-                "# TYPE objectio_gateway_scatter_gather_latency_seconds_sum counter"
-            )
-            .unwrap();
-            writeln!(
-                output,
-                "objectio_gateway_scatter_gather_latency_seconds_sum {}",
-                sg_latency as f64 / 1_000_000.0
-            )
-            .unwrap();
-        }
 
         // Read locality — labeled counter of bytes pulled off OSDs broken
         // down by topological distance from this gateway. Stays at 0 when
@@ -1054,31 +917,6 @@ impl S3Metrics {
             }
         }
 
-        // Iceberg policy decision metrics
-        let policy_decisions = self.iceberg_policy_decisions.read().unwrap();
-        if !policy_decisions.is_empty() {
-            writeln!(
-                output,
-                "# HELP objectio_iceberg_policy_decisions_total Total Iceberg policy decisions by action and decision"
-            )
-            .unwrap();
-            writeln!(
-                output,
-                "# TYPE objectio_iceberg_policy_decisions_total counter"
-            )
-            .unwrap();
-            for (key, count) in policy_decisions.iter() {
-                writeln!(
-                    output,
-                    "objectio_iceberg_policy_decisions_total{{action=\"{}\",decision=\"{}\"}} {}",
-                    key.action,
-                    key.decision,
-                    count.load(Ordering::Relaxed)
-                )
-                .unwrap();
-            }
-        }
-
         output
     }
 }
@@ -1244,7 +1082,7 @@ mod capacity_tests {
         assert!(out.contains("objectio_cluster_osds_total 2"), "{out}");
         assert!(out.contains("objectio_cluster_osds_up 1"), "{out}");
         assert!(
-            out.contains(r#"objectio_osd_up{node_id="gone",address="http://gone:9200"} 0"#),
+            out.contains(r#"objectio_osd_up{osd_id="gone",address="http://gone:9200"} 0"#),
             "the down OSD is missing from the scrape entirely: {out}"
         );
     }
@@ -1255,17 +1093,14 @@ mod capacity_tests {
     fn each_osd_gets_its_own_series() {
         let out = export(vec![node("hot", 100, 99, true), node("cold", 100, 1, true)]);
         assert!(
-            out.contains(r#"objectio_osd_used_bytes{node_id="hot",address="http://hot:9200"} 99"#),
+            out.contains(r#"objectio_osd_used_bytes{osd_id="hot",address="http://hot:9200"} 99"#),
             "{out}"
         );
         assert!(
-            out.contains(r#"objectio_osd_used_bytes{node_id="cold",address="http://cold:9200"} 1"#),
+            out.contains(r#"objectio_osd_used_bytes{osd_id="cold",address="http://cold:9200"} 1"#),
             "{out}"
         );
-        assert!(
-            out.contains(r#"objectio_osd_shards{node_id="hot""#),
-            "{out}"
-        );
+        assert!(out.contains(r#"objectio_osd_shards{osd_id="hot""#), "{out}");
     }
 
     /// Before the first poll completes there is nothing to report, and the

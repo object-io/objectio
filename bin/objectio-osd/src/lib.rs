@@ -17,7 +17,6 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
-use objectio_block::metrics::{MetricsCollector, PrometheusExporter};
 use objectio_proto::metadata::{
     FailureDomainInfo, RegisterOsdRequest, metadata_service_client::MetadataServiceClient,
 };
@@ -90,7 +89,8 @@ pub struct Args {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Metrics server port (Prometheus)
+    /// Prometheus `/metrics` port; 0 serves none (the gateway re-exports
+    /// these metrics either way)
     #[arg(long, default_value = "9201")]
     pub metrics_port: u16,
 
@@ -556,11 +556,8 @@ pub async fn run(
     }
 
     // Create metrics state
-    let metrics_collector = Arc::new(MetricsCollector::default());
     let metrics_state = Arc::new(OsdMetricsState {
         osd_service: osd_service.clone(),
-        collector: metrics_collector.clone(),
-        exporter: PrometheusExporter::default(),
         osd_id: node_id.clone(),
         node_name: node_name.clone().unwrap_or_else(|| "unknown".to_string()),
         failure_domain: failure_domain.clone(),
@@ -581,19 +578,22 @@ pub async fn run(
     }
 
     // Start metrics server
+    // Port 0 turns it off: the same text is served over gRPC GetMetrics,
+    // which the gateway re-exports (aio runs it this way).
     let metrics_port = args.metrics_port;
-    let metrics_state_clone = metrics_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
-            error!("Metrics server error: {}", e);
-        }
-    });
+    if metrics_port != 0 {
+        let metrics_state_clone = metrics_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
+                error!("Metrics server error: {}", e);
+            }
+        });
+    }
 
     info!("Starting gRPC server on {}", addr);
-    info!(
-        "Metrics available at http://0.0.0.0:{}/metrics",
-        metrics_port
-    );
+    if metrics_port != 0 {
+        info!("Metrics available at http://0.0.0.0:{metrics_port}/metrics");
+    }
 
     // Start heartbeat task
     let heartbeat_meta_endpoint = meta_endpoint.clone();
@@ -621,6 +621,7 @@ pub async fn run(
     let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
         .map_err(|e| anyhow::anyhow!("OSD listener: {e}"))?;
     let server_future = objectio_proto::transport::server()
+        .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(&RPC_METRICS))
         .add_service(storage_service)
         .serve_with_incoming_shutdown(incoming, async move {
             shutdown.await;
@@ -725,11 +726,13 @@ async fn register_with_meta(
     Ok(())
 }
 
+/// Every gRPC call this OSD serves: counts by status and latency.
+static RPC_METRICS: std::sync::LazyLock<objectio_proto::rpc_metrics::RpcMetrics> =
+    std::sync::LazyLock::new(Default::default);
+
 /// OSD metrics state for the HTTP server
 struct OsdMetricsState {
     osd_service: Arc<OsdService>,
-    collector: Arc<MetricsCollector>,
-    exporter: PrometheusExporter,
     osd_id: String,
     node_name: String,
     failure_domain: FailureDomainConfig,
@@ -789,28 +792,10 @@ fn render_metrics(state: &OsdMetricsState) -> String {
     // Get disk stats from OSD service
     let status = state.osd_service.status();
 
-    // Total capacity and used
-    writeln!(
-        output,
-        "# HELP objectio_osd_capacity_bytes Total OSD capacity"
-    )
-    .unwrap();
-    writeln!(output, "# TYPE objectio_osd_capacity_bytes gauge").unwrap();
-    writeln!(
-        output,
-        "objectio_osd_capacity_bytes{{osd_id=\"{}\"}} {}",
-        state.osd_id, status.total_capacity
-    )
-    .unwrap();
-
-    writeln!(output, "# HELP objectio_osd_used_bytes Used space on OSD").unwrap();
-    writeln!(output, "# TYPE objectio_osd_used_bytes gauge").unwrap();
-    writeln!(
-        output,
-        "objectio_osd_used_bytes{{osd_id=\"{}\"}} {}",
-        state.osd_id, status.total_used
-    )
-    .unwrap();
+    // OSD capacity and usage are per disk below (`objectio_disk_*`), and
+    // per OSD from the gateway's poll (`objectio_osd_capacity_bytes`,
+    // `objectio_osd_used_bytes`). Exporting them here as well put two
+    // series per OSD under one name once OSDs are scraped directly.
 
     // Shard count
     writeln!(
@@ -941,10 +926,13 @@ fn render_metrics(state: &OsdMetricsState) -> String {
         .osd_service
         .render_scrub_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
 
-    // Export block metrics if available
-    output.push_str(&state.exporter.export(&state.collector));
-
-    // Export gRPC metrics
+    // gRPC calls served, every method
+    RPC_METRICS.render(
+        &mut output,
+        "objectio_osd_grpc",
+        "this OSD",
+        &format!("osd_id=\"{}\"", state.osd_id),
+    );
     output.push_str(
         &state
             .osd_service

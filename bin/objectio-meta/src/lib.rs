@@ -86,7 +86,8 @@ pub struct Args {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Metrics server port (Prometheus)
+    /// Prometheus `/metrics` port; 0 serves none (the gateway re-exports
+    /// these metrics either way)
     #[arg(long, default_value = "9101")]
     pub metrics_port: u16,
 
@@ -267,13 +268,17 @@ pub async fn run(
     }
 
     // Start metrics server
+    // Port 0 turns it off: the same text is served over gRPC GetMetrics,
+    // which the gateway re-exports (aio runs it this way).
     let metrics_port = args.metrics_port;
-    let metrics_state_clone = metrics_state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
-            error!("Metrics server error: {}", e);
-        }
-    });
+    if metrics_port != 0 {
+        let metrics_state_clone = metrics_state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
+                error!("Metrics server error: {}", e);
+            }
+        });
+    }
 
     // ------------------------------------------------------------
     // Raft wiring (Phase R1)
@@ -360,15 +365,16 @@ pub async fn run(
     });
 
     info!("Starting gRPC server on {}", addr);
-    info!(
-        "Metrics available at http://0.0.0.0:{}/metrics",
-        metrics_port
-    );
+    if metrics_port != 0 {
+        info!("Metrics available at http://0.0.0.0:{metrics_port}/metrics");
+    }
 
     // Start gRPC server with metadata, block, and Raft RPC services.
     let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id);
     objectio_proto::transport::server()
-        .layer(op_metrics::OpTimerLayer)
+        .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(
+            &op_metrics::RPC_METRICS,
+        ))
         .add_service(MetadataServiceServer::from_arc(meta_service))
         .add_service(BlockServiceServer::from_arc(block_service))
         // Raft messages are JSON, which bloats binary values 3-4x; at

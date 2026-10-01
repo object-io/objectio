@@ -111,111 +111,38 @@ pub struct GrpcMetrics {
 }
 
 impl GrpcMetrics {
-    /// Export metrics in Prometheus format
+    /// Shard bytes moved, in Prometheus format. Request counts and latency
+    /// for every method come from the transport layer (`RPC_METRICS`).
     pub fn export_prometheus(&self, osd_id: &str) -> String {
-        let mut output = String::with_capacity(4 * 1024);
-
-        // Requests total by method and status
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_requests_total Total gRPC requests by method and status"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_osd_grpc_requests_total counter").unwrap();
-
+        let mut output = String::with_capacity(1024);
         let methods = [
             ("WriteShard", &self.write_shard),
             ("ReadShard", &self.read_shard),
-            ("DeleteShard", &self.delete_shard),
-            ("GetShardMeta", &self.get_shard_meta),
-            ("ListShards", &self.list_shards),
-            ("PutObjectMeta", &self.put_object_meta),
-            ("GetObjectMeta", &self.get_object_meta),
-            ("DeleteObjectMeta", &self.delete_object_meta),
-            ("ListObjectsMeta", &self.list_objects_meta),
-            ("HealthCheck", &self.health_check),
-            ("GetStatus", &self.get_status),
         ];
-
-        for (method, metrics) in methods.iter() {
-            let success = metrics.requests_success.load(Ordering::Relaxed);
-            let error = metrics.requests_error.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "objectio_osd_grpc_requests_total{{osd_id=\"{}\",method=\"{}\",status=\"success\"}} {}",
-                osd_id, method, success
-            ).unwrap();
-            writeln!(
-                output,
-                "objectio_osd_grpc_requests_total{{osd_id=\"{}\",method=\"{}\",status=\"error\"}} {}",
-                osd_id, method, error
-            ).unwrap();
-        }
-
-        // Latency sum (for calculating average)
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_latency_seconds_sum Sum of gRPC request latencies"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "# TYPE objectio_osd_grpc_latency_seconds_sum counter"
-        )
-        .unwrap();
-        for (method, metrics) in methods.iter() {
-            let sum_us = metrics.latency_sum_us.load(Ordering::Relaxed);
-            writeln!(
-                output,
-                "objectio_osd_grpc_latency_seconds_sum{{osd_id=\"{}\",method=\"{}\"}} {}",
-                osd_id,
-                method,
-                sum_us as f64 / 1_000_000.0
-            )
-            .unwrap();
-        }
-
-        // Bytes sent/received
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_bytes_received_total Total bytes received via gRPC"
-        )
-        .unwrap();
-        writeln!(
-            output,
-            "# TYPE objectio_osd_grpc_bytes_received_total counter"
-        )
-        .unwrap();
-        for (method, metrics) in methods.iter() {
-            let bytes = metrics.bytes_received.load(Ordering::Relaxed);
-            if bytes > 0 {
+        for (name, help, load) in [
+            (
+                "objectio_osd_grpc_bytes_received_total",
+                "Bytes of shard requests received, by method",
+                (|m: &GrpcMethodMetrics| m.bytes_received.load(Ordering::Relaxed))
+                    as fn(&GrpcMethodMetrics) -> u64,
+            ),
+            (
+                "objectio_osd_grpc_bytes_sent_total",
+                "Bytes of shard responses sent, by method",
+                |m: &GrpcMethodMetrics| m.bytes_sent.load(Ordering::Relaxed),
+            ),
+        ] {
+            writeln!(output, "# HELP {name} {help}").unwrap();
+            writeln!(output, "# TYPE {name} counter").unwrap();
+            for (method, metrics) in &methods {
                 writeln!(
                     output,
-                    "objectio_osd_grpc_bytes_received_total{{osd_id=\"{}\",method=\"{}\"}} {}",
-                    osd_id, method, bytes
+                    "{name}{{osd_id=\"{osd_id}\",method=\"{method}\"}} {}",
+                    load(metrics)
                 )
                 .unwrap();
             }
         }
-
-        writeln!(
-            output,
-            "# HELP objectio_osd_grpc_bytes_sent_total Total bytes sent via gRPC"
-        )
-        .unwrap();
-        writeln!(output, "# TYPE objectio_osd_grpc_bytes_sent_total counter").unwrap();
-        for (method, metrics) in methods.iter() {
-            let bytes = metrics.bytes_sent.load(Ordering::Relaxed);
-            if bytes > 0 {
-                writeln!(
-                    output,
-                    "objectio_osd_grpc_bytes_sent_total{{osd_id=\"{}\",method=\"{}\"}} {}",
-                    osd_id, method, bytes
-                )
-                .unwrap();
-            }
-        }
-
         output
     }
 }
