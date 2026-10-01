@@ -531,13 +531,31 @@ impl WriteJournal {
     pub fn sync(&self) -> BlockResult<()> {
         let writer_guard = self.writer.lock();
         if let Some(ref writer) = *writer_guard {
+            let started = std::time::Instant::now();
             writer
                 .get_ref()
                 .sync_all()
                 .map_err(|e| BlockError::Journal(format!("sync failed: {}", e)))?;
+            SYNC_SECONDS.observe_duration(started.elapsed());
         }
         Ok(())
     }
+}
+
+/// Time of each journal fsync: every acknowledged block write waits for one.
+static SYNC_SECONDS: std::sync::LazyLock<objectio_common::histogram::Histogram> =
+    std::sync::LazyLock::new(|| {
+        objectio_common::histogram::Histogram::new(objectio_common::histogram::LATENCY_BUCKETS)
+    });
+
+/// The journal's metrics, as Prometheus text.
+pub fn render_metrics(out: &mut String) {
+    SYNC_SECONDS.render(
+        out,
+        "objectio_block_journal_fsync_seconds",
+        "Time to fsync the block write journal; every acknowledged write waits for one",
+        "",
+    );
 }
 
 #[cfg(test)]

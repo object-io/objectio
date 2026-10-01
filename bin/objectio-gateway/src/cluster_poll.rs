@@ -435,6 +435,8 @@ pub fn render_metrics() -> String {
     let mut base = s3_metrics().export_prometheus();
     base.push_str(&objectio_common::process_metrics::render(""));
     base.push_str(&crate::gateway_metrics::render());
+    // Components running in this process (aio's block gateway).
+    base.push_str(&objectio_common::metrics_registry::render_registered());
 
     let Ok(s) = SNAPSHOT.read() else {
         return base;

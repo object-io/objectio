@@ -34,6 +34,7 @@ use tracing::{info, warn};
 use crate::ec_io::{free_stripes, read_chunk};
 use crate::flush::{flush_volume_all, flush_volume_all_locked};
 use crate::meta_blocks::MetaBlocks;
+use crate::metrics::{Io, Protocol};
 use crate::nbd::NbdServer;
 use crate::osd_pool::OsdPool;
 
@@ -65,8 +66,9 @@ impl BlockGatewayState {
     }
 
     /// Delete the shards of stripes meta says nothing uses any more.
-    async fn free(&self, what: &str, stripes: &[StripeMeta]) {
+    async fn free(&self, what: &str, reason: &str, stripes: &[StripeMeta]) {
         let failed = free_stripes(&self.meta, &self.osd_pool, stripes).await;
+        crate::metrics::stripes_freed(reason, stripes.len(), failed);
         if failed > 0 {
             warn!("{what}: {failed} shard deletes failed; that space leaks");
         }
@@ -263,7 +265,7 @@ impl BlockService for BlockGatewayService {
         // Only the stripes nothing else uses: a snapshot of this volume,
         // or a clone of one, keeps the chunks it shares.
         self.state
-            .free(&format!("volume {}", req.volume_id), &freeable)
+            .free(&format!("volume {}", req.volume_id), "volume", &freeable)
             .await;
         info!("Deleted volume {}", req.volume_id);
         Ok(Response::new(DeleteVolumeResponse { success: true }))
@@ -445,7 +447,11 @@ impl BlockService for BlockGatewayService {
             .into_inner()
             .freeable;
         self.state
-            .free(&format!("snapshot {}", req.snapshot_id), &freeable)
+            .free(
+                &format!("snapshot {}", req.snapshot_id),
+                "snapshot",
+                &freeable,
+            )
             .await;
         Ok(Response::new(DeleteSnapshotResponse { success: true }))
     }
@@ -609,6 +615,7 @@ impl BlockService for BlockGatewayService {
     // ── Direct I/O ────────────────────────────────────────────────────────────
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
+        let io = Io::start(Protocol::Grpc, "read");
         let req = request.into_inner();
         self.check_bounds(
             &req.volume_id,
@@ -622,6 +629,7 @@ impl BlockService for BlockGatewayService {
                 .cache
                 .read(&req.volume_id, req.offset_bytes, req.length_bytes as u64)
         {
+            io.done(data.len() as u64);
             return Ok(Response::new(ReadResponse { data }));
         }
 
@@ -662,6 +670,7 @@ impl BlockService for BlockGatewayService {
             result_offset += src.len();
         }
 
+        io.done(result.len() as u64);
         Ok(Response::new(ReadResponse { data: result }))
     }
 
@@ -669,6 +678,7 @@ impl BlockService for BlockGatewayService {
         &self,
         request: Request<WriteRequest>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let io = Io::start(Protocol::Grpc, "write");
         let req = request.into_inner();
         let len = req.data.len() as u32;
 
@@ -680,6 +690,7 @@ impl BlockService for BlockGatewayService {
             .write(&req.volume_id, req.offset_bytes, &req.data)
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        io.done(u64::from(len));
         Ok(Response::new(WriteResponse { bytes_written: len }))
     }
 
@@ -687,6 +698,7 @@ impl BlockService for BlockGatewayService {
         &self,
         request: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
+        let io = Io::start(Protocol::Grpc, "flush");
         let req = request.into_inner();
         // Writes are durable once acknowledged (journaled); a chunk that
         // could not be stored now is retried, and the caller told.
@@ -696,10 +708,12 @@ impl BlockService for BlockGatewayService {
                 "{dirty} chunks could not be stored yet; they stay journaled and are retried"
             )));
         }
+        io.done(0);
         Ok(Response::new(FlushResponse { success: true }))
     }
 
     async fn trim(&self, request: Request<TrimRequest>) -> Result<Response<TrimResponse>, Status> {
+        let io = Io::start(Protocol::Grpc, "trim");
         let req = request.into_inner();
 
         // Zero-fill the trimmed range in cache
@@ -715,6 +729,7 @@ impl BlockService for BlockGatewayService {
             warn!("Trim write-zero failed for vol {}: {e}", req.volume_id);
         }
 
+        io.done(req.length_bytes);
         Ok(Response::new(TrimResponse { success: true }))
     }
 

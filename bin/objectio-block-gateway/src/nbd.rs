@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 
 use crate::ec_io::read_chunk;
 use crate::meta_blocks::MetaBlocks;
+use crate::metrics::{Io, Protocol};
 use crate::osd_pool::OsdPool;
 
 // ── NBD protocol constants ────────────────────────────────────────────────────
@@ -375,6 +376,7 @@ impl NbdServer {
 
             match cmd {
                 NBD_CMD_READ => {
+                    let io = Io::start(Protocol::Nbd, "read");
                     // A read that fails is an error to the client, never
                     // zeros: zeros it would take for the data. (A failed read
                     // used to be answered with zeros and no error.) An error
@@ -406,6 +408,7 @@ impl NbdServer {
                     stream.write_u32(0).await?; // no error
                     stream.write_u64(handle).await?;
                     stream.write_all(&data).await?;
+                    io.done(u64::from(length));
                 }
 
                 NBD_CMD_WRITE => {
@@ -416,6 +419,7 @@ impl NbdServer {
                         self.send_reply(stream, handle, 1).await?; // EPERM
                         continue;
                     }
+                    let io = Io::start(Protocol::Nbd, "write");
                     let mut data = vec![0u8; length as usize];
                     stream.read_exact(&mut data).await?;
 
@@ -429,12 +433,16 @@ impl NbdServer {
                         0u32
                     };
                     self.send_reply(stream, handle, error).await?;
+                    if error == 0 {
+                        io.done(u64::from(length));
+                    }
                 }
 
                 NBD_CMD_FLUSH => {
                     // Every write is already fsynced to the journal when it
                     // is acknowledged; syncing again here is belt and braces.
                     // (This used to acknowledge without doing anything.)
+                    let io = Io::start(Protocol::Nbd, "flush");
                     let error = match self.cache.sync() {
                         Ok(()) => 0u32,
                         Err(e) => {
@@ -443,16 +451,23 @@ impl NbdServer {
                         }
                     };
                     self.send_reply(stream, handle, error).await?;
+                    if error == 0 {
+                        io.done(0);
+                    }
                 }
 
                 NBD_CMD_TRIM => {
                     // Zero-fill trimmed range
+                    let io = Io::start(Protocol::Nbd, "trim");
                     let zeros = vec![0u8; length as usize];
                     let error = match self.load_for_write(vol_id, offset, length).await {
                         Ok(()) if self.cache.write(vol_id, offset, &zeros).is_ok() => 0u32,
                         _ => 5u32, // EIO
                     };
                     self.send_reply(stream, handle, error).await?;
+                    if error == 0 {
+                        io.done(u64::from(length));
+                    }
                 }
 
                 NBD_CMD_DISC => {

@@ -784,6 +784,9 @@ async fn main() -> Result<()> {
             block_data.display().to_string(),
             "--log-level".into(),
             args.log_level.clone(),
+            // Served on the gateway's /metrics, as the rest of aio is.
+            "--metrics-listen".into(),
+            String::new(),
         ]);
         tokio::spawn(async move {
             if let Err(e) = objectio_block_gateway::run(block_args).await {

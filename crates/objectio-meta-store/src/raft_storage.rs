@@ -597,7 +597,9 @@ impl MetaRaftStorage {
     }
 
     fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
+        let started = std::time::Instant::now();
         let (data, state) = self.dump_state_machine()?;
+        crate::commit_metrics::snapshot_built(data.len(), started.elapsed());
         let snapshot_id = format!(
             "meta-snap-{}-{}",
             state.last_applied.map_or(0, |id| id.leader_id.term),
@@ -863,9 +865,11 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
         // The whole state machine, replaced. (This used to only move
         // last_applied forward with no data, so a replica caught up from a
         // snapshot believed it was current while missing everything.)
+        let started = std::time::Instant::now();
         let tables_in = parse_snapshot(snapshot.get_ref())
             .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))?;
         self.install_state_machine(&tables_in, meta)?;
+        crate::commit_metrics::snapshot_installed(started.elapsed());
         if let Some(tx) = self.listener.as_ref() {
             let _ = tx.send(ApplyEvent::SnapshotInstalled);
         }

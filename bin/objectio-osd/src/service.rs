@@ -237,6 +237,23 @@ pub struct OsdService {
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
 
+/// Time of each shard's disk operation on this OSD: `write` (the block),
+/// `sync` (making it durable before the write is acknowledged), `read`.
+static DISK_SECONDS: std::sync::LazyLock<objectio_common::histogram::HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        objectio_common::histogram::HistogramVec::new(objectio_common::histogram::LATENCY_BUCKETS)
+    });
+
+/// Disk operation latency, as a Prometheus family.
+pub fn render_disk_metrics(out: &mut String, osd_label: &str) {
+    DISK_SECONDS.render(
+        out,
+        "objectio_osd_disk_seconds",
+        "Time of one shard disk operation: write, sync (before the write is acknowledged), read",
+        osd_label,
+    );
+}
+
 /// What the scrubber has done since the OSD started.
 #[derive(Default)]
 struct ScrubStats {
@@ -244,6 +261,8 @@ struct ScrubStats {
     shards: AtomicU64,
     bytes: AtomicU64,
     corrupt: AtomicU64,
+    last_pass_ms: AtomicU64,
+    last_pass_end: AtomicU64,
 }
 
 /// Resolve the OSD's stable node_id + cluster_uuid from (in priority order):
@@ -733,6 +752,16 @@ impl OsdService {
             }
         }
         self.scrub.passes.fetch_add(1, Ordering::Relaxed);
+        self.scrub.last_pass_ms.store(
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.scrub.last_pass_end.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            Ordering::Relaxed,
+        );
         info!(
             "scrub pass done: {} bytes in {:.1}s, {} shard(s) corrupt",
             bytes,
@@ -778,6 +807,21 @@ impl OsdService {
         ] {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
+        }
+        for (name, help, v) in [
+            (
+                "objectio_osd_scrub_last_pass_seconds",
+                "How long the last completed scrub pass took",
+                self.scrub.last_pass_ms.load(Ordering::Relaxed) as f64 / 1000.0,
+            ),
+            (
+                "objectio_osd_scrub_last_pass_timestamp_seconds",
+                "When the last scrub pass completed (Unix time; 0: none yet)",
+                self.scrub.last_pass_end.load(Ordering::Relaxed) as f64,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
             let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
         }
     }
@@ -1232,12 +1276,16 @@ impl StorageService for OsdService {
         // reactor stays free during the syscall / io_uring wait. On
         // Linux + --features io-uring this is +25% throughput on
         // 4 MiB stripes vs the old sync path (see storage-io-levels.md).
+        let started = Instant::now();
         disk.write_block_async(block_num, object_id, shard_id.stripe_id, data)
             .await
             .map_err(|e| Status::internal(format!("write failed: {}", e)))?;
+        DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
 
+        let started = Instant::now();
         disk.sync()
             .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
+        DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
 
         // Store location in index
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
@@ -1330,20 +1378,20 @@ impl StorageService for OsdService {
         let disk = &self.disks[location.disk_idx];
 
         // Async read — same semantics, reactor stays free during I/O.
-        let (_header, data) = disk
-            .read_block_async(location.block_num)
-            .await
-            .map_err(|e| {
-                self.grpc_metrics.read_shard.record(
-                    false,
-                    start.elapsed().as_micros() as u64,
-                    bytes_in,
-                    0,
-                );
-                // Unreadable is as good as gone: report it for rebuilding.
-                self.mark_corrupt(&key, location.block_num);
-                Status::data_loss(format!("shard is unreadable: {e}"))
-            })?;
+        let read_started = Instant::now();
+        let read = disk.read_block_async(location.block_num).await;
+        DISK_SECONDS.observe_duration("op=\"read\"", read_started.elapsed());
+        let (_header, data) = read.map_err(|e| {
+            self.grpc_metrics.read_shard.record(
+                false,
+                start.elapsed().as_micros() as u64,
+                bytes_in,
+                0,
+            );
+            // Unreadable is as good as gone: report it for rebuilding.
+            self.mark_corrupt(&key, location.block_num);
+            Status::data_loss(format!("shard is unreadable: {e}"))
+        })?;
 
         debug!(
             "ReadShard: object={}, stripe={}, pos={}, size={}",

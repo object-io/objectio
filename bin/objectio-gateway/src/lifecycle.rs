@@ -46,7 +46,10 @@ pub fn spawn_lifecycle_worker(
         let mut interval = tokio::time::interval(config.interval);
         loop {
             interval.tick().await;
-            if let Err(e) = run_lifecycle_scan(&meta_client, &osd_pool).await {
+            let started = std::time::Instant::now();
+            let result = run_lifecycle_scan(&meta_client, &osd_pool).await;
+            crate::gateway_metrics::record_lifecycle_scan(started.elapsed(), result.is_ok());
+            if let Err(e) = result {
                 error!("Lifecycle scan failed: {}", e);
             }
         }
@@ -188,6 +191,7 @@ async fn run_lifecycle_scan(
                             .await
                         {
                             Ok(_) => {
+                                crate::gateway_metrics::record_lifecycle("expire", true);
                                 total_expired += 1;
                                 debug!(
                                     "Expired object: {}/{} (age={}d, rule={})",
@@ -195,6 +199,7 @@ async fn run_lifecycle_scan(
                                 );
                             }
                             Err(e) => {
+                                crate::gateway_metrics::record_lifecycle("expire", false);
                                 warn!("Failed to expire {}/{}: {}", bucket, obj.key, e);
                             }
                         }
@@ -211,6 +216,7 @@ async fn run_lifecycle_scan(
                             .await
                         {
                             Ok(_) => {
+                                crate::gateway_metrics::record_lifecycle("delete_marker", true);
                                 total_markers_cleaned += 1;
                                 debug!(
                                     "Cleaned delete marker: {}/{} (version={})",
@@ -218,6 +224,7 @@ async fn run_lifecycle_scan(
                                 );
                             }
                             Err(e) => {
+                                crate::gateway_metrics::record_lifecycle("delete_marker", false);
                                 warn!(
                                     "Failed to clean delete marker {}/{}: {}",
                                     bucket, obj.key, e
@@ -245,7 +252,7 @@ async fn run_lifecycle_scan(
                     if upload_age_days >= u64::from(rule.abort_incomplete_multipart_upload_days) {
                         // Meta hands back the parts it dropped; they are
                         // referenced by nothing once it has.
-                        if let Ok(aborted) = client
+                        let aborted = client
                             .abort_multipart_upload(
                                 objectio_proto::metadata::AbortMultipartUploadRequest {
                                     bucket: bucket.clone(),
@@ -253,8 +260,9 @@ async fn run_lifecycle_scan(
                                     upload_id: upload.upload_id.clone(),
                                 },
                             )
-                            .await
-                        {
+                            .await;
+                        crate::gateway_metrics::record_lifecycle("abort_upload", aborted.is_ok());
+                        if let Ok(aborted) = aborted {
                             crate::osd_pool::reclaim_shards(
                                 osd_pool,
                                 &mut client,

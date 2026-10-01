@@ -2279,6 +2279,7 @@ name = "objectio-block-gateway"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
  "bytes",
  "chrono",
  "clap",

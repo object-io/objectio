@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use objectio_common::histogram::label_value;
 use objectio_proto::block::{Snapshot, SnapshotState, Volume, VolumeState};
 use objectio_proto::metadata::{
     BlockChunkRef, BlockCloneVolumeRequest, BlockCommitChunksRequest, BlockCreateSnapshotRequest,
@@ -909,6 +910,144 @@ impl MetaService {
             Ok((ops, n))
         })
         .await
+    }
+}
+
+impl MetaService {
+    /// Block volumes, snapshots and the shared-stripe registry, from the
+    /// Raft-replicated tables.
+    pub(crate) fn render_block_metrics(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let tables = self.block.read();
+        let volumes: Vec<Volume> = tables
+            .table(VOLUMES)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter_map(|v| Volume::decode(v.as_slice()).ok())
+            .collect();
+        let snapshots: Vec<Snapshot> = tables
+            .table(SNAPSHOTS)
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter_map(|v| Snapshot::decode(v.as_slice()).ok())
+            .collect();
+        // Chunks each volume and snapshot holds: what it has written (or
+        // captured), since a volume is thin.
+        let count = |t: &str, id: &str| tables.chunks_of(t, id, 0, u64::MAX).len() as u64;
+        let header = |out: &mut String, name: &str, help: &str| {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+        };
+
+        header(out, "objectio_block_volumes_total", "Block volumes");
+        let _ = writeln!(out, "objectio_block_volumes_total {}", volumes.len());
+        header(
+            out,
+            "objectio_block_volumes_by_state",
+            "Block volumes by state",
+        );
+        for state in [
+            VolumeState::Creating,
+            VolumeState::Available,
+            VolumeState::Attached,
+            VolumeState::Error,
+            VolumeState::Deleting,
+        ] {
+            let n = volumes.iter().filter(|v| v.state() == state).count();
+            let name = state
+                .as_str_name()
+                .trim_start_matches("VOLUME_STATE_")
+                .to_lowercase();
+            let _ = writeln!(
+                out,
+                "objectio_block_volumes_by_state{{state=\"{name}\"}} {n}"
+            );
+        }
+        let provisioned: u64 = volumes.iter().map(|v| v.size_bytes).sum();
+        let used: Vec<u64> = volumes
+            .iter()
+            .map(|v| count(CHUNKS, &v.volume_id) * u64::from(v.chunk_size_bytes))
+            .collect();
+        header(
+            out,
+            "objectio_block_volumes_provisioned_bytes",
+            "Size of every block volume added up",
+        );
+        let _ = writeln!(
+            out,
+            "objectio_block_volumes_provisioned_bytes {provisioned}"
+        );
+        header(
+            out,
+            "objectio_block_volumes_used_bytes",
+            "Chunks block volumes have written, in bytes (volumes are thin: unwritten chunks take nothing)",
+        );
+        let _ = writeln!(
+            out,
+            "objectio_block_volumes_used_bytes {}",
+            used.iter().sum::<u64>()
+        );
+        header(
+            out,
+            "objectio_block_volume_size_bytes",
+            "Size of one block volume",
+        );
+        for v in &volumes {
+            let _ = writeln!(
+                out,
+                "objectio_block_volume_size_bytes{{volume_id=\"{}\",name=\"{}\",pool=\"{}\"}} {}",
+                v.volume_id,
+                label_value(&v.name),
+                label_value(&v.pool),
+                v.size_bytes
+            );
+        }
+        header(
+            out,
+            "objectio_block_volume_used_bytes",
+            "Chunks one block volume has written, in bytes",
+        );
+        for (v, u) in volumes.iter().zip(&used) {
+            let _ = writeln!(
+                out,
+                "objectio_block_volume_used_bytes{{volume_id=\"{}\",name=\"{}\",pool=\"{}\"}} {u}",
+                v.volume_id,
+                label_value(&v.name),
+                label_value(&v.pool)
+            );
+        }
+        header(out, "objectio_block_snapshots_total", "Block snapshots");
+        let _ = writeln!(out, "objectio_block_snapshots_total {}", snapshots.len());
+        header(
+            out,
+            "objectio_block_snapshot_chunks",
+            "Chunks one snapshot holds (shared with its volume until overwritten)",
+        );
+        for snap in &snapshots {
+            let _ = writeln!(
+                out,
+                "objectio_block_snapshot_chunks{{snapshot_id=\"{}\",volume_id=\"{}\",name=\"{}\"}} {}",
+                snap.snapshot_id,
+                snap.volume_id,
+                label_value(&snap.name),
+                count(SNAP_CHUNKS, &snap.snapshot_id)
+            );
+        }
+        drop(tables);
+
+        let refs = self.stripe_refs.read();
+        header(
+            out,
+            "objectio_meta_shared_stripes",
+            "Stripes used by more than one object, chunk, snapshot or clone (zero-copy copies, snapshots)",
+        );
+        let _ = writeln!(out, "objectio_meta_shared_stripes {}", refs.len());
+        header(
+            out,
+            "objectio_meta_shared_stripe_referrers",
+            "References held on shared stripes; a stripe is freed when its last one goes",
+        );
+        let referrers: usize = refs.values().map(|r| r.referrers.len()).sum();
+        let _ = writeln!(out, "objectio_meta_shared_stripe_referrers {referrers}");
     }
 }
 

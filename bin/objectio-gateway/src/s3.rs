@@ -2747,6 +2747,7 @@ async fn copy_by_reference(
         "CopyObject: {source_bucket}/{source_key} -> {what} ({} bytes, by reference)",
         source.size
     );
+    crate::gateway_metrics::record_copy("reference", source.size);
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
         to_xml(&CopyObjectResult {
@@ -2893,6 +2894,7 @@ async fn copy_object_data(
     if !put_resp.status().is_success() {
         return put_resp;
     }
+    crate::gateway_metrics::record_copy("bytes", copied_bytes as u64);
 
     // 4. CopyObject wants a CopyObjectResult XML body, not the PUT's empty
     //    response. ETag comes from the PUT we just issued.
@@ -4017,6 +4019,9 @@ pub async fn put_object(
         total_shards_written,
         placement.nodes.len(),
     );
+    if inline {
+        crate::gateway_metrics::record_inline(original_size);
+    }
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)

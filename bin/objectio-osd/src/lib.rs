@@ -925,6 +925,7 @@ fn render_metrics(state: &OsdMetricsState) -> String {
     state
         .osd_service
         .render_scrub_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
+    service::render_disk_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
 
     // gRPC calls served, every method
     RPC_METRICS.render(

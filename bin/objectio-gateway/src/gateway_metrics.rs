@@ -32,6 +32,42 @@ static DEDUP_CHUNKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_DROPPED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_SKIPPED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static INLINE_OBJECTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static INLINE_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static COPIES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static COPIED_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static LIFECYCLE_ACTIONS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static LIFECYCLE_SCANS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static LIFECYCLE_SCAN_SECONDS: LazyLock<HistogramVec> =
+    LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
+
+/// An object small enough to be stored in its metadata, with no shards.
+pub fn record_inline(bytes: u64) {
+    INLINE_OBJECTS.inc("");
+    INLINE_BYTES.add("", bytes);
+}
+
+/// A CopyObject completed: `reference` shares the source's stripes,
+/// `bytes` read and wrote them again.
+pub fn record_copy(mode: &str, bytes: u64) {
+    COPIES.inc(&format!("mode=\"{mode}\""));
+    COPIED_BYTES.add(&format!("mode=\"{mode}\""), bytes);
+}
+
+/// One lifecycle action: `expire`, `delete_marker`, `abort_upload`.
+pub fn record_lifecycle(action: &str, ok: bool) {
+    LIFECYCLE_ACTIONS.inc(&format!(
+        "action=\"{action}\",result=\"{}\"",
+        if ok { "ok" } else { "error" }
+    ));
+}
+
+/// One lifecycle scan over every bucket, and whether it ran to the end.
+pub fn record_lifecycle_scan(elapsed: Duration, ok: bool) {
+    let result = if ok { "ok" } else { "error" };
+    LIFECYCLE_SCANS.inc(&format!("result=\"{result}\""));
+    LIFECYCLE_SCAN_SECONDS.observe_duration("", elapsed);
+}
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
 const KNOWN_CODES: &[u16] = &[
@@ -286,6 +322,42 @@ pub fn render() -> String {
         &mut out,
         "objectio_dedup_dryrun_skipped_total",
         "Writes in dry-run buckets that dry-run does not look at, by reason",
+    );
+    INLINE_OBJECTS.render(
+        &mut out,
+        "objectio_gateway_inline_objects_total",
+        "Objects small enough to be stored in their metadata, with no shards",
+    );
+    INLINE_BYTES.render(
+        &mut out,
+        "objectio_gateway_inline_bytes_total",
+        "Bytes of objects stored in their metadata",
+    );
+    COPIES.render(
+        &mut out,
+        "objectio_gateway_copies_total",
+        "CopyObject requests completed, by mode: reference (shares the source's stripes) or bytes (rewritten)",
+    );
+    COPIED_BYTES.render(
+        &mut out,
+        "objectio_gateway_copied_bytes_total",
+        "Bytes CopyObject copied, by mode; reference copies move none of them",
+    );
+    LIFECYCLE_ACTIONS.render(
+        &mut out,
+        "objectio_lifecycle_actions_total",
+        "Lifecycle actions taken, by action (expire, delete_marker, abort_upload) and result",
+    );
+    LIFECYCLE_SCANS.render(
+        &mut out,
+        "objectio_lifecycle_scans_total",
+        "Lifecycle scans over every bucket, by result",
+    );
+    LIFECYCLE_SCAN_SECONDS.render(
+        &mut out,
+        "objectio_lifecycle_scan_seconds",
+        "Time one lifecycle scan took",
+        "",
     );
     objectio_erasure::metrics::render(&mut out);
     out
