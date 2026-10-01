@@ -663,7 +663,7 @@ async fn find_affected_objects(
     Ok(resp.into_inner().objects)
 }
 
-async fn open_channel(address: &str) -> anyhow::Result<Channel> {
+pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
     let uri = canonical_uri(address);
     let channel = tokio::time::timeout(PER_OSD_TIMEOUT, Channel::from_shared(uri)?.connect())
         .await
@@ -673,7 +673,7 @@ async fn open_channel(address: &str) -> anyhow::Result<Channel> {
 
 /// The shard in a ReadShard response, if it matches the checksum the OSD
 /// sent with it. A response without one is taken as is.
-fn verified_shard(resp: ReadShardResponse) -> anyhow::Result<prost::bytes::Bytes> {
+pub(crate) fn verified_shard(resp: ReadShardResponse) -> anyhow::Result<prost::bytes::Bytes> {
     if let Some(expected) = resp.checksum.map(|c| c.crc32c) {
         let got = crc32c::crc32c(&resp.data);
         if got != expected {
@@ -687,7 +687,7 @@ fn verified_shard(resp: ReadShardResponse) -> anyhow::Result<prost::bytes::Bytes
 
 /// The checksum a shard is written with, so the target refuses it if it is
 /// damaged on the way.
-fn checksum_of(data: &[u8]) -> Checksum {
+pub(crate) fn checksum_of(data: &[u8]) -> Checksum {
     Checksum {
         crc32c: crc32c::crc32c(data),
         xxhash64: 0,

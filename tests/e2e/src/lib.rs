@@ -273,16 +273,34 @@ impl Cluster {
     /// under a new identity, and the gateway ranks the unknown old one last,
     /// so it never even tries the missing shards.
     pub fn restart_with_lost_disk(&mut self, index: usize) {
-        assert!(
-            index < self.osds,
-            "no OSD {index} in a {}-OSD cluster",
-            self.osds
-        );
+        self.restart_with_lost_disks(&[index]);
+    }
+
+    /// As [`Self::restart_with_lost_disk`], for several OSDs at once.
+    pub fn restart_with_lost_disks(&mut self, indexes: &[usize]) {
+        for &index in indexes {
+            assert!(
+                index < self.osds,
+                "no OSD {index} in a {}-OSD cluster",
+                self.osds
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let disk = self.data_dir.path().join(format!("osd-{index}/disk0"));
-        std::fs::remove_dir_all(&disk).unwrap_or_else(|e| panic!("remove {}: {e}", disk.display()));
+        for &index in indexes {
+            let disk = self.data_dir.path().join(format!("osd-{index}/disk0"));
+            std::fs::remove_dir_all(&disk)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", disk.display()));
+        }
         self.restart_with_osds(self.osds);
+    }
+
+    /// OSD `index`'s disk file, for tests that damage it in place.
+    #[must_use]
+    pub fn osd_disk(&self, index: usize) -> PathBuf {
+        self.data_dir
+            .path()
+            .join(format!("osd-{index}/disk0/disk.raw"))
     }
 
     fn log_target() -> Stdio {
