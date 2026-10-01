@@ -375,13 +375,18 @@ impl NbdServer {
 
             match cmd {
                 NBD_CMD_READ => {
-                    let mut data = self
-                        .nbd_read(vol_id, offset, length as u64)
-                        .await
-                        .unwrap_or_else(|e| {
+                    // A read that fails is an error to the client, never
+                    // zeros: zeros it would take for the data. (A failed read
+                    // used to be answered with zeros and no error.) An error
+                    // reply carries no data.
+                    let mut data = match self.nbd_read(vol_id, offset, u64::from(length)).await {
+                        Ok(d) => d,
+                        Err(e) => {
                             warn!("NBD read error for {peer}: {e}");
-                            vec![0u8; length as usize]
-                        });
+                            self.send_reply(stream, handle, 5).await?; // EIO
+                            continue;
+                        }
+                    };
 
                     // A simple reply has no length field, so the client reads
                     // exactly `length` bytes off the socket no matter what we
