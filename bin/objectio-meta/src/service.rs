@@ -661,6 +661,9 @@ pub struct MetaService {
     placement_groups: RwLock<HashMap<(String, u32), PlacementGroup>>,
     /// Object lock configurations: bucket_name -> ObjectLockConfiguration
     object_lock_configs: RwLock<HashMap<String, ObjectLockConfiguration>>,
+    /// Shared stripes and who references them, by stripe id in hex. See
+    /// `share_stripes`.
+    stripe_refs: RwLock<HashMap<String, objectio_proto::metadata::StripeRefs>>,
     /// Lifecycle configurations: bucket_name -> LifecycleConfiguration
     lifecycle_configs: RwLock<HashMap<String, LifecycleConfiguration>>,
     /// Bucket default SSE configurations: bucket_name -> BucketSseConfiguration
@@ -900,6 +903,7 @@ impl MetaService {
             unity_model_versions: RwLock::new(HashMap::new()),
             placement_groups: RwLock::new(HashMap::new()),
             object_lock_configs: RwLock::new(HashMap::new()),
+            stripe_refs: RwLock::new(HashMap::new()),
             lifecycle_configs: RwLock::new(HashMap::new()),
             bucket_encryption_configs: RwLock::new(HashMap::new()),
             kms_keys: RwLock::new(HashMap::new()),
@@ -1012,6 +1016,9 @@ impl MetaService {
                             svc.apply_config_event(&key, new_value.as_deref());
                         }
                         CasTable::Tenants => svc.apply_tenant_event(&key, new_value.as_deref()),
+                        CasTable::Named(ref t) if t == "stripe_refs" => {
+                            svc.apply_stripe_refs_event(&key, new_value.as_deref());
+                        }
                         // Tables not yet covered by a cache refresh:
                         // writers are responsible for mirroring their
                         // own writes on the leader, and followers still
@@ -1045,6 +1052,91 @@ impl MetaService {
                 map.remove(key);
             }
         }
+    }
+
+    /// Mirror a committed change to the shared-stripe registry.
+    fn apply_stripe_refs_event(&self, key: &str, new_value: Option<&[u8]>) {
+        use prost::Message;
+        let mut map = self.stripe_refs.write();
+        match new_value {
+            Some(bytes) => match objectio_proto::metadata::StripeRefs::decode(bytes) {
+                Ok(r) => {
+                    map.insert(key.to_string(), r);
+                }
+                Err(e) => warn!("apply: decode StripeRefs('{key}') failed: {e}"),
+            },
+            None => {
+                map.remove(key);
+            }
+        }
+    }
+
+    /// Apply registry changes (`None` removes an entry) atomically, each
+    /// expected to still hold what it was read as. `Ok(false)` on a
+    /// conflict, for the caller to re-read and retry.
+    async fn write_stripe_refs(
+        &self,
+        changes: Vec<(String, Option<objectio_proto::metadata::StripeRefs>)>,
+        requested_by: &str,
+    ) -> Result<bool, Status> {
+        use prost::Message;
+        if changes.is_empty() {
+            return Ok(true);
+        }
+        let expected: Vec<Option<Vec<u8>>> = {
+            let map = self.stripe_refs.read();
+            changes
+                .iter()
+                .map(|(k, _)| map.get(k).map(Message::encode_to_vec))
+                .collect()
+        };
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let ops = changes
+                .iter()
+                .zip(expected)
+                .map(|((key, new), expected)| CasOp {
+                    table: CasTable::Named("stripe_refs".into()),
+                    key: key.clone(),
+                    expected,
+                    new_value: new.as_ref().map(Message::encode_to_vec),
+                })
+                .collect();
+            let cmd = MetaCommand::MultiCas {
+                ops,
+                requested_by: requested_by.into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => return Ok(false),
+                    other => {
+                        error!("unexpected raft response for {requested_by}: {other:?}");
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            for (key, new) in &changes {
+                match new {
+                    Some(r) => store.put_stripe_refs(key, &r.encode_to_vec()),
+                    None => store.delete_stripe_refs(key),
+                }
+            }
+        }
+        let mut map = self.stripe_refs.write();
+        for (key, new) in changes {
+            match new {
+                Some(r) => {
+                    map.insert(key, r);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Mirror a committed tenant write, so every replica — not only the
@@ -2322,6 +2414,20 @@ impl MetaService {
                 }
             }
             info!("Loaded {} placement groups from store", loaded);
+        }
+
+        // Shared stripes
+        {
+            let mut map = self.stripe_refs.write();
+            for (key, bytes) in store.load_all_stripe_refs() {
+                match objectio_proto::metadata::StripeRefs::decode(bytes.as_slice()) {
+                    Ok(refs) => {
+                        map.insert(key, refs);
+                    }
+                    Err(e) => error!("Failed to decode stripe refs '{key}': {e}"),
+                }
+            }
+            info!("Loaded {} shared stripes from store", map.len());
         }
 
         // Object lock configs
@@ -9921,6 +10027,88 @@ impl MetadataService for MetaService {
         Ok(Response::new(PutBucketVersioningResponse { success: true }))
     }
 
+    async fn share_stripes(
+        &self,
+        request: Request<objectio_proto::metadata::ShareStripesRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ShareStripesResponse>, Status> {
+        use objectio_proto::metadata::StripeRefs;
+        let req = request.into_inner();
+        if req.owner.is_empty() || req.sharer.is_empty() {
+            return Err(Status::invalid_argument("owner and sharer are required"));
+        }
+        for _ in 0..8 {
+            let mut changes = Vec::new();
+            {
+                let map = self.stripe_refs.read();
+                for id in &req.stripe_ids {
+                    let key = hex::encode(id);
+                    let mut refs = match map.get(&key) {
+                        // Shared already: the owner must still be a referrer,
+                        // or it has let the stripe go and may have freed it.
+                        Some(r) if !r.referrers.contains(&req.owner) => {
+                            return Err(Status::failed_precondition(format!(
+                                "stripe {key} is no longer referenced by the copy's source"
+                            )));
+                        }
+                        Some(r) => r.clone(),
+                        None => StripeRefs {
+                            referrers: vec![req.owner.clone()],
+                        },
+                    };
+                    if !refs.referrers.contains(&req.sharer) {
+                        refs.referrers.push(req.sharer.clone());
+                        changes.push((key, Some(refs)));
+                    }
+                }
+            }
+            if self.write_stripe_refs(changes, "share-stripes").await? {
+                return Ok(Response::new(
+                    objectio_proto::metadata::ShareStripesResponse {},
+                ));
+            }
+        }
+        Err(Status::aborted("stripe references kept changing; retry"))
+    }
+
+    async fn release_stripes(
+        &self,
+        request: Request<objectio_proto::metadata::ReleaseStripesRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ReleaseStripesResponse>, Status> {
+        let req = request.into_inner();
+        for _ in 0..8 {
+            let mut changes = Vec::new();
+            let mut freeable = Vec::new();
+            {
+                let map = self.stripe_refs.read();
+                for id in &req.stripe_ids {
+                    let key = hex::encode(id);
+                    match map.get(&key) {
+                        // Never shared: its only referrer is letting it go.
+                        None => freeable.push(id.clone()),
+                        Some(r) if r.referrers.contains(&req.referrer) => {
+                            let mut refs = r.clone();
+                            refs.referrers.retain(|x| x != &req.referrer);
+                            if refs.referrers.is_empty() {
+                                freeable.push(id.clone());
+                                changes.push((key, None));
+                            } else {
+                                changes.push((key, Some(refs)));
+                            }
+                        }
+                        // Shared, and not by this referrer: someone else's.
+                        Some(_) => {}
+                    }
+                }
+            }
+            if self.write_stripe_refs(changes, "release-stripes").await? {
+                return Ok(Response::new(
+                    objectio_proto::metadata::ReleaseStripesResponse { freeable },
+                ));
+            }
+        }
+        Err(Status::aborted("stripe references kept changing; retry"))
+    }
+
     async fn set_bucket_dedup(
         &self,
         request: Request<objectio_proto::metadata::SetBucketDedupRequest>,
@@ -11345,6 +11533,102 @@ mod te_segment_tests {
             listed_segments(&svc).await,
             [(1, String::new()), (2, "10.0.0.2:15002".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod stripe_refs_tests {
+    //! The shared-stripe registry: a stripe's shards may be freed only
+    //! when the last object referencing it lets go.
+
+    use super::MetaService;
+    use objectio_proto::metadata::metadata_service_server::MetadataService;
+    use objectio_proto::metadata::{ReleaseStripesRequest, ShareStripesRequest};
+    use tonic::Request;
+
+    const X: [u8; 16] = [7; 16];
+    const SOURCE: [u8; 16] = [1; 16];
+    const COPY: [u8; 16] = [2; 16];
+    const COPY2: [u8; 16] = [3; 16];
+
+    async fn share(
+        svc: &MetaService,
+        owner: [u8; 16],
+        sharer: [u8; 16],
+    ) -> Result<(), tonic::Status> {
+        svc.share_stripes(Request::new(ShareStripesRequest {
+            stripe_ids: vec![X.to_vec()],
+            owner: owner.to_vec(),
+            sharer: sharer.to_vec(),
+        }))
+        .await
+        .map(drop)
+    }
+
+    async fn release(svc: &MetaService, referrer: [u8; 16]) -> bool {
+        let freeable = svc
+            .release_stripes(Request::new(ReleaseStripesRequest {
+                stripe_ids: vec![X.to_vec()],
+                referrer: referrer.to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .freeable;
+        freeable == vec![X.to_vec()]
+    }
+
+    #[tokio::test]
+    async fn an_unshared_stripe_is_freed_by_its_only_referrer() {
+        let svc = MetaService::new();
+        assert!(release(&svc, SOURCE).await);
+    }
+
+    /// Either side of a copy may go first; the shards go with the last.
+    #[tokio::test]
+    async fn a_shared_stripe_is_freed_only_by_its_last_referrer() {
+        let svc = MetaService::new();
+        share(&svc, SOURCE, COPY).await.unwrap();
+        assert!(!release(&svc, SOURCE).await, "freed while the copy used it");
+        assert!(release(&svc, COPY).await);
+
+        let svc = MetaService::new();
+        share(&svc, SOURCE, COPY).await.unwrap();
+        assert!(!release(&svc, COPY).await, "freed while the source used it");
+        assert!(release(&svc, SOURCE).await);
+    }
+
+    #[tokio::test]
+    async fn a_copy_of_a_copy_shares_too() {
+        let svc = MetaService::new();
+        share(&svc, SOURCE, COPY).await.unwrap();
+        share(&svc, COPY, COPY2).await.unwrap();
+        assert!(!release(&svc, SOURCE).await);
+        assert!(!release(&svc, COPY).await);
+        assert!(release(&svc, COPY2).await);
+    }
+
+    /// Releasing twice must not free a stripe someone else still uses.
+    #[tokio::test]
+    async fn a_repeated_release_is_harmless() {
+        let svc = MetaService::new();
+        share(&svc, SOURCE, COPY).await.unwrap();
+        assert!(!release(&svc, SOURCE).await);
+        assert!(
+            !release(&svc, SOURCE).await,
+            "a retried release freed the copy's data"
+        );
+    }
+
+    /// A source that has already let go of a shared stripe cannot share it
+    /// again: its shards may be gone with it.
+    #[tokio::test]
+    async fn sharing_from_a_source_that_let_go_is_refused() {
+        let svc = MetaService::new();
+        share(&svc, SOURCE, COPY).await.unwrap();
+        release(&svc, SOURCE).await;
+        let err = share(&svc, SOURCE, COPY2).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }
 

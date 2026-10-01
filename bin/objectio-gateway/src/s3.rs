@@ -8,7 +8,7 @@ use crate::osd_pool::{
     Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget,
     delete_object_meta_from_all, get_object_meta_from_any, get_object_version_meta_from_any,
     put_object_meta_to_all, read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite,
-    referenced_object_ids, stripe_targets, write_shard_to_osd,
+    referenced_object_ids, stripe_targets, stripe_targets_of, write_shard_to_osd,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{
@@ -2035,14 +2035,297 @@ async fn check_copy_sse(
     Ok(())
 }
 
-/// CopyObject: read the source through the GET handler (reconstruction and
-/// decryption included), then write it through the PUT handler, so the copy
-/// has stripes of its own and the destination's SSE settings apply.
+/// A copy that references the source's stripes instead of copying their
+/// bytes. `None` when it does not apply — either side encrypted, or the
+/// source changed or let its stripes go mid-copy — for the caller to copy
+/// the bytes instead.
 ///
-/// Always this, never a metadata-only copy: a copy that shared the source's
-/// shards lost its data when the source was deleted, since nothing counted
-/// who else pointed at them -- and a rename through an S3 FUSE mount is a
-/// copy then a delete. Buffers the object in memory, as the rest of the PUT
+/// The order is what makes it safe. The copy is registered as a referrer
+/// of the source's stripes first, and the source then read again: if it is
+/// still the same object, its delete has not happened yet, and when it
+/// does, meta's registry keeps the stripes for the copy. If it is not, the
+/// source's stripes may already be freed, so the copy backs out.
+async fn copy_by_reference(
+    state: &Arc<AppState>,
+    dest_bucket: &str,
+    dest_key: &str,
+    source_bucket: &str,
+    source_key: &str,
+    copy_headers: &HeaderMap,
+) -> Option<Response> {
+    use objectio_proto::metadata::ShareStripesRequest;
+    let mut meta_client = state.meta_client.clone();
+
+    let src_placement = meta_client
+        .get_placement(GetPlacementRequest {
+            bucket: source_bucket.to_string(),
+            key: source_key.to_string(),
+            size: 0,
+            storage_class: "STANDARD".to_string(),
+        })
+        .await
+        .ok()?
+        .into_inner();
+    let source = get_object_meta_from_any(
+        &state.osd_pool,
+        &src_placement.nodes,
+        source_bucket,
+        source_key,
+    )
+    .await
+    .ok()??;
+    let encrypted = SseAlgorithm::try_from(source.encryption_algorithm)
+        .is_ok_and(|a| a != SseAlgorithm::SseNone);
+    if source.is_delete_marker || encrypted || source.object_id.is_empty() {
+        return None;
+    }
+    if resolve_sse_decision(&mut meta_client, dest_bucket, Some(copy_headers))
+        .await
+        .ok()?
+        .is_some()
+    {
+        return None;
+    }
+
+    let new_id = Uuid::new_v4().as_bytes().to_vec();
+    let mut stripes = source.stripes.clone();
+    for stripe in &mut stripes {
+        if stripe.object_id.is_empty() {
+            stripe.object_id.clone_from(&source.object_id);
+        }
+    }
+    let stripe_ids: Vec<Vec<u8>> = stripes
+        .iter()
+        .map(|s| s.object_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    // On the way out after sharing: the copy lets go again. If the source
+    // has gone meanwhile this frees the stripes, as its delete would have.
+    let back_out = |state: &Arc<AppState>, what: String| {
+        let mut targets = stripe_targets(&stripes);
+        for t in &mut targets {
+            t.owner.clone_from(&new_id);
+        }
+        spawn_reclaim(state, targets, Reclaim::FailedWrite, what);
+    };
+
+    if !stripe_ids.is_empty() {
+        match meta_client
+            .share_stripes(ShareStripesRequest {
+                stripe_ids: stripe_ids.clone(),
+                owner: source.object_id.clone(),
+                sharer: new_id.clone(),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.code() == tonic::Code::FailedPrecondition => return None,
+            Err(e) => {
+                return Some(S3Error::xml_response(
+                    "ServiceUnavailable",
+                    &format!("could not register the copy: {}", e.message()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            }
+        }
+        let still = get_object_meta_from_any(
+            &state.osd_pool,
+            &src_placement.nodes,
+            source_bucket,
+            source_key,
+        )
+        .await;
+        if !matches!(still, Ok(Some(ref m)) if m.object_id == source.object_id) {
+            back_out(state, format!("copy of {source_bucket}/{source_key}"));
+            return None;
+        }
+    }
+
+    // The destination, as a PUT of it would be.
+    let dest_placement = match meta_client
+        .get_placement(GetPlacementRequest {
+            bucket: dest_bucket.to_string(),
+            key: dest_key.to_string(),
+            size: source.size,
+            storage_class: "STANDARD".to_string(),
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            back_out(state, format!("copy to {dest_bucket}/{dest_key}"));
+            return Some(S3Error::xml_response(
+                "InternalError",
+                &format!("Failed to get placement: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    };
+    let versioning_enabled = meta_client
+        .get_bucket_versioning(GetBucketVersioningRequest {
+            bucket: dest_bucket.to_string(),
+        })
+        .await
+        .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
+    let version_id = if versioning_enabled {
+        Uuid::new_v4().to_string()
+    } else {
+        String::new()
+    };
+    let replace = copy_headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"));
+    let (content_type, user_metadata) = if replace {
+        (
+            copy_headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+            extract_user_metadata(copy_headers),
+        )
+    } else {
+        (source.content_type.clone(), source.user_metadata.clone())
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let object_meta = ObjectMeta {
+        bucket: dest_bucket.to_string(),
+        key: dest_key.to_string(),
+        object_id: new_id.clone(),
+        size: source.size,
+        content_type: content_type.clone(),
+        etag: source.etag.clone(),
+        created_at: now,
+        modified_at: now,
+        stripes: stripes.clone(),
+        user_metadata,
+        version_id: version_id.clone(),
+        storage_class: source.storage_class.clone(),
+        inline_data: source.inline_data.clone(),
+        checksum: source.checksum.clone(),
+        ..Default::default()
+    };
+
+    let listing_req = objectio_proto::metadata::CreateObjectRequest {
+        bucket: dest_bucket.to_string(),
+        key: dest_key.to_string(),
+        size: source.size,
+        content_type,
+        etag: source.etag.clone(),
+        user_metadata: object_meta.user_metadata.clone(),
+        stripes: stripes.clone(),
+        object_id: new_id.clone(),
+        pg_id: dest_placement.pg_id,
+        pool: dest_placement.pool.clone(),
+    };
+    let new_object = referenced_object_ids(&object_meta);
+    let mut listing_client = state.meta_client.clone();
+    let mut unlist_client = state.meta_client.clone();
+    let committed = commit_object(
+        put_object_meta_to_all(
+            &state.osd_pool,
+            &dest_placement.nodes,
+            dest_bucket,
+            dest_key,
+            object_meta,
+            versioning_enabled,
+            &[],
+        ),
+        async { listing_client.create_object(listing_req).await.map(drop) },
+        || async {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            let _ = unlist_client
+                .delete_object(MetaDelReq {
+                    bucket: dest_bucket.to_string(),
+                    key: dest_key.to_string(),
+                    version_id: String::new(),
+                })
+                .await;
+        },
+    )
+    .await;
+
+    let what = format!("{dest_bucket}/{dest_key}");
+    match &committed {
+        Ok((displaced, _)) => {
+            settle_commit(
+                state,
+                Ok(displaced.as_slice()),
+                Vec::new(),
+                &new_object,
+                versioning_enabled,
+                &what,
+            );
+            // A copy onto itself replaced an object that used the same
+            // stripes: it lets go of them, though they are not free.
+            if !versioning_enabled
+                && let Some(old) = displaced.iter().find_map(|d| d.replaced.as_ref())
+                && old.object_id != new_id
+            {
+                let kept: Vec<Vec<u8>> = old
+                    .stripes
+                    .iter()
+                    .map(|s| s.object_id.clone())
+                    .filter(|id| new_object.contains(id))
+                    .collect();
+                let mut meta = state.meta_client.clone();
+                crate::osd_pool::release_only(&mut meta, &old.object_id, kept).await;
+            }
+        }
+        Err(e) => {
+            error!("CopyObject by reference: failed to store {what}: {e}");
+            back_out(state, what);
+            return Some(S3Error::xml_response(
+                "InternalError",
+                &format!("Failed to store object metadata: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    }
+    if let Ok((_, Committed::Unlisted(e))) = &committed {
+        warn!(
+            "create_object on meta failed for {what} ({e}); readable by key, not listed until repair"
+        );
+    }
+
+    info!(
+        "CopyObject: {source_bucket}/{source_key} -> {what} ({} bytes, by reference)",
+        source.size
+    );
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        to_xml(&CopyObjectResult {
+            etag: source.etag.clone(),
+            last_modified: timestamp_to_iso(now),
+        })
+        .unwrap_or_default()
+    );
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .header("ETag", &source.etag);
+    if !version_id.is_empty() {
+        builder = builder.header("x-amz-version-id", &version_id);
+    }
+    Some(builder.body(Body::from(xml)).unwrap())
+}
+
+/// CopyObject. Where neither side is encrypted, the copy shares the
+/// source's stripes ([`copy_by_reference`]): no bytes are read or written,
+/// whatever the size. Otherwise, or if sharing is refused, it reads the
+/// source through the GET handler (reconstruction and decryption included)
+/// and writes it through the PUT handler, so the copy has stripes of its
+/// own and the destination's SSE settings apply.
+///
+/// Sharing is safe because meta now counts who references a shared stripe
+/// (`ShareStripes`/`ReleaseStripes`): a copy that shared the source's shards
+/// used to lose its data when the source was deleted -- and a rename through
+/// an S3 FUSE mount is a copy then a delete. Buffers the object in memory, as the rest of the PUT
 /// path does; streaming copies are a separate improvement.
 ///
 /// Metadata follows S3's `x-amz-metadata-directive`: COPY (the default) keeps
@@ -2061,6 +2344,19 @@ async fn copy_object_data(
         "CopyObject: {}/{} -> {}/{}",
         source_bucket, source_key, dest_bucket, dest_key
     );
+
+    if let Some(resp) = copy_by_reference(
+        &state,
+        &dest_bucket,
+        &dest_key,
+        &source_bucket,
+        &source_key,
+        &copy_headers,
+    )
+    .await
+    {
+        return resp;
+    }
 
     // 1. Read the source object as plaintext. The existing GET handler takes
     //    care of reconstruction + decryption.
@@ -4470,7 +4766,7 @@ pub async fn delete_object(
         let failed = reclaim_shards(
             &state.osd_pool,
             &mut meta_client,
-            stripe_targets(&meta.stripes),
+            stripe_targets_of(&meta),
             Reclaim::Delete,
         )
         .await;

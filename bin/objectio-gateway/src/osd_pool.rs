@@ -962,6 +962,22 @@ pub struct ShardTarget {
     pub object_id: Vec<u8>,
     pub stripe_id: u64,
     pub position: u32,
+    /// The object letting the shard go. A stripe shared with other objects
+    /// (a zero-copy copy) is freed only when its last referrer lets go;
+    /// see meta's `ReleaseStripes`.
+    pub owner: Vec<u8>,
+}
+
+/// Every shard of `object`'s stripes, released on the object's behalf.
+#[must_use]
+pub fn stripe_targets_of(object: &objectio_proto::metadata::ObjectMeta) -> Vec<ShardTarget> {
+    let mut targets = stripe_targets(&object.stripes);
+    if !object.object_id.is_empty() {
+        for t in &mut targets {
+            t.owner.clone_from(&object.object_id);
+        }
+    }
+    targets
 }
 
 /// Every shard `stripes` records, at the node its location names.
@@ -982,6 +998,8 @@ pub fn stripe_targets(stripes: &[objectio_proto::metadata::StripeMeta]) -> Vec<S
                 object_id: stripe.object_id.clone(),
                 stripe_id: stripe.stripe_id,
                 position: shard.position,
+                // Unless the caller knows better: the stripe's own writer.
+                owner: stripe.object_id.clone(),
             })
         })
         .filter(|t| !t.node_id.is_empty() && seen.insert(t.clone()))
@@ -1044,9 +1062,58 @@ pub fn reclaimable_after_overwrite(
     replies
         .iter()
         .filter_map(|d| d.replaced.as_ref())
-        .flat_map(|r| stripe_targets(&r.stripes))
+        .flat_map(stripe_targets_of)
         .filter(|t| !keep.contains(&t.object_id) && seen.insert(t.clone()))
         .collect()
+}
+
+/// Release each target's stripe on its owner's behalf, and return the
+/// `(owner, stripe)` pairs whose stripes no object references any more.
+async fn freeable(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    targets: &[ShardTarget],
+) -> Result<std::collections::HashSet<(Vec<u8>, Vec<u8>)>, tonic::Status> {
+    let mut by_owner: HashMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = HashMap::new();
+    for t in targets {
+        by_owner
+            .entry(t.owner.clone())
+            .or_default()
+            .insert(t.object_id.clone());
+    }
+    let mut free = std::collections::HashSet::new();
+    for (owner, ids) in by_owner {
+        let resp = meta
+            .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
+                stripe_ids: ids.into_iter().collect(),
+                referrer: owner.clone(),
+            })
+            .await?
+            .into_inner();
+        free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
+    }
+    Ok(free)
+}
+
+/// Drop `owner`'s reference to `stripe_ids` without deleting anything: an
+/// object replaced by one that still uses these stripes (a copy onto
+/// itself) stops referencing them, but they are not free.
+pub async fn release_only(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    owner: &[u8],
+    stripe_ids: Vec<Vec<u8>>,
+) {
+    if owner.is_empty() || stripe_ids.is_empty() {
+        return;
+    }
+    if let Err(e) = meta
+        .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
+            stripe_ids,
+            referrer: owner.to_vec(),
+        })
+        .await
+    {
+        warn!("could not release a replaced object's shared stripes: {e}");
+    }
 }
 
 /// Shards a write has sent to OSDs, freed again if the write is abandoned —
@@ -1084,6 +1151,7 @@ impl PendingShards {
             object_id: object_id.to_vec(),
             stripe_id,
             position,
+            owner: object_id.to_vec(),
         });
     }
 
@@ -1124,6 +1192,25 @@ pub async fn reclaim_shards(
     use futures::StreamExt;
     use objectio_proto::storage::{DeleteShardRequest, ShardId};
 
+    if targets.is_empty() {
+        return 0;
+    }
+
+    // Only stripes no other object still references may go. Asked of meta
+    // once per releasing object; if meta cannot answer, nothing is deleted
+    // — a leak can be reclaimed later, deleted shared data cannot.
+    let total = targets.len();
+    let targets = match freeable(meta, &targets).await {
+        Ok(free) => targets
+            .into_iter()
+            .filter(|t| free.contains(&(t.owner.clone(), t.object_id.clone())))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            warn!("reclaim: cannot ask meta which stripes are still shared, keeping them: {e}");
+            crate::gateway_metrics::record_reclaim(reason.label(), 0, total as u64);
+            return total;
+        }
+    };
     if targets.is_empty() {
         return 0;
     }
@@ -1444,6 +1531,7 @@ mod reclaim_tests {
             object_id: vec![5; 16],
             stripe_id: 0,
             position: 0,
+            owner: vec![5; 16],
         };
         let failed = reclaim_shards(&pool, &mut meta, vec![target], Reclaim::FailedWrite).await;
         assert_eq!(failed, 1);
