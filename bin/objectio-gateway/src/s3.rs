@@ -976,6 +976,80 @@ fn parse_range_header(range_header: &str, total_size: u64) -> Option<ByteRange> 
 
 /// Given a byte range and stripe metadata, return `(stripe_index, stripe_byte_offset)`
 /// pairs for only the stripes that overlap the range.
+/// A stripe's bytes as its object sees them: a packed stripe's slice, or
+/// the whole stripe.
+fn object_part(stripe: &StripeMeta, data: Vec<u8>) -> Vec<u8> {
+    if stripe.slice_length == 0 {
+        return data;
+    }
+    let start = usize::try_from(stripe.slice_offset)
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let end = start
+        .saturating_add(usize::try_from(stripe.slice_length).unwrap_or(usize::MAX))
+        .min(data.len());
+    data[start..end].to_vec()
+}
+
+/// Bytes `[from, to)` of a pack stripe's data, read from the data shards
+/// they fall in, with no decoding. `None` if any of those reads fails: the
+/// caller then decodes the stripe from any k shards.
+async fn read_packed_slice(
+    state: &Arc<AppState>,
+    node_address_map: &mut HashMap<Vec<u8>, String>,
+    meta_client: &mut MetadataServiceClient<Channel>,
+    stripe: &StripeMeta,
+    stripe_data_size: usize,
+    from: u64,
+    to: u64,
+) -> Option<Vec<u8>> {
+    let k = stripe.ec_k as usize;
+    let shard = objectio_erasure::ErasureCodec::shard_size_for(stripe_data_size, k) as u64;
+    if shard == 0 || to <= from {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(usize::try_from(to - from).ok()?);
+    let mut pos = from;
+    while pos < to {
+        let index = pos / shard;
+        if index >= k as u64 {
+            return None;
+        }
+        let in_shard = pos % shard;
+        let len = (shard - in_shard).min(to - pos);
+        let loc = stripe
+            .shards
+            .iter()
+            .find(|l| u64::from(l.position) == index)?;
+        let placement = objectio_proto::metadata::NodePlacement {
+            te_segment: String::new(),
+            position: loc.position,
+            node_id: loc.node_id.clone(),
+            node_address: resolve_node_address(node_address_map, meta_client, &loc.node_id).await,
+            disk_id: loc.disk_id.clone(),
+            shard_type: loc.shard_type,
+            local_group: loc.local_group,
+        };
+        let bytes = crate::osd_pool::read_shard_range_from_osd(
+            &state.osd_pool,
+            &placement,
+            &stripe.object_id,
+            stripe.stripe_id,
+            loc.position,
+            in_shard,
+            u32::try_from(len).ok()?,
+        )
+        .await
+        .ok()?;
+        if bytes.len() as u64 != len {
+            return None;
+        }
+        out.extend_from_slice(&bytes);
+        pos += len;
+    }
+    Some(out)
+}
+
 fn overlapping_stripes(
     stripes: &[StripeMeta],
     object_size: u64,
@@ -984,7 +1058,9 @@ fn overlapping_stripes(
     let mut offset = 0u64;
     let mut result = Vec::new();
     for (idx, stripe) in stripes.iter().enumerate() {
-        let effective_size = if stripe.data_size > 0 {
+        let effective_size = if stripe.slice_length > 0 {
+            stripe.slice_length
+        } else if stripe.data_size > 0 {
             stripe.data_size
         } else if stripes.len() == 1 {
             object_size
@@ -4459,9 +4535,10 @@ pub async fn get_object(
                         } else {
                             Vec::from(data)
                         };
+                        let actual_data = object_part(stripe, actual_data);
                         let (mut slice, slice_start_in_stripe): (Vec<u8>, u64) =
                             if let Some(ref range) = resolved_range {
-                                let stripe_end = stripe_byte_offset + stripe_data_size as u64;
+                                let stripe_end = stripe_byte_offset + actual_data.len() as u64;
                                 let slice_start =
                                     range.start.saturating_sub(stripe_byte_offset) as usize;
                                 let slice_end = std::cmp::min(range.end + 1, stripe_end)
@@ -4521,6 +4598,47 @@ pub async fn get_object(
             "Reading EC stripe {} of {}/{}: size={}, ec={}+{}",
             stripe_idx, bucket, key, stripe_data_size, ec_k, ec_m
         );
+
+        // A packed object's slice: read just its bytes from the data
+        // shard(s) they are in. Anything short of that (a shard down, a
+        // checksum mismatch) falls through to reading k shards and
+        // decoding the pack, below.
+        if stripe.slice_length > 0 && stripe_ec_type == ErasureType::ErasureMds {
+            let part_len = stripe.slice_length;
+            let (from, to) = match resolved_range {
+                Some(ref range) => (
+                    range.start.saturating_sub(stripe_byte_offset),
+                    (range.end + 1 - stripe_byte_offset).min(part_len),
+                ),
+                None => (0, part_len),
+            };
+            if let Some(mut slice) = read_packed_slice(
+                &state,
+                &mut node_address_map,
+                &mut meta_client,
+                stripe,
+                stripe_data_size,
+                stripe.slice_offset + from,
+                stripe.slice_offset + to,
+            )
+            .await
+            {
+                if let Some(dek) = get_sse_dek.as_ref()
+                    && let Err(resp) = decrypt_stripe_slice(
+                        dek,
+                        stripe,
+                        &object,
+                        stripe_byte_offset,
+                        from,
+                        &mut slice,
+                    )
+                {
+                    return resp;
+                }
+                all_data.extend(slice);
+                continue;
+            }
+        }
 
         // Read shards from OSDs - we need at least k shards
         let mut shards: Vec<Option<Bytes>> = vec![None; total_shards];
@@ -4686,9 +4804,10 @@ pub async fn get_object(
             }
         };
 
+        let stripe_data = object_part(stripe, stripe_data);
         let (mut slice, slice_start_in_stripe): (Vec<u8>, u64) =
             if let Some(ref range) = resolved_range {
-                let stripe_end = stripe_byte_offset + stripe_data_size as u64;
+                let stripe_end = stripe_byte_offset + stripe_data.len() as u64;
                 let slice_start = range.start.saturating_sub(stripe_byte_offset) as usize;
                 let slice_end = std::cmp::min(range.end + 1, stripe_end)
                     .saturating_sub(stripe_byte_offset) as usize;
@@ -6555,6 +6674,7 @@ async fn upload_part_internal(
                 data_size: stripe_data_size,
                 object_id: part_object_id.to_vec(), // Store object_id used for shards
                 encryption_iv: stripe_iv.clone(),
+                ..Default::default()
             });
         }
 
@@ -6723,6 +6843,7 @@ async fn upload_part_internal(
                 data_size: stripe_data_size,
                 object_id: part_object_id.to_vec(),
                 encryption_iv: stripe_iv.clone(),
+                ..Default::default()
             });
         }
 
