@@ -198,6 +198,11 @@ service MetadataService {
     // Primary OSD of each chunk fingerprint, for dry-run accounting.
     rpc LocateChunks(LocateChunksRequest) returns (LocateChunksResponse);
 
+    // Stripes referenced by more than one object (a zero-copy CopyObject;
+    // later block snapshots and dedup). Unshared stripes have no entry.
+    rpc ShareStripes(ShareStripesRequest) returns (ShareStripesResponse);
+    rpc ReleaseStripes(ReleaseStripesRequest) returns (ReleaseStripesResponse);
+
     // Object lock configuration
     rpc PutObjectLockConfiguration(PutObjectLockConfigRequest) returns (PutObjectLockConfigResponse);
     rpc GetObjectLockConfiguration(GetObjectLockConfigRequest) returns (GetObjectLockConfigResponse);
@@ -2549,4 +2554,35 @@ message LocateChunksRequest {
 message LocateChunksResponse {
     repeated string addresses = 1;   // primary OSD per fingerprint, in order; "" if none
     repeated bytes node_ids = 2;     // the same OSDs' node ids; empty if none
+}
+
+// ---- Shared stripes ----
+
+// Who references a shared stripe: object ids (an object's, or a version's).
+// Stored in meta's `stripe_refs` table, keyed by the stripe's object id in
+// hex. A stripe with no entry has exactly one referrer, the object that
+// wrote it.
+message StripeRefs {
+    repeated bytes referrers = 1;
+}
+
+// Make each stripe referenced by `sharer` as well as `owner`, the object
+// it is copied from. FAILED_PRECONDITION if a stripe is already shared and
+// `owner` is not among its referrers: the owner has let it go.
+message ShareStripesRequest {
+    repeated bytes stripe_ids = 1;
+    bytes owner = 2;
+    bytes sharer = 3;
+}
+message ShareStripesResponse {}
+
+// `referrer` no longer references these stripes. `freeable` are those no
+// one references any more — unshared ones, and shared ones whose last
+// referrer this was — and only those may have their shards deleted.
+message ReleaseStripesRequest {
+    repeated bytes stripe_ids = 1;
+    bytes referrer = 2;
+}
+message ReleaseStripesResponse {
+    repeated bytes freeable = 1;
 }

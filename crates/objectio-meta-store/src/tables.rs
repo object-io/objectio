@@ -110,6 +110,10 @@ pub const UNITY_MODEL_VERSIONS: TableDefinition<&str, &[u8]> =
 pub const OBJECT_LOCK_CONFIGS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("object_lock_configs");
 
+// Shared stripes: who references a stripe that more than one object does.
+// Key: the stripe's object id, hex. Value: prost-encoded StripeRefs.
+pub const STRIPE_REFS: TableDefinition<&str, &[u8]> = TableDefinition::new("stripe_refs");
+
 // Lifecycle configurations
 // Key: bucket name, Value: prost-encoded LifecycleConfiguration
 pub const LIFECYCLE_CONFIGS: TableDefinition<&str, &[u8]> =

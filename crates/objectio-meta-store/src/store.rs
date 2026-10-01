@@ -1368,6 +1368,40 @@ impl MetaStore {
         }
     }
 
+    pub fn put_stripe_refs(&self, key: &str, data: &[u8]) {
+        if let Err(e) = self.put_bytes(tables::STRIPE_REFS, key, data) {
+            error!("Failed to persist stripe refs for '{key}': {e}");
+        }
+    }
+
+    pub fn delete_stripe_refs(&self, key: &str) {
+        if let Err(e) = self.delete_key(tables::STRIPE_REFS, key) {
+            error!("Failed to delete stripe refs for '{key}': {e}");
+        }
+    }
+
+    pub fn load_all_stripe_refs(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let table = match read_txn.open_table(tables::STRIPE_REFS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Vec::new(),
+            Err(e) => {
+                error!("Failed to open stripe refs table: {e}");
+                return Vec::new();
+            }
+        };
+        table
+            .iter()
+            .map(|it| {
+                it.flatten()
+                    .map(|e| (e.0.value().to_string(), e.1.value().to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn load_all_object_lock_configs(&self) -> Vec<(String, Vec<u8>)> {
         let read_txn = match self.db.begin_read() {
             Ok(t) => t,
