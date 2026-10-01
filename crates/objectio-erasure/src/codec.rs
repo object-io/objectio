@@ -484,9 +484,35 @@ impl ErasureCodec {
                     .iter()
                     .map(|s| s.as_ref().map(|v| v.as_slice()))
                     .collect();
-                backend
+                // The backends do not return what `decode` documents: both
+                // hand back every shard, data first, and rust-simd fills a
+                // missing parity shard with zeros. Taking that output as
+                // "the missing shards, in order" rebuilt the wrong bytes.
+                // Only the data shards are reliable, so take those and
+                // re-encode the stripe for the parity.
+                let decoded = backend
                     .decode(&shard_refs, shard_size, missing_indices)
-                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()).into())
+                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
+                if decoded.len() < k {
+                    return Err(ErasureError::DecodingFailed(format!(
+                        "decode returned {} shards, need the {k} data shards",
+                        decoded.len()
+                    ))
+                    .into());
+                }
+                let data: Vec<&[u8]> = decoded[..k].iter().map(Vec::as_slice).collect();
+                let mut stripe = backend
+                    .encode(&data, shard_size)
+                    .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
+                missing_indices
+                    .iter()
+                    .map(|&i| {
+                        stripe.get_mut(i).map(std::mem::take).ok_or_else(|| {
+                            ErasureError::InvalidConfig(format!("no shard {i} in the stripe"))
+                                .into()
+                        })
+                    })
+                    .collect()
             }
             CodecBackend::Lrc(backend) => {
                 let shard_refs: Vec<Option<&[u8]>> = shards
@@ -617,6 +643,31 @@ mod tests {
         let lrc = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
         let mut buf = vec![0u8; 1 << 20];
         assert!(lrc.encode_into(&[1; 1000], &mut buf).is_err());
+    }
+
+    /// Every shard, data or parity, comes back as it was encoded, for every
+    /// way of losing up to m of them — what repair and drain write back.
+    #[test]
+    fn reconstruct_shards_rebuilds_exactly_the_positions_asked_for() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data: Vec<u8> = (0..70_001u32).map(|i| (i * 7 % 253) as u8).collect();
+        let stripe = codec.encode(&data).unwrap();
+        let mut losses: Vec<Vec<usize>> = (0..6).map(|a| vec![a]).collect();
+        for a in 0..6 {
+            for b in a + 1..6 {
+                losses.push(vec![a, b]);
+            }
+        }
+        for lost in losses {
+            let survivors: Vec<Option<Vec<u8>>> = (0..6)
+                .map(|i| (!lost.contains(&i)).then(|| stripe[i].clone()))
+                .collect();
+            let rebuilt = codec.reconstruct_shards(&survivors, &lost).unwrap();
+            assert_eq!(rebuilt.len(), lost.len(), "lost {lost:?}");
+            for (i, shard) in lost.iter().zip(&rebuilt) {
+                assert_eq!(shard, &stripe[*i], "shard {i} wrong after losing {lost:?}");
+            }
+        }
     }
 
     #[test]

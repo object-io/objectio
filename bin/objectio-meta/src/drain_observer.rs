@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use objectio_proto::metadata::ShardLocation;
 use objectio_proto::storage::{
-    FindObjectsReferencingNodeRequest, GetObjectMetaRequest, GetStatusRequest,
-    PutObjectMetaRequest, ReadShardRequest, ShardId, WriteShardRequest,
+    Checksum, FindObjectsReferencingNodeRequest, GetObjectMetaRequest, GetStatusRequest,
+    PutObjectMetaRequest, ReadShardRequest, ReadShardResponse, ShardId, WriteShardRequest,
     storage_service_client::StorageServiceClient,
 };
 use tokio::time::{MissedTickBehavior, interval};
@@ -95,6 +95,7 @@ async fn fanout_put_object_meta(
     for addr in &addrs {
         let addr = addr.clone();
         let req = PutObjectMetaRequest {
+            expected_object_id: Vec::new(),
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             object: Some(object.clone()),
@@ -465,7 +466,11 @@ async fn migrate_shard_one(
     .await
     .map_err(|_| anyhow::anyhow!("read_shard timeout"))?;
     let bytes = match read_result {
-        Ok(resp) => resp.into_inner().data,
+        // Moving damaged bytes would make the copy look like a good shard
+        // under a checksum the target computes from the damage. Fail the
+        // item instead; the next sweep tries again.
+        Ok(resp) => verified_shard(resp.into_inner())
+            .map_err(|e| anyhow::anyhow!("read_shard from {draining_addr}: {e}"))?,
         Err(status) if status.code() == tonic::Code::NotFound => {
             tracing::info!(
                 "drain migrator: source has no shard for {}/{} stripe={} pos={}; falling back to EC reconstruct",
@@ -519,14 +524,10 @@ async fn migrate_shard_one(
         target.write_shard(WriteShardRequest {
             rdma: None,
             shard_id: Some(shard_id.clone()),
+            checksum: Some(checksum_of(&bytes)),
             data: bytes,
             ec_k: 0, // Not inspected by OSD; kept for wire-compat.
             ec_m: 0,
-            // Shard was already checksummed when first written; the
-            // OSD recomputes on its side to validate the stored bytes.
-            // Supplying None tells the OSD to skip the optional
-            // client-provided check.
-            checksum: None,
         }),
     )
     .await
@@ -662,12 +663,36 @@ async fn find_affected_objects(
     Ok(resp.into_inner().objects)
 }
 
-async fn open_channel(address: &str) -> anyhow::Result<Channel> {
+pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
     let uri = canonical_uri(address);
     let channel = tokio::time::timeout(PER_OSD_TIMEOUT, Channel::from_shared(uri)?.connect())
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
     Ok(channel)
+}
+
+/// The shard in a ReadShard response, if it matches the checksum the OSD
+/// sent with it. A response without one is taken as is.
+pub(crate) fn verified_shard(resp: ReadShardResponse) -> anyhow::Result<prost::bytes::Bytes> {
+    if let Some(expected) = resp.checksum.map(|c| c.crc32c) {
+        let got = crc32c::crc32c(&resp.data);
+        if got != expected {
+            return Err(anyhow::anyhow!(
+                "shard has crc32c {got:08x}, expected {expected:08x}"
+            ));
+        }
+    }
+    Ok(resp.data)
+}
+
+/// The checksum a shard is written with, so the target refuses it if it is
+/// damaged on the way.
+pub(crate) fn checksum_of(data: &[u8]) -> Checksum {
+    Checksum {
+        crc32c: crc32c::crc32c(data),
+        xxhash64: 0,
+        sha256: vec![],
+    }
 }
 
 /// Turn a registered OSD address into something `Channel::from_shared` takes.
@@ -794,7 +819,7 @@ async fn reconstruct_dangling_shard(
         futs.push(async move {
             let ch = open_channel(&addr).await?;
             let mut client = StorageServiceClient::new(ch);
-            let bytes = tokio::time::timeout(
+            let resp = tokio::time::timeout(
                 PER_OSD_TIMEOUT,
                 client.read_shard(ReadShardRequest {
                     rdma_dest: None,
@@ -809,8 +834,9 @@ async fn reconstruct_dangling_shard(
             )
             .await
             .map_err(|_| anyhow::anyhow!("read timeout"))??
-            .into_inner()
-            .data;
+            .into_inner();
+            // A damaged survivor is left out, as an unreachable one is.
+            let bytes = verified_shard(resp)?;
             Ok::<(u32, Vec<u8>), anyhow::Error>((pos, bytes.into()))
         });
     }
@@ -906,10 +932,10 @@ async fn reconstruct_dangling_shard(
         target.write_shard(WriteShardRequest {
             rdma: None,
             shard_id: Some(shard_id),
+            checksum: Some(checksum_of(&reconstructed)),
             data: reconstructed.into(),
             ec_k: ec_k as u32,
             ec_m: ec_m as u32,
-            checksum: None,
         }),
     )
     .await
@@ -986,7 +1012,33 @@ async fn reconstruct_dangling_shard(
 
 #[cfg(test)]
 mod tests {
-    use super::{DrainStep, canonical_uri, drain_step};
+    use super::{DrainStep, canonical_uri, checksum_of, drain_step, verified_shard};
+    use objectio_proto::storage::ReadShardResponse;
+
+    fn response(data: &[u8], crc32c: Option<u32>) -> ReadShardResponse {
+        ReadShardResponse {
+            data: data.to_vec().into(),
+            checksum: crc32c.map(|crc32c| objectio_proto::storage::Checksum {
+                crc32c,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A damaged shard is not migrated: the target would store it under a
+    /// checksum of the damage and serve it as good.
+    #[test]
+    fn a_shard_that_does_not_match_its_checksum_is_not_moved() {
+        let data = b"a shard on a draining osd";
+        let good = checksum_of(data).crc32c;
+        assert_eq!(
+            &verified_shard(response(data, Some(good))).unwrap()[..],
+            data
+        );
+        assert!(verified_shard(response(data, Some(good ^ 1))).is_err());
+        assert_eq!(&verified_shard(response(data, None)).unwrap()[..], data);
+    }
 
     /// An OSD that did not answer is never declared drained.
     ///

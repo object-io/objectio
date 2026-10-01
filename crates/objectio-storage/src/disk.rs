@@ -307,6 +307,13 @@ impl DiskManager {
         self.superblock.read().block_size
     }
 
+    /// Byte offset of `block_num` in the device or file.
+    #[must_use]
+    pub fn block_offset(&self, block_num: u64) -> u64 {
+        let sb = self.superblock.read();
+        sb.data_offset + block_num * u64::from(sb.block_size)
+    }
+
     /// Get statistics
     pub fn stats(&self) -> &DiskStats {
         &self.stats

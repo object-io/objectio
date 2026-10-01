@@ -22,6 +22,9 @@ pub enum OsdPoolError {
     #[error("no nodes available")]
     #[allow(dead_code)]
     NoNodesAvailable,
+
+    #[error("shard checksum mismatch: {0}")]
+    ChecksumMismatch(String),
 }
 
 /// Node identifier (16-byte UUID)
@@ -266,7 +269,26 @@ pub async fn read_shard_from_osd(
             OsdPoolError::ConnectionFailed(e.to_string())
         })?;
 
-    Ok(response.into_inner().data.into())
+    // A shard damaged on the way is a failed read, so the chunk is decoded
+    // from the others instead of from the damage.
+    let response = response.into_inner();
+    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+        warn!(
+            "shard {position} from OSD {} does not match its checksum; not using it",
+            placement.node_address
+        );
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} from {}",
+            placement.node_address
+        )));
+    }
+    Ok(response.data.into())
+}
+
+/// Whether `data` is the shard the OSD described. A response without a
+/// checksum is taken as is: the field is optional on the wire.
+fn matches_checksum(checksum: Option<&objectio_proto::storage::Checksum>, data: &[u8]) -> bool {
+    checksum.is_none_or(|c| c.crc32c == crc32c::crc32c(data))
 }
 
 /// Store object metadata on the primary OSD
@@ -282,6 +304,7 @@ pub async fn put_object_meta_to_osd(
     let mut client = pool.get_client_for_placement(primary_placement).await?;
 
     let request = PutObjectMetaRequest {
+        expected_object_id: Vec::new(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         object: Some(object_meta),
@@ -470,4 +493,24 @@ pub async fn delete_shards_for_object(
         }
     }
     failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_checksum;
+    use objectio_proto::storage::Checksum;
+
+    #[test]
+    fn a_damaged_shard_does_not_match_its_checksum() {
+        let data = b"a chunk shard".to_vec();
+        let sent = Checksum {
+            crc32c: crc32c::crc32c(&data),
+            ..Default::default()
+        };
+        assert!(matches_checksum(Some(&sent), &data));
+        let mut damaged = data;
+        damaged[0] ^= 1;
+        assert!(!matches_checksum(Some(&sent), &damaged));
+        assert!(matches_checksum(None, &damaged));
+    }
 }

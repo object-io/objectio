@@ -65,6 +65,10 @@ service StorageService {
     // the gateway can serve it from its /metrics. In the all-in-one binary
     // the OSDs have no metrics port of their own.
     rpc GetMetrics(objectio.metadata.GetMetricsRequest) returns (objectio.metadata.GetMetricsResponse);
+
+    // Whether this OSD holds each shard, and whether it is intact: missing,
+    // or found corrupt by the scrubber or a read. Asked by Meta's repairer.
+    rpc CheckShards(CheckShardsRequest) returns (CheckShardsResponse);
 }
 
 // Shard identifier
@@ -291,6 +295,11 @@ message PutObjectMetaRequest {
     string key = 2;
     objectio.metadata.ObjectMeta object = 3;
     bool versioning_enabled = 4;  // If true, also store version entry
+    // Compare-and-set: when non-empty, store only if the current entry for
+    // the key is the object with this id (FAILED_PRECONDITION otherwise).
+    // Lets a background writer — the repairer adding a rebuilt shard's
+    // location — never roll back a PUT that replaced the object meanwhile.
+    bytes expected_object_id = 5;
 }
 
 message PutObjectMetaResponse {
@@ -371,4 +380,18 @@ message ListObjectVersionsMetaResponse {
     string next_key_marker = 2;
     string next_version_id_marker = 3;
     bool is_truncated = 4;
+}
+
+message CheckShardsRequest {
+    repeated ShardId shards = 1;
+}
+
+enum ShardState {
+    SHARD_STATE_OK = 0;
+    SHARD_STATE_MISSING = 1;   // not on this OSD
+    SHARD_STATE_CORRUPT = 2;   // on this OSD, but its bytes fail their checksum
+}
+
+message CheckShardsResponse {
+    repeated ShardState states = 1;   // one per requested shard, in order
 }

@@ -63,6 +63,7 @@ use objectio_proto::metadata::{
     ListMultipartUploadsRequest,
     ListPartsRequest,
     ListUsersRequest,
+    ObjectChecksum,
     ObjectLockConfiguration as ProtoObjectLockConfig,
     ObjectMeta,
     ObjectRetention,
@@ -586,6 +587,29 @@ fn add_metadata_headers(
         builder = builder.header(header_name, value);
     }
     builder
+}
+
+/// Add the object's stored `x-amz-checksum-<algorithm>` to a GET or HEAD
+/// response, when the request asked with `x-amz-checksum-mode: ENABLED`.
+/// Only for whole-object responses: the stored value is the checksum of the
+/// whole object, which a ranged body would not match.
+fn add_checksum_header(
+    builder: http::response::Builder,
+    request_headers: &HeaderMap,
+    object: &ObjectMeta,
+) -> http::response::Builder {
+    let enabled = request_headers
+        .get("x-amz-checksum-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("ENABLED"));
+    let stored = object.checksum.as_ref().and_then(|c| {
+        crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
+            .map(|a| (a.header_name(), c.value.as_str()))
+    });
+    match stored {
+        Some((name, value)) if enabled => builder.header(name, value),
+        _ => builder,
+    }
 }
 
 /// Parsed Range header
@@ -2162,6 +2186,25 @@ fn is_object_metadata_header(name: &str) -> bool {
         )
 }
 
+/// Shards of a k+m stripe that must be on disk before a write is
+/// acknowledged: k+1, or all of them when there is no parity.
+///
+/// k is enough to read the stripe back, but an object acknowledged with
+/// exactly k has no redundancy left: one more failure loses it. One spare
+/// shard means a write still succeeds with an OSD down, and what it stores
+/// survives one further failure until the repairer restores the rest.
+const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
+    let k = ec_k as usize;
+    if ec_m == 0 { k } else { k + 1 }
+}
+
+/// Replicas that must be written before a replicated write is
+/// acknowledged: two — the copy and a spare — or one in a pool that keeps
+/// only one. Same reasoning as [`write_quorum`].
+const fn replica_quorum(replicas: usize) -> usize {
+    if replicas < 2 { replicas } else { 2 }
+}
+
 /// How a PUT's two commits ended, when the one that decides it succeeded.
 #[derive(Debug, PartialEq, Eq)]
 enum Committed<E> {
@@ -2196,6 +2239,44 @@ where
                 unlist().await;
             }
             Err(e)
+        }
+    }
+}
+
+/// Check an upload's body against the `Content-MD5` and `x-amz-checksum-*`
+/// the request carries, refusing it as S3 does on a mismatch or a malformed
+/// header.
+///
+/// Returns the checksums read, and the body's MD5 when `Content-MD5` made us
+/// compute it. A request carrying neither costs nothing here.
+async fn verify_upload_checksums(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(crate::checksum::RequestChecksums, Option<[u8; 16]>), Response> {
+    let refused = |e: &crate::checksum::ChecksumError| {
+        S3Error::xml_response(e.code(), &e.message(), StatusCode::BAD_REQUEST)
+    };
+    let checksums =
+        crate::checksum::RequestChecksums::from_headers(headers).map_err(|e| refused(&e))?;
+    if checksums.is_empty() {
+        return Ok((checksums, None));
+    }
+    // Hashing a large body is CPU-bound; keep it off the async workers.
+    let task = {
+        let checksums = checksums.clone();
+        let body = body.clone();
+        tokio::task::spawn_blocking(move || checksums.verify(&body))
+    };
+    match task.await {
+        Ok(Ok(md5)) => Ok((checksums, md5)),
+        Ok(Err(e)) => Err(refused(&e)),
+        Err(e) => {
+            error!("checksum computation failed: {e}");
+            Err(S3Error::xml_response(
+                "InternalError",
+                "Checksum computation failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
         }
     }
 }
@@ -2305,10 +2386,32 @@ pub async fn put_object(
     // time still spent waiting for it afterwards.
     let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
     let object_id = *Uuid::new_v4().as_bytes();
-    let etag_task = {
-        let body = body.clone();
-        tokio::task::spawn_blocking(move || format!("\"{}\"", crate::digest::md5_hex(&body)))
+
+    // A body that does not match the checksum the client sent is refused
+    // here, before any shard is written or metadata committed, so a mismatch
+    // stores nothing.
+    let (checksums, verified_md5) = match verify_upload_checksums(&headers, &body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
+    if !checksums.is_empty() {
+        phases.mark("checksum");
+    }
+
+    let etag_task = match verified_md5 {
+        // Content-MD5 was checked, so the ETag's MD5 is already known: hand
+        // it back through a task that is already done instead of hashing the
+        // body a second time.
+        Some(md5) => tokio::spawn(async move { format!("\"{}\"", hex::encode(md5)) }),
+        None => {
+            let body = body.clone();
+            tokio::task::spawn_blocking(move || format!("\"{}\"", crate::digest::md5_hex(&body)))
+        }
+    };
+    let stored_checksum = checksums.flexible.as_ref().map(|f| ObjectChecksum {
+        algorithm: f.algorithm.aws_name().to_string(),
+        value: f.value_b64(),
+    });
     let original_size = body.len() as u64;
 
     // SSE: if the request header or bucket default asks for encryption,
@@ -2477,19 +2580,19 @@ pub async fn put_object(
                 }
             }
 
-            // For replication, we need at least 1 successful write per stripe
-            if success_count < 1 {
+            let quorum = replica_quorum(total_replicas);
+            if success_count < quorum {
                 error!(
-                    "Replication failed for stripe {}: {} successful writes, need at least 1",
-                    stripe_idx, success_count
+                    "Replication failed for stripe {}: {} successful writes, need {}",
+                    stripe_idx, success_count, quorum
                 );
                 return S3Error::xml_response(
-                    "InternalError",
+                    "ServiceUnavailable",
                     &format!(
-                        "Replication failed for stripe {}: {} successful writes, need 1",
-                        stripe_idx, success_count
+                        "Replication failed for stripe {}: {} successful writes, need {}",
+                        stripe_idx, success_count, quorum
                     ),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
 
@@ -2561,6 +2664,7 @@ pub async fn put_object(
             encryption_context: sse_encryption_context.clone(),
             usage_owner: Vec::new(), // filled in by put_object_meta_to_all
             inline_data: Vec::new(),
+            checksum: stored_checksum.clone(),
         };
 
         if let Err(e) = put_object_meta_to_all(
@@ -2590,6 +2694,9 @@ pub async fn put_object(
         let mut resp = Response::builder()
             .status(StatusCode::OK)
             .header("ETag", etag);
+        if let Some(c) = &checksums.flexible {
+            resp = resp.header(c.algorithm.header_name(), c.value_b64());
+        }
         if !version_id.is_empty() {
             resp = resp.header("x-amz-version-id", &version_id);
         }
@@ -2841,20 +2948,19 @@ pub async fn put_object(
             }
         }
 
-        // Check write quorum - need at least k shards to reconstruct data
-        let quorum = ec_k as usize;
+        let quorum = write_quorum(ec_k, ec_m);
         if success_count < quorum {
             error!(
                 "Write quorum not met for stripe {}: {} successful, need {} (ec_k={}, ec_m={}, total_shards={})",
                 stripe_idx, success_count, quorum, ec_k, ec_m, total_shards
             );
             return S3Error::xml_response(
-                "InternalError",
+                "ServiceUnavailable",
                 &format!(
                     "Write quorum not met for stripe {}: {} successful writes, need {}",
                     stripe_idx, success_count, quorum
                 ),
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
             );
         }
 
@@ -2931,6 +3037,7 @@ pub async fn put_object(
         encryption_context: sse_encryption_context,
         usage_owner: Vec::new(), // filled in by put_object_meta_to_all
         inline_data: if inline { body.to_vec() } else { Vec::new() },
+        checksum: stored_checksum,
     };
 
     // Two commits make the object, at the same time: see `commit_object`.
@@ -3007,6 +3114,9 @@ pub async fn put_object(
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header("ETag", etag);
+    if let Some(c) = &checksums.flexible {
+        resp = resp.header(c.algorithm.header_name(), c.value_b64());
+    }
     if !version_id.is_empty() {
         resp = resp.header("x-amz-version-id", &version_id);
     }
@@ -3173,6 +3283,7 @@ pub async fn get_object(
                 .unwrap();
         }
         builder = add_metadata_headers(builder, &object.user_metadata);
+        builder = add_checksum_header(builder, &headers, &object);
         return builder.body(Body::empty()).unwrap();
     }
 
@@ -3784,6 +3895,7 @@ pub async fn get_object(
         }
 
         let builder = add_metadata_headers(builder, &object.user_metadata);
+        let builder = add_checksum_header(builder, &headers, &object);
 
         builder.body(Body::from(all_data)).unwrap()
     }
@@ -3911,6 +4023,7 @@ pub async fn head_object(
     Path((bucket, key)): Path<(String, String)>,
     // Authorized by `authz::authz_layer` before this handler runs.
     _auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
 ) -> Response {
     // If key is empty (trailing slash on bucket), treat as head_bucket
     if key.is_empty() {
@@ -3986,6 +4099,7 @@ pub async fn head_object(
 
             // Add user metadata headers
             let builder = add_metadata_headers(builder, &obj.user_metadata);
+            let builder = add_checksum_header(builder, &headers, &obj);
 
             builder.body(Body::empty()).unwrap()
         }
@@ -5172,10 +5286,20 @@ async fn upload_part_internal(
         );
     }
 
+    // Refuse a part that does not match its checksum before any of it is
+    // written, as PutObject does.
+    let (checksums, verified_md5) = match verify_upload_checksums(&headers, &body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
     // Calculate ETag for this part — AWS semantics for SSE-S3/SSE-KMS:
     // part ETag is the MD5 of the *plaintext*. Compute before we possibly
-    // encrypt below.
-    let etag = format!("\"{}\"", crate::digest::md5_hex(&body));
+    // encrypt below; Content-MD5 already did when it was sent.
+    let etag = format!(
+        "\"{}\"",
+        verified_md5.map_or_else(|| crate::digest::md5_hex(&body), hex::encode)
+    );
     let part_size = body.len() as u64;
 
     let mut meta_client = state.meta_client.clone();
@@ -5583,20 +5707,19 @@ async fn upload_part_internal(
                 }
             }
 
-            // Check write quorum - need at least k shards to reconstruct data
-            let quorum = ec_k as usize;
+            let quorum = write_quorum(ec_k, ec_m);
             if success < quorum {
                 error!(
                     "Write quorum not met for part stripe {}: {} successful, need {} (ec_k={}, ec_m={})",
                     stripe_idx, success, quorum, ec_k, ec_m
                 );
                 return S3Error::xml_response(
-                    "InternalError",
+                    "ServiceUnavailable",
                     &format!(
                         "Write quorum not met for stripe {}: {} successful writes, need {}",
                         stripe_idx, success, quorum
                     ),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
 
@@ -5655,6 +5778,9 @@ async fn upload_part_internal(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("ETag", &etag);
+            if let Some(c) = &checksums.flexible {
+                builder = builder.header(c.algorithm.header_name(), c.value_b64());
+            }
             if let Some(v) = sse_response_header {
                 builder = builder.header("x-amz-server-side-encryption", v);
                 if v == "aws:kms" && !sse_kms_key_id.is_empty() {
@@ -8934,5 +9060,31 @@ mod commit_tests {
         .await;
         assert_eq!(r, Err("osd"));
         assert!(!unlisted.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod write_quorum_tests {
+    use super::write_quorum;
+
+    #[test]
+    fn a_write_keeps_one_spare_shard() {
+        assert_eq!(write_quorum(4, 2), 5);
+        assert_eq!(write_quorum(8, 3), 9);
+        assert_eq!(write_quorum(2, 1), 3, "with m = 1 that is every shard");
+    }
+
+    #[test]
+    fn a_replicated_write_keeps_one_spare_copy() {
+        use super::replica_quorum;
+        assert_eq!(replica_quorum(3), 2);
+        assert_eq!(replica_quorum(2), 2);
+        assert_eq!(replica_quorum(1), 1);
+    }
+
+    #[test]
+    fn without_parity_every_shard_is_needed() {
+        assert_eq!(write_quorum(1, 0), 1);
+        assert_eq!(write_quorum(4, 0), 4);
     }
 }
