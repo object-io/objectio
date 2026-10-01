@@ -6,7 +6,7 @@ use crate::chunk::{ChunkId, ChunkMapper};
 use crate::error::{BlockError, BlockResult};
 use crate::journal::WriteJournal;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -184,22 +184,24 @@ impl WriteCache {
         // cache lock: the journal's order is then the order writes are
         // applied, and it cannot be reset between a write being logged and
         // that write becoming dirty.
-        if let Some(ref journal) = self.journal {
-            journal.log_write(
+        let logged = match self.journal {
+            Some(ref journal) => Some(journal.log_write(
                 volume_id,
                 self.chunk_mapper.byte_offset_to_chunk_id(offset),
                 offset % self.chunk_mapper.chunk_size(),
                 Bytes::copy_from_slice(data),
-            )?;
-        }
+            )?),
+            None => None,
+        };
         self.apply(&mut caches, volume_id, offset, data)?;
         drop(caches);
         // Acknowledged means on stable storage: the journal is fsynced
         // before the write returns, not only on an explicit flush, so a
         // power cut cannot lose a write the client was told succeeded.
-        // Outside the cache lock, so other writes proceed meanwhile.
-        if let Some(ref journal) = self.journal {
-            journal.sync()?;
+        // Outside the cache lock, so other writes proceed meanwhile, and
+        // concurrent writes share one fsync (group commit).
+        if let (Some(journal), Some(seq)) = (&self.journal, logged) {
+            journal.sync_to(seq + 1)?;
         }
         Ok(())
     }
@@ -237,21 +239,30 @@ impl WriteCache {
         for range in chunk_ranges {
             let range_len = range.length as usize;
 
-            // Get or create chunk data
-            let chunk_data = if let Some(dirty) = cache.dirty_chunks.get(&range.chunk_id) {
-                // Already dirty, update it
-                dirty.data.to_vec()
-            } else if let Some(clean) = cache.clean_chunks.remove(&range.chunk_id) {
-                // Was clean, promote to dirty
-                cache.clean_bytes = cache.clean_bytes.saturating_sub(clean.len() as u64);
-                clean.to_vec()
-            } else {
-                // New chunk, initialize with zeros
-                vec![0u8; chunk_size]
-            };
+            // The chunk's current bytes: dirty, clean (promoted to dirty), or
+            // zeros for a chunk never cached.
+            let (existing, dirty_since) =
+                if let Some(dirty) = cache.dirty_chunks.remove(&range.chunk_id) {
+                    (Some(dirty.data), Some(dirty.dirty_since))
+                } else if let Some(clean) = cache.clean_chunks.remove(&range.chunk_id) {
+                    cache.clean_bytes = cache.clean_bytes.saturating_sub(clean.len() as u64);
+                    (Some(clean), None)
+                } else {
+                    (None, None)
+                };
+            let was_dirty = dirty_since.is_some();
 
-            // Update chunk data
-            let mut chunk_data = chunk_data;
+            // Written in place when the cache holds the only reference;
+            // copied only while a flush or a read holds one too (they keep
+            // the bytes they took). This used to copy the whole 4 MiB chunk
+            // on every write, under the cache lock: ~3k writes/s for the
+            // whole gateway, whatever the disk could do.
+            let mut chunk_data: BytesMut = match existing {
+                Some(b) => b
+                    .try_into_mut()
+                    .unwrap_or_else(|shared| BytesMut::from(&shared[..])),
+                None => BytesMut::zeroed(chunk_size),
+            };
             if chunk_data.len() < chunk_size {
                 chunk_data.resize(chunk_size, 0);
             }
@@ -261,16 +272,11 @@ impl WriteCache {
                 .copy_from_slice(&data[data_offset..data_offset + range_len]);
 
             // Store as dirty
-            let was_dirty = cache.dirty_chunks.contains_key(&range.chunk_id);
             cache.next_version += 1;
             let dirty_chunk = DirtyChunk {
                 version: cache.next_version,
-                data: Bytes::from(chunk_data),
-                dirty_since: if was_dirty {
-                    cache.dirty_chunks.get(&range.chunk_id).unwrap().dirty_since
-                } else {
-                    now
-                },
+                data: chunk_data.freeze(),
+                dirty_since: dirty_since.unwrap_or(now),
                 last_modified: now,
             };
 
@@ -346,8 +352,14 @@ impl WriteCache {
     pub fn add_clean(&self, volume_id: &str, chunk_id: ChunkId, data: Bytes) {
         let mut caches = self.caches.write();
         if let Some(cache) = caches.get_mut(volume_id) {
-            // Don't overwrite dirty data
-            if !cache.dirty_chunks.contains_key(&chunk_id) {
+            // Never replace what the cache holds, dirty or clean: it is at
+            // least as new as anything loaded from the OSDs. A load that
+            // started before a write was applied, flushed and marked clean
+            // would otherwise put the older bytes back over it — and with
+            // requests served concurrently, two loads of one chunk can race.
+            if !cache.dirty_chunks.contains_key(&chunk_id)
+                && !cache.clean_chunks.contains_key(&chunk_id)
+            {
                 cache.clean_bytes += data.len() as u64;
                 cache.clean_chunks.insert(chunk_id, data);
             }
@@ -602,6 +614,28 @@ mod tests {
         let still = cache.dirty_chunks("vol1");
         assert_eq!(still.len(), 1, "the newer write was dropped");
         assert_eq!(&still[0].1[4096..8192], &[2u8; 4096]);
+    }
+
+    /// A chunk is written in place, but never under a flush: the bytes a
+    /// flush took stay what they were when it took them.
+    #[test]
+    fn a_write_does_not_change_the_bytes_a_flush_is_storing() {
+        let cache = test_cache();
+        cache.init_volume("vol1");
+        cache.write("vol1", 0, &[1u8; 4096]).unwrap();
+        let taken = cache.dirty_chunks("vol1");
+        cache.write("vol1", 0, &[2u8; 4096]).unwrap();
+        assert_eq!(
+            &taken[0].1[..4096],
+            &[1u8; 4096],
+            "the flush's bytes changed"
+        );
+        let now = cache.dirty_chunks("vol1");
+        assert_eq!(&now[0].1[..4096], &[2u8; 4096]);
+        assert!(
+            now[0].2 > taken[0].2,
+            "the newer write must be flushed again"
+        );
     }
 
     /// Writes logged since the journal was reopened are recovered, and

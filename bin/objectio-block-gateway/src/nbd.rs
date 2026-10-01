@@ -14,7 +14,7 @@ use objectio_proto::block::Attachment;
 use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ec_io::read_chunk;
 use crate::meta_blocks::MetaBlocks;
@@ -59,6 +59,10 @@ const NBD_INFO_EXPORT: u16 = 0;
 const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_DISC: u16 = 2;
+
+/// Requests served at once on one connection. The kernel client queues up
+/// to 128; more than this waits to be read.
+const MAX_IN_FLIGHT: usize = 64;
 const NBD_CMD_FLUSH: u16 = 3;
 const NBD_CMD_TRIM: u16 = 4;
 
@@ -225,8 +229,7 @@ impl NbdServer {
         let (export_name, export) = self.negotiate_options(&mut stream).await?;
 
         // ── Data phase ────────────────────────────────────────────────────────
-        self.data_phase(&mut stream, &export_name, &export, peer)
-            .await?;
+        self.data_phase(stream, &export_name, &export, peer).await?;
 
         info!("NBD: client {peer} disconnected from '{export_name}'");
         Ok(())
@@ -371,143 +374,177 @@ impl NbdServer {
         Ok(())
     }
 
+    /// Serve requests until the client disconnects.
+    ///
+    /// Requests are read in order and served concurrently, up to
+    /// `MAX_IN_FLIGHT` per connection, each reply written whole as soon as
+    /// it is ready: NBD replies carry the request's handle, so they may go
+    /// out in any order. Served one at a time (as this used to), a client's
+    /// queue depth bought nothing: 32 requests in flight were answered one
+    /// after another, and writes never shared a journal fsync. Every write
+    /// is durable before its reply either way.
     async fn data_phase(
-        &self,
-        stream: &mut TcpStream,
+        self: &Arc<Self>,
+        stream: TcpStream,
         vol_id: &str,
         export: &NbdExport,
         peer: SocketAddr,
     ) -> anyhow::Result<()> {
-        loop {
-            // Read request header: magic(4) + flags(2) + type(2) + handle(8) + offset(8) + length(4) = 28 bytes
-            let magic = stream.read_u32().await?;
-            if magic != NBD_REQUEST_MAGIC {
-                return Err(anyhow::anyhow!("bad request magic: {magic:#x}"));
+        let (mut rd, wr) = stream.into_split();
+        let wr = Arc::new(tokio::sync::Mutex::new(wr));
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let mut in_flight = tokio::task::JoinSet::new();
+        let result = loop {
+            // Request header: magic(4) + flags(2) + type(2) + handle(8) +
+            // offset(8) + length(4) = 28 bytes.
+            let header = async {
+                let magic = rd.read_u32().await?;
+                if magic != NBD_REQUEST_MAGIC {
+                    return Err(anyhow::anyhow!("bad request magic: {magic:#x}"));
+                }
+                let _flags = rd.read_u16().await?;
+                let cmd = rd.read_u16().await?;
+                let handle = rd.read_u64().await?;
+                let offset = rd.read_u64().await?;
+                let length = rd.read_u32().await?;
+                Ok::<_, anyhow::Error>((cmd, handle, offset, length))
             }
-            let _flags = stream.read_u16().await?;
-            let cmd = stream.read_u16().await?;
-            let handle = stream.read_u64().await?;
-            let offset = stream.read_u64().await?;
-            let length = stream.read_u32().await?;
-
-            match cmd {
-                NBD_CMD_READ => {
-                    let io = Io::start(Protocol::Nbd, "read");
-                    // A read that fails is an error to the client, never
-                    // zeros: zeros it would take for the data. (A failed read
-                    // used to be answered with zeros and no error.) An error
-                    // reply carries no data.
-                    let mut data = match self.nbd_read(vol_id, offset, u64::from(length)).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            warn!("NBD read error for {peer}: {e}");
-                            self.send_reply(stream, handle, 5).await?; // EIO
-                            continue;
-                        }
-                    };
-
-                    // A simple reply has no length field, so the client reads
-                    // exactly `length` bytes off the socket no matter what we
-                    // send. Anything else desynchronises the connection for
-                    // good — belt and braces on top of nbd_read's own
-                    // guarantee, because the failure is silent corruption.
-                    if data.len() != length as usize {
-                        warn!(
-                            "NBD read for {peer} returned {} bytes for a {length}-byte request",
-                            data.len()
-                        );
-                        data.resize(length as usize, 0);
-                    }
-
-                    // Reply: magic(4) + error(4) + handle(8) + data, in one
-                    // write.
-                    let mut reply = Vec::with_capacity(16 + data.len());
-                    reply.extend_from_slice(&reply_header(handle, 0));
-                    reply.extend_from_slice(&data);
-                    stream.write_all(&reply).await?;
-                    io.done(u64::from(length));
-                }
-
-                NBD_CMD_WRITE => {
-                    if export.read_only {
-                        // Still need to consume the data bytes
-                        let mut discard = vec![0u8; length as usize];
-                        stream.read_exact(&mut discard).await?;
-                        self.send_reply(stream, handle, 1).await?; // EPERM
-                        continue;
-                    }
-                    let io = Io::start(Protocol::Nbd, "write");
-                    let mut data = vec![0u8; length as usize];
-                    stream.read_exact(&mut data).await?;
-
-                    let error = if let Err(e) = self.load_for_write(vol_id, offset, length).await {
-                        warn!("NBD write for {peer}: {e}");
-                        5u32 // EIO
-                    } else if let Err(e) = self.cache.write(vol_id, offset, &data) {
-                        warn!("NBD write cache error for {peer}: {e}");
-                        5u32 // EIO
-                    } else {
-                        0u32
-                    };
-                    self.send_reply(stream, handle, error).await?;
-                    if error == 0 {
-                        io.done(u64::from(length));
-                    }
-                }
-
-                NBD_CMD_FLUSH => {
-                    // Every write is already fsynced to the journal when it
-                    // is acknowledged; syncing again here is belt and braces.
-                    // (This used to acknowledge without doing anything.)
-                    let io = Io::start(Protocol::Nbd, "flush");
-                    let error = match self.cache.sync() {
-                        Ok(()) => 0u32,
-                        Err(e) => {
-                            warn!("NBD flush for {peer}: {e}");
-                            5u32 // EIO
-                        }
-                    };
-                    self.send_reply(stream, handle, error).await?;
-                    if error == 0 {
-                        io.done(0);
-                    }
-                }
-
-                NBD_CMD_TRIM => {
-                    // Zero-fill trimmed range
-                    let io = Io::start(Protocol::Nbd, "trim");
-                    let zeros = vec![0u8; length as usize];
-                    let error = match self.load_for_write(vol_id, offset, length).await {
-                        Ok(()) if self.cache.write(vol_id, offset, &zeros).is_ok() => 0u32,
-                        _ => 5u32, // EIO
-                    };
-                    self.send_reply(stream, handle, error).await?;
-                    if error == 0 {
-                        io.done(u64::from(length));
-                    }
-                }
-
-                NBD_CMD_DISC => {
-                    info!("NBD: client {peer} sent disconnect for '{vol_id}'");
-                    return Ok(());
-                }
-
-                _ => {
-                    warn!("NBD: unknown command {cmd} from {peer}");
-                    self.send_reply(stream, handle, 22).await?; // EINVAL
-                }
+            .await;
+            let (cmd, handle, offset, length) = match header {
+                Ok(h) => h,
+                Err(e) => break Err(e),
+            };
+            if cmd == NBD_CMD_DISC {
+                info!("NBD: client {peer} sent disconnect for '{vol_id}'");
+                break Ok(());
             }
-        }
+            // A write's data follows its header on the socket, so it is read
+            // here, in order, before the next request.
+            let payload = if cmd == NBD_CMD_WRITE {
+                let mut data = vec![0u8; length as usize];
+                if let Err(e) = rd.read_exact(&mut data).await {
+                    break Err(e.into());
+                }
+                Some(data)
+            } else {
+                None
+            };
+            let slot = Arc::clone(&slots).acquire_owned().await?;
+            let server = Arc::clone(self);
+            let wr = Arc::clone(&wr);
+            let vol = vol_id.to_string();
+            let read_only = export.read_only;
+            in_flight.spawn(async move {
+                let reply = server
+                    .serve_request(&vol, peer, read_only, cmd, handle, offset, length, payload)
+                    .await;
+                if let Err(e) = wr.lock().await.write_all(&reply).await {
+                    debug!("NBD: reply to {peer} not sent: {e}");
+                }
+                drop(slot);
+            });
+            // Reap what has finished, so the set does not grow with the
+            // connection's lifetime.
+            while in_flight.try_join_next().is_some() {}
+        };
+        // Requests already read get their replies before the connection
+        // goes.
+        while in_flight.join_next().await.is_some() {}
+        result
     }
 
-    async fn send_reply(
+    /// One request's whole reply: header, and for a read its data.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_request(
         &self,
-        stream: &mut TcpStream,
+        vol_id: &str,
+        peer: SocketAddr,
+        read_only: bool,
+        cmd: u16,
         handle: u64,
-        error: u32,
-    ) -> anyhow::Result<()> {
-        stream.write_all(&reply_header(handle, error)).await?;
-        Ok(())
+        offset: u64,
+        length: u32,
+        payload: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        let status = |error: u32| reply_header(handle, error).to_vec();
+        match cmd {
+            NBD_CMD_READ => {
+                let io = Io::start(Protocol::Nbd, "read");
+                // A read that fails is an error to the client, never zeros:
+                // zeros it would take for the data. An error reply carries no
+                // data.
+                let mut data = match self.nbd_read(vol_id, offset, u64::from(length)).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("NBD read error for {peer}: {e}");
+                        return status(5); // EIO
+                    }
+                };
+                // A simple reply has no length field, so the client reads
+                // exactly `length` bytes off the socket no matter what is
+                // sent; anything else desynchronises the connection for good.
+                if data.len() != length as usize {
+                    warn!(
+                        "NBD read for {peer} returned {} bytes for a {length}-byte request",
+                        data.len()
+                    );
+                    data.resize(length as usize, 0);
+                }
+                let mut reply = Vec::with_capacity(16 + data.len());
+                reply.extend_from_slice(&reply_header(handle, 0));
+                reply.extend_from_slice(&data);
+                io.done(u64::from(length));
+                reply
+            }
+            NBD_CMD_WRITE => {
+                if read_only {
+                    return status(1); // EPERM
+                }
+                let io = Io::start(Protocol::Nbd, "write");
+                let data = payload.unwrap_or_default();
+                if let Err(e) = self.load_for_write(vol_id, offset, length).await {
+                    warn!("NBD write for {peer}: {e}");
+                    return status(5); // EIO
+                }
+                if let Err(e) = self.cache.write(vol_id, offset, &data) {
+                    warn!("NBD write cache error for {peer}: {e}");
+                    return status(5);
+                }
+                io.done(u64::from(length));
+                status(0)
+            }
+            NBD_CMD_FLUSH => {
+                // Every write is fsynced to the journal before it is
+                // acknowledged; this makes sure, and costs nothing when
+                // everything is already synced.
+                let io = Io::start(Protocol::Nbd, "flush");
+                if let Err(e) = self.cache.sync() {
+                    warn!("NBD flush for {peer}: {e}");
+                    return status(5);
+                }
+                io.done(0);
+                status(0)
+            }
+            NBD_CMD_TRIM => {
+                if read_only {
+                    return status(1);
+                }
+                // Zero-fill the trimmed range.
+                let io = Io::start(Protocol::Nbd, "trim");
+                let zeros = vec![0u8; length as usize];
+                match self.load_for_write(vol_id, offset, length).await {
+                    Ok(()) if self.cache.write(vol_id, offset, &zeros).is_ok() => {
+                        io.done(u64::from(length));
+                        status(0)
+                    }
+                    _ => status(5),
+                }
+            }
+            _ => {
+                warn!("NBD: unknown command {cmd} from {peer}");
+                status(22) // EINVAL
+            }
+        }
     }
 
     /// Read `length` bytes at `offset`, always returning exactly that many.

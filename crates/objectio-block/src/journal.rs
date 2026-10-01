@@ -252,8 +252,17 @@ pub struct WriteJournal {
     path: PathBuf,
     /// Journal file writer
     writer: Mutex<Option<BufWriter<File>>>,
-    /// Current sequence number
+    /// Next sequence number. Every entry numbered below it has been
+    /// written to the OS (the writer is flushed before it moves on).
     sequence: AtomicU64,
+    /// Every entry numbered below this is on stable storage.
+    synced: AtomicU64,
+    /// A second handle on the journal file, used to fsync it without
+    /// holding the writer; held while syncing, so a rotation cannot swap
+    /// the file under a sync. See [`Self::sync_to`].
+    syncer: Mutex<Option<File>>,
+    /// Fsyncs this journal has done.
+    fsyncs: AtomicU64,
     /// Last checkpoint sequence
     last_checkpoint: AtomicU64,
     /// Maximum journal size before rotation
@@ -318,10 +327,16 @@ impl WriteJournal {
             path, sequence, last_checkpoint, current_size
         );
 
+        let syncer = file
+            .try_clone()
+            .map_err(|e| BlockError::Journal(format!("failed to clone journal handle: {}", e)))?;
         Ok(Self {
             path,
             writer: Mutex::new(Some(BufWriter::new(file))),
             sequence: AtomicU64::new(sequence),
+            synced: AtomicU64::new(sequence),
+            syncer: Mutex::new(Some(syncer)),
+            fsyncs: AtomicU64::new(0),
             last_checkpoint: AtomicU64::new(last_checkpoint),
             max_size,
             current_size: AtomicU64::new(current_size),
@@ -486,6 +501,9 @@ impl WriteJournal {
 
     /// Rotate journal (create new one, discard old)
     pub fn rotate(&self) -> BlockResult<()> {
+        // No sync runs while the file is swapped: a sync started on the old
+        // file must not be taken as covering entries in the new one.
+        let mut syncer = self.syncer.lock();
         // Close current journal
         {
             let mut writer_guard = self.writer.lock();
@@ -506,6 +524,11 @@ impl WriteJournal {
             .open(&self.path)
             .map_err(|e| BlockError::Journal(format!("failed to create new journal: {}", e)))?;
 
+        *syncer =
+            Some(file.try_clone().map_err(|e| {
+                BlockError::Journal(format!("failed to clone journal handle: {}", e))
+            })?);
+        drop(syncer);
         let mut writer = BufWriter::new(file);
         let seq = self.sequence.load(Ordering::SeqCst);
         Self::write_header(&mut writer, seq, seq)?;
@@ -527,17 +550,49 @@ impl WriteJournal {
         Ok(())
     }
 
-    /// Sync journal to disk
+    /// Fsyncs this journal has done.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Make every entry appended so far durable.
     pub fn sync(&self) -> BlockResult<()> {
-        let writer_guard = self.writer.lock();
-        if let Some(ref writer) = *writer_guard {
+        self.sync_to(self.sequence.load(Ordering::SeqCst))
+    }
+
+    /// Make every entry numbered below `upto` durable: group commit.
+    ///
+    /// One fsync covers every entry written to the OS before it started,
+    /// so concurrent writers share it instead of queueing for one each:
+    /// a writer that finds its entry already covered returns at once, and
+    /// one that waited on the sync lock usually finds the sync just done
+    /// covered it. The fsync goes through a second handle without the
+    /// writer lock, so appends carry on while it runs. (It used to hold the
+    /// writer lock, and the next writer held the cache lock waiting for it:
+    /// every write in the gateway queued behind one fsync at a time.)
+    pub fn sync_to(&self, upto: u64) -> BlockResult<()> {
+        if self.synced.load(Ordering::SeqCst) >= upto {
+            return Ok(());
+        }
+        let syncer = self.syncer.lock();
+        if self.synced.load(Ordering::SeqCst) >= upto {
+            return Ok(());
+        }
+        // Everything numbered below `target` is in the OS already: the
+        // sequence moves on only after the writer is flushed.
+        let target = self.sequence.load(Ordering::SeqCst);
+        if let Some(file) = syncer.as_ref() {
             let started = std::time::Instant::now();
-            writer
-                .get_ref()
-                .sync_all()
+            file.sync_data()
                 .map_err(|e| BlockError::Journal(format!("sync failed: {}", e)))?;
             SYNC_SECONDS.observe_duration(started.elapsed());
+            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+            SYNCED_ENTRIES.fetch_add(
+                target.saturating_sub(self.synced.load(Ordering::SeqCst)),
+                Ordering::Relaxed,
+            );
         }
+        self.synced.fetch_max(target, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -548,8 +603,18 @@ static SYNC_SECONDS: std::sync::LazyLock<objectio_common::histogram::Histogram> 
         objectio_common::histogram::Histogram::new(objectio_common::histogram::LATENCY_BUCKETS)
     });
 
+/// Journal entries made durable, counted once each: entries per fsync is
+/// `objectio_block_journal_entries_synced_total / …_fsync_seconds_count`.
+static SYNCED_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
 /// The journal's metrics, as Prometheus text.
 pub fn render_metrics(out: &mut String) {
+    let n = SYNCED_ENTRIES.load(Ordering::Relaxed);
+    out.push_str(&format!(
+        "# HELP objectio_block_journal_entries_synced_total Journal entries made durable; divided by fsyncs, the group-commit size\n\
+         # TYPE objectio_block_journal_entries_synced_total counter\n\
+         objectio_block_journal_entries_synced_total {n}\n"
+    ));
     SYNC_SECONDS.render(
         out,
         "objectio_block_journal_fsync_seconds",
@@ -561,6 +626,44 @@ pub fn render_metrics(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Group commit: writers syncing at once share fsyncs, and every one
+    /// of their entries is in the journal afterwards.
+    #[test]
+    fn concurrent_writers_share_fsyncs_and_lose_nothing() {
+        const THREADS: u64 = 8;
+        const EACH: u64 = 50;
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            std::sync::Arc::new(WriteJournal::open(dir.path().join("j"), 1 << 30).unwrap());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let j = std::sync::Arc::clone(&journal);
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        let seq = j
+                            .log_write("v", t, i * 4096, Bytes::from(vec![t as u8; 4096]))
+                            .unwrap();
+                        j.sync_to(seq + 1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let writes = THREADS * EACH;
+        assert_eq!(journal.recover().unwrap().len() as u64, writes);
+        assert!(
+            journal.fsyncs() < writes,
+            "{} fsyncs for {writes} writes: none were shared",
+            journal.fsyncs()
+        );
+        // Everything is durable: another sync has nothing to do.
+        let before = journal.fsyncs();
+        journal.sync().unwrap();
+        assert_eq!(journal.fsyncs(), before);
+    }
     use tempfile::tempdir;
 
     #[test]
