@@ -567,6 +567,55 @@ pub async fn read_shard_from_osd(
     Ok(response.data)
 }
 
+/// `length` bytes at `offset` of a shard, over gRPC: a packed object's
+/// slice, without moving the whole shard. The OSD checks the whole shard
+/// against its stored checksum before slicing, and the slice comes back
+/// with a checksum of its own, checked here. An OSD that predates ranged
+/// reads returns the whole shard; it is checked whole and sliced here.
+pub async fn read_shard_range_from_osd(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    object_id: &[u8],
+    stripe_id: u64,
+    position: u32,
+    offset: u64,
+    length: u32,
+) -> Result<Bytes, OsdPoolError> {
+    use objectio_proto::storage::{ReadShardRequest, ShardId};
+    let request = ReadShardRequest {
+        rdma_dest: None,
+        shard_id: Some(ShardId {
+            object_id: object_id.to_vec(),
+            stripe_id,
+            position,
+        }),
+        offset,
+        length,
+    };
+    let response = call_read_shard(pool, placement, request).await?;
+    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+        crate::gateway_metrics::record_shard_checksum_mismatch("read");
+        warn!(
+            "shard {position} range from {} does not match its checksum; not using it",
+            placement.node_address
+        );
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} range from {}",
+            placement.node_address
+        )));
+    }
+    crate::gateway_metrics::record_shard_transfer("read", "grpc");
+    let data = response.data;
+    if data.len() > length as usize {
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        let end = start.saturating_add(length as usize).min(data.len());
+        return Ok(data.slice(start..end));
+    }
+    Ok(data)
+}
+
 // ============================================================================
 // Object Metadata Operations
 //
