@@ -592,6 +592,28 @@ impl MetaStore {
         table.get(key).ok()?.map(|v| v.value().to_vec())
     }
 
+    /// The home of a key ("{bucket}/{key}"): prost-encoded `ObjectHome`.
+    pub fn read_object_home(&self, key: &str) -> Option<Vec<u8>> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = match read_txn.open_table(tables::OBJECT_HOMES) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    pub fn put_object_home(&self, key: &str, bytes: &[u8]) {
+        if let Err(e) = self.put_bytes(tables::OBJECT_HOMES, key, bytes) {
+            error!("Failed to persist object home '{key}': {e}");
+        }
+    }
+
+    pub fn delete_object_home(&self, key: &str) {
+        if let Err(e) = self.delete_key(tables::OBJECT_HOMES, key) {
+            error!("Failed to delete object home '{key}': {e}");
+        }
+    }
+
     pub fn put_object_listing(&self, key: &str, bytes: &[u8]) {
         if let Err(e) = self.put_bytes(tables::OBJECT_LISTINGS, key, bytes) {
             error!("Failed to persist object listing '{key}': {e}");
