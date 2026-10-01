@@ -588,3 +588,61 @@ fn a_snapshot_holds_a_partial_write_merged_into_its_stored_chunk() {
     );
     assert_eq!(b.read(&vol, 0, CHUNK), want);
 }
+
+/// A volume with 256 KiB chunks: data across chunk boundaries survives a
+/// flush and a restart (its journal replays in its own chunk size), and a
+/// snapshot's clone keeps the size; sizes that would pad shards are refused.
+#[test]
+fn a_volume_with_small_chunks_keeps_its_data_and_its_chunk_size() {
+    const SMALL: u64 = 256 * 1024;
+    let mut b = Block::start();
+    // The volume, or the code it was refused with.
+    let create = |b: &Block, name: &str, chunk: u32| {
+        b.rt.block_on(b.client().create_volume(CreateVolumeRequest {
+            name: name.into(),
+            size_bytes: 8 * MIB,
+            chunk_size_bytes: chunk,
+            ..Default::default()
+        }))
+        .map(|r| r.into_inner().volume.unwrap())
+        .map_err(|s| s.code())
+    };
+    for bad in [64 * 1024, 300 * 1024, 8 << 20] {
+        assert_eq!(
+            create(&b, "bad", bad).unwrap_err(),
+            tonic::Code::InvalidArgument,
+            "{bad}"
+        );
+    }
+    let vol = create(&b, "small", u32::try_from(SMALL).unwrap()).unwrap();
+    assert_eq!(u64::from(vol.chunk_size_bytes), SMALL);
+    let vol = vol.volume_id;
+
+    // Across three chunk boundaries, part flushed and part only journaled.
+    let flushed = pattern(SMALL * 2 + 8192, 12);
+    b.write(&vol, SMALL - 4096, &flushed);
+    b.flush(&vol);
+    let journaled = pattern(4096, 13);
+    b.write(&vol, 3 * SMALL - 2048, &journaled);
+    b.restart();
+    let vol = b.id_of("small");
+    let mut want = flushed;
+    let at = usize::try_from(2 * SMALL + 2048).unwrap();
+    want[at..at + 4096].copy_from_slice(&journaled);
+    let got = b.read(&vol, SMALL - 4096, want.len() as u64);
+    assert_eq!(got, want, "data lost across a restart with small chunks");
+
+    let snap = b.snapshot(&vol, "s");
+    let clone = b.clone_of(&snap, "c");
+    assert_eq!(b.read(&clone, SMALL - 4096, want.len() as u64), want);
+    let cloned =
+        b.rt.block_on(
+            b.client()
+                .get_volume(objectio_proto::block::GetVolumeRequest { volume_id: clone }),
+        )
+        .unwrap()
+        .into_inner()
+        .volume
+        .unwrap();
+    assert_eq!(u64::from(cloned.chunk_size_bytes), SMALL);
+}

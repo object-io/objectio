@@ -165,7 +165,7 @@ All crates      → objectio-common (error types, shared types, config)
 - **objectio-proto**: gRPC stubs auto-generated via `crates/objectio-proto/build.rs` from `proto/{storage,metadata,cluster,block}.proto`. This is the only build script in the workspace; changing proto files triggers regeneration.
 - **objectio-erasure**: Pluggable backends — `rust-simd` (default, portable) or `isal` (x86_64, 3-5x faster). Feature-flag selected.
 - **objectio-placement**: CRUSH and CRUSH2 placement algorithms for shard distribution across failure domains. CRUSH2 (HRW hashing) is recommended; pre-built templates in `crush2::templates`.
-- **objectio-storage**: Raw disk I/O engine with WAL, block allocation, ARC metadata cache, SMART monitoring. Uses `O_DIRECT`/`F_NOCACHE`. Key constants: 64KB block size, 4KB alignment, 1GB WAL, 1GB minimum disk.
+- **objectio-storage**: Raw disk I/O engine with WAL, block allocation, ARC metadata cache, SMART monitoring. Uses `O_DIRECT`/`F_NOCACHE`. Key constants: 4KB block size (a shard is stored with a 96-byte header+footer, rounded up to whole blocks), 4KB alignment, 1GB WAL, 1GB minimum disk.
 - **objectio-block**: Block storage layer — VolumeManager, ChunkMapper, WriteCache, WriteJournal, QoS rate limiter. **Uses its own `BlockError`/`BlockResult` types**, not `objectio_common::Error`. Do not mix the two error types.
 - **objectio-auth**: AWS SigV4 authentication. Feature flags: `builtin` (default), `oidc`, `openfga`, `full`. Also provides `PolicyEvaluator`/`BucketPolicy`/`RequestContext` used by both S3 bucket policies and Iceberg namespace/table policies.
 - **objectio-s3**: Axum-based S3 API handlers (bucket ops, object ops, multipart upload). Admin API at `/_admin/*` endpoints for user/key management. Also exports `IcebergOperation` enum and Prometheus metrics for Iceberg operations.
@@ -177,7 +177,7 @@ All crates      → objectio-common (error types, shared types, config)
 - **Chunk/stripe size**: 4MB (4 × 1024 × 1024) — the fundamental EC unit across object and block storage
 - **LBA size**: 512 bytes (block storage sector size)
 - **LBAs per chunk**: 8192 (4MB / 512B)
-- **Storage block size**: 64KB (internal allocation unit in objectio-storage)
+- **Storage block size**: 4KB (allocation unit in objectio-storage; each shard adds a 96-byte header+footer, so a block-aligned shard takes one extra block)
 - **O_DIRECT alignment**: 4KB
 - **Default EC scheme**: 4+2 (4 data + 2 parity shards)
 
