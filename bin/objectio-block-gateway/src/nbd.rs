@@ -95,6 +95,15 @@ fn reply_offset(
     absolute.saturating_sub(read_offset) as usize
 }
 
+/// A simple reply's header: magic, error, handle, big-endian.
+fn reply_header(handle: u64, error: u32) -> [u8; 16] {
+    let mut h = [0u8; 16];
+    h[..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
+    h[4..8].copy_from_slice(&error.to_be_bytes());
+    h[8..].copy_from_slice(&handle.to_be_bytes());
+    h
+}
+
 impl NbdServer {
     /// See [`crate::ec_io::load_for_partial_write`].
     async fn load_for_write(&self, volume_id: &str, offset: u64, len: u32) -> anyhow::Result<()> {
@@ -172,6 +181,13 @@ impl NbdServer {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    // Every reply is small and answers a request the client
+                    // is waiting on. With Nagle on, a reply sent in more
+                    // than one segment waited for the client's delayed ACK:
+                    // ~40 ms on Linux, on every read, write and flush.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("NBD: cannot set TCP_NODELAY for {peer}: {e}");
+                    }
                     let server = Arc::clone(&self);
                     tokio::spawn(async move {
                         if let Err(e) = server.handle_client(stream, peer).await {
@@ -403,11 +419,12 @@ impl NbdServer {
                         data.resize(length as usize, 0);
                     }
 
-                    // Reply: magic(4) + error(4) + handle(8) + data
-                    stream.write_u32(NBD_REPLY_MAGIC).await?;
-                    stream.write_u32(0).await?; // no error
-                    stream.write_u64(handle).await?;
-                    stream.write_all(&data).await?;
+                    // Reply: magic(4) + error(4) + handle(8) + data, in one
+                    // write.
+                    let mut reply = Vec::with_capacity(16 + data.len());
+                    reply.extend_from_slice(&reply_header(handle, 0));
+                    reply.extend_from_slice(&data);
+                    stream.write_all(&reply).await?;
                     io.done(u64::from(length));
                 }
 
@@ -489,9 +506,7 @@ impl NbdServer {
         handle: u64,
         error: u32,
     ) -> anyhow::Result<()> {
-        stream.write_u32(NBD_REPLY_MAGIC).await?;
-        stream.write_u32(error).await?;
-        stream.write_u64(handle).await?;
+        stream.write_all(&reply_header(handle, error)).await?;
         Ok(())
     }
 
@@ -553,7 +568,15 @@ impl NbdServer {
 
 #[cfg(test)]
 mod tests {
-    use super::reply_offset;
+    use super::{NBD_REPLY_MAGIC, reply_header, reply_offset};
+
+    #[test]
+    fn a_reply_header_is_magic_error_handle_big_endian() {
+        let h = reply_header(0x0102_0304_0506_0708, 5);
+        assert_eq!(&h[..4], &NBD_REPLY_MAGIC.to_be_bytes());
+        assert_eq!(&h[4..8], &[0, 0, 0, 5]);
+        assert_eq!(&h[8..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
     use objectio_block::chunk::ChunkMapper;
 
     /// The reply buffer must be tiled exactly: every byte written once, no
