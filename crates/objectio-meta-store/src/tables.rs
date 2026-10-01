@@ -136,6 +136,12 @@ pub const KMS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("kms_key
 // next bucket. Value: prost-encoded ObjectListingEntry.
 pub const OBJECT_LISTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("object_listings");
 
+// Object homes: the OSDs a key's ObjectMeta was written to. GetPlacement
+// returns them for the key, so placement computed from a topology that has
+// changed since never hides an object. Key: "{bucket}/{key}".
+// Value: prost-encoded ObjectHome. Written by CasTable::Named("object_homes").
+pub const OBJECT_HOMES: TableDefinition<&str, &[u8]> = TableDefinition::new("object_homes");
+
 // Placement groups. One row per PG, keyed as "{pool}\0{pg_id:010}"
 // (10-digit zero-padded so a range scan over a pool returns PGs in
 // pg_id order). Value: prost-encoded PlacementGroup. Mutated by the

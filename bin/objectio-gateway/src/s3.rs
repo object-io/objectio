@@ -2672,6 +2672,7 @@ async fn copy_by_reference(
         object_id: new_id.clone(),
         pg_id: dest_placement.pg_id,
         pool: dest_placement.pool.clone(),
+        home_osd_ids: home_of(&dest_placement.nodes),
     };
     let new_object = referenced_object_ids(&object_meta);
     let mut listing_client = state.meta_client.clone();
@@ -2694,6 +2695,7 @@ async fn copy_by_reference(
                     bucket: dest_bucket.to_string(),
                     key: dest_key.to_string(),
                     version_id: String::new(),
+                    forget_home: false,
                 })
                 .await;
         },
@@ -3945,6 +3947,7 @@ pub async fn put_object(
             object_id: object_id.to_vec(),
             pg_id: placement.pg_id,
             pool: placement.pool.clone(),
+            home_osd_ids: home_of(&placement.nodes),
         }
     };
     let mut listing_client = state.meta_client.clone();
@@ -3969,6 +3972,7 @@ pub async fn put_object(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
+                    forget_home: false,
                 })
                 .await
             {
@@ -5150,15 +5154,17 @@ pub async fn delete_object(
     }
 
     // Check versioning state
-    let versioning_enabled = match meta_client
+    let versioning = meta_client
         .get_bucket_versioning(GetBucketVersioningRequest {
             bucket: bucket.clone(),
         })
         .await
-    {
-        Ok(resp) => resp.into_inner().state() == VersioningState::VersioningEnabled,
-        Err(_) => false,
-    };
+        .map(|resp| resp.into_inner().state())
+        .ok();
+    let versioning_enabled = versioning == Some(VersioningState::VersioningEnabled);
+    // Known never to have had versions, so nothing of the key outlives
+    // this delete and its home can go. Not when the state is unknown.
+    let never_versioned = versioning == Some(VersioningState::VersioningDisabled);
 
     if versioning_enabled && version_id.is_none() {
         // Versioned delete without version_id: create a delete marker
@@ -5218,6 +5224,7 @@ pub async fn delete_object(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
+                    forget_home: false,
                 })
                 .await;
         }
@@ -5278,6 +5285,7 @@ pub async fn delete_object(
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: vid.to_string(),
+                forget_home: never_versioned && vid.is_empty(),
             })
             .await;
     }
@@ -6988,6 +6996,7 @@ async fn complete_multipart_upload_internal(
                         object_id: object.object_id.clone(),
                         pg_id: placement.pg_id,
                         pool: placement.pool.clone(),
+                        home_osd_ids: home_of(&placement.nodes),
                     };
                     if let Err(e) = state.meta_client.clone().create_object(req).await {
                         warn!(
@@ -8655,17 +8664,25 @@ async fn list_object_versions_internal(
         .unwrap()
 }
 
+/// The OSDs `nodes` (a placement) puts an ObjectMeta on, by position: what
+/// meta records as the key's home when the write lands.
+fn home_of(nodes: &[objectio_proto::metadata::NodePlacement]) -> Vec<Vec<u8>> {
+    nodes.iter().map(|n| n.node_id.clone()).collect()
+}
+
 /// Helper to get the primary OSD placement for an object
 async fn get_placement_nodes_for_object(
     state: &AppState,
     bucket: &str,
     key: &str,
 ) -> Result<Vec<objectio_proto::metadata::NodePlacement>, Response> {
-    let placement_key = format!("{}/{}", bucket, key);
     let mut client = state.meta_client.clone();
     match client
         .get_placement(GetPlacementRequest {
-            key: placement_key,
+            // The key alone: meta places "bucket/key". This passed
+            // "bucket/key", so tagging, retention and legal hold went to the
+            // OSDs of "bucket/bucket/key" while GET read the object's own.
+            key: key.to_string(),
             bucket: bucket.to_string(),
             size: 0,
             storage_class: String::new(),

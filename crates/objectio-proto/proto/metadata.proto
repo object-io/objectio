@@ -479,6 +479,18 @@ message CreateObjectRequest {
     // will leave the listing entry unpopulated on the PG axis.
     uint32 pg_id = 9;
     string pool = 10;
+    // The OSDs the gateway wrote the object's ObjectMeta to, by position
+    // (its GetPlacement nodes). Meta records them as the key's home, and
+    // GetPlacement returns the home for the key from then on, so the
+    // metadata is found where it was written whatever joins or leaves the
+    // cluster. Empty leaves the home as it is.
+    repeated bytes home_osd_ids = 11;
+}
+
+// Where a key's ObjectMeta lives: the OSDs it was written to, by position.
+// Kept while the key may have versions on them, past its listing entry.
+message ObjectHome {
+    repeated bytes osd_ids = 1;
 }
 
 message CreateObjectResponse {
@@ -490,6 +502,9 @@ message DeleteObjectRequest {
     string bucket = 1;
     string key = 2;
     string version_id = 3;      // Optional: delete specific version
+    // The key is gone for good (an unversioned bucket's DELETE): forget its
+    // home too. Never for a rollback, which may leave an older object there.
+    bool forget_home = 4;
 }
 
 message DeleteObjectResponse {

@@ -786,6 +786,8 @@ async fn restore_listing(
             object_id: object.object_id.clone(),
             pg_id: 0,
             pool: String::new(),
+            // Its home, if it has one, is where it was found.
+            home_osd_ids: Vec::new(),
         }),
     )
     .await

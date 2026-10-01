@@ -239,6 +239,7 @@ use objectio_proto::metadata::{
     ListingNode,
     MultipartUpload,
     NodePlacement,
+    ObjectHome,
     ObjectListingEntry,
     ObjectLockConfiguration,
     ObjectMeta,
@@ -3186,436 +3187,84 @@ where
     Ok(page)
 }
 
-#[tonic::async_trait]
-impl MetadataService for MetaService {
-    async fn get_metrics(
-        &self,
-        _request: Request<objectio_proto::metadata::GetMetricsRequest>,
-    ) -> Result<Response<objectio_proto::metadata::GetMetricsResponse>, Status> {
-        Ok(Response::new(
-            objectio_proto::metadata::GetMetricsResponse {
-                text: self.metrics_renderer.get().map(|f| f()).unwrap_or_default(),
-                process_instance: objectio_common::process_metrics::instance_id().to_string(),
-            },
-        ))
+impl MetaService {
+    /// The OSDs `bucket/key`'s ObjectMeta was written to, by position, if
+    /// it has been written.
+    fn object_home(&self, bucket: &str, key: &str) -> Option<ObjectHome> {
+        let bytes = self
+            .store
+            .as_ref()?
+            .read_object_home(&format!("{bucket}/{key}"))?;
+        ObjectHome::decode(bytes.as_slice())
+            .inspect_err(|e| warn!("decode ObjectHome({bucket}/{key}) failed: {e}"))
+            .ok()
     }
 
-    async fn create_bucket(
-        &self,
-        request: Request<CreateBucketRequest>,
-    ) -> Result<Response<CreateBucketResponse>, Status> {
-        let req = request.into_inner();
-
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("bucket name is required"));
+    /// Put `nodes` (a computed placement) at the key's home: each position
+    /// on the OSD the key's ObjectMeta was written to, so it is read where
+    /// it is, whatever joined or left the cluster since. A home OSD that
+    /// is no longer active gives its position to the first computed OSD
+    /// not already in the set, as the computed placement would have.
+    fn place_at_home(&self, nodes: &mut [NodePlacement], home: &ObjectHome) {
+        if home.osd_ids.len() != nodes.len() {
+            // The pool's protection changed since, so positions no longer
+            // line up.
+            warn!(
+                "object home has {} OSDs, placement {}: using the computed placement",
+                home.osd_ids.len(),
+                nodes.len()
+            );
+            return;
         }
-
-        // Check if bucket already exists
-        if self.buckets.read().contains_key(&req.name) {
-            return Err(Status::already_exists("bucket already exists"));
-        }
-
-        // Validate tenant exists if specified
-        let tenant = req.tenant.clone();
-        if !tenant.is_empty() && !self.tenants.read().contains_key(&tenant) {
-            return Err(Status::not_found(format!("tenant '{}' not found", tenant)));
-        }
-
-        // Enforce tenant bucket quota
-        if !tenant.is_empty()
-            && let Some(tc) = self.tenants.read().get(&tenant)
-            && tc.quota_buckets > 0
-        {
-            let count = self
-                .buckets
-                .read()
-                .values()
-                .filter(|b| b.tenant == tenant)
-                .count() as u64;
-            if count >= tc.quota_buckets {
-                return Err(Status::resource_exhausted(format!(
-                    "tenant '{}' bucket quota exceeded ({}/{})",
-                    tenant, count, tc.quota_buckets
-                )));
-            }
-        }
-
-        let bucket = BucketMeta {
-            dedup: None,
-            name: req.name.clone(),
-            owner: req.owner,
-            created_at: Self::current_timestamp(),
-            storage_class: if req.storage_class.is_empty() {
-                "STANDARD".to_string()
-            } else {
-                req.storage_class
-            },
-            versioning: VersioningState::VersioningDisabled.into(),
-            pool: String::new(),
-            tenant,
-            quota_bytes: 0,
-            quota_objects: 0,
-            object_lock: None,
-        };
-
-        // Replicate through Raft so followers see the new bucket at the
-        // same log position. Single-op MultiCas with expected=None enforces
-        // "must-not-exist" at the state machine — if a concurrent proposal
-        // on another pod raced us, the CAS fails and we surface it as
-        // AlreadyExists (same error the in-memory precheck above returns).
-        let bucket_bytes = bucket.encode_to_vec();
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Buckets,
-                    key: req.name.clone(),
-                    expected: None,
-                    new_value: Some(bucket_bytes),
-                }],
-                requested_by: "create-bucket".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(resp) => match resp.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { .. } => {
-                        return Err(Status::already_exists("bucket already exists"));
-                    }
-                    other => {
-                        error!("unexpected raft response for create_bucket: {:?}", other);
-                        return Err(Status::internal("raft commit returned wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
-            }
-        } else if let Some(store) = &self.store {
-            store.put_bucket(&req.name, &bucket);
-        }
-
-        self.buckets
-            .write()
-            .insert(req.name.clone(), bucket.clone());
-
-        info!("Created bucket: {}", req.name);
-
-        Ok(Response::new(CreateBucketResponse {
-            bucket: Some(bucket),
-        }))
-    }
-
-    async fn delete_bucket(
-        &self,
-        request: Request<DeleteBucketRequest>,
-    ) -> Result<Response<DeleteBucketResponse>, Status> {
-        let req = request.into_inner();
-
-        // Read current bucket bytes so the CAS can detect a concurrent
-        // mutation between now and commit.
-        let current = {
-            let b = self.buckets.read();
-            b.get(&req.name)
-                .cloned()
-                .ok_or_else(|| Status::not_found("bucket not found"))?
-        };
-        let expected_bytes = current.encode_to_vec();
-
-        // Note: The check for whether bucket is empty should be done by
-        // the Gateway using scatter-gather before calling delete_bucket.
-
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Buckets,
-                    key: req.name.clone(),
-                    expected: Some(expected_bytes),
-                    new_value: None, // delete
-                }],
-                requested_by: "delete-bucket".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(resp) => match resp.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { .. } => {
-                        return Err(Status::aborted("bucket changed since read; retry delete"));
-                    }
-                    other => {
-                        error!("unexpected raft response for delete_bucket: {:?}", other);
-                        return Err(Status::internal("raft commit returned wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
-            }
-        } else if let Some(store) = &self.store {
-            store.delete_bucket(&req.name);
-        }
-
-        self.buckets.write().remove(&req.name);
-
-        info!("Deleted bucket: {}", req.name);
-
-        Ok(Response::new(DeleteBucketResponse { success: true }))
-    }
-
-    async fn get_bucket(
-        &self,
-        request: Request<GetBucketRequest>,
-    ) -> Result<Response<GetBucketResponse>, Status> {
-        let req = request.into_inner();
-
-        let bucket = self
-            .buckets
-            .read()
-            .get(&req.name)
-            .cloned()
-            .ok_or_else(|| Status::not_found("bucket not found"))?;
-
-        Ok(Response::new(GetBucketResponse {
-            bucket: Some(bucket),
-        }))
-    }
-
-    async fn list_buckets(
-        &self,
-        request: Request<ListBucketsRequest>,
-    ) -> Result<Response<ListBucketsResponse>, Status> {
-        let req = request.into_inner();
-
-        let buckets: Vec<BucketMeta> = self
-            .buckets
-            .read()
-            .values()
-            .filter(|b| req.owner.is_empty() || b.owner == req.owner)
-            .filter(|b| req.tenant.is_empty() || b.tenant == req.tenant)
+        let topology = self.topology.read();
+        let osd_nodes = self.osd_nodes.read();
+        let usable: Vec<Option<&OsdNode>> = home
+            .osd_ids
+            .iter()
+            .map(|id| {
+                let id = <[u8; 16]>::try_from(id.as_slice()).ok()?;
+                topology
+                    .active_nodes()
+                    .any(|n| *n.id.as_bytes() == id)
+                    .then(|| osd_nodes.iter().find(|n| n.node_id == id))
+                    .flatten()
+            })
+            .collect();
+        let mut spares: std::collections::VecDeque<NodePlacement> = nodes
+            .iter()
+            .filter(|n| {
+                !usable
+                    .iter()
+                    .flatten()
+                    .any(|h| h.node_id.as_slice() == n.node_id.as_slice())
+            })
             .cloned()
             .collect();
-
-        Ok(Response::new(ListBucketsResponse { buckets }))
-    }
-
-    /// DEPRECATED: Object metadata is now stored on primary OSD
-    /// This RPC is kept for backward compatibility but does nothing
-    /// Register a PUT in the Meta-backed OBJECT_LISTINGS index. Every
-    /// S3 PUT that succeeds at the data layer calls this to make the
-    /// object visible via ListObjects. Routed through Raft MultiCas so
-    /// followers see the commit at the same log position.
-    async fn create_object(
-        &self,
-        request: Request<CreateObjectRequest>,
-    ) -> Result<Response<CreateObjectResponse>, Status> {
-        let req = request.into_inner();
-        if req.bucket.is_empty() || req.key.is_empty() {
-            return Err(Status::invalid_argument("bucket and key required"));
-        }
-
-        // Build the listing entry. primary_osd_id is optional (the
-        // first shard in the first stripe, as a routing hint).
-        let primary_osd_id = req
-            .stripes
-            .first()
-            .and_then(|s| s.shards.first())
-            .map(|s| s.node_id.clone())
-            .unwrap_or_default();
-        let now = Self::current_timestamp();
-        let entry = ObjectListingEntry {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            size: req.size,
-            etag: req.etag.clone(),
-            content_type: req.content_type.clone(),
-            created_at: now,
-            modified_at: now,
-            version_id: String::new(),
-            is_delete_marker: false,
-            storage_class: "STANDARD".into(),
-            user_metadata: req.user_metadata.clone(),
-            primary_osd_id,
-            // Gateway carried these from its GetPlacement call. With
-            // pg_id set, ListObjects + GET can resolve osd_ids via a
-            // single PG lookup; without, we fall back to the legacy
-            // per-object CRUSH path.
-            pg_id: req.pg_id,
-            pool: req.pool.clone(),
-        };
-        let listing_key = format!("{}\0{}\0", req.bucket, req.key);
-        let new_bytes = entry.encode_to_vec();
-
-        // Idempotent overwrite: PUT on an existing key replaces. Read
-        // current (if any) so the MultiCas doesn't spuriously fail.
-        let expected_bytes = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read_object_listing(&listing_key));
-
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::ObjectListings,
-                    key: listing_key.clone(),
-                    expected: expected_bytes,
-                    new_value: Some(new_bytes),
-                }],
-                requested_by: "create-object".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { .. } => {
-                        return Err(Status::aborted(
-                            "listing changed during PUT; client should retry",
-                        ));
-                    }
-                    other => {
-                        error!("unexpected raft response for create_object: {:?}", other);
-                        return Err(Status::internal("raft commit wrong variant"));
-                    }
+        for (slot, home_node) in nodes.iter_mut().zip(usable) {
+            let (node_id, node_address, disk_id, te_segment) = match home_node {
+                Some(n) => (
+                    n.node_id.to_vec(),
+                    n.address.clone(),
+                    n.disk_ids
+                        .first()
+                        .map_or_else(|| vec![0u8; 16], |d| d.to_vec()),
+                    n.te_segment.clone(),
+                ),
+                None => match spares.pop_front() {
+                    Some(s) => (s.node_id, s.node_address, s.disk_id, s.te_segment),
+                    None => continue,
                 },
-                Err(e) => return Err(raft_write_to_status(&e)),
-            }
-        } else if let Some(store) = &self.store {
-            store.put_object_listing(&listing_key, &entry.encode_to_vec());
-        }
-
-        Ok(Response::new(CreateObjectResponse { object: None }))
-    }
-
-    async fn delete_object(
-        &self,
-        request: Request<DeleteObjectRequest>,
-    ) -> Result<Response<DeleteObjectResponse>, Status> {
-        let req = request.into_inner();
-        let listing_key = format!("{}\0{}\0{}", req.bucket, req.key, req.version_id);
-        let expected_bytes = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read_object_listing(&listing_key));
-        if expected_bytes.is_none() {
-            // Nothing to remove — return success idempotently.
-            return Ok(Response::new(DeleteObjectResponse {
-                success: true,
-                version_id: req.version_id,
-            }));
-        }
-
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::ObjectListings,
-                    key: listing_key,
-                    expected: expected_bytes,
-                    new_value: None,
-                }],
-                requested_by: "delete-object".into(),
             };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { .. } => {
-                        return Err(Status::aborted("listing changed during DELETE; retry"));
-                    }
-                    other => {
-                        error!("unexpected raft response for delete_object: {:?}", other);
-                        return Err(Status::internal("raft commit wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
-            }
-        } else if let Some(store) = &self.store {
-            // Legacy non-raft path: direct redb delete.
-            store
-                .delete_object_listing(&format!("{}\0{}\0{}", req.bucket, req.key, req.version_id));
+            slot.node_id = node_id;
+            slot.node_address = node_address;
+            slot.disk_id = disk_id;
+            slot.te_segment = te_segment;
         }
-
-        Ok(Response::new(DeleteObjectResponse {
-            success: true,
-            version_id: req.version_id,
-        }))
     }
 
-    /// Single-object read — not in the common path (gateway goes to
-    /// OSDs for ObjectMeta), kept so admin tools can look up metadata
-    /// by (bucket, key).
-    async fn get_object(
-        &self,
-        _request: Request<GetObjectRequest>,
-    ) -> Result<Response<GetObjectResponse>, Status> {
-        Err(Status::unimplemented(
-            "Object metadata lives on OSDs — use GetObjectMeta. ObjectListings only stores the listing hint.",
-        ))
-    }
-
-    /// Linearizable listing via a B-tree scan of OBJECT_LISTINGS in
-    /// Meta's redb. Replaces the old scatter-gather-then-merge path
-    /// on the gateway. Continuation token is the bucket-relative
-    /// form of the last key returned.
-    async fn list_objects(
-        &self,
-        request: Request<ListObjectsRequest>,
-    ) -> Result<Response<ListObjectsResponse>, Status> {
-        let req = request.into_inner();
-        if req.bucket.is_empty() {
-            return Err(Status::invalid_argument("bucket required"));
-        }
-        let max_keys = if req.max_keys == 0 {
-            1000
-        } else {
-            req.max_keys.min(1000) as usize
-        };
-        let start_after = if !req.continuation_token.is_empty() {
-            req.continuation_token.clone()
-        } else {
-            req.start_after.clone()
-        };
-
-        let Some(store) = &self.store else {
-            // No persistent store = no Raft backend — return empty.
-            return Ok(Response::new(ListObjectsResponse::default()));
-        };
-        let page = page_listing(
-            |after, n| {
-                let (rows, more, _) = store
-                    .list_object_listings(&req.bucket, &req.prefix, after, n)
-                    .map_err(|e| e.to_string())?;
-                let entries = rows
-                    .into_iter()
-                    .filter_map(|(_k, bytes)| {
-                        <ObjectListingEntry as prost::Message>::decode(bytes.as_slice())
-                            .inspect_err(|err| warn!("decode ObjectListingEntry failed: {err}"))
-                            .ok()
-                    })
-                    .collect();
-                Ok::<_, String>((entries, more))
-            },
-            &req.prefix,
-            &req.delimiter,
-            &start_after,
-            max_keys,
-        )
-        .map_err(|e| {
-            error!("list_object_listings failed: {e}");
-            Status::internal(format!("list failed: {e}"))
-        })?;
-        let (entries, common_prefixes, is_truncated, next_token) = (
-            page.entries,
-            page.common_prefixes,
-            page.is_truncated,
-            page.next_token,
-        );
-
-        let key_count = entries.len() as u32 + common_prefixes.len() as u32;
-        Ok(Response::new(ListObjectsResponse {
-            objects: Vec::new(),
-            common_prefixes,
-            next_continuation_token: next_token,
-            is_truncated,
-            key_count,
-            entries,
-        }))
-    }
-
-    async fn get_placement(
+    /// Placement computed from the topology (or the bucket's pool's
+    /// placement groups), whatever the key's home.
+    async fn computed_placement(
         &self,
         request: Request<GetPlacementRequest>,
     ) -> Result<Response<GetPlacementResponse>, Status> {
@@ -3929,6 +3578,499 @@ impl MetadataService for MetaService {
                 dedup_domain: String::new(),
             },
         )))
+    }
+}
+
+#[tonic::async_trait]
+impl MetadataService for MetaService {
+    async fn get_metrics(
+        &self,
+        _request: Request<objectio_proto::metadata::GetMetricsRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetMetricsResponse>, Status> {
+        Ok(Response::new(
+            objectio_proto::metadata::GetMetricsResponse {
+                text: self.metrics_renderer.get().map(|f| f()).unwrap_or_default(),
+                process_instance: objectio_common::process_metrics::instance_id().to_string(),
+            },
+        ))
+    }
+
+    async fn create_bucket(
+        &self,
+        request: Request<CreateBucketRequest>,
+    ) -> Result<Response<CreateBucketResponse>, Status> {
+        let req = request.into_inner();
+
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("bucket name is required"));
+        }
+
+        // Check if bucket already exists
+        if self.buckets.read().contains_key(&req.name) {
+            return Err(Status::already_exists("bucket already exists"));
+        }
+
+        // Validate tenant exists if specified
+        let tenant = req.tenant.clone();
+        if !tenant.is_empty() && !self.tenants.read().contains_key(&tenant) {
+            return Err(Status::not_found(format!("tenant '{}' not found", tenant)));
+        }
+
+        // Enforce tenant bucket quota
+        if !tenant.is_empty()
+            && let Some(tc) = self.tenants.read().get(&tenant)
+            && tc.quota_buckets > 0
+        {
+            let count = self
+                .buckets
+                .read()
+                .values()
+                .filter(|b| b.tenant == tenant)
+                .count() as u64;
+            if count >= tc.quota_buckets {
+                return Err(Status::resource_exhausted(format!(
+                    "tenant '{}' bucket quota exceeded ({}/{})",
+                    tenant, count, tc.quota_buckets
+                )));
+            }
+        }
+
+        let bucket = BucketMeta {
+            dedup: None,
+            name: req.name.clone(),
+            owner: req.owner,
+            created_at: Self::current_timestamp(),
+            storage_class: if req.storage_class.is_empty() {
+                "STANDARD".to_string()
+            } else {
+                req.storage_class
+            },
+            versioning: VersioningState::VersioningDisabled.into(),
+            pool: String::new(),
+            tenant,
+            quota_bytes: 0,
+            quota_objects: 0,
+            object_lock: None,
+        };
+
+        // Replicate through Raft so followers see the new bucket at the
+        // same log position. Single-op MultiCas with expected=None enforces
+        // "must-not-exist" at the state machine — if a concurrent proposal
+        // on another pod raced us, the CAS fails and we surface it as
+        // AlreadyExists (same error the in-memory precheck above returns).
+        let bucket_bytes = bucket.encode_to_vec();
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Buckets,
+                    key: req.name.clone(),
+                    expected: None,
+                    new_value: Some(bucket_bytes),
+                }],
+                requested_by: "create-bucket".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(resp) => match resp.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::already_exists("bucket already exists"));
+                    }
+                    other => {
+                        error!("unexpected raft response for create_bucket: {:?}", other);
+                        return Err(Status::internal("raft commit returned wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.put_bucket(&req.name, &bucket);
+        }
+
+        self.buckets
+            .write()
+            .insert(req.name.clone(), bucket.clone());
+
+        info!("Created bucket: {}", req.name);
+
+        Ok(Response::new(CreateBucketResponse {
+            bucket: Some(bucket),
+        }))
+    }
+
+    async fn delete_bucket(
+        &self,
+        request: Request<DeleteBucketRequest>,
+    ) -> Result<Response<DeleteBucketResponse>, Status> {
+        let req = request.into_inner();
+
+        // Read current bucket bytes so the CAS can detect a concurrent
+        // mutation between now and commit.
+        let current = {
+            let b = self.buckets.read();
+            b.get(&req.name)
+                .cloned()
+                .ok_or_else(|| Status::not_found("bucket not found"))?
+        };
+        let expected_bytes = current.encode_to_vec();
+
+        // Note: The check for whether bucket is empty should be done by
+        // the Gateway using scatter-gather before calling delete_bucket.
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Buckets,
+                    key: req.name.clone(),
+                    expected: Some(expected_bytes),
+                    new_value: None, // delete
+                }],
+                requested_by: "delete-bucket".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(resp) => match resp.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("bucket changed since read; retry delete"));
+                    }
+                    other => {
+                        error!("unexpected raft response for delete_bucket: {:?}", other);
+                        return Err(Status::internal("raft commit returned wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.delete_bucket(&req.name);
+        }
+
+        self.buckets.write().remove(&req.name);
+
+        info!("Deleted bucket: {}", req.name);
+
+        Ok(Response::new(DeleteBucketResponse { success: true }))
+    }
+
+    async fn get_bucket(
+        &self,
+        request: Request<GetBucketRequest>,
+    ) -> Result<Response<GetBucketResponse>, Status> {
+        let req = request.into_inner();
+
+        let bucket = self
+            .buckets
+            .read()
+            .get(&req.name)
+            .cloned()
+            .ok_or_else(|| Status::not_found("bucket not found"))?;
+
+        Ok(Response::new(GetBucketResponse {
+            bucket: Some(bucket),
+        }))
+    }
+
+    async fn list_buckets(
+        &self,
+        request: Request<ListBucketsRequest>,
+    ) -> Result<Response<ListBucketsResponse>, Status> {
+        let req = request.into_inner();
+
+        let buckets: Vec<BucketMeta> = self
+            .buckets
+            .read()
+            .values()
+            .filter(|b| req.owner.is_empty() || b.owner == req.owner)
+            .filter(|b| req.tenant.is_empty() || b.tenant == req.tenant)
+            .cloned()
+            .collect();
+
+        Ok(Response::new(ListBucketsResponse { buckets }))
+    }
+
+    /// DEPRECATED: Object metadata is now stored on primary OSD
+    /// This RPC is kept for backward compatibility but does nothing
+    /// Register a PUT in the Meta-backed OBJECT_LISTINGS index. Every
+    /// S3 PUT that succeeds at the data layer calls this to make the
+    /// object visible via ListObjects. Routed through Raft MultiCas so
+    /// followers see the commit at the same log position.
+    async fn create_object(
+        &self,
+        request: Request<CreateObjectRequest>,
+    ) -> Result<Response<CreateObjectResponse>, Status> {
+        let req = request.into_inner();
+        if req.bucket.is_empty() || req.key.is_empty() {
+            return Err(Status::invalid_argument("bucket and key required"));
+        }
+
+        // Build the listing entry. primary_osd_id is optional (the
+        // first shard in the first stripe, as a routing hint).
+        let primary_osd_id = req
+            .stripes
+            .first()
+            .and_then(|s| s.shards.first())
+            .map(|s| s.node_id.clone())
+            .unwrap_or_default();
+        let now = Self::current_timestamp();
+        let entry = ObjectListingEntry {
+            bucket: req.bucket.clone(),
+            key: req.key.clone(),
+            size: req.size,
+            etag: req.etag.clone(),
+            content_type: req.content_type.clone(),
+            created_at: now,
+            modified_at: now,
+            version_id: String::new(),
+            is_delete_marker: false,
+            storage_class: "STANDARD".into(),
+            user_metadata: req.user_metadata.clone(),
+            primary_osd_id,
+            // Gateway carried these from its GetPlacement call. With
+            // pg_id set, ListObjects + GET can resolve osd_ids via a
+            // single PG lookup; without, we fall back to the legacy
+            // per-object CRUSH path.
+            pg_id: req.pg_id,
+            pool: req.pool.clone(),
+        };
+        let listing_key = format!("{}\0{}\0", req.bucket, req.key);
+        let new_bytes = entry.encode_to_vec();
+
+        // Idempotent overwrite: PUT on an existing key replaces. Read
+        // current (if any) so the MultiCas doesn't spuriously fail.
+        let expected_bytes = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_object_listing(&listing_key));
+
+        // The key's home, recorded with its listing when it moved (or is
+        // new): where the gateway just wrote its ObjectMeta.
+        let home_key = format!("{}/{}", req.bucket, req.key);
+        let current_home = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_object_home(&home_key));
+        let new_home = (!req.home_osd_ids.is_empty())
+            .then(|| {
+                ObjectHome {
+                    osd_ids: req.home_osd_ids.clone(),
+                }
+                .encode_to_vec()
+            })
+            .filter(|h| current_home.as_ref() != Some(h));
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let mut ops = vec![CasOp {
+                table: CasTable::ObjectListings,
+                key: listing_key.clone(),
+                expected: expected_bytes,
+                new_value: Some(new_bytes),
+            }];
+            if let Some(home) = new_home {
+                ops.push(CasOp {
+                    table: CasTable::Named("object_homes".into()),
+                    key: home_key,
+                    expected: current_home,
+                    new_value: Some(home),
+                });
+            }
+            let cmd = MetaCommand::MultiCas {
+                ops,
+                requested_by: "create-object".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted(
+                            "listing changed during PUT; client should retry",
+                        ));
+                    }
+                    other => {
+                        error!("unexpected raft response for create_object: {:?}", other);
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.put_object_listing(&listing_key, &entry.encode_to_vec());
+            if let Some(home) = new_home {
+                store.put_object_home(&home_key, &home);
+            }
+        }
+
+        Ok(Response::new(CreateObjectResponse { object: None }))
+    }
+
+    async fn delete_object(
+        &self,
+        request: Request<DeleteObjectRequest>,
+    ) -> Result<Response<DeleteObjectResponse>, Status> {
+        let req = request.into_inner();
+        let listing_key = format!("{}\0{}\0{}", req.bucket, req.key, req.version_id);
+        let expected_bytes = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_object_listing(&listing_key));
+        let home_key = format!("{}/{}", req.bucket, req.key);
+        let home = if req.forget_home {
+            self.store
+                .as_ref()
+                .and_then(|s| s.read_object_home(&home_key))
+        } else {
+            None
+        };
+        if expected_bytes.is_none() && home.is_none() {
+            // Nothing to remove — return success idempotently.
+            return Ok(Response::new(DeleteObjectResponse {
+                success: true,
+                version_id: req.version_id,
+            }));
+        }
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let mut ops = Vec::with_capacity(2);
+            if expected_bytes.is_some() {
+                ops.push(CasOp {
+                    table: CasTable::ObjectListings,
+                    key: listing_key,
+                    expected: expected_bytes,
+                    new_value: None,
+                });
+            }
+            if home.is_some() {
+                ops.push(CasOp {
+                    table: CasTable::Named("object_homes".into()),
+                    key: home_key,
+                    expected: home,
+                    new_value: None,
+                });
+            }
+            let cmd = MetaCommand::MultiCas {
+                ops,
+                requested_by: "delete-object".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("listing changed during DELETE; retry"));
+                    }
+                    other => {
+                        error!("unexpected raft response for delete_object: {:?}", other);
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            // Legacy non-raft path: direct redb delete.
+            store
+                .delete_object_listing(&format!("{}\0{}\0{}", req.bucket, req.key, req.version_id));
+            if home.is_some() {
+                store.delete_object_home(&home_key);
+            }
+        }
+
+        Ok(Response::new(DeleteObjectResponse {
+            success: true,
+            version_id: req.version_id,
+        }))
+    }
+
+    /// Single-object read — not in the common path (gateway goes to
+    /// OSDs for ObjectMeta), kept so admin tools can look up metadata
+    /// by (bucket, key).
+    async fn get_object(
+        &self,
+        _request: Request<GetObjectRequest>,
+    ) -> Result<Response<GetObjectResponse>, Status> {
+        Err(Status::unimplemented(
+            "Object metadata lives on OSDs — use GetObjectMeta. ObjectListings only stores the listing hint.",
+        ))
+    }
+
+    /// Linearizable listing via a B-tree scan of OBJECT_LISTINGS in
+    /// Meta's redb. Replaces the old scatter-gather-then-merge path
+    /// on the gateway. Continuation token is the bucket-relative
+    /// form of the last key returned.
+    async fn list_objects(
+        &self,
+        request: Request<ListObjectsRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let req = request.into_inner();
+        if req.bucket.is_empty() {
+            return Err(Status::invalid_argument("bucket required"));
+        }
+        let max_keys = if req.max_keys == 0 {
+            1000
+        } else {
+            req.max_keys.min(1000) as usize
+        };
+        let start_after = if !req.continuation_token.is_empty() {
+            req.continuation_token.clone()
+        } else {
+            req.start_after.clone()
+        };
+
+        let Some(store) = &self.store else {
+            // No persistent store = no Raft backend — return empty.
+            return Ok(Response::new(ListObjectsResponse::default()));
+        };
+        let page = page_listing(
+            |after, n| {
+                let (rows, more, _) = store
+                    .list_object_listings(&req.bucket, &req.prefix, after, n)
+                    .map_err(|e| e.to_string())?;
+                let entries = rows
+                    .into_iter()
+                    .filter_map(|(_k, bytes)| {
+                        <ObjectListingEntry as prost::Message>::decode(bytes.as_slice())
+                            .inspect_err(|err| warn!("decode ObjectListingEntry failed: {err}"))
+                            .ok()
+                    })
+                    .collect();
+                Ok::<_, String>((entries, more))
+            },
+            &req.prefix,
+            &req.delimiter,
+            &start_after,
+            max_keys,
+        )
+        .map_err(|e| {
+            error!("list_object_listings failed: {e}");
+            Status::internal(format!("list failed: {e}"))
+        })?;
+        let (entries, common_prefixes, is_truncated, next_token) = (
+            page.entries,
+            page.common_prefixes,
+            page.is_truncated,
+            page.next_token,
+        );
+
+        let key_count = entries.len() as u32 + common_prefixes.len() as u32;
+        Ok(Response::new(ListObjectsResponse {
+            objects: Vec::new(),
+            common_prefixes,
+            next_continuation_token: next_token,
+            is_truncated,
+            key_count,
+            entries,
+        }))
+    }
+
+    async fn get_placement(
+        &self,
+        request: Request<GetPlacementRequest>,
+    ) -> Result<Response<GetPlacementResponse>, Status> {
+        let home = self.object_home(&request.get_ref().bucket, &request.get_ref().key);
+        let mut response = self.computed_placement(request).await?;
+        if let Some(home) = home {
+            self.place_at_home(&mut response.get_mut().nodes, &home);
+        }
+        Ok(response)
     }
 
     async fn create_multipart_upload(
