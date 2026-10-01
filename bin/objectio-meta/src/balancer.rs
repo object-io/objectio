@@ -6,13 +6,13 @@
 //! an OSD is underloaded, the balancer picks a better copyset from
 //! the precomputed pool and commits the new `osd_ids` via MultiCas.
 //!
-//! # Greenfield mode
+//! # What a move moves
 //!
-//! ObjectIO has no production data to preserve, so moves commit
-//! **directly** — `osd_ids = new_set`, `version += 1`, no
-//! `migrating_to_osd_ids` dance and no per-object shard copy. Any
-//! shards left on OSDs that dropped out of a PG are orphans; the
-//! terminal-loss GC in `drain_observer.rs` collects them.
+//! Moves commit **directly** — `osd_ids = new_set`, `version += 1` — and
+//! copy no data. That places *new* keys only: a key already written keeps
+//! its home (the OSDs its ObjectMeta was written to, recorded by meta), and
+//! GetPlacement returns that, so a move never hides an object. Its shards
+//! stay where its stripes say they are. `migrating_to_osd_ids` is unused.
 //!
 //! # Tuning knobs (config keys, all optional)
 //!
