@@ -2349,6 +2349,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-dedup-estimate"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "objectio-gateway",
+]
+
+[[package]]
 name = "objectio-delta-sharing"
 version = "0.3.0"
 dependencies = [
