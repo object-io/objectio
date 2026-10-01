@@ -494,17 +494,114 @@ impl RaftLogReader<MetaTypeConfig> for MetaRaftStorage {
 }
 
 // ---------------------------------------------------------------
-// RaftSnapshotBuilder — minimal stub. Real snapshots in a later phase.
+// Snapshots: every state-machine table, dumped and installed whole.
 // ---------------------------------------------------------------
 
-impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStorage {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
-        let state = self.load_state()?;
-        // Empty payload — no state-machine compaction yet. Log will
-        // keep growing in R1, which is fine for config-scale workloads.
+/// Tables Raft keeps for itself. Every other table in the database is
+/// state-machine state and goes into a snapshot.
+const RAFT_TABLES: [&str; 3] = ["raft_logs", "raft_vote", "raft_state"];
+
+const SNAPSHOT_MAGIC: &[u8] = b"OBIO-META-SNAPSHOT-1\n";
+
+/// One table's rows, as a snapshot carries them.
+type TableRows = (String, Vec<(String, Vec<u8>)>);
+
+impl MetaRaftStorage {
+    /// The state machine's tables and the Raft state they correspond to,
+    /// read in one transaction so they agree.
+    fn dump_state_machine(&self) -> Result<(Vec<u8>, RaftPersistentState), StorageError<NodeId>> {
+        let txn = self.db.begin_read().map_err(read_err)?;
+        let state = match txn.open_table(tables::RAFT_STATE) {
+            Ok(t) => match t.get("state").map_err(read_err)? {
+                Some(v) => {
+                    serde_json::from_slice(v.value()).map_err(|e| decode_err("raft_state", e))?
+                }
+                None => RaftPersistentState::default(),
+            },
+            Err(redb::TableError::TableDoesNotExist(_)) => RaftPersistentState::default(),
+            Err(e) => return Err(read_err(e)),
+        };
+        let mut names: Vec<String> = txn
+            .list_tables()
+            .map_err(read_err)?
+            .map(|h| redb::TableHandle::name(&h).to_string())
+            .filter(|n| !RAFT_TABLES.contains(&n.as_str()))
+            .collect();
+        names.sort();
+
+        let mut out = SNAPSHOT_MAGIC.to_vec();
+        put_u64(&mut out, names.len() as u64);
+        for name in &names {
+            let table = txn
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(name))
+                .map_err(read_err)?;
+            put_bytes(&mut out, name.as_bytes());
+            let rows: Vec<(String, Vec<u8>)> = table
+                .iter()
+                .map_err(read_err)?
+                .map(|r| r.map(|(k, v)| (k.value().to_string(), v.value().to_vec())))
+                .collect::<Result<_, _>>()
+                .map_err(read_err)?;
+            put_u64(&mut out, rows.len() as u64);
+            for (k, v) in rows {
+                put_bytes(&mut out, k.as_bytes());
+                put_bytes(&mut out, &v);
+            }
+        }
+        Ok((out, state))
+    }
+
+    /// Replace every state-machine table with the snapshot's, and record
+    /// the position it was taken at, in one transaction: a crash leaves
+    /// either the old state or the new, never a mix.
+    fn install_state_machine(
+        &self,
+        tables_in: &[TableRows],
+        meta: &SnapshotMeta<NodeId, Node>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let txn = self.db.begin_write().map_err(write_err)?;
+        {
+            let existing: Vec<String> = txn
+                .list_tables()
+                .map_err(write_err)?
+                .map(|h| redb::TableHandle::name(&h).to_string())
+                .filter(|n| !RAFT_TABLES.contains(&n.as_str()))
+                .collect();
+            for name in &existing {
+                txn.delete_table(redb::TableDefinition::<&str, &[u8]>::new(name))
+                    .map_err(write_err)?;
+            }
+            for (name, rows) in tables_in {
+                let mut t = txn
+                    .open_table(redb::TableDefinition::<&str, &[u8]>::new(name))
+                    .map_err(write_err)?;
+                for (k, v) in rows {
+                    t.insert(k.as_str(), v.as_slice()).map_err(write_err)?;
+                }
+            }
+            let mut state = match txn.open_table(tables::RAFT_STATE) {
+                Ok(t) => match t.get("state").map_err(write_err)? {
+                    Some(v) => serde_json::from_slice(v.value())
+                        .map_err(|e| decode_err("raft_state", e))?,
+                    None => RaftPersistentState::default(),
+                },
+                Err(e) => return Err(write_err(e)),
+            };
+            state.last_applied = meta.last_log_id;
+            state.membership = meta.last_membership.clone();
+            let mut t = txn.open_table(tables::RAFT_STATE).map_err(write_err)?;
+            let encoded = serde_json::to_vec(&state).map_err(|e| encode_err("raft_state", e))?;
+            t.insert("state", encoded.as_slice()).map_err(write_err)?;
+        }
+        crate::commit_metrics::commit(txn).map_err(write_err)
+    }
+
+    fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
+        let (data, state) = self.dump_state_machine()?;
         let snapshot_id = format!(
-            "meta-snap-{}",
-            state.last_applied.map(|id| id.index).unwrap_or_default()
+            "meta-snap-{}-{}",
+            state.last_applied.map_or(0, |id| id.leader_id.term),
+            state.last_applied.map_or(0, |id| id.index)
         );
         Ok(Snapshot {
             meta: SnapshotMeta {
@@ -512,8 +609,70 @@ impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStorage {
                 last_membership: state.membership,
                 snapshot_id,
             },
-            snapshot: Box::new(Cursor::new(Vec::new())),
+            snapshot: Box::new(Cursor::new(data)),
         })
+    }
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u64(out, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
+/// Parse a whole snapshot before anything is installed from it: a
+/// truncated or corrupt one is refused, never half-applied.
+fn parse_snapshot(data: &[u8]) -> Result<Vec<TableRows>, String> {
+    struct Reader<'a>(&'a [u8]);
+    impl Reader<'_> {
+        fn take(&mut self, n: usize) -> Result<&[u8], String> {
+            if self.0.len() < n {
+                return Err("snapshot is truncated".into());
+            }
+            let (a, b) = self.0.split_at(n);
+            self.0 = b;
+            Ok(a)
+        }
+        fn u64(&mut self) -> Result<u64, String> {
+            Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        }
+        fn bytes(&mut self) -> Result<&[u8], String> {
+            let n = usize::try_from(self.u64()?).map_err(|e| e.to_string())?;
+            self.take(n)
+        }
+        fn string(&mut self) -> Result<String, String> {
+            String::from_utf8(self.bytes()?.to_vec()).map_err(|e| e.to_string())
+        }
+    }
+    let mut r = Reader(data);
+    if r.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
+        return Err("not a meta snapshot".into());
+    }
+    let mut tables_out = Vec::new();
+    for _ in 0..r.u64()? {
+        let name = r.string()?;
+        if RAFT_TABLES.contains(&name.as_str()) {
+            return Err(format!("snapshot carries Raft's own table {name}"));
+        }
+        let mut rows = Vec::new();
+        for _ in 0..r.u64()? {
+            let k = r.string()?;
+            rows.push((k, r.bytes()?.to_vec()));
+        }
+        tables_out.push((name, rows));
+    }
+    if !r.0.is_empty() {
+        return Err("trailing bytes after the last table".into());
+    }
+    Ok(tables_out)
+}
+
+impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStorage {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
+        self.snapshot_of()
     }
 }
 
@@ -699,21 +858,26 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, Node>,
-        _snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
-        // R1 stub — snapshots aren't payload-bearing yet, so installing
-        // one only updates the persistent markers.
-        let mut state = self.load_state()?;
-        state.last_applied = meta.last_log_id;
-        state.membership = meta.last_membership.clone();
-        self.save_state(&state)
+        // The whole state machine, replaced. (This used to only move
+        // last_applied forward with no data, so a replica caught up from a
+        // snapshot believed it was current while missing everything.)
+        let tables_in = parse_snapshot(snapshot.get_ref())
+            .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))?;
+        self.install_state_machine(&tables_in, meta)?;
+        if let Some(tx) = self.listener.as_ref() {
+            let _ = tx.send(ApplyEvent::SnapshotInstalled);
+        }
+        Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<MetaTypeConfig>>, StorageError<NodeId>> {
-        // We don't persist snapshots in R1.
-        Ok(None)
+        // Built fresh from the tables: always the current state, so there
+        // is no stored snapshot to fall out of date.
+        self.snapshot_of().map(Some)
     }
 }
 
@@ -989,12 +1153,14 @@ mod tests {
                 assert_eq!(key, "b1");
                 assert_eq!(new_value.as_deref(), Some(&b"v1"[..]));
             }
+            other => panic!("unexpected {other:?}"),
         }
         match &events[1] {
             ApplyEvent::MultiCasOp { table, key, .. } => {
                 assert_eq!(table, &CasTable::IcebergTables);
                 assert_eq!(key, "ns/t");
             }
+            other => panic!("unexpected {other:?}"),
         }
         match &events[2] {
             ApplyEvent::MultiCasOp {
@@ -1006,6 +1172,7 @@ mod tests {
                 assert_eq!(key, "b2");
                 assert!(new_value.is_none(), "delete op");
             }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1106,5 +1273,140 @@ mod tests {
             let (last, _) = s.last_applied_state().await.unwrap();
             assert_eq!(last.unwrap().index, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! A snapshot carries the whole state machine to a replica that needs
+    //! it, and replaces what that replica had.
+
+    use super::*;
+    use openraft::{CommittedLeaderId, LogId};
+    use redb::ReadableTable;
+    use tempfile::TempDir;
+
+    fn storage() -> (TempDir, MetaRaftStorage) {
+        let dir = TempDir::new().unwrap();
+        let db = Database::create(dir.path().join("meta.db")).unwrap();
+        (dir, MetaRaftStorage::new(Arc::new(db)))
+    }
+
+    fn put(s: &MetaRaftStorage, table: &str, key: &str, value: &[u8]) {
+        let txn = s.db.begin_write().unwrap();
+        {
+            let mut t = txn
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(table))
+                .unwrap();
+            t.insert(key, value).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn rows(s: &MetaRaftStorage, table: &str) -> Vec<(String, Vec<u8>)> {
+        let txn = s.db.begin_read().unwrap();
+        let Ok(t) = txn.open_table(redb::TableDefinition::<&str, &[u8]>::new(table)) else {
+            return Vec::new();
+        };
+        t.iter()
+            .unwrap()
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.value().to_string(), v.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn at(index: u64) -> SnapshotMeta<NodeId, Node> {
+        SnapshotMeta {
+            last_log_id: Some(LogId::new(CommittedLeaderId::new(3, 1), index)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: format!("t-{index}"),
+        }
+    }
+
+    /// The leader's tables reach a fresh replica whole — the step that
+    /// used to deliver nothing while claiming the replica was current.
+    #[tokio::test]
+    async fn a_snapshot_carries_every_table_to_a_fresh_replica() {
+        let (_a, mut leader) = storage();
+        put(&leader, "buckets", "b1", b"bucket one");
+        put(&leader, "object_listings", "b1\0k\0", b"listing");
+        put(&leader, "stripe_refs", "aa", b"refs");
+        let snap = leader.build_snapshot().await.unwrap();
+
+        let (_b, mut replica) = storage();
+        replica
+            .install_snapshot(&at(42), snap.snapshot)
+            .await
+            .unwrap();
+        for table in ["buckets", "object_listings", "stripe_refs"] {
+            assert_eq!(rows(&replica, table), rows(&leader, table), "{table}");
+        }
+        assert_eq!(
+            replica.load_state().unwrap().last_applied.unwrap().index,
+            42
+        );
+    }
+
+    /// What the replica had that the leader no longer has is gone after.
+    #[tokio::test]
+    async fn installing_replaces_what_the_replica_had() {
+        let (_a, mut leader) = storage();
+        put(&leader, "buckets", "kept", b"v");
+        let snap = leader.build_snapshot().await.unwrap();
+
+        let (_b, mut replica) = storage();
+        put(&replica, "buckets", "deleted-since", b"old");
+        put(&replica, "tenants", "stale", b"old");
+        replica
+            .install_snapshot(&at(7), snap.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(&replica, "buckets"),
+            vec![("kept".into(), b"v".to_vec())]
+        );
+        assert!(rows(&replica, "tenants").is_empty());
+    }
+
+    /// A damaged snapshot is refused before anything is touched.
+    #[tokio::test]
+    async fn a_truncated_snapshot_changes_nothing() {
+        let (_a, mut leader) = storage();
+        put(&leader, "buckets", "b", b"v");
+        let mut data = leader.build_snapshot().await.unwrap().snapshot.into_inner();
+        data.truncate(data.len() - 3);
+
+        let (_b, mut replica) = storage();
+        put(&replica, "buckets", "mine", b"x");
+        let err = replica
+            .install_snapshot(&at(9), Box::new(Cursor::new(data)))
+            .await;
+        assert!(err.is_err());
+        assert_eq!(
+            rows(&replica, "buckets"),
+            vec![("mine".into(), b"x".to_vec())]
+        );
+        assert_ne!(
+            replica.load_state().unwrap().last_applied.map(|l| l.index),
+            Some(9)
+        );
+    }
+
+    /// The service hears about it, to rebuild its caches.
+    #[tokio::test]
+    async fn installing_tells_the_service() {
+        let (_a, mut leader) = storage();
+        let snap = leader.build_snapshot().await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("meta.db")).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut replica = MetaRaftStorage::with_apply_listener(db, tx);
+        replica
+            .install_snapshot(&at(1), snap.snapshot)
+            .await
+            .unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ApplyEvent::SnapshotInstalled)));
     }
 }

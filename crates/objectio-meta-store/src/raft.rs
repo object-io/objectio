@@ -153,6 +153,9 @@ pub enum ApplyEvent {
         /// `None` = the op deleted the key.
         new_value: Option<Vec<u8>>,
     },
+    /// The state machine was replaced wholesale by a snapshot from the
+    /// leader: every in-memory cache must be rebuilt from the store.
+    SnapshotInstalled,
 }
 
 /// Reply the state machine emits from `apply`, visible to the client that
