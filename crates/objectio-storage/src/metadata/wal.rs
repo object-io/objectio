@@ -785,26 +785,15 @@ mod group_commit_tests {
 
     /// Concurrent writers must actually share syncs rather than queue for them.
     ///
-    /// Eight threads each appending 25 records is 200 records. One fsync
-    /// apiece, serialized, cannot beat 200 x the device's sync latency; shared
-    /// ones can. The bound is deliberately loose — this asserts the
-    /// serialization is gone, not a particular speed on a particular disk.
+    /// Eight threads each appending 25 records is 200 records. Serialized,
+    /// that is 200 fsyncs; shared, fewer. Counted rather than timed: a
+    /// wall-clock bound failed on loaded CI runners, where a disk shared
+    /// with other tests made the concurrent run slow for reasons that have
+    /// nothing to do with whether syncs are shared.
     #[test]
     fn concurrent_writers_share_syncs() {
         let dir = tempfile::tempdir().unwrap();
-
-        // Calibrate against this machine: how long does one synced append take?
-        let solo = wal(&dir);
-        let t = Instant::now();
-        for i in 0..20 {
-            solo.append(&op(i)).unwrap();
-        }
-        let per_append = t.elapsed() / 20;
-        drop(solo);
-
-        let dir2 = tempfile::tempdir().unwrap();
-        let w = Arc::new(wal(&dir2));
-        let t = Instant::now();
+        let w = Arc::new(wal(&dir));
         let mut hs = Vec::new();
         for tid in 0..8 {
             let w = Arc::clone(&w);
@@ -817,13 +806,14 @@ mod group_commit_tests {
         for h in hs {
             h.join().unwrap();
         }
-        let elapsed = t.elapsed();
 
-        let fully_serialized = per_append * 200;
+        let stats = w.sync_stats();
+        let syncs = stats.syncs.load(Ordering::Relaxed);
+        let records = stats.records.load(Ordering::Relaxed);
+        assert_eq!(records, 200, "every append must be made durable");
         assert!(
-            elapsed < fully_serialized,
-            "200 concurrent appends took {elapsed:?}, no better than {fully_serialized:?} \
-             of one-sync-each — writers are still serializing on the sync"
+            syncs < records,
+            "{syncs} fsyncs for {records} concurrent appends: writers are not sharing syncs"
         );
     }
 
