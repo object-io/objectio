@@ -88,7 +88,7 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 base64 = "0.22"
 
 # Utilities
-uuid = { version = "1.11", features = ["v4", "serde"] }
+uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 bytes = "1.9"
 hex = "0.4"
 md-5 = "0.10"
