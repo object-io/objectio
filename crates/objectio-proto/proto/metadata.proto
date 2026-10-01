@@ -355,6 +355,10 @@ message ObjectMeta {
     // GET/HEAD with `x-amz-checksum-mode: ENABLED`. Absent when the PUT
     // carried none, and on objects written before it existed.
     ObjectChecksum checksum = 23;
+
+    // Object tags (S3 object tagging): at most 10, set by PutObjectTagging,
+    // `x-amz-tagging` on PUT / CreateMultipartUpload, or copied by CopyObject.
+    map<string, string> tags = 24;
 }
 
 // A full-object checksum, as S3 reports it.
