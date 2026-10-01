@@ -33,12 +33,16 @@ use objectio_proto::storage::{
     ListObjectsMetaResponse,
     ListShardsRequest,
     ListShardsResponse,
+    NoteChunksRequest,
+    NoteChunksResponse,
     // Object metadata RPCs
     PutObjectMetaRequest,
     PutObjectMetaResponse,
     RdmaBuffer,
     ReadShardRequest,
     ReadShardResponse,
+    ResetChunkNotesRequest,
+    ResetChunkNotesResponse,
     ShardState,
     WriteShardRequest,
     WriteShardResponse,
@@ -264,6 +268,14 @@ struct ShardLocation {
 /// keeps us from colliding with the ShardMeta entries the object
 /// layer writes under its own 's'-prefixed keys.
 const SHARD_LOC_PREFIX: &[u8] = b"osd_loc:";
+
+/// Dedup dry-run: chunk fingerprints this OSD has been told about, each
+/// with how many times. See objectio-docs `architecture/design/dedup.md`.
+const DEDUP_NOTE_PREFIX: &[u8] = b"dedup_note:";
+
+fn dedup_note_key(fingerprint: &[u8]) -> MetadataKey {
+    MetadataKey::from_bytes([DEDUP_NOTE_PREFIX, fingerprint].concat())
+}
 
 /// OSD service state
 pub struct OsdService {
@@ -1132,6 +1144,58 @@ impl StorageService for OsdService {
             })
             .collect();
         Ok(Response::new(CheckShardsResponse { states }))
+    }
+
+    async fn note_chunks(
+        &self,
+        request: Request<NoteChunksRequest>,
+    ) -> Result<Response<NoteChunksResponse>, Status> {
+        let req = request.into_inner();
+        let mut seen = Vec::with_capacity(req.fingerprints.len());
+        let mut writes = Vec::with_capacity(req.fingerprints.len());
+        // A fingerprint repeated within one call counts from its first
+        // occurrence, as it would across calls.
+        let mut counts: HashMap<&[u8], u64> = HashMap::new();
+        for fp in &req.fingerprints {
+            let count = counts.entry(fp.as_slice()).or_insert_with(|| {
+                self.meta_store
+                    .get(&dedup_note_key(fp))
+                    .and_then(|v| v.try_into().ok().map(u64::from_le_bytes))
+                    .unwrap_or(0)
+            });
+            seen.push(*count > 0);
+            *count += 1;
+        }
+        for (fp, count) in counts {
+            writes.push((dedup_note_key(fp), count.to_le_bytes().to_vec()));
+        }
+        // One WAL record for the whole call.
+        self.meta_store
+            .batch_put(writes)
+            .map_err(|e| Status::internal(format!("recording chunk notes: {e}")))?;
+        Ok(Response::new(NoteChunksResponse { seen }))
+    }
+
+    async fn reset_chunk_notes(
+        &self,
+        _request: Request<ResetChunkNotesRequest>,
+    ) -> Result<Response<ResetChunkNotesResponse>, Status> {
+        let prefix = MetadataKey::from_bytes(DEDUP_NOTE_PREFIX.to_vec());
+        let keys: Vec<MetadataKey> = self
+            .meta_store
+            .scan_prefix(&prefix)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for batch in keys.chunks(4096) {
+            self.meta_store
+                .batch_delete(batch)
+                .map_err(|e| Status::internal(format!("forgetting chunk notes: {e}")))?;
+        }
+        info!("dedup dry-run: forgot {} chunk notes", keys.len());
+        Ok(Response::new(ResetChunkNotesResponse {
+            forgotten: keys.len() as u64,
+        }))
     }
 
     async fn get_metrics(
@@ -2663,6 +2727,79 @@ mod integrity_tests {
         );
 
         put(&osd, meta(2), &[2; 16]).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod dedup_note_tests {
+    //! The dedup dry-run's per-OSD fingerprint set.
+
+    use super::*;
+    use objectio_proto::storage::storage_service_server::StorageService;
+
+    fn osd_at(dir: &std::path::Path) -> OsdService {
+        OsdService::new(
+            vec![dir.join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.join("state"),
+        )
+        .unwrap()
+    }
+
+    async fn note(osd: &OsdService, fps: &[&[u8]]) -> Vec<bool> {
+        osd.note_chunks(Request::new(NoteChunksRequest {
+            fingerprints: fps.iter().map(|f| f.to_vec()).collect(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .seen
+    }
+
+    #[tokio::test]
+    async fn a_fingerprint_is_new_once_then_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = osd_at(dir.path());
+        assert_eq!(note(&osd, &[b"a", b"b"]).await, vec![false, false]);
+        assert_eq!(note(&osd, &[b"b", b"c"]).await, vec![true, false]);
+    }
+
+    /// Two copies of a chunk in one object count the second as a duplicate.
+    #[tokio::test]
+    async fn a_repeat_within_one_call_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = osd_at(dir.path());
+        assert_eq!(
+            note(&osd, &[b"x", b"x", b"x"]).await,
+            vec![false, true, true]
+        );
+    }
+
+    /// The set outlives a restart, and a reset outlives one too.
+    #[tokio::test]
+    async fn notes_and_resets_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let osd = osd_at(dir.path());
+            note(&osd, &[b"kept"]).await;
+        }
+        {
+            let osd = osd_at(dir.path());
+            assert_eq!(note(&osd, &[b"kept"]).await, vec![true]);
+            let forgotten = osd
+                .reset_chunk_notes(Request::new(ResetChunkNotesRequest {}))
+                .await
+                .unwrap()
+                .into_inner()
+                .forgotten;
+            assert_eq!(forgotten, 1);
+        }
+        let osd = osd_at(dir.path());
+        assert_eq!(
+            note(&osd, &[b"kept"]).await,
+            vec![false],
+            "the reset was lost"
+        );
     }
 }
 

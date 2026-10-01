@@ -96,7 +96,20 @@ fn json_to_tenant(v: &serde_json::Value) -> TenantConfig {
         enabled: v["enabled"].as_bool().unwrap_or(true),
         created_at: 0,
         updated_at: 0,
+        // Validated by the handler first (`tenant_dedup_error`).
+        dedup: v
+            .get("dedup")
+            .filter(|d| !d.is_null())
+            .and_then(|d| objectio_proto::dedup::from_json(d).ok()),
     }
+}
+
+/// Why a tenant body's `dedup` cannot be stored, if it cannot.
+fn tenant_dedup_error(v: &serde_json::Value) -> Option<String> {
+    let d = v.get("dedup").filter(|d| !d.is_null())?;
+    objectio_proto::dedup::from_json(d)
+        .and_then(|p| objectio_proto::dedup::validate(&p))
+        .err()
 }
 
 /// Convert a PoolConfig to JSON (prost types don't implement Serialize)
@@ -137,6 +150,9 @@ fn tenant_to_json(t: &TenantConfig) -> serde_json::Value {
         "enabled": t.enabled,
         "created_at": t.created_at,
         "updated_at": t.updated_at,
+        // Round-trips: the console saves the whole tenant, and a field it
+        // did not send back would reset to inherit.
+        "dedup": t.dedup.as_ref().map(objectio_proto::dedup::to_json),
     })
 }
 use serde::Deserialize;
@@ -912,6 +928,9 @@ pub async fn admin_create_tenant(
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
+    if let Some(e) = tenant_dedup_error(&body) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
     let tenant = json_to_tenant(&body);
     let mut client = state.meta_client.clone();
     match client
@@ -968,6 +987,9 @@ pub async fn admin_update_tenant(
 ) -> Response {
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
+    }
+    if let Some(e) = tenant_dedup_error(&body) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
     }
     let mut tenant = json_to_tenant(&body);
     tenant.name = name;
@@ -3233,6 +3255,208 @@ pub async fn admin_usage(auth: Option<Extension<AuthResult>>, headers: HeaderMap
         "buckets": report.buckets,
     }))
     .into_response()
+}
+
+// ---- Deduplication policy (objectio-docs architecture/design/dedup.md) ----
+
+fn status_response(e: &tonic::Status) -> Response {
+    let code = match e.code() {
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+        tonic::Code::Aborted => StatusCode::CONFLICT,
+        tonic::Code::FailedPrecondition | tonic::Code::Unavailable => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, e.message().to_string()).into_response()
+}
+
+fn dedup_policy_json(p: &objectio_proto::metadata::GetDedupPolicyResponse) -> serde_json::Value {
+    use objectio_proto::dedup::{mode_name, scope_name, to_json};
+    serde_json::json!({
+        "bucket": p.bucket.as_ref().map(to_json),
+        "tenant": p.tenant.as_ref().map(to_json),
+        "tenant_name": p.tenant_name,
+        "cluster": p.cluster.as_ref().map(to_json),
+        "effective": {
+            "mode": mode_name(p.effective_mode()),
+            "scope": scope_name(p.effective_scope()),
+            "mode_from": p.mode_from,
+            "scope_from": p.scope_from,
+        },
+    })
+}
+
+async fn fetch_dedup_policy(state: &AppState, bucket: &str) -> Response {
+    let mut meta = state.meta_client.clone();
+    match meta
+        .get_dedup_policy(objectio_proto::metadata::GetDedupPolicyRequest {
+            bucket: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(r) => Json(dedup_policy_json(&r.into_inner())).into_response(),
+        Err(e) => status_response(&e),
+    }
+}
+
+/// `GET /_admin/dedup`: the cluster default.
+pub async fn admin_get_dedup(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    fetch_dedup_policy(&state, "").await
+}
+
+/// `PUT /_admin/dedup` `{"mode": …, "scope": …}`: set the cluster default.
+pub async fn admin_put_dedup(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    let policy = match objectio_proto::dedup::from_json(&body)
+        .and_then(|p| objectio_proto::dedup::validate(&p).map(|()| p))
+    {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let who = auth
+        .as_ref()
+        .map_or_else(|| "console".to_string(), |Extension(a)| a.user_id.clone());
+    let mut meta = state.meta_client.clone();
+    if let Err(e) = meta
+        .set_config(SetConfigRequest {
+            key: objectio_proto::dedup::CLUSTER_KEY.to_string(),
+            value: objectio_proto::dedup::to_json(&policy)
+                .to_string()
+                .into_bytes(),
+            updated_by: who,
+        })
+        .await
+    {
+        return status_response(&e);
+    }
+    fetch_dedup_policy(&state, "").await
+}
+
+/// `GET /_admin/buckets/{name}/dedup`: the bucket's policy at every level,
+/// and what it resolves to.
+pub async fn admin_get_bucket_dedup(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    fetch_dedup_policy(&state, &bucket).await
+}
+
+async fn set_bucket_dedup(
+    state: &AppState,
+    bucket: &str,
+    policy: Option<objectio_proto::metadata::DedupPolicy>,
+) -> Response {
+    let mut meta = state.meta_client.clone();
+    if let Err(e) = meta
+        .set_bucket_dedup(objectio_proto::metadata::SetBucketDedupRequest {
+            bucket: bucket.to_string(),
+            policy,
+        })
+        .await
+    {
+        return status_response(&e);
+    }
+    fetch_dedup_policy(state, bucket).await
+}
+
+/// `PUT /_admin/buckets/{name}/dedup` `{"mode": …, "scope": …}`; absent
+/// fields inherit.
+pub async fn admin_put_bucket_dedup(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    match objectio_proto::dedup::from_json(&body) {
+        Ok(p) => set_bucket_dedup(&state, &bucket, Some(p)).await,
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// `DELETE /_admin/buckets/{name}/dedup`: inherit everything.
+pub async fn admin_delete_bucket_dedup(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    set_bucket_dedup(&state, &bucket, None).await
+}
+
+/// `POST /_admin/dedup/dry-run/reset`: every OSD forgets the fingerprints
+/// dry-run has noted, starting a new measurement window.
+pub async fn admin_reset_dedup_dry_run(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    let mut meta = state.meta_client.clone();
+    let nodes = match meta
+        .get_listing_nodes(GetListingNodesRequest {
+            bucket: String::new(),
+            include_all_states: true,
+        })
+        .await
+    {
+        Ok(r) => r.into_inner().nodes,
+        Err(e) => return status_response(&e),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let (mut forgotten, mut failed) = (0u64, Vec::new());
+    for node in nodes {
+        if !seen.insert(node.address.clone()) {
+            continue;
+        }
+        let result = async {
+            let mut client = state
+                .osd_pool
+                .get_or_connect(&node.node_id, &node.address)
+                .await
+                .map_err(|e| e.to_string())?;
+            client
+                .reset_chunk_notes(objectio_proto::storage::ResetChunkNotesRequest {})
+                .await
+                .map(|r| r.into_inner().forgotten)
+                .map_err(|e| e.message().to_string())
+        }
+        .await;
+        match result {
+            Ok(n) => forgotten += n,
+            Err(e) => failed.push(serde_json::json!({ "osd": node.address, "error": e })),
+        }
+    }
+    Json(serde_json::json!({ "forgotten": forgotten, "failed": failed })).into_response()
 }
 
 #[cfg(test)]

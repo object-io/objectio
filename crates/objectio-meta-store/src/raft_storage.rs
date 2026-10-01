@@ -171,6 +171,11 @@ impl MetaRaftStorage {
                 }
                 crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
+                // Followers refresh their config cache from this, as they
+                // do for a MultiCas on the config table. Without it a
+                // setting changed through the leader stayed stale on every
+                // other replica until restart.
+                self.notify_config(key, Some(bytes));
                 Ok(MetaResponse::ConfigSet { version })
             }
             MetaCommand::DeleteConfig { key } => {
@@ -181,6 +186,7 @@ impl MetaRaftStorage {
                 };
                 crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
+                self.notify_config(key, None);
                 Ok(MetaResponse::ConfigDeleted { existed })
             }
             MetaCommand::SetOsdAdminState {
@@ -230,6 +236,20 @@ impl MetaRaftStorage {
                 ops,
                 requested_by: _,
             } => apply_multi_cas(&self.db, state, ops, log_id, self.listener.as_ref()),
+        }
+    }
+}
+
+impl MetaRaftStorage {
+    /// Tell the service a config key changed, as a MultiCas on the config
+    /// table would.
+    fn notify_config(&self, key: &str, new_value: Option<Vec<u8>>) {
+        if let Some(tx) = self.listener.as_ref() {
+            let _ = tx.send(ApplyEvent::MultiCasOp {
+                table: CasTable::Config,
+                key: key.to_string(),
+                new_value,
+            });
         }
     }
 }

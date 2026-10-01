@@ -192,6 +192,12 @@ service MetadataService {
     rpc PutBucketVersioning(PutBucketVersioningRequest) returns (PutBucketVersioningResponse);
     rpc GetBucketVersioning(GetBucketVersioningRequest) returns (GetBucketVersioningResponse);
 
+    // Deduplication policy (objectio-docs architecture/design/dedup.md)
+    rpc SetBucketDedup(SetBucketDedupRequest) returns (SetBucketDedupResponse);
+    rpc GetDedupPolicy(GetDedupPolicyRequest) returns (GetDedupPolicyResponse);
+    // Primary OSD of each chunk fingerprint, for dry-run accounting.
+    rpc LocateChunks(LocateChunksRequest) returns (LocateChunksResponse);
+
     // Object lock configuration
     rpc PutObjectLockConfiguration(PutObjectLockConfigRequest) returns (PutObjectLockConfigResponse);
     rpc GetObjectLockConfiguration(GetObjectLockConfigRequest) returns (GetObjectLockConfigResponse);
@@ -250,6 +256,7 @@ message BucketMeta {
     uint64 quota_bytes = 8;          // Per-bucket storage quota (0 = unlimited)
     uint64 quota_objects = 9;        // Per-bucket object count quota (0 = unlimited)
     ObjectLockConfiguration object_lock = 10;  // Object lock config (immutable after creation)
+    DedupPolicy dedup = 11;          // Unset fields inherit from the tenant, then the cluster
     // NOTE: default encryption is persisted in a separate table keyed by bucket name
     // (BUCKET_ENCRYPTION_CONFIGS) to keep BucketMeta read-hot and avoid rewriting it on
     // PutBucketEncryption. Loaded into the meta service on boot. No field here.
@@ -566,6 +573,13 @@ message GetPlacementResponse {
     uint32 pg_id = 11;
     uint64 pg_version = 12;
     string pool = 13;               // Pool this PG lives in.
+
+    // Effective dedup policy for this bucket — bucket, then tenant, then
+    // cluster default — resolved here so a PUT needs no extra round trip.
+    // The gateway needs only the mode and the fingerprint domain, never
+    // the scope.
+    DedupMode dedup_mode = 14;
+    string dedup_domain = 15;
 }
 
 message NodePlacement {
@@ -2190,6 +2204,7 @@ message TenantConfig {
     bool enabled = 11;
     uint64 created_at = 12;
     uint64 updated_at = 13;
+    DedupPolicy dedup = 14;               // Unset fields inherit from the cluster default
 }
 
 message CreateTenantRequest { TenantConfig tenant = 1; }
@@ -2479,3 +2494,59 @@ message ListKmsKeysResponse {
 
 message DeleteKmsKeyRequest { string key_id = 1; }
 message DeleteKmsKeyResponse { bool success = 1; }
+
+
+// ---- Deduplication (objectio-docs architecture/design/dedup.md) ----
+
+enum DedupMode {
+    DEDUP_MODE_UNSET = 0;     // inherit
+    DEDUP_MODE_OFF = 1;
+    DEDUP_MODE_DRY_RUN = 2;   // fingerprint and count would-be savings; store as usual
+    DEDUP_MODE_ON = 3;        // phase 2; refused until then
+}
+
+enum DedupScope {
+    DEDUP_SCOPE_UNSET = 0;    // inherit
+    DEDUP_SCOPE_BUCKET = 1;
+    DEDUP_SCOPE_TENANT = 2;
+    DEDUP_SCOPE_CLUSTER = 3;
+}
+
+// Mode and scope inherit separately: a bucket may set only its mode and
+// take its scope from the tenant.
+message DedupPolicy {
+    DedupMode mode = 1;
+    DedupScope scope = 2;
+}
+
+message SetBucketDedupRequest {
+    string bucket = 1;
+    DedupPolicy policy = 2;   // absent or all-unset: inherit everything
+}
+message SetBucketDedupResponse {}
+
+// The policy at each level for `bucket`, and what they resolve to. With
+// an empty bucket, just the cluster default.
+message GetDedupPolicyRequest {
+    string bucket = 1;
+}
+message GetDedupPolicyResponse {
+    DedupPolicy bucket = 1;
+    DedupPolicy tenant = 2;
+    DedupPolicy cluster = 3;
+    string tenant_name = 4;
+    DedupMode effective_mode = 5;
+    DedupScope effective_scope = 6;
+    string effective_domain = 7;
+    string mode_from = 8;     // "bucket" | "tenant" | "cluster" | "default"
+    string scope_from = 9;
+}
+
+message LocateChunksRequest {
+    string bucket = 1;
+    repeated bytes fingerprints = 2;
+}
+message LocateChunksResponse {
+    repeated string addresses = 1;   // primary OSD per fingerprint, in order; "" if none
+    repeated bytes node_ids = 2;     // the same OSDs' node ids; empty if none
+}

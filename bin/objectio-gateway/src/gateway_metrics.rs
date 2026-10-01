@@ -28,6 +28,10 @@ static SHARD_CHECKSUM_MISMATCHES: LazyLock<CounterVec> = LazyLock::new(CounterVe
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static DEDUP_CHUNKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static DEDUP_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static DEDUP_DROPPED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static DEDUP_SKIPPED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
 const KNOWN_CODES: &[u16] = &[
@@ -146,6 +150,25 @@ pub fn record_reclaim(reason: &str, reclaimed: u64, failed: u64) {
     RECLAIM_FAILURES.add(&labels, failed);
 }
 
+/// A chunk the dedup dry-run fingerprinted in `bucket` under `chunking`:
+/// already stored in its domain (`duplicate`) or not (`new`).
+pub fn record_dedup_chunk(bucket: &str, chunking: &str, duplicate: bool, bytes: u64) {
+    let result = if duplicate { "duplicate" } else { "new" };
+    let labels = format!("bucket=\"{bucket}\",chunking=\"{chunking}\",result=\"{result}\"");
+    DEDUP_CHUNKS.inc(&labels);
+    DEDUP_BYTES.add(&labels, bytes);
+}
+
+/// Dry-run work given up on, so its numbers undercount by this much.
+pub fn record_dedup_dropped(reason: &str) {
+    DEDUP_DROPPED.inc(&format!("reason=\"{reason}\""));
+}
+
+/// A write in a dry-run bucket that dry-run does not look at.
+pub fn record_dedup_skipped(reason: &str) {
+    DEDUP_SKIPPED.inc(&format!("reason=\"{reason}\""));
+}
+
 /// Splits one request's time into consecutive phases. Each [`mark`] records
 /// the time since the previous one, so the phases of a request add up to the
 /// part of it the handler spent between the first and last mark.
@@ -243,6 +266,26 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_shard_reclaim_failures_total",
         "Shard deletes that failed, leaving the block allocated, by reason",
+    );
+    DEDUP_CHUNKS.render(
+        &mut out,
+        "objectio_dedup_dryrun_chunks_total",
+        "Chunks the dedup dry-run fingerprinted, by bucket, chunking and whether already stored",
+    );
+    DEDUP_BYTES.render(
+        &mut out,
+        "objectio_dedup_dryrun_bytes_total",
+        "Bytes the dedup dry-run fingerprinted, by bucket, chunking and whether already stored",
+    );
+    DEDUP_DROPPED.render(
+        &mut out,
+        "objectio_dedup_dryrun_dropped_total",
+        "Dry-run work given up on (queue full, lookup failed), by reason",
+    );
+    DEDUP_SKIPPED.render(
+        &mut out,
+        "objectio_dedup_dryrun_skipped_total",
+        "Writes in dry-run buckets that dry-run does not look at, by reason",
     );
     objectio_erasure::metrics::render(&mut out);
     out
