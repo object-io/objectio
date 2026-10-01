@@ -39,6 +39,9 @@ bytes = { workspace = true }
 http-body-util = "0.1"
 md-5 = { workspace = true }
 crc32c = { workspace = true }
+# Upload checksums (x-amz-checksum-crc32 / -crc64nvme); see src/checksum.rs.
+crc32fast = "1.4"
+crc = "3.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 objectio-auth = { workspace = true, features = ["oidc"] }

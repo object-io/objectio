@@ -318,6 +318,18 @@ message ObjectMeta {
     // placement, so any one of them can serve it. Empty for every other
     // object, and in listings, which never carry it.
     bytes inline_data = 22;
+
+    // The flexible checksum (x-amz-checksum-*) the client sent with the PUT,
+    // checked against the body before anything was stored. Returned on
+    // GET/HEAD with `x-amz-checksum-mode: ENABLED`. Absent when the PUT
+    // carried none, and on objects written before it existed.
+    ObjectChecksum checksum = 23;
+}
+
+// A full-object checksum, as S3 reports it.
+message ObjectChecksum {
+    string algorithm = 1;   // S3 name: CRC32, CRC32C, CRC64NVME, SHA1, SHA256
+    string value = 2;       // base64 of the big-endian checksum / digest
 }
 
 // Stripe metadata (EC group)

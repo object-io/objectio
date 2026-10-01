@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod auth_middleware;
 pub mod authz;
+pub mod checksum;
 pub mod chunked_decode;
 pub mod cluster_poll;
 pub mod console_auth;
