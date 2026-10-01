@@ -149,8 +149,9 @@ export const QUERIES = {
   // is absent from the /metrics text the live view reads.
   throughputByInstance:
     "sum by (instance) (rate(objectio_s3_response_bytes_total[$RATE]))",
+  // p99 of every OSD call, by method, in milliseconds.
   osdLatencyByInstance:
-    "sum by (instance) (rate(objectio_osd_grpc_latency_seconds_sum[$RATE]))",
+    "1000 * histogram_quantile(0.99, sum by (method, le) (rate(objectio_osd_grpc_latency_seconds_bucket[$RATE])))",
 };
 
 /// Rate window for a given range. A 5s scrape needs at least a few intervals
