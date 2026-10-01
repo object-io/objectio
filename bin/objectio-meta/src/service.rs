@@ -966,6 +966,11 @@ impl MetaService {
             use objectio_meta_store::{ApplyEvent, CasTable};
             while let Some(ev) = rx.recv().await {
                 match ev {
+                    // Every table was replaced: rebuild every cache.
+                    ApplyEvent::SnapshotInstalled => {
+                        info!("Raft snapshot installed; reloading meta state from the store");
+                        svc.load_from_store();
+                    }
                     ApplyEvent::MultiCasOp {
                         table,
                         key,
@@ -1967,6 +1972,9 @@ impl MetaService {
     }
 
     /// Load all data from the persistent store into in-memory maps.
+    /// Fill every cache from the store, clearing it first: run at startup,
+    /// and again after a Raft snapshot replaced the store's tables, when an
+    /// entry the snapshot no longer has must not linger.
     fn load_from_store(&self) {
         let Some(store) = &self.store else { return };
 
@@ -1974,6 +1982,7 @@ impl MetaService {
         match store.load_buckets() {
             Ok(buckets) => {
                 let mut map = self.buckets.write();
+                map.clear();
                 for (name, bucket) in buckets {
                     map.insert(name, bucket);
                 }
@@ -1986,6 +1995,7 @@ impl MetaService {
         match store.load_bucket_policies() {
             Ok(policies) => {
                 let mut map = self.bucket_policies.write();
+                map.clear();
                 for (name, policy) in policies {
                     map.insert(name, policy);
                 }
@@ -1998,6 +2008,7 @@ impl MetaService {
         match store.load_multipart_uploads() {
             Ok(uploads) => {
                 let mut map = self.multipart_uploads.write();
+                map.clear();
                 for (id, state) in uploads {
                     map.insert(id, state);
                 }
@@ -2045,6 +2056,7 @@ impl MetaService {
                     );
                 }
                 let mut osd_nodes = self.osd_nodes.write();
+                osd_nodes.clear();
                 for node in deduped {
                     osd_nodes.push(node);
                 }
@@ -2073,7 +2085,9 @@ impl MetaService {
         match store.load_users() {
             Ok(users) => {
                 let mut user_map = self.users.write();
+                user_map.clear();
                 let mut user_keys = self.user_keys.write();
+                user_keys.clear();
                 for (id, user) in users {
                     user_keys.entry(id.clone()).or_default();
                     user_map.insert(id, user);
@@ -2087,6 +2101,7 @@ impl MetaService {
         match store.load_access_keys() {
             Ok(keys) => {
                 let mut key_map = self.access_keys.write();
+                key_map.clear();
                 let mut user_keys = self.user_keys.write();
                 for (id, key) in keys {
                     user_keys
@@ -2104,6 +2119,7 @@ impl MetaService {
         match store.load_groups() {
             Ok(groups) => {
                 let mut group_map = self.groups.write();
+                group_map.clear();
                 for (id, group) in groups {
                     group_map.insert(id, group);
                 }
@@ -2116,6 +2132,7 @@ impl MetaService {
         match store.load_data_filters() {
             Ok(filters) => {
                 let mut filter_map = self.data_filters.write();
+                filter_map.clear();
                 for (id, filter) in filters {
                     filter_map.insert(id, filter);
                 }
@@ -2128,6 +2145,7 @@ impl MetaService {
         match store.list_iceberg_namespaces("") {
             Ok(entries) => {
                 let mut ns_map = self.iceberg_namespaces.write();
+                ns_map.clear();
                 for (key, bytes) in entries {
                     match IcebergCreateNamespaceResponse::decode(bytes.as_slice()) {
                         Ok(resp) => {
@@ -2145,6 +2163,7 @@ impl MetaService {
         match store.list_iceberg_tables("") {
             Ok(entries) => {
                 let mut tbl_map = self.iceberg_tables.write();
+                tbl_map.clear();
                 for (key, bytes) in entries {
                     match IcebergTableEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
@@ -2170,6 +2189,7 @@ impl MetaService {
         match store.load_delta_shares() {
             Ok(entries) => {
                 let mut map = self.delta_shares.write();
+                map.clear();
                 for (key, bytes) in entries {
                     match DeltaShareEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
@@ -2187,6 +2207,7 @@ impl MetaService {
         match store.load_delta_tables() {
             Ok(entries) => {
                 let mut map = self.delta_tables.write();
+                map.clear();
                 for (key, bytes) in entries {
                     match DeltaShareTableEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
@@ -2204,7 +2225,9 @@ impl MetaService {
         match store.load_delta_recipients() {
             Ok(entries) => {
                 let mut map = self.delta_recipients.write();
+                map.clear();
                 let mut token_index = self.delta_token_index.write();
+                token_index.clear();
                 for (key, bytes) in entries {
                     match DeltaRecipientEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
@@ -2223,6 +2246,7 @@ impl MetaService {
         {
             let entries = store.load_all_config();
             let mut map = self.config.write();
+            map.clear();
             let mut max_version = 0u64;
             for (key, bytes) in entries {
                 match ConfigEntry::decode(bytes.as_slice()) {
@@ -2242,6 +2266,7 @@ impl MetaService {
         {
             let entries = store.load_all_pools();
             let mut map = self.pools.write();
+            map.clear();
             for (key, bytes) in entries {
                 match PoolConfig::decode(bytes.as_slice()) {
                     Ok(pool) => {
@@ -2257,6 +2282,7 @@ impl MetaService {
         {
             let entries = store.load_all_tenants();
             let mut map = self.tenants.write();
+            map.clear();
             for (key, bytes) in entries {
                 match TenantConfig::decode(bytes.as_slice()) {
                     Ok(tenant) => {
@@ -2272,6 +2298,7 @@ impl MetaService {
         {
             let entries = store.load_all_warehouses();
             let mut map = self.iceberg_warehouses.write();
+            map.clear();
             for (key, bytes) in entries {
                 match IcebergWarehouse::decode(bytes.as_slice()) {
                     Ok(wh) => {
@@ -2287,6 +2314,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_catalogs();
             let mut map = self.unity_catalogs.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityCatalog::decode(bytes.as_slice()) {
                     Ok(c) => {
@@ -2300,6 +2328,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_schemas();
             let mut map = self.unity_schemas.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnitySchema::decode(bytes.as_slice()) {
                     Ok(s) => {
@@ -2313,6 +2342,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_tables();
             let mut map = self.unity_tables.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityTable::decode(bytes.as_slice()) {
                     Ok(t) => {
@@ -2326,6 +2356,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_functions();
             let mut map = self.unity_functions.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityFunction::decode(bytes.as_slice()) {
                     Ok(f) => {
@@ -2339,6 +2370,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_volumes();
             let mut map = self.unity_volumes.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityVolume::decode(bytes.as_slice()) {
                     Ok(v) => {
@@ -2352,6 +2384,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_models();
             let mut map = self.unity_models.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityModel::decode(bytes.as_slice()) {
                     Ok(m) => {
@@ -2365,6 +2398,7 @@ impl MetaService {
         {
             let entries = store.load_all_unity_model_versions();
             let mut map = self.unity_model_versions.write();
+            map.clear();
             for (key, bytes) in entries {
                 match UnityModelVersion::decode(bytes.as_slice()) {
                     Ok(v) => {
@@ -2382,6 +2416,7 @@ impl MetaService {
         {
             let pool_names: Vec<String> = self.pools.read().keys().cloned().collect();
             let mut map = self.placement_groups.write();
+            map.clear();
             let mut loaded = 0usize;
             for pool in &pool_names {
                 let mut next_pg: u32 = 0;
@@ -2419,6 +2454,7 @@ impl MetaService {
         // Shared stripes
         {
             let mut map = self.stripe_refs.write();
+            map.clear();
             for (key, bytes) in store.load_all_stripe_refs() {
                 match objectio_proto::metadata::StripeRefs::decode(bytes.as_slice()) {
                     Ok(refs) => {
@@ -2434,6 +2470,7 @@ impl MetaService {
         {
             let entries = store.load_all_object_lock_configs();
             let mut map = self.object_lock_configs.write();
+            map.clear();
             for (key, bytes) in entries {
                 match ObjectLockConfiguration::decode(bytes.as_slice()) {
                     Ok(config) => {
@@ -2449,6 +2486,7 @@ impl MetaService {
         {
             let entries = store.load_all_lifecycle_configs();
             let mut map = self.lifecycle_configs.write();
+            map.clear();
             for (key, bytes) in entries {
                 match LifecycleConfiguration::decode(bytes.as_slice()) {
                     Ok(config) => {
@@ -2464,6 +2502,7 @@ impl MetaService {
         {
             let entries = store.load_all_bucket_encryption_configs();
             let mut map = self.bucket_encryption_configs.write();
+            map.clear();
             for (key, bytes) in entries {
                 match BucketSseConfiguration::decode(bytes.as_slice()) {
                     Ok(config) => {
@@ -2479,6 +2518,7 @@ impl MetaService {
         {
             let entries = store.load_all_kms_keys();
             let mut map = self.kms_keys.write();
+            map.clear();
             for (key_id, bytes) in entries {
                 match KmsKey::decode(bytes.as_slice()) {
                     Ok(k) => {
@@ -2494,6 +2534,7 @@ impl MetaService {
         {
             let entries = store.load_all_iam_policies();
             let mut map = self.iam_policies.write();
+            map.clear();
             for (name, bytes) in entries {
                 match PolicyObject::decode(bytes.as_slice()) {
                     Ok(policy) => {
@@ -2542,6 +2583,7 @@ impl MetaService {
         {
             let entries = store.load_all_policy_attachments();
             let mut map = self.policy_attachments.write();
+            map.clear();
             for (key, csv) in entries {
                 let policies: Vec<String> = csv
                     .split(',')

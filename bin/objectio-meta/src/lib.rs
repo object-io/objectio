@@ -110,15 +110,19 @@ pub struct Args {
     pub raft_advertise: String,
 }
 
+/// Largest Raft RPC message meta accepts.
+const RAFT_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+
 /// Raft settings for the meta cluster.
 ///
-/// Snapshots are never built. The state machine's snapshot is still a stub
-/// (empty, and installing one does nothing), and under openraft's default
-/// policy (a snapshot every 5,000 entries, then the log purged to the last
-/// 1,000) a replica that fell further behind, or a newly added one, caught
-/// up from that empty snapshot and silently missed everything before it.
-/// Until real snapshots exist the log is kept whole: it grows, but every
-/// replica can always be caught up from it.
+/// Snapshots are never built on a schedule, so the log is never purged:
+/// it grows, but every replica can always be caught up from it. Snapshots
+/// themselves now carry the whole state machine (they used to be empty,
+/// and openraft's default policy purged the log into them, so a replica
+/// caught up from one silently missed everything before it). They are
+/// what a node gets when the log it needs was purged by an earlier
+/// version. Scheduled compaction comes back once a multi-node test covers
+/// catching a replica up from one.
 fn raft_config() -> openraft::Config {
     openraft::Config {
         cluster_name: "objectio-meta".into(),
@@ -126,6 +130,9 @@ fn raft_config() -> openraft::Config {
         election_timeout_min: 500,
         election_timeout_max: 1000,
         snapshot_policy: openraft::SnapshotPolicy::Never,
+        // Snapshots travel in chunks: small enough that one, JSON-encoded,
+        // is far under the Raft RPC limit.
+        snapshot_max_chunk_size: 512 * 1024,
         ..Default::default()
     }
 }
@@ -364,9 +371,14 @@ pub async fn run(
         .layer(op_metrics::OpTimerLayer)
         .add_service(MetadataServiceServer::from_arc(meta_service))
         .add_service(BlockServiceServer::from_arc(block_service))
-        .add_service(objectio_proto::raft::raft_rpc_server::RaftRpcServer::new(
-            raft_rpc_svc,
-        ))
+        // Raft messages are JSON, which bloats binary values 3-4x; at
+        // tonic's default 4 MiB limit a batch of large entries, or a
+        // snapshot chunk, would be refused and the follower never caught up.
+        .add_service(
+            objectio_proto::raft::raft_rpc_server::RaftRpcServer::new(raft_rpc_svc)
+                .max_decoding_message_size(RAFT_MESSAGE_LIMIT)
+                .max_encoding_message_size(RAFT_MESSAGE_LIMIT),
+        )
         .serve_with_shutdown(addr, async move {
             shutdown.await;
             info!("Shutting down...");
