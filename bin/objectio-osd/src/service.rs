@@ -284,8 +284,8 @@ pub struct OsdService {
     /// Renders this OSD's Prometheus exposition for `GetMetrics`. Set once
     /// the metrics state exists, which is after the service is built.
     metrics_renderer: std::sync::OnceLock<MetricsRenderer>,
-    /// Shards whose bytes failed their checksum, found by the scrubber or a
-    /// read. Kept until the shard is rewritten; reported through
+    /// Shards that cannot be read back intact — failing their checksum or
+    /// unreadable — found by the scrubber or a read. Kept until the shard is rewritten; reported through
     /// `CheckShards` so Meta's repairer rebuilds them. In memory only: after
     /// a restart the next scrub pass finds them again.
     corrupt: RwLock<std::collections::HashSet<String>>,
@@ -305,12 +305,6 @@ struct ScrubStats {
     shards: AtomicU64,
     bytes: AtomicU64,
     corrupt: AtomicU64,
-}
-
-/// Whether a storage error is a block failing its checksum, as opposed to
-/// the read itself failing.
-fn is_checksum_error(e: &objectio_common::Error) -> bool {
-    matches!(e, objectio_common::Error::Storage(msg) if msg.contains("checksum"))
 }
 
 /// Resolve the OSD's stable node_id + cluster_uuid from (in priority order):
@@ -433,6 +427,9 @@ impl OsdService {
         //      fallback.
         let mut disks = Vec::new();
         let mut disk_ids = Vec::new();
+        // Disks formatted just now, by index: whatever the shard index says
+        // was on them is gone.
+        let mut formatted_now = Vec::new();
 
         for path in &disk_paths {
             info!("Initializing disk: {}", path);
@@ -445,6 +442,7 @@ impl OsdService {
                         path,
                         d.block_size()
                     );
+                    formatted_now.push(false);
                     d
                 }
                 Err(_) => {
@@ -463,6 +461,7 @@ impl OsdService {
                         "Initializing new disk: {} with size {} bytes, block_size {} bytes",
                         path, size, block_size
                     );
+                    formatted_now.push(true);
                     DiskManager::init(path, size, Some(block_size))
                         .map_err(|e| format!("Failed to init disk {}: {}", path, e))?
                 }
@@ -520,7 +519,26 @@ impl OsdService {
         // (replayed from the WAL as part of `MetadataStore::open_or_create`
         // above). Before this step the OSD used to report 0 shards on
         // every restart even though disk.raw was full.
-        let persisted = Self::load_persisted_shard_index(&meta_store);
+        let mut persisted = Self::load_persisted_shard_index(&meta_store);
+        // A disk that had to be formatted — replaced, or wiped — holds none
+        // of the shards the index remembers on it. Forget them, so they are
+        // reported missing and rebuilt rather than reported present and
+        // failing every read.
+        let before = persisted.len();
+        persisted.retain(|key, loc| {
+            let lost = formatted_now.get(loc.disk_idx).copied().unwrap_or(false);
+            if lost {
+                let _ = Self::forget_shard_location(&meta_store, key);
+            }
+            !lost
+        });
+        if persisted.len() < before {
+            warn!(
+                "{} shards were on a disk formatted at startup; they are lost \
+                 and will be rebuilt by Meta's repairer",
+                before - persisted.len()
+            );
+        }
         info!(
             "Rebuilt shard index from persistent store: {} entries",
             persisted.len()
@@ -751,15 +769,16 @@ impl OsdService {
             if loc.disk_idx >= self.disks.len() {
                 continue;
             }
-            match self.disks[loc.disk_idx]
+            // Any failure counts, not only a checksum: a block whose header
+            // no longer parses, or that the disk cannot return, cannot be
+            // served either. `mark_corrupt` ignores a shard rewritten or
+            // deleted since the snapshot.
+            if let Err(e) = self.disks[loc.disk_idx]
                 .read_block_async(loc.block_num)
                 .await
             {
-                Ok(_) => {}
-                Err(e) if is_checksum_error(&e) => self.mark_corrupt(&key, loc.block_num),
-                // Freed and reused since the snapshot, or an I/O error that a
-                // read will report on its own. Neither is rot.
-                Err(e) => debug!("scrub: could not read {key}: {e}"),
+                debug!("scrub: {key} is unreadable: {e}");
+                self.mark_corrupt(&key, loc.block_num);
             }
             bytes += u64::from(loc.size);
             self.scrub.shards.fetch_add(1, Ordering::Relaxed);
@@ -1297,11 +1316,9 @@ impl StorageService for OsdService {
                     bytes_in,
                     0,
                 );
-                if is_checksum_error(&e) {
-                    self.mark_corrupt(&key, location.block_num);
-                    return Status::data_loss(format!("shard is corrupt: {e}"));
-                }
-                Status::internal(format!("read failed: {}", e))
+                // Unreadable is as good as gone: report it for rebuilding.
+                self.mark_corrupt(&key, location.block_num);
+                Status::data_loss(format!("shard is unreadable: {e}"))
             })?;
 
         debug!(
