@@ -593,6 +593,280 @@ fn add_metadata_headers(
     builder
 }
 
+// ── Object tagging ───────────────────────────────────────────────────────────
+
+/// Bucket tagging is not implemented. Said plainly: a GET of `?tagging`
+/// used to answer with the bucket's listing, and a PUT tried to create
+/// the bucket.
+fn bucket_tagging_unsupported() -> Response {
+    S3Error::xml_response(
+        "NotImplemented",
+        "Bucket tagging is not supported",
+        StatusCode::NOT_IMPLEMENTED,
+    )
+}
+
+/// Tags an object may carry (S3's limit).
+const MAX_TAGS: usize = 10;
+
+/// User-metadata key under which a multipart upload carries the tags its
+/// CreateMultipartUpload asked for, until CompleteMultipartUpload puts them
+/// on the object. A header name cannot contain a space, so no
+/// `x-amz-meta-*` header can collide with it.
+const UPLOAD_TAGS_KEY: &str = "objectio tagging";
+
+/// Check tags against S3's rules: at most 10, keys of 1–128 characters and
+/// values of at most 256, no key twice, none in the reserved `aws:` space.
+#[allow(clippy::result_large_err)]
+fn validate_tags(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, Response> {
+    let invalid = |msg: String| {
+        Err(S3Error::xml_response(
+            "InvalidTag",
+            &msg,
+            StatusCode::BAD_REQUEST,
+        ))
+    };
+    if pairs.len() > MAX_TAGS {
+        return invalid(format!("Object tags cannot be greater than {MAX_TAGS}"));
+    }
+    let mut tags = HashMap::new();
+    for (k, v) in pairs {
+        if k.is_empty() || k.chars().count() > 128 {
+            return invalid(format!("The TagKey you have provided is invalid: {k:?}"));
+        }
+        if v.chars().count() > 256 {
+            return invalid(format!(
+                "The TagValue you have provided is invalid for {k:?}"
+            ));
+        }
+        if k.to_ascii_lowercase().starts_with("aws:") {
+            return invalid(format!("Your TagKey cannot be prefixed with aws: ({k:?})"));
+        }
+        if tags.insert(k.clone(), v).is_some() {
+            return invalid(format!(
+                "Cannot provide multiple Tags with the same key: {k:?}"
+            ));
+        }
+    }
+    Ok(tags)
+}
+
+/// Tags from an `x-amz-tagging` value: URL-encoded `k1=v1&k2=v2`.
+#[allow(clippy::result_large_err)]
+fn parse_tagging(value: &str) -> Result<HashMap<String, String>, Response> {
+    let decode = |s: &str| {
+        urlencoding::decode(&s.replace('+', " "))
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_else(|_| s.to_string())
+    };
+    let pairs = value
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (decode(k), decode(v))
+        })
+        .collect();
+    validate_tags(pairs)
+}
+
+/// Tags a request sets with `x-amz-tagging`; none when it has no such
+/// header.
+#[allow(clippy::result_large_err)]
+fn tagging_header(headers: &HeaderMap) -> Result<HashMap<String, String>, Response> {
+    match headers.get("x-amz-tagging").map(|v| v.to_str()) {
+        None => Ok(HashMap::new()),
+        Some(Ok(v)) => parse_tagging(v),
+        Some(Err(_)) => Err(S3Error::xml_response(
+            "InvalidArgument",
+            "x-amz-tagging is not valid text",
+            StatusCode::BAD_REQUEST,
+        )),
+    }
+}
+
+/// `tags` as an `x-amz-tagging` value.
+fn encode_tagging(tags: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<_> = tags.iter().collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Whether a copy takes its tags from the request (`x-amz-tagging-directive:
+/// REPLACE`) rather than from its source.
+fn replaces_tags(copy_headers: &HeaderMap) -> bool {
+    copy_headers
+        .get("x-amz-tagging-directive")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"))
+}
+
+/// `x-amz-tagging-count` on a GET or HEAD of an object that has tags.
+fn add_tagging_count(
+    builder: http::response::Builder,
+    tags: &HashMap<String, String>,
+) -> http::response::Builder {
+    if tags.is_empty() {
+        builder
+    } else {
+        builder.header("x-amz-tagging-count", tags.len())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename = "Tagging")]
+struct TaggingXml {
+    #[serde(rename = "TagSet", default)]
+    tag_set: TagSetXml,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct TagSetXml {
+    #[serde(rename = "Tag", default)]
+    tags: Vec<TagXml>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TagXml {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "Value", default)]
+    value: String,
+}
+
+/// The object's ObjectMeta and the nodes that hold it, or the response to
+/// give instead.
+async fn object_meta_for_update(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+) -> Result<(ObjectMeta, Vec<objectio_proto::metadata::NodePlacement>), Response> {
+    let nodes = get_placement_nodes_for_object(state, bucket, key).await?;
+    match get_object_meta_from_any(&state.osd_pool, &nodes, bucket, key).await {
+        Ok(Some(meta)) if !meta.is_delete_marker => Ok((meta, nodes)),
+        Ok(_) => Err(S3Error::xml_response(
+            "NoSuchKey",
+            "The specified key does not exist.",
+            StatusCode::NOT_FOUND,
+        )),
+        Err(e) => {
+            error!("Failed to get object metadata: {e}");
+            Err(S3Error::xml_response(
+                "InternalError",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
+
+async fn get_object_tagging_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+) -> Response {
+    let (meta, _) = match object_meta_for_update(&state, &bucket, &key).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let mut tags: Vec<TagXml> = meta
+        .tags
+        .into_iter()
+        .map(|(key, value)| TagXml { key, value })
+        .collect();
+    tags.sort_by(|a, b| a.key.cmp(&b.key));
+    let body = TaggingXml {
+        tag_set: TagSetXml { tags },
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        to_xml(&body).unwrap_or_default()
+    );
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml");
+    if !meta.version_id.is_empty() {
+        builder = builder.header("x-amz-version-id", &meta.version_id);
+    }
+    builder.body(Body::from(xml)).unwrap()
+}
+
+/// Replace the object's tags (`None` removes them all): PutObjectTagging
+/// and DeleteObjectTagging.
+async fn set_object_tagging(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    tags: HashMap<String, String>,
+    status: StatusCode,
+) -> Response {
+    let (mut meta, nodes) = match object_meta_for_update(&state, &bucket, &key).await {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    meta.tags = tags;
+    let version_id = meta.version_id.clone();
+    // Only over the object just read: a PUT that replaced it meanwhile must
+    // not have this one written back over it.
+    let expected = meta.object_id.clone();
+    if let Err(e) = put_object_meta_to_all(
+        &state.osd_pool,
+        &nodes,
+        &bucket,
+        &key,
+        meta,
+        false,
+        &expected,
+    )
+    .await
+    {
+        error!("Failed to update tags of {bucket}/{key}: {e}");
+        return S3Error::xml_response(
+            "InternalError",
+            &e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    }
+    let mut builder = Response::builder().status(status);
+    if !version_id.is_empty() {
+        builder = builder.header("x-amz-version-id", version_id);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+async fn put_object_tagging_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    body: Bytes,
+) -> Response {
+    let parsed: TaggingXml = match quick_xml::de::from_reader(body.as_ref()) {
+        Ok(t) => t,
+        Err(e) => {
+            return S3Error::xml_response(
+                "MalformedXML",
+                &format!("Invalid tagging XML: {e}"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    let pairs = parsed
+        .tag_set
+        .tags
+        .into_iter()
+        .map(|t| (t.key, t.value))
+        .collect();
+    let tags = match validate_tags(pairs) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    set_object_tagging(state, bucket, key, tags, StatusCode::OK).await
+}
+
 /// Add the object's stored `x-amz-checksum-<algorithm>` to a GET or HEAD
 /// response, when the request asked with `x-amz-checksum-mode: ENABLED`.
 /// Only for whole-object responses: the stored value is the checksum of the
@@ -803,6 +1077,9 @@ pub(crate) fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
 /// Query parameters for list objects
 #[derive(Debug, Deserialize, Default)]
 pub struct ListObjectsParams {
+    /// If present, a bucket tagging request: not supported (see
+    /// `bucket_tagging_unsupported`).
+    tagging: Option<String>,
     prefix: Option<String>,
     delimiter: Option<String>,
     #[serde(rename = "max-keys")]
@@ -880,6 +1157,9 @@ impl PostBucketParams {
 /// Query parameters for PUT bucket operations
 #[derive(Debug, Deserialize, Default)]
 pub struct PutBucketParams {
+    /// If present, a bucket tagging request: not supported (see
+    /// `bucket_tagging_unsupported`).
+    tagging: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a versioning request
@@ -896,6 +1176,9 @@ pub struct PutBucketParams {
 /// Query parameters for DELETE bucket operations
 #[derive(Debug, Deserialize, Default)]
 pub struct DeleteBucketParams {
+    /// If present, a bucket tagging request: not supported (see
+    /// `bucket_tagging_unsupported`).
+    tagging: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list multipart uploads request
@@ -921,6 +1204,8 @@ pub struct PutObjectParams {
     /// If present, this is a put legal hold request
     #[serde(rename = "legal-hold")]
     legal_hold: Option<String>,
+    /// If present, this is a tagging request
+    tagging: Option<String>,
 }
 
 /// Query parameters for GET object operations (handles both GET and list parts)
@@ -944,6 +1229,8 @@ pub struct GetObjectParams {
     /// If present, this is a get legal hold request
     #[serde(rename = "legal-hold")]
     legal_hold: Option<String>,
+    /// If present, this is a tagging request
+    tagging: Option<String>,
 }
 
 /// Query parameters for POST object operations (handles multipart initiate/complete)
@@ -970,6 +1257,8 @@ pub struct DeleteObjectParams {
     /// Version ID for deleting specific version
     #[serde(rename = "versionId")]
     version_id: Option<String>,
+    /// If present, this is a DeleteObjectTagging request
+    tagging: Option<String>,
 }
 
 // XML response types for S3 API
@@ -1291,6 +1580,149 @@ pub struct DeleteError {
     pub message: String,
 }
 
+/// UploadPartCopy response
+#[derive(Serialize)]
+#[serde(rename = "CopyPartResult")]
+struct CopyPartResult {
+    #[serde(rename = "ETag")]
+    etag: String,
+    #[serde(rename = "LastModified")]
+    last_modified: String,
+}
+
+/// Largest part UploadPartCopy takes: it is read into memory, so it is
+/// held to the single-PUT limit.
+const MAX_COPY_PART: usize = 100 * 1024 * 1024;
+
+/// UploadPartCopy: a part of a multipart upload taken from (a range of) an
+/// existing object.
+///
+/// It used to be an UploadPart of the request's empty body: the copy source
+/// was ignored and an empty part stored, so an upload completed from such
+/// parts was silently missing their data. The AWS CLI copies any object
+/// over its multipart threshold this way.
+async fn upload_part_copy_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+) -> Response {
+    let source = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let decoded = urlencoding::decode(s).unwrap_or_else(|_| s.into());
+            decoded.trim_start_matches('/').to_string()
+        })
+        .unwrap_or_default();
+    let Some((source_bucket, source_key)) = source.split_once('/') else {
+        return S3Error::xml_response(
+            "InvalidArgument",
+            "Invalid x-amz-copy-source format",
+            StatusCode::BAD_REQUEST,
+        );
+    };
+
+    // The middleware authorized writing the destination; reading the
+    // source is checked here, as CopyObject does.
+    if let Some(Extension(auth_result)) = &auth
+        && let Some(deny_response) = crate::authz::authorize(
+            &state,
+            auth_result,
+            &crate::authz::AuthzRequest {
+                method: &Method::GET,
+                action: "s3:GetObject",
+                bucket: source_bucket,
+                key: Some(source_key),
+                scope_key: source_key,
+                headers: Some(&headers),
+            },
+        )
+        .await
+    {
+        return deny_response;
+    }
+    let mut meta_client = state.meta_client.clone();
+    if let Err(resp) = check_copy_sse(
+        &state,
+        &mut meta_client,
+        source_bucket,
+        source_key,
+        &bucket,
+        &headers,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    // The source range, read the way a ranged GET reads it.
+    let mut get_headers = HeaderMap::new();
+    if let Some(range) = headers.get("x-amz-copy-source-range") {
+        get_headers.insert(header::RANGE, range.clone());
+    }
+    let got = get_object(
+        State(Arc::clone(&state)),
+        Path((source_bucket.to_string(), source_key.to_string())),
+        auth,
+        get_headers,
+    )
+    .await;
+    if !got.status().is_success() {
+        return got;
+    }
+    let data = match axum::body::to_bytes(got.into_body(), MAX_COPY_PART).await {
+        Ok(b) => b,
+        Err(_) => {
+            return S3Error::xml_response(
+                "EntityTooLarge",
+                &format!("A copied part may be at most {MAX_COPY_PART} bytes"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+
+    let put = upload_part_internal(
+        state,
+        bucket,
+        key,
+        upload_id,
+        part_number,
+        HeaderMap::new(),
+        data,
+    )
+    .await;
+    if !put.status().is_success() {
+        return put;
+    }
+    let etag = put
+        .headers()
+        .get("ETag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        to_xml(&CopyPartResult {
+            etag,
+            last_modified: timestamp_to_iso(now),
+        })
+        .unwrap_or_default()
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
 /// CopyObject response
 #[derive(Serialize)]
 #[serde(rename = "CopyObjectResult")]
@@ -1411,6 +1843,9 @@ pub async fn create_bucket(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if params.tagging.is_some() {
+        return bucket_tagging_unsupported();
+    }
     if params.policy.is_some() {
         return put_bucket_policy_internal(state, bucket, body).await;
     }
@@ -1544,6 +1979,9 @@ pub async fn delete_bucket(
     Path(bucket): Path<String>,
     Query(params): Query<DeleteBucketParams>,
 ) -> Response {
+    if params.tagging.is_some() {
+        return bucket_tagging_unsupported();
+    }
     if params.policy.is_some() {
         return delete_bucket_policy_internal(state, bucket).await;
     }
@@ -1637,6 +2075,9 @@ pub async fn list_objects(
     // Authorized by `authz::authz_layer` before this handler runs.
     _auth: Option<Extension<AuthResult>>,
 ) -> Response {
+    if params.tagging.is_some() {
+        return bucket_tagging_unsupported();
+    }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
     }
@@ -2189,6 +2630,14 @@ async fn copy_by_reference(
     } else {
         (source.content_type.clone(), source.user_metadata.clone())
     };
+    let tags = if replaces_tags(copy_headers) {
+        match tagging_header(copy_headers) {
+            Ok(t) => t,
+            Err(resp) => return Some(resp),
+        }
+    } else {
+        source.tags.clone()
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -2208,6 +2657,7 @@ async fn copy_by_reference(
         storage_class: source.storage_class.clone(),
         inline_data: source.inline_data.clone(),
         checksum: source.checksum.clone(),
+        tags,
         ..Default::default()
     };
 
@@ -2410,6 +2860,22 @@ async fn copy_object_data(
         if is_object_metadata_header(name.as_str()) {
             put_headers.insert(name.clone(), value.clone());
         }
+    }
+    // Tags: the request's under REPLACE, otherwise the source's, which a
+    // GET response only counts (x-amz-tagging-count).
+    let tagging = if replaces_tags(&copy_headers) {
+        copy_headers.get("x-amz-tagging").cloned()
+    } else {
+        match object_meta_for_update(&state, &source_bucket, &source_key).await {
+            Ok((src, _)) if !src.tags.is_empty() => {
+                http::HeaderValue::from_str(&encode_tagging(&src.tags)).ok()
+            }
+            Ok(_) => None,
+            Err(resp) => return resp,
+        }
+    };
+    if let Some(v) = tagging {
+        put_headers.insert("x-amz-tagging", v);
     }
 
     // 3. Re-PUT through the regular handler. Encryption/erasure-coding/
@@ -2681,6 +3147,12 @@ pub async fn put_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Refused before anything is stored.
+    let tags = match tagging_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
     // Check for copy source header (CopyObject operation)
     let copy_source = headers
         .get("x-amz-copy-source")
@@ -3060,6 +3532,7 @@ pub async fn put_object(
             usage_owner: Vec::new(), // filled in by put_object_meta_to_all
             inline_data: Vec::new(),
             checksum: stored_checksum.clone(),
+            tags: tags.clone(),
         };
 
         let new_object = referenced_object_ids(&object_meta);
@@ -3453,6 +3926,7 @@ pub async fn put_object(
         usage_owner: Vec::new(), // filled in by put_object_meta_to_all
         inline_data: if inline { body.to_vec() } else { Vec::new() },
         checksum: stored_checksum,
+        tags,
     };
 
     // Two commits make the object, at the same time: see `commit_object`.
@@ -3716,6 +4190,7 @@ pub async fn get_object(
                 .unwrap();
         }
         builder = add_metadata_headers(builder, &object.user_metadata);
+        builder = add_tagging_count(builder, &object.tags);
         builder = add_checksum_header(builder, &headers, &object);
         return builder.body(Body::empty()).unwrap();
     }
@@ -4296,6 +4771,7 @@ pub async fn get_object(
         }
 
         let builder = add_metadata_headers(builder, &object.user_metadata);
+        let builder = add_tagging_count(builder, &object.tags);
 
         builder.body(Body::from(all_data)).unwrap()
     } else {
@@ -4328,6 +4804,7 @@ pub async fn get_object(
         }
 
         let builder = add_metadata_headers(builder, &object.user_metadata);
+        let builder = add_tagging_count(builder, &object.tags);
         let builder = add_checksum_header(builder, &headers, &object);
 
         builder.body(Body::from(all_data)).unwrap()
@@ -4571,6 +5048,7 @@ pub async fn head_object(
 
             // Add user metadata headers
             let builder = add_metadata_headers(builder, &obj.user_metadata);
+            let builder = add_tagging_count(builder, &obj.tags);
             let builder = add_checksum_header(builder, &headers, &obj);
 
             builder.body(Body::empty()).unwrap()
@@ -5458,6 +5936,24 @@ async fn initiate_multipart_upload_internal(
 ) -> Response {
     let mut client = state.meta_client.clone();
 
+    // What the object will carry, fixed now as AWS fixes it: content type,
+    // x-amz-meta-*, and tags (held in the upload's metadata until
+    // CompleteMultipartUpload puts them on the object). All three used to
+    // be dropped: a multipart object came back with none of them.
+    let tags = match tagging_header(headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let mut user_metadata = extract_user_metadata(headers);
+    if !tags.is_empty() {
+        user_metadata.insert(UPLOAD_TAGS_KEY.to_string(), encode_tagging(&tags));
+    }
+
     // SSE-C multipart: validate the customer key at CreateMultipartUpload
     // and stash its MD5 on meta. UploadPart requests must resupply the same
     // key; we never store the raw bytes. Warehouse-bucket guard matches the
@@ -5493,8 +5989,8 @@ async fn initiate_multipart_upload_internal(
             .create_multipart_upload(CreateMultipartUploadRequest {
                 bucket: bucket.clone(),
                 key: key.clone(),
-                content_type: String::new(),
-                user_metadata: HashMap::new(),
+                content_type: content_type.clone(),
+                user_metadata: user_metadata.clone(),
                 encryption_algorithm: SseAlgorithm::SseC as i32,
                 kms_key_id: String::new(),
                 encrypted_dek: Vec::new(),
@@ -5634,8 +6130,8 @@ async fn initiate_multipart_upload_internal(
         .create_multipart_upload(CreateMultipartUploadRequest {
             bucket: bucket.clone(),
             key: key.clone(),
-            content_type: String::new(),
-            user_metadata: HashMap::new(),
+            content_type,
+            user_metadata,
             encryption_algorithm: algo,
             kms_key_id,
             encrypted_dek: wrapped_dek,
@@ -5703,6 +6199,18 @@ pub async fn put_object_with_params(
 ) -> Response {
     // If uploadId and partNumber are present, this is a multipart part upload
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
+        if headers.contains_key("x-amz-copy-source") {
+            return upload_part_copy_internal(
+                state,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                auth,
+                headers,
+            )
+            .await;
+        }
         return upload_part_internal(state, bucket, key, upload_id, part_number, headers, body)
             .await;
     }
@@ -5711,6 +6219,9 @@ pub async fn put_object_with_params(
     }
     if params.legal_hold.is_some() {
         return put_object_legal_hold_internal(state, bucket, key, body).await;
+    }
+    if params.tagging.is_some() {
+        return put_object_tagging_internal(state, bucket, key, body).await;
     }
 
     // Otherwise, it's a regular PUT object
@@ -6372,7 +6883,11 @@ async fn complete_multipart_upload_internal(
                 Reclaim::UnusedPart,
                 format!("{bucket}/{key} upload {upload_id}"),
             );
-            if let Some(object) = resp.object {
+            if let Some(mut object) = resp.object {
+                // Tags asked for at CreateMultipartUpload; validated then.
+                if let Some(t) = object.user_metadata.remove(UPLOAD_TAGS_KEY) {
+                    object.tags = parse_tagging(&t).unwrap_or_default();
+                }
                 // Log multipart assembly details
                 let stripe_sizes: Vec<u64> = object.stripes.iter().map(|s| s.data_size).collect();
                 let stripe_total: u64 = stripe_sizes.iter().sum();
@@ -6580,6 +7095,9 @@ pub async fn get_object_with_params(
     if params.legal_hold.is_some() {
         return get_object_legal_hold_internal(state, bucket, key).await;
     }
+    if params.tagging.is_some() {
+        return get_object_tagging_internal(state, bucket, key).await;
+    }
 
     // Otherwise, it's a regular GET object
     get_object(State(state), Path((bucket, key)), auth, headers).await
@@ -6674,6 +7192,10 @@ pub async fn delete_object_with_params(
     // If uploadId is present, this is an abort multipart upload request
     if let Some(upload_id) = params.upload_id {
         return abort_multipart_upload_internal(state, bucket, key, upload_id).await;
+    }
+    if params.tagging.is_some() {
+        return set_object_tagging(state, bucket, key, HashMap::new(), StatusCode::NO_CONTENT)
+            .await;
     }
 
     // Otherwise, it's a regular DELETE object (possibly version-specific)
@@ -9030,6 +9552,23 @@ mod s3_tests {
         ]));
         assert_eq!(m.len(), 1);
         assert!(m.contains_key("keep"));
+    }
+
+    #[test]
+    fn tags_survive_encoding_into_a_header_and_back() {
+        let mut t = std::collections::HashMap::new();
+        t.insert("team".to_string(), "ml & data".to_string());
+        t.insert("a=b".to_string(), "c+d/é".to_string());
+        assert_eq!(
+            super::parse_tagging(&super::encode_tagging(&t)).ok(),
+            Some(t)
+        );
+    }
+
+    #[test]
+    fn a_plus_in_a_tagging_header_is_a_space() {
+        let t = super::parse_tagging("k=a+b").ok().unwrap();
+        assert_eq!(t["k"], "a b");
     }
 
     #[test]

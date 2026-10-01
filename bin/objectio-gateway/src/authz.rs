@@ -190,6 +190,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
                 "s3:PutObjectRetention"
             } else if has(query, "legal-hold") {
                 "s3:PutObjectLegalHold"
+            } else if has(query, "tagging") {
+                "s3:PutObjectTagging"
             } else {
                 "s3:PutObject"
             }
@@ -199,6 +201,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
                 "s3:GetObjectRetention"
             } else if has(query, "legal-hold") {
                 "s3:GetObjectLegalHold"
+            } else if has(query, "tagging") {
+                "s3:GetObjectTagging"
             } else if has(query, "uploadId") {
                 "s3:ListMultipartUploadParts"
             } else {
@@ -209,6 +213,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
         Method::DELETE => {
             if has(query, "uploadId") {
                 "s3:AbortMultipartUpload"
+            } else if has(query, "tagging") {
+                "s3:DeleteObjectTagging"
             } else {
                 "s3:DeleteObject"
             }
@@ -844,6 +850,17 @@ mod tests {
             check_of(Method::GET, "/b/k", "legal-hold").0,
             "s3:GetObjectLegalHold"
         );
+    }
+
+    #[test]
+    fn tagging_is_its_own_permission() {
+        for (method, action) in [
+            (Method::GET, "s3:GetObjectTagging"),
+            (Method::PUT, "s3:PutObjectTagging"),
+            (Method::DELETE, "s3:DeleteObjectTagging"),
+        ] {
+            assert_eq!(check_of(method, "/b/k", "tagging").0, action);
+        }
     }
 
     #[test]
