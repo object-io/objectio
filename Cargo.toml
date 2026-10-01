@@ -31,6 +31,7 @@ members = [
     "bin/objectio-aio",
     "bin/objectio-io-bench",
     "bin/objectio-s3-bench",
+    "bin/objectio-dedup-estimate",
     "crates/objectio-transport-te",
 ]
 
