@@ -726,6 +726,39 @@ impl Cluster {
         }
         panic!("no online OSD with a disk");
     }
+
+    /// Bytes used across every disk of every online OSD.
+    ///
+    /// With erasure coding each OSD holds one shard of a stripe, so
+    /// [`Self::used_bytes`] sees only a slice of an object — and nothing at
+    /// all of one whose placement skips the first OSD.
+    pub fn total_used_bytes(&self) -> u64 {
+        let r = self.request("GET", "/_admin/nodes", &[]);
+        assert_eq!(r.status, 200, "GET /_admin/nodes: {}", r.text());
+        let v: serde_json::Value = r.json();
+        v["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .filter(|n| n["online"].as_bool() == Some(true))
+            .flat_map(|n| n["disks"].as_array().cloned().unwrap_or_default())
+            .map(|d| d["used_capacity"].as_u64().unwrap_or(0))
+            .sum()
+    }
+
+    /// Poll [`Self::total_used_bytes`] until it equals `want`, and return the
+    /// last reading. Space freed off a request's critical path lands a
+    /// moment after the response, so a single reading would race it.
+    pub fn await_total_used_bytes(&self, want: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let got = self.total_used_bytes();
+            if got == want || Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 pub struct Response {

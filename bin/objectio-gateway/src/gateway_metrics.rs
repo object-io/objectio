@@ -26,6 +26,8 @@ static SHARD_TRANSFERS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RDMA_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static SHARD_CHECKSUM_MISMATCHES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
+static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
 const KNOWN_CODES: &[u16] = &[
@@ -135,6 +137,15 @@ pub fn record_shard_checksum_mismatch(direction: &str) {
     SHARD_CHECKSUM_MISMATCHES.inc(&format!("direction=\"{direction}\""));
 }
 
+/// Shards deleted because nothing referenced them any more, and deletes
+/// that failed (their blocks stay allocated). `reason` is a fixed label from
+/// [`crate::osd_pool::Reclaim`].
+pub fn record_reclaim(reason: &str, reclaimed: u64, failed: u64) {
+    let labels = format!("reason=\"{reason}\"");
+    SHARDS_RECLAIMED.add(&labels, reclaimed);
+    RECLAIM_FAILURES.add(&labels, failed);
+}
+
 /// Splits one request's time into consecutive phases. Each [`mark`] records
 /// the time since the previous one, so the phases of a request add up to the
 /// part of it the handler spent between the first and last mark.
@@ -222,6 +233,16 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_shard_checksum_mismatches_total",
         "Shards sent over gRPC that did not match their checksum, by direction",
+    );
+    SHARDS_RECLAIMED.render(
+        &mut out,
+        "objectio_gateway_shards_reclaimed_total",
+        "Shards deleted from OSDs because nothing references them any more, by reason",
+    );
+    RECLAIM_FAILURES.render(
+        &mut out,
+        "objectio_gateway_shard_reclaim_failures_total",
+        "Shard deletes that failed, leaving the block allocated, by reason",
     );
     objectio_erasure::metrics::render(&mut out);
     out

@@ -55,7 +55,7 @@ pub fn spawn_lifecycle_worker(
 
 async fn run_lifecycle_scan(
     meta_client: &MetadataServiceClient<Channel>,
-    _osd_pool: &OsdPool,
+    osd_pool: &OsdPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = meta_client.clone();
 
@@ -243,7 +243,9 @@ async fn run_lifecycle_scan(
                 for upload in &resp.into_inner().uploads {
                     let upload_age_days = (now.saturating_sub(upload.initiated)) / 86400;
                     if upload_age_days >= u64::from(rule.abort_incomplete_multipart_upload_days) {
-                        let _ = client
+                        // Meta hands back the parts it dropped; they are
+                        // referenced by nothing once it has.
+                        if let Ok(aborted) = client
                             .abort_multipart_upload(
                                 objectio_proto::metadata::AbortMultipartUploadRequest {
                                     bucket: bucket.clone(),
@@ -251,7 +253,16 @@ async fn run_lifecycle_scan(
                                     upload_id: upload.upload_id.clone(),
                                 },
                             )
+                            .await
+                        {
+                            crate::osd_pool::reclaim_shards(
+                                osd_pool,
+                                &mut client,
+                                crate::osd_pool::stripe_targets(&aborted.into_inner().stripes),
+                                crate::osd_pool::Reclaim::Abort,
+                            )
                             .await;
+                        }
                         debug!(
                             "Aborted incomplete upload: {}/{} (upload_id={}, age={}d)",
                             bucket, upload.key, upload.upload_id, upload_age_days

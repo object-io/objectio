@@ -95,11 +95,14 @@ async fn fanout_put_object_meta(
     for addr in &addrs {
         let addr = addr.clone();
         let req = PutObjectMetaRequest {
-            expected_object_id: Vec::new(),
+            require_existing: false,
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             object: Some(object.clone()),
             versioning_enabled: false,
+            // Built from an earlier read: refuse to put the object back if a
+            // PUT has replaced it since (that PUT freed its shards).
+            expected_object_id: object.object_id.clone(),
         };
         futs.push(async move {
             let ch = open_channel(&addr).await?;
