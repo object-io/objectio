@@ -64,7 +64,7 @@ impl BlockGatewayState {
         if let Err(e) = self.volume_manager.restore_volume(from_proto(v)) {
             warn!("volume {}: cannot mirror meta's record: {e}", v.volume_id);
         }
-        self.cache.init_volume(&v.volume_id);
+        self.cache.init_volume_sized(&v.volume_id, chunk_size_of(v));
     }
 
     /// Delete the shards of stripes meta says nothing uses any more.
@@ -150,6 +150,45 @@ pub fn from_proto(v: &ProtoVolume) -> objectio_block::volume::Volume {
     }
 }
 
+/// Bytes the OSD allocates a shard in. A shard smaller than this is padded
+/// to it, so a chunk smaller than k of them wastes capacity.
+const OSD_BLOCK: u64 = 64 * 1024;
+/// Largest chunk size: the erasure-coding stripe objects use.
+const MAX_CHUNK: u64 = 4 * 1024 * 1024;
+/// Smallest chunk size offered.
+const MIN_CHUNK: u64 = 256 * 1024;
+
+/// The chunk size a new volume gets: `requested` (0: the 4 MiB default),
+/// if it is a power of two from 256 KiB to 4 MiB, and at least `ec_k`
+/// OSD blocks so its shards fill whole blocks. Smaller chunks rewrite less
+/// per small random write (a 4 KiB write rewrites its whole chunk's
+/// stripe), at the cost of more chunk records per volume.
+fn valid_chunk_size(requested: u32, ec_k: u32) -> Result<u64, String> {
+    let size = if requested == 0 {
+        MAX_CHUNK
+    } else {
+        u64::from(requested)
+    };
+    let min = MIN_CHUNK.max(u64::from(ec_k) * OSD_BLOCK);
+    if !size.is_power_of_two() || size < min || size > MAX_CHUNK {
+        return Err(format!(
+            "chunk size must be a power of two from {min} to {MAX_CHUNK} bytes \
+             (at least {ec_k} OSD blocks of {OSD_BLOCK}, or its shards are padded); got {size}"
+        ));
+    }
+    Ok(size)
+}
+
+/// A volume's chunk size as meta records it (0 on volumes from before it
+/// was recorded: the 4 MiB default).
+pub fn chunk_size_of(v: &ProtoVolume) -> u64 {
+    if v.chunk_size_bytes == 0 {
+        MAX_CHUNK
+    } else {
+        u64::from(v.chunk_size_bytes)
+    }
+}
+
 fn block_err_to_status(e: objectio_block::error::BlockError) -> Status {
     use objectio_block::error::BlockError;
     match e {
@@ -183,12 +222,8 @@ impl BlockService for BlockGatewayService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        let chunk_size = self.state.cache.chunk_mapper().chunk_size();
-        if req.chunk_size_bytes != 0 && u64::from(req.chunk_size_bytes) != chunk_size {
-            return Err(Status::invalid_argument(format!(
-                "this gateway stores {chunk_size}-byte chunks only"
-            )));
-        }
+        let chunk_size = valid_chunk_size(req.chunk_size_bytes, self.state.ec_k)
+            .map_err(Status::invalid_argument)?;
         let vol = some(
             self.state
                 .meta
@@ -714,5 +749,23 @@ impl BlockService for BlockGatewayService {
         _request: Request<GetIoTraceRequest>,
     ) -> Result<Response<GetIoTraceResponse>, Status> {
         Ok(Response::new(GetIoTraceResponse { traces: vec![] }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_chunk_size;
+
+    #[test]
+    fn a_chunk_size_is_a_power_of_two_that_fills_whole_osd_blocks() {
+        assert_eq!(valid_chunk_size(0, 4), Ok(4 << 20), "default");
+        assert_eq!(valid_chunk_size(256 << 10, 4), Ok(256 << 10));
+        assert_eq!(valid_chunk_size(1 << 20, 4), Ok(1 << 20));
+        // 4+2 needs 4 × 64 KiB; 8+3 needs 8 × 64 KiB.
+        assert!(valid_chunk_size(256 << 10, 8).is_err());
+        assert_eq!(valid_chunk_size(512 << 10, 8), Ok(512 << 10));
+        for bad in [64 << 10, 128 << 10, 300 << 10, 8 << 20] {
+            assert!(valid_chunk_size(bad, 4).is_err(), "{bad} accepted");
+        }
     }
 }

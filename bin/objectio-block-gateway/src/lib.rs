@@ -164,7 +164,7 @@ pub async fn run(args: Args) -> Result<()> {
         volume_manager
             .restore_volume(service::from_proto(v))
             .with_context(|| format!("restore volume {}", v.volume_id))?;
-        cache.init_volume(&v.volume_id);
+        cache.init_volume_sized(&v.volume_id, service::chunk_size_of(v));
     }
     info!("{} volumes in meta", volumes.len());
 
@@ -260,13 +260,16 @@ pub async fn run(args: Args) -> Result<()> {
 /// stored bytes, in the order they were acknowledged.
 async fn replay_journal(state: &BlockGatewayState) -> Result<()> {
     let writes = state.cache.recover().context("read the block journal")?;
-    let chunk_size = state.cache.chunk_mapper().chunk_size();
     let mut replayed = 0usize;
     for (volume_id, chunk_id, offset_in_chunk, data) in writes {
         if state.volume_manager.get_volume(&volume_id).is_err() {
             continue; // deleted since
         }
-        let offset = chunk_id * chunk_size + offset_in_chunk;
+        // Entries are in the volume's own chunks; its size never changes.
+        let Some(mapper) = state.cache.mapper_of(&volume_id) else {
+            continue;
+        };
+        let offset = chunk_id * mapper.chunk_size() + offset_in_chunk;
         // A chunk not cached comes back pending; its stored bytes are
         // merged in before it is read whole or flushed.
         state

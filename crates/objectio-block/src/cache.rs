@@ -72,11 +72,14 @@ struct VolumeCache {
     clean_bytes: u64,
     /// Source of `DirtyChunk::version`.
     next_version: u64,
+    /// This volume's chunk size; fixed for its lifetime.
+    mapper: ChunkMapper,
 }
 
 impl VolumeCache {
-    fn new() -> Self {
+    fn new(mapper: ChunkMapper) -> Self {
         Self {
+            mapper,
             dirty_chunks: BTreeMap::new(),
             clean_chunks: BTreeMap::new(),
             dirty_bytes: 0,
@@ -155,12 +158,25 @@ impl WriteCache {
         self.chunk_mapper.clone()
     }
 
-    /// Initialize cache for a volume
+    /// Initialize cache for a volume, with the cache's default chunk size.
     pub fn init_volume(&self, volume_id: &str) {
+        self.init_volume_sized(volume_id, self.chunk_mapper.chunk_size());
+    }
+
+    /// Initialize cache for a volume whose chunks are `chunk_size` bytes.
+    pub fn init_volume_sized(&self, volume_id: &str, chunk_size: u64) {
         let mut caches = self.caches.write();
         if !caches.contains_key(volume_id) {
-            caches.insert(volume_id.to_string(), VolumeCache::new());
+            caches.insert(
+                volume_id.to_string(),
+                VolumeCache::new(ChunkMapper::new(chunk_size)),
+            );
         }
+    }
+
+    /// The chunk mapping of `volume_id`, if the cache knows the volume.
+    pub fn mapper_of(&self, volume_id: &str) -> Option<ChunkMapper> {
+        self.caches.read().get(volume_id).map(|c| c.mapper.clone())
     }
 
     /// Remove cache for a volume
@@ -184,9 +200,10 @@ impl WriteCache {
         }
 
         let mut caches = self.caches.write();
-        if !caches.contains_key(volume_id) {
-            return Err(BlockError::VolumeNotFound(volume_id.to_string()));
-        }
+        let mapper = caches
+            .get(volume_id)
+            .map(|c| c.mapper.clone())
+            .ok_or_else(|| BlockError::VolumeNotFound(volume_id.to_string()))?;
         // Log to the journal before acknowledging (write-ahead), under the
         // cache lock: the journal's order is then the order writes are
         // applied, and it cannot be reset between a write being logged and
@@ -194,8 +211,8 @@ impl WriteCache {
         let logged = match self.journal {
             Some(ref journal) => Some(journal.log_write(
                 volume_id,
-                self.chunk_mapper.byte_offset_to_chunk_id(offset),
-                offset % self.chunk_mapper.chunk_size(),
+                mapper.byte_offset_to_chunk_id(offset),
+                offset % mapper.chunk_size(),
                 Bytes::copy_from_slice(data),
             )?),
             None => None,
@@ -230,15 +247,11 @@ impl WriteCache {
         offset: u64,
         data: &[u8],
     ) -> BlockResult<()> {
-        // Calculate affected chunks
-        let chunk_ranges = self
-            .chunk_mapper
-            .byte_range_to_chunks(offset, data.len() as u64);
-        let chunk_size = self.chunk_mapper.chunk_size() as usize;
-
         let cache = caches
             .get_mut(volume_id)
             .ok_or_else(|| BlockError::VolumeNotFound(volume_id.to_string()))?;
+        let chunk_ranges = cache.mapper.byte_range_to_chunks(offset, data.len() as u64);
+        let chunk_size = cache.mapper.chunk_size() as usize;
 
         let mut data_offset = 0usize;
         let now = Instant::now();
@@ -334,9 +347,9 @@ impl WriteCache {
             return Some(Vec::new());
         }
 
-        let chunk_ranges = self.chunk_mapper.byte_range_to_chunks(offset, length);
         let caches = self.caches.read();
         let cache = caches.get(volume_id)?;
+        let chunk_ranges = cache.mapper.byte_range_to_chunks(offset, length);
 
         let mut result = Vec::with_capacity(length as usize);
 
@@ -415,11 +428,11 @@ impl WriteCache {
     /// again, with every written range kept. A no-op for a chunk not
     /// pending (resolved already, or gone).
     pub fn resolve(&self, volume_id: &str, chunk_id: ChunkId, base: &[u8]) {
-        let chunk_size = self.chunk_mapper.chunk_size() as usize;
         let mut caches = self.caches.write();
         let Some(cache) = caches.get_mut(volume_id) else {
             return;
         };
+        let chunk_size = cache.mapper.chunk_size() as usize;
         let next = cache.next_version + 1;
         let Some(dirty) = cache.dirty_chunks.get_mut(&chunk_id) else {
             return;
