@@ -18,11 +18,6 @@ const MIB: u64 = 1024 * 1024;
 const CHUNK: u64 = 4 * MIB;
 const CHUNK_LEN: usize = 4 << 20;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// A cluster with block storage, and a client for it.
 struct Block {
     cluster: Cluster,
@@ -37,12 +32,11 @@ impl Block {
     }
 
     fn start_with_args(extra: &[&str]) -> Self {
-        let port = free_port();
-        let nbd = free_port();
-        let (port_s, nbd_s) = (port.to_string(), nbd.to_string());
-        let mut args = vec!["--block-port", &port_s, "--nbd-port", &nbd_s];
+        let mut args = vec!["--block-port", "{free}", "--nbd-port", "{free}"];
         args.extend_from_slice(extra);
         let cluster = Cluster::start_with_ec_and_args(6, 4, 2, &args);
+        let port: u16 = cluster.arg("--block-port").unwrap().parse().unwrap();
+        let nbd: u16 = cluster.arg("--nbd-port").unwrap().parse().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         Self {
             cluster,

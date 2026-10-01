@@ -298,6 +298,59 @@ async fn wait_listening(port: u16, label: &str, max: u64) -> Result<()> {
     Err(anyhow!("{label} did not listen on :{port} within {max}s"))
 }
 
+/// Fail unless the block gateway's ports are its own: `BlockService`
+/// answers on `grpc_port` and the NBD handshake on `nbd_port`.
+async fn serves_block(grpc_port: u16, nbd_port: u16, max: u64) -> Result<()> {
+    use objectio_proto::block::ListVolumesRequest;
+    use objectio_proto::block::block_service_client::BlockServiceClient;
+    use tokio::io::AsyncReadExt;
+
+    const NBD_MAGIC: &[u8; 8] = b"NBDMAGIC";
+    let url = format!("http://127.0.0.1:{grpc_port}");
+    let mut last = String::new();
+    for _ in 0..(max * 10) {
+        match BlockServiceClient::connect(url.clone()).await {
+            Ok(mut client) => match client
+                .list_volumes(ListVolumesRequest {
+                    max_results: 1,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(_) => {
+                    last.clear();
+                    break;
+                }
+                Err(s) if s.code() == tonic::Code::Unimplemented => {
+                    return Err(anyhow!(
+                        "block port :{grpc_port} answers, but not as the block gateway \
+                         (taken by another server)"
+                    ));
+                }
+                Err(s) => last = s.to_string(),
+            },
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !last.is_empty() {
+        return Err(anyhow!(
+            "block gateway on :{grpc_port} not serving within {max}s: {last}"
+        ));
+    }
+    let mut magic = [0u8; 8];
+    let nbd = async {
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", nbd_port)).await?;
+        conn.read_exact(&mut magic).await
+    };
+    match tokio::time::timeout(Duration::from_secs(5), nbd).await {
+        Ok(Ok(_)) if &magic == NBD_MAGIC => {}
+        _ => return Err(anyhow!("NBD port :{nbd_port} is not the block gateway's")),
+    }
+
+    Ok(())
+}
+
 /// Wait for OSD `i` to write the address it bound, and return its port.
 async fn wait_osd_addr(path: &std::path::Path, i: usize, max: u64) -> Result<u16> {
     for _ in 0..(max * 10) {
@@ -801,6 +854,11 @@ async fn main() -> Result<()> {
             }
         });
         wait_listening(args.block_port, "block gateway", 20).await?;
+        // Listening is not the same as ours: when a port was taken between
+        // being picked and being bound, the block gateway exits and the
+        // port answers for whatever holds it (another process's OSD, say),
+        // and a client's first call fails as Unimplemented.
+        serves_block(args.block_port, args.nbd_port, 20).await?;
     }
     // An OSD that could not start (typically: its port was taken between
     // being picked and being bound) leaves meta pointing at an address

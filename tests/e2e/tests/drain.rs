@@ -15,11 +15,6 @@ use serde_json::json;
 
 const MIB: usize = 1024 * 1024;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 fn payload(len: usize, seed: u8) -> Vec<u8> {
     let mut x = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(seed);
     (0..len)
@@ -150,8 +145,6 @@ async fn read_volume(port: u16, vol: String, len: usize) -> Result<Vec<u8>, toni
 
 #[test]
 fn a_drained_osd_can_be_pulled_with_two_more_lost() {
-    let (bp, np) = (free_port(), free_port());
-    let (bps, nps) = (bp.to_string(), np.to_string());
     let mut c = Cluster::start_with_ec_and_args(
         7,
         4,
@@ -160,11 +153,12 @@ fn a_drained_osd_can_be_pulled_with_two_more_lost() {
             "--drain-interval-secs",
             "1",
             "--block-port",
-            &bps,
+            "{free}",
             "--nbd-port",
-            &nps,
+            "{free}",
         ],
     );
+    let bp: u16 = c.arg("--block-port").unwrap().parse().unwrap();
     c.json("POST", "/_admin/buckets", json!({"name": "d"}))
         .expect_ok();
 
