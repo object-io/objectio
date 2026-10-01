@@ -150,18 +150,23 @@ pub fn from_proto(v: &ProtoVolume) -> objectio_block::volume::Volume {
     }
 }
 
-/// Bytes the OSD allocates a shard in. A shard smaller than this is padded
-/// to it, so a chunk smaller than k of them wastes capacity.
-const OSD_BLOCK: u64 = 64 * 1024;
+/// The OSD stores a shard with a 96-byte header and footer, rounded up to
+/// its 4 KiB blocks: a block-aligned shard spills into one extra block.
+/// Per shard that is 4 KiB of overhead, so the smaller the shard, the
+/// larger the share: 1.6% at 256 KiB shards (1 MiB chunks), 6.25% at
+/// 64 KiB shards (256 KiB chunks on 4+2), 25% at 16 KiB shards.
+const OSD_BLOCK: u64 = 4 * 1024;
 /// Largest chunk size: the erasure-coding stripe objects use.
 const MAX_CHUNK: u64 = 4 * 1024 * 1024;
-/// Smallest chunk size offered.
+/// Smallest chunk size offered: below it, the per-shard overhead above
+/// passes 6.25% of the data.
 const MIN_CHUNK: u64 = 256 * 1024;
 
 /// The chunk size a new volume gets: `requested` (0: the 4 MiB default),
-/// if it is a power of two from 256 KiB to 4 MiB, and at least `ec_k`
-/// OSD blocks so its shards fill whole blocks. Smaller chunks rewrite less
-/// per small random write (a 4 KiB write rewrites its whole chunk's
+/// if it is a power of two from 256 KiB to 4 MiB, and big enough that
+/// each of `ec_k` data shards is at least 16 OSD blocks (64 KiB), which
+/// keeps the shard header's block under 6.25%. Smaller chunks rewrite
+/// less per small random write (a 4 KiB write rewrites its whole chunk's
 /// stripe), at the cost of more chunk records per volume.
 fn valid_chunk_size(requested: u32, ec_k: u32) -> Result<u64, String> {
     let size = if requested == 0 {
@@ -169,11 +174,12 @@ fn valid_chunk_size(requested: u32, ec_k: u32) -> Result<u64, String> {
     } else {
         u64::from(requested)
     };
-    let min = MIN_CHUNK.max(u64::from(ec_k) * OSD_BLOCK);
+    let min = MIN_CHUNK.max(u64::from(ec_k) * 16 * OSD_BLOCK);
     if !size.is_power_of_two() || size < min || size > MAX_CHUNK {
         return Err(format!(
             "chunk size must be a power of two from {min} to {MAX_CHUNK} bytes \
-             (at least {ec_k} OSD blocks of {OSD_BLOCK}, or its shards are padded); got {size}"
+             (each of the {ec_k} data shards at least 64 KiB, so per-shard \
+             overhead stays under 6.25%); got {size}"
         ));
     }
     Ok(size)
