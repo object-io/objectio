@@ -117,8 +117,11 @@ The `objectio-block` crate provides block storage on top of the distributed obje
 - **Thin provisioning**: unwritten chunks read as zeros (written zeros are still stored)
 - **Write cache**: whole 4 MiB chunks; a partial write loads the stored chunk first
 - **Write journal**: every write is journaled and fsynced before it is acknowledged; replayed on restart
+- **Metadata in meta**: volumes, snapshots and every chunk's stripe live in meta's Raft tables (`bin/objectio-meta/src/service/block_meta.rs`); the gateway keeps only its journal, so losing its disk loses no volume
+- **Snapshots and clones**: share stripes through the shared-stripe registry; an overwrite or delete frees only stripes nothing else uses
+- **Repair**: the meta repairer walks block stripes from meta's tables as well as objects
 
-Not implemented yet, though the types and RPCs exist: snapshot/clone *data* (snapshots record no chunks, clones read as zeros, nothing is copy-on-write), QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate `BlockMetaService` that the block gateway does not use — the gateway's own redb (`block.db`) is what holds volumes and chunk refs. aio runs the block gateway with `--block-port`.
+Not implemented yet, though the types and RPCs exist: QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate legacy `BlockMetaService` (bincode tables, used by the CLI) that the block gateway does not use. aio runs the block gateway with `--block-port`.
 
 The block gRPC service is defined in `crates/objectio-proto/proto/block.proto` (BlockService) and runs on the Block Gateway.
 

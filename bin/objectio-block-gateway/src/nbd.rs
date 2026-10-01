@@ -17,8 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info, warn};
 
 use crate::ec_io::read_chunk;
+use crate::meta_blocks::MetaBlocks;
 use crate::osd_pool::OsdPool;
-use crate::store::BlockStore;
 
 // ── NBD protocol constants ────────────────────────────────────────────────────
 
@@ -73,17 +73,8 @@ pub struct NbdServer {
     exports: RwLock<HashMap<String, NbdExport>>,
     /// Keep a reference to the shared gateway state for I/O
     cache: Arc<objectio_block::WriteCache>,
-    store: Arc<BlockStore>,
+    meta: Arc<MetaBlocks>,
     osd_pool: Arc<OsdPool>,
-    meta_client: Arc<
-        tokio::sync::Mutex<
-            objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
-                tonic::transport::Channel,
-            >,
-        >,
-    >,
-    ec_k: u32,
-    ec_m: u32,
 }
 
 /// Where a chunk's slice of a read lands in the reply buffer.
@@ -108,11 +99,8 @@ impl NbdServer {
     async fn load_for_write(&self, volume_id: &str, offset: u64, len: u32) -> anyhow::Result<()> {
         crate::ec_io::load_for_partial_write(
             &self.cache,
-            &self.store,
-            &self.meta_client,
+            &self.meta,
             &self.osd_pool,
-            self.ec_k,
-            self.ec_m,
             volume_id,
             offset,
             u64::from(len),
@@ -122,26 +110,14 @@ impl NbdServer {
 
     pub fn new(
         cache: Arc<objectio_block::WriteCache>,
-        store: Arc<BlockStore>,
+        meta: Arc<MetaBlocks>,
         osd_pool: Arc<OsdPool>,
-        meta_client: Arc<
-            tokio::sync::Mutex<
-                objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
-                    tonic::transport::Channel,
-                >,
-            >,
-        >,
-        ec_k: u32,
-        ec_m: u32,
     ) -> Self {
         Self {
             exports: RwLock::new(HashMap::new()),
             cache,
-            store,
+            meta,
             osd_pool,
-            meta_client,
-            ec_k,
-            ec_m,
         }
     }
 
@@ -526,19 +502,14 @@ impl NbdServer {
         let mut out = vec![0u8; length as usize];
 
         for range in chunk_mapper.byte_range_to_chunks(offset, length) {
-            let chunk_data = match self.store.get_chunk(vol_id, range.chunk_id)? {
-                Some(key) => {
-                    read_chunk(
-                        Arc::clone(&self.meta_client),
-                        &self.osd_pool,
-                        &key,
-                        self.ec_k,
-                        self.ec_m,
-                    )
-                    .await?
-                }
-                None => vec![0u8; chunk_size],
-            };
+            let chunk_data = read_chunk(
+                &self.meta,
+                &self.osd_pool,
+                vol_id,
+                range.chunk_id,
+                chunk_size,
+            )
+            .await?;
 
             self.cache.add_clean(
                 vol_id,

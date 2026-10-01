@@ -295,6 +295,16 @@ impl Cluster {
         self.restart_with_osds(self.osds);
     }
 
+    /// Restart with the data directory `dir` (relative to the cluster's,
+    /// such as `block`) destroyed.
+    pub fn restart_without(&mut self, dir: &str) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let path = self.data_dir.path().join(dir);
+        std::fs::remove_dir_all(&path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
+        self.restart_with_osds(self.osds);
+    }
+
     /// OSD `index`'s disk file, for tests that damage it in place.
     #[must_use]
     pub fn osd_disk(&self, index: usize) -> PathBuf {

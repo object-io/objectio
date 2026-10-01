@@ -1,4 +1,7 @@
 //! gRPC BlockService implementation
+//!
+//! Volumes, snapshots and clones are meta's (see `meta_blocks`); the
+//! volume manager here mirrors meta's volume records for the I/O path.
 
 use std::sync::Arc;
 
@@ -15,36 +18,81 @@ use objectio_proto::block::{
     GetVolumeRequest, GetVolumeResponse, GetVolumeStatsRequest, GetVolumeStatsResponse,
     ListAttachmentsRequest, ListAttachmentsResponse, ListOsdMetricsRequest, ListOsdMetricsResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesRequest, ListVolumesResponse,
-    ReadRequest, ReadResponse, ResizeVolumeRequest, ResizeVolumeResponse,
-    Snapshot as ProtoSnapshot, TargetType, TrimRequest, TrimResponse, UpdateVolumeQosRequest,
-    UpdateVolumeQosResponse, Volume as ProtoVolume, VolumeStats, WriteRequest, WriteResponse,
+    ReadRequest, ReadResponse, ResizeVolumeRequest, ResizeVolumeResponse, TargetType, TrimRequest,
+    TrimResponse, UpdateVolumeQosRequest, UpdateVolumeQosResponse, Volume as ProtoVolume,
+    VolumeState as ProtoVolumeState, VolumeStats, WriteRequest, WriteResponse,
 };
-use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
-use tokio::sync::Mutex;
-use tonic::{Request, Response, Status, transport::Channel};
+use objectio_proto::metadata::{
+    BlockCloneVolumeRequest, BlockCreateSnapshotRequest, BlockCreateVolumeRequest,
+    BlockDeleteSnapshotRequest, BlockDeleteVolumeRequest, BlockGetSnapshotRequest,
+    BlockGetVolumeRequest, BlockListSnapshotsRequest, BlockListVolumesRequest,
+    BlockUpdateVolumeRequest, StripeMeta,
+};
+use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::ec_io::{delete_chunk, read_chunk};
-use crate::flush::flush_volume_all;
+use crate::ec_io::{free_stripes, read_chunk};
+use crate::flush::{flush_volume_all, flush_volume_all_locked};
+use crate::meta_blocks::MetaBlocks;
 use crate::nbd::NbdServer;
 use crate::osd_pool::OsdPool;
-use crate::store::BlockStore;
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 pub struct BlockGatewayState {
-    pub meta_client: Arc<Mutex<MetadataServiceClient<Channel>>>,
+    pub meta: Arc<MetaBlocks>,
     pub osd_pool: Arc<OsdPool>,
     pub cache: Arc<WriteCache>,
-    pub store: Arc<BlockStore>,
     pub volume_manager: Arc<VolumeManager>,
     pub nbd_server: Arc<NbdServer>,
     pub advertise_host: String,
     pub nbd_port: u16,
     pub ec_k: u32,
     pub ec_m: u32,
-    /// Held while chunks are flushed: see `flush::flush_chunks`.
+    /// Held while chunks are flushed (see `flush`), and while a snapshot is
+    /// taken or a volume deleted, so neither races a flush.
     pub flush_lock: tokio::sync::Mutex<()>,
+}
+
+impl BlockGatewayState {
+    /// Make the local copy of a volume match meta's record of it.
+    pub fn mirror(&self, v: &ProtoVolume) {
+        let _ = self.volume_manager.delete_volume(&v.volume_id, true);
+        if let Err(e) = self.volume_manager.restore_volume(from_proto(v)) {
+            warn!("volume {}: cannot mirror meta's record: {e}", v.volume_id);
+        }
+        self.cache.init_volume(&v.volume_id);
+    }
+
+    /// Delete the shards of stripes meta says nothing uses any more.
+    async fn free(&self, what: &str, stripes: &[StripeMeta]) {
+        let failed = free_stripes(&self.meta, &self.osd_pool, stripes).await;
+        if failed > 0 {
+            warn!("{what}: {failed} shard deletes failed; that space leaks");
+        }
+        if !stripes.is_empty() {
+            info!("{what}: freed {} chunks", stripes.len());
+        }
+    }
+
+    /// Record a volume's new state in meta, then here.
+    async fn set_state(&self, volume_id: &str, state: ProtoVolumeState) -> Result<(), Status> {
+        let v = self
+            .meta
+            .client()
+            .await
+            .block_update_volume(BlockUpdateVolumeRequest {
+                volume_id: volume_id.to_string(),
+                size_bytes: 0,
+                state: state.into(),
+            })
+            .await?
+            .into_inner()
+            .volume
+            .ok_or_else(|| Status::internal("meta returned no volume"))?;
+        self.mirror(&v);
+        Ok(())
+    }
 }
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -78,11 +126,8 @@ impl BlockGatewayService {
     async fn load_for_write(&self, volume_id: &str, offset: u64, len: u64) -> Result<(), Status> {
         crate::ec_io::load_for_partial_write(
             &self.state.cache,
-            &self.state.store,
-            &self.state.meta_client,
+            &self.state.meta,
             &self.state.osd_pool,
-            self.state.ec_k,
-            self.state.ec_m,
             volume_id,
             offset,
             len,
@@ -98,33 +143,20 @@ impl BlockGatewayService {
 
 // ── Conversions ───────────────────────────────────────────────────────────────
 
-fn volume_to_proto(v: &objectio_block::volume::Volume) -> ProtoVolume {
-    ProtoVolume {
+/// Meta's record of a volume, as the volume manager holds it.
+pub fn from_proto(v: &ProtoVolume) -> objectio_block::volume::Volume {
+    objectio_block::volume::Volume {
         volume_id: v.volume_id.clone(),
         name: v.name.clone(),
         size_bytes: v.size_bytes,
         used_bytes: v.used_bytes,
         pool: v.pool.clone(),
-        state: i32::from(v.state),
+        state: VolumeState::from(v.state),
         created_at: v.created_at,
         updated_at: v.updated_at,
-        parent_snapshot_id: v.parent_snapshot_id.clone().unwrap_or_default(),
-        chunk_size_bytes: v.chunk_size as u32,
+        parent_snapshot_id: Some(v.parent_snapshot_id.clone()).filter(|s| !s.is_empty()),
+        chunk_size: u64::from(v.chunk_size_bytes),
         metadata: v.metadata.clone(),
-        qos: None,
-    }
-}
-
-fn snapshot_to_proto(s: &objectio_block::volume::Snapshot) -> ProtoSnapshot {
-    ProtoSnapshot {
-        snapshot_id: s.snapshot_id.clone(),
-        volume_id: s.volume_id.clone(),
-        name: s.name.clone(),
-        size_bytes: s.size_bytes,
-        unique_bytes: s.unique_bytes,
-        state: 2, // SnapshotState::Available
-        created_at: s.created_at,
-        metadata: s.metadata.clone(),
     }
 }
 
@@ -146,6 +178,10 @@ fn block_err_to_status(e: objectio_block::error::BlockError) -> Status {
     }
 }
 
+fn some<T>(v: Option<T>) -> Result<T, Status> {
+    v.ok_or_else(|| Status::internal("meta returned an empty response"))
+}
+
 // ── BlockService impl ─────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
@@ -157,25 +193,31 @@ impl BlockService for BlockGatewayService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
-        let vm = &self.state.volume_manager;
-
-        let vol = vm
-            .create_volume(req.name, req.size_bytes, req.pool)
-            .map_err(block_err_to_status)?;
-
-        // Init cache slot
-        self.state.cache.init_volume(&vol.volume_id);
-
-        // Persist
-        if let Err(e) = self.state.store.save_volume(&vol) {
-            warn!("Failed to persist volume {}: {e}", vol.volume_id);
+        let chunk_size = self.state.cache.chunk_mapper().chunk_size();
+        if req.chunk_size_bytes != 0 && u64::from(req.chunk_size_bytes) != chunk_size {
+            return Err(Status::invalid_argument(format!(
+                "this gateway stores {chunk_size}-byte chunks only"
+            )));
         }
-
+        let vol = some(
+            self.state
+                .meta
+                .client()
+                .await
+                .block_create_volume(BlockCreateVolumeRequest {
+                    name: req.name,
+                    size_bytes: req.size_bytes,
+                    pool: req.pool,
+                    chunk_size_bytes: chunk_size as u32,
+                    metadata: req.metadata,
+                })
+                .await?
+                .into_inner()
+                .volume,
+        )?;
+        self.state.mirror(&vol);
         info!("Created volume {} ({}B)", vol.volume_id, vol.size_bytes);
-
-        Ok(Response::new(CreateVolumeResponse {
-            volume: Some(volume_to_proto(&vol)),
-        }))
+        Ok(Response::new(CreateVolumeResponse { volume: Some(vol) }))
     }
 
     async fn delete_volume(
@@ -183,54 +225,47 @@ impl BlockService for BlockGatewayService {
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let req = request.into_inner();
-        let vm = &self.state.volume_manager;
-
-        vm.delete_volume(&req.volume_id, req.force)
-            .map_err(block_err_to_status)?;
-
-        self.state.cache.remove_volume(&req.volume_id);
-
-        // Hand the storage back before the refs that name it are dropped.
-        // Deleting a volume used to remove the local records and nothing else,
-        // so every chunk it had flushed stayed on the OSDs permanently — the
-        // space was neither in use nor reclaimable, and nothing in the cluster
-        // knew it existed.
-        //
-        // Best effort, and deliberately not a reason to fail the delete: the
-        // caller asked for the volume to go away, and a shard that will not
-        // delete is a leaked block rather than a live volume.
-        match self.state.store.list_volume_chunks(&req.volume_id) {
-            Ok(chunks) => {
-                for object_key in &chunks {
-                    if let Err(e) = delete_chunk(
-                        Arc::clone(&self.state.meta_client),
-                        &self.state.osd_pool,
-                        object_key,
-                    )
-                    .await
-                    {
-                        warn!(
-                            "volume {}: chunk {object_key} not freed: {e}",
-                            req.volume_id
-                        );
-                    }
-                }
-                if !chunks.is_empty() {
-                    info!("Freed {} chunks for volume {}", chunks.len(), req.volume_id);
-                }
+        if let Ok(v) = self.state.volume_manager.get_volume(&req.volume_id)
+            && v.state == VolumeState::Attached
+        {
+            if !req.force {
+                return Err(block_err_to_status(
+                    objectio_block::error::BlockError::VolumeAttached(req.volume_id),
+                ));
             }
-            Err(e) => warn!(
-                "volume {}: cannot list chunks, storage will leak: {e}",
-                req.volume_id
-            ),
+            self.state.nbd_server.unregister(&req.volume_id);
+            self.state
+                .set_state(&req.volume_id, ProtoVolumeState::Available)
+                .await?;
         }
 
-        if let Err(e) = self.state.store.delete_volume(&req.volume_id) {
-            warn!("Failed to delete volume record {}: {e}", req.volume_id);
-        }
-
+        // No flush in flight for it while meta drops its chunks.
+        let freeable = {
+            let _flushing = self.state.flush_lock.lock().await;
+            let freeable = self
+                .state
+                .meta
+                .client()
+                .await
+                .block_delete_volume(BlockDeleteVolumeRequest {
+                    volume_id: req.volume_id.clone(),
+                })
+                .await?
+                .into_inner()
+                .freeable;
+            let _ = self
+                .state
+                .volume_manager
+                .delete_volume(&req.volume_id, true);
+            self.state.cache.remove_volume(&req.volume_id);
+            freeable
+        };
+        // Only the stripes nothing else uses: a snapshot of this volume,
+        // or a clone of one, keeps the chunks it shares.
+        self.state
+            .free(&format!("volume {}", req.volume_id), &freeable)
+            .await;
         info!("Deleted volume {}", req.volume_id);
-
         Ok(Response::new(DeleteVolumeResponse { success: true }))
     }
 
@@ -241,13 +276,17 @@ impl BlockService for BlockGatewayService {
         let req = request.into_inner();
         let vol = self
             .state
-            .volume_manager
-            .get_volume(&req.volume_id)
-            .map_err(block_err_to_status)?;
-
-        Ok(Response::new(GetVolumeResponse {
-            volume: Some(volume_to_proto(&vol)),
-        }))
+            .meta
+            .client()
+            .await
+            .block_get_volume(BlockGetVolumeRequest {
+                volume_id: req.volume_id,
+                name: String::new(),
+            })
+            .await?
+            .into_inner()
+            .volume;
+        Ok(Response::new(GetVolumeResponse { volume: vol }))
     }
 
     async fn list_volumes(
@@ -256,12 +295,13 @@ impl BlockService for BlockGatewayService {
     ) -> Result<Response<ListVolumesResponse>, Status> {
         let volumes = self
             .state
-            .volume_manager
-            .list_volumes()
-            .iter()
-            .map(volume_to_proto)
-            .collect();
-
+            .meta
+            .client()
+            .await
+            .block_list_volumes(BlockListVolumesRequest {})
+            .await?
+            .into_inner()
+            .volumes;
         Ok(Response::new(ListVolumesResponse {
             volumes,
             next_marker: String::new(),
@@ -274,19 +314,33 @@ impl BlockService for BlockGatewayService {
         request: Request<ResizeVolumeRequest>,
     ) -> Result<Response<ResizeVolumeResponse>, Status> {
         let req = request.into_inner();
-        let vol = self
+        let current = self
             .state
             .volume_manager
-            .resize_volume(&req.volume_id, req.new_size_bytes)
+            .get_volume(&req.volume_id)
             .map_err(block_err_to_status)?;
-
-        if let Err(e) = self.state.store.save_volume(&vol) {
-            warn!("Failed to persist resized volume {}: {e}", vol.volume_id);
+        if !current.can_modify() {
+            return Err(Status::failed_precondition(format!(
+                "volume {} is attached",
+                req.volume_id
+            )));
         }
-
-        Ok(Response::new(ResizeVolumeResponse {
-            volume: Some(volume_to_proto(&vol)),
-        }))
+        let vol = some(
+            self.state
+                .meta
+                .client()
+                .await
+                .block_update_volume(BlockUpdateVolumeRequest {
+                    volume_id: req.volume_id,
+                    size_bytes: req.new_size_bytes,
+                    state: 0,
+                })
+                .await?
+                .into_inner()
+                .volume,
+        )?;
+        self.state.mirror(&vol);
+        Ok(Response::new(ResizeVolumeResponse { volume: Some(vol) }))
     }
 
     async fn update_volume_qos(
@@ -296,13 +350,17 @@ impl BlockService for BlockGatewayService {
         let req = request.into_inner();
         let vol = self
             .state
-            .volume_manager
-            .get_volume(&req.volume_id)
-            .map_err(block_err_to_status)?;
-
-        Ok(Response::new(UpdateVolumeQosResponse {
-            volume: Some(volume_to_proto(&vol)),
-        }))
+            .meta
+            .client()
+            .await
+            .block_get_volume(BlockGetVolumeRequest {
+                volume_id: req.volume_id,
+                name: String::new(),
+            })
+            .await?
+            .into_inner()
+            .volume;
+        Ok(Response::new(UpdateVolumeQosResponse { volume: vol }))
     }
 
     async fn get_volume_stats(
@@ -332,23 +390,41 @@ impl BlockService for BlockGatewayService {
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let snap = self
-            .state
+        self.state
             .volume_manager
-            .create_snapshot(&req.volume_id, req.name)
+            .get_volume(&req.volume_id)
             .map_err(block_err_to_status)?;
 
-        if let Err(e) = self.state.store.save_snapshot(&snap) {
-            warn!("Failed to persist snapshot {}: {e}", snap.snapshot_id);
+        // Everything written before the snapshot is in it: flush it all,
+        // and hold flushes off until meta has recorded the chunk map, so
+        // the snapshot is one point in time rather than a mix of two.
+        let _flushing = self.state.flush_lock.lock().await;
+        let dirty = flush_volume_all_locked(&req.volume_id, &self.state).await;
+        if dirty > 0 {
+            return Err(Status::unavailable(format!(
+                "{dirty} chunks of {} could not be stored; snapshot not taken",
+                req.volume_id
+            )));
         }
-
+        let snap = some(
+            self.state
+                .meta
+                .client()
+                .await
+                .block_create_snapshot(BlockCreateSnapshotRequest {
+                    volume_id: req.volume_id.clone(),
+                    name: req.name,
+                })
+                .await?
+                .into_inner()
+                .snapshot,
+        )?;
         info!(
             "Created snapshot {} for volume {}",
             snap.snapshot_id, snap.volume_id
         );
-
         Ok(Response::new(CreateSnapshotResponse {
-            snapshot: Some(snapshot_to_proto(&snap)),
+            snapshot: Some(snap),
         }))
     }
 
@@ -357,16 +433,20 @@ impl BlockService for BlockGatewayService {
         request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         let req = request.into_inner();
-
+        let freeable = self
+            .state
+            .meta
+            .client()
+            .await
+            .block_delete_snapshot(BlockDeleteSnapshotRequest {
+                snapshot_id: req.snapshot_id.clone(),
+            })
+            .await?
+            .into_inner()
+            .freeable;
         self.state
-            .volume_manager
-            .delete_snapshot(&req.snapshot_id)
-            .map_err(block_err_to_status)?;
-
-        if let Err(e) = self.state.store.delete_snapshot(&req.snapshot_id) {
-            warn!("Failed to delete snapshot record {}: {e}", req.snapshot_id);
-        }
-
+            .free(&format!("snapshot {}", req.snapshot_id), &freeable)
+            .await;
         Ok(Response::new(DeleteSnapshotResponse { success: true }))
     }
 
@@ -375,15 +455,18 @@ impl BlockService for BlockGatewayService {
         request: Request<GetSnapshotRequest>,
     ) -> Result<Response<GetSnapshotResponse>, Status> {
         let req = request.into_inner();
-        let snap = self
+        let snapshot = self
             .state
-            .volume_manager
-            .get_snapshot(&req.snapshot_id)
-            .map_err(block_err_to_status)?;
-
-        Ok(Response::new(GetSnapshotResponse {
-            snapshot: Some(snapshot_to_proto(&snap)),
-        }))
+            .meta
+            .client()
+            .await
+            .block_get_snapshot(BlockGetSnapshotRequest {
+                snapshot_id: req.snapshot_id,
+            })
+            .await?
+            .into_inner()
+            .snapshot;
+        Ok(Response::new(GetSnapshotResponse { snapshot }))
     }
 
     async fn list_snapshots(
@@ -391,23 +474,17 @@ impl BlockService for BlockGatewayService {
         request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let req = request.into_inner();
-
-        // Validate volume exists if filter provided
-        if !req.volume_id.is_empty() {
-            self.state
-                .volume_manager
-                .get_volume(&req.volume_id)
-                .map_err(block_err_to_status)?;
-        }
-
         let snapshots = self
             .state
-            .volume_manager
-            .list_snapshots(&req.volume_id)
-            .iter()
-            .map(snapshot_to_proto)
-            .collect();
-
+            .meta
+            .client()
+            .await
+            .block_list_snapshots(BlockListSnapshotsRequest {
+                volume_id: req.volume_id,
+            })
+            .await?
+            .into_inner()
+            .snapshots;
         Ok(Response::new(ListSnapshotsResponse {
             snapshots,
             next_marker: String::new(),
@@ -420,26 +497,25 @@ impl BlockService for BlockGatewayService {
         request: Request<CloneVolumeRequest>,
     ) -> Result<Response<CloneVolumeResponse>, Status> {
         let req = request.into_inner();
-        let vol = self
-            .state
-            .volume_manager
-            .clone_from_snapshot(&req.snapshot_id, req.name, None)
-            .map_err(block_err_to_status)?;
-
-        self.state.cache.init_volume(&vol.volume_id);
-
-        if let Err(e) = self.state.store.save_volume(&vol) {
-            warn!("Failed to persist cloned volume {}: {e}", vol.volume_id);
-        }
-
+        let vol = some(
+            self.state
+                .meta
+                .client()
+                .await
+                .block_clone_volume(BlockCloneVolumeRequest {
+                    snapshot_id: req.snapshot_id.clone(),
+                    name: req.name,
+                })
+                .await?
+                .into_inner()
+                .volume,
+        )?;
+        self.state.mirror(&vol);
         info!(
             "Cloned volume {} from snapshot {}",
             vol.volume_id, req.snapshot_id
         );
-
-        Ok(Response::new(CloneVolumeResponse {
-            volume: Some(volume_to_proto(&vol)),
-        }))
+        Ok(Response::new(CloneVolumeResponse { volume: Some(vol) }))
     }
 
     // ── Attachment ────────────────────────────────────────────────────────────
@@ -463,29 +539,21 @@ impl BlockService for BlockGatewayService {
         }
 
         let target_type = TargetType::try_from(req.target_type).unwrap_or(TargetType::Nbd);
+        if target_type != TargetType::Nbd {
+            return Err(Status::unimplemented("only NBD target type is supported"));
+        }
         let read_only = req.read_only;
 
-        let target_address = if target_type == TargetType::Nbd {
-            // Register with NBD server and return connection string
-            self.state
-                .nbd_server
-                .register(&req.volume_id, vol.size_bytes, read_only);
-            format!(
-                "nbd://{}:{}/{}",
-                self.state.advertise_host, self.state.nbd_port, req.volume_id
-            )
-        } else {
-            return Err(Status::unimplemented("only NBD target type is supported"));
-        };
-
         self.state
-            .volume_manager
-            .set_volume_state(&req.volume_id, VolumeState::Attached)
-            .map_err(block_err_to_status)?;
-
-        if let Ok(updated) = self.state.volume_manager.get_volume(&req.volume_id) {
-            let _ = self.state.store.save_volume(&updated);
-        }
+            .set_state(&req.volume_id, ProtoVolumeState::Attached)
+            .await?;
+        self.state
+            .nbd_server
+            .register(&req.volume_id, vol.size_bytes, read_only);
+        let target_address = format!(
+            "nbd://{}:{}/{}",
+            self.state.advertise_host, self.state.nbd_port, req.volume_id
+        );
 
         info!("Attached volume {} → {}", req.volume_id, target_address);
 
@@ -507,20 +575,20 @@ impl BlockService for BlockGatewayService {
     ) -> Result<Response<DetachVolumeResponse>, Status> {
         let req = request.into_inner();
 
-        // Flush all dirty data before detach
-        flush_volume_all(&req.volume_id, &self.state).await;
-
-        // Unregister from NBD
-        self.state.nbd_server.unregister(&req.volume_id);
-
-        self.state
-            .volume_manager
-            .set_volume_state(&req.volume_id, VolumeState::Available)
-            .map_err(block_err_to_status)?;
-
-        if let Ok(updated) = self.state.volume_manager.get_volume(&req.volume_id) {
-            let _ = self.state.store.save_volume(&updated);
+        // Store what is dirty. Anything that fails stays journaled and is
+        // flushed later; detaching does not lose it.
+        let dirty = flush_volume_all(&req.volume_id, &self.state).await;
+        if dirty > 0 {
+            warn!(
+                "Detaching {} with {dirty} chunks still to store",
+                req.volume_id
+            );
         }
+
+        self.state.nbd_server.unregister(&req.volume_id);
+        self.state
+            .set_state(&req.volume_id, ProtoVolumeState::Available)
+            .await?;
 
         info!("Detached volume {}", req.volume_id);
 
@@ -560,35 +628,23 @@ impl BlockService for BlockGatewayService {
         // Cache miss: need to determine which chunk(s) and read from EC
         let chunk_mapper = self.state.volume_manager.chunk_mapper();
         let ranges = chunk_mapper.byte_range_to_chunks(req.offset_bytes, req.length_bytes as u64);
+        let chunk_size = chunk_mapper.chunk_size();
 
         let mut result = vec![0u8; req.length_bytes as usize];
         let mut result_offset = 0usize;
 
         for range in &ranges {
-            let object_key = self
-                .state
-                .store
-                .get_chunk(&req.volume_id, range.chunk_id)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let chunk_data = if let Some(key) = object_key {
-                // Read from EC storage
-                read_chunk(
-                    Arc::clone(&self.state.meta_client),
-                    &self.state.osd_pool,
-                    &key,
-                    self.state.ec_k,
-                    self.state.ec_m,
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-            } else {
-                // Chunk never written = sparse zero region
-                vec![0u8; chunk_mapper.chunk_size() as usize]
-            };
+            let chunk_data = read_chunk(
+                &self.state.meta,
+                &self.state.osd_pool,
+                &req.volume_id,
+                range.chunk_id,
+                chunk_size as usize,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
             // Add to clean cache for future reads
-            let chunk_size = chunk_mapper.chunk_size();
             self.state.cache.add_clean(
                 &req.volume_id,
                 range.chunk_id,
@@ -632,7 +688,14 @@ impl BlockService for BlockGatewayService {
         request: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
         let req = request.into_inner();
-        flush_volume_all(&req.volume_id, &self.state).await;
+        // Writes are durable once acknowledged (journaled); a chunk that
+        // could not be stored now is retried, and the caller told.
+        let dirty = flush_volume_all(&req.volume_id, &self.state).await;
+        if dirty > 0 {
+            return Err(Status::unavailable(format!(
+                "{dirty} chunks could not be stored yet; they stay journaled and are retried"
+            )));
+        }
         Ok(Response::new(FlushResponse { success: true }))
     }
 

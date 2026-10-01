@@ -7,10 +7,10 @@
 
 mod ec_io;
 mod flush;
+mod meta_blocks;
 mod nbd;
 mod osd_pool;
 mod service;
-mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,9 +24,9 @@ use objectio_proto::block::block_service_server::BlockServiceServer;
 use tokio::sync::Mutex;
 use tracing::info;
 
+use crate::meta_blocks::MetaBlocks;
 use crate::osd_pool::OsdPool;
 use crate::service::BlockGatewayState;
-use crate::store::BlockStore;
 
 /// Largest gRPC Read or Write the gateway takes: 16 chunks.
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
@@ -55,7 +55,8 @@ pub struct Args {
     #[arg(long, default_value = "http://localhost:9100")]
     pub meta_endpoint: String,
 
-    /// Data directory (Redb store + journal)
+    /// Data directory (the write journal). Volumes, snapshots and chunk
+    /// maps are kept in meta.
     #[arg(long, default_value = "./block-gw-data")]
     pub data_dir: std::path::PathBuf,
 
@@ -94,10 +95,6 @@ pub async fn run(args: Args) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)
         .with_context(|| format!("create data_dir {:?}", args.data_dir))?;
 
-    // ── Persistent store ──────────────────────────────────────────────────────
-    let store =
-        Arc::new(BlockStore::open(args.data_dir.join("block.db")).context("open block store")?);
-
     // ── Write cache ───────────────────────────────────────────────────────────
     let journal_path = args.data_dir.join("block.journal");
     let cache_config = CacheConfig {
@@ -108,17 +105,6 @@ pub async fn run(args: Args) -> Result<()> {
     let chunk_mapper = Arc::new(ChunkMapper::default());
     let cache = Arc::new(WriteCache::new(chunk_mapper, cache_config));
 
-    // ── Volume manager ────────────────────────────────────────────────────────
-    let volume_manager = Arc::new(VolumeManager::new());
-    store
-        .restore_volumes(&volume_manager)
-        .context("restore volumes")?;
-
-    // Ensure caches exist for all restored volumes
-    for vol in volume_manager.list_volumes() {
-        cache.init_volume(&vol.volume_id);
-    }
-
     // ── Meta gRPC client ──────────────────────────────────────────────────────
     let meta_channel = tonic::transport::Endpoint::new(args.meta_endpoint.clone())
         .context("parse meta endpoint")?
@@ -126,9 +112,27 @@ pub async fn run(args: Args) -> Result<()> {
         .await
         .context("connect to meta service")?;
 
-    let meta_client = Arc::new(Mutex::new(
+    let meta = Arc::new(MetaBlocks::new(Arc::new(Mutex::new(
         objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta_channel),
-    ));
+    ))));
+
+    // ── Volumes, from meta ────────────────────────────────────────────────────
+    let volume_manager = Arc::new(VolumeManager::new());
+    let volumes = meta
+        .client()
+        .await
+        .block_list_volumes(objectio_proto::metadata::BlockListVolumesRequest {})
+        .await
+        .context("list volumes from meta")?
+        .into_inner()
+        .volumes;
+    for v in &volumes {
+        volume_manager
+            .restore_volume(service::from_proto(v))
+            .with_context(|| format!("restore volume {}", v.volume_id))?;
+        cache.init_volume(&v.volume_id);
+    }
+    info!("{} volumes in meta", volumes.len());
 
     // ── OSD pool ──────────────────────────────────────────────────────────────
     let osd_pool = Arc::new(OsdPool::new());
@@ -154,19 +158,15 @@ pub async fn run(args: Args) -> Result<()> {
     // ── NBD server ────────────────────────────────────────────────────────────
     let nbd_server = Arc::new(nbd::NbdServer::new(
         Arc::clone(&cache),
-        Arc::clone(&store),
+        Arc::clone(&meta),
         Arc::clone(&osd_pool),
-        Arc::clone(&meta_client),
-        args.ec_k,
-        args.ec_m,
     ));
 
     // ── Gateway state ─────────────────────────────────────────────────────────
     let state = Arc::new(BlockGatewayState {
-        meta_client,
+        meta,
         osd_pool,
         cache,
-        store,
         volume_manager,
         nbd_server: Arc::clone(&nbd_server),
         advertise_host,
@@ -230,11 +230,8 @@ async fn replay_journal(state: &BlockGatewayState) -> Result<()> {
         let offset = chunk_id * chunk_size + offset_in_chunk;
         ec_io::load_for_partial_write(
             &state.cache,
-            &state.store,
-            &state.meta_client,
+            &state.meta,
             &state.osd_pool,
-            state.ec_k,
-            state.ec_m,
             &volume_id,
             offset,
             data.len() as u64,

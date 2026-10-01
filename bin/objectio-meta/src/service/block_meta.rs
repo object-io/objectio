@@ -27,7 +27,7 @@ use objectio_proto::metadata::{
     BlockGetChunksRequest, BlockGetChunksResponse, BlockGetSnapshotRequest, BlockGetVolumeRequest,
     BlockListSnapshotsRequest, BlockListSnapshotsResponse, BlockListVolumesResponse,
     BlockReleaseResponse, BlockSnapshotResponse, BlockUpdateVolumeRequest, BlockVolumeResponse,
-    StripeMeta, StripeRefs,
+    ShardLocation, StripeMeta, StripeRefs,
 };
 use prost::Message;
 use tonic::Status;
@@ -848,6 +848,70 @@ impl MetaService {
     }
 }
 
+impl MetaService {
+    /// Every stripe a volume or snapshot refers to, each once. What the
+    /// repairer walks for block storage: the chunk records here are the
+    /// only record of where a block chunk's shards are.
+    pub(crate) fn block_stripes(&self) -> Vec<StripeMeta> {
+        let tables = self.block.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for t in [CHUNKS, SNAP_CHUNKS] {
+            for raw in tables.table(t).into_iter().flat_map(BTreeMap::values) {
+                if let Ok(BlockChunkRef {
+                    stripe: Some(s), ..
+                }) = BlockChunkRef::decode(raw.as_slice())
+                    && seen.insert(s.object_id.clone())
+                {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// Add rebuilt shards' locations to every chunk record holding the
+    /// stripe `object_id`, at positions it has none for. How many records
+    /// changed.
+    pub(crate) async fn block_add_shard_locations(
+        &self,
+        object_id: &[u8],
+        added: &[ShardLocation],
+    ) -> Result<usize, Status> {
+        let _serial = self.block_lock.lock().await;
+        self.block_retry("repair-block-stripe", || {
+            let mut ops = Vec::new();
+            let tables = self.block.read();
+            for t in [CHUNKS, SNAP_CHUNKS] {
+                for (key, raw) in tables.table(t).into_iter().flatten() {
+                    let mut r = BlockChunkRef::decode(raw.as_slice())
+                        .map_err(|e| decode_err("chunk", &e))?;
+                    let Some(stripe) = r.stripe.as_mut() else {
+                        continue;
+                    };
+                    if stripe.object_id != object_id {
+                        continue;
+                    }
+                    let mut changed = false;
+                    for loc in added {
+                        if stripe.shards.iter().all(|l| l.position != loc.position) {
+                            stripe.shards.push(loc.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        stripe.shards.sort_by_key(|l| l.position);
+                        ops.push(put(t, key.clone(), &r));
+                    }
+                }
+            }
+            let n = ops.len();
+            Ok((ops, n))
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The rules that keep a volume's, a snapshot's and a clone's data
@@ -1074,5 +1138,41 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(shrink.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// A shard the repairer rebuilt where none was recorded is recorded on
+    /// the volume's chunk and on the snapshot's alike.
+    #[tokio::test]
+    async fn rebuilt_shard_locations_reach_every_chunk_holding_the_stripe() {
+        let svc = MetaService::new();
+        let vol = volume(&svc, "v").await;
+        commit(&svc, &vol, 0, None, Some(1)).await.unwrap();
+        svc.block_create_snapshot_impl(BlockCreateSnapshotRequest {
+            volume_id: vol.clone(),
+            name: "s".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(svc.block_stripes().len(), 1, "one stripe, held twice");
+
+        let loc = ShardLocation {
+            position: 5,
+            node_id: vec![9; 16],
+            ..Default::default()
+        };
+        let changed = svc
+            .block_add_shard_locations(&[1; 16], std::slice::from_ref(&loc))
+            .await
+            .unwrap();
+        assert_eq!(changed, 2);
+        let stripe = &svc.block_stripes()[0];
+        assert_eq!(stripe.shards, vec![loc.clone()]);
+        // Already recorded: nothing to change.
+        assert_eq!(
+            svc.block_add_shard_locations(&[1; 16], &[loc])
+                .await
+                .unwrap(),
+            0
+        );
     }
 }
