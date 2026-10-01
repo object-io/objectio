@@ -1681,6 +1681,14 @@ impl MetaService {
 
     /// Snapshot of every registered OSD. Cloned so a caller can make network
     /// calls without holding the lock.
+    /// Whether `bucket/key` has a current entry in the listing index.
+    pub fn object_listed(&self, bucket: &str, key: &str) -> bool {
+        self.store
+            .as_ref()
+            .and_then(|s| s.read_object_listing(&format!("{bucket}\0{key}\0")))
+            .is_some()
+    }
+
     pub fn osd_nodes_snapshot(&self) -> Vec<OsdNode> {
         self.osd_nodes.read().clone()
     }

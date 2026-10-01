@@ -11,6 +11,7 @@ pub mod liveness;
 mod op_metrics;
 pub mod raft_admin;
 pub mod raft_rpc;
+pub mod repair;
 pub mod service;
 
 use anyhow::Result;
@@ -94,6 +95,13 @@ pub struct Args {
     /// (/_admin/raft/{init,add-learner,change-membership,status}).
     #[arg(long, default_value = "9102")]
     pub admin_port: u16,
+
+    /// Seconds between repair passes. Each pass checks every object's
+    /// shards and rebuilds any that are missing or corrupt from the rest
+    /// of their stripe, and restores listing entries that are missing.
+    /// Runs on the Raft leader. 0 turns it off.
+    #[arg(long, default_value_t = 3600)]
+    pub repair_interval_secs: u64,
 
     /// This node's addressable endpoint for Raft peers (host:port of the
     /// gRPC server). Peers dial this when adding us as a learner or
@@ -306,6 +314,10 @@ pub async fn run(
     // tick. Currently observational (Phase 4a); execution lands with
     // the Phase 5 migration path.
     balancer::spawn(meta_service.clone());
+    repair::spawn(
+        meta_service.clone(),
+        std::time::Duration::from_secs(args.repair_interval_secs),
+    );
     info!(
         "Raft node id={} advertise={} (call POST /init on :{} to bootstrap)",
         node_id, self_addr, args.admin_port
@@ -416,6 +428,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     .unwrap();
     writeln!(output, "# TYPE objectio_meta_osds_total gauge").unwrap();
     writeln!(output, "objectio_meta_osds_total {}", stats.osd_count).unwrap();
+    repair::render_metrics(&mut output);
 
     // User counts
     writeln!(output, "# HELP objectio_meta_users_total Total users").unwrap();

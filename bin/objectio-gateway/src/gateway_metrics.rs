@@ -24,6 +24,7 @@ static SHARD_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::ne
 static OSD_ERRORS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static SHARD_TRANSFERS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RDMA_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static SHARD_CHECKSUM_MISMATCHES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 
 /// HTTP codes worth their own series; anything else is `4xx` / `5xx`.
@@ -127,6 +128,13 @@ pub fn record_rdma_fallback(direction: &str, reason: crate::rdma::Fallback) {
     ));
 }
 
+/// A shard sent as gRPC bytes that did not match its checksum: on `read`
+/// the gateway dropped it, on `write` the OSD refused it. Transfer Engine
+/// mismatches are counted as `rdma_fallbacks_total{reason="checksum"}`.
+pub fn record_shard_checksum_mismatch(direction: &str) {
+    SHARD_CHECKSUM_MISMATCHES.inc(&format!("direction=\"{direction}\""));
+}
+
 /// Splits one request's time into consecutive phases. Each [`mark`] records
 /// the time since the previous one, so the phases of a request add up to the
 /// part of it the handler spent between the first and last mark.
@@ -210,6 +218,11 @@ pub fn render() -> String {
         "objectio_gateway_rdma_fallbacks_total",
         "Shards sent over gRPC to an OSD that offers Transfer Engine, by reason",
     );
+    SHARD_CHECKSUM_MISMATCHES.render(
+        &mut out,
+        "objectio_gateway_shard_checksum_mismatches_total",
+        "Shards sent over gRPC that did not match their checksum, by direction",
+    );
     objectio_erasure::metrics::render(&mut out);
     out
 }
@@ -237,6 +250,15 @@ mod tests {
             assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 1"));
         }
         assert!(render().contains("objectio_s3_requests_in_flight{operation=\"TestOp\"} 0"));
+    }
+
+    #[test]
+    fn checksum_mismatches_are_counted_by_direction() {
+        record_shard_checksum_mismatch("read");
+        assert!(
+            render()
+                .contains("objectio_gateway_shard_checksum_mismatches_total{direction=\"read\"}")
+        );
     }
 
     #[test]

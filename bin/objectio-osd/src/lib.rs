@@ -95,6 +95,18 @@ pub struct Args {
     #[arg(long, default_value = "9201")]
     pub metrics_port: u16,
 
+    /// Seconds between scrub passes, each of which reads every shard on this
+    /// OSD and checks its checksums, so rot is found before a read needs the
+    /// shard. A pass starts this long after the previous one ended. 0 turns
+    /// scrubbing off.
+    #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+    pub scrub_interval_secs: u64,
+
+    /// Read rate cap for scrubbing, in MiB/s, so it does not compete with
+    /// client I/O. 0 means unthrottled.
+    #[arg(long, default_value_t = 50)]
+    pub scrub_rate_mib: u64,
+
     /// Accept shard transfers over Mooncake Transfer Engine: `rdma`, or
     /// `tcp` to develop without RDMA hardware. Unset: gRPC bytes only.
     #[cfg(feature = "rdma")]
@@ -382,6 +394,22 @@ pub async fn run(
     // cluster_uuid into disk superblocks on the response) can share
     // it with the gRPC server and the metrics state.
     let osd_service = Arc::new(osd_service);
+
+    if args.scrub_interval_secs > 0 {
+        let svc = Arc::clone(&osd_service);
+        let interval = Duration::from_secs(args.scrub_interval_secs);
+        let rate = args.scrub_rate_mib * 1024 * 1024;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                svc.scrub_pass(rate).await;
+            }
+        });
+        info!(
+            "Scrubbing every {}s at up to {} MiB/s",
+            args.scrub_interval_secs, args.scrub_rate_mib
+        );
+    }
 
     let node_id_bytes = *osd_service.node_id();
     let node_id = hex::encode(node_id_bytes);
@@ -910,6 +938,9 @@ fn render_metrics(state: &OsdMetricsState) -> String {
     state
         .osd_service
         .render_wal_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
+    state
+        .osd_service
+        .render_scrub_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
 
     // Export block metrics if available
     output.push_str(&state.exporter.export(&state.collector));
