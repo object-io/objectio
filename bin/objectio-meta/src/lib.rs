@@ -103,6 +103,14 @@ pub struct Args {
     #[arg(long, default_value_t = 3600)]
     pub repair_interval_secs: u64,
 
+    /// Seconds between drain sweeps (on the Raft leader).
+    #[arg(long, default_value_t = 30)]
+    pub drain_interval_secs: u64,
+
+    /// Shards a drain sweep moves off each draining OSD, at most.
+    #[arg(long, default_value_t = 64)]
+    pub drain_batch: usize,
+
     /// This node's addressable endpoint for Raft peers (host:port of the
     /// gRPC server). Peers dial this when adding us as a learner or
     /// sending AppendEntries. Defaults to `--listen` but must be
@@ -328,7 +336,11 @@ pub async fn run(
     // Drain observer — every replica runs the task, only the leader
     // issues client_writes. Kick it off once the Raft handle is wired
     // so `is_raft_leader` returns a meaningful answer.
-    drain_observer::spawn(meta_service.clone());
+    drain_observer::spawn(
+        meta_service.clone(),
+        std::time::Duration::from_secs(args.drain_interval_secs.max(1)),
+        args.drain_batch,
+    );
     liveness::spawn(meta_service.clone());
     // PG balancer — leader-only, evaluates placement-group load each
     // tick. Currently observational (Phase 4a); execution lands with

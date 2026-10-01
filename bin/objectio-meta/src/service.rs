@@ -1941,6 +1941,43 @@ impl MetaService {
             .find(eligible)
     }
 
+    /// Where a drain moves shard `position` of a stripe: an OSD in
+    /// service (not Draining or Out) that holds no other shard of the
+    /// stripe (`holders`), so the stripe keeps one shard per OSD and still
+    /// survives the failures it was written to survive. The CRUSH choice
+    /// for `object_id` if it qualifies; otherwise the first in-service OSD
+    /// that does, in a fixed order per stripe.
+    pub fn pick_drain_target(
+        &self,
+        object_id: &[u8; 16],
+        position: u32,
+        holders: &[[u8; 16]],
+    ) -> Option<[u8; 16]> {
+        let in_service: Vec<[u8; 16]> = self
+            .osd_nodes
+            .read()
+            .iter()
+            .filter(|n| n.admin_state == objectio_common::OsdAdminState::In)
+            .map(|n| n.node_id)
+            .collect();
+        let ok = |c: &[u8; 16]| in_service.contains(c) && !holders.contains(c);
+        if let Some(c) = self.pick_migration_target(object_id, position, &[0u8; 16])
+            && ok(&c)
+        {
+            return Some(c);
+        }
+        // Spread the fallback by stripe rather than always the same OSD.
+        let mut candidates: Vec<[u8; 16]> = in_service.iter().copied().filter(|c| ok(c)).collect();
+        candidates.sort_by_key(|c| {
+            let mut h = [0u8; 16];
+            for (i, b) in c.iter().enumerate() {
+                h[i] = b ^ object_id[i] ^ (position as u8);
+            }
+            h
+        });
+        candidates.first().copied()
+    }
+
     /// Invoke `SetOsdAdminState` from internal code (background tasks,
     /// not from an incoming RPC). Same Raft-routed path as the public
     /// gRPC handler; just skips the request-parsing / authz layer and

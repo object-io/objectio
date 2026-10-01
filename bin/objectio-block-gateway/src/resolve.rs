@@ -49,8 +49,12 @@ impl Resolver {
         }
     }
 
-    fn chunk_size(&self) -> u64 {
-        self.cache.chunk_mapper().chunk_size()
+    /// `volume_id`'s chunk size (each volume has its own).
+    fn chunk_size(&self, volume_id: &str) -> u64 {
+        self.cache
+            .mapper_of(volume_id)
+            .unwrap_or_else(|| self.cache.chunk_mapper().as_ref().clone())
+            .chunk_size()
     }
 
     /// Make `chunk_id` whole if it is pending: load its stored bytes
@@ -72,7 +76,7 @@ impl Resolver {
                 &self.pool,
                 volume_id,
                 chunk_id,
-                self.chunk_size() as usize,
+                self.chunk_size(volume_id) as usize,
             )
             .await?;
             self.cache.resolve(volume_id, chunk_id, &base);
@@ -101,7 +105,9 @@ impl Resolver {
     /// After a write: start loading the stored bytes of any chunk it left
     /// pending, in the background, so a later read or flush finds it whole.
     pub fn kick(self: &Arc<Self>, volume_id: &str, offset: u64, len: u64) {
-        let mapper = self.cache.chunk_mapper();
+        let Some(mapper) = self.cache.mapper_of(volume_id) else {
+            return;
+        };
         for range in mapper.byte_range_to_chunks(offset, len) {
             if !self.cache.is_pending(volume_id, range.chunk_id) {
                 continue;
@@ -137,13 +143,12 @@ impl Resolver {
         if let Some(data) = self.cache.read(volume_id, offset, length) {
             return Ok(data);
         }
-        let chunk_size = self.chunk_size();
+        let Some(mapper) = self.cache.mapper_of(volume_id) else {
+            anyhow::bail!("volume {volume_id} is not open on this gateway");
+        };
+        let chunk_size = mapper.chunk_size();
         let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-        for range in self
-            .cache
-            .chunk_mapper()
-            .byte_range_to_chunks(offset, length)
-        {
+        for range in mapper.byte_range_to_chunks(offset, length) {
             let chunk = self
                 .whole_chunk(volume_id, range.chunk_id, chunk_size)
                 .await?;

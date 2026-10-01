@@ -168,6 +168,11 @@ struct Args {
     #[arg(long, default_value_t = 3600)]
     repair_interval_secs: u64,
 
+    /// Seconds between drain sweeps, which move shards off OSDs set to
+    /// Draining. Forwarded to meta.
+    #[arg(long, default_value_t = 30)]
+    drain_interval_secs: u64,
+
     /// Seconds between scrub passes, which read every shard and check its
     /// checksums. Forwarded to every OSD; 0 turns it off.
     #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
@@ -574,6 +579,8 @@ async fn main() -> Result<()> {
         args.log_level.clone(),
         "--repair-interval-secs".into(),
         args.repair_interval_secs.to_string(),
+        "--drain-interval-secs".into(),
+        args.drain_interval_secs.to_string(),
     ];
     if use_ec {
         let need = usize::from(args.ec_k) + usize::from(args.ec_m);

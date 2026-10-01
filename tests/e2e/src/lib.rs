@@ -295,6 +295,19 @@ impl Cluster {
         self.restart_with_osds(self.osds);
     }
 
+    /// The address OSD `index` registered with, as `/_admin/nodes` lists it.
+    #[must_use]
+    pub fn osd_address(&self, index: usize) -> String {
+        let path = self
+            .data_dir
+            .path()
+            .join(format!("osd-{index}/state/osd.addr"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .trim()
+            .to_string()
+    }
+
     /// Restart with the data directory `dir` (relative to the cluster's,
     /// such as `block`) destroyed.
     pub fn restart_without(&mut self, dir: &str) {
