@@ -16,6 +16,8 @@ import { Banner, ChartCard, StatTile, Tabs } from "../components/ui";
 import { LegendDot } from "../components/ui/ChartCard";
 import { seriesColor } from "../components/ui/chart-series";
 import { cluster } from "../api/client";
+import SystemView from "./monitoring/SystemView";
+import { SECTIONS } from "./monitoring/sections";
 import {
   LIVE_INTERVAL_MS,
   MAX_LIVE_POINTS,
@@ -85,6 +87,8 @@ function chartAxes() {
 export default function Monitoring() {
   const [caps, setCaps] = useState<MetricsCapabilities | null>(null);
   const [range, setRange] = useState("5m");
+  const [section, setSection] = useState("requests");
+  const system = SECTIONS.find((s) => s.key === section);
   const [paused, setPaused] = useState(false);
   const [live, setLive] = useState<Point[]>([]);
   const [promData, setPromData] = useState<Record<string, Series[]>>({});
@@ -193,7 +197,7 @@ export default function Monitoring() {
   const opsRows = usingPrometheus ? toRows(promData.ops ?? [], "operation") : null;
   const errRows = usingPrometheus ? toRows(promData.errs ?? [], "status") : null;
   const thruRows = usingPrometheus ? toRows(promData.thru ?? [], "instance") : null;
-  const osdRows = usingPrometheus ? toRows(promData.osd ?? [], "instance") : null;
+  const osdRows = usingPrometheus ? toRows(promData.osd ?? [], "method") : null;
 
   const latencyRows = usingPrometheus
     ? (() => {
@@ -232,6 +236,17 @@ export default function Monitoring() {
             <ExternalLink size={13} /> Raw /metrics
           </a>
         }
+      />
+
+      <Tabs
+        variant="underline"
+        className="mb-4"
+        items={[
+          { key: "requests", label: "Requests" },
+          ...SECTIONS.map((s) => ({ key: s.key, label: s.label })),
+        ]}
+        value={section}
+        onChange={setSection}
       />
 
       <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
@@ -275,6 +290,15 @@ export default function Monitoring() {
         </Banner>
       )}
 
+      {system ? (
+        <SystemView
+          section={system}
+          rangeSeconds={selected.seconds}
+          usingPrometheus={usingPrometheus}
+          paused={paused}
+        />
+      ) : (
+      <>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
         {tiles.map((t) => (
           <StatTile
@@ -383,7 +407,7 @@ export default function Monitoring() {
           )}
         </ChartCard>
 
-        <ChartCard title="OSD request latency" subtitle="objectio_osd_grpc_latency_seconds, by instance">
+        <ChartCard title="OSD request latency" subtitle="milliseconds · p99, by method">
           {usingPrometheus ? (
             <ResponsiveContainer width="100%" height={200}>
               <LineChart data={osdRows?.rows ?? []}>
@@ -394,10 +418,12 @@ export default function Monitoring() {
               </LineChart>
             </ResponsiveContainer>
           ) : (
-            <Unavailable reason="OSD metrics live on each OSD's own :9201 endpoint, which the browser cannot reach. Prometheus already scrapes them." />
+            <Unavailable reason="Percentiles over time come from Prometheus. The Disks & OSDs tab shows them from the live scrape." />
           )}
         </ChartCard>
       </div>
+      </>
+      )}
     </div>
   );
 }
