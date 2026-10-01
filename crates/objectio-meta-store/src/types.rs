@@ -108,6 +108,88 @@ pub struct OsdNode {
     pub te_segment: String,
 }
 
+impl OsdNode {
+    /// Decode an `OsdNode` from the `OSD_NODES` table, whichever release
+    /// wrote it.
+    ///
+    /// bincode records carry no field names or lengths, so
+    /// `#[serde(default)]` does nothing for it: a record written before a
+    /// field existed is just short, and decoding it as the current struct
+    /// fails with "unexpected end of file". v0.3.0 met exactly that on
+    /// records v0.2.2 wrote and started with no OSDs until each one
+    /// registered again — forgetting any Draining or Out state. Each
+    /// earlier layout is tried in turn, newest first; **adding a field to
+    /// `OsdNode` means adding the old layout to [`legacy_osd_node`].**
+    ///
+    /// # Errors
+    /// The current layout's error, when no layout decodes `bytes`.
+    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> {
+        bincode::deserialize::<Self>(bytes).or_else(|current| {
+            bincode::deserialize::<legacy_osd_node::V2>(bytes)
+                .map(Self::from)
+                .or_else(|_| bincode::deserialize::<legacy_osd_node::V1>(bytes).map(Self::from))
+                .map_err(|_| current)
+        })
+    }
+}
+
+/// Earlier on-disk layouts of [`OsdNode`], for [`OsdNode::decode`].
+pub mod legacy_osd_node {
+    use serde::{Deserialize, Serialize};
+
+    /// v0.2.x: before `te_segment`.
+    #[derive(Serialize, Deserialize)]
+    pub struct V2 {
+        pub node_id: [u8; 16],
+        pub address: String,
+        pub disk_ids: Vec<[u8; 16]>,
+        pub failure_domain: Option<(String, String, String)>,
+        pub topology: Option<(String, String, String, String, String)>,
+        pub disk_capacity_bytes: Vec<u64>,
+        pub admin_state: objectio_common::OsdAdminState,
+    }
+
+    /// The first release: before `admin_state`.
+    #[derive(Serialize, Deserialize)]
+    pub struct V1 {
+        pub node_id: [u8; 16],
+        pub address: String,
+        pub disk_ids: Vec<[u8; 16]>,
+        pub failure_domain: Option<(String, String, String)>,
+        pub topology: Option<(String, String, String, String, String)>,
+        pub disk_capacity_bytes: Vec<u64>,
+    }
+}
+
+impl From<legacy_osd_node::V2> for OsdNode {
+    fn from(v: legacy_osd_node::V2) -> Self {
+        Self {
+            node_id: v.node_id,
+            address: v.address,
+            disk_ids: v.disk_ids,
+            failure_domain: v.failure_domain,
+            topology: v.topology,
+            disk_capacity_bytes: v.disk_capacity_bytes,
+            admin_state: v.admin_state,
+            te_segment: String::new(),
+        }
+    }
+}
+
+impl From<legacy_osd_node::V1> for OsdNode {
+    fn from(v: legacy_osd_node::V1) -> Self {
+        Self::from(legacy_osd_node::V2 {
+            node_id: v.node_id,
+            address: v.address,
+            disk_ids: v.disk_ids,
+            failure_domain: v.failure_domain,
+            topology: v.topology,
+            disk_capacity_bytes: v.disk_capacity_bytes,
+            admin_state: objectio_common::OsdAdminState::default(),
+        })
+    }
+}
+
 /// EC configuration for a storage class
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum EcConfig {
@@ -386,5 +468,77 @@ mod access_key_compat_tests {
     #[test]
     fn garbage_is_still_an_error() {
         assert!(decode_access_key(&[0xff, 0x00, 0x01]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod osd_node_compat_tests {
+    use super::*;
+    use objectio_common::OsdAdminState;
+
+    fn v2() -> legacy_osd_node::V2 {
+        legacy_osd_node::V2 {
+            node_id: [7; 16],
+            address: "http://10.0.0.7:9200".into(),
+            disk_ids: vec![[1; 16], [2; 16]],
+            failure_domain: Some(("r".into(), "dc".into(), "rack".into())),
+            topology: Some((
+                "r".into(),
+                "z".into(),
+                "dc".into(),
+                "rack".into(),
+                "h".into(),
+            )),
+            disk_capacity_bytes: vec![10, 20],
+            admin_state: OsdAdminState::Draining,
+        }
+    }
+
+    #[test]
+    fn the_current_layout_round_trips() {
+        let mut node = OsdNode::from(v2());
+        node.te_segment = "10.0.0.7:15000".into();
+        let back = OsdNode::decode(&bincode::serialize(&node).unwrap()).unwrap();
+        assert_eq!(back.te_segment, "10.0.0.7:15000");
+        assert_eq!(back.admin_state, OsdAdminState::Draining);
+    }
+
+    /// What v0.3.0 could not read: a record v0.2.x wrote, without
+    /// `te_segment`. Its Draining state must survive the upgrade.
+    #[test]
+    fn a_v0_2_record_decodes_with_its_admin_state() {
+        let bytes = bincode::serialize(&v2()).unwrap();
+        assert!(
+            bincode::deserialize::<OsdNode>(&bytes).is_err(),
+            "the current layout reads this by itself now; is the legacy path still needed?"
+        );
+        let node = OsdNode::decode(&bytes).unwrap();
+        assert_eq!(node.node_id, [7; 16]);
+        assert_eq!(node.address, "http://10.0.0.7:9200");
+        assert_eq!(node.disk_ids, vec![[1; 16], [2; 16]]);
+        assert_eq!(node.disk_capacity_bytes, vec![10, 20]);
+        assert_eq!(node.admin_state, OsdAdminState::Draining);
+        assert!(node.te_segment.is_empty());
+    }
+
+    #[test]
+    fn a_first_release_record_decodes_as_in() {
+        let v = v2();
+        let v1 = legacy_osd_node::V1 {
+            node_id: v.node_id,
+            address: v.address,
+            disk_ids: v.disk_ids,
+            failure_domain: v.failure_domain,
+            topology: v.topology,
+            disk_capacity_bytes: v.disk_capacity_bytes,
+        };
+        let node = OsdNode::decode(&bincode::serialize(&v1).unwrap()).unwrap();
+        assert_eq!(node.address, "http://10.0.0.7:9200");
+        assert_eq!(node.admin_state, OsdAdminState::In);
+    }
+
+    #[test]
+    fn garbage_is_still_an_error() {
+        assert!(OsdNode::decode(&[1, 2, 3]).is_err());
     }
 }

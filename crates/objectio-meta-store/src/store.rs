@@ -210,7 +210,20 @@ impl MetaStore {
     }
 
     pub fn load_osd_nodes(&self) -> MetaStoreResult<Vec<(String, OsdNode)>> {
-        self.load_bincode_table(tables::OSD_NODES)
+        // Not `load_bincode_table`: records from earlier releases have an
+        // older layout, which only `OsdNode::decode` reads.
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(tables::OSD_NODES)?;
+        let mut result = Vec::new();
+        for entry in table.iter()? {
+            let entry = entry?;
+            let key = entry.0.value().to_string();
+            match OsdNode::decode(entry.1.value()) {
+                Ok(node) => result.push((key, node)),
+                Err(e) => error!("Failed to decode OSD node '{}': {}", key, e),
+            }
+        }
+        Ok(result)
     }
 
     // ---- Cluster Topology (bincode, single key) ----
@@ -1523,4 +1536,37 @@ impl MetaStore {
 /// already removed: `{key}\0{version}` → `{key}`.
 fn listing_object_key(entry: &str) -> &str {
     entry.split('\0').next().unwrap_or(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store written by v0.2.x loads its OSDs: v0.3.0 started with none.
+    #[test]
+    fn osd_nodes_written_by_v0_2_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetaStore::open(dir.path().join("meta.redb")).unwrap();
+        let old = crate::types::legacy_osd_node::V2 {
+            node_id: [9; 16],
+            address: "http://127.0.0.1:9200".into(),
+            disk_ids: vec![[3; 16]],
+            failure_domain: None,
+            topology: None,
+            disk_capacity_bytes: vec![1 << 30],
+            admin_state: objectio_common::OsdAdminState::Out,
+        };
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(tables::OSD_NODES).unwrap();
+            t.insert("09", bincode::serialize(&old).unwrap().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let nodes = store.load_osd_nodes().unwrap();
+        assert_eq!(nodes.len(), 1, "the v0.2 record was dropped");
+        assert_eq!(nodes[0].1.address, "http://127.0.0.1:9200");
+        assert_eq!(nodes[0].1.admin_state, objectio_common::OsdAdminState::Out);
+    }
 }
