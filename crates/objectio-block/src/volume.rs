@@ -233,6 +233,28 @@ impl VolumeManager {
         Ok(volume)
     }
 
+    /// Put back a volume that was persisted, under the id it was created
+    /// with: its stored chunks are keyed by that id. (Restoring through
+    /// `create_volume` minted a new id, so after a restart every volume
+    /// read as zeros.)
+    pub fn restore_volume(&self, volume: Volume) -> BlockResult<()> {
+        if self.volume_names.read().contains_key(&volume.name) {
+            return Err(BlockError::VolumeExists(volume.name));
+        }
+        let volume_id = volume.volume_id.clone();
+        self.volume_names
+            .write()
+            .insert(volume.name.clone(), volume_id.clone());
+        self.volumes.write().insert(volume_id.clone(), volume);
+        self.volume_chunks
+            .write()
+            .insert(volume_id.clone(), HashMap::new());
+        self.volume_snapshots
+            .write()
+            .insert(volume_id, HashSet::new());
+        Ok(())
+    }
+
     /// Get a volume by ID
     pub fn get_volume(&self, volume_id: &str) -> BlockResult<Volume> {
         self.volumes

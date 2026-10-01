@@ -111,14 +111,14 @@ Four-service architecture: **Gateway** (:9000), **Meta** (:9100), **OSD** (:9200
 
 ### Block Storage
 
-The `objectio-block` crate provides block storage on top of the distributed object layer. It maps logical block addresses (LBAs, 512-byte sectors) to erasure-coded 4MB chunks stored on OSDs. Key capabilities:
+The `objectio-block` crate provides block storage on top of the distributed object layer. It maps logical block addresses (LBAs, 512-byte sectors) to erasure-coded 4MB chunks stored on OSDs. What works end to end (block gateway, `tests/e2e/tests/block.rs`):
 
-- **Thin provisioning**: Storage allocated only on write
-- **Snapshots/Clones**: Copy-on-write snapshots and writable clones
-- **QoS**: Per-volume IOPS/bandwidth limits with token bucket rate limiting and priority scheduling
-- **Protocols**: iSCSI, NVMe-oF, NBD attachment targets
-- **Write journal**: Crash-consistent writes via write-ahead journal
-- **Write cache**: Coalesces small writes before flushing to chunks
+- **NBD and gRPC I/O**: reads, writes, flush, trim
+- **Thin provisioning**: unwritten chunks read as zeros (written zeros are still stored)
+- **Write cache**: whole 4 MiB chunks; a partial write loads the stored chunk first
+- **Write journal**: every write is journaled and fsynced before it is acknowledged; replayed on restart
+
+Not implemented yet, though the types and RPCs exist: snapshot/clone *data* (snapshots record no chunks, clones read as zeros, nothing is copy-on-write), QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate `BlockMetaService` that the block gateway does not use — the gateway's own redb (`block.db`) is what holds volumes and chunk refs. aio runs the block gateway with `--block-port`.
 
 The block gRPC service is defined in `crates/objectio-proto/proto/block.proto` (BlockService) and runs on the Block Gateway.
 

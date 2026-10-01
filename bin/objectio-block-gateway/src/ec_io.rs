@@ -200,6 +200,41 @@ pub async fn write_chunk(
     Ok(object_key)
 }
 
+/// Load into `cache`, as clean, every stored chunk that a write of `len`
+/// bytes at `offset` only partly covers and that the cache does not hold.
+///
+/// The cache keeps whole chunks and writes a chunk back whole, so a write
+/// into a chunk it does not hold must start from that chunk's stored bytes.
+/// It used to start from zeros: after a restart, or for any chunk not read
+/// since, a 4 KiB write wiped the other 4 MiB of its chunk at the next
+/// flush. A chunk that cannot be read fails the write rather than doing that.
+#[allow(clippy::too_many_arguments)]
+pub async fn load_for_partial_write(
+    cache: &objectio_block::WriteCache,
+    store: &crate::store::BlockStore,
+    meta_client: &Arc<Mutex<MetadataServiceClient<Channel>>>,
+    osd_pool: &Arc<OsdPool>,
+    ec_k: u32,
+    ec_m: u32,
+    volume_id: &str,
+    offset: u64,
+    len: u64,
+) -> Result<()> {
+    let mapper = cache.chunk_mapper();
+    let chunk_size = mapper.chunk_size();
+    for range in mapper.byte_range_to_chunks(offset, len) {
+        let whole = range.offset_in_chunk == 0 && range.length == chunk_size;
+        if whole || cache.holds_chunk(volume_id, range.chunk_id) {
+            continue;
+        }
+        if let Some(key) = store.get_chunk(volume_id, range.chunk_id)? {
+            let data = read_chunk(Arc::clone(meta_client), osd_pool, &key, ec_k, ec_m).await?;
+            cache.add_clean(volume_id, range.chunk_id, bytes::Bytes::from(data));
+        }
+    }
+    Ok(())
+}
+
 /// Read and reconstruct a chunk from the OSD cluster.
 ///
 /// `object_key` is the value previously returned by `write_chunk`.

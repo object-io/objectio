@@ -2182,6 +2182,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "include_dir",
+ "objectio-block-gateway",
  "objectio-gateway",
  "objectio-meta",
  "objectio-osd",
@@ -2342,10 +2343,13 @@ version = "0.3.0"
 dependencies = [
  "hex",
  "hmac",
+ "objectio-proto",
  "reqwest",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

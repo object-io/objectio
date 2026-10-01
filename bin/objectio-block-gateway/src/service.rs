@@ -43,6 +43,8 @@ pub struct BlockGatewayState {
     pub nbd_port: u16,
     pub ec_k: u32,
     pub ec_m: u32,
+    /// Held while chunks are flushed: see `flush::flush_chunks`.
+    pub flush_lock: tokio::sync::Mutex<()>,
 }
 
 // ── Service ───────────────────────────────────────────────────────────────────
@@ -52,6 +54,43 @@ pub struct BlockGatewayService {
 }
 
 impl BlockGatewayService {
+    /// Refuse I/O past the end of the volume: it would create chunks the
+    /// volume does not own.
+    fn check_bounds(&self, volume_id: &str, offset: u64, len: u64) -> Result<(), Status> {
+        let vol = self
+            .state
+            .volume_manager
+            .get_volume(volume_id)
+            .map_err(|e| Status::not_found(e.to_string()))?;
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > vol.size_bytes)
+        {
+            return Err(Status::out_of_range(format!(
+                "{len} bytes at {offset} run past the end of the {}-byte volume",
+                vol.size_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// See [`crate::ec_io::load_for_partial_write`].
+    async fn load_for_write(&self, volume_id: &str, offset: u64, len: u64) -> Result<(), Status> {
+        crate::ec_io::load_for_partial_write(
+            &self.state.cache,
+            &self.state.store,
+            &self.state.meta_client,
+            &self.state.osd_pool,
+            self.state.ec_k,
+            self.state.ec_m,
+            volume_id,
+            offset,
+            len,
+        )
+        .await
+        .map_err(|e| Status::unavailable(format!("reading the chunk to write into: {e}")))
+    }
+
     pub fn new(state: Arc<BlockGatewayState>) -> Self {
         Self { state }
     }
@@ -503,6 +542,11 @@ impl BlockService for BlockGatewayService {
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let req = request.into_inner();
+        self.check_bounds(
+            &req.volume_id,
+            req.offset_bytes,
+            u64::from(req.length_bytes),
+        )?;
 
         // Try cache first
         if let Some(data) =
@@ -572,6 +616,9 @@ impl BlockService for BlockGatewayService {
         let req = request.into_inner();
         let len = req.data.len() as u32;
 
+        self.check_bounds(&req.volume_id, req.offset_bytes, req.data.len() as u64)?;
+        self.load_for_write(&req.volume_id, req.offset_bytes, req.data.len() as u64)
+            .await?;
         self.state
             .cache
             .write(&req.volume_id, req.offset_bytes, &req.data)
@@ -593,6 +640,9 @@ impl BlockService for BlockGatewayService {
         let req = request.into_inner();
 
         // Zero-fill the trimmed range in cache
+        self.check_bounds(&req.volume_id, req.offset_bytes, req.length_bytes)?;
+        self.load_for_write(&req.volume_id, req.offset_bytes, req.length_bytes)
+            .await?;
         let zeros = vec![0u8; req.length_bytes as usize];
         if let Err(e) = self
             .state
