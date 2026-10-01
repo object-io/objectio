@@ -871,6 +871,49 @@ impl MetaService {
         out
     }
 
+    /// Point position `position` of stripe `object_id` at `to` wherever it
+    /// is on node `from`, in every chunk record holding the stripe (a
+    /// volume's and its snapshots' alike): a drain moving the shard. How
+    /// many records changed.
+    pub(crate) async fn block_move_shard(
+        &self,
+        object_id: &[u8],
+        position: u32,
+        from: &[u8],
+        to: &ShardLocation,
+    ) -> Result<usize, Status> {
+        let _serial = self.block_lock.lock().await;
+        self.block_retry("drain-block-shard", || {
+            let mut ops = Vec::new();
+            let tables = self.block.read();
+            for t in [CHUNKS, SNAP_CHUNKS] {
+                for (key, raw) in tables.table(t).into_iter().flatten() {
+                    let mut r = BlockChunkRef::decode(raw.as_slice())
+                        .map_err(|e| decode_err("chunk", &e))?;
+                    let Some(stripe) = r.stripe.as_mut() else {
+                        continue;
+                    };
+                    if stripe.object_id != object_id {
+                        continue;
+                    }
+                    let mut changed = false;
+                    for loc in &mut stripe.shards {
+                        if loc.position == position && loc.node_id == from {
+                            *loc = to.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        ops.push(put(t, key.clone(), &r));
+                    }
+                }
+            }
+            let n = ops.len();
+            Ok((ops, n))
+        })
+        .await
+    }
+
     /// Add rebuilt shards' locations to every chunk record holding the
     /// stripe `object_id`, at positions it has none for. How many records
     /// changed.

@@ -27,7 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use objectio_proto::metadata::ShardLocation;
+use objectio_proto::metadata::{ObjectMeta, ShardLocation, StripeMeta};
 use objectio_proto::storage::{
     Checksum, FindObjectsReferencingNodeRequest, GetObjectMetaRequest, GetStatusRequest,
     PutObjectMetaRequest, ReadShardRequest, ReadShardResponse, ShardId, WriteShardRequest,
@@ -39,17 +39,11 @@ use tracing::{debug, info, warn};
 
 use crate::service::MetaService;
 
-/// How often we sweep. Not a Raft timer — no correctness implications
-/// if it runs late; it just delays the auto-flip.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// Shard moves in flight at once within a sweep.
+const MOVES_AT_ONCE: usize = 8;
 
 /// Per-RPC timeout when talking to an OSD during a sweep.
 const PER_OSD_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Cap the migrator to one shard per Draining OSD per sweep. Low
-/// enough to keep live IO unaffected on a small cluster; Phase 3c
-/// can lift this into a config once we have rate-limiter plumbing.
-const SHARDS_PER_SWEEP: usize = 1;
 
 /// Fan out an ObjectMeta write to every OSD that currently holds a shard for
 /// the object. With ObjectMeta replicated on all k+m shard hosts (MinIO
@@ -136,15 +130,15 @@ async fn fanout_put_object_meta(
 }
 
 /// Spawn the drain observer. Non-blocking; returns immediately.
-pub fn spawn(meta: Arc<MetaService>) {
+pub fn spawn(meta: Arc<MetaService>, every: Duration, batch: usize) {
     tokio::spawn(async move {
-        run(meta).await;
+        run(meta, every, batch).await;
     });
-    info!("Drain observer spawned (sweep every {:?})", SWEEP_INTERVAL);
+    info!("Drain observer spawned (sweep every {every:?}, up to {batch} shards a sweep)");
 }
 
-async fn run(meta: Arc<MetaService>) {
-    let mut ticker = interval(SWEEP_INTERVAL);
+async fn run(meta: Arc<MetaService>, every: Duration, batch: usize) {
+    let mut ticker = interval(every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // CRUSH-drift per-shard rebalancer is disabled: the PG balancer
     // owns placement decisions now, and ObjectIO is greenfield — no
@@ -152,13 +146,13 @@ async fn run(meta: Arc<MetaService>) {
     // admin-state=Draining) sweep stays.
     loop {
         ticker.tick().await;
-        if let Err(e) = sweep_once(&meta).await {
+        if let Err(e) = sweep_once(&meta, batch).await {
             warn!("drain observer sweep failed: {e}");
         }
     }
 }
 
-async fn sweep_once(meta: &Arc<MetaService>) -> anyhow::Result<()> {
+async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()> {
     if !meta.is_raft_leader() {
         debug!("drain observer: not leader, skipping sweep");
         return Ok(());
@@ -219,45 +213,30 @@ async fn sweep_once(meta: &Arc<MetaService>) -> anyhow::Result<()> {
             }
         };
 
-        // Auto-finalise when empty. We do this BEFORE attempting to
-        // migrate anything — if shard_count is already zero, nothing
-        // to migrate.
-        match drain_step(observed) {
-            DrainStep::Wait => continue,
-            DrainStep::Migrate => {}
-            DrainStep::Finalise => {
-                info!(
-                    "drain observer: OSD {} has 0 shards at {address}; finalising → Out",
-                    hex::encode(node_id)
-                );
-                match meta
-                    .internal_set_osd_admin_state(
-                        node_id,
-                        objectio_common::OsdAdminState::Out,
-                        "drain-observer".into(),
-                    )
-                    .await
-                {
-                    Ok(()) => meta.clear_drain_progress(&node_id),
-                    Err(e) => warn!(
-                        "drain observer: failed to flip {} → Out: {e}",
-                        hex::encode(node_id)
-                    ),
-                }
-                continue;
-            }
-        }
-
-        // Shards remain — migrate one per sweep.
-        if let Err(e) = migrate_one_shard(meta, node_id, &address, SHARDS_PER_SWEEP).await {
-            warn!(
-                "drain observer: migration step for {} failed: {e}",
+        // Move what refers to it; finalise once nothing does.
+        let scan = match observed {
+            Some(_) => Some(migrate_batch(meta, node_id, &address, batch).await),
+            None => None,
+        };
+        if drain_step(scan) == DrainStep::Finalise {
+            info!(
+                "drain observer: nothing refers to OSD {} any more; finalising → Out",
                 hex::encode(node_id)
             );
-            meta.update_drain_progress(node_id, |p| {
-                p.last_error = format!("migrate: {e}");
-                p.updated_at = now_unix();
-            });
+            match meta
+                .internal_set_osd_admin_state(
+                    node_id,
+                    objectio_common::OsdAdminState::Out,
+                    "drain-observer".into(),
+                )
+                .await
+            {
+                Ok(()) => meta.clear_drain_progress(&node_id),
+                Err(e) => warn!(
+                    "drain observer: failed to flip {} → Out: {e}",
+                    hex::encode(node_id)
+                ),
+            }
         }
     }
 
@@ -287,364 +266,418 @@ async fn query_shard_count(address: &str) -> anyhow::Result<u64> {
     Ok(resp.into_inner().shard_count)
 }
 
-/// Migrate up to `batch` shards off the draining OSD.
+/// What one scan of the cluster found for a draining OSD.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Scan {
+    /// Every OSD answered the scan (and meta's block tables were read).
+    pub complete: bool,
+    /// Shards on the draining OSD something still refers to.
+    pub found: usize,
+    /// Of those, moved in this sweep.
+    pub moved: usize,
+}
+
+/// One shard on the draining OSD, and everything found referring to it:
+/// ObjectMetas (one, or several sharing the stripe), block chunk records.
+struct Move {
+    shard: ShardId,
+    objects: Vec<ObjectRef>,
+    /// The stripe as a block chunk record has it, when one does.
+    block_stripe: Option<StripeMeta>,
+}
+
+struct ObjectRef {
+    owner_addr: String,
+    bucket: String,
+    key: String,
+}
+
+/// Move up to `batch` shards off the draining OSD, and report what is
+/// left referring to it.
 ///
-/// Strategy:
+/// A shard is identified as it is stored: under its stripe's own id
+/// (multipart parts, stripes shared by copies, block chunks), falling back
+/// to the object's. Using the object's id for every stripe made each
+/// multipart object and each copy unmovable: its shard was "not found"
+/// under the object id, and the rebuild fallback used the same wrong id.
 ///
-///   a. Fan out `FindObjectsReferencingNode(draining_node_id)` to every
-///      OSD in the cluster. Each OSD scans its own primary-held
-///      ObjectMetas and returns the ones whose any stripe has a
-///      ShardLocation on the draining node. The output names the OSD
-///      that owns the meta (implicitly: whichever OSD answered with
-///      that object) so we know where to PutObjectMeta later.
-///   b. Pick up to `batch` (object, shard) pairs and migrate each:
-///      1. Read shard bytes from draining OSD.
-///      2. Pick a CRUSH target excluding the draining OSD.
-///      3. Write to the target.
-///      4. Update ObjectMeta on the primary OSD (the one that
-///         returned this object in step a).
-///      5. Delete the source shard. Idempotent — if we crash between
-///         steps 3 and 4, a later sweep's step a still finds the same
-///         ObjectMeta (unchanged) so retry continues.
-async fn migrate_one_shard(
+/// The shard is copied once, then everything referring to it is re-pointed.
+/// The source is never deleted here: objects sharing the stripe that this
+/// sweep did not reach still read it there. (Deleting it after re-pointing
+/// one object left every other object sharing the stripe a shard short.)
+/// The OSD is finalised when nothing refers to it any more; what is left
+/// on it then is unreferenced.
+async fn migrate_batch(
     meta: &Arc<MetaService>,
     draining: [u8; 16],
     draining_addr: &str,
     batch: usize,
-) -> anyhow::Result<()> {
-    if batch == 0 {
-        return Ok(());
-    }
+) -> Scan {
+    let mut scan = Scan {
+        complete: true,
+        ..Scan::default()
+    };
+    let mut moves: Vec<Move> = Vec::new();
+    let mut index: std::collections::HashMap<(Vec<u8>, u64, u32), usize> =
+        std::collections::HashMap::new();
+    let mut slot = |moves: &mut Vec<Move>, shard: ShardId| -> usize {
+        let k = (shard.object_id.clone(), shard.stripe_id, shard.position);
+        *index.entry(k).or_insert_with(|| {
+            moves.push(Move {
+                shard,
+                objects: Vec::new(),
+                block_stripe: None,
+            });
+            moves.len() - 1
+        })
+    };
 
-    // Step a — fan out the search. Record which OSD owns each
-    // returned object so step 4 can update meta on the right node.
-    // Each (owner_addr, AffectedObject) stays distinct.
-    let owners = meta.all_osd_addresses();
-    let mut candidates: Vec<(String, objectio_proto::storage::AffectedObject)> = Vec::new();
-    for (addr, _id) in &owners {
-        match find_affected_objects(addr, &draining, batch as u32 * 4).await {
-            Ok(objs) => {
-                for o in objs {
-                    candidates.push((addr.clone(), o));
-                    if candidates.len() >= batch * 4 {
-                        break;
+    // ObjectMetas, from every OSD (each holds copies of its placement's).
+    let limit = u32::try_from(batch.saturating_mul(4)).unwrap_or(u32::MAX);
+    for (addr, _id) in meta.all_osd_addresses() {
+        match find_affected_objects(&addr, &draining, limit).await {
+            Ok(objects) => {
+                for o in objects {
+                    for s in o.shards {
+                        let shard = ShardId {
+                            object_id: if s.shard_object_id.is_empty() {
+                                o.object_id.clone()
+                            } else {
+                                s.shard_object_id
+                            },
+                            stripe_id: s.stripe_id,
+                            position: s.position,
+                        };
+                        let i = slot(&mut moves, shard);
+                        moves[i].objects.push(ObjectRef {
+                            owner_addr: addr.clone(),
+                            bucket: o.bucket.clone(),
+                            key: o.key.clone(),
+                        });
                     }
                 }
             }
             Err(e) => {
-                debug!("drain migrator: find_affected on {addr} failed: {e} (ignoring)");
+                debug!("drain: scan of {addr} failed: {e}");
+                scan.complete = false;
             }
         }
     }
-
-    if candidates.is_empty() {
-        // No ObjectMeta references this OSD, yet shard_count > 0 —
-        // possible if the OSD holds orphaned shards whose ObjectMeta
-        // has already been deleted. Phase 3c handles orphan cleanup;
-        // for now log and let the operator see a stalled count.
-        debug!(
-            "drain migrator: OSD {} reports shards but no ObjectMeta references it (orphans?)",
-            hex::encode(draining)
-        );
-        return Ok(());
-    }
-
-    // Step b — migrate up to `batch` shards from the candidates list.
-    // Flatten into per-shard work items.
-    struct WorkItem {
-        owner_addr: String,
-        bucket: String,
-        key: String,
-        object_id: [u8; 16],
-        stripe_id: u64,
-        position: u32,
-    }
-    let mut work: Vec<WorkItem> = Vec::new();
-    for (owner_addr, obj) in candidates {
-        let Ok(object_id): Result<[u8; 16], _> = obj.object_id.as_slice().try_into() else {
-            continue;
-        };
-        for s in obj.shards {
-            work.push(WorkItem {
-                owner_addr: owner_addr.clone(),
-                bucket: obj.bucket.clone(),
-                key: obj.key.clone(),
-                object_id,
-                stripe_id: s.stripe_id,
-                position: s.position,
-            });
-            if work.len() >= batch {
-                break;
+    // Block chunk stripes, recorded in meta's own tables.
+    for stripe in meta.block_stripes() {
+        for loc in &stripe.shards {
+            if loc.node_id == draining {
+                let i = slot(
+                    &mut moves,
+                    ShardId {
+                        object_id: stripe.object_id.clone(),
+                        stripe_id: stripe.stripe_id,
+                        position: loc.position,
+                    },
+                );
+                moves[i].block_stripe = Some(stripe.clone());
             }
         }
-        if work.len() >= batch {
-            break;
-        }
     }
+    scan.found = moves.len();
 
-    for item in &work {
-        let borrowed = WorkItemRef {
-            owner_addr: &item.owner_addr,
-            bucket: &item.bucket,
-            key: &item.key,
-            object_id: item.object_id,
-            stripe_id: item.stripe_id,
-            position: item.position,
-        };
-        match migrate_shard_one(meta, &draining, draining_addr, &borrowed).await {
+    // A few at a time: each reads and writes a shard.
+    use futures::StreamExt;
+    let results: Vec<anyhow::Result<()>> = futures::stream::iter(moves.into_iter().take(batch))
+        .map(|mv| async move {
+            let what = format!(
+                "{} stripe={} pos={}",
+                hex::encode(&mv.shard.object_id),
+                mv.shard.stripe_id,
+                mv.shard.position
+            );
+            move_shard(meta, &draining, draining_addr, &mv)
+                .await
+                .map_err(|e| anyhow::anyhow!("{what}: {e}"))
+        })
+        .buffer_unordered(MOVES_AT_ONCE)
+        .collect()
+        .await;
+    for r in results {
+        match r {
             Ok(()) => {
+                scan.moved += 1;
                 meta.update_drain_progress(draining, |p| {
                     p.shards_migrated = p.shards_migrated.saturating_add(1);
                     p.updated_at = now_unix();
-                    p.last_error.clear();
                 });
-                info!(
-                    "drain migrator: moved {}/{} shard stripe={} pos={} off {}",
-                    item.bucket,
-                    item.key,
-                    item.stripe_id,
-                    item.position,
-                    hex::encode(draining)
-                );
             }
             Err(e) => {
+                warn!("drain: {e}");
                 meta.update_drain_progress(draining, |p| {
-                    p.last_error = format!(
-                        "{}/{} stripe={} pos={}: {e}",
-                        item.bucket, item.key, item.stripe_id, item.position
-                    );
+                    p.last_error = e.to_string();
                     p.updated_at = now_unix();
                 });
-                warn!(
-                    "drain migrator: failed to move {}/{} stripe={} pos={}: {e}",
-                    item.bucket, item.key, item.stripe_id, item.position
-                );
             }
         }
     }
-
-    Ok(())
+    scan
 }
 
-/// Drive one shard through read-target / write-target / update-meta /
-/// delete-source. Fails fast on any step — the caller retries on the
-/// next sweep.
-async fn migrate_shard_one(
+/// Copy one shard to its new home and re-point everything referring to it.
+async fn move_shard(
     meta: &Arc<MetaService>,
     draining: &[u8; 16],
     draining_addr: &str,
-    item: &WorkItemRef<'_>,
+    mv: &Move,
 ) -> anyhow::Result<()> {
-    // 1. Pick target via CRUSH (excludes draining OSDs by construction).
+    let id: [u8; 16] = mv
+        .shard
+        .object_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("shard id is not 16 bytes"))?;
+    // The stripe as recorded: whose other shards are where.
+    let stripe = match &mv.block_stripe {
+        Some(s) => s.clone(),
+        None => stripe_of(mv).await?,
+    };
+    let holders: Vec<[u8; 16]> = stripe
+        .shards
+        .iter()
+        .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
+        .collect();
     let target_node = meta
-        .pick_migration_target(&item.object_id, item.position, draining)
-        .ok_or_else(|| anyhow::anyhow!("no CRUSH target available"))?;
+        .pick_drain_target(&id, mv.shard.position, &holders)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no in-service OSD without a shard of this stripe to move it to")
+        })?;
     let target_addr = meta
         .osd_address_by_id(&target_node)
         .ok_or_else(|| anyhow::anyhow!("target not registered"))?;
     if target_addr == draining_addr {
-        return Err(anyhow::anyhow!("CRUSH returned the draining node itself"));
+        return Err(anyhow::anyhow!(
+            "the target chosen is the draining OSD itself"
+        ));
     }
 
-    // 2. Read shard from source. If the source reports NotFound — the meta
-    //    still references the draining OSD but the bytes are already gone —
-    //    fall through to EC reconstruct against the surviving shards and
-    //    write the rebuilt bytes to the CRUSH target.
-    let shard_id = ShardId {
-        object_id: item.object_id.to_vec(),
-        stripe_id: item.stripe_id,
-        position: item.position,
-    };
-    let source_ch = open_channel(draining_addr).await?;
-    let mut source = StorageServiceClient::new(source_ch);
-    let read_result = tokio::time::timeout(
-        PER_OSD_TIMEOUT,
-        source.read_shard(ReadShardRequest {
-            rdma_dest: None,
-            shard_id: Some(shard_id.clone()),
-            offset: 0,
-            length: 0,
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("read_shard timeout"))?;
-    let bytes = match read_result {
-        // Moving damaged bytes would make the copy look like a good shard
-        // under a checksum the target computes from the damage. Fail the
-        // item instead; the next sweep tries again.
-        Ok(resp) => verified_shard(resp.into_inner())
-            .map_err(|e| anyhow::anyhow!("read_shard from {draining_addr}: {e}"))?,
-        Err(status) if status.code() == tonic::Code::NotFound => {
-            tracing::info!(
-                "drain migrator: source has no shard for {}/{} stripe={} pos={}; falling back to EC reconstruct",
-                item.bucket,
-                item.key,
-                item.stripe_id,
-                item.position
-            );
-            // Pull the current full ObjectMeta so reconstruct can see the
-            // surviving ShardLocations.
-            let owner_ch_r = open_channel(item.owner_addr).await?;
-            let mut owner_r = StorageServiceClient::new(owner_ch_r);
-            let Some(object_for_rc) = tokio::time::timeout(
-                PER_OSD_TIMEOUT,
-                owner_r.get_object_meta(GetObjectMetaRequest {
-                    bucket: item.bucket.to_string(),
-                    key: item.key.to_string(),
-                    version_id: String::new(),
-                }),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("get_object_meta timeout"))??
-            .into_inner()
-            .object
-            else {
-                return Err(anyhow::anyhow!(
-                    "owner no longer has ObjectMeta {}/{}",
-                    item.bucket,
-                    item.key
-                ));
-            };
-            return reconstruct_dangling_shard(
-                meta,
-                draining,
-                item.owner_addr,
-                target_node,
-                &object_for_rc,
-                item.stripe_id,
-                item.position,
-            )
-            .await;
+    // The bytes: from the draining OSD, checked; or, if it cannot give
+    // them, rebuilt from the rest of the stripe.
+    let bytes = match read_shard(draining_addr, &mv.shard).await {
+        Ok(b) => b,
+        Err(e) => {
+            debug!("drain: reading from the draining OSD failed ({e}); rebuilding");
+            rebuild_shard(meta, &stripe, &mv.shard, draining).await?
         }
-        Err(e) => return Err(anyhow::anyhow!("read_shard: {e}")),
+    };
+    let location = write_shard(&target_addr, &mv.shard, bytes).await?;
+    let to = ShardLocation {
+        position: mv.shard.position,
+        node_id: target_node.to_vec(),
+        disk_id: location.disk_id,
+        offset: 0,
+        shard_type: 0,
+        local_group: 0,
     };
 
-    // 3. Write to target.
-    let target_ch = open_channel(&target_addr).await?;
-    let mut target = StorageServiceClient::new(target_ch);
-    let write_resp = tokio::time::timeout(
-        PER_OSD_TIMEOUT,
-        target.write_shard(WriteShardRequest {
-            rdma: None,
-            shard_id: Some(shard_id.clone()),
-            checksum: Some(checksum_of(&bytes)),
-            data: bytes,
-            ec_k: 0, // Not inspected by OSD; kept for wire-compat.
-            ec_m: 0,
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("write_shard timeout"))??
-    .into_inner();
+    for o in &mv.objects {
+        repoint_object(meta, o, &mv.shard, draining, draining_addr, &to).await?;
+    }
+    if mv.block_stripe.is_some() {
+        meta.block_move_shard(&mv.shard.object_id, mv.shard.position, draining, &to)
+            .await
+            .map_err(|e| anyhow::anyhow!("block chunk records: {e}"))?;
+    }
+    Ok(())
+}
 
-    // 4. Update ObjectMeta on the primary (the OSD that returned this
-    //    object in step a — `owner_addr`).
-    let owner_ch = open_channel(item.owner_addr).await?;
-    let mut owner = StorageServiceClient::new(owner_ch);
-    let Some(mut object) = tokio::time::timeout(
+/// The stripe a shard belongs to, from one of the ObjectMetas referring
+/// to it.
+async fn stripe_of(mv: &Move) -> anyhow::Result<StripeMeta> {
+    for o in &mv.objects {
+        if let Ok(Some(object)) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await
+            && let Some(s) = object
+                .stripes
+                .iter()
+                .find(|s| is_shard_of(&object, s, &mv.shard))
+        {
+            return Ok(s.clone());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no ObjectMeta describes the stripe any more"
+    ))
+}
+
+/// Whether `shard` belongs to `stripe` of `object`.
+fn is_shard_of(object: &ObjectMeta, stripe: &StripeMeta, shard: &ShardId) -> bool {
+    let id = if stripe.object_id.is_empty() {
+        &object.object_id
+    } else {
+        &stripe.object_id
+    };
+    stripe.stripe_id == shard.stripe_id && *id == shard.object_id
+}
+
+/// Point one ObjectMeta's copy of `shard` at `to`, on every replica,
+/// unless the object was replaced meanwhile.
+async fn repoint_object(
+    meta: &Arc<MetaService>,
+    o: &ObjectRef,
+    shard: &ShardId,
+    draining: &[u8; 16],
+    draining_addr: &str,
+    to: &ShardLocation,
+) -> anyhow::Result<()> {
+    let Some(mut object) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await? else {
+        return Ok(()); // deleted since: nothing to re-point
+    };
+    let mut changed = false;
+    let object_id = object.object_id.clone();
+    for stripe in &mut object.stripes {
+        let id = if stripe.object_id.is_empty() {
+            &object_id
+        } else {
+            &stripe.object_id
+        };
+        if stripe.stripe_id != shard.stripe_id || *id != shard.object_id {
+            continue;
+        }
+        for loc in &mut stripe.shards {
+            if loc.position == shard.position && loc.node_id == draining.as_slice() {
+                *loc = ShardLocation {
+                    shard_type: loc.shard_type,
+                    local_group: loc.local_group,
+                    ..to.clone()
+                };
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        fanout_put_object_meta(meta, &object, &o.owner_addr, &[draining_addr]).await?;
+    }
+    Ok(())
+}
+
+async fn get_object_meta(
+    addr: &str,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Option<ObjectMeta>> {
+    let mut client = StorageServiceClient::new(open_channel(addr).await?)
+        .max_decoding_message_size(100 * 1024 * 1024);
+    let resp = tokio::time::timeout(
         PER_OSD_TIMEOUT,
-        owner.get_object_meta(GetObjectMetaRequest {
-            bucket: item.bucket.to_string(),
-            key: item.key.to_string(),
+        client.get_object_meta(GetObjectMetaRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             version_id: String::new(),
         }),
     )
     .await
     .map_err(|_| anyhow::anyhow!("get_object_meta timeout"))??
-    .into_inner()
-    .object
-    else {
-        return Err(anyhow::anyhow!(
-            "owner no longer has ObjectMeta {}/{}",
-            item.bucket,
-            item.key
-        ));
-    };
+    .into_inner();
+    Ok(resp.object.filter(|_| resp.found))
+}
 
-    let mut updated = false;
-    for stripe in &mut object.stripes {
-        if stripe.stripe_id != item.stripe_id {
-            continue;
-        }
-        for shard in &mut stripe.shards {
-            if shard.position == item.position && shard.node_id == draining.as_slice() {
-                let target_disk = write_resp
-                    .location
-                    .as_ref()
-                    .map(|l| l.disk_id.clone())
-                    .unwrap_or_default();
-                *shard = ShardLocation {
-                    position: shard.position,
-                    node_id: target_node.to_vec(),
-                    disk_id: target_disk,
-                    offset: 0,
-                    shard_type: shard.shard_type,
-                    local_group: shard.local_group,
-                };
-                updated = true;
-            }
-        }
-    }
-
-    if !updated {
-        // Meta already re-pointed by an earlier sweep (crash-safety
-        // path). Treat as success — the source shard delete below
-        // still needs to run.
-        debug!(
-            "drain migrator: {}/{} stripe={} pos={} already updated, proceeding to delete source",
-            item.bucket, item.key, item.stripe_id, item.position
-        );
-    }
-
-    // Also refresh the draining OSD's local copy (it held the shard a
-    // moment ago). Otherwise its listing keeps reporting the stale
-    // location and the rebalancer chases the same phantom forever.
-    fanout_put_object_meta(meta, &object, item.owner_addr, &[draining_addr]).await?;
-
-    // 5. Delete source shard. The OSD's shard_count drops on the next
-    //    GetStatus sweep and the observer can eventually auto-finalise.
-    tokio::time::timeout(
+async fn read_shard(addr: &str, shard: &ShardId) -> anyhow::Result<prost::bytes::Bytes> {
+    let mut client = StorageServiceClient::new(open_channel(addr).await?)
+        .max_decoding_message_size(100 * 1024 * 1024);
+    let resp = tokio::time::timeout(
         PER_OSD_TIMEOUT,
-        source.delete_shard(objectio_proto::storage::DeleteShardRequest {
-            shard_id: Some(shard_id),
+        client.read_shard(ReadShardRequest {
+            rdma_dest: None,
+            shard_id: Some(shard.clone()),
+            offset: 0,
+            length: 0,
         }),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("delete_shard timeout"))??;
-
-    Ok(())
+    .map_err(|_| anyhow::anyhow!("read_shard timeout"))??
+    .into_inner();
+    // Moving damaged bytes would store them under a checksum of the damage.
+    verified_shard(resp)
 }
 
-/// Borrowed form of WorkItem so migrate_shard_one doesn't take
-/// ownership of the candidate list.
-struct WorkItemRef<'a> {
-    owner_addr: &'a str,
-    bucket: &'a str,
-    key: &'a str,
-    object_id: [u8; 16],
-    stripe_id: u64,
-    position: u32,
+async fn write_shard(
+    addr: &str,
+    shard: &ShardId,
+    bytes: prost::bytes::Bytes,
+) -> anyhow::Result<objectio_proto::storage::BlockLocation> {
+    let mut client = StorageServiceClient::new(open_channel(addr).await?)
+        .max_encoding_message_size(100 * 1024 * 1024);
+    tokio::time::timeout(
+        PER_OSD_TIMEOUT,
+        client.write_shard(WriteShardRequest {
+            rdma: None,
+            shard_id: Some(shard.clone()),
+            checksum: Some(checksum_of(&bytes)),
+            data: bytes,
+            ec_k: 0,
+            ec_m: 0,
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("write_shard timeout"))??
+    .into_inner()
+    .location
+    .ok_or_else(|| anyhow::anyhow!("write_shard returned no location"))
 }
 
-impl<'a> WorkItemRef<'a> {
-    #[allow(dead_code)] // constructed inline in migrate_shard_one
-    fn new(
-        owner_addr: &'a str,
-        bucket: &'a str,
-        key: &'a str,
-        object_id: [u8; 16],
-        stripe_id: u64,
-        position: u32,
-    ) -> Self {
-        Self {
-            owner_addr,
-            bucket,
-            key,
-            object_id,
-            stripe_id,
-            position,
+/// Rebuild `shard` from k other shards of its stripe (any but the one on
+/// the draining OSD), each checked against its checksum.
+async fn rebuild_shard(
+    meta: &Arc<MetaService>,
+    stripe: &StripeMeta,
+    shard: &ShardId,
+    draining: &[u8; 16],
+) -> anyhow::Result<prost::bytes::Bytes> {
+    use futures::StreamExt;
+    let (k, m) = (stripe.ec_k as usize, stripe.ec_m as usize);
+    if k == 0 || m == 0 {
+        return Err(anyhow::anyhow!("not an erasure-coded stripe ({k}+{m})"));
+    }
+    let mut reads = futures::stream::FuturesUnordered::new();
+    for loc in &stripe.shards {
+        if loc.position == shard.position || loc.node_id == draining.as_slice() {
+            continue;
+        }
+        let Some(addr) = <[u8; 16]>::try_from(loc.node_id.as_slice())
+            .ok()
+            .and_then(|n| meta.osd_address_by_id(&n))
+        else {
+            continue;
+        };
+        let id = ShardId {
+            position: loc.position,
+            ..shard.clone()
+        };
+        reads.push(async move { (id.position, read_shard(&addr, &id).await) });
+    }
+    let mut survivors: Vec<Option<Vec<u8>>> = vec![None; k + m];
+    let mut have = 0;
+    while let Some((pos, r)) = reads.next().await {
+        if let Ok(bytes) = r
+            && let Some(slot) = survivors.get_mut(pos as usize)
+        {
+            *slot = Some(bytes.to_vec());
+            have += 1;
+            if have == k {
+                break;
+            }
         }
     }
+    if have < k {
+        return Err(anyhow::anyhow!(
+            "only {have} good shards reachable, need {k}"
+        ));
+    }
+    let codec =
+        objectio_erasure::ErasureCodec::new(objectio_common::ErasureConfig::new(k as u8, m as u8))
+            .map_err(|e| anyhow::anyhow!("codec: {e}"))?;
+    let mut rebuilt = codec
+        .reconstruct_shards(&survivors, &[shard.position as usize])
+        .map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
+    rebuilt
+        .pop()
+        .map(prost::bytes::Bytes::from)
+        .ok_or_else(|| anyhow::anyhow!("rebuild returned nothing"))
 }
 
 async fn find_affected_objects(
@@ -716,26 +749,31 @@ fn canonical_uri(address: &str) -> String {
 /// about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStep {
-    /// The OSD did not answer. Record the error and leave it Draining.
+    /// The scan could not run. Leave it Draining.
     Wait,
-    /// The OSD reports no shards left. Flip it to Out.
+    /// Nothing refers to the OSD any more. Flip it to Out.
     Finalise,
-    /// Shards remain. Move some.
+    /// Something still refers to it, or the scan was incomplete.
     Migrate,
 }
 
 /// Decide the step, separately from performing it.
 ///
-/// The property worth stating out loud: an OSD that cannot be reached is never
-/// finalised. Finalising flips it to Out, which is what the console shows the
-/// operator before they pull the drive — and an unreachable OSD is precisely
-/// the case where "how many shards are left" is unknown rather than zero.
-/// Reading a failed poll as an empty disk would turn a network blip into data
-/// loss.
-const fn drain_step(shard_count: Option<u64>) -> DrainStep {
-    match shard_count {
+/// The property worth stating out loud: an OSD is finalised only when a scan
+/// that every OSD answered found nothing referring to it. Finalising flips
+/// it to Out, which is what the console shows the operator before they pull
+/// the drive; an OSD that did not answer may hold the one ObjectMeta that
+/// still points at it. (This used to finalise on the draining OSD's shard
+/// count reaching zero, which it never did while shared or multipart
+/// stripes were left on it.)
+const fn drain_step(scan: Option<Scan>) -> DrainStep {
+    match scan {
         None => DrainStep::Wait,
-        Some(0) => DrainStep::Finalise,
+        Some(Scan {
+            complete: true,
+            found: 0,
+            ..
+        }) => DrainStep::Finalise,
         Some(_) => DrainStep::Migrate,
     }
 }
@@ -747,275 +785,9 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------
-// Phase 4c — EC reconstruction for dangling ObjectMeta shard refs
-// ---------------------------------------------------------------------
-
-/// Repair one shard whose owner is no longer in the cluster
-/// registration. Reads k surviving shards from the same stripe,
-/// reconstructs the missing one via EC, writes it to the CRUSH
-/// target, and rewrites the ObjectMeta so the dangling node_id is
-/// replaced. On success counts as a "rebalance" migration so the
-/// admin UI shows forward progress; on insufficient-survivors
-/// failure reports a distinct last_error so the operator knows
-/// the object is now degraded below k.
-async fn reconstruct_dangling_shard(
-    meta: &std::sync::Arc<crate::service::MetaService>,
-    dead_owner: &[u8; 16],
-    owner_meta_addr: &str,
-    target_node: [u8; 16],
-    object: &objectio_proto::metadata::ObjectMeta,
-    stripe_id: u64,
-    position: u32,
-) -> anyhow::Result<()> {
-    // Locate this stripe's full shard layout.
-    let stripe = object
-        .stripes
-        .iter()
-        .find(|s| s.stripe_id == stripe_id)
-        .ok_or_else(|| anyhow::anyhow!("stripe {stripe_id} missing from ObjectMeta"))?;
-
-    let ec_k = stripe.ec_k as usize;
-    let ec_m = stripe.ec_m as usize;
-    let total = ec_k + ec_m;
-    if total == 0 {
-        return Err(anyhow::anyhow!("stripe has zero k+m"));
-    }
-
-    // Build an index → node_id map and the slot for the missing
-    // position. Skip the position we're rebuilding; skip shards whose
-    // owner isn't registered (they're also dangling, can't pull from
-    // them either).
-    let registered: std::collections::HashSet<[u8; 16]> =
-        meta.osd_nodes_read().iter().map(|n| n.node_id).collect();
-
-    let target_addr = meta
-        .osd_address_by_id(&target_node)
-        .ok_or_else(|| anyhow::anyhow!("reconstruct target not registered"))?;
-
-    // Fetch surviving shards from OSDs that are alive AND registered.
-    // The loop does concurrent reads via a small FuturesUnordered
-    // bounded by `ec_k + 2` attempts — enough to tolerate a missed
-    // response while not flooding the cluster.
-    use futures::StreamExt;
-    use futures::stream::FuturesUnordered;
-
-    let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
-    for shard in &stripe.shards {
-        if shard.position == position {
-            continue;
-        }
-        if shard.node_id.len() != 16 {
-            continue;
-        }
-        let mut nid = [0u8; 16];
-        nid.copy_from_slice(&shard.node_id);
-        if !registered.contains(&nid) {
-            continue; // Also dangling — skip.
-        }
-        let Some(addr) = meta.osd_address_by_id(&nid) else {
-            continue;
-        };
-        let object_id = object.object_id.clone();
-        let stripe_id = stripe.stripe_id;
-        let pos = shard.position;
-        futs.push(async move {
-            let ch = open_channel(&addr).await?;
-            let mut client = StorageServiceClient::new(ch);
-            let resp = tokio::time::timeout(
-                PER_OSD_TIMEOUT,
-                client.read_shard(ReadShardRequest {
-                    rdma_dest: None,
-                    shard_id: Some(ShardId {
-                        object_id,
-                        stripe_id,
-                        position: pos,
-                    }),
-                    offset: 0,
-                    length: 0,
-                }),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("read timeout"))??
-            .into_inner();
-            // A damaged survivor is left out, as an unreachable one is.
-            let bytes = verified_shard(resp)?;
-            Ok::<(u32, Vec<u8>), anyhow::Error>((pos, bytes.into()))
-        });
-    }
-
-    let mut survivors: Vec<Option<Vec<u8>>> = vec![None; total];
-    while let Some(r) = futs.next().await {
-        if let Ok((pos, bytes)) = r {
-            if (pos as usize) < total {
-                survivors[pos as usize] = Some(bytes);
-            }
-            if survivors.iter().filter(|s| s.is_some()).count() >= ec_k {
-                break;
-            }
-        }
-    }
-    drop(futs);
-
-    let available = survivors.iter().filter(|s| s.is_some()).count();
-    if available < ec_k {
-        // Distinguish transient "readers couldn't connect" from
-        // permanent "no reachable shards even exist." If every shard in
-        // this stripe points at a node_id that isn't currently
-        // registered, the object is terminally lost — GC the stale
-        // ObjectMeta from the scanning OSD so the rebalancer stops
-        // re-finding it every sweep. The `registered` set above is the
-        // current OSD list at call time.
-        let registered_shards = stripe
-            .shards
-            .iter()
-            .filter(|s| {
-                s.node_id.len() == 16
-                    && registered.contains(&<[u8; 16]>::try_from(s.node_id.as_slice()).unwrap())
-            })
-            .count();
-        if registered_shards < ec_k {
-            // Terminal: can't ever recover this. Delete the meta pointer
-            // on the OSD that surfaced it (one garbage-collected
-            // entry per sweep per object). Other OSDs' replicas will
-            // be cleaned up when they surface via their own list.
-            if let Ok(ch) = open_channel(owner_meta_addr).await {
-                let mut client = StorageServiceClient::new(ch);
-                let _ = client
-                    .delete_object_meta(objectio_proto::storage::DeleteObjectMetaRequest {
-                        bucket: object.bucket.clone(),
-                        key: object.key.clone(),
-                        version_id: String::new(),
-                    })
-                    .await;
-            }
-            tracing::info!(
-                "reconstruct: {}/{} stripe={stripe_id} pos={position} terminally lost \
-                 ({registered_shards}/{ec_k} shards on registered OSDs); \
-                 GC'd ObjectMeta from {owner_meta_addr}",
-                object.bucket,
-                object.key,
-            );
-            return Err(anyhow::anyhow!(
-                "terminally_lost: {}/{} stripe={stripe_id} pos={position} \
-                 ({registered_shards}/{ec_k} on registered OSDs)",
-                object.bucket,
-                object.key,
-            ));
-        }
-        return Err(anyhow::anyhow!(
-            "reconstruct: only {available} survivors reachable of {registered_shards} \
-             registered, need {ec_k} (transient)"
-        ));
-    }
-
-    // Run EC decode to regenerate the missing shard. Use a plain
-    // Reed-Solomon config with the stripe's recorded k/m — matches
-    // how the object was encoded at write time.
-    let config = objectio_common::ErasureConfig::new(ec_k as u8, ec_m as u8);
-    let codec = objectio_erasure::ErasureCodec::new(config)
-        .map_err(|e| anyhow::anyhow!("codec new: {e}"))?;
-    let mut rebuilt = codec
-        .reconstruct_shards(&survivors, &[position as usize])
-        .map_err(|e| anyhow::anyhow!("ec reconstruct: {e}"))?;
-    let reconstructed = rebuilt
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("reconstruct returned empty"))?;
-
-    // Write reconstructed bytes to the CRUSH target.
-    let shard_id = ShardId {
-        object_id: object.object_id.clone(),
-        stripe_id,
-        position,
-    };
-    let target_ch = open_channel(&target_addr).await?;
-    let mut target = StorageServiceClient::new(target_ch);
-    let write_resp = tokio::time::timeout(
-        PER_OSD_TIMEOUT,
-        target.write_shard(WriteShardRequest {
-            rdma: None,
-            shard_id: Some(shard_id),
-            checksum: Some(checksum_of(&reconstructed)),
-            data: reconstructed.into(),
-            ec_k: ec_k as u32,
-            ec_m: ec_m as u32,
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("write_shard timeout"))??
-    .into_inner();
-
-    // Rewrite ObjectMeta so the dangling ShardLocation now points at
-    // the newly-written target. Use a fresh fetch to avoid racing
-    // another in-flight rebalance update.
-    let owner_ch = open_channel(owner_meta_addr).await?;
-    let mut owner = StorageServiceClient::new(owner_ch);
-    let Some(mut fresh) = tokio::time::timeout(
-        PER_OSD_TIMEOUT,
-        owner.get_object_meta(GetObjectMetaRequest {
-            bucket: object.bucket.clone(),
-            key: object.key.clone(),
-            version_id: String::new(),
-        }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("get_object_meta timeout"))??
-    .into_inner()
-    .object
-    else {
-        return Err(anyhow::anyhow!(
-            "owner lost ObjectMeta for {}/{} mid-reconstruct",
-            object.bucket,
-            object.key
-        ));
-    };
-    for stripe in &mut fresh.stripes {
-        if stripe.stripe_id != stripe_id {
-            continue;
-        }
-        for shard in &mut stripe.shards {
-            if shard.position == position && shard.node_id == dead_owner.as_slice() {
-                let target_disk = write_resp
-                    .location
-                    .as_ref()
-                    .map(|l| l.disk_id.clone())
-                    .unwrap_or_default();
-                *shard = objectio_proto::metadata::ShardLocation {
-                    position: shard.position,
-                    node_id: target_node.to_vec(),
-                    disk_id: target_disk,
-                    offset: 0,
-                    shard_type: shard.shard_type,
-                    local_group: shard.local_group,
-                };
-            }
-        }
-    }
-    // Include dead_owner's address (if it's still registered — a drain
-    // target is, a permanently-gone OSD isn't) so its stale local meta is
-    // refreshed and the rebalancer stops re-spotting the same drift.
-    let dead_owner_addr = meta.osd_address_by_id(dead_owner);
-    let mut extra: Vec<&str> = Vec::new();
-    if let Some(ref a) = dead_owner_addr {
-        extra.push(a.as_str());
-    }
-    fanout_put_object_meta(meta, &fresh, owner_meta_addr, &extra).await?;
-
-    tracing::info!(
-        "reconstruct: rebuilt {}/{} stripe={} pos={} from {} survivors onto {}",
-        object.bucket,
-        object.key,
-        stripe_id,
-        position,
-        available,
-        hex::encode(target_node),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DrainStep, canonical_uri, checksum_of, drain_step, verified_shard};
+    use super::{DrainStep, Scan, canonical_uri, checksum_of, drain_step, verified_shard};
     use objectio_proto::storage::ReadShardResponse;
 
     fn response(data: &[u8], crc32c: Option<u32>) -> ReadShardResponse {
@@ -1043,26 +815,24 @@ mod tests {
         assert_eq!(&verified_shard(response(data, None)).unwrap()[..], data);
     }
 
-    /// An OSD that did not answer is never declared drained.
-    ///
+    fn scan(complete: bool, found: usize) -> Option<Scan> {
+        Some(Scan {
+            complete,
+            found,
+            moved: 0,
+        })
+    }
+
     /// Finalising sets the OSD to Out, which is what the console shows the
-    /// operator before they pull the drive. A failed poll means the shard
-    /// count is unknown, not zero — reading it as zero turns a network blip
-    /// into a drive pulled with live data on it.
+    /// operator before they pull the drive. It is done only when a scan that
+    /// every OSD answered found nothing referring to the OSD: an OSD that
+    /// did not answer may hold the one ObjectMeta that still does.
     #[test]
-    fn an_unreachable_osd_is_never_finalised() {
+    fn an_osd_is_finalised_only_when_a_complete_scan_finds_nothing() {
+        assert_eq!(drain_step(scan(true, 0)), DrainStep::Finalise);
+        assert_eq!(drain_step(scan(false, 0)), DrainStep::Migrate);
+        assert_eq!(drain_step(scan(true, 3)), DrainStep::Migrate);
         assert_eq!(drain_step(None), DrainStep::Wait);
-    }
-
-    #[test]
-    fn an_empty_osd_is_finalised() {
-        assert_eq!(drain_step(Some(0)), DrainStep::Finalise);
-    }
-
-    #[test]
-    fn an_osd_with_shards_left_keeps_migrating() {
-        assert_eq!(drain_step(Some(1)), DrainStep::Migrate);
-        assert_eq!(drain_step(Some(u64::MAX)), DrainStep::Migrate);
     }
 
     #[test]

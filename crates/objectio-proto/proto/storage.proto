@@ -289,6 +289,9 @@ message AffectedObject {
 message AffectedShardRef {
     uint64 stripe_id = 1;
     uint32 position = 2;
+    // The id the shard is stored under: the stripe's own (multipart parts,
+    // stripes shared by copies) or, when the stripe has none, the object's.
+    bytes shard_object_id = 3;
 }
 
 // ============================================================
