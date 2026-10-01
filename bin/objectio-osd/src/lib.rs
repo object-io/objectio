@@ -31,7 +31,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tonic::transport::Server;
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -621,7 +620,7 @@ pub async fn run(
     // ~40 ms on Linux.
     let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
         .map_err(|e| anyhow::anyhow!("OSD listener: {e}"))?;
-    let server_future = Server::builder()
+    let server_future = objectio_proto::transport::server()
         .add_service(storage_service)
         .serve_with_incoming_shutdown(incoming, async move {
             shutdown.await;
