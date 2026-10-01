@@ -19,11 +19,13 @@ objectio-meta = { path = "../objectio-meta" }
 objectio-osd = { path = "../objectio-osd" }
 objectio-gateway = { path = "../objectio-gateway" }
 objectio-block-gateway = { path = "../objectio-block-gateway" }
+objectio-proto = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 which = "6"

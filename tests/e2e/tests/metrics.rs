@@ -9,11 +9,6 @@ use objectio_proto::block::block_service_client::BlockServiceClient;
 use objectio_proto::block::{CreateVolumeRequest, FlushRequest, WriteRequest};
 use serde_json::json;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 /// Object and block traffic of every kind the checks below look for.
 fn serve_some_traffic(c: &Cluster, block_port: u16) {
     c.json("POST", "/_admin/buckets", json!({"name": "m"}))
@@ -136,9 +131,13 @@ fn value(text: &str, prefix: &str) -> u64 {
 
 #[test]
 fn metrics_are_a_valid_exposition_and_cover_every_service() {
-    let block_port = free_port();
-    let (bp, np) = (block_port.to_string(), free_port().to_string());
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--block-port", &bp, "--nbd-port", &np]);
+    let c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        &["--block-port", "{free}", "--nbd-port", "{free}"],
+    );
+    let block_port: u16 = c.arg("--block-port").unwrap().parse().unwrap();
     serve_some_traffic(&c, block_port);
     let text = scrape_after_traffic(&c);
 

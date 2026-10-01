@@ -121,6 +121,9 @@ impl Cluster {
     }
 
     /// As [`Self::start_with_ec`], with further aio flags — kept for restarts.
+    ///
+    /// An argument `{free}` becomes a free port, picked afresh on each
+    /// attempt to start (see [`free_port`]); [`Self::arg`] says which.
     pub fn start_with_ec_and_args(osds: usize, ec_k: u8, ec_m: u8, args: &[&str]) -> Self {
         Self::boot(
             osds,
@@ -181,6 +184,16 @@ impl Cluster {
             // cluster may have written state for the port it lost.
             let data_dir = tempfile::tempdir().expect("tempdir");
             let port = free_port();
+            let extra_args: Vec<String> = extra_args
+                .iter()
+                .map(|a| {
+                    if a == "{free}" {
+                        free_port().to_string()
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
             let mut child = Self::spawn(data_dir.path(), port, osds, ec, &extra_args);
 
             // Credentials come from the file meta writes, not from scraping
@@ -425,7 +438,7 @@ impl Cluster {
                     .as_array()
                     .map_or(0, |n| n.iter().filter(|n| n["online"] == true).count());
                 if online >= self.osds {
-                    return Ok(());
+                    return self.wait_block_gateway(deadline);
                 }
                 last = format!("{online} of {} OSDs online", self.osds);
             } else {
@@ -436,6 +449,73 @@ impl Cluster {
         let _ = self.child.kill();
         let _ = self.child.wait();
         Err(format!("OSDs did not come online within 90s — {last}"))
+    }
+
+    /// The value the cluster was started with for `flag` (`--block-port`,
+    /// say), once `{free}` was replaced.
+    pub fn arg(&self, flag: &str) -> Option<&str> {
+        let i = self.extra_args.iter().position(|a| a == flag)?;
+        self.extra_args.get(i + 1).map(String::as_str)
+    }
+
+    /// With a block gateway, wait until it serves on its port. Something
+    /// else answering there (the port was taken between being picked and
+    /// being bound) fails the start, so it is retried on fresh ports.
+    fn wait_block_gateway(&mut self, deadline: Instant) -> Result<(), String> {
+        use objectio_proto::block::ListVolumesRequest;
+        use objectio_proto::block::block_service_client::BlockServiceClient;
+
+        let Some(port) = self.arg("--block-port").map(ToString::to_string) else {
+            return Ok(());
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let mut last = String::from("no answer");
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!("objectio-aio exited during startup with {status}"));
+            }
+            let answer = rt.block_on(async {
+                let mut client = BlockServiceClient::connect(format!("http://127.0.0.1:{port}"))
+                    .await
+                    .map_err(|e| (false, e.to_string()))?;
+                client
+                    .list_volumes(ListVolumesRequest::default())
+                    .await
+                    .map_err(|s| (s.code() == tonic::Code::Unimplemented, s.to_string()))
+            });
+            match answer {
+                Ok(_) if self.nbd_is_ours() => return Ok(()),
+                Ok(_) => {
+                    last = "something other than the block gateway holds its NBD port".into();
+                    break;
+                }
+                Err((true, _)) => {
+                    last = format!("something other than the block gateway holds :{port}");
+                    break;
+                }
+                Err((false, e)) => last = e,
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Err(format!("the block gateway did not come up — {last}"))
+    }
+
+    /// Whether the NBD port, if there is one, opens with the NBD handshake.
+    fn nbd_is_ours(&self) -> bool {
+        use std::io::Read;
+        let Some(port) = self.arg("--nbd-port") else {
+            return true;
+        };
+        let mut magic = [0u8; 8];
+        std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .and_then(|mut s| {
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                s.read_exact(&mut magic)
+            })
+            .is_ok()
+            && &magic == b"NBDMAGIC"
     }
 
     /// Build a presigned URL: `SigV4` credentials in the query string, no
