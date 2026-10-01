@@ -110,6 +110,26 @@ pub struct Args {
     pub raft_advertise: String,
 }
 
+/// Raft settings for the meta cluster.
+///
+/// Snapshots are never built. The state machine's snapshot is still a stub
+/// (empty, and installing one does nothing), and under openraft's default
+/// policy (a snapshot every 5,000 entries, then the log purged to the last
+/// 1,000) a replica that fell further behind, or a newly added one, caught
+/// up from that empty snapshot and silently missed everything before it.
+/// Until real snapshots exist the log is kept whole: it grows, but every
+/// replica can always be caught up from it.
+fn raft_config() -> openraft::Config {
+    openraft::Config {
+        cluster_name: "objectio-meta".into(),
+        heartbeat_interval: 250,
+        election_timeout_min: 500,
+        election_timeout_max: 1000,
+        snapshot_policy: openraft::SnapshotPolicy::Never,
+        ..Default::default()
+    }
+}
+
 /// Run the metadata service until `shutdown` resolves. The caller is
 /// responsible for:
 ///   - building `args` (e.g. from `Args::parse()` in the bin, or
@@ -278,17 +298,7 @@ pub async fn run(
     meta_service.spawn_apply_listener(apply_rx);
     let raft_storage = objectio_meta_store::MetaRaftStorage::with_apply_listener(raft_db, apply_tx);
     let (log_store, state_machine) = openraft::storage::Adaptor::new(raft_storage);
-    let raft_config = Arc::new(
-        openraft::Config {
-            cluster_name: "objectio-meta".into(),
-            heartbeat_interval: 250,
-            election_timeout_min: 500,
-            election_timeout_max: 1000,
-            ..Default::default()
-        }
-        .validate()
-        .expect("raft config valid"),
-    );
+    let raft_config = Arc::new(raft_config().validate().expect("raft config valid"));
     let network = objectio_meta_store::MetaRaftNetworkFactory::new(node_id);
     let raft = openraft::Raft::<objectio_meta_store::MetaTypeConfig>::new(
         node_id,
@@ -693,4 +703,14 @@ async fn start_metrics_server(port: u16, state: Arc<MetaMetricsState>) -> Result
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod raft_config_tests {
+    /// Purging the log is only safe once snapshots carry the state.
+    #[test]
+    fn the_log_is_never_compacted_into_an_empty_snapshot() {
+        let c = super::raft_config().validate().unwrap();
+        assert!(matches!(c.snapshot_policy, openraft::SnapshotPolicy::Never));
+    }
 }
