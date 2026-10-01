@@ -2475,6 +2475,7 @@ dependencies = [
  "bincode",
  "clap",
  "config",
+ "crc32c",
  "futures",
  "hex",
  "md5",

@@ -959,6 +959,24 @@ impl StorageService for OsdService {
         };
         let bytes_in = data.len() as u64;
 
+        // Over rdma the staging slot has already checked this. Bytes in the
+        // message are checked here, before a block is allocated, so a shard
+        // damaged on the way is refused rather than stored and later served
+        // as good under a checksum computed from the damage. A writer that
+        // sends no checksum is still accepted.
+        let crc32c = crc32c::crc32c(data);
+        if staged.is_none()
+            && let Some(expected) = req.checksum.as_ref().map(|c| c.crc32c)
+            && expected != crc32c
+        {
+            self.grpc_metrics
+                .write_shard
+                .record(false, start.elapsed().as_micros() as u64, 0, 0);
+            return Err(Status::data_loss(format!(
+                "shard has crc32c {crc32c:08x}, expected {expected:08x}"
+            )));
+        }
+
         debug!(
             "WriteShard: object={}, stripe={}, pos={}, size={}",
             hex::encode(&shard_id.object_id),
@@ -995,9 +1013,6 @@ impl StorageService for OsdService {
 
         disk.sync()
             .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
-
-        // Calculate checksum
-        let crc32c = crc32c::crc32c(data);
 
         // Store location in index
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
@@ -2062,6 +2077,120 @@ mod shard_index_tests {
     fn an_empty_store_rebuilds_to_an_empty_index() {
         let (_dir, s) = store();
         assert!(OsdService::load_persisted_shard_index(&s).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod grpc_write_tests {
+    //! Shards sent as bytes in the WriteShard message.
+
+    use super::*;
+    use objectio_proto::storage::ShardId;
+    use objectio_proto::storage::storage_service_server::StorageService;
+
+    fn osd() -> (tempfile::TempDir, OsdService) {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap();
+        (dir, osd)
+    }
+
+    fn shard_id() -> ShardId {
+        ShardId {
+            object_id: vec![9; 16],
+            stripe_id: 0,
+            position: 1,
+        }
+    }
+
+    fn write_request(data: &[u8], crc: Option<u32>) -> WriteShardRequest {
+        WriteShardRequest {
+            shard_id: Some(shard_id()),
+            data: data.to_vec().into(),
+            ec_k: 4,
+            ec_m: 2,
+            checksum: crc.map(|crc32c| Checksum {
+                crc32c,
+                ..Default::default()
+            }),
+            rdma: None,
+        }
+    }
+
+    async fn read_back(osd: &OsdService) -> Result<ReadShardResponse, Status> {
+        osd.read_shard(Request::new(ReadShardRequest {
+            shard_id: Some(shard_id()),
+            ..Default::default()
+        }))
+        .await
+        .map(Response::into_inner)
+    }
+
+    fn free_space(osd: &OsdService) -> u64 {
+        osd.disks.iter().map(DiskManager::free_space).sum()
+    }
+
+    /// The gRPC twin of the rdma test of the same name: bytes damaged on the
+    /// way must not be stored under a checksum computed from the damage.
+    #[tokio::test]
+    async fn a_shard_that_does_not_match_its_checksum_is_refused_and_not_stored() {
+        let (_dir, osd) = osd();
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let free_before = free_space(&osd);
+        let wrong = crc32c::crc32c(&data) ^ 1;
+
+        let err = osd
+            .write_shard(Request::new(write_request(&data, Some(wrong))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+
+        let err = read_back(&osd).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::NotFound,
+            "a refused shard was indexed"
+        );
+        assert_eq!(
+            free_space(&osd),
+            free_before,
+            "a refused shard kept its blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shard_that_matches_its_checksum_is_stored() {
+        let (_dir, osd) = osd();
+        let data = vec![0x5a; 70_000];
+        osd.write_shard(Request::new(write_request(
+            &data,
+            Some(crc32c::crc32c(&data)),
+        )))
+        .await
+        .unwrap();
+
+        let resp = read_back(&osd).await.unwrap();
+        assert_eq!(&resp.data[..], &data[..]);
+        assert_eq!(resp.checksum.unwrap().crc32c, crc32c::crc32c(&data));
+    }
+
+    /// Older writers send no checksum; they keep working, and the OSD
+    /// records the checksum of what it got.
+    #[tokio::test]
+    async fn a_shard_without_a_checksum_is_still_stored() {
+        let (_dir, osd) = osd();
+        let data = b"no checksum from this writer".to_vec();
+        osd.write_shard(Request::new(write_request(&data, None)))
+            .await
+            .unwrap();
+
+        let resp = read_back(&osd).await.unwrap();
+        assert_eq!(&resp.data[..], &data[..]);
+        assert_eq!(resp.checksum.unwrap().crc32c, crc32c::crc32c(&data));
     }
 }
 

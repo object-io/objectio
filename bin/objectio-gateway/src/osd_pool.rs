@@ -22,6 +22,9 @@ pub enum OsdPoolError {
     #[error("no nodes available")]
     #[allow(dead_code)]
     NoNodesAvailable,
+
+    #[error("shard checksum mismatch: {0}")]
+    ChecksumMismatch(String),
 }
 
 /// Node identifier (16-byte UUID)
@@ -285,6 +288,12 @@ fn rdma_failure(
     reason
 }
 
+/// Whether `data` is the shard the OSD described. A response without a
+/// checksum is taken as is: the field is optional on the wire.
+fn matches_checksum(checksum: Option<&objectio_proto::storage::Checksum>, data: &[u8]) -> bool {
+    checksum.is_none_or(|c| c.crc32c == crc32c::crc32c(data))
+}
+
 /// One WriteShard call, with the gateway's timeout and error accounting.
 async fn call_write_shard(
     pool: &OsdPool,
@@ -442,7 +451,15 @@ pub async fn write_shard_to_osd(
         data,
         rdma: None,
     };
-    let location = call_write_shard(pool, placement, request).await?;
+    let location = call_write_shard(pool, placement, request)
+        .await
+        .inspect_err(|e| {
+            // The OSD refuses bytes that do not match the checksum sent
+            // with them: the shard was damaged between here and there.
+            if matches!(e, ShardCallError::Status(s) if s.code() == tonic::Code::DataLoss) {
+                crate::gateway_metrics::record_shard_checksum_mismatch("write");
+            }
+        })?;
     crate::gateway_metrics::record_shard_transfer("write", "grpc");
     Ok(location)
 }
@@ -494,8 +511,7 @@ pub async fn read_shard_from_osd(
                                 Fallback::Error
                             } else {
                                 let bytes = slot.into_bytes(len);
-                                let expected = resp.checksum.map(|c| c.crc32c);
-                                if expected.is_none_or(|c| c == crc32c::crc32c(&bytes)) {
+                                if matches_checksum(resp.checksum.as_ref(), &bytes) {
                                     crate::gateway_metrics::record_shard_transfer("read", "rdma");
                                     return Ok(bytes);
                                 }
@@ -533,6 +549,20 @@ pub async fn read_shard_from_osd(
         length: 0, // 0 means read all
     };
     let response = call_read_shard(pool, placement, request).await?;
+    // The same check the rdma path makes. A shard damaged on the way is a
+    // failed read, so the caller moves on to another shard or replica
+    // instead of decoding the damage into the object.
+    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+        crate::gateway_metrics::record_shard_checksum_mismatch("read");
+        warn!(
+            "shard {position} from {} does not match its checksum; not using it",
+            placement.node_address
+        );
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} from {}",
+            placement.node_address
+        )));
+    }
     crate::gateway_metrics::record_shard_transfer("read", "grpc");
     Ok(response.data)
 }
@@ -918,4 +948,46 @@ pub async fn copy_object_meta_on_osd(
     response.into_inner().object.ok_or_else(|| {
         OsdPoolError::ConnectionFailed("missing object in CopyObjectMetaResponse".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_checksum;
+    use objectio_proto::storage::Checksum;
+
+    fn checksum(crc32c: u32) -> Checksum {
+        Checksum {
+            crc32c,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_shard_matches_the_checksum_of_its_own_bytes() {
+        let data = b"a shard as the osd stored it";
+        assert!(matches_checksum(
+            Some(&checksum(crc32c::crc32c(data))),
+            data
+        ));
+    }
+
+    /// Without this a shard damaged between OSD and gateway is decoded into
+    /// the object and handed to the client as good.
+    #[test]
+    fn a_damaged_shard_does_not_match() {
+        let data = b"a shard as the osd stored it".to_vec();
+        let sent = checksum(crc32c::crc32c(&data));
+        let mut damaged = data;
+        damaged[3] ^= 0x10;
+        assert!(!matches_checksum(Some(&sent), &damaged));
+        assert!(!matches_checksum(
+            Some(&sent),
+            &damaged[..damaged.len() - 1]
+        ));
+    }
+
+    #[test]
+    fn a_response_without_a_checksum_is_taken_as_is() {
+        assert!(matches_checksum(None, b"anything"));
+    }
 }

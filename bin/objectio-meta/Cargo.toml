@@ -22,6 +22,8 @@ objectio-proto = { workspace = true }
 # one instead of failing the whole object.
 objectio-erasure = { workspace = true }
 futures = { workspace = true }
+# Shards the drain migrator moves are checked on read and on write.
+crc32c = { workspace = true }
 openraft = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
