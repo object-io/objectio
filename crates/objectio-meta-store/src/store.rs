@@ -1368,6 +1368,42 @@ impl MetaStore {
         }
     }
 
+    /// Write a row of a table by name (for state kept only as raw bytes,
+    /// such as the block metadata tables), when Raft is not in use.
+    pub fn put_raw(&self, table: &str, key: &str, data: &[u8]) {
+        if let Err(e) = self.put_bytes(redb::TableDefinition::new(table), key, data) {
+            error!("Failed to persist {table}/{key}: {e}");
+        }
+    }
+
+    pub fn delete_raw(&self, table: &str, key: &str) {
+        if let Err(e) = self.delete_key(redb::TableDefinition::<&str, &[u8]>::new(table), key) {
+            error!("Failed to delete {table}/{key}: {e}");
+        }
+    }
+
+    /// Every row of a table by name; empty if it does not exist yet.
+    pub fn load_all_raw(&self, table: &str) -> Vec<(String, Vec<u8>)> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let t = match read_txn.open_table(redb::TableDefinition::<&str, &[u8]>::new(table)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Vec::new(),
+            Err(e) => {
+                error!("Failed to open {table}: {e}");
+                return Vec::new();
+            }
+        };
+        t.iter()
+            .map(|it| {
+                it.flatten()
+                    .map(|e| (e.0.value().to_string(), e.1.value().to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn put_stripe_refs(&self, key: &str, data: &[u8]) {
         if let Err(e) = self.put_bytes(tables::STRIPE_REFS, key, data) {
             error!("Failed to persist stripe refs for '{key}': {e}");

@@ -1,5 +1,7 @@
 //! Metadata gRPC service implementation
 
+mod block_meta;
+
 use objectio_common::{NodeId, NodeStatus};
 use objectio_meta_store::{
     CasTable, EcConfig, MetaStore, MultipartUploadState, OsdNode, PartState, StoredAccessKey,
@@ -664,6 +666,11 @@ pub struct MetaService {
     /// Shared stripes and who references them, by stripe id in hex. See
     /// `share_stripes`.
     stripe_refs: RwLock<HashMap<String, objectio_proto::metadata::StripeRefs>>,
+    /// Block volumes, chunk maps and snapshots, as stored. See `block_meta`.
+    block: RwLock<block_meta::BlockTables>,
+    /// Serializes block metadata changes on this node, so a multi-step
+    /// change (a snapshot copying a chunk map) is not raced by another.
+    block_lock: tokio::sync::Mutex<()>,
     /// Lifecycle configurations: bucket_name -> LifecycleConfiguration
     lifecycle_configs: RwLock<HashMap<String, LifecycleConfiguration>>,
     /// Bucket default SSE configurations: bucket_name -> BucketSseConfiguration
@@ -904,6 +911,8 @@ impl MetaService {
             placement_groups: RwLock::new(HashMap::new()),
             object_lock_configs: RwLock::new(HashMap::new()),
             stripe_refs: RwLock::new(HashMap::new()),
+            block: RwLock::new(block_meta::BlockTables::default()),
+            block_lock: tokio::sync::Mutex::new(()),
             lifecycle_configs: RwLock::new(HashMap::new()),
             bucket_encryption_configs: RwLock::new(HashMap::new()),
             kms_keys: RwLock::new(HashMap::new()),
@@ -1023,6 +1032,9 @@ impl MetaService {
                         CasTable::Tenants => svc.apply_tenant_event(&key, new_value.as_deref()),
                         CasTable::Named(ref t) if t == "stripe_refs" => {
                             svc.apply_stripe_refs_event(&key, new_value.as_deref());
+                        }
+                        CasTable::Named(ref t) if block_meta::TABLES.contains(&t.as_str()) => {
+                            svc.apply_block_event(t, &key, new_value.as_deref());
                         }
                         // Tables not yet covered by a cache refresh:
                         // writers are responsible for mirroring their
@@ -2464,6 +2476,9 @@ impl MetaService {
                 }
             }
             info!("Loaded {} shared stripes from store", map.len());
+        }
+        {
+            self.load_block_tables(store);
         }
 
         // Object lock configs
@@ -10149,6 +10164,114 @@ impl MetadataService for MetaService {
             }
         }
         Err(Status::aborted("stripe references kept changing; retry"))
+    }
+
+    async fn block_create_volume(
+        &self,
+        request: Request<objectio_proto::metadata::BlockCreateVolumeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockVolumeResponse>, Status> {
+        Ok(Response::new(
+            self.block_create_volume_impl(request.into_inner()).await?,
+        ))
+    }
+
+    async fn block_get_volume(
+        &self,
+        request: Request<objectio_proto::metadata::BlockGetVolumeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockVolumeResponse>, Status> {
+        Ok(Response::new(
+            self.block_get_volume_impl(request.get_ref())?,
+        ))
+    }
+
+    async fn block_list_volumes(
+        &self,
+        _request: Request<objectio_proto::metadata::BlockListVolumesRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockListVolumesResponse>, Status> {
+        Ok(Response::new(self.block_list_volumes_impl()))
+    }
+
+    async fn block_update_volume(
+        &self,
+        request: Request<objectio_proto::metadata::BlockUpdateVolumeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockVolumeResponse>, Status> {
+        Ok(Response::new(
+            self.block_update_volume_impl(request.into_inner()).await?,
+        ))
+    }
+
+    async fn block_delete_volume(
+        &self,
+        request: Request<objectio_proto::metadata::BlockDeleteVolumeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockReleaseResponse>, Status> {
+        Ok(Response::new(
+            self.block_delete_volume_impl(request.into_inner()).await?,
+        ))
+    }
+
+    async fn block_get_chunks(
+        &self,
+        request: Request<objectio_proto::metadata::BlockGetChunksRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockGetChunksResponse>, Status> {
+        Ok(Response::new(
+            self.block_get_chunks_impl(request.get_ref())?,
+        ))
+    }
+
+    async fn block_commit_chunks(
+        &self,
+        request: Request<objectio_proto::metadata::BlockCommitChunksRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockReleaseResponse>, Status> {
+        Ok(Response::new(
+            self.block_commit_chunks_impl(request.into_inner()).await?,
+        ))
+    }
+
+    async fn block_create_snapshot(
+        &self,
+        request: Request<objectio_proto::metadata::BlockCreateSnapshotRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockSnapshotResponse>, Status> {
+        Ok(Response::new(
+            self.block_create_snapshot_impl(request.into_inner())
+                .await?,
+        ))
+    }
+
+    async fn block_get_snapshot(
+        &self,
+        request: Request<objectio_proto::metadata::BlockGetSnapshotRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockSnapshotResponse>, Status> {
+        Ok(Response::new(
+            self.block_get_snapshot_impl(request.get_ref())?,
+        ))
+    }
+
+    async fn block_list_snapshots(
+        &self,
+        request: Request<objectio_proto::metadata::BlockListSnapshotsRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockListSnapshotsResponse>, Status> {
+        Ok(Response::new(
+            self.block_list_snapshots_impl(request.get_ref()),
+        ))
+    }
+
+    async fn block_delete_snapshot(
+        &self,
+        request: Request<objectio_proto::metadata::BlockDeleteSnapshotRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockReleaseResponse>, Status> {
+        Ok(Response::new(
+            self.block_delete_snapshot_impl(request.into_inner())
+                .await?,
+        ))
+    }
+
+    async fn block_clone_volume(
+        &self,
+        request: Request<objectio_proto::metadata::BlockCloneVolumeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::BlockVolumeResponse>, Status> {
+        Ok(Response::new(
+            self.block_clone_volume_impl(request.into_inner()).await?,
+        ))
     }
 
     async fn set_bucket_dedup(
