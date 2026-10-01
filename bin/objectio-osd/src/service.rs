@@ -850,6 +850,39 @@ impl OsdService {
             .and_then(|v| ObjectMeta::decode(&v[..]).ok())
     }
 
+    /// Whether a `PutObjectMeta` that expects `expected` (empty: anything)
+    /// may replace `current`. No current entry passes, unless
+    /// `require_existing`.
+    fn precondition_holds(
+        current: Option<&ObjectMeta>,
+        expected: &[u8],
+        require_existing: bool,
+    ) -> bool {
+        if expected.is_empty() {
+            return true;
+        }
+        current.map_or(!require_existing, |c| c.object_id == expected)
+    }
+
+    /// Whether `object` is also stored as a version of `bucket/key`, which
+    /// keeps its shards referenced after it stops being current.
+    fn version_entry_holds(
+        store: &MetadataStore,
+        bucket: &str,
+        key: &str,
+        object: &ObjectMeta,
+    ) -> bool {
+        !object.version_id.is_empty()
+            && store
+                .get(&MetadataKey::object_version(
+                    bucket,
+                    key,
+                    &object.version_id,
+                ))
+                .and_then(|v| ObjectMeta::decode(&v[..]).ok())
+                .is_some_and(|v| v.object_id == object.object_id)
+    }
+
     /// Get gRPC metrics
     pub fn grpc_metrics(&self) -> &Arc<GrpcMetrics> {
         &self.grpc_metrics
@@ -1653,12 +1686,9 @@ impl StorageService for OsdService {
         // Always store as current version at m:{bucket}\0{key}
         let key = MetadataKey::object_meta(&req.bucket, &req.key);
         let old = self.stored_meta(&key);
-        if !req.expected_object_id.is_empty()
-            && old.as_ref().map(|o| o.object_id.as_slice())
-                != Some(req.expected_object_id.as_slice())
-        {
+        if !Self::precondition_holds(old.as_ref(), &req.expected_object_id, req.require_existing) {
             return Err(Status::failed_precondition(format!(
-                "{}/{} is no longer the object it was",
+                "{}/{} is no longer the object this write was built from",
                 req.bucket, req.key
             )));
         }
@@ -1687,9 +1717,19 @@ impl StorageService for OsdService {
             req.bucket, req.key, object.size, object.version_id
         );
 
+        // Hand back what this write displaced, read under the same key lock
+        // as the write, so the caller can free its shards. Whether a version
+        // entry still holds it is checked after this write's own version
+        // entry has gone in.
+        let replaced_version_kept = old
+            .as_ref()
+            .is_some_and(|o| Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, o));
+
         Ok(Response::new(PutObjectMetaResponse {
             success: true,
             timestamp,
+            replaced: old,
+            replaced_version_kept,
         }))
     }
 
@@ -2567,15 +2607,40 @@ mod integrity_tests {
         object: ObjectMeta,
         expected: &[u8],
     ) -> Result<(), tonic::Status> {
+        put_as(osd, object, expected, false).await
+    }
+
+    async fn put_as(
+        osd: &OsdService,
+        object: ObjectMeta,
+        expected: &[u8],
+        require_existing: bool,
+    ) -> Result<(), tonic::Status> {
         osd.put_object_meta(Request::new(PutObjectMetaRequest {
             bucket: "b".into(),
             key: "k".into(),
             object: Some(object),
             versioning_enabled: false,
             expected_object_id: expected.to_vec(),
+            require_existing,
         }))
         .await
         .map(drop)
+    }
+
+    /// The repairer must not bring back an object deleted after it read it;
+    /// shard migration, writing to an OSD with no copy yet, must get through.
+    #[tokio::test]
+    async fn an_absent_object_refuses_a_write_only_when_one_is_required() {
+        let (_dir, osd) = osd();
+        let err = put_as(&osd, meta(1), &[1; 16], true).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            osd.stored_meta(&MetadataKey::object_meta("b", "k"))
+                .is_none(),
+            "a deleted object came back"
+        );
+        put_as(&osd, meta(1), &[1; 16], false).await.unwrap();
     }
 
     /// The repairer's update must not undo a PUT that replaced the object
@@ -2777,5 +2842,117 @@ mod rdma_tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+    }
+}
+
+#[cfg(test)]
+mod object_meta_tests {
+    //! What `PutObjectMeta` tells the gateway about the object it replaced,
+    //! which is what the gateway frees.
+
+    use super::*;
+    use objectio_proto::storage::storage_service_server::StorageService;
+
+    fn osd() -> (tempfile::TempDir, OsdService) {
+        let dir = tempfile::tempdir().unwrap();
+        let osd = OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap();
+        (dir, osd)
+    }
+
+    fn object(id: u8, version_id: &str) -> ObjectMeta {
+        ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            object_id: vec![id; 16],
+            version_id: version_id.into(),
+            size: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn put(
+        osd: &OsdService,
+        object: ObjectMeta,
+        versioning: bool,
+        expected: &[u8],
+    ) -> Result<PutObjectMetaResponse, Status> {
+        osd.put_object_meta(Request::new(PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(object),
+            versioning_enabled: versioning,
+            expected_object_id: expected.to_vec(),
+            require_existing: false,
+        }))
+        .await
+        .map(Response::into_inner)
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_hands_back_the_object_it_replaced() {
+        let (_dir, osd) = osd();
+        let first = put(&osd, object(1, ""), false, &[]).await.unwrap();
+        assert!(first.replaced.is_none(), "a new key replaced something");
+
+        let second = put(&osd, object(2, ""), false, &[]).await.unwrap();
+        assert_eq!(second.replaced.unwrap().object_id, vec![1; 16]);
+        assert!(!second.replaced_version_kept);
+    }
+
+    /// With versioning the replaced object is still a version: its shards
+    /// are referenced, and the response says so.
+    #[tokio::test]
+    async fn a_replaced_object_kept_as_a_version_is_flagged() {
+        let (_dir, osd) = osd();
+        put(&osd, object(1, "v1"), true, &[]).await.unwrap();
+        let second = put(&osd, object(2, "v2"), true, &[]).await.unwrap();
+        assert_eq!(second.replaced.unwrap().object_id, vec![1; 16]);
+        assert!(second.replaced_version_kept);
+
+        // Suspended versioning: the new write keeps no version, but the
+        // one it replaces still has its own.
+        let third = put(&osd, object(3, ""), false, &[]).await.unwrap();
+        assert!(third.replaced_version_kept);
+        let fourth = put(&osd, object(4, ""), false, &[]).await.unwrap();
+        assert!(!fourth.replaced_version_kept, "a null version is not kept");
+    }
+
+    /// A read-modify-write built from an object a newer PUT has replaced
+    /// must not put it back: that PUT has freed its shards.
+    #[tokio::test]
+    async fn a_write_expecting_a_replaced_object_is_refused() {
+        let (_dir, osd) = osd();
+        put(&osd, object(1, ""), false, &[]).await.unwrap();
+        put(&osd, object(2, ""), false, &[]).await.unwrap();
+
+        let err = put(&osd, object(1, ""), false, &[1; 16]).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let current = osd
+            .get_object_meta(Request::new(GetObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(current.object.unwrap().object_id, vec![2; 16]);
+
+        // Expecting the current object, or writing to a key with none, is
+        // allowed.
+        put(&osd, object(2, ""), false, &[2; 16]).await.unwrap();
+        osd.delete_object_meta(Request::new(DeleteObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: String::new(),
+        }))
+        .await
+        .unwrap();
+        put(&osd, object(5, ""), false, &[9; 16]).await.unwrap();
     }
 }

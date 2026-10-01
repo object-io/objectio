@@ -367,3 +367,116 @@ fn a_read_only_key_cannot_upload_parts() {
         init.text()
     );
 }
+
+/// 1 MiB, distinct per `seed`. A part that is also the last may be any size.
+fn mib(seed: u8) -> Vec<u8> {
+    (0..1024 * 1024u32)
+        .map(|i| u8::try_from(i % 251).unwrap() ^ seed)
+        .collect()
+}
+
+fn ec_cluster(osds: usize, bucket: &str) -> Cluster {
+    let c = Cluster::start_with_ec(osds, 4, 2);
+    c.json("POST", "/_admin/buckets", json!({ "name": bucket }))
+        .expect_ok();
+    c
+}
+
+/// Uploading a part number again replaces the part, and the replaced part's
+/// shards are freed rather than left referenced by nothing.
+#[test]
+fn reuploading_a_part_frees_the_part_it_replaced() {
+    let c = ec_cluster(6, "mpu-redo");
+    let baseline = c.total_used_bytes();
+    let upload = initiate(&c, "mpu-redo", "k");
+    upload_part(&c, "mpu-redo", "k", &upload, 1, &mib(1));
+    let one = c.total_used_bytes() - baseline;
+
+    let etag = upload_part(&c, "mpu-redo", "k", &upload, 1, &mib(2));
+    assert_eq!(
+        c.await_total_used_bytes(baseline + one) - baseline,
+        one,
+        "the replaced part's shards are still allocated"
+    );
+
+    complete(&c, "mpu-redo", "k", &upload, &[(1, etag)]).expect_ok();
+    let got = c.request("GET", "/mpu-redo/k", &[]);
+    got.expect(200);
+    assert!(got.bytes == mib(2), "the object is not the second upload");
+    assert_eq!(c.await_total_used_bytes(baseline + one) - baseline, one);
+}
+
+/// Parts uploaded but left out of the completion are not part of any
+/// object, and are freed when the upload completes.
+#[test]
+fn parts_left_out_of_a_completion_are_freed() {
+    let c = ec_cluster(6, "mpu-subset");
+    let baseline = c.total_used_bytes();
+    let upload = initiate(&c, "mpu-subset", "k");
+    let first = upload_part(&c, "mpu-subset", "k", &upload, 1, &mib(1));
+    let one = c.total_used_bytes() - baseline;
+    upload_part(&c, "mpu-subset", "k", &upload, 2, &mib(2));
+    upload_part(&c, "mpu-subset", "k", &upload, 3, &mib(3));
+
+    complete(&c, "mpu-subset", "k", &upload, &[(1, first)]).expect_ok();
+    assert!(c.request("GET", "/mpu-subset/k", &[]).bytes == mib(1));
+    assert_eq!(
+        c.await_total_used_bytes(baseline + one) - baseline,
+        one,
+        "parts 2 and 3 were left out of the object but kept their shards"
+    );
+}
+
+/// Completing an upload onto a key that already has an object replaces it,
+/// and frees it, as a plain PUT does.
+#[test]
+fn completing_onto_an_existing_key_frees_the_old_object() {
+    let c = ec_cluster(6, "mpu-over");
+    let baseline = c.total_used_bytes();
+    c.request("PUT", "/mpu-over/k", &mib(0)).expect(200);
+    let one = c.total_used_bytes() - baseline;
+
+    let upload = initiate(&c, "mpu-over", "k");
+    let etag = upload_part(&c, "mpu-over", "k", &upload, 1, &mib(1));
+    complete(&c, "mpu-over", "k", &upload, &[(1, etag)]).expect_ok();
+
+    assert!(c.request("GET", "/mpu-over/k", &[]).bytes == mib(1));
+    assert_eq!(
+        c.await_total_used_bytes(baseline + one) - baseline,
+        one,
+        "the object the completion replaced kept its shards"
+    );
+    c.request("DELETE", "/mpu-over/k", &[]).expect(204);
+    assert_eq!(c.await_total_used_bytes(baseline), baseline);
+}
+
+/// Abort frees each part where that part was placed. Parts are placed by
+/// their own key, not the object's, so with more OSDs than one stripe
+/// spans they land on OSDs the object's placement does not name.
+#[test]
+fn aborting_frees_parts_wherever_they_were_placed() {
+    let c = ec_cluster(9, "mpu-spread");
+    let baseline = c.total_used_bytes();
+    let upload = initiate(&c, "mpu-spread", "k");
+    for n in 1..=6u32 {
+        upload_part(
+            &c,
+            "mpu-spread",
+            "k",
+            &upload,
+            n,
+            &mib(u8::try_from(n).unwrap()),
+        );
+    }
+    assert!(c.total_used_bytes() > baseline);
+
+    c.request("DELETE", &format!("/mpu-spread/k?uploadId={upload}"), &[])
+        .expect(204);
+    let after = c.await_total_used_bytes(baseline);
+    assert_eq!(
+        after,
+        baseline,
+        "abort left {} bytes of parts allocated",
+        after.saturating_sub(baseline)
+    );
+}

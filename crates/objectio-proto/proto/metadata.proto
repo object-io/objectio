@@ -651,6 +651,9 @@ message PartInfo {
 
 message CompleteMultipartUploadResponse {
     ObjectMeta object = 1;
+    // Stripes of parts that were uploaded but left out of the object. The
+    // upload is gone, so nothing refers to them; the caller frees them.
+    repeated StripeMeta unused_stripes = 2;
 }
 
 message AbortMultipartUploadRequest {
@@ -661,6 +664,10 @@ message AbortMultipartUploadRequest {
 
 message AbortMultipartUploadResponse {
     bool success = 1;
+    // Stripes of every part the aborted upload held, taken out of the upload
+    // in the same step that dropped it, so the caller can free them without
+    // racing a CompleteMultipartUpload.
+    repeated StripeMeta stripes = 2;
 }
 
 message ListMultipartUploadsRequest {
@@ -699,6 +706,9 @@ message RegisterPartRequest {
 message RegisterPartResponse {
     bool success = 1;
     string etag = 2;            // Confirmed ETag
+    // Stripes of the part this one replaced (same part number uploaded
+    // again). Nothing refers to them any more; the caller frees them.
+    repeated StripeMeta replaced_stripes = 3;
 }
 
 // List parts of a multipart upload

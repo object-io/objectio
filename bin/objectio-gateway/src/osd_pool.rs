@@ -592,9 +592,34 @@ fn unique_node_placements(placements: &[NodePlacement]) -> Vec<NodePlacement> {
     out
 }
 
+/// A failed [`put_object_meta_to_all`].
+#[derive(Debug)]
+pub struct MetaWriteError {
+    pub error: OsdPoolError,
+    /// No replica can have applied the write: each one was unreachable or
+    /// refused it outright. Only then may the caller free the shards the
+    /// write would have referenced — after a timeout, or an error from
+    /// inside the OSD, a replica may hold the new ObjectMeta, and reads
+    /// served from it would find its shards gone.
+    pub unapplied: bool,
+}
+
+impl std::fmt::Display for MetaWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// Write ObjectMeta to every shard-carrying OSD in parallel. Requires all
 /// replicas to accept — any failure fails the PUT and the caller surfaces a
 /// retryable error to the S3 client.
+///
+/// `expected_object_id`, when not empty, makes each replica refuse the
+/// write unless its current ObjectMeta for the key is that object (or it
+/// has none): a read-modify-write must not put back an object that a PUT
+/// replaced, and freed, after the read.
+///
+/// Returns what each replica displaced, for the caller to free.
 pub async fn put_object_meta_to_all(
     pool: &OsdPool,
     placements: &[NodePlacement],
@@ -602,12 +627,16 @@ pub async fn put_object_meta_to_all(
     key: &str,
     object_meta: objectio_proto::metadata::ObjectMeta,
     versioning_enabled: bool,
-) -> Result<(), OsdPoolError> {
+    expected_object_id: &[u8],
+) -> Result<Vec<Displaced>, MetaWriteError> {
     use objectio_proto::storage::PutObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
     if targets.is_empty() {
-        return Err(OsdPoolError::NoNodesAvailable);
+        return Err(MetaWriteError {
+            error: OsdPoolError::NoNodesAvailable,
+            unapplied: true,
+        });
     }
 
     // Exactly one replica counts the object in usage. Chosen from the
@@ -620,38 +649,69 @@ pub async fn put_object_meta_to_all(
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
         let req = PutObjectMetaRequest {
-            expected_object_id: Vec::new(),
+            require_existing: false,
             bucket: bucket.to_string(),
             key: key.to_string(),
             object: Some(object_meta.clone()),
             versioning_enabled,
+            expected_object_id: expected_object_id.to_vec(),
         };
         let p = placement.clone();
+        // The bool on an error: this replica certainly did not apply it.
         futs.push(async move {
-            let mut client = pool.get_client_for_placement(&p).await?;
+            let mut client = pool
+                .get_client_for_placement(&p)
+                .await
+                .map_err(|e| (e, true))?;
             let fut = client.put_object_meta(req);
-            tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
                 .await
                 .map_err(|_| {
                     error!("Timeout putting object metadata to OSD {}", p.node_address);
-                    OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string())
+                    (
+                        OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
+                        false,
+                    )
                 })?
                 .map_err(|e| {
                     error!(
                         "Failed to put object metadata to OSD {}: {}",
                         p.node_address, e
                     );
-                    OsdPoolError::ConnectionFailed(e.to_string())
-                })?;
-            Ok::<_, OsdPoolError>(())
+                    let refused = matches!(
+                        e.code(),
+                        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                    );
+                    (OsdPoolError::ConnectionFailed(e.to_string()), refused)
+                })?
+                .into_inner();
+            Ok::<_, (OsdPoolError, bool)>(Displaced {
+                replaced: resp.replaced,
+                version_kept: resp.replaced_version_kept,
+            })
         });
     }
 
     let results = futures::future::join_all(futs).await;
+    let mut displaced = Vec::with_capacity(results.len());
+    let mut failure: Option<OsdPoolError> = None;
+    let mut unapplied = true;
     for r in results {
-        r?;
+        match r {
+            Ok(d) => {
+                unapplied = false;
+                displaced.push(d);
+            }
+            Err((e, refused)) => {
+                unapplied &= refused;
+                failure.get_or_insert(e);
+            }
+        }
     }
-    Ok(())
+    match failure {
+        Some(error) => Err(MetaWriteError { error, unapplied }),
+        None => Ok(displaced),
+    }
 }
 
 /// Read ObjectMeta from any shard-carrying OSD. Tries each placement in CRUSH
@@ -664,6 +724,18 @@ pub async fn get_object_meta_from_any(
     placements: &[NodePlacement],
     bucket: &str,
     key: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    get_object_version_meta_from_any(pool, placements, bucket, key, "").await
+}
+
+/// As [`get_object_meta_from_any`], for one version of the key; an empty
+/// `version_id` is the current object.
+pub async fn get_object_version_meta_from_any(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
     use objectio_proto::storage::GetObjectMetaRequest;
 
@@ -678,7 +750,7 @@ pub async fn get_object_meta_from_any(
         let req = GetObjectMetaRequest {
             bucket: bucket.to_string(),
             key: key.to_string(),
-            version_id: String::new(),
+            version_id: version_id.to_string(),
         };
         let client_res = pool.get_client_for_placement(placement).await;
         let mut client = match client_res {
@@ -840,79 +912,307 @@ pub async fn delete_object_meta_from_all(
     Ok(())
 }
 
-/// Delete every shard of an object from the OSDs that hold them.
+// ============================================================================
+// Shard reclamation
+//
+// A shard is referenced by the ObjectMeta that lists it, or by a multipart
+// upload's part, and by nothing else. Whatever stops referencing a shard —
+// a delete, an overwrite, a re-uploaded or abandoned part, a write that
+// failed half way — has to delete it, or its block stays allocated forever
+// with nothing left that knows where it is.
+// ============================================================================
+
+/// Why shards are being freed: the `reason` label on the reclaim metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reclaim {
+    /// The object was deleted.
+    Delete,
+    /// A write to the key replaced the object.
+    Overwrite,
+    /// The write that sent them failed before its object was committed.
+    FailedWrite,
+    /// The same part number was uploaded again.
+    ReplacedPart,
+    /// The part was uploaded but left out of the completed object.
+    UnusedPart,
+    /// The multipart upload was aborted.
+    Abort,
+}
+
+impl Reclaim {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Overwrite => "overwrite",
+            Self::FailedWrite => "failed_write",
+            Self::ReplacedPart => "replaced_part",
+            Self::UnusedPart => "unused_part",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+/// One shard to delete, and the OSD holding it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardTarget {
+    pub node_id: Vec<u8>,
+    /// The OSD's address when the caller knows it; empty to look it up.
+    pub address: String,
+    pub object_id: Vec<u8>,
+    pub stripe_id: u64,
+    pub position: u32,
+}
+
+/// Every shard `stripes` records, at the node its location names.
 ///
-/// Nothing did this. Deleting an object removed its metadata and its listing
-/// entry, so it vanished from the API, and left every shard on the platter
-/// forever — storage was write-once until the disk filled, at which point all
-/// writes failed. A cluster could report an empty bucket and a full disk at
-/// the same time.
+/// Routed by `ShardLocation::node_id` because that is where the shard is:
+/// a multipart object's parts are placed by their own keys, and a drained
+/// shard has moved, so the key's current placement can miss both.
+#[must_use]
+pub fn stripe_targets(stripes: &[objectio_proto::metadata::StripeMeta]) -> Vec<ShardTarget> {
+    let mut seen = std::collections::HashSet::new();
+    stripes
+        .iter()
+        .filter(|stripe| !stripe.object_id.is_empty())
+        .flat_map(|stripe| {
+            stripe.shards.iter().map(move |shard| ShardTarget {
+                node_id: shard.node_id.clone(),
+                address: String::new(),
+                object_id: stripe.object_id.clone(),
+                stripe_id: stripe.stripe_id,
+                position: shard.position,
+            })
+        })
+        .filter(|t| !t.node_id.is_empty() && seen.insert(t.clone()))
+        .collect()
+}
+
+/// The object ids whose shards `object` refers to: its own, and each
+/// stripe's (a multipart object's stripes carry their parts' ids).
+#[must_use]
+pub fn referenced_object_ids(
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> std::collections::HashSet<Vec<u8>> {
+    std::iter::once(object.object_id.clone())
+        .chain(object.stripes.iter().map(|s| s.object_id.clone()))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// What one replica's `PutObjectMeta` displaced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Displaced {
+    pub replaced: Option<objectio_proto::metadata::ObjectMeta>,
+    /// The replaced object is still held there as a version.
+    pub version_kept: bool,
+}
+
+/// Shards of the object an overwrite displaced, if it is safe to free them.
 ///
-/// The request is broadcast to every placement node rather than routed by
-/// `node_id`: an OSD that does not hold a given shard answers
-/// `success: false` and does nothing, which is cheaper than maintaining a
-/// node-to-address map here and is idempotent under retry.
+/// Only when every replica displaced the same object, and none still keeps
+/// it as a version. Each OSD applies writes to a key one at a time, but two
+/// concurrent PUTs can reach the replicas in different orders: then one
+/// replica reports the other PUT's object as replaced while another still
+/// holds it as current. Agreement across every replica rules that out — if
+/// all of them replaced X with this write, none of them holds X any more —
+/// and costs only a leaked object in the rare split case.
 ///
-/// Best-effort by design. A shard that cannot be deleted now is a leaked
-/// block, not a correctness problem — the object is already gone as far as
-/// every reader is concerned — so this never fails the caller's delete. It
-/// returns how many shards it could not place so the caller can log it.
-pub async fn delete_shards_for_object(
+/// `keep` is what the new object refers to; nothing in it is freed, which
+/// covers a metadata-only rewrite of the same object.
+#[must_use]
+pub fn reclaimable_after_overwrite(
+    replies: &[Displaced],
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<ShardTarget> {
+    let Some(first) = replies.first().and_then(|d| d.replaced.as_ref()) else {
+        return Vec::new();
+    };
+    let unanimous = replies.iter().all(|d| {
+        !d.version_kept
+            && d.replaced
+                .as_ref()
+                .is_some_and(|r| r.object_id == first.object_id)
+    });
+    if !unanimous || first.object_id.is_empty() || keep.contains(&first.object_id) {
+        return Vec::new();
+    }
+    // Replicas can disagree on where a shard is while a migration is
+    // refreshing them; deleting at every location any of them names is
+    // harmless where the shard is not.
+    let mut seen = std::collections::HashSet::new();
+    replies
+        .iter()
+        .filter_map(|d| d.replaced.as_ref())
+        .flat_map(|r| stripe_targets(&r.stripes))
+        .filter(|t| !keep.contains(&t.object_id) && seen.insert(t.clone()))
+        .collect()
+}
+
+/// Shards a write has sent to OSDs, freed again if the write is abandoned —
+/// an error return, or the request future being dropped mid-write.
+///
+/// Every shard is recorded when it is sent, not when it is acknowledged: a
+/// write that timed out may still have landed. [`Self::disarm`] hands the
+/// list over once the write's metadata commit begins, because from then on
+/// a replica may reference these shards and only the commit's outcome says
+/// whether they can go.
+pub struct PendingShards {
+    targets: Vec<ShardTarget>,
+    on_abandon: Option<Box<dyn FnOnce(Vec<ShardTarget>) + Send>>,
+}
+
+impl PendingShards {
+    pub fn new(on_abandon: impl FnOnce(Vec<ShardTarget>) + Send + 'static) -> Self {
+        Self {
+            targets: Vec::new(),
+            on_abandon: Some(Box::new(on_abandon)),
+        }
+    }
+
+    /// Record a shard about to be written to `placement`.
+    pub fn sent(
+        &mut self,
+        placement: &NodePlacement,
+        object_id: &[u8],
+        stripe_id: u64,
+        position: u32,
+    ) {
+        self.targets.push(ShardTarget {
+            node_id: placement.node_id.clone(),
+            address: placement.node_address.clone(),
+            object_id: object_id.to_vec(),
+            stripe_id,
+            position,
+        });
+    }
+
+    /// Stop freeing on drop; returns what was sent.
+    #[must_use]
+    pub fn disarm(mut self) -> Vec<ShardTarget> {
+        self.on_abandon = None;
+        std::mem::take(&mut self.targets)
+    }
+}
+
+impl Drop for PendingShards {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_abandon.take()
+            && !self.targets.is_empty()
+        {
+            f(std::mem::take(&mut self.targets));
+        }
+    }
+}
+
+/// How many shards [`reclaim_shards`] deletes at once.
+const RECLAIM_CONCURRENCY: usize = 64;
+
+/// Delete `targets` from the OSDs holding them, and count the outcome.
+///
+/// Best-effort by design: a shard that cannot be deleted now is a leaked
+/// block, not a correctness problem, so this never fails the caller. An OSD
+/// that does not hold a shard answers `success: false`, which is not a
+/// failure — deleting is idempotent under retry. Returns how many deletes
+/// failed.
+pub async fn reclaim_shards(
     pool: &OsdPool,
-    placements: &[NodePlacement],
-    stripes: &[objectio_proto::metadata::StripeMeta],
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    targets: Vec<ShardTarget>,
+    reason: Reclaim,
 ) -> usize {
+    use futures::StreamExt;
     use objectio_proto::storage::{DeleteShardRequest, ShardId};
 
-    let targets = unique_node_placements(placements);
-    if targets.is_empty() || stripes.is_empty() {
+    if targets.is_empty() {
         return 0;
     }
 
-    let mut futs = Vec::new();
-    for stripe in stripes {
-        // Multipart uploads write each part under its own object_id, so the
-        // id has to come from the stripe rather than the object.
-        let object_id = stripe.object_id.clone();
-        if object_id.is_empty() {
+    // One client per OSD: connected already, at an address the caller gave,
+    // or — after a restart, or for a node outside this request's placement —
+    // at the address meta has registered for it, asked once.
+    let mut clients: HashMap<Vec<u8>, StorageServiceClient<Channel>> = HashMap::new();
+    let mut addresses: HashMap<Vec<u8>, String> = targets
+        .iter()
+        .filter(|t| !t.address.is_empty())
+        .map(|t| (t.node_id.clone(), t.address.clone()))
+        .collect();
+    let mut asked_meta = false;
+    let node_ids: std::collections::HashSet<Vec<u8>> =
+        targets.iter().map(|t| t.node_id.clone()).collect();
+    for node_id in node_ids {
+        if let Ok(client) = pool.get_client(&node_id).await {
+            clients.insert(node_id, client);
             continue;
         }
-        for shard in &stripe.shards {
-            for placement in &targets {
-                let req = DeleteShardRequest {
-                    shard_id: Some(ShardId {
-                        object_id: object_id.clone(),
-                        stripe_id: stripe.stripe_id,
-                        position: shard.position,
-                    }),
-                };
-                let p = placement.clone();
-                futs.push(async move {
-                    let mut client = pool.get_client_for_placement(&p).await?;
-                    let fut = client.delete_shard(req);
-                    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-                        .await
-                        .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
-                        .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-                    Ok::<_, OsdPoolError>(resp.into_inner().success)
-                });
+        if !addresses.contains_key(&node_id) && !asked_meta {
+            asked_meta = true;
+            match meta
+                .get_listing_nodes(objectio_proto::metadata::GetListingNodesRequest {
+                    bucket: String::new(),
+                    include_all_states: true,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    for n in resp.into_inner().nodes {
+                        addresses.entry(n.node_id).or_insert(n.address);
+                    }
+                }
+                Err(e) => warn!("reclaim: could not list OSD addresses: {e}"),
             }
+        }
+        match addresses.get(&node_id) {
+            Some(addr) => match pool.get_or_connect(&node_id, addr).await {
+                Ok(client) => {
+                    clients.insert(node_id, client);
+                }
+                Err(e) => warn!("reclaim: cannot reach OSD {addr}: {e}"),
+            },
+            None => warn!("reclaim: no address for OSD {}", hex::encode(&node_id)),
         }
     }
 
-    let total = futs.len();
-    let results = futures::future::join_all(futs).await;
+    let results: Vec<Result<bool, OsdPoolError>> = futures::stream::iter(targets)
+        .map(|t| {
+            let client = clients.get(&t.node_id).cloned();
+            async move {
+                let mut client =
+                    client.ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
+                let req = DeleteShardRequest {
+                    shard_id: Some(ShardId {
+                        object_id: t.object_id,
+                        stripe_id: t.stripe_id,
+                        position: t.position,
+                    }),
+                };
+                let resp = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.delete_shard(req),
+                )
+                .await
+                .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                Ok(resp.into_inner().success)
+            }
+        })
+        .buffer_unordered(RECLAIM_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut reclaimed = 0u64;
     let mut failed = 0usize;
     for r in results {
-        if let Err(e) = r {
-            failed += 1;
-            warn!("delete_shard failed: {e}");
+        match r {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                failed += 1;
+                warn!("reclaim ({}): delete_shard failed: {e}", reason.label());
+            }
         }
     }
-    tracing::debug!(
-        "delete_shards_for_object: {} of {total} calls failed",
-        failed
-    );
+    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
     failed
 }
 
@@ -949,6 +1249,209 @@ pub async fn copy_object_meta_on_osd(
     response.into_inner().object.ok_or_else(|| {
         OsdPoolError::ConnectionFailed("missing object in CopyObjectMetaResponse".to_string())
     })
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+    use objectio_proto::metadata::{ObjectMeta, ShardLocation, StripeMeta};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// A stripe of object `id`, its shard at each position on node `n`+pos.
+    fn stripe(id: u8, stripe_id: u64, n: u8, shards: u32) -> StripeMeta {
+        StripeMeta {
+            stripe_id,
+            object_id: vec![id; 16],
+            shards: (0..shards)
+                .map(|position| ShardLocation {
+                    position,
+                    node_id: vec![n + u8::try_from(position).unwrap(); 16],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn object(id: u8, stripes: Vec<StripeMeta>) -> ObjectMeta {
+        ObjectMeta {
+            object_id: vec![id; 16],
+            stripes,
+            ..Default::default()
+        }
+    }
+
+    fn replaced(o: &ObjectMeta) -> Displaced {
+        Displaced {
+            replaced: Some(o.clone()),
+            version_kept: false,
+        }
+    }
+
+    fn keep(o: &ObjectMeta) -> HashSet<Vec<u8>> {
+        referenced_object_ids(o)
+    }
+
+    #[test]
+    fn shards_are_addressed_to_the_node_holding_them() {
+        let t = stripe_targets(&[stripe(1, 0, 10, 3), stripe(1, 1, 20, 3)]);
+        assert_eq!(t.len(), 6);
+        assert!(t.iter().all(|t| t.object_id == vec![1; 16]));
+        let s1: Vec<u8> = t
+            .iter()
+            .filter(|t| t.stripe_id == 1)
+            .map(|t| t.node_id[0])
+            .collect();
+        assert_eq!(s1, [20, 21, 22]);
+    }
+
+    /// Each part of a multipart object is its own object id, on its own
+    /// placement.
+    #[test]
+    fn a_multipart_objects_stripes_keep_their_parts_ids() {
+        let o = object(9, vec![stripe(1, 0, 10, 2), stripe(2, 0, 30, 2)]);
+        let ids: HashSet<Vec<u8>> = stripe_targets(&o.stripes)
+            .into_iter()
+            .map(|t| t.object_id)
+            .collect();
+        assert_eq!(ids, HashSet::from([vec![1; 16], vec![2; 16]]));
+        assert_eq!(keep(&o).len(), 3);
+    }
+
+    #[test]
+    fn an_agreed_overwrite_frees_the_old_object() {
+        let old = object(1, vec![stripe(1, 0, 10, 6)]);
+        let new = object(2, vec![stripe(2, 0, 10, 6)]);
+        let got = reclaimable_after_overwrite(&[replaced(&old), replaced(&old)], &keep(&new));
+        assert_eq!(got, stripe_targets(&old.stripes));
+    }
+
+    #[test]
+    fn a_new_key_frees_nothing() {
+        let new = object(2, vec![]);
+        assert!(reclaimable_after_overwrite(&[Displaced::default()], &keep(&new)).is_empty());
+        assert!(reclaimable_after_overwrite(&[], &keep(&new)).is_empty());
+    }
+
+    /// Two PUTs that reached the replicas in different orders: each sees the
+    /// other's object as replaced on some replica, while another replica
+    /// still holds it. Neither may free anything.
+    #[test]
+    fn replicas_that_disagree_free_nothing() {
+        let a = object(1, vec![stripe(1, 0, 10, 2)]);
+        let b = object(2, vec![stripe(2, 0, 10, 2)]);
+        let x = object(3, vec![stripe(3, 0, 10, 2)]);
+        assert!(reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a)).is_empty());
+        assert!(
+            reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_object_kept_as_a_version_is_not_freed() {
+        let old = object(1, vec![stripe(1, 0, 10, 2)]);
+        let new = object(2, vec![]);
+        let kept = Displaced {
+            replaced: Some(old.clone()),
+            version_kept: true,
+        };
+        assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
+    }
+
+    /// Retention, legal hold and shard migration rewrite the same object.
+    #[test]
+    fn rewriting_the_same_object_frees_nothing() {
+        let o = object(1, vec![stripe(1, 0, 10, 2)]);
+        assert!(reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)).is_empty());
+    }
+
+    /// Nothing the new object still refers to is freed, whatever the old
+    /// one was called.
+    #[test]
+    fn stripes_the_new_object_shares_are_kept() {
+        let old = object(1, vec![stripe(7, 0, 10, 2), stripe(8, 0, 20, 2)]);
+        let new = object(2, vec![stripe(8, 0, 20, 2)]);
+        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new));
+        assert!(got.iter().all(|t| t.object_id == vec![7; 16]));
+        assert_eq!(got.len(), 2);
+    }
+
+    /// While a migration refreshes the replicas they can name different
+    /// nodes for a shard; it is deleted wherever any of them says it is.
+    #[test]
+    fn locations_from_every_replica_are_freed() {
+        let here = object(1, vec![stripe(1, 0, 10, 2)]);
+        let moved = object(1, vec![stripe(1, 0, 40, 2)]);
+        let got = reclaimable_after_overwrite(
+            &[replaced(&here), replaced(&moved)],
+            &keep(&object(2, vec![])),
+        );
+        let nodes: HashSet<u8> = got.iter().map(|t| t.node_id[0]).collect();
+        assert_eq!(nodes, HashSet::from([10, 11, 40, 41]));
+    }
+
+    fn recorder() -> (Arc<Mutex<Vec<ShardTarget>>>, PendingShards) {
+        let freed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&freed);
+        let pending = PendingShards::new(move |t| sink.lock().unwrap().extend(t));
+        (freed, pending)
+    }
+
+    fn node(n: u8) -> NodePlacement {
+        NodePlacement {
+            node_id: vec![n; 16],
+            node_address: format!("http://osd{n}:9200"),
+            ..Default::default()
+        }
+    }
+
+    /// An error return, or the request being dropped mid-write, frees every
+    /// shard sent — acknowledged or not, since a timed-out write may land.
+    #[test]
+    fn an_abandoned_write_frees_every_shard_it_sent() {
+        let (freed, mut pending) = recorder();
+        pending.sent(&node(1), &[5; 16], 0, 0);
+        pending.sent(&node(2), &[5; 16], 0, 1);
+        drop(pending);
+        let freed = freed.lock().unwrap();
+        assert_eq!(freed.len(), 2);
+        assert_eq!(freed[1].address, "http://osd2:9200");
+        assert_eq!(freed[1].position, 1);
+    }
+
+    #[test]
+    fn a_write_that_reached_its_commit_frees_nothing_by_itself() {
+        let (freed, mut pending) = recorder();
+        pending.sent(&node(1), &[5; 16], 0, 0);
+        let sent = pending.disarm();
+        assert_eq!(sent.len(), 1);
+        assert!(freed.lock().unwrap().is_empty());
+    }
+
+    /// Reclaim against an OSD that cannot be reached counts a failure and
+    /// returns, rather than failing whatever triggered it.
+    #[tokio::test]
+    async fn an_unreachable_osd_is_counted_not_fatal() {
+        let pool = OsdPool::new();
+        let meta = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut meta =
+            objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta);
+        let target = ShardTarget {
+            node_id: vec![1; 16],
+            address: "http://127.0.0.1:1".into(),
+            object_id: vec![5; 16],
+            stripe_id: 0,
+            position: 0,
+        };
+        let failed = reclaim_shards(&pool, &mut meta, vec![target], Reclaim::FailedWrite).await;
+        assert_eq!(failed, 1);
+        assert!(
+            crate::gateway_metrics::render()
+                .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")
+        );
+    }
 }
 
 #[cfg(test)]

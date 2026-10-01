@@ -3781,7 +3781,9 @@ impl MetadataService for MetaService {
             last_modified: now,
             stripes: req.stripes, // Multiple stripes for large parts
         };
-        upload.parts.insert(req.part_number, part_state);
+        // The part this replaces is referenced by nothing once the insert
+        // lands; hand its stripes back so the gateway can free them.
+        let replaced = upload.parts.insert(req.part_number, part_state);
 
         // Persist entire upload state (includes new part)
         if let Some(store) = &self.store {
@@ -3796,6 +3798,7 @@ impl MetadataService for MetaService {
         Ok(Response::new(RegisterPartResponse {
             success: true,
             etag: req.etag,
+            replaced_stripes: replaced.map(|p| p.stripes).unwrap_or_default(),
         }))
     }
 
@@ -3862,13 +3865,14 @@ impl MetadataService for MetaService {
     ) -> Result<Response<CompleteMultipartUploadResponse>, Status> {
         let req = request.into_inner();
 
-        // Get the upload state
-        let upload = {
-            let uploads = self.multipart_uploads.read();
-            uploads.get(&req.upload_id).cloned().ok_or_else(|| {
-                Status::not_found(format!("multipart upload not found: {}", req.upload_id))
-            })?
-        };
+        // Validate and take the upload in one step under the write lock. A
+        // read-then-remove let an abort, or a part re-upload, land in
+        // between: the abort freed parts this completion went on to use, and
+        // a re-uploaded part was dropped with the upload, unreferenced.
+        let mut uploads = self.multipart_uploads.write();
+        let upload = uploads.get(&req.upload_id).ok_or_else(|| {
+            Status::not_found(format!("multipart upload not found: {}", req.upload_id))
+        })?;
 
         // Verify bucket/key match
         if upload.bucket != req.bucket || upload.key != req.key {
@@ -3947,8 +3951,20 @@ impl MetadataService for MetaService {
             ..Default::default()
         };
 
+        // Parts uploaded but not named in the completion belong to nothing
+        // once the upload is gone.
+        let used: std::collections::HashSet<u32> =
+            req.parts.iter().map(|p| p.part_number).collect();
+        let unused_stripes: Vec<_> = upload
+            .parts
+            .values()
+            .filter(|p| !used.contains(&p.part_number))
+            .flat_map(|p| p.stripes.iter().cloned())
+            .collect();
+
         // Remove the completed upload from state
-        self.multipart_uploads.write().remove(&req.upload_id);
+        uploads.remove(&req.upload_id);
+        drop(uploads);
 
         if let Some(store) = &self.store {
             store.delete_multipart_upload(&req.upload_id);
@@ -3965,6 +3981,7 @@ impl MetadataService for MetaService {
 
         Ok(Response::new(CompleteMultipartUploadResponse {
             object: Some(object),
+            unused_stripes,
         }))
     }
 
@@ -3974,8 +3991,21 @@ impl MetadataService for MetaService {
     ) -> Result<Response<AbortMultipartUploadResponse>, Status> {
         let req = request.into_inner();
 
-        // Remove the upload from state
-        let removed = self.multipart_uploads.write().remove(&req.upload_id);
+        // Remove the upload from state. Only the bucket/key it was started
+        // for may abort it: the caller frees every part it held.
+        let removed = {
+            let mut uploads = self.multipart_uploads.write();
+            if uploads
+                .get(&req.upload_id)
+                .is_some_and(|u| u.bucket != req.bucket || u.key != req.key)
+            {
+                return Err(Status::not_found(format!(
+                    "multipart upload not found: {}",
+                    req.upload_id
+                )));
+            }
+            uploads.remove(&req.upload_id)
+        };
 
         if removed.is_some() {
             if let Some(store) = &self.store {
@@ -3992,11 +4022,15 @@ impl MetadataService for MetaService {
             );
         }
 
-        // Note: Part data on OSDs should be cleaned up by background garbage collection
-        // using the __mpu/{upload_id}/* prefix
+        // The parts' shards are freed by the caller, from the stripes taken
+        // out here with the upload: nothing else records where they are.
+        let stripes = removed
+            .map(|u| u.parts.into_values().flat_map(|p| p.stripes).collect())
+            .unwrap_or_default();
 
         Ok(Response::new(AbortMultipartUploadResponse {
             success: true,
+            stripes,
         }))
     }
 
@@ -11076,5 +11110,144 @@ mod te_segment_tests {
             listed_segments(&svc).await,
             [(1, String::new()), (2, "10.0.0.2:15002".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod multipart_reclaim_tests {
+    //! The stripes meta hands back when a part, or a whole upload, stops
+    //! being referenced — the gateway frees exactly these.
+
+    use super::MetaService;
+    use objectio_proto::metadata::metadata_service_server::MetadataService;
+    use objectio_proto::metadata::{
+        AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CreateBucketRequest,
+        CreateMultipartUploadRequest, PartInfo, RegisterPartRequest, StripeMeta,
+    };
+    use tonic::Request;
+
+    fn stripe(id: u8) -> StripeMeta {
+        StripeMeta {
+            object_id: vec![id; 16],
+            ..Default::default()
+        }
+    }
+
+    async fn upload(svc: &MetaService) -> String {
+        svc.create_bucket(Request::new(CreateBucketRequest {
+            name: "b".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        svc.create_multipart_upload(Request::new(CreateMultipartUploadRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .upload_id
+    }
+
+    async fn register(svc: &MetaService, upload_id: &str, part: u32, id: u8) -> Vec<StripeMeta> {
+        svc.register_part(Request::new(RegisterPartRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: upload_id.into(),
+            part_number: part,
+            etag: format!("\"{id:032x}\""),
+            size: 1,
+            stripes: vec![stripe(id)],
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .replaced_stripes
+    }
+
+    fn ids(stripes: &[StripeMeta]) -> Vec<u8> {
+        let mut v: Vec<u8> = stripes.iter().map(|s| s.object_id[0]).collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[tokio::test]
+    async fn re_registering_a_part_returns_the_one_it_replaced() {
+        let svc = MetaService::new();
+        let id = upload(&svc).await;
+        assert!(register(&svc, &id, 1, 1).await.is_empty());
+        assert_eq!(ids(&register(&svc, &id, 1, 2).await), [1]);
+        assert!(register(&svc, &id, 2, 3).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_returns_the_parts_it_left_out() {
+        let svc = MetaService::new();
+        let id = upload(&svc).await;
+        for (part, sid) in [(1, 1), (2, 2), (3, 3)] {
+            register(&svc, &id, part, sid).await;
+        }
+        let resp = svc
+            .complete_multipart_upload(Request::new(CompleteMultipartUploadRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: id.clone(),
+                parts: vec![PartInfo {
+                    part_number: 2,
+                    etag: format!("\"{:032x}\"", 2),
+                    size: 0,
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ids(&resp.object.unwrap().stripes), [2]);
+        assert_eq!(ids(&resp.unused_stripes), [1, 3]);
+
+        // The upload is gone: an abort now frees nothing.
+        let abort = svc
+            .abort_multipart_upload(Request::new(AbortMultipartUploadRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            abort.stripes.is_empty(),
+            "abort freed a completed object's parts"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_returns_every_part_and_only_for_its_own_key() {
+        let svc = MetaService::new();
+        let id = upload(&svc).await;
+        register(&svc, &id, 1, 1).await;
+        register(&svc, &id, 2, 2).await;
+
+        let err = svc
+            .abort_multipart_upload(Request::new(AbortMultipartUploadRequest {
+                bucket: "b".into(),
+                key: "other".into(),
+                upload_id: id.clone(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let abort = svc
+            .abort_multipart_upload(Request::new(AbortMultipartUploadRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: id,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ids(&abort.stripes), [1, 2]);
     }
 }

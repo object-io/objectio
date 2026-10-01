@@ -295,16 +295,29 @@ message PutObjectMetaRequest {
     string key = 2;
     objectio.metadata.ObjectMeta object = 3;
     bool versioning_enabled = 4;  // If true, also store version entry
-    // Compare-and-set: when non-empty, store only if the current entry for
-    // the key is the object with this id (FAILED_PRECONDITION otherwise).
-    // Lets a background writer — the repairer adding a rebuilt shard's
-    // location — never roll back a PUT that replaced the object meanwhile.
+    // Compare-and-swap for read-modify-write callers (retention, legal hold,
+    // shard migration, the repairer): when set, the write is refused with
+    // FAILED_PRECONDITION if the key's current ObjectMeta is a different
+    // object. Without it, such a write built from a stale read would put
+    // back an object a newer PUT replaced — and whose shards that PUT freed.
+    // An absent current entry does not refuse the write (shard migration
+    // writes to OSDs that hold no copy yet) unless `require_existing` is set.
     bytes expected_object_id = 5;
+    // With `expected_object_id`: an absent entry refuses the write too. For
+    // a writer that must not bring back an object deleted since it read it
+    // — the repairer adding a rebuilt shard's location.
+    bool require_existing = 6;
 }
 
 message PutObjectMetaResponse {
     bool success = 1;
     uint64 timestamp = 2;
+    // The current ObjectMeta this write displaced, if the key had one. The
+    // gateway frees its shards once every replica reports the same one.
+    objectio.metadata.ObjectMeta replaced = 3;
+    // `replaced` is still kept on this OSD as a version entry, so its shards
+    // are still referenced and must not be freed.
+    bool replaced_version_kept = 4;
 }
 
 // Get object metadata request

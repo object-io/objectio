@@ -5,8 +5,10 @@
 const MAX_SHARD_SIZE: usize = 4 * 1024 * 1024 - 4096; // ~4MB per shard
 
 use crate::osd_pool::{
-    OsdPool, delete_object_meta_from_all, get_object_meta_from_any, put_object_meta_to_all,
-    read_shard_from_osd, write_shard_to_osd,
+    Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget,
+    delete_object_meta_from_all, get_object_meta_from_any, get_object_version_meta_from_any,
+    put_object_meta_to_all, read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite,
+    referenced_object_ids, stripe_targets, write_shard_to_osd,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{
@@ -1520,7 +1522,7 @@ pub async fn post_bucket(
 ) -> Response {
     // Check if this is a delete objects request
     if params.is_delete_request() {
-        return delete_objects(State(state), Path(bucket), auth, body).await;
+        return delete_objects(State(state), Path(bucket), auth, headers, body).await;
     }
     if params.grep.is_some() {
         return grep_prefix_internal(state, bucket, auth, headers, body).await;
@@ -2223,17 +2225,17 @@ enum Committed<E> {
 /// a listing entry that did land is taken out again with `unlist`, so the
 /// listing never shows an object GET cannot read. A failed listing commit
 /// alone does not fail the PUT: the data landed and is readable by key.
-async fn commit_object<ME, LE, U>(
-    object_meta: impl Future<Output = Result<(), ME>>,
+async fn commit_object<T, ME, LE, U>(
+    object_meta: impl Future<Output = Result<T, ME>>,
     listing: impl Future<Output = Result<(), LE>>,
     unlist: impl FnOnce() -> U,
-) -> Result<Committed<LE>, ME>
+) -> Result<(T, Committed<LE>), ME>
 where
     U: Future<Output = ()>,
 {
     match tokio::join!(object_meta, listing) {
-        (Ok(()), Ok(())) => Ok(Committed::Both),
-        (Ok(()), Err(e)) => Ok(Committed::Unlisted(e)),
+        (Ok(t), Ok(())) => Ok((t, Committed::Both)),
+        (Ok(t), Err(e)) => Ok((t, Committed::Unlisted(e))),
         (Err(e), listed) => {
             if listed.is_ok() {
                 unlist().await;
@@ -2278,6 +2280,73 @@ async fn verify_upload_checksums(
                 StatusCode::INTERNAL_SERVER_ERROR,
             ))
         }
+    }
+}
+
+/// Free `targets` off the request's critical path, logging what could not
+/// be freed. `what` names the object or upload for the log.
+fn spawn_reclaim(state: &Arc<AppState>, targets: Vec<ShardTarget>, reason: Reclaim, what: String) {
+    if targets.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        warn!(
+            "{what}: no runtime to free {} shards ({}); they stay allocated",
+            targets.len(),
+            reason.label()
+        );
+        return;
+    };
+    let state = Arc::clone(state);
+    runtime.spawn(async move {
+        let total = targets.len();
+        let mut meta = state.meta_client.clone();
+        let failed = reclaim_shards(&state.osd_pool, &mut meta, targets, reason).await;
+        if failed > 0 {
+            warn!(
+                "{what}: {failed} of {total} shard deletes failed ({}); those blocks stay allocated",
+                reason.label()
+            );
+        } else {
+            debug!("{what}: freed {total} shards ({})", reason.label());
+        }
+    });
+}
+
+/// The shards a write is about to send, freed if it is abandoned before
+/// its metadata commit.
+fn pending_shards(state: &Arc<AppState>, what: String) -> PendingShards {
+    let state = Arc::clone(state);
+    PendingShards::new(move |targets| spawn_reclaim(&state, targets, Reclaim::FailedWrite, what))
+}
+
+/// Free what a metadata commit left unreferenced. On success, the object it
+/// replaced — unless versioning keeps that as a version. On a failure no
+/// replica applied, `sent`: the shards the new object would have used.
+fn settle_commit(
+    state: &Arc<AppState>,
+    outcome: Result<&[Displaced], &MetaWriteError>,
+    sent: Vec<ShardTarget>,
+    new_object: &std::collections::HashSet<Vec<u8>>,
+    versioning_enabled: bool,
+    what: &str,
+) {
+    match outcome {
+        Ok(displaced) if !versioning_enabled => spawn_reclaim(
+            state,
+            reclaimable_after_overwrite(displaced, new_object),
+            Reclaim::Overwrite,
+            what.to_string(),
+        ),
+        Ok(_) => {}
+        Err(e) if e.unapplied => {
+            spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
+        }
+        Err(_) if !sent.is_empty() => warn!(
+            "{what}: {} shards stay allocated: a replica may hold the failed write's metadata",
+            sent.len()
+        ),
+        Err(_) => {}
     }
 }
 
@@ -2501,6 +2570,7 @@ pub async fn put_object(
 
         let mut all_stripes = Vec::with_capacity(num_stripes);
         let mut total_success = 0;
+        let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
 
         for stripe_idx in 0..num_stripes {
             let stripe_start = stripe_idx * stripe_size;
@@ -2529,6 +2599,7 @@ pub async fn put_object(
                 let shard_data = stripe_data.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
+                pending.sent(&placement_node, &obj_id, s_idx, pos);
 
                 write_futures.push(async move {
                     let result = write_shard_to_osd(
@@ -2667,16 +2738,27 @@ pub async fn put_object(
             checksum: stored_checksum.clone(),
         };
 
-        if let Err(e) = put_object_meta_to_all(
+        let new_object = referenced_object_ids(&object_meta);
+        let sent = pending.disarm();
+        let outcome = put_object_meta_to_all(
             &state.osd_pool,
             &placement.nodes,
             &bucket,
             &key,
             object_meta,
             versioning_enabled,
+            &[],
         )
-        .await
-        {
+        .await;
+        settle_commit(
+            &state,
+            outcome.as_deref(),
+            sent,
+            &new_object,
+            versioning_enabled,
+            &format!("{bucket}/{key}"),
+        );
+        if let Err(e) = outcome {
             error!("Failed to store object metadata on OSDs: {}", e);
             return S3Error::xml_response(
                 "InternalError",
@@ -2746,6 +2828,7 @@ pub async fn put_object(
 
     let mut all_stripes = Vec::with_capacity(num_stripes);
     let mut total_shards_written = 0;
+    let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
 
     for stripe_idx in 0..num_stripes {
         let stripe_start = stripe_idx * max_stripe_data_size;
@@ -2881,6 +2964,7 @@ pub async fn put_object(
             let shard_data = shard.clone();
             let pos = i as u32;
             let s_idx = stripe_idx as u64;
+            pending.sent(&placement_node, &obj_id, s_idx, pos);
             let rdma = state.rdma.clone();
             let shard_addr = rdma_base.map(|base| base + (i * shard_data.len()) as u64);
             // Transfer Engine was on offer, but no stripe slot was free.
@@ -3058,6 +3142,8 @@ pub async fn put_object(
     };
     let mut listing_client = state.meta_client.clone();
     let mut unlist_client = state.meta_client.clone();
+    let new_object = referenced_object_ids(&object_meta);
+    let sent = pending.disarm();
     let committed = commit_object(
         put_object_meta_to_all(
             &state.osd_pool,
@@ -3066,6 +3152,7 @@ pub async fn put_object(
             &key,
             object_meta,
             versioning_enabled,
+            &[],
         ),
         async { listing_client.create_object(listing_req).await.map(drop) },
         || async {
@@ -3085,9 +3172,17 @@ pub async fn put_object(
     .await;
     phases.mark("commit");
 
+    settle_commit(
+        &state,
+        committed.as_ref().map(|(d, _)| d.as_slice()),
+        sent,
+        &new_object,
+        versioning_enabled,
+        &format!("{bucket}/{key}"),
+    );
     match committed {
-        Ok(Committed::Both) => {}
-        Ok(Committed::Unlisted(e)) => warn!(
+        Ok((_, Committed::Both)) => {}
+        Ok((_, Committed::Unlisted(e))) => warn!(
             "create_object on meta failed ({e}); object is readable by key \
              but will not appear in ListObjects until repair",
         ),
@@ -4017,6 +4112,45 @@ async fn resolve_node_address(
     })
 }
 
+/// The object a DELETE of `key` — version `vid`, or the current object when
+/// empty — leaves referenced by nothing, so its shards may be freed.
+///
+/// `None` when there is no such object, when it is still referenced, or when
+/// that cannot be told: a version that is also the current object loses only
+/// its version entry, and a current object that is also a version (written
+/// while versioning was on) stays as that version. This used to free the
+/// *current* object's shards whatever `vid` named, so deleting an old
+/// version destroyed the latest one's data.
+async fn unreferenced_after_delete(
+    pool: &OsdPool,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    vid: &str,
+) -> Option<ObjectMeta> {
+    let current = get_object_meta_from_any(pool, nodes, bucket, key)
+        .await
+        .ok()?;
+    if vid.is_empty() {
+        let current = current?;
+        if current.version_id.is_empty() {
+            return Some(current);
+        }
+        let kept = get_object_version_meta_from_any(pool, nodes, bucket, key, &current.version_id)
+            .await
+            .ok()?;
+        return kept
+            .is_none_or(|v| v.object_id != current.object_id)
+            .then_some(current);
+    }
+    let version = get_object_version_meta_from_any(pool, nodes, bucket, key, vid)
+        .await
+        .ok()??;
+    current
+        .is_none_or(|c| c.object_id != version.object_id)
+        .then_some(version)
+}
+
 /// Head object (HEAD /{bucket}/{key})
 pub async fn head_object(
     State(state): State<Arc<AppState>>,
@@ -4240,6 +4374,7 @@ pub async fn delete_object(
             &key,
             delete_marker,
             true,
+            &[],
         )
         .await
         {
@@ -4286,14 +4421,15 @@ pub async fn delete_object(
     // every block the object occupied with no way left to find them. That is
     // what used to happen — the shards were never deleted at all — so a
     // cluster could show an empty bucket and a disk with no free blocks.
-    if let Ok(Some(meta)) =
-        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
+    if let Some(meta) =
+        unreferenced_after_delete(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
         && !meta.stripes.is_empty()
     {
-        let failed = crate::osd_pool::delete_shards_for_object(
+        let failed = reclaim_shards(
             &state.osd_pool,
-            &placement.nodes,
-            &meta.stripes,
+            &mut meta_client,
+            stripe_targets(&meta.stripes),
+            Reclaim::Delete,
         )
         .await;
         if failed > 0 {
@@ -4348,6 +4484,7 @@ pub async fn delete_objects(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
     auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     debug!("DELETE objects: {} (batch)", bucket);
@@ -4414,56 +4551,40 @@ pub async fn delete_objects(
             continue;
         }
 
-        // Get placement to find primary OSD
-        let mut meta_client = state.meta_client.clone();
-        let placement = match meta_client
-            .get_placement(GetPlacementRequest {
-                bucket: bucket.clone(),
-                key: obj.key.clone(),
-                size: 0,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-        {
-            Ok(resp) => resp.into_inner(),
-            Err(e) => {
-                // Object doesn't exist - S3 still reports it as deleted
-                debug!(
-                    "Object {}/{} not found during delete: {}",
-                    bucket, obj.key, e
-                );
-                deleted.push(DeletedObject {
-                    key: obj.key,
-                    version_id: obj.version_id,
-                });
-                continue;
-            }
-        };
-
-        if placement.nodes.is_empty() {
-            // No nodes available - still report as deleted (S3 behavior)
+        // Each key goes through the single-object DELETE, so a batch gets
+        // the same versioning, object-lock and listing handling, and frees
+        // the shards. Deleting only the ObjectMeta here, as this did, left
+        // every object's shards allocated and its listing entry behind.
+        let resp = delete_object(
+            State(Arc::clone(&state)),
+            Path((bucket.clone(), obj.key.clone())),
+            None,
+            obj.version_id.clone(),
+            headers.clone(),
+        )
+        .await;
+        if resp.status().is_success() {
+            let version_id = resp
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+                .or(obj.version_id);
             deleted.push(DeletedObject {
                 key: obj.key,
-                version_id: obj.version_id,
+                version_id,
             });
-            continue;
+        } else {
+            let code = resp
+                .extensions()
+                .get::<crate::gateway_metrics::S3ErrorCode>()
+                .map_or_else(|| "InternalError".to_string(), |c| c.0.clone());
+            errors.push(DeleteError {
+                key: obj.key,
+                message: code.clone(),
+                code,
+            });
         }
-
-        if let Err(e) =
-            delete_object_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &obj.key, "")
-                .await
-        {
-            warn!(
-                "Failed to delete object {}/{} from OSDs: {}",
-                bucket, obj.key, e
-            );
-            // Continue anyway - might not exist, which is OK
-        }
-
-        deleted.push(DeletedObject {
-            key: obj.key,
-            version_id: obj.version_id,
-        });
     }
 
     info!(
@@ -5441,6 +5562,10 @@ async fn upload_part_internal(
 
     // Generate a unique object ID for this part
     let part_object_id = *Uuid::new_v4().as_bytes();
+    let mut pending = pending_shards(
+        &state,
+        format!("{bucket}/{key} upload {upload_id} part {part_number}"),
+    );
 
     // Replication mode: no EC, just write raw data to each replica
     // For large parts, split into multiple stripes (each stripe <= MAX_SHARD_SIZE)
@@ -5500,6 +5625,7 @@ async fn upload_part_internal(
                 let shard_data = stripe_bytes.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
+                pending.sent(&placement_node, &obj_id, s_idx, pos);
 
                 write_futures.push(async move {
                     let result = write_shard_to_osd(
@@ -5662,6 +5788,7 @@ async fn upload_part_internal(
                 let shard_data = shard.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
+                pending.sent(&placement_node, &obj_id, s_idx, pos);
 
                 write_futures.push(async move {
                     let result = write_shard_to_osd(
@@ -5757,7 +5884,11 @@ async fn upload_part_internal(
     );
 
     // Register the part with metadata service (using all stripes)
-    match meta_client
+    // Registered or not, the part's shards are settled below: kept if meta
+    // recorded the part, freed if it refused it (the upload was aborted or
+    // completed meanwhile). An error that is not a refusal may have landed.
+    let sent = pending.disarm();
+    let registered = meta_client
         .register_part(RegisterPartRequest {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -5767,12 +5898,20 @@ async fn upload_part_internal(
             size: part_size,
             stripes: all_stripes, // Multiple stripes for large parts
         })
-        .await
-    {
-        Ok(_) => {
+        .await;
+    let what = format!("{bucket}/{key} upload {upload_id} part {part_number}");
+    match registered {
+        Ok(resp) => {
             info!(
                 "Uploaded part {}: bucket={}, key={}, uploadId={}, size={}",
                 part_number, bucket, key, upload_id, part_size
+            );
+            // The part this one replaced is referenced by nothing now.
+            spawn_reclaim(
+                &state,
+                stripe_targets(&resp.into_inner().replaced_stripes),
+                Reclaim::ReplacedPart,
+                what,
             );
 
             let mut builder = Response::builder()
@@ -5802,6 +5941,17 @@ async fn upload_part_internal(
         }
         Err(e) => {
             error!("Failed to register part: {}", e);
+            if matches!(
+                e.code(),
+                tonic::Code::NotFound | tonic::Code::InvalidArgument
+            ) {
+                spawn_reclaim(&state, sent, Reclaim::FailedWrite, what);
+            } else if !sent.is_empty() {
+                warn!(
+                    "{what}: {} shards stay allocated: meta may have recorded the part",
+                    sent.len()
+                );
+            }
             if e.code() == tonic::Code::NotFound {
                 S3Error::xml_response(
                     "NoSuchUpload",
@@ -5876,6 +6026,13 @@ async fn complete_multipart_upload_internal(
     {
         Ok(response) => {
             let resp = response.into_inner();
+            // Parts left out of the object went with the upload.
+            spawn_reclaim(
+                &state,
+                stripe_targets(&resp.unused_stripes),
+                Reclaim::UnusedPart,
+                format!("{bucket}/{key} upload {upload_id}"),
+            );
             if let Some(object) = resp.object {
                 // Log multipart assembly details
                 let stripe_sizes: Vec<u64> = object.stripes.iter().map(|s| s.data_size).collect();
@@ -5917,17 +6074,35 @@ async fn complete_multipart_upload_internal(
                     }
                 };
 
-                if !placement.nodes.is_empty()
-                    && let Err(e) = put_object_meta_to_all(
-                        &state.osd_pool,
-                        &placement.nodes,
-                        &bucket,
-                        &key,
-                        object.clone(),
-                        false,
-                    )
+                // With versioning on, an object this replaces is kept (the
+                // OSDs also say so per replica); otherwise it is freed.
+                let versioning_enabled = meta_client
+                    .get_bucket_versioning(GetBucketVersioningRequest {
+                        bucket: bucket.clone(),
+                    })
                     .await
-                {
+                    .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
+                let outcome = put_object_meta_to_all(
+                    &state.osd_pool,
+                    &placement.nodes,
+                    &bucket,
+                    &key,
+                    object.clone(),
+                    false,
+                    &[],
+                )
+                .await;
+                // On failure the parts belong to nothing: meta has already
+                // dropped the upload.
+                settle_commit(
+                    &state,
+                    outcome.as_deref(),
+                    stripe_targets(&object.stripes),
+                    &referenced_object_ids(&object),
+                    versioning_enabled,
+                    &format!("{bucket}/{key}"),
+                );
+                if let Err(e) = outcome {
                     error!("Failed to store object metadata on OSDs: {}", e);
                     return S3Error::xml_response(
                         "InternalError",
@@ -6182,52 +6357,14 @@ async fn abort_multipart_upload_internal(
 ) -> Response {
     let mut client = state.meta_client.clone();
 
-    // Reclaim the parts already uploaded before dropping the record that says
-    // where they are. Abort used to tell meta to forget the upload and stop —
-    // so every part written before the abort stayed on the platter forever,
-    // with nothing left pointing at it. Same leak as object delete had, on a
-    // path that never went through it.
+    // Meta drops the upload and hands back every part's stripes in one step;
+    // then the parts are freed, each where its own location says it is.
     //
-    // Read the parts first: after `abort_multipart_upload` the stripe list is
-    // gone and the blocks are unreachable.
-    let parts = client
-        .list_parts(objectio_proto::metadata::ListPartsRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
-            part_number_marker: 0,
-            max_parts: 10_000,
-        })
-        .await
-        .map(|r| r.into_inner().parts)
-        .unwrap_or_default();
-
-    if !parts.is_empty()
-        && let Ok(placement) = client
-            .get_placement(GetPlacementRequest {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                size: 0,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-    {
-        let nodes = placement.into_inner().nodes;
-        for part in &parts {
-            // Best effort, like the object path: a shard that cannot be
-            // deleted is a leaked block, not a failed abort.
-            let failed =
-                crate::osd_pool::delete_shards_for_object(&state.osd_pool, &nodes, &part.stripes)
-                    .await;
-            if failed > 0 {
-                warn!(
-                    "{bucket}/{key} upload {upload_id}: {failed} shard deletes failed for part {}",
-                    part.part_number
-                );
-            }
-        }
-    }
-
+    // This used to list the parts, free them, then abort — so an abort racing
+    // a completion could free parts the completed object was made of. And it
+    // sent the deletes to the *object key's* placement, but parts are placed
+    // by their own keys: with more OSDs than a stripe spans, part shards on
+    // OSDs outside the key's placement were never deleted.
     match client
         .abort_multipart_upload(AbortMultipartUploadRequest {
             bucket: bucket.clone(),
@@ -6236,7 +6373,20 @@ async fn abort_multipart_upload_internal(
         })
         .await
     {
-        Ok(_) => {
+        Ok(resp) => {
+            // Best effort, like the object path: a shard that cannot be
+            // deleted is a leaked block, not a failed abort. Awaited, as a
+            // DELETE is, so the space is free when the client hears back.
+            let failed = reclaim_shards(
+                &state.osd_pool,
+                &mut client,
+                stripe_targets(&resp.into_inner().stripes),
+                Reclaim::Abort,
+            )
+            .await;
+            if failed > 0 {
+                warn!("{bucket}/{key} upload {upload_id}: {failed} shard deletes failed");
+            }
             info!(
                 "Aborted multipart upload: bucket={}, key={}, uploadId={}",
                 bucket, key, upload_id
@@ -6246,6 +6396,11 @@ async fn abort_multipart_upload_internal(
                 .body(Body::empty())
                 .unwrap()
         }
+        Err(e) if e.code() == tonic::Code::NotFound => S3Error::xml_response(
+            "NoSuchUpload",
+            "The specified multipart upload does not exist",
+            StatusCode::NOT_FOUND,
+        ),
         Err(e) => {
             error!("Failed to abort multipart upload: {}", e);
             S3Error::xml_response(
@@ -7246,8 +7401,19 @@ async fn put_object_retention_internal(
         retain_until_date: retain_until,
     });
 
-    if let Err(e) =
-        put_object_meta_to_all(&state.osd_pool, &nodes, &bucket, &key, object_meta, false).await
+    // Only over the object just read: a PUT that replaced it meanwhile has
+    // freed its shards, and must not have it written back over its own.
+    let expected = object_meta.object_id.clone();
+    if let Err(e) = put_object_meta_to_all(
+        &state.osd_pool,
+        &nodes,
+        &bucket,
+        &key,
+        object_meta,
+        false,
+        &expected,
+    )
+    .await
     {
         error!("Failed to update object retention: {}", e);
         return S3Error::xml_response(
@@ -7364,8 +7530,19 @@ async fn put_object_legal_hold_internal(
 
     object_meta.legal_hold = Some(LegalHold { status });
 
-    if let Err(e) =
-        put_object_meta_to_all(&state.osd_pool, &nodes, &bucket, &key, object_meta, false).await
+    // Only over the object just read: a PUT that replaced it meanwhile has
+    // freed its shards, and must not have it written back over its own.
+    let expected = object_meta.object_id.clone();
+    if let Err(e) = put_object_meta_to_all(
+        &state.osd_pool,
+        &nodes,
+        &bucket,
+        &key,
+        object_meta,
+        false,
+        &expected,
+    )
+    .await
     {
         error!("Failed to update legal hold: {}", e);
         return S3Error::xml_response(
@@ -9014,7 +9191,7 @@ mod commit_tests {
     async fn the_two_commits_run_at_the_same_time() {
         let start = std::time::Instant::now();
         let r = commit_object(after(200, Ok(())), after(200, Ok(())), || async {}).await;
-        assert_eq!(r, Ok(Committed::Both));
+        assert_eq!(r, Ok(((), Committed::Both)));
         assert!(
             start.elapsed() < Duration::from_millis(350),
             "the commits ran one after the other: {:?}",
@@ -9029,7 +9206,7 @@ mod commit_tests {
             unlisted.store(true, Ordering::SeqCst);
         })
         .await;
-        assert_eq!(r, Ok(Committed::Unlisted("raft")));
+        assert_eq!(r, Ok(((), Committed::Unlisted("raft"))));
         assert!(
             !unlisted.load(Ordering::SeqCst),
             "took a readable object out of the listing"
@@ -9039,7 +9216,7 @@ mod commit_tests {
     #[tokio::test]
     async fn a_failed_object_meta_commit_takes_the_object_out_of_the_listing() {
         let unlisted = AtomicBool::new(false);
-        let r: Result<Committed<&str>, _> =
+        let r: Result<((), Committed<&str>), _> =
             commit_object(after(0, Err("osd")), after(0, Ok(())), || async {
                 unlisted.store(true, Ordering::SeqCst);
             })
