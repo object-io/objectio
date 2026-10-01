@@ -855,15 +855,14 @@ impl OsdService {
         key: &str,
         object: &ObjectMeta,
     ) -> bool {
-        !object.version_id.is_empty()
-            && store
-                .get(&MetadataKey::object_version(
-                    bucket,
-                    key,
-                    &object.version_id,
-                ))
-                .and_then(|v| ObjectMeta::decode(&v[..]).ok())
-                .is_some_and(|v| v.object_id == object.object_id)
+        store
+            .get(&MetadataKey::object_version(
+                bucket,
+                key,
+                version_entry_id(&object.version_id),
+            ))
+            .and_then(|v| ObjectMeta::decode(&v[..]).ok())
+            .is_some_and(|v| v.object_id == object.object_id)
     }
 
     /// Get gRPC metrics
@@ -1757,8 +1756,36 @@ impl StorageService for OsdService {
         self.usage
             .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
 
+        // The object this write replaces was stored while versioning was
+        // off (the "null" version). With versioning on now, S3 keeps it as
+        // a noncurrent version rather than letting it go: give it a version
+        // entry. It used to be dropped, and its shards freed.
+        if req.versioning_enabled
+            && !object.version_id.is_empty()
+            && let Some(null) = old.as_ref().filter(|o| o.version_id.is_empty())
+        {
+            let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
+            let replaced = self.stored_meta(&null_key);
+            self.meta_store
+                .put(null_key, null.encode_to_vec())
+                .map_err(|e| Status::internal(format!("failed to keep the null version: {e}")))?;
+            self.usage.apply(
+                &req.bucket,
+                EntryKind::Version,
+                replaced.as_ref(),
+                Some(null),
+            );
+        }
+
+        // A versioned object's own version entry is the same object: an
+        // update in place (tags, retention, legal hold) changes both, or a
+        // read by version id sees it without them, and a delete by version
+        // id checks a lock that isn't there.
+        let updates_its_version = !req.versioning_enabled
+            && !object.version_id.is_empty()
+            && Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, &object);
         // If versioning is enabled and version_id is set, also store version entry
-        if req.versioning_enabled && !object.version_id.is_empty() {
+        if (req.versioning_enabled || updates_its_version) && !object.version_id.is_empty() {
             let version_key =
                 MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
             let old = self.stored_meta(&version_key);
@@ -1929,8 +1956,12 @@ impl StorageService for OsdService {
                     break;
                 }
 
-                // Decode object metadata
+                // Decode object metadata. A bucket's listing leaves out keys
+                // whose current version is a delete marker: they don't exist.
                 if let Ok(object) = ObjectMeta::decode(&value[..]) {
+                    if !cluster_wide && object.is_delete_marker {
+                        continue;
+                    }
                     last_key = cursor;
                     objects.push(for_listing(object));
                     count += 1;
@@ -2146,6 +2177,12 @@ impl StorageService for OsdService {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    /// Every version of the bucket's keys under `prefix`, in key order,
+    /// whole keys at a time: keys after `key_marker` (and `key_marker`
+    /// itself when `version_id_marker` is set, its versions left to the
+    /// caller to skip), stopping at the first key boundary at or past
+    /// `max_keys` versions. Includes the null version: the current object
+    /// when it was stored while versioning was off.
     async fn list_object_versions_meta(
         &self,
         request: Request<ListObjectVersionsMetaRequest>,
@@ -2156,50 +2193,54 @@ impl StorageService for OsdService {
         } else {
             req.max_keys as usize
         };
+        let wanted = |key: &str| {
+            key.starts_with(&req.prefix)
+                && (req.key_marker.is_empty()
+                    || key > req.key_marker.as_str()
+                    || (key == req.key_marker && !req.version_id_marker.is_empty()))
+        };
 
-        // Scan version entries (v:{bucket}\0...)
-        let prefix = MetadataKey::object_version_bucket_prefix(&req.bucket);
-        let entries = self.meta_store.scan_prefix(&prefix);
-
-        let mut versions = Vec::new();
-        let mut count = 0;
-        let mut last_key = String::new();
-        let mut last_version_id = String::new();
-
-        for (meta_key, value) in entries {
-            if let Some((_bucket, key, version_id)) = meta_key.parse_object_version() {
-                // Apply prefix filter
-                if !req.prefix.is_empty() && !key.starts_with(&req.prefix) {
-                    continue;
-                }
-
-                // Apply key_marker: skip entries at or before key_marker
-                if !req.key_marker.is_empty() {
-                    if key < req.key_marker {
-                        continue;
-                    }
-                    if key == req.key_marker
-                        && !req.version_id_marker.is_empty()
-                        && version_id <= req.version_id_marker
-                    {
-                        continue;
-                    }
-                }
-
-                if count >= max_keys {
-                    break;
-                }
-
-                if let Ok(object) = ObjectMeta::decode(&value[..]) {
-                    last_key = key;
-                    last_version_id = version_id;
-                    versions.push(for_listing(object));
-                    count += 1;
-                }
+        let mut by_key: std::collections::BTreeMap<String, Vec<ObjectMeta>> =
+            std::collections::BTreeMap::new();
+        for (meta_key, value) in self
+            .meta_store
+            .scan_prefix(&MetadataKey::object_version_bucket_prefix(&req.bucket))
+        {
+            if let Some((_, key, _)) = meta_key.parse_object_version()
+                && wanted(&key)
+                && let Ok(object) = ObjectMeta::decode(&value[..])
+            {
+                by_key.entry(key).or_default().push(for_listing(object));
+            }
+        }
+        for (meta_key, value) in self
+            .meta_store
+            .scan_prefix(&MetadataKey::object_meta_prefix(&req.bucket))
+        {
+            if let Some((_, key)) = meta_key.parse_object_meta()
+                && wanted(&key)
+                && let Ok(object) = ObjectMeta::decode(&value[..])
+                && object.version_id.is_empty()
+            {
+                // The current null version supersedes a null version
+                // entry kept from before.
+                let versions = by_key.entry(key).or_default();
+                versions.retain(|v| !v.version_id.is_empty());
+                versions.push(for_listing(object));
             }
         }
 
-        let is_truncated = count >= max_keys;
+        let mut versions = Vec::new();
+        let mut last_key = String::new();
+        let mut is_truncated = false;
+        for (key, mut of_key) in by_key {
+            if versions.len() >= max_keys {
+                is_truncated = true;
+                break;
+            }
+            versions.append(&mut of_key);
+            last_key = key;
+        }
 
         Ok(Response::new(ListObjectVersionsMetaResponse {
             versions,
@@ -2208,13 +2249,21 @@ impl StorageService for OsdService {
             } else {
                 String::new()
             },
-            next_version_id_marker: if is_truncated {
-                last_version_id
-            } else {
-                String::new()
-            },
+            next_version_id_marker: String::new(),
             is_truncated,
         }))
+    }
+}
+
+/// The version entry of the object stored while versioning was off.
+const NULL_VERSION: &str = "null";
+
+/// The version entry an object's `version_id` is kept under.
+fn version_entry_id(version_id: &str) -> &str {
+    if version_id.is_empty() {
+        NULL_VERSION
+    } else {
+        version_id
     }
 }
 

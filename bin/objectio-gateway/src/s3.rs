@@ -1195,6 +1195,9 @@ pub struct ListObjectsParams {
     /// Key marker for ListMultipartUploads pagination
     #[serde(rename = "key-marker")]
     key_marker: Option<String>,
+    /// Version marker for ListObjectVersions pagination
+    #[serde(rename = "version-id-marker")]
+    version_id_marker: Option<String>,
     /// Upload ID marker for ListMultipartUploads pagination
     #[serde(rename = "upload-id-marker")]
     upload_id_marker: Option<String>,
@@ -1282,6 +1285,9 @@ pub struct PutObjectParams {
     legal_hold: Option<String>,
     /// If present, this is a tagging request
     tagging: Option<String>,
+    /// The version a retention, legal hold or tagging request is for
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
 }
 
 /// Query parameters for GET object operations (handles both GET and list parts)
@@ -1298,7 +1304,6 @@ pub struct GetObjectParams {
     part_number_marker: Option<u32>,
     /// Version ID for retrieving specific version (used by version-aware GET)
     #[serde(rename = "versionId")]
-    #[allow(dead_code)]
     version_id: Option<String>,
     /// If present, this is a get object retention request
     retention: Option<String>,
@@ -1686,14 +1691,7 @@ async fn upload_part_copy_internal(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    let source = headers
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            let decoded = urlencoding::decode(s).unwrap_or_else(|_| s.into());
-            decoded.trim_start_matches('/').to_string()
-        })
-        .unwrap_or_default();
+    let (source, source_version) = copy_source_of(&headers).unwrap_or_default();
     let Some((source_bucket, source_key)) = source.split_once('/') else {
         return S3Error::xml_response(
             "InvalidArgument",
@@ -1701,6 +1699,11 @@ async fn upload_part_copy_internal(
             StatusCode::BAD_REQUEST,
         );
     };
+    if let Some(refused) =
+        unless_current(&state, source_bucket, source_key, source_version.as_deref()).await
+    {
+        return refused;
+    }
 
     // The middleware authorized writing the destination; reading the
     // source is checked here, as CopyObject does.
@@ -2181,8 +2184,13 @@ pub async fn list_objects(
         return list_object_versions_internal(
             state,
             bucket,
-            params.prefix.clone().unwrap_or_default(),
-            params.max_keys.unwrap_or(1000),
+            VersionListing {
+                prefix: params.prefix.clone().unwrap_or_default(),
+                delimiter: params.delimiter.clone().filter(|d| !d.is_empty()),
+                key_marker: params.key_marker.clone().unwrap_or_default(),
+                version_id_marker: params.version_id_marker.clone().unwrap_or_default(),
+                max_keys: params.max_keys.unwrap_or(1000).min(1000),
+            },
         )
         .await;
     }
@@ -2686,7 +2694,7 @@ async fn copy_by_reference(
         .await
         .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
     let version_id = if versioning_enabled {
-        Uuid::new_v4().to_string()
+        new_version_id()
     } else {
         String::new()
     };
@@ -3234,14 +3242,8 @@ pub async fn put_object(
     };
 
     // Check for copy source header (CopyObject operation)
-    let copy_source = headers
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            // URL decode and strip leading slash if present
-            let decoded = urlencoding::decode(s).unwrap_or_else(|_| s.into());
-            decoded.trim_start_matches('/').to_string()
-        });
+    let (copy_source, copy_source_version) = copy_source_of(&headers).unzip();
+    let copy_source_version = copy_source_version.flatten();
 
     // CopyObject: the source is read and written again as the destination
     // (copy_object_data). SSE-C on either side is deliberately unsupported
@@ -3259,6 +3261,16 @@ pub async fn put_object(
         }
         let source_bucket = parts[0];
         let source_key = parts[1];
+        if let Some(refused) = unless_current(
+            &state,
+            source_bucket,
+            source_key,
+            copy_source_version.as_deref(),
+        )
+        .await
+        {
+            return refused;
+        }
 
         // CopyObject reads the source as well as writing the destination.
         // The middleware authorized the destination; the source is a
@@ -3388,7 +3400,7 @@ pub async fn put_object(
         Err(_) => false,
     };
     let version_id = if versioning_enabled {
-        Uuid::new_v4().to_string()
+        new_version_id()
     } else {
         String::new()
     };
@@ -4140,6 +4152,17 @@ pub async fn get_object(
     _auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
+    get_object_version(state, bucket, key, None, headers).await
+}
+
+/// GET one version of an object (`?versionId=`), or the current one.
+async fn get_object_version(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    headers: HeaderMap,
+) -> Response {
     debug!("GET object: {}/{}", bucket, key);
 
     // Parse Range header if present
@@ -4228,21 +4251,17 @@ pub async fn get_object(
     // This is done lazily below only if a node_id is missing from the map.
     phases.mark("meta_lookup");
 
-    let object = match get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
-        .await
+    let object = match object_to_read(
+        &state,
+        &placement.nodes,
+        &bucket,
+        &key,
+        version_id.as_deref(),
+    )
+    .await
     {
-        Ok(Some(obj)) => obj,
-        Ok(None) => {
-            return S3Error::xml_response("NoSuchKey", "Object not found", StatusCode::NOT_FOUND);
-        }
-        Err(e) => {
-            error!("Failed to get object metadata from OSDs: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
+        Ok(obj) => obj,
+        Err(resp) => return resp,
     };
     phases.mark("object_meta");
 
@@ -4254,7 +4273,7 @@ pub async fn get_object(
     // Empty files are ordinary — .gitkeep, an empty __init__.py, a zero-length
     // marker — and this made every one of them a write-only object.
     if object.stripes.is_empty() && object.size == 0 {
-        let mut builder = Response::builder()
+        let mut builder = with_version_id(Response::builder(), &object)
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, &object.content_type)
             .header(header::CONTENT_LENGTH, "0")
@@ -4869,7 +4888,7 @@ pub async fn get_object(
     if let Some(ref range) = resolved_range {
         let content_range = format!("bytes {}-{}/{total_size}", range.start, range.end);
 
-        let mut builder = Response::builder()
+        let mut builder = with_version_id(Response::builder(), &object)
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, &object.content_type)
             .header(header::CONTENT_LENGTH, all_data.len().to_string())
@@ -4903,7 +4922,7 @@ pub async fn get_object(
 
         builder.body(Body::from(all_data)).unwrap()
     } else {
-        let mut builder = Response::builder()
+        let mut builder = with_version_id(Response::builder(), &object)
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, &object.content_type)
             .header(header::CONTENT_LENGTH, all_data.len().to_string())
@@ -5098,6 +5117,7 @@ async fn unreferenced_after_delete(
 pub async fn head_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<HeadObjectParams>,
     // Authorized by `authz::authz_layer` before this handler runs.
     _auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
@@ -5135,9 +5155,17 @@ pub async fn head_object(
             .unwrap();
     }
 
-    match get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await {
-        Ok(Some(obj)) => {
-            let mut builder = Response::builder()
+    match object_to_read(
+        &state,
+        &placement.nodes,
+        &bucket,
+        &key,
+        params.version_id.as_deref(),
+    )
+    .await
+    {
+        Ok(obj) => {
+            let mut builder = with_version_id(Response::builder(), &obj)
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, &obj.content_type)
                 .header(header::CONTENT_LENGTH, obj.size.to_string())
@@ -5181,15 +5209,420 @@ pub async fn head_object(
 
             builder.body(Body::empty()).unwrap()
         }
-        Ok(None) => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap(),
-        Err(_) => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::empty())
-            .unwrap(),
+        // HEAD has no body: keep the status and headers of the refusal.
+        Err(mut resp) => {
+            *resp.body_mut() = Body::empty();
+            resp
+        }
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HeadObjectParams {
+    #[serde(rename = "versionId")]
+    version_id: Option<String>,
+}
+
+/// `x-amz-version-id` for an object that has a version (not the null one).
+fn with_version_id(
+    builder: axum::http::response::Builder,
+    object: &ObjectMeta,
+) -> axum::http::response::Builder {
+    if object.version_id.is_empty() {
+        builder
+    } else {
+        builder.header("x-amz-version-id", &object.version_id)
+    }
+}
+
+/// The ObjectMeta a GET or HEAD reads: `version_id`'s, or the current
+/// object's. Otherwise the response S3 gives: 404 NoSuchKey (with
+/// `x-amz-delete-marker` when the current version is a delete marker), 404
+/// NoSuchVersion, or 405 for a delete marker asked for by version.
+async fn object_to_read(
+    state: &AppState,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<ObjectMeta, Response> {
+    let failed = |e: crate::osd_pool::OsdPoolError| {
+        error!("Failed to get object metadata from OSDs: {e}");
+        S3Error::xml_response(
+            "InternalError",
+            &e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    };
+    let marker_headers = |mut resp: Response, marker: &ObjectMeta| {
+        let h = resp.headers_mut();
+        h.insert(
+            "x-amz-delete-marker",
+            header::HeaderValue::from_static("true"),
+        );
+        if let Ok(v) = header::HeaderValue::from_str(version_label(&marker.version_id)) {
+            h.insert("x-amz-version-id", v);
+        }
+        resp
+    };
+    let Some(wanted) = version_id else {
+        return match get_object_meta_from_any(&state.osd_pool, nodes, bucket, key).await {
+            Ok(Some(o)) if o.is_delete_marker => Err(marker_headers(
+                S3Error::xml_response(
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                    StatusCode::NOT_FOUND,
+                ),
+                &o,
+            )),
+            Ok(Some(o)) => Ok(o),
+            Ok(None) => Err(S3Error::xml_response(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                StatusCode::NOT_FOUND,
+            )),
+            Err(e) => Err(failed(e)),
+        };
+    };
+    let found = find_version(&state.osd_pool, nodes, bucket, key, wanted)
+        .await
+        .map_err(failed)?;
+    match found {
+        Some(o) if o.is_delete_marker => {
+            let mut resp = marker_headers(
+                S3Error::xml_response(
+                    "MethodNotAllowed",
+                    "The specified method is not allowed against this resource.",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                ),
+                &o,
+            );
+            resp.headers_mut()
+                .insert(header::ALLOW, header::HeaderValue::from_static("DELETE"));
+            Err(resp)
+        }
+        Some(o) => Ok(o),
+        None => Err(S3Error::xml_response(
+            "NoSuchVersion",
+            "The specified version does not exist.",
+            StatusCode::NOT_FOUND,
+        )),
+    }
+}
+
+/// DELETE `?versionId=`: remove that version for good. When it was the
+/// current one, the newest remaining version (or delete marker) becomes
+/// current, and the listing follows: the object reappears, or is gone.
+///
+/// Metadata goes first and the version's shards last, so a failure part
+/// way leaks blocks rather than leaving metadata pointing at freed ones.
+async fn delete_version(
+    state: &Arc<AppState>,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    vid: &str,
+) -> Response {
+    use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+
+    let internal = |what: &str, e: &dyn std::fmt::Display| {
+        error!("{bucket}/{key} version {vid}: {what}: {e}");
+        S3Error::xml_response(
+            "InternalError",
+            &e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    };
+    let done = |marker: bool| {
+        let mut b = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("x-amz-version-id", vid);
+        if marker {
+            b = b.header("x-amz-delete-marker", "true");
+        }
+        b.body(Body::empty()).unwrap()
+    };
+    let pool = &state.osd_pool;
+    let version = match find_version(pool, nodes, bucket, key, vid).await {
+        Ok(Some(v)) => v,
+        // Deleting what isn't there succeeds, as S3 has it.
+        Ok(None) => return done(false),
+        Err(e) => return internal("cannot read it", &e),
+    };
+    let current = match get_object_meta_from_any(pool, nodes, bucket, key).await {
+        Ok(c) => c,
+        Err(e) => return internal("cannot read the current version", &e),
+    };
+    let is_current = current
+        .as_ref()
+        .is_some_and(|c| c.object_id == version.object_id && c.version_id == version.version_id);
+
+    if let Err(e) = delete_object_meta_from_all(pool, nodes, bucket, key, vid).await {
+        return internal("cannot remove its version entry", &e);
+    }
+    if is_current {
+        let mut meta_client = state.meta_client.clone();
+        match newest_version(pool, nodes, bucket, key, &version).await {
+            Ok(Some(next)) => {
+                if let Err(e) = put_object_meta_to_all(
+                    pool,
+                    nodes,
+                    bucket,
+                    key,
+                    next.clone(),
+                    false,
+                    &version.object_id,
+                )
+                .await
+                {
+                    return internal("cannot make the previous version current", &e);
+                }
+                if next.is_delete_marker {
+                    let _ = meta_client
+                        .delete_object(MetaDelReq {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            version_id: String::new(),
+                            forget_home: false,
+                        })
+                        .await;
+                } else if let Err(e) = meta_client
+                    .create_object(objectio_proto::metadata::CreateObjectRequest {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        size: next.size,
+                        content_type: next.content_type.clone(),
+                        etag: next.etag.clone(),
+                        user_metadata: next.user_metadata.clone(),
+                        stripes: next.stripes.clone(),
+                        object_id: next.object_id.clone(),
+                        pg_id: 0,
+                        pool: String::new(),
+                        home_osd_ids: home_of(nodes),
+                    })
+                    .await
+                {
+                    // Readable by key; the repairer puts the listing back.
+                    warn!("{bucket}/{key}: cannot list the version now current: {e}");
+                }
+            }
+            Ok(None) => {
+                if let Err(e) = delete_object_meta_from_all(pool, nodes, bucket, key, "").await {
+                    return internal("cannot remove the current version", &e);
+                }
+                let _ = meta_client
+                    .delete_object(MetaDelReq {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        version_id: String::new(),
+                        forget_home: false,
+                    })
+                    .await;
+            }
+            Err(e) => return internal("cannot read the remaining versions", &e),
+        }
+    }
+
+    if !version.stripes.is_empty() {
+        let failed = reclaim_shards(
+            pool,
+            &mut state.meta_client.clone(),
+            stripe_targets_of(&version),
+            Reclaim::Delete,
+        )
+        .await;
+        if failed > 0 {
+            warn!(
+                "{bucket}/{key} version {vid}: {failed} shard deletes failed; those blocks stay allocated"
+            );
+        }
+    }
+    info!("Deleted version {vid} of {bucket}/{key}");
+    done(version.is_delete_marker)
+}
+
+/// The newest version of `bucket/key` other than `gone`, from the first of
+/// `nodes` that answers.
+async fn newest_version(
+    pool: &OsdPool,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    gone: &ObjectMeta,
+) -> Result<Option<ObjectMeta>, String> {
+    use objectio_proto::storage::ListObjectVersionsMetaRequest;
+    let mut last = String::from("no OSD to ask");
+    for node in nodes {
+        let mut client = match pool.get_client_for_placement(node).await {
+            Ok(c) => c,
+            Err(e) => {
+                last = e.to_string();
+                continue;
+            }
+        };
+        match client
+            .list_object_versions_meta(ListObjectVersionsMetaRequest {
+                bucket: bucket.to_string(),
+                prefix: key.to_string(),
+                // The key itself, first: its versions come in one page.
+                key_marker: key.to_string(),
+                version_id_marker: "-".to_string(),
+                max_keys: 1,
+            })
+            .await
+        {
+            Ok(resp) => {
+                return Ok(resp
+                    .into_inner()
+                    .versions
+                    .into_iter()
+                    .filter(|v| v.key == key)
+                    .filter(|v| v.object_id != gone.object_id || v.version_id != gone.version_id)
+                    .max_by(|a, b| version_age(a).cmp(&version_age(b))));
+            }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
+/// `x-amz-copy-source`: "bucket/key", URL-decoded, and the version it
+/// names, if any (`?versionId=`).
+fn copy_source_of(headers: &HeaderMap) -> Option<(String, Option<String>)> {
+    let raw = headers.get("x-amz-copy-source")?.to_str().ok()?;
+    let (path, version) = match raw.split_once("?versionId=") {
+        Some((p, v)) => (p, Some(v.to_string())),
+        None => (raw, None),
+    };
+    let decoded = urlencoding::decode(path).unwrap_or_else(|_| path.into());
+    Some((decoded.trim_start_matches('/').to_string(), version))
+}
+
+/// For a sub-resource request (tagging, retention, legal hold) naming a
+/// version: those act on the current version only, so refuse one naming
+/// another rather than answer for the wrong version.
+async fn unless_current(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Option<Response> {
+    let wanted = version_id?;
+    let nodes = match get_placement_nodes_for_object(state, bucket, key).await {
+        Ok(n) => n,
+        Err(resp) => return Some(resp),
+    };
+    match get_object_meta_from_any(&state.osd_pool, &nodes, bucket, key).await {
+        Ok(Some(current)) if version_label(&current.version_id) == wanted => None,
+        Ok(_) => match find_version(&state.osd_pool, &nodes, bucket, key, wanted).await {
+            Ok(Some(_)) => Some(S3Error::xml_response(
+                "NotImplemented",
+                "Only the current version's tagging, retention and legal hold can be read or set",
+                StatusCode::NOT_IMPLEMENTED,
+            )),
+            _ => Some(S3Error::xml_response(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                StatusCode::NOT_FOUND,
+            )),
+        },
+        Err(e) => Some(S3Error::xml_response(
+            "InternalError",
+            &e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+/// Why a lock forbids deleting `meta`, as the response to give.
+fn lock_refusal(meta: &ObjectMeta, headers: &HeaderMap) -> Option<Response> {
+    // Check legal hold
+    if meta.legal_hold.as_ref().is_some_and(|lh| lh.status) {
+        return Some(S3Error::xml_response(
+            "AccessDenied",
+            "Object is under legal hold and cannot be deleted",
+            StatusCode::FORBIDDEN,
+        ));
+    }
+
+    // Check retention
+    if let Some(retention) = &meta.retention {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if retention.retain_until_date > now {
+            let bypass = headers
+                .get("x-amz-bypass-governance-retention")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+            if retention.mode() == RetentionMode::RetentionCompliance {
+                return Some(S3Error::xml_response(
+                    "AccessDenied",
+                    "Object is under compliance retention and cannot be deleted",
+                    StatusCode::FORBIDDEN,
+                ));
+            }
+            if retention.mode() == RetentionMode::RetentionGovernance && !bypass {
+                return Some(S3Error::xml_response(
+                    "AccessDenied",
+                    "Object is under governance retention. Use x-amz-bypass-governance-retention header to override",
+                    StatusCode::FORBIDDEN,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// A new version's id: a UUIDv7, so ids sort by when they were made, and
+/// "newest" is the same on every OSD and gateway that lists them.
+fn new_version_id() -> String {
+    Uuid::now_v7().to_string()
+}
+
+/// Where a version sorts among its key's: when it was made, in ms. A
+/// UUIDv7 id carries it; the null version and older ids use its
+/// modification time.
+fn version_age(object: &ObjectMeta) -> (u64, &str) {
+    let ms = Uuid::parse_str(&object.version_id)
+        .ok()
+        .filter(|u| u.get_version_num() == 7)
+        .and_then(|u| u.get_timestamp())
+        .map_or(object.modified_at.saturating_mul(1000), |t| {
+            let (secs, nanos) = t.to_unix();
+            secs * 1000 + u64::from(nanos / 1_000_000)
+        });
+    (ms, object.version_id.as_str())
+}
+
+/// A version as S3 names it: the null version is "null".
+fn version_label(version_id: &str) -> &str {
+    if version_id.is_empty() {
+        "null"
+    } else {
+        version_id
+    }
+}
+
+/// Version `wanted` of `bucket/key` ("null" is the object stored while
+/// versioning was off): the current object if it is that version, else its
+/// version entry.
+async fn find_version(
+    pool: &OsdPool,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    wanted: &str,
+) -> Result<Option<ObjectMeta>, crate::osd_pool::OsdPoolError> {
+    if wanted == "null"
+        && let Some(current) = get_object_meta_from_any(pool, nodes, bucket, key).await?
+        && current.version_id.is_empty()
+    {
+        return Ok(Some(current));
+    }
+    get_object_version_meta_from_any(pool, nodes, bucket, key, wanted).await
 }
 
 /// Delete object (DELETE /{bucket}/{key})
@@ -5229,49 +5662,6 @@ pub async fn delete_object(
             .unwrap();
     }
 
-    // Lock enforcement: check retention and legal hold before deleting
-    if let Ok(Some(meta)) =
-        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
-    {
-        // Check legal hold
-        if meta.legal_hold.as_ref().is_some_and(|lh| lh.status) {
-            return S3Error::xml_response(
-                "AccessDenied",
-                "Object is under legal hold and cannot be deleted",
-                StatusCode::FORBIDDEN,
-            );
-        }
-
-        // Check retention
-        if let Some(retention) = &meta.retention {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if retention.retain_until_date > now {
-                let bypass = headers
-                    .get("x-amz-bypass-governance-retention")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-                if retention.mode() == RetentionMode::RetentionCompliance {
-                    return S3Error::xml_response(
-                        "AccessDenied",
-                        "Object is under compliance retention and cannot be deleted",
-                        StatusCode::FORBIDDEN,
-                    );
-                }
-                if retention.mode() == RetentionMode::RetentionGovernance && !bypass {
-                    return S3Error::xml_response(
-                        "AccessDenied",
-                        "Object is under governance retention. Use x-amz-bypass-governance-retention header to override",
-                        StatusCode::FORBIDDEN,
-                    );
-                }
-            }
-        }
-    }
-
     // Check versioning state
     let versioning = meta_client
         .get_bucket_versioning(GetBucketVersioningRequest {
@@ -5285,9 +5675,31 @@ pub async fn delete_object(
     // this delete and its home can go. Not when the state is unknown.
     let never_versioned = versioning == Some(VersioningState::VersioningDisabled);
 
+    // Lock enforcement: retention and legal hold protect the version a
+    // delete would destroy. A versioned delete without a version destroys
+    // nothing (it adds a marker), so S3 allows it.
+    let protected = if let Some(vid) = &version_id {
+        find_version(&state.osd_pool, &placement.nodes, &bucket, &key, vid)
+            .await
+            .ok()
+            .flatten()
+    } else if versioning_enabled {
+        None
+    } else {
+        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
+            .await
+            .ok()
+            .flatten()
+    };
+    if let Some(meta) = protected
+        && let Some(refusal) = lock_refusal(&meta, &headers)
+    {
+        return refusal;
+    }
+
     if versioning_enabled && version_id.is_none() {
         // Versioned delete without version_id: create a delete marker
-        let marker_version_id = Uuid::new_v4().to_string();
+        let marker_version_id = new_version_id();
         let delete_marker = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -5360,8 +5772,12 @@ pub async fn delete_object(
             .unwrap();
     }
 
-    // Non-versioned delete, or versioned delete with specific version_id
-    let vid = version_id.as_deref().unwrap_or("");
+    if let Some(vid) = version_id {
+        return delete_version(&state, &placement.nodes, &bucket, &key, &vid).await;
+    }
+
+    // Without a version: the current object goes. (With versioning on, a
+    // marker was added above instead.)
 
     // Reclaim the shards *before* dropping the metadata: the stripe layout is
     // the only record of where they live, so destroying it first would leak
@@ -5369,7 +5785,7 @@ pub async fn delete_object(
     // what used to happen — the shards were never deleted at all — so a
     // cluster could show an empty bucket and a disk with no free blocks.
     if let Some(meta) =
-        unreferenced_after_delete(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
+        unreferenced_after_delete(&state.osd_pool, &placement.nodes, &bucket, &key, "").await
         && !meta.stripes.is_empty()
     {
         let failed = reclaim_shards(
@@ -5389,7 +5805,7 @@ pub async fn delete_object(
     }
 
     if let Err(e) =
-        delete_object_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
+        delete_object_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await
     {
         warn!("Failed to delete object metadata from OSD: {}", e);
     }
@@ -5403,28 +5819,17 @@ pub async fn delete_object(
             .delete_object(MetaDelReq {
                 bucket: bucket.clone(),
                 key: key.clone(),
-                version_id: vid.to_string(),
-                forget_home: never_versioned && vid.is_empty(),
+                version_id: String::new(),
+                forget_home: never_versioned,
             })
             .await;
     }
 
-    info!(
-        "Deleted object: {}/{}{}",
-        bucket,
-        key,
-        if vid.is_empty() {
-            String::new()
-        } else {
-            format!(" (version={})", vid)
-        }
-    );
-
-    let mut resp = Response::builder().status(StatusCode::NO_CONTENT);
-    if let Some(ref vid) = version_id {
-        resp = resp.header("x-amz-version-id", vid.as_str());
-    }
-    resp.body(Body::empty()).unwrap()
+    info!("Deleted object: {}/{}", bucket, key);
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Delete multiple objects (POST /{bucket}?delete)
@@ -6347,12 +6752,27 @@ pub async fn put_object_with_params(
             .await;
     }
     if params.retention.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return put_object_retention_internal(state, bucket, key, body).await;
     }
     if params.legal_hold.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return put_object_legal_hold_internal(state, bucket, key, body).await;
     }
     if params.tagging.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return put_object_tagging_internal(state, bucket, key, body).await;
     }
 
@@ -7070,13 +7490,17 @@ async fn complete_multipart_upload_internal(
                     })
                     .await
                     .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
+                // A new version, as a single-part PUT makes.
+                if versioning_enabled {
+                    object.version_id = new_version_id();
+                }
                 let outcome = put_object_meta_to_all(
                     &state.osd_pool,
                     &placement.nodes,
                     &bucket,
                     &key,
                     object.clone(),
-                    false,
+                    versioning_enabled,
                     &[],
                 )
                 .await;
@@ -7144,7 +7568,7 @@ async fn complete_multipart_upload_internal(
                     bucket, key, upload_id, object.size
                 );
 
-                let mut builder = Response::builder()
+                let mut builder = with_version_id(Response::builder(), &object)
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/xml")
                     .header("ETag", &object.etag);
@@ -7225,17 +7649,33 @@ pub async fn get_object_with_params(
         .await;
     }
     if params.retention.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return get_object_retention_internal(state, bucket, key).await;
     }
     if params.legal_hold.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return get_object_legal_hold_internal(state, bucket, key).await;
     }
     if params.tagging.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return get_object_tagging_internal(state, bucket, key).await;
     }
 
     // Otherwise, it's a regular GET object
-    get_object(State(state), Path((bucket, key)), auth, headers).await
+    let _ = auth;
+    get_object_version(state, bucket, key, params.version_id, headers).await
 }
 
 /// List parts - internal implementation
@@ -7329,6 +7769,11 @@ pub async fn delete_object_with_params(
         return abort_multipart_upload_internal(state, bucket, key, upload_id).await;
     }
     if params.tagging.is_some() {
+        if let Some(refused) =
+            unless_current(&state, &bucket, &key, params.version_id.as_deref()).await
+        {
+            return refused;
+        }
         return set_object_tagging(state, bucket, key, HashMap::new(), StatusCode::NO_CONTENT)
             .await;
     }
@@ -8607,16 +9052,35 @@ struct ListVersionsResult {
     name: String,
     #[serde(rename = "Prefix")]
     prefix: String,
+    #[serde(rename = "KeyMarker")]
+    key_marker: String,
+    #[serde(rename = "VersionIdMarker")]
+    version_id_marker: String,
+    #[serde(rename = "NextKeyMarker", skip_serializing_if = "Option::is_none")]
+    next_key_marker: Option<String>,
+    #[serde(
+        rename = "NextVersionIdMarker",
+        skip_serializing_if = "Option::is_none"
+    )]
+    next_version_id_marker: Option<String>,
     #[serde(rename = "MaxKeys")]
     max_keys: u32,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    delimiter: Option<String>,
     #[serde(rename = "IsTruncated")]
     is_truncated: bool,
-    #[serde(rename = "Version")]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    versions: Vec<ObjectVersionXml>,
-    #[serde(rename = "DeleteMarker")]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    delete_markers: Vec<DeleteMarkerXml>,
+    /// Versions and delete markers in listing order, as S3 interleaves
+    /// them.
+    #[serde(rename = "$value")]
+    entries: Vec<VersionEntryXml>,
+    #[serde(rename = "CommonPrefixes", skip_serializing_if = "Vec::is_empty")]
+    common_prefixes: Vec<CommonPrefix>,
+}
+
+#[derive(Serialize)]
+enum VersionEntryXml {
+    Version(ObjectVersionXml),
+    DeleteMarker(DeleteMarkerXml),
 }
 
 #[derive(Serialize)]
@@ -8649,13 +9113,35 @@ struct DeleteMarkerXml {
     last_modified: String,
 }
 
+/// What a ListObjectVersions request asks for.
+struct VersionListing {
+    prefix: String,
+    delimiter: Option<String>,
+    key_marker: String,
+    version_id_marker: String,
+    max_keys: u32,
+}
+
+/// One OSD's version listing, read a page of whole keys at a time.
+struct VersionSource {
+    node: objectio_proto::metadata::ListingNode,
+    /// Where its next page starts; `None` once it has no more.
+    next: Option<String>,
+    /// The last key it returned: everything up to here is in.
+    reached: Option<String>,
+}
+
+/// ListObjectVersions. Every version lives on the OSDs of its key's home,
+/// so each OSD's listing holds whole keys: read them all in key order, a
+/// page at a time, and use only the keys every OSD still being read has
+/// got past (an OSD further back may yet return more versions of a key).
+/// Then dedupe the replicas, order each key's versions newest first, and
+/// page.
 async fn list_object_versions_internal(
     state: Arc<AppState>,
     bucket: String,
-    prefix: String,
-    max_keys: u32,
+    req: VersionListing,
 ) -> Response {
-    // Use scatter-gather to list versions from all OSDs
     use objectio_proto::storage::ListObjectVersionsMetaRequest;
 
     let nodes = match state
@@ -8678,102 +9164,207 @@ async fn list_object_versions_internal(
         }
     };
 
-    let mut all_versions = Vec::new();
-    let mut all_delete_markers = Vec::new();
-
-    for node in &nodes {
-        let addr = format!("http://{}", node.address);
-        let mut client =
-            match objectio_proto::storage::storage_service_client::StorageServiceClient::connect(
-                addr,
-            )
+    // Enough keys to fill a page whatever each holds, and one more to say
+    // whether there is a next page.
+    let want = req.max_keys as usize + 1;
+    let page = req.max_keys.max(100);
+    let mut sources: Vec<VersionSource> = nodes
+        .into_iter()
+        .map(|node| VersionSource {
+            node,
+            next: Some(req.key_marker.clone()),
+            reached: None,
+        })
+        .collect();
+    let mut found: std::collections::BTreeMap<String, Vec<ObjectMeta>> =
+        std::collections::BTreeMap::new();
+    let complete_to = |sources: &[VersionSource]| -> Option<Option<String>> {
+        // None: nothing is complete yet. Some(None): everything is.
+        let mut horizon: Option<&String> = None;
+        for s in sources.iter().filter(|s| s.next.is_some()) {
+            let r = s.reached.as_ref()?;
+            horizon = Some(horizon.map_or(r, |h| h.min(r)));
+        }
+        Some(horizon.cloned())
+    };
+    loop {
+        let complete = match complete_to(&sources) {
+            Some(None) => found.len(),
+            Some(Some(h)) => found.range(..=h).count(),
+            None => 0,
+        };
+        if complete >= want {
+            break;
+        }
+        // Read on from the OSD furthest behind.
+        let Some(behind) = sources
+            .iter_mut()
+            .filter(|s| s.next.is_some())
+            .min_by(|a, b| a.reached.cmp(&b.reached))
+        else {
+            break;
+        };
+        let from = behind.next.take().unwrap_or_default();
+        let first = behind.reached.is_none();
+        let mut client = match state
+            .osd_pool
+            .get_or_connect(&behind.node.node_id, &behind.node.address)
             .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to connect to OSD {}: {}", node.address, e);
-                    continue;
-                }
-            };
-
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // Its keys are on the other OSDs of their homes.
+                warn!(
+                    "version listing: OSD {} unreachable: {e}",
+                    behind.node.address
+                );
+                continue;
+            }
+        };
         match client
             .list_object_versions_meta(ListObjectVersionsMetaRequest {
                 bucket: bucket.clone(),
-                prefix: prefix.clone(),
-                key_marker: String::new(),
-                version_id_marker: String::new(),
-                max_keys,
+                prefix: req.prefix.clone(),
+                key_marker: from,
+                // The marker key's own versions, on the first page only:
+                // its later versions come after the version marker.
+                version_id_marker: if first && !req.version_id_marker.is_empty() {
+                    req.version_id_marker.clone()
+                } else {
+                    String::new()
+                },
+                max_keys: page,
             })
             .await
         {
             Ok(resp) => {
-                let inner = resp.into_inner();
-                for obj in inner.versions {
-                    let last_modified = i64::try_from(obj.modified_at)
-                        .ok()
-                        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default();
-
-                    if obj.is_delete_marker {
-                        all_delete_markers.push(DeleteMarkerXml {
-                            key: obj.key,
-                            version_id: obj.version_id,
-                            is_latest: false, // Set later after sorting
-                            last_modified,
-                        });
-                    } else {
-                        all_versions.push(ObjectVersionXml {
-                            key: obj.key,
-                            version_id: obj.version_id,
-                            is_latest: false,
-                            last_modified,
-                            etag: obj.etag,
-                            size: obj.size,
-                            storage_class: if obj.storage_class.is_empty() {
-                                "STANDARD".to_string()
-                            } else {
-                                obj.storage_class
-                            },
-                        });
-                    }
+                let page = resp.into_inner();
+                for v in page.versions {
+                    behind.reached = Some(v.key.clone());
+                    found.entry(v.key.clone()).or_default().push(v);
+                }
+                behind.next = page.is_truncated.then_some(page.next_key_marker);
+                if behind.reached.is_none() {
+                    behind.reached = Some(String::new());
                 }
             }
             Err(e) => {
-                warn!("Failed to list versions from OSD {}: {}", node.address, e);
+                warn!("version listing: OSD {} failed: {e}", behind.node.address);
             }
         }
     }
+    let horizon = complete_to(&sources).flatten();
+    let more_beyond = horizon.is_some();
+    if let Some(h) = &horizon {
+        found.retain(|k, _| k <= h);
+    }
 
-    // Sort by key, then by modified_at desc to determine is_latest
-    all_versions.sort_by(|a, b| {
-        a.key
-            .cmp(&b.key)
-            .then(b.last_modified.cmp(&a.last_modified))
-    });
-
-    // Mark the first version of each key as is_latest
-    let mut seen_keys = std::collections::HashSet::new();
-    for v in &mut all_versions {
-        if seen_keys.insert(v.key.clone()) {
-            v.is_latest = true;
+    // Each key's versions once, newest first; the newest is the latest.
+    let mut ordered: Vec<(ObjectMeta, bool)> = Vec::new();
+    for (_, mut versions) in found {
+        versions.sort_by(|a, b| version_age(b).cmp(&version_age(a)));
+        versions.dedup_by(|a, b| a.version_id == b.version_id);
+        for (i, v) in versions.into_iter().enumerate() {
+            ordered.push((v, i == 0));
         }
     }
-
-    let is_truncated = all_versions.len() as u32 > max_keys;
-    if is_truncated {
-        all_versions.truncate(max_keys as usize);
+    // After the markers: past key_marker, or past version_id_marker within it.
+    if !req.key_marker.is_empty() {
+        let mut past = req.version_id_marker.is_empty();
+        // A marker that is a rolled-up prefix: past every key under it.
+        let rolled_marker = req
+            .delimiter
+            .as_ref()
+            .is_some_and(|d| req.key_marker.ends_with(d.as_str()));
+        ordered.retain(|(v, _)| {
+            if rolled_marker && v.key.starts_with(&req.key_marker) {
+                return false;
+            }
+            if v.key != req.key_marker {
+                return v.key > req.key_marker;
+            }
+            if past {
+                return !req.version_id_marker.is_empty();
+            }
+            if version_label(&v.version_id) == req.version_id_marker {
+                past = true;
+            }
+            false
+        });
     }
+
+    let mut entries = Vec::new();
+    let mut common_prefixes: Vec<CommonPrefix> = Vec::new();
+    let mut last: Option<(String, String)> = None;
+    let mut is_truncated = false;
+    for (v, is_latest) in ordered {
+        let rolled = req.delimiter.as_ref().and_then(|d| {
+            v.key[req.prefix.len()..]
+                .find(d.as_str())
+                .map(|i| v.key[..req.prefix.len() + i + d.len()].to_string())
+        });
+        if let Some(p) = rolled {
+            if common_prefixes.last().is_some_and(|c| c.prefix == p) {
+                continue;
+            }
+            if entries.len() + common_prefixes.len() >= req.max_keys as usize {
+                is_truncated = true;
+                break;
+            }
+            // The next page starts after the whole prefix.
+            last = Some((p.clone(), String::new()));
+            common_prefixes.push(CommonPrefix { prefix: p });
+            continue;
+        }
+        if entries.len() + common_prefixes.len() >= req.max_keys as usize {
+            is_truncated = true;
+            break;
+        }
+        last = Some((v.key.clone(), version_label(&v.version_id).to_string()));
+        let last_modified = timestamp_to_iso(v.modified_at);
+        let version_id = version_label(&v.version_id).to_string();
+        entries.push(if v.is_delete_marker {
+            VersionEntryXml::DeleteMarker(DeleteMarkerXml {
+                key: v.key,
+                version_id,
+                is_latest,
+                last_modified,
+            })
+        } else {
+            VersionEntryXml::Version(ObjectVersionXml {
+                key: v.key,
+                version_id,
+                is_latest,
+                last_modified,
+                etag: v.etag,
+                size: v.size,
+                storage_class: if v.storage_class.is_empty() {
+                    "STANDARD".to_string()
+                } else {
+                    v.storage_class
+                },
+            })
+        });
+    }
+    let is_truncated = is_truncated || (more_beyond && last.is_some());
+    let (next_key_marker, next_version_id_marker) = match (is_truncated, last) {
+        (true, Some((k, v))) => (Some(k), Some(v).filter(|v| !v.is_empty())),
+        _ => (None, None),
+    };
 
     let result = ListVersionsResult {
         name: bucket,
-        prefix,
-        max_keys,
+        prefix: req.prefix,
+        key_marker: req.key_marker,
+        version_id_marker: req.version_id_marker,
+        next_key_marker,
+        next_version_id_marker,
+        max_keys: req.max_keys,
+        delimiter: req.delimiter,
         is_truncated,
-        versions: all_versions,
-        delete_markers: all_delete_markers,
+        entries,
+        common_prefixes,
     };
-
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
         to_xml(&result).unwrap_or_default()
