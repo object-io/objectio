@@ -31,7 +31,7 @@ use objectio_proto::metadata::{
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
-use crate::ec_io::{free_stripes, read_chunk};
+use crate::ec_io::free_stripes;
 use crate::flush::{flush_volume_all, flush_volume_all_locked};
 use crate::meta_blocks::MetaBlocks;
 use crate::metrics::{Io, Protocol};
@@ -46,6 +46,8 @@ pub struct BlockGatewayState {
     pub cache: Arc<WriteCache>,
     pub volume_manager: Arc<VolumeManager>,
     pub nbd_server: Arc<NbdServer>,
+    /// Loads the stored bytes of chunks with pending writes; serves reads.
+    pub resolver: Arc<crate::resolve::Resolver>,
     pub advertise_host: String,
     pub nbd_port: u16,
     pub ec_k: u32,
@@ -122,20 +124,6 @@ impl BlockGatewayService {
             )));
         }
         Ok(())
-    }
-
-    /// See [`crate::ec_io::load_for_partial_write`].
-    async fn load_for_write(&self, volume_id: &str, offset: u64, len: u64) -> Result<(), Status> {
-        crate::ec_io::load_for_partial_write(
-            &self.state.cache,
-            &self.state.meta,
-            &self.state.osd_pool,
-            volume_id,
-            offset,
-            len,
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("reading the chunk to write into: {e}")))
     }
 
     pub fn new(state: Arc<BlockGatewayState>) -> Self {
@@ -623,52 +611,16 @@ impl BlockService for BlockGatewayService {
             u64::from(req.length_bytes),
         )?;
 
-        // Try cache first
-        if let Some(data) =
-            self.state
-                .cache
-                .read(&req.volume_id, req.offset_bytes, req.length_bytes as u64)
-        {
-            io.done(data.len() as u64);
-            return Ok(Response::new(ReadResponse { data }));
-        }
-
-        // Cache miss: need to determine which chunk(s) and read from EC
-        let chunk_mapper = self.state.volume_manager.chunk_mapper();
-        let ranges = chunk_mapper.byte_range_to_chunks(req.offset_bytes, req.length_bytes as u64);
-        let chunk_size = chunk_mapper.chunk_size();
-
-        let mut result = vec![0u8; req.length_bytes as usize];
-        let mut result_offset = 0usize;
-
-        for range in &ranges {
-            let chunk_data = read_chunk(
-                &self.state.meta,
-                &self.state.osd_pool,
+        let result = self
+            .state
+            .resolver
+            .read(
                 &req.volume_id,
-                range.chunk_id,
-                chunk_size as usize,
+                req.offset_bytes,
+                u64::from(req.length_bytes),
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Add to clean cache for future reads
-            self.state.cache.add_clean(
-                &req.volume_id,
-                range.chunk_id,
-                bytes::Bytes::from(chunk_data.clone()),
-            );
-
-            // Copy the requested range from this chunk
-            let start = range.offset_in_chunk as usize;
-            let end = (range.offset_in_chunk + range.length) as usize;
-            let src = &chunk_data[start..end.min(chunk_data.len()).min(chunk_size as usize)];
-            let dst_end = result_offset + src.len();
-            if dst_end <= result.len() {
-                result[result_offset..dst_end].copy_from_slice(src);
-            }
-            result_offset += src.len();
-        }
+            .map_err(|e| Status::unavailable(e.to_string()))?;
 
         io.done(result.len() as u64);
         Ok(Response::new(ReadResponse { data: result }))
@@ -683,12 +635,13 @@ impl BlockService for BlockGatewayService {
         let len = req.data.len() as u32;
 
         self.check_bounds(&req.volume_id, req.offset_bytes, req.data.len() as u64)?;
-        self.load_for_write(&req.volume_id, req.offset_bytes, req.data.len() as u64)
-            .await?;
         self.state
             .cache
             .write(&req.volume_id, req.offset_bytes, &req.data)
             .map_err(|e| Status::internal(e.to_string()))?;
+        self.state
+            .resolver
+            .kick(&req.volume_id, req.offset_bytes, req.data.len() as u64);
 
         io.done(u64::from(len));
         Ok(Response::new(WriteResponse { bytes_written: len }))
@@ -718,16 +671,16 @@ impl BlockService for BlockGatewayService {
 
         // Zero-fill the trimmed range in cache
         self.check_bounds(&req.volume_id, req.offset_bytes, req.length_bytes)?;
-        self.load_for_write(&req.volume_id, req.offset_bytes, req.length_bytes)
-            .await?;
         let zeros = vec![0u8; req.length_bytes as usize];
-        if let Err(e) = self
-            .state
+        // A failed trim is an error to the caller. (It used to be logged
+        // and reported as success.)
+        self.state
             .cache
             .write(&req.volume_id, req.offset_bytes, &zeros)
-        {
-            warn!("Trim write-zero failed for vol {}: {e}", req.volume_id);
-        }
+            .map_err(|e| Status::internal(format!("trim: {e}")))?;
+        self.state
+            .resolver
+            .kick(&req.volume_id, req.offset_bytes, req.length_bytes);
 
         io.done(req.length_bytes);
         Ok(Response::new(TrimResponse { success: true }))

@@ -104,6 +104,10 @@ async fn flush_chunks_locked(
 /// Flush the chunks of one volume that are due (old enough, or under cache
 /// pressure).
 pub async fn flush_volume(vol_id: &str, state: &BlockGatewayState) {
+    // Chunks with writes waiting for their stored bytes are made whole
+    // first; one that cannot be stays pending and journaled, and is
+    // retried next time.
+    state.resolver.resolve_volume(vol_id).await;
     let chunks = state.cache.get_chunks_to_flush(vol_id);
     if chunks.is_empty() {
         return;
@@ -120,13 +124,16 @@ pub async fn flush_volume(vol_id: &str, state: &BlockGatewayState) {
 /// Flush every dirty chunk of a volume now, the caller holding
 /// `state.flush_lock`. How many chunks are still dirty.
 pub async fn flush_volume_all_locked(vol_id: &str, state: &BlockGatewayState) -> usize {
+    // Pending chunks are dirty too: made whole first, and counted as still
+    // dirty if they cannot be (a snapshot must not be taken without them).
+    let unresolved = state.resolver.resolve_volume(vol_id).await;
     let chunks = state.cache.dirty_chunks(vol_id);
     let n = flush_chunks_locked(vol_id, state, &chunks).await;
     if !chunks.is_empty() {
         info!("Force-flushed {n}/{} chunks for vol {vol_id}", chunks.len());
     }
     reset_journal(state);
-    chunks.len() - n
+    chunks.len() - n + unresolved
 }
 
 /// Flush every dirty chunk of a volume now (Flush RPC, detach). How many

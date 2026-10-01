@@ -27,6 +27,13 @@ pub struct DirtyChunk {
     /// Bumped by every write to the chunk, so a flush can tell whether the
     /// bytes it wrote out are still the latest.
     pub version: u64,
+    /// The byte ranges written, `(offset, length)`, while the chunk's stored
+    /// bytes are not merged in yet: a partial write to a chunk the cache did
+    /// not hold is acknowledged once journaled, without waiting to load the
+    /// rest of the chunk (that load cost a random 4 KiB write ~17 ms).
+    /// `None` once the chunk is whole. A pending chunk is not flushed or
+    /// read whole until [`WriteCache::resolve`] merges the stored bytes in.
+    pub pending: Option<Vec<(u32, u32)>>,
 }
 
 /// Write cache configuration
@@ -241,16 +248,29 @@ impl WriteCache {
 
             // The chunk's current bytes: dirty, clean (promoted to dirty), or
             // zeros for a chunk never cached.
-            let (existing, dirty_since) =
+            let (existing, dirty_since, pending_of) =
                 if let Some(dirty) = cache.dirty_chunks.remove(&range.chunk_id) {
-                    (Some(dirty.data), Some(dirty.dirty_since))
+                    (Some(dirty.data), Some(dirty.dirty_since), dirty.pending)
                 } else if let Some(clean) = cache.clean_chunks.remove(&range.chunk_id) {
                     cache.clean_bytes = cache.clean_bytes.saturating_sub(clean.len() as u64);
-                    (Some(clean), None)
+                    (Some(clean), None, None)
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
             let was_dirty = dirty_since.is_some();
+            let offset_in_chunk = range.offset_in_chunk as usize;
+            let whole = offset_in_chunk == 0 && range_len == chunk_size;
+            // A chunk held whole stays whole. One not held becomes pending
+            // unless this write covers all of it.
+            let pending = match (&existing, pending_of) {
+                (Some(_), Some(mut ranges)) => {
+                    ranges.push((offset_in_chunk as u32, range_len as u32));
+                    (!covers(&mut ranges, chunk_size)).then_some(ranges)
+                }
+                (Some(_), None) => None,
+                (None, _) if whole => None,
+                (None, _) => Some(vec![(offset_in_chunk as u32, range_len as u32)]),
+            };
 
             // Written in place when the cache holds the only reference;
             // copied only while a flush or a read holds one too (they keep
@@ -267,7 +287,6 @@ impl WriteCache {
                 chunk_data.resize(chunk_size, 0);
             }
 
-            let offset_in_chunk = range.offset_in_chunk as usize;
             chunk_data[offset_in_chunk..offset_in_chunk + range_len]
                 .copy_from_slice(&data[data_offset..data_offset + range_len]);
 
@@ -278,6 +297,7 @@ impl WriteCache {
                 data: chunk_data.freeze(),
                 dirty_since: dirty_since.unwrap_or(now),
                 last_modified: now,
+                pending,
             };
 
             if !was_dirty {
@@ -321,14 +341,22 @@ impl WriteCache {
         let mut result = Vec::with_capacity(length as usize);
 
         for range in &chunk_ranges {
-            // Check dirty cache first
-            if let Some(dirty) = cache.dirty_chunks.get(&range.chunk_id) {
+            // Check dirty cache first (a pending chunk is not whole yet)
+            if let Some(dirty) = cache
+                .dirty_chunks
+                .get(&range.chunk_id)
+                .filter(|d| d.pending.is_none())
+            {
                 let offset_in_chunk = range.offset_in_chunk as usize;
                 let range_len = range.length as usize;
                 result.extend_from_slice(&dirty.data[offset_in_chunk..offset_in_chunk + range_len]);
             }
             // Check clean cache
-            else if let Some(clean) = cache.clean_chunks.get(&range.chunk_id) {
+            else if let Some(clean) = cache
+                .clean_chunks
+                .get(&range.chunk_id)
+                .filter(|_| !cache.dirty_chunks.contains_key(&range.chunk_id))
+            {
                 let offset_in_chunk = range.offset_in_chunk as usize;
                 let range_len = range.length as usize;
                 result.extend_from_slice(&clean[offset_in_chunk..offset_in_chunk + range_len]);
@@ -341,11 +369,73 @@ impl WriteCache {
         Some(result)
     }
 
-    /// Whether the cache holds `chunk_id` of `volume_id`, dirty or clean.
+    /// Whether the cache holds all of `chunk_id` of `volume_id`, dirty or
+    /// clean.
     pub fn holds_chunk(&self, volume_id: &str, chunk_id: ChunkId) -> bool {
+        self.chunk(volume_id, chunk_id).is_some()
+    }
+
+    /// The whole chunk, if the cache holds all of it: dirty, or clean.
+    pub fn chunk(&self, volume_id: &str, chunk_id: ChunkId) -> Option<Bytes> {
+        let caches = self.caches.read();
+        let c = caches.get(volume_id)?;
+        match c.dirty_chunks.get(&chunk_id) {
+            Some(d) if d.pending.is_none() => Some(d.data.clone()),
+            Some(_) => None,
+            None => c.clean_chunks.get(&chunk_id).cloned(),
+        }
+    }
+
+    /// Whether `chunk_id` has writes waiting for its stored bytes.
+    pub fn is_pending(&self, volume_id: &str, chunk_id: ChunkId) -> bool {
         self.caches.read().get(volume_id).is_some_and(|c| {
-            c.dirty_chunks.contains_key(&chunk_id) || c.clean_chunks.contains_key(&chunk_id)
+            c.dirty_chunks
+                .get(&chunk_id)
+                .is_some_and(|d| d.pending.is_some())
         })
+    }
+
+    /// Chunks of `volume_id` with writes waiting for their stored bytes.
+    pub fn pending_chunks(&self, volume_id: &str) -> Vec<ChunkId> {
+        self.caches
+            .read()
+            .get(volume_id)
+            .map(|c| {
+                c.dirty_chunks
+                    .iter()
+                    .filter(|(_, d)| d.pending.is_some())
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Merge a pending chunk's stored bytes (`base`; zeros for a chunk
+    /// never stored) under the writes made to it: the chunk is whole
+    /// again, with every written range kept. A no-op for a chunk not
+    /// pending (resolved already, or gone).
+    pub fn resolve(&self, volume_id: &str, chunk_id: ChunkId, base: &[u8]) {
+        let chunk_size = self.chunk_mapper.chunk_size() as usize;
+        let mut caches = self.caches.write();
+        let Some(cache) = caches.get_mut(volume_id) else {
+            return;
+        };
+        let next = cache.next_version + 1;
+        let Some(dirty) = cache.dirty_chunks.get_mut(&chunk_id) else {
+            return;
+        };
+        let Some(ranges) = dirty.pending.take() else {
+            return;
+        };
+        let mut whole = BytesMut::from(&base[..base.len().min(chunk_size)]);
+        whole.resize(chunk_size, 0);
+        for (off, len) in ranges {
+            let (off, len) = (off as usize, len as usize);
+            whole[off..off + len].copy_from_slice(&dirty.data[off..off + len]);
+        }
+        dirty.data = whole.freeze();
+        dirty.version = next;
+        cache.next_version = next;
     }
 
     /// Add a clean chunk to the read cache
@@ -381,7 +471,11 @@ impl WriteCache {
         let now = Instant::now();
         let mut to_flush = Vec::new();
 
-        for (chunk_id, dirty) in &cache.dirty_chunks {
+        for (chunk_id, dirty) in cache
+            .dirty_chunks
+            .iter()
+            .filter(|(_, d)| d.pending.is_none())
+        {
             let age = now.duration_since(dirty.dirty_since);
             if age >= self.config.max_dirty_age || self.should_flush() {
                 to_flush.push((*chunk_id, dirty.data.clone(), dirty.version));
@@ -481,6 +575,7 @@ impl WriteCache {
             .map(|c| {
                 c.dirty_chunks
                     .iter()
+                    .filter(|(_, d)| d.pending.is_none())
                     .map(|(id, d)| (*id, d.data.clone(), d.version))
                     .collect()
             })
@@ -524,9 +619,33 @@ pub struct CacheStats {
     pub clean_chunks: usize,
 }
 
+/// Whether `ranges` cover `0..len` (merged in place as a side effect).
+fn covers(ranges: &mut Vec<(u32, u32)>, len: usize) -> bool {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for &(off, l) in ranges.iter() {
+        match merged.last_mut() {
+            Some(last) if off <= last.0 + last.1 => {
+                last.1 = last.1.max(off + l - last.0);
+            }
+            _ => merged.push((off, l)),
+        }
+    }
+    *ranges = merged;
+    ranges.len() == 1 && ranges[0] == (0, len as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resolve every pending chunk as never stored (zeros), as the gateway
+    /// does for a chunk with no stripe.
+    fn settle(cache: &WriteCache, vol: &str) {
+        for c in cache.pending_chunks(vol) {
+            cache.resolve(vol, c, &[]);
+        }
+    }
 
     fn test_cache() -> WriteCache {
         let mapper = Arc::new(ChunkMapper::new(1024 * 1024)); // 1MB chunks for testing
@@ -540,6 +659,7 @@ mod tests {
 
         let data = vec![0xABu8; 4096]; // 4KB
         cache.write("vol1", 0, &data).unwrap();
+        settle(&cache, "vol1");
 
         // Should be able to read it back
         let read = cache.read("vol1", 0, 4096).unwrap();
@@ -559,6 +679,7 @@ mod tests {
         // Write 2MB starting at 512KB (spans chunks 0 and 1)
         let data = vec![0xCDu8; 2 * 1024 * 1024];
         cache.write("vol1", 512 * 1024, &data).unwrap();
+        settle(&cache, "vol1");
 
         // Should have 3 dirty chunks (512KB in chunk 0, 1MB in chunk 1, 512KB in chunk 2)
         let stats = cache.stats();
@@ -576,6 +697,7 @@ mod tests {
 
         let data = vec![0xEFu8; 4096];
         cache.write("vol1", 0, &data).unwrap();
+        settle(&cache, "vol1");
 
         // The dirty chunk is offered for flushing, and clean once flushed
         let dirty = cache.dirty_chunks("vol1");
@@ -606,6 +728,7 @@ mod tests {
         let cache = test_cache();
         cache.init_volume("vol1");
         cache.write("vol1", 0, &[1u8; 4096]).unwrap();
+        settle(&cache, "vol1");
         let in_flight = cache.dirty_chunks("vol1");
 
         cache.write("vol1", 4096, &[2u8; 4096]).unwrap(); // during the flush
@@ -616,6 +739,53 @@ mod tests {
         assert_eq!(&still[0].1[4096..8192], &[2u8; 4096]);
     }
 
+    /// A partial write to a chunk the cache does not hold is taken at once
+    /// and waits for the chunk's stored bytes: never flushed or served
+    /// whole until they are merged in, and then every written byte wins.
+    #[test]
+    fn a_partial_write_waits_for_its_chunk_and_wins_over_it() {
+        let cache = test_cache();
+        cache.init_volume("vol1");
+        cache.write("vol1", 4096, &[7u8; 4096]).unwrap();
+        assert!(cache.is_pending("vol1", 0));
+        assert!(cache.chunk("vol1", 0).is_none());
+        assert!(cache.read("vol1", 0, 8192).is_none(), "served half a chunk");
+        assert!(
+            cache.dirty_chunks("vol1").is_empty(),
+            "flushable while pending"
+        );
+        assert_eq!(cache.pending_chunks("vol1"), vec![0]);
+
+        // Another write lands before the stored bytes do.
+        cache.write("vol1", 0, &[8u8; 100]).unwrap();
+        let stored = vec![1u8; 1024 * 1024];
+        cache.resolve("vol1", 0, &stored);
+        let whole = cache.chunk("vol1", 0).expect("whole after resolve");
+        assert_eq!(&whole[..100], &[8u8; 100]);
+        assert_eq!(&whole[100..4096], &[1u8; 3996][..]);
+        assert_eq!(&whole[4096..8192], &[7u8; 4096]);
+        assert_eq!(&whole[8192..8200], &[1u8; 8]);
+        assert_eq!(cache.dirty_chunks("vol1").len(), 1);
+        // Resolving again changes nothing.
+        cache.resolve("vol1", 0, &vec![9u8; 1024 * 1024]);
+        assert_eq!(cache.chunk("vol1", 0).unwrap(), whole);
+    }
+
+    /// Writes that between them cover the chunk need nothing stored.
+    #[test]
+    fn writes_covering_a_chunk_need_none_of_its_stored_bytes() {
+        let cache = test_cache();
+        cache.init_volume("vol1");
+        let half = 512 * 1024;
+        cache
+            .write("vol1", half, &vec![2u8; half as usize])
+            .unwrap();
+        assert!(cache.is_pending("vol1", 0));
+        cache.write("vol1", 0, &vec![3u8; half as usize]).unwrap();
+        assert!(!cache.is_pending("vol1", 0));
+        assert_eq!(cache.dirty_chunks("vol1").len(), 1);
+    }
+
     /// A chunk is written in place, but never under a flush: the bytes a
     /// flush took stay what they were when it took them.
     #[test]
@@ -623,6 +793,7 @@ mod tests {
         let cache = test_cache();
         cache.init_volume("vol1");
         cache.write("vol1", 0, &[1u8; 4096]).unwrap();
+        settle(&cache, "vol1");
         let taken = cache.dirty_chunks("vol1");
         cache.write("vol1", 0, &[2u8; 4096]).unwrap();
         assert_eq!(
@@ -653,6 +824,7 @@ mod tests {
         let cache = WriteCache::with_journal(Arc::clone(&mapper), &path);
         cache.init_volume("vol1");
         cache.write("vol1", 4096, b"after a reopen").unwrap();
+        settle(&cache, "vol1");
         let recovered: Vec<_> = cache.recover().unwrap().into_iter().map(|w| w.3).collect();
         assert_eq!(recovered, vec![&b"first"[..], &b"after a reopen"[..]]);
 

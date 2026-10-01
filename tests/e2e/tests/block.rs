@@ -547,3 +547,44 @@ fn pipelined_nbd_requests_are_each_answered_and_the_data_is_right() {
         );
     }
 }
+
+/// A read spanning a chunk with writes not yet stored and one the gateway
+/// has not cached sees those writes. It used to fetch both chunks from the
+/// OSDs, returning stale bytes for the first.
+#[test]
+fn a_read_across_chunks_sees_writes_not_yet_stored() {
+    let b = Block::start();
+    let vol = b.create("span", 4 * CHUNK);
+    let tail = pattern(4096, 9);
+    b.write(&vol, CHUNK - 4096, &tail);
+    // Not flushed; chunk 1 never written.
+    let read = b.read(&vol, CHUNK - 4096, 8192);
+    assert_eq!(&read[..4096], &tail[..], "the unflushed write was not read");
+    assert_eq!(&read[4096..], &[0u8; 4096][..]);
+}
+
+/// A partial write into a stored chunk the gateway has not cached is taken
+/// at once; the chunk's stored bytes are merged in behind it, and a
+/// snapshot taken then holds the merged chunk.
+#[test]
+fn a_snapshot_holds_a_partial_write_merged_into_its_stored_chunk() {
+    let mut b = Block::start();
+    let vol = b.create("merge", 2 * CHUNK);
+    let base = pattern(CHUNK, 10);
+    b.write(&vol, 0, &base);
+    b.flush(&vol);
+    b.restart(); // nothing cached
+    let vol = b.id_of("merge");
+    let patch = pattern(4096, 11);
+    b.write(&vol, 8192, &patch);
+    let snap = b.snapshot(&vol, "s");
+    let clone = b.clone_of(&snap, "c");
+    let mut want = base;
+    want[8192..8192 + 4096].copy_from_slice(&patch);
+    assert_eq!(
+        b.read(&clone, 0, CHUNK),
+        want,
+        "the snapshot lost the stored bytes or the write"
+    );
+    assert_eq!(b.read(&vol, 0, CHUNK), want);
+}
