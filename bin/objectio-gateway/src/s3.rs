@@ -2656,6 +2656,12 @@ pub async fn create_bucket(
             region: "us-east-1".to_string(),
             tenant,
             settings: crate::public_access::initial_settings(&state).await,
+            // The pool its data goes to; meta checks the tenant may use it.
+            pool: headers
+                .get("x-objectio-pool")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
         })
         .await
     {
@@ -2746,6 +2752,16 @@ pub async fn create_bucket(
                     "The requested bucket name is not available",
                     StatusCode::CONFLICT,
                 )
+            } else if e.code() == tonic::Code::PermissionDenied {
+                S3Error::xml_response("AccessDenied", e.message(), StatusCode::FORBIDDEN)
+            } else if matches!(
+                e.code(),
+                tonic::Code::NotFound | tonic::Code::FailedPrecondition
+            ) {
+                // A pool that doesn't exist or is disabled.
+                S3Error::xml_response("InvalidArgument", e.message(), StatusCode::BAD_REQUEST)
+            } else if e.code() == tonic::Code::ResourceExhausted {
+                S3Error::xml_response("TooManyBuckets", e.message(), StatusCode::BAD_REQUEST)
             } else {
                 error!("Failed to create bucket: {}", e);
                 S3Error::xml_response(

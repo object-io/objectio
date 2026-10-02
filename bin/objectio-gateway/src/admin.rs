@@ -1403,11 +1403,23 @@ pub async fn admin_create_bucket(
             region: String::new(),
             tenant,
             settings: crate::public_access::initial_settings(&state).await,
+            pool: body["pool"].as_str().unwrap_or_default().to_string(),
         })
         .await
     {
-        Ok(_) => Json(serde_json::json!({ "name": name })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+        Ok(r) => Json(serde_json::json!({
+            "name": name,
+            "pool": r.into_inner().bucket.map(|b| b.pool).unwrap_or_default(),
+        }))
+        .into_response(),
+        Err(e) => {
+            let status = match e.code() {
+                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                tonic::Code::AlreadyExists => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (status, e.message().to_string()).into_response()
+        }
     }
 }
 

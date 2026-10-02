@@ -1146,6 +1146,54 @@ impl StorageService for OsdService {
         Ok(Response::new(NoteChunksResponse { seen }))
     }
 
+    async fn purge(
+        &self,
+        request: Request<objectio_proto::storage::PurgeRequest>,
+    ) -> Result<Response<objectio_proto::storage::PurgeResponse>, Status> {
+        let req = request.into_inner();
+        if req.node_id.as_slice() != self.node_id.as_slice() {
+            return Err(Status::invalid_argument("purge names another OSD; refused"));
+        }
+        // Shards: the index entry, its persisted copy, then the block — the
+        // same order as DeleteShard, so a crash leaks a block rather than
+        // handing a live shard's block out.
+        let keys: Vec<String> = self.shard_index.read().keys().cloned().collect();
+        let mut shards = 0u64;
+        for key in keys {
+            let removed = self.shard_index.write().remove(&key);
+            if let Some(loc) = removed {
+                if let Err(e) = Self::forget_shard_location(&self.meta_store, &key) {
+                    warn!("purge: forgetting shard {key}: {e}");
+                }
+                self.free_location(&loc);
+                shards += 1;
+            }
+            self.corrupt.write().remove(&key);
+        }
+        // Object and version metadata: stale once drained, and harmful if
+        // the OSD came back with it (deleted objects would reappear).
+        let mut entries = 0u64;
+        for prefix in [
+            MetadataKey::all_object_meta_prefix(),
+            MetadataKey::from_bytes(vec![b'v']),
+        ] {
+            for (key, _) in self.meta_store.scan_prefix(&prefix) {
+                match self.meta_store.delete(&key) {
+                    Ok(_) => entries += 1,
+                    Err(e) => {
+                        return Err(Status::internal(format!("purge: {e}")));
+                    }
+                }
+            }
+        }
+        self.usage.rebuild(std::iter::empty());
+        info!("Purged: {shards} shards, {entries} metadata entries");
+        Ok(Response::new(objectio_proto::storage::PurgeResponse {
+            shards,
+            entries,
+        }))
+    }
+
     async fn reset_chunk_notes(
         &self,
         _request: Request<ResetChunkNotesRequest>,

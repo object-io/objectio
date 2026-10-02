@@ -666,3 +666,10 @@ def test_audit_config(client, stub):
     client.delete_audit_config()
     assert (stub.last["method"], stub.last["query"]) == ("DELETE", {})
 
+
+def test_create_bucket_in_a_pool(client, stub):
+    stub.json({"name": "b", "pool": "gold"})
+    client.create_bucket("b", tenant="acme", pool="gold")
+    assert stub.last["path"] == "/_admin/buckets"
+    assert stub.body() == {"name": "b", "tenant": "acme", "pool": "gold"}
+
