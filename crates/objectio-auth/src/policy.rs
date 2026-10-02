@@ -79,6 +79,26 @@ impl BucketPolicy {
         Ok(policy)
     }
 
+    /// A role's trust policy. As in AWS its statements name no `Resource`:
+    /// the resource is the role it is attached to, so one is implied.
+    pub fn from_trust_json(json: &str) -> Result<Self, serde_json::Error> {
+        let mut raw: serde_json::Value = serde_json::from_str(json)?;
+        let imply = |st: &mut serde_json::Value| {
+            if let Some(obj) = st.as_object_mut()
+                && !obj.contains_key("Resource")
+                && !obj.contains_key("NotResource")
+            {
+                obj.insert("Resource".to_string(), serde_json::json!("*"));
+            }
+        };
+        match raw.get_mut("Statement") {
+            Some(serde_json::Value::Array(a)) => a.iter_mut().for_each(imply),
+            Some(one) => imply(one),
+            None => {}
+        }
+        Self::from_json(&raw.to_string())
+    }
+
     /// Serialize to JSON
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
@@ -334,9 +354,18 @@ impl<'de> Deserialize<'de> for Principal {
                                 .collect(),
                             _ => Vec::new(),
                         };
+                        // An identity provider is named by its issuer,
+                        // with or without the scheme.
+                        let bare = |n: String| {
+                            let n = n.trim_end_matches('/');
+                            n.strip_prefix("https://")
+                                .or_else(|| n.strip_prefix("http://"))
+                                .unwrap_or(n)
+                                .to_string()
+                        };
                         obio_principals
                             .get_or_insert_with(Vec::new)
-                            .extend(names.into_iter().map(|n| format!("{key}:{n}")));
+                            .extend(names.into_iter().map(|n| format!("{key}:{}", bare(n))));
                     } else {
                         // Skip unknown keys
                         let _: serde_json::Value = map.next_value()?;
@@ -1889,6 +1918,24 @@ mod principal_spelling_tests {
         assert_eq!(
             evaluate("arn:obio:iam::objectio:user/eve"),
             PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn a_trust_policy_needs_no_resource() {
+        let doc = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Principal":{"Federated":"idp.example.com"},
+            "Action":"sts:AssumeRoleWithWebIdentity"}]}"#;
+        assert!(BucketPolicy::from_json(doc).is_err());
+        let trust = BucketPolicy::from_trust_json(doc).unwrap();
+        let ctx = RequestContext::new(
+            "Federated:idp.example.com",
+            "sts:AssumeRoleWithWebIdentity",
+            "arn:obio:iam::acme:role/ci",
+        );
+        assert_eq!(
+            PolicyEvaluator::new().evaluate(&trust, &ctx),
+            PolicyDecision::Allow
         );
     }
 }

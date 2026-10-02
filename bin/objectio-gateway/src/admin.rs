@@ -299,8 +299,19 @@ pub async fn admin_set_config(
     }
 
     // Validate JSON
-    if serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+    let Ok(new_value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
+    };
+
+    if !is_system_admin(&caller)
+        && section.starts_with("identity/openid/")
+        && (flags_system_admin(&new_value) || is_system_provider(&state, &section).await)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Only the system admin may manage a system_admin provider",
+        )
+            .into_response();
     }
 
     let updated_by = auth
@@ -390,7 +401,7 @@ pub async fn admin_delete_config(
             return (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
         }
         let allowed = caller_tenant_oidc_config_keys(&state, &auth, &headers).await;
-        if !allowed.contains(&section) {
+        if !allowed.contains(&section) || is_system_provider(&state, &section).await {
             return (StatusCode::FORBIDDEN, "System admin access required").into_response();
         }
     }
@@ -618,6 +629,31 @@ pub fn require_system_admin(
         return None;
     }
     Some((StatusCode::FORBIDDEN, "System admin access required").into_response())
+}
+
+fn flags_system_admin(config: &serde_json::Value) -> bool {
+    config
+        .get("system_admin")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the stored provider at `key` vouches for system administrators
+/// (console login, STS for system roles). A tenant admin who could edit
+/// one would point it at their own IdP and sign in as the operator, so
+/// only the system admin may set the flag or touch a provider carrying it.
+async fn is_system_provider(state: &AppState, key: &str) -> bool {
+    state
+        .meta_client
+        .clone()
+        .get_config(GetConfigRequest {
+            key: key.to_string(),
+        })
+        .await
+        .ok()
+        .and_then(|r| r.into_inner().entry)
+        .and_then(|e| serde_json::from_slice::<serde_json::Value>(&e.value).ok())
+        .is_some_and(|v| flags_system_admin(&v))
 }
 
 /// Slug-style provider name reserved for a tenant's own OIDC config.

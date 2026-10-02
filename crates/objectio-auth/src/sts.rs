@@ -87,11 +87,22 @@ impl StsProvider {
     /// `scope` should be an `s3://bucket/prefix/` URI — only requests
     /// against that bucket+prefix will be accepted by the auth middleware.
     pub fn issue(&self, user_arn: &str, scope: &str, operation: Operation) -> TemporaryCredentials {
+        self.issue_for(user_arn, scope, operation, self.default_duration)
+    }
+
+    /// As [`Self::issue`], valid for `duration`.
+    pub fn issue_for(
+        &self,
+        user_arn: &str,
+        scope: &str,
+        operation: Operation,
+        duration: Duration,
+    ) -> TemporaryCredentials {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let expires_at = now + self.default_duration.as_secs();
+        let expires_at = now + duration.as_secs();
 
         // ASIA prefix marks this as a temporary credential per AWS convention.
         let access_key_id = format!("ASIA{}", random_alphanum(16));

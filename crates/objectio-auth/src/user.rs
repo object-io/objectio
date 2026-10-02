@@ -167,6 +167,10 @@ pub enum AuthMode {
     Sts,
     /// `--no-auth` mode or pre-auth public route.
     Anonymous,
+    /// A role's session (`AssumeRoleWithWebIdentity`): temporary keys
+    /// carrying the role's tenant and its attached policies, inside the
+    /// tenant boundary like any of the tenant's users.
+    AssumedRole,
 }
 
 impl AuthMode {
@@ -178,6 +182,7 @@ impl AuthMode {
             Self::Permanent => "Permanent",
             Self::Sts => "STS",
             Self::Anonymous => "Anonymous",
+            Self::AssumedRole => "AssumedRole",
         }
     }
 }

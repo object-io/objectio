@@ -439,7 +439,15 @@ async fn load_identity_policies(
     }
 
     let mut client = state.meta_client.clone();
-    let request = if is_group {
+    let request = if let Some(role) = principal_id.strip_prefix("role:") {
+        // An assumed role's session: the role's attachments, keyed the way
+        // the admin API invalidates them ("role:<tenant/name>").
+        ListAttachedPoliciesRequest {
+            user_id: String::new(),
+            group_id: String::new(),
+            role_name: role.to_string(),
+        }
+    } else if is_group {
         ListAttachedPoliciesRequest {
             user_id: String::new(),
             group_id: principal_id.to_string(),

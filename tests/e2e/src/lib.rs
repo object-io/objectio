@@ -714,6 +714,26 @@ impl Cluster {
         self.request_inner(method, path, body, access_key, secret_key, &[])
     }
 
+    /// Signed with temporary credentials: the session token rides along in
+    /// `X-Amz-Security-Token`, as SDKs send it.
+    pub fn request_as_session(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        creds: (&str, &str, &str),
+    ) -> Response {
+        let (access_key, secret_key, token) = creds;
+        self.request_inner(
+            method,
+            path,
+            body,
+            access_key,
+            secret_key,
+            &[("X-Amz-Security-Token", token)],
+        )
+    }
+
     fn request_inner(
         &self,
         method: &str,

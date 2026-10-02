@@ -31,7 +31,7 @@ pub struct ConsoleOidcState {
 }
 
 /// Build an OidcProvider from a stored identity config (identity/openid/{name})
-fn build_oidc_provider_from_config(
+pub(crate) fn build_oidc_provider_from_config(
     config: &serde_json::Value,
 ) -> Option<objectio_auth::OidcProvider> {
     let issuer_url = config.get("issuer_url")?.as_str()?.to_string();

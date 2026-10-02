@@ -2390,6 +2390,7 @@ dependencies = [
  "objectio-common",
  "objectio-proto",
  "reqwest",
+ "ring",
  "serde_json",
  "sha2",
  "tempfile",
