@@ -2437,6 +2437,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "md-5",
+ "memchr",
  "objectio-auth",
  "objectio-client",
  "objectio-common",

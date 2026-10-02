@@ -11,6 +11,7 @@ pub mod checksum;
 pub mod chunked_decode;
 pub mod cluster_poll;
 pub mod console_auth;
+pub mod cors;
 pub mod dedup;
 pub mod digest;
 pub mod gateway_metrics;
@@ -24,6 +25,7 @@ pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod origin;
 pub mod osd_pool;
+pub mod post_object;
 pub mod prom;
 pub mod public_access;
 pub mod rdma;
@@ -1277,10 +1279,17 @@ pub async fn run(
         ))
     };
 
+    let post_object_state = Arc::new(post_object::PostObjectState {
+        app: Arc::clone(&state),
+        auth_enabled: !args.no_auth,
+    });
+
     // S3-side layer stack (chunked-decode + body limit + optional SigV4 auth).
     let build_s3_protected = || {
         let r = Router::new()
             .merge(s3_routes.clone())
+            // Innermost: after authentication and authorization.
+            .layer(middleware::from_fn(s3::unsupported_subresource_layer))
             .layer(middleware::from_fn(chunked_decode::s3_chunked_decode_layer))
             .layer(body_limit);
         let r = if args.no_auth {
@@ -1301,6 +1310,18 @@ pub async fn run(
         r.layer(middleware::from_fn_with_state(
             Arc::clone(&sts_state),
             sts_api::sts_layer,
+        ))
+        // Browser form uploads carry their credentials in the form, not an
+        // Authorization header: taken ahead of SigV4, like STS.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&post_object_state),
+            post_object::post_object_layer,
+        ))
+        // CORS outermost: preflights are never signed, and a browser needs
+        // the headers on every answer, refusals included.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            cors::cors_layer,
         ))
     };
 

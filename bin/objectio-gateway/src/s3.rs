@@ -684,8 +684,26 @@ fn is_warehouse_bucket(bucket: &str) -> bool {
 }
 
 /// Extract user metadata from request headers (x-amz-meta-* headers)
+/// The standard headers an object keeps and serves back, as S3 does. They
+/// ride in `user_metadata` under this prefix (a space can't be in a header
+/// name, so no `x-amz-meta-` key can collide) and are served under their own
+/// names.
+const STORED_HEADER_PREFIX: &str = "objectio header ";
+const STORED_HEADERS: [&str; 5] = [
+    "cache-control",
+    "content-disposition",
+    "content-encoding",
+    "content-language",
+    "expires",
+];
+
 fn extract_user_metadata(headers: &HeaderMap) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
+    for name in STORED_HEADERS {
+        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            metadata.insert(format!("{STORED_HEADER_PREFIX}{name}"), v.to_string());
+        }
+    }
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
         if name_str.starts_with("x-amz-meta-")
@@ -705,6 +723,14 @@ fn add_metadata_headers(
     user_metadata: &HashMap<String, String>,
 ) -> http::response::Builder {
     for (key, value) in user_metadata {
+        if let Some(standard) = key.strip_prefix(STORED_HEADER_PREFIX) {
+            if STORED_HEADERS.contains(&standard)
+                && let Ok(v) = http::HeaderValue::from_str(value)
+            {
+                builder = builder.header(standard, v);
+            }
+            continue;
+        }
         // Only what makes a valid header: one that doesn't would fail the
         // whole response (a panic, the connection dropped) for every read
         // of the object.
@@ -719,6 +745,51 @@ fn add_metadata_headers(
 }
 
 // ── Object tagging ───────────────────────────────────────────────────────────
+
+/// S3 sub-resources this gateway doesn't implement. Without this a request
+/// naming one fell through to the plain request: `GET /b?website` answered
+/// with the bucket's listing, `PUT /b?logging` tried to create the bucket.
+const UNSUPPORTED_SUBRESOURCES: [&str; 13] = [
+    "website",
+    "logging",
+    "notification",
+    "replication",
+    "inventory",
+    "analytics",
+    "metrics",
+    "intelligent-tiering",
+    "accelerate",
+    "requestPayment",
+    "restore",
+    "select",
+    "torrent",
+];
+
+/// Refuse a request naming an unimplemented sub-resource: `501
+/// NotImplemented`, said plainly, rather than doing something else.
+pub async fn unsupported_subresource_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let named = request.uri().query().and_then(|q| {
+        q.split('&').find_map(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            UNSUPPORTED_SUBRESOURCES
+                .contains(&name)
+                .then(|| name.to_string())
+        })
+    });
+    match named {
+        // `/health`, `/` and the like name no bucket and never get here with
+        // a sub-resource; S3 paths do.
+        Some(name) if request.uri().path() != "/" => S3Error::xml_response(
+            "NotImplemented",
+            &format!("The {name} sub-resource is not implemented"),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        _ => next.run(request).await,
+    }
+}
 
 /// Bucket tagging is not implemented. Said plainly: a GET of `?tagging`
 /// used to answer with the bucket's listing, and a PUT tried to create
@@ -1451,6 +1522,8 @@ pub struct ListObjectsParams {
     /// If present, a GetBucketPolicyStatus request
     #[serde(rename = "policyStatus")]
     policy_status: Option<String>,
+    /// If present, a GetBucketCors request (see `crate::cors`)
+    cors: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list object versions request
@@ -1532,6 +1605,8 @@ pub struct PutBucketParams {
     /// If present, a PutPublicAccessBlock request
     #[serde(rename = "publicAccessBlock")]
     public_access_block: Option<String>,
+    /// If present, a PutBucketCors request (see `crate::cors`)
+    cors: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
@@ -1552,6 +1627,8 @@ pub struct DeleteBucketParams {
     /// If present, a DeletePublicAccessBlock request
     #[serde(rename = "publicAccessBlock")]
     public_access_block: Option<String>,
+    /// If present, a DeleteBucketCors request (see `crate::cors`)
+    cors: Option<String>,
 }
 
 /// Query parameters for PUT object operations (handles both simple PUT and multipart)
@@ -1606,6 +1683,38 @@ pub struct GetObjectParams {
     legal_hold: Option<String>,
     /// If present, this is a tagging request
     tagging: Option<String>,
+    #[serde(rename = "response-content-type")]
+    response_content_type: Option<String>,
+    #[serde(rename = "response-content-language")]
+    response_content_language: Option<String>,
+    #[serde(rename = "response-expires")]
+    response_expires: Option<String>,
+    #[serde(rename = "response-cache-control")]
+    response_cache_control: Option<String>,
+    #[serde(rename = "response-content-disposition")]
+    response_content_disposition: Option<String>,
+    #[serde(rename = "response-content-encoding")]
+    response_content_encoding: Option<String>,
+}
+
+impl GetObjectParams {
+    /// The `response-*` overrides asked for: header name and value.
+    fn response_overrides(&self) -> Vec<(header::HeaderName, &str)> {
+        [
+            (header::CONTENT_TYPE, &self.response_content_type),
+            (header::CONTENT_LANGUAGE, &self.response_content_language),
+            (header::EXPIRES, &self.response_expires),
+            (header::CACHE_CONTROL, &self.response_cache_control),
+            (
+                header::CONTENT_DISPOSITION,
+                &self.response_content_disposition,
+            ),
+            (header::CONTENT_ENCODING, &self.response_content_encoding),
+        ]
+        .into_iter()
+        .filter_map(|(name, v)| v.as_deref().map(|v| (name, v)))
+        .collect()
+    }
 }
 
 /// Query parameters for POST object operations (handles multipart initiate/complete)
@@ -2489,6 +2598,9 @@ pub async fn create_bucket(
     if params.public_access_block.is_some() {
         return crate::public_access::put_bucket(&state, &bucket, &body).await;
     }
+    if params.cors.is_some() {
+        return crate::cors::put_bucket(&state, &bucket, &headers, &body).await;
+    }
     if let Some(refused) = acl_header_refusal(&headers) {
         return refused;
     }
@@ -2692,6 +2804,9 @@ pub async fn delete_bucket(
     if params.public_access_block.is_some() {
         return crate::public_access::delete_bucket(&state, &bucket).await;
     }
+    if params.cors.is_some() {
+        return crate::cors::delete_bucket(&state, &bucket).await;
+    }
 
     // Noncurrent versions and delete markers count as contents, as in S3;
     // they live only on the OSDs. Meta checks current objects itself.
@@ -2862,6 +2977,9 @@ pub async fn list_objects(
     }
     if params.policy_status.is_some() {
         return crate::public_access::get_policy_status(&state, &bucket).await;
+    }
+    if params.cors.is_some() {
+        return crate::cors::get_bucket(&state, &bucket).await;
     }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
@@ -9930,7 +10048,46 @@ pub async fn get_object_with_params(
     }
 
     // Otherwise, it's a regular GET object
-    let _ = auth;
+    // `response-*`: the headers this one answer should carry instead of the
+    // object's own (a presigned link forcing a download name, say). S3
+    // refuses them to anonymous callers.
+    let overrides = params.response_overrides();
+    if !overrides.is_empty() {
+        let anonymous = auth
+            .as_ref()
+            .is_some_and(|Extension(a)| a.auth_mode == objectio_auth::AuthMode::Anonymous);
+        if anonymous {
+            return S3Error::xml_response(
+                "InvalidRequest",
+                "Request specific response headers cannot be used for anonymous GET requests.",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        let mut values = Vec::with_capacity(overrides.len());
+        for (name, v) in overrides {
+            match header::HeaderValue::from_str(v) {
+                Ok(v) => values.push((name, v)),
+                Err(_) => {
+                    return S3Error::xml_response(
+                        "InvalidArgument",
+                        &format!("Invalid value for {name}"),
+                        StatusCode::BAD_REQUEST,
+                    );
+                }
+            }
+        }
+        let mut resp = if let Some(n) = params.part_number {
+            get_object_part(state, bucket, key, params.version_id, n, headers).await
+        } else {
+            get_object_version(state, bucket, key, params.version_id, headers).await
+        };
+        if resp.status().is_success() {
+            for (name, v) in values {
+                resp.headers_mut().insert(name, v);
+            }
+        }
+        return resp;
+    }
     if params.attributes.is_some() {
         return get_object_attributes(state, bucket, key, params.version_id, &headers).await;
     }

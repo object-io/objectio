@@ -272,46 +272,10 @@ pub async fn auth_layer(
         .map(String::from);
 
     if access_key_id.starts_with("ASIA") {
-        let Some(token) = &session_token else {
-            return Err(AuthError::AccessDenied(
-                "temporary credentials require X-Amz-Security-Token".to_string(),
-            ));
-        };
-        let Some(sts) = &auth_state.sts_provider else {
-            return Err(AuthError::AccessDenied(
-                "STS credential vending is not configured on this gateway".to_string(),
-            ));
-        };
-        let session_info = sts.validate(token).ok_or_else(|| {
-            AuthError::AccessDenied("invalid or expired session token".to_string())
-        })?;
-        // A role's session: "arn:obio:sts::<tenant|objectio>:assumed-role/<role>/<session>".
-        let role = session_info
-            .user_arn
-            .strip_prefix("arn:obio:sts::")
-            .and_then(|r| r.split_once(":assumed-role/"))
-            .and_then(|(account, rest)| {
-                let role = rest.split('/').next()?;
-                let tenant = if account == "objectio" { "" } else { account };
-                Some((tenant.to_string(), role.to_string()))
-            });
-
-        // Recover the derived secret and run the SAME SigV4 verify path as
-        // permanent keys — without this the session token is the only
-        // proof, which is replayable.
-        let derived_secret = sts.derive_secret(access_key_id);
-        let cred = CachedCredential {
-            access_key_id: access_key_id.to_string(),
-            secret_access_key: derived_secret,
-            user_id: session_info.user_arn.clone(),
-            user_arn: session_info.user_arn.clone(),
-            tenant: String::new(),
-            scope: Some(CredentialScope {
-                scope: session_info.scope.clone(),
-                operation: session_info.operation,
-            }),
-            cached_at: std::time::Instant::now(),
-        };
+        let (cred, auth_result) =
+            sts_session(&auth_state, access_key_id, session_token.as_deref())?;
+        // The SAME SigV4 verify path as permanent keys — without this the
+        // session token is the only proof, which is replayable.
         verify_request_v4(
             &request,
             &parsed.signed_headers,
@@ -319,44 +283,7 @@ pub async fn auth_layer(
             &cred,
             &auth_state.region,
         )?;
-
-        debug!(
-            "STS auth ok: user_arn={} scope={} op={:?}",
-            session_info.user_arn, session_info.scope, session_info.operation
-        );
-        let auth_result = if let Some((tenant, role)) = role {
-            // The role's policies decide; the tenant boundary holds.
-            let key = if tenant.is_empty() {
-                role
-            } else {
-                format!("{tenant}/{role}")
-            };
-            AuthResult {
-                user_id: format!("role:{key}"),
-                user_arn: session_info.user_arn,
-                access_key_id: access_key_id.to_string(),
-                group_arns: Vec::new(),
-                group_ids: Vec::new(),
-                tenant,
-                auth_mode: objectio_auth::AuthMode::AssumedRole,
-                scope: None,
-                source_ip: None,
-                source_endpoint: None,
-            }
-        } else {
-            AuthResult {
-                user_id: session_info.user_arn.clone(),
-                user_arn: session_info.user_arn,
-                access_key_id: access_key_id.to_string(),
-                group_arns: Vec::new(),
-                group_ids: Vec::new(),
-                tenant: String::new(),
-                auth_mode: objectio_auth::AuthMode::Sts,
-                scope: cred.scope.clone(),
-                source_ip: None,
-                source_endpoint: None,
-            }
-        };
+        debug!("STS auth ok: user_arn={}", auth_result.user_arn);
         crate::audit::attach(&mut request, auth_result);
         return Ok(next.run(request).await);
     }
@@ -392,6 +319,90 @@ pub async fn auth_layer(
     Ok(next.run(request).await)
 }
 
+/// A temporary key's signing secret and the identity it carries.
+///
+/// `access_key_id` is an `ASIA…` key and `token` its session token. The
+/// secret is derived from the key, so the caller still has to verify a
+/// signature with it: the token alone proves nothing. A role's session gets
+/// the role as its principal and the role's tenant; any other session is a
+/// scoped STS credential with no tenant.
+pub(crate) fn sts_session(
+    auth_state: &AuthState,
+    access_key_id: &str,
+    token: Option<&str>,
+) -> Result<(CachedCredential, AuthResult), AuthError> {
+    let Some(token) = token else {
+        return Err(AuthError::AccessDenied(
+            "temporary credentials require X-Amz-Security-Token".to_string(),
+        ));
+    };
+    let Some(sts) = &auth_state.sts_provider else {
+        return Err(AuthError::AccessDenied(
+            "STS credential vending is not configured on this gateway".to_string(),
+        ));
+    };
+    let session_info = sts
+        .validate(token)
+        .ok_or_else(|| AuthError::AccessDenied("invalid or expired session token".to_string()))?;
+    // A role's session: "arn:obio:sts::<tenant|objectio>:assumed-role/<role>/<session>".
+    let role = session_info
+        .user_arn
+        .strip_prefix("arn:obio:sts::")
+        .and_then(|r| r.split_once(":assumed-role/"))
+        .and_then(|(account, rest)| {
+            let role = rest.split('/').next()?;
+            let tenant = if account == "objectio" { "" } else { account };
+            Some((tenant.to_string(), role.to_string()))
+        });
+
+    let cred = CachedCredential {
+        access_key_id: access_key_id.to_string(),
+        secret_access_key: sts.derive_secret(access_key_id),
+        user_id: session_info.user_arn.clone(),
+        user_arn: session_info.user_arn.clone(),
+        tenant: String::new(),
+        scope: Some(CredentialScope {
+            scope: session_info.scope.clone(),
+            operation: session_info.operation,
+        }),
+        cached_at: std::time::Instant::now(),
+    };
+    let auth_result = if let Some((tenant, role)) = role {
+        // The role's policies decide; the tenant boundary holds.
+        let key = if tenant.is_empty() {
+            role
+        } else {
+            format!("{tenant}/{role}")
+        };
+        AuthResult {
+            user_id: format!("role:{key}"),
+            user_arn: session_info.user_arn,
+            access_key_id: access_key_id.to_string(),
+            group_arns: Vec::new(),
+            group_ids: Vec::new(),
+            tenant,
+            auth_mode: objectio_auth::AuthMode::AssumedRole,
+            scope: None,
+            source_ip: None,
+            source_endpoint: None,
+        }
+    } else {
+        AuthResult {
+            user_id: session_info.user_arn.clone(),
+            user_arn: session_info.user_arn,
+            access_key_id: access_key_id.to_string(),
+            group_arns: Vec::new(),
+            group_ids: Vec::new(),
+            tenant: String::new(),
+            auth_mode: objectio_auth::AuthMode::Sts,
+            scope: cred.scope.clone(),
+            source_ip: None,
+            source_endpoint: None,
+        }
+    };
+    Ok((cred, auth_result))
+}
+
 /// Authenticate a presigned request and run the handler.
 ///
 /// Split out of `auth_layer` so the two credential sources stay legible; it
@@ -405,46 +416,30 @@ async fn run_presigned(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let cred = if presigned.access_key_id.starts_with("ASIA") {
-        let token = presigned.session_token.as_deref().ok_or_else(|| {
-            AuthError::AccessDenied(
-                "temporary credentials require X-Amz-Security-Token".to_string(),
-            )
-        })?;
-        let sts = auth_state.sts_provider.as_ref().ok_or_else(|| {
-            AuthError::AccessDenied(
-                "STS credential vending is not configured on this gateway".to_string(),
-            )
-        })?;
-        let session = sts.validate(token).ok_or_else(|| {
-            AuthError::AccessDenied("invalid or expired session token".to_string())
-        })?;
-        CachedCredential {
-            access_key_id: presigned.access_key_id.clone(),
-            secret_access_key: sts.derive_secret(&presigned.access_key_id),
-            user_id: session.user_arn.clone(),
-            user_arn: session.user_arn.clone(),
-            tenant: String::new(),
-            scope: Some(CredentialScope {
-                scope: session.scope.clone(),
-                operation: session.operation,
-            }),
-            cached_at: std::time::Instant::now(),
-        }
+    // A session key is resolved exactly as a header-signed one is: a role's
+    // session takes the role (its policies, its tenant boundary). This path
+    // used to make every session a tenant-less STS credential, so a URL
+    // presigned with a role's keys skipped the tenant boundary and the
+    // role's policies alike.
+    let auth_result = if presigned.access_key_id.starts_with("ASIA") {
+        let (cred, session) = sts_session(
+            &auth_state,
+            &presigned.access_key_id,
+            presigned.session_token.as_deref(),
+        )?;
+        // The signature proves the caller holds the session's secret.
+        verify_presigned_v4(&request, &presigned, &cred)?;
+        session
     } else {
-        auth_state
+        let cred = auth_state
             .lookup_credential(&presigned.access_key_id)
-            .await?
+            .await?;
+        let mut auth_result = verify_presigned_v4(&request, &presigned, &cred)?;
+        let (g_arns, g_ids) = auth_state.lookup_user_groups(&auth_result.user_id).await;
+        auth_result.group_arns = g_arns;
+        auth_result.group_ids = g_ids;
+        auth_result
     };
-
-    let mut auth_result = verify_presigned_v4(&request, &presigned, &cred)?;
-    if presigned.access_key_id.starts_with("ASIA") {
-        auth_result.auth_mode = objectio_auth::AuthMode::Sts;
-    }
-
-    let (g_arns, g_ids) = auth_state.lookup_user_groups(&auth_result.user_id).await;
-    auth_result.group_arns = g_arns;
-    auth_result.group_ids = g_ids;
 
     debug!(
         "Authenticated presigned request: {} (key: {})",
@@ -971,7 +966,12 @@ fn build_string_to_sign(canonical_request: &str, date_str: &str, credential_scop
 }
 
 /// Derive the signing key
-fn derive_signing_key(secret_key: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn derive_signing_key(
+    secret_key: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
     let k_secret = format!("AWS4{}", secret_key);
     let k_date = hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -980,7 +980,7 @@ fn derive_signing_key(secret_key: &str, date_stamp: &str, region: &str, service:
 }
 
 /// Calculate the SigV4 signature
-fn calculate_signature_v4(signing_key: &[u8], string_to_sign: &str) -> String {
+pub(crate) fn calculate_signature_v4(signing_key: &[u8], string_to_sign: &str) -> String {
     hex::encode(hmac_sha256(signing_key, string_to_sign.as_bytes()))
 }
 
@@ -1070,7 +1070,7 @@ fn url_decode(s: &str) -> Vec<u8> {
 }
 
 /// Constant-time string comparison to prevent timing attacks
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
