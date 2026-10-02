@@ -350,6 +350,12 @@ message DeleteObjectMetaRequest {
 
 message DeleteObjectMetaResponse {
     bool success = 1;
+    // For a delete by version: the key's current object afterwards. When
+    // the version deleted was current, the OSD makes the newest remaining
+    // version current (or removes it, none being left) in the same step,
+    // under the key's lock, so concurrent deletes of a key's versions can
+    // never leave it pointing at a version that is gone.
+    objectio.metadata.ObjectMeta current = 2;
 }
 
 // List objects metadata request (for ListObjects)

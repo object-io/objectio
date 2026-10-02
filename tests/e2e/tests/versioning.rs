@@ -438,3 +438,47 @@ fn a_locked_older_version_cannot_be_deleted_by_its_id() {
         "the locked version",
     );
 }
+
+/// Deleting every version of a key at once, from many clients: none may be
+/// left current. Promotion used to happen in the gateway across separate
+/// calls, so one delete could make current a version another was deleting,
+/// leaving the key "current" with no data behind it.
+#[test]
+fn concurrent_deletes_of_every_version_leave_nothing_current() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    versioned(&c, "v");
+    for round in 0..5 {
+        let ids: Vec<String> = (0..6)
+            .map(|i| put(&c, "/v/k", &body(round * 10 + i, 3_000)))
+            .collect();
+        std::thread::scope(|s| {
+            for id in &ids {
+                let c = &c;
+                s.spawn(move || {
+                    let r = c.request("DELETE", &format!("/v/k?versionId={id}"), &[]);
+                    assert_eq!(r.status, 204, "{}", r.text());
+                });
+            }
+        });
+        assert!(
+            listed(&c.request("GET", "/v?versions", &[]).text()).is_empty(),
+            "round {round}: versions left"
+        );
+        let head = c.request("HEAD", "/v/k", &[]);
+        assert_eq!(
+            head.status,
+            404,
+            "round {round}: a key with no versions is still current ({:?})",
+            head.header("x-amz-version-id")
+        );
+        assert!(
+            !c.request("GET", "/v", &[]).text().contains("<Key>k</Key>"),
+            "round {round}: still listed"
+        );
+    }
+    assert_eq!(
+        c.request("DELETE", "/v", &[]).status,
+        204,
+        "the bucket is empty"
+    );
+}

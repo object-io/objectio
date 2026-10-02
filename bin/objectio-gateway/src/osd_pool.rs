@@ -961,6 +961,44 @@ pub async fn delete_object_meta_from_all(
     Ok(())
 }
 
+/// Delete one version of `bucket/key` from every replica. Each OSD, if it
+/// was the current version, makes the newest remaining one current under
+/// the key's lock. Returns how many replicas did it, of how many.
+pub async fn delete_version_from_all(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> (usize, usize) {
+    use objectio_proto::storage::DeleteObjectMetaRequest;
+
+    let targets = unique_node_placements(placements);
+    let futs = targets.iter().map(|p| async move {
+        let mut client = pool.get_client_for_placement(p).await?;
+        let fut = client.delete_object_meta(DeleteObjectMetaRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
+            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+        Ok::<_, OsdPoolError>(())
+    });
+    let results = futures::future::join_all(futs).await;
+    let ok = results
+        .iter()
+        .filter(|r| {
+            r.as_ref()
+                .inspect_err(|e| warn!("delete version {version_id} of {bucket}/{key}: {e}"))
+                .is_ok()
+        })
+        .count();
+    (ok, targets.len())
+}
+
 // ============================================================================
 // Shard reclamation
 //

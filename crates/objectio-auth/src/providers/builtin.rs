@@ -1,24 +1,21 @@
 //! Builtin AWS Signature identity provider
 //!
-//! This provider uses SigV4Verifier and SigV2Verifier with UserStore
-//! for authentication. It supports both AWS Signature Version 4 and
-//! Version 2 for compatibility with legacy clients.
+//! This provider uses SigV4Verifier with UserStore for authentication.
+//! SigV2 is refused, as S3 refuses it on every bucket created since 2020.
 
 use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::error::AuthError;
 use crate::provider::{AuthProviderError, AuthRequest, AuthenticatedIdentity, IdentityProvider};
-use crate::sigv2::SigV2Verifier;
 use crate::sigv4::SigV4Verifier;
 use crate::store::UserStore;
 use crate::user::AuthResult;
 
 /// Builtin AWS Signature identity provider using local UserStore
-/// Supports both SigV4 (recommended) and SigV2 (legacy)
+/// SigV4 only.
 pub struct BuiltinSigV4Provider {
     sigv4_verifier: SigV4Verifier,
-    sigv2_verifier: SigV2Verifier,
     user_store: Arc<UserStore>,
 }
 
@@ -26,10 +23,8 @@ impl BuiltinSigV4Provider {
     /// Create a new builtin AWS auth provider
     pub fn new(user_store: Arc<UserStore>, region: impl Into<String>) -> Self {
         let sigv4_verifier = SigV4Verifier::new(user_store.clone(), region);
-        let sigv2_verifier = SigV2Verifier::new(user_store.clone());
         Self {
             sigv4_verifier,
-            sigv2_verifier,
             user_store,
         }
     }
@@ -76,9 +71,6 @@ impl IdentityProvider for BuiltinSigV4Provider {
         // Verify the signature using the appropriate verifier
         let auth_result: AuthResult = if request.has_sigv4_auth() {
             self.sigv4_verifier.verify(&http_request)
-        } else if request.has_sigv2_auth() {
-            tracing::debug!("Using SigV2 authentication (legacy)");
-            self.sigv2_verifier.verify(&http_request)
         } else {
             return Err(AuthProviderError::UnsupportedAuthMethod);
         }
@@ -124,23 +116,6 @@ mod tests {
         headers.insert(
             "authorization",
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=xxx"
-                .parse()
-                .unwrap(),
-        );
-
-        let request = AuthRequest::new("GET", "/bucket/key", &headers);
-        assert!(provider.can_handle(&request));
-    }
-
-    #[tokio::test]
-    async fn test_can_handle_sigv2() {
-        let user_store = Arc::new(UserStore::new());
-        let provider = BuiltinSigV4Provider::new(user_store, "us-east-1");
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            "authorization",
-            "AWS AKIAIOSFODNN7EXAMPLE:frJIUN8DYpKDtOLCwo//yllqDzg="
                 .parse()
                 .unwrap(),
         );

@@ -629,11 +629,29 @@ impl Cluster {
     /// Fetch a URL with no credentials of any kind — what a client handed a
     /// presigned link actually does.
     pub fn fetch(&self, method: &str, url: &str, body: &[u8]) -> Response {
+        Self::fetch_raw(method, url, body, &[])
+    }
+
+    /// As [`Self::fetch`], with these headers and no body: for requests
+    /// signed (or mis-signed) by hand.
+    pub fn fetch_with_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        Self::fetch_raw(method, url, &[], headers)
+    }
+
+    fn fetch_raw(method: &str, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Response {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
             .unwrap();
         let mut req = client.request(method.parse().expect("method"), url);
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }

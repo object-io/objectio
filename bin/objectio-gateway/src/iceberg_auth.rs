@@ -51,22 +51,13 @@ pub async fn iceberg_unified_auth_layer(
                     .lookup_credential(parsed.access_key_id())
                     .await
                 {
-                    let verify_result = match &parsed {
-                        crate::auth_middleware::ParsedAuth::V4 {
-                            signed_headers,
-                            signature,
-                            ..
-                        } => crate::auth_middleware::verify_request_v4(
-                            &request,
-                            signed_headers,
-                            signature,
-                            &cred,
-                            &state.sigv4_state.region,
-                        ),
-                        crate::auth_middleware::ParsedAuth::V2 { signature, .. } => {
-                            crate::auth_middleware::verify_request_v2(&request, signature, &cred)
-                        }
-                    };
+                    let verify_result = crate::auth_middleware::verify_request_v4(
+                        &request,
+                        &parsed.signed_headers,
+                        &parsed.signature,
+                        &cred,
+                        &state.sigv4_state.region,
+                    );
                     if let Ok(mut auth_result) = verify_result {
                         // Stitch group memberships so policies attached to
                         // an IAM group cascade to its members on the Unity/

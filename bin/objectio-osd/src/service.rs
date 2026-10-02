@@ -1889,9 +1889,47 @@ impl StorageService for OsdService {
                 "Deleted version: {}/{} (version={})",
                 req.bucket, req.key, req.version_id
             );
+
+            // Was it the current version? Then the newest remaining one
+            // becomes current, still under the key's lock.
+            let current_key = MetadataKey::object_meta(&req.bucket, &req.key);
+            let current = self.stored_meta(&current_key);
+            if current
+                .as_ref()
+                .is_some_and(|c| version_entry_id(&c.version_id) == req.version_id)
+            {
+                let newest = self
+                    .meta_store
+                    .scan_prefix(&MetadataKey::object_version_prefix(&req.bucket, &req.key))
+                    .into_iter()
+                    .filter_map(|(_, v)| ObjectMeta::decode(&v[..]).ok())
+                    .max_by(|a, b| version_age(a).cmp(&version_age(b)));
+                match &newest {
+                    Some(n) => self.meta_store.put(current_key, n.encode_to_vec()),
+                    None => self.meta_store.delete(&current_key),
+                }
+                .map_err(|e| {
+                    Status::internal(format!("failed to replace the current version: {e}"))
+                })?;
+                self.usage.apply(
+                    &req.bucket,
+                    EntryKind::Current,
+                    current.as_ref(),
+                    newest.as_ref(),
+                );
+            }
         }
 
-        Ok(Response::new(DeleteObjectMetaResponse { success: true }))
+        let current = if req.version_id.is_empty() {
+            None
+        } else {
+            self.stored_meta(&MetadataKey::object_meta(&req.bucket, &req.key))
+                .map(for_listing)
+        };
+        Ok(Response::new(DeleteObjectMetaResponse {
+            success: true,
+            current,
+        }))
     }
 
     async fn list_objects_meta(
@@ -2257,6 +2295,21 @@ impl StorageService for OsdService {
 
 /// The version entry of the object stored while versioning was off.
 const NULL_VERSION: &str = "null";
+
+/// Where a version sorts among its key's: when it was made, in ms. A
+/// UUIDv7 id carries it; the null version and older ids use the
+/// modification time. The gateway orders versions the same way.
+fn version_age(object: &ObjectMeta) -> (u64, &str) {
+    let ms = uuid::Uuid::parse_str(&object.version_id)
+        .ok()
+        .filter(|u| u.get_version_num() == 7)
+        .and_then(|u| u.get_timestamp())
+        .map_or(object.modified_at.saturating_mul(1000), |t| {
+            let (secs, nanos) = t.to_unix();
+            secs * 1000 + u64::from(nanos / 1_000_000)
+        });
+    (ms, object.version_id.as_str())
+}
 
 /// The version entry an object's `version_id` is kept under.
 fn version_entry_id(version_id: &str) -> &str {
