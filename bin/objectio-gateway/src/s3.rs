@@ -41,13 +41,11 @@ use objectio_proto::metadata::{
     CreateUserRequest,
     DeleteAccessKeyRequest,
     DeleteBucketEncryptionRequest,
-    DeleteBucketLifecycleRequest,
     DeleteBucketPolicyRequest,
     DeleteBucketRequest,
     DeleteUserRequest,
     ErasureType,
     GetBucketEncryptionRequest,
-    GetBucketLifecycleRequest,
     GetBucketPolicyRequest,
     GetBucketRequest,
     GetBucketVersioningRequest,
@@ -58,8 +56,6 @@ use objectio_proto::metadata::{
     GetUserRequest,
     KeyOperation as ProtoKeyOperation,
     LegalHold,
-    LifecycleConfiguration as ProtoLifecycleConfig,
-    LifecycleRule as ProtoLifecycleRule,
     ListAccessKeysRequest,
     ListBucketsRequest,
     ListMultipartUploadsRequest,
@@ -71,7 +67,6 @@ use objectio_proto::metadata::{
     ObjectRetention,
     PartInfo,
     PutBucketEncryptionRequest,
-    PutBucketLifecycleRequest,
     PutBucketVersioningRequest,
     PutObjectLockConfigRequest,
     RegisterPartRequest,
@@ -2507,7 +2502,7 @@ pub async fn create_bucket(
         return put_object_lock_config_internal(state, bucket, body).await;
     }
     if params.lifecycle.is_some() {
-        return put_bucket_lifecycle_internal(state, bucket, body).await;
+        return crate::lifecycle::put_config(&state, &bucket, &body).await;
     }
     if params.encryption.is_some() {
         return put_bucket_encryption_internal(state, bucket, body).await;
@@ -2689,7 +2684,7 @@ pub async fn delete_bucket(
         return delete_bucket_policy_internal(state, bucket).await;
     }
     if params.lifecycle.is_some() {
-        return delete_bucket_lifecycle_internal(state, bucket).await;
+        return crate::lifecycle::delete_config(&state, &bucket).await;
     }
     if params.encryption.is_some() {
         return delete_bucket_encryption_internal(state, bucket).await;
@@ -2878,7 +2873,7 @@ pub async fn list_objects(
         return get_object_lock_config_internal(state, bucket).await;
     }
     if params.lifecycle.is_some() {
-        return get_bucket_lifecycle_internal(state, bucket).await;
+        return crate::lifecycle::get_config(&state, &bucket).await;
     }
     if params.encryption.is_some() {
         return get_bucket_encryption_internal(state, bucket).await;
@@ -7396,6 +7391,18 @@ fn new_version_id() -> String {
 /// Where a version sorts among its key's: when it was made, in ms. A
 /// UUIDv7 id carries it; the null version and older ids use its
 /// modification time.
+/// When a version was written, in unix milliseconds.
+pub(crate) fn version_time_ms(object: &ObjectMeta) -> u64 {
+    version_age(object).0
+}
+
+/// A key's versions newest first, each once (it may be read from several
+/// OSDs of its home).
+pub(crate) fn sort_versions(versions: &mut Vec<ObjectMeta>) {
+    versions.sort_by(|a, b| version_age(b).cmp(&version_age(a)));
+    versions.dedup_by(|a, b| a.version_id == b.version_id);
+}
+
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
     let ms = Uuid::parse_str(&object.version_id)
         .ok()
@@ -7409,7 +7416,7 @@ fn version_age(object: &ObjectMeta) -> (u64, &str) {
 }
 
 /// A version as S3 names it: the null version is "null".
-fn version_label(version_id: &str) -> &str {
+pub(crate) fn version_label(version_id: &str) -> &str {
     if version_id.is_empty() {
         "null"
     } else {
@@ -10551,259 +10558,6 @@ async fn get_object_lock_config_internal(state: Arc<AppState>, bucket: String) -
 }
 
 // ============================================================================
-// Lifecycle Configuration
-// ============================================================================
-
-#[derive(Deserialize)]
-#[serde(rename = "LifecycleConfiguration")]
-struct LifecycleConfigRequest {
-    #[serde(rename = "Rule")]
-    #[serde(default)]
-    rules: Vec<LifecycleRuleXml>,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-struct LifecycleRuleXml {
-    #[serde(rename = "ID")]
-    #[serde(default)]
-    id: String,
-    #[serde(rename = "Status")]
-    status: String,
-    #[serde(rename = "Filter")]
-    #[serde(default)]
-    filter: Option<LifecycleFilterXml>,
-    #[serde(rename = "Expiration")]
-    #[serde(default)]
-    expiration: Option<LifecycleExpirationXml>,
-    #[serde(rename = "NoncurrentVersionExpiration")]
-    #[serde(default)]
-    noncurrent_version_expiration: Option<NoncurrentVersionExpirationXml>,
-    #[serde(rename = "AbortIncompleteMultipartUpload")]
-    #[serde(default)]
-    abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUploadXml>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Default)]
-struct LifecycleFilterXml {
-    #[serde(rename = "Prefix")]
-    #[serde(default)]
-    prefix: String,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-struct LifecycleExpirationXml {
-    #[serde(rename = "Days")]
-    #[serde(default)]
-    days: Option<u32>,
-    #[serde(rename = "ExpiredObjectDeleteMarker")]
-    #[serde(default)]
-    expired_object_delete_marker: Option<bool>,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-struct NoncurrentVersionExpirationXml {
-    #[serde(rename = "NoncurrentDays")]
-    #[serde(default)]
-    noncurrent_days: Option<u32>,
-}
-
-#[derive(Deserialize, Serialize, Clone)]
-struct AbortIncompleteMultipartUploadXml {
-    #[serde(rename = "DaysAfterInitiation")]
-    #[serde(default)]
-    days_after_initiation: Option<u32>,
-}
-
-#[derive(Serialize)]
-#[serde(rename = "LifecycleConfiguration")]
-struct LifecycleConfigResponse {
-    #[serde(rename = "Rule")]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<LifecycleRuleXml>,
-}
-
-async fn put_bucket_lifecycle_internal(
-    state: Arc<AppState>,
-    bucket: String,
-    body: Bytes,
-) -> Response {
-    let config: LifecycleConfigRequest = match quick_xml::de::from_reader(body.as_ref()) {
-        Ok(c) => c,
-        Err(e) => {
-            return S3Error::xml_response(
-                "MalformedXML",
-                &format!("Invalid lifecycle XML: {}", e),
-                StatusCode::BAD_REQUEST,
-            );
-        }
-    };
-
-    let proto_rules: Vec<ProtoLifecycleRule> = config
-        .rules
-        .iter()
-        .map(|r| ProtoLifecycleRule {
-            id: r.id.clone(),
-            enabled: r.status == "Enabled",
-            prefix: r
-                .filter
-                .as_ref()
-                .map(|f| f.prefix.clone())
-                .unwrap_or_default(),
-            expiration_days: r.expiration.as_ref().and_then(|e| e.days).unwrap_or(0),
-            expiration_date: 0,
-            noncurrent_version_expiration_days: r
-                .noncurrent_version_expiration
-                .as_ref()
-                .and_then(|n| n.noncurrent_days)
-                .unwrap_or(0),
-            expired_object_delete_marker: r
-                .expiration
-                .as_ref()
-                .and_then(|e| e.expired_object_delete_marker)
-                .unwrap_or(false),
-            abort_incomplete_multipart_upload_days: r
-                .abort_incomplete_multipart_upload
-                .as_ref()
-                .and_then(|a| a.days_after_initiation)
-                .unwrap_or(0),
-        })
-        .collect();
-
-    let mut client = state.meta_client.clone();
-    match client
-        .put_bucket_lifecycle(PutBucketLifecycleRequest {
-            bucket: bucket.clone(),
-            config: Some(ProtoLifecycleConfig { rules: proto_rules }),
-        })
-        .await
-    {
-        Ok(_) => Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
-            .unwrap(),
-        Err(e) => {
-            error!("Failed to set lifecycle config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-        }
-    }
-}
-
-async fn get_bucket_lifecycle_internal(state: Arc<AppState>, bucket: String) -> Response {
-    let mut client = state.meta_client.clone();
-    match client
-        .get_bucket_lifecycle(GetBucketLifecycleRequest {
-            bucket: bucket.clone(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let inner = resp.into_inner();
-            if !inner.found {
-                return S3Error::xml_response(
-                    "NoSuchLifecycleConfiguration",
-                    "The lifecycle configuration does not exist",
-                    StatusCode::NOT_FOUND,
-                );
-            }
-            let config = inner.config.unwrap_or_default();
-            let rules: Vec<LifecycleRuleXml> = config
-                .rules
-                .iter()
-                .map(|r| LifecycleRuleXml {
-                    id: r.id.clone(),
-                    status: if r.enabled {
-                        "Enabled".to_string()
-                    } else {
-                        "Disabled".to_string()
-                    },
-                    filter: Some(LifecycleFilterXml {
-                        prefix: r.prefix.clone(),
-                    }),
-                    expiration: if r.expiration_days > 0 || r.expired_object_delete_marker {
-                        Some(LifecycleExpirationXml {
-                            days: if r.expiration_days > 0 {
-                                Some(r.expiration_days)
-                            } else {
-                                None
-                            },
-                            expired_object_delete_marker: if r.expired_object_delete_marker {
-                                Some(true)
-                            } else {
-                                None
-                            },
-                        })
-                    } else {
-                        None
-                    },
-                    noncurrent_version_expiration: if r.noncurrent_version_expiration_days > 0 {
-                        Some(NoncurrentVersionExpirationXml {
-                            noncurrent_days: Some(r.noncurrent_version_expiration_days),
-                        })
-                    } else {
-                        None
-                    },
-                    abort_incomplete_multipart_upload: if r.abort_incomplete_multipart_upload_days
-                        > 0
-                    {
-                        Some(AbortIncompleteMultipartUploadXml {
-                            days_after_initiation: Some(r.abort_incomplete_multipart_upload_days),
-                        })
-                    } else {
-                        None
-                    },
-                })
-                .collect();
-
-            let result = LifecycleConfigResponse { rules };
-            let xml = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-                to_xml(&result).unwrap_or_default()
-            );
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
-        }
-        Err(e) => {
-            error!("Failed to get lifecycle config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-        }
-    }
-}
-
-async fn delete_bucket_lifecycle_internal(state: Arc<AppState>, bucket: String) -> Response {
-    let mut client = state.meta_client.clone();
-    match client
-        .delete_bucket_lifecycle(DeleteBucketLifecycleRequest {
-            bucket: bucket.clone(),
-        })
-        .await
-    {
-        Ok(_) => Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .unwrap(),
-        Err(e) => {
-            error!("Failed to delete lifecycle config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
-        }
-    }
-}
-
-// ============================================================================
 // Bucket Default Server-Side Encryption
 // ============================================================================
 
@@ -11521,13 +11275,29 @@ struct VersionSource {
 /// got past (an OSD further back may yet return more versions of a key).
 /// Then dedupe the replicas, order each key's versions newest first, and
 /// page.
-async fn list_object_versions_internal(
-    state: Arc<AppState>,
-    bucket: String,
-    req: VersionListing,
-) -> Response {
+/// Every version of the keys from `key_marker` on, gathered from the OSDs
+/// of their homes: at least `max_keys` whole keys (each with all its
+/// versions, unsorted, possibly repeated across OSDs) unless the bucket
+/// runs out first, and whether any keys lie beyond. Keys at or before
+/// `key_marker` may be included; callers skip them.
+pub(crate) async fn gather_versions(
+    state: &AppState,
+    bucket: &str,
+    prefix: &str,
+    key_marker: &str,
+    version_id_marker: &str,
+    max_keys: u32,
+) -> Result<(std::collections::BTreeMap<String, Vec<ObjectMeta>>, bool), Response> {
     use objectio_proto::storage::ListObjectVersionsMetaRequest;
-
+    let bucket = bucket.to_string();
+    let req = VersionListing {
+        prefix: prefix.to_string(),
+        delimiter: None,
+        key_marker: key_marker.to_string(),
+        version_id_marker: version_id_marker.to_string(),
+        max_keys,
+        url_encoded: false,
+    };
     let nodes = match state
         .meta_client
         .clone()
@@ -11540,11 +11310,11 @@ async fn list_object_versions_internal(
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
             error!("Failed to get listing nodes: {}", e);
-            return S3Error::xml_response(
+            return Err(S3Error::xml_response(
                 "InternalError",
                 &e.to_string(),
                 StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            ));
         }
     };
 
@@ -11642,6 +11412,28 @@ async fn list_object_versions_internal(
     if let Some(h) = &horizon {
         found.retain(|k, _| k <= h);
     }
+
+    Ok((found, more_beyond))
+}
+
+async fn list_object_versions_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    req: VersionListing,
+) -> Response {
+    let (found, more_beyond) = match gather_versions(
+        &state,
+        &bucket,
+        &req.prefix,
+        &req.key_marker,
+        &req.version_id_marker,
+        req.max_keys,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
 
     // Each key's versions once, newest first; the newest is the latest.
     let mut ordered: Vec<(ObjectMeta, bool)> = Vec::new();

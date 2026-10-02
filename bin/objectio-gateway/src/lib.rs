@@ -327,6 +327,15 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_AUDIT_LOG")]
     pub audit_log: Option<String>,
 
+    /// How often the lifecycle worker scans buckets with lifecycle rules.
+    #[arg(long, default_value_t = 3600)]
+    pub lifecycle_interval_secs: u64,
+
+    /// The length of a lifecycle "day" in seconds. For testing only: a
+    /// rule's Days count in units of this.
+    #[arg(long, default_value_t = 86_400, hide = true)]
+    pub lifecycle_day_secs: u64,
+
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
     /// ServerSideEncryptionConfiguration will encrypt at rest. If missing,
@@ -764,13 +773,6 @@ pub async fn run(
         )
     };
 
-    // Start lifecycle background worker
-    lifecycle::spawn_lifecycle_worker(
-        meta_client.clone(),
-        Arc::clone(&osd_pool),
-        lifecycle::LifecycleWorkerConfig::default(),
-    );
-
     // Clone meta_client for OIDC auto-provisioning before it's moved into AppState
     let meta_client_for_oidc = meta_client.clone();
 
@@ -926,6 +928,16 @@ pub async fn run(
         auth_state: Arc::clone(&auth_state),
         auditor: Arc::clone(&auditor),
     });
+
+    // Lifecycle: every gateway runs a worker; a lease in meta lets one scan
+    // at a time.
+    lifecycle::spawn_worker(
+        Arc::clone(&state),
+        lifecycle::Timing {
+            interval: std::time::Duration::from_secs(args.lifecycle_interval_secs.max(1)),
+            day: std::time::Duration::from_secs(args.lifecycle_day_secs.max(1)),
+        },
+    );
 
     // Build router
     // Allow up to 100MB for single-part uploads (larger objects need multipart)

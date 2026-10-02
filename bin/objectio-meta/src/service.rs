@@ -3278,6 +3278,9 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
 
+/// Named leases (`AcquireLease`), JSON `{holder, expires_at}`.
+const LEASES_TABLE: &str = "leases";
+
 /// Per-bucket settings, keyed `<bucket>/<name>`.
 const BUCKET_SETTINGS_TABLE: &str = "bucket_settings";
 
@@ -11314,6 +11317,92 @@ impl MetadataService for MetaService {
                 config: None,
                 found: false,
             })),
+        }
+    }
+
+    async fn acquire_lease(
+        &self,
+        request: Request<objectio_proto::metadata::AcquireLeaseRequest>,
+    ) -> Result<Response<objectio_proto::metadata::AcquireLeaseResponse>, Status> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Lease {
+            holder: String,
+            expires_at: u64,
+        }
+        let req = request.into_inner();
+        if req.name.is_empty() || req.holder.is_empty() {
+            return Err(Status::invalid_argument("name and holder are required"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let current_bytes = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(LEASES_TABLE, &req.name));
+        let current = current_bytes
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<Lease>(b).ok());
+        let held_by_other = current
+            .as_ref()
+            .is_some_and(|l| l.holder != req.holder && l.expires_at > now);
+        if held_by_other {
+            let l = current.unwrap_or(Lease {
+                holder: String::new(),
+                expires_at: 0,
+            });
+            return Ok(Response::new(
+                objectio_proto::metadata::AcquireLeaseResponse {
+                    acquired: false,
+                    holder: l.holder,
+                    expires_at: l.expires_at,
+                },
+            ));
+        }
+        let (new_value, lease) = if req.release {
+            (
+                None,
+                Lease {
+                    holder: String::new(),
+                    expires_at: 0,
+                },
+            )
+        } else {
+            let lease = Lease {
+                holder: req.holder.clone(),
+                expires_at: now + req.ttl_secs.max(1),
+            };
+            (serde_json::to_vec(&lease).ok(), lease)
+        };
+        if req.release && current.is_none() {
+            return Ok(Response::new(
+                objectio_proto::metadata::AcquireLeaseResponse::default(),
+            ));
+        }
+        // Compare-and-swap on what was read: of two callers racing for a
+        // free lease, one commit wins and the other is refused.
+        match self
+            .cas_one(
+                objectio_meta_store::CasTable::Named(LEASES_TABLE.into()),
+                &req.name,
+                current_bytes,
+                new_value,
+                "acquire-lease",
+            )
+            .await
+        {
+            Ok(()) => Ok(Response::new(
+                objectio_proto::metadata::AcquireLeaseResponse {
+                    acquired: !req.release,
+                    holder: lease.holder,
+                    expires_at: lease.expires_at,
+                },
+            )),
+            Err(e) if e.code() == tonic::Code::Aborted => Ok(Response::new(
+                objectio_proto::metadata::AcquireLeaseResponse::default(),
+            )),
+            Err(e) => Err(e),
         }
     }
 
