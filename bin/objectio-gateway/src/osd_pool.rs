@@ -866,6 +866,18 @@ pub async fn get_object_meta_from_osd(
     bucket: &str,
     key: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    get_object_version_meta_from_osd(pool, primary_placement, bucket, key, "").await
+}
+
+/// One OSD's copy of one version of `key` (`""`: the current one). An
+/// error says this copy couldn't be read, not that there is none.
+pub async fn get_object_version_meta_from_osd(
+    pool: &OsdPool,
+    primary_placement: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
     use objectio_proto::storage::GetObjectMetaRequest;
 
     let mut client = pool.get_client_for_placement(primary_placement).await?;
@@ -873,7 +885,7 @@ pub async fn get_object_meta_from_osd(
     let request = GetObjectMetaRequest {
         bucket: bucket.to_string(),
         key: key.to_string(),
-        version_id: String::new(),
+        version_id: version_id.to_string(),
     };
 
     let get_future = client.get_object_meta(request);

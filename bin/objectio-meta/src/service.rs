@@ -11235,6 +11235,47 @@ impl MetadataService for MetaService {
         ))
     }
 
+    async fn pack_settle(
+        &self,
+        request: Request<objectio_proto::metadata::PackSettleRequest>,
+    ) -> Result<Response<objectio_proto::metadata::PackSettleResponse>, Status> {
+        let req = request.into_inner();
+        for _ in 0..8 {
+            // A pack freed meanwhile has nothing left to settle.
+            let Some((mut record, bytes)) = self.pack_record(&req.pack_id) else {
+                return Ok(Response::new(
+                    objectio_proto::metadata::PackSettleResponse {},
+                ));
+            };
+            let before = record.members.len();
+            record
+                .members
+                .retain(|m| !req.object_ids.contains(&m.object_id));
+            if record.members.len() == before {
+                return Ok(Response::new(
+                    objectio_proto::metadata::PackSettleResponse {},
+                ));
+            }
+            let ok = self
+                .cas_many(
+                    vec![objectio_meta_store::CasOp {
+                        table: objectio_meta_store::CasTable::Named(PACKS_TABLE.into()),
+                        key: hex::encode(&req.pack_id),
+                        expected: Some(bytes),
+                        new_value: Some(record.encode_to_vec()),
+                    }],
+                    "pack-settle",
+                )
+                .await?;
+            if ok {
+                return Ok(Response::new(
+                    objectio_proto::metadata::PackSettleResponse {},
+                ));
+            }
+        }
+        Err(Status::aborted("pack kept changing; retry"))
+    }
+
     async fn block_create_volume(
         &self,
         request: Request<objectio_proto::metadata::BlockCreateVolumeRequest>,
@@ -13644,6 +13685,56 @@ mod pack_tests {
             .await
             .unwrap_err();
         assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn settled_members_leave_the_record_and_others_stay() {
+        use objectio_proto::metadata::{PackMember, PackSettleRequest};
+        let (_dir, svc) = service();
+        let pack = [11u8; 16];
+        svc.intend_pack(Request::new(IntendPackRequest {
+            pack: Some(PackRecord {
+                pack_id: pack.to_vec(),
+                stripe: Some(stripe(&pack, 0)),
+                members: (1..=3u8)
+                    .map(|i| PackMember {
+                        object_id: vec![i; 16],
+                        key: format!("k{i}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.seal_pack(Request::new(SealPackRequest {
+            pack_id: pack.to_vec(),
+            referrers: vec![vec![1; 16], vec![2; 16], vec![3; 16]],
+            stripe: None,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(svc.packs()[0].members.len(), 3, "sealing keeps the members");
+        svc.pack_settle(Request::new(PackSettleRequest {
+            pack_id: pack.to_vec(),
+            object_ids: vec![vec![1; 16], vec![3; 16], vec![9; 16]],
+        }))
+        .await
+        .unwrap();
+        let left: Vec<String> = svc.packs()[0]
+            .members
+            .iter()
+            .map(|m| m.key.clone())
+            .collect();
+        assert_eq!(left, ["k2"]);
+        // A pack that's gone has nothing to settle.
+        svc.pack_settle(Request::new(PackSettleRequest {
+            pack_id: vec![99; 16],
+            object_ids: vec![vec![2; 16]],
+        }))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

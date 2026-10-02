@@ -295,3 +295,247 @@ fn a_drain_moves_pack_shards() {
     c.restart_with_lost_disks(&[drained_index, holding[1].0, holding[2].0]);
     assert_readable(&c, "d", &objects, "drained, and two more lost");
 }
+
+// ── Phase 2: crash injection, reconciliation, the worker ─────────────────
+
+fn reconcile(c: &Cluster) -> Value {
+    let r = c.json(
+        "POST",
+        "/_admin/test/pack-reconcile",
+        json!({ "min_age_secs": 0 }),
+    );
+    assert_eq!(r.status, 200, "reconcile: {}", r.text());
+    r.json()
+}
+
+fn pack_stopping(c: &Cluster, bucket: &str, objects: &[(String, Vec<u8>)], stop: &str) -> Value {
+    let keys: Vec<&str> = objects.iter().map(|(k, _)| k.as_str()).collect();
+    let r = c.json(
+        "POST",
+        "/_admin/test/pack",
+        json!({ "bucket": bucket, "keys": keys, "stop_after": stop }),
+    );
+    assert_eq!(r.status, 200, "pack: {}", r.text());
+    r.json()
+}
+
+fn count(report: &Value, field: &str) -> u64 {
+    report[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no {field}: {report}"))
+}
+
+fn delete_all(c: &Cluster, bucket: &str, objects: &[(String, Vec<u8>)]) {
+    for (key, _) in objects {
+        c.request("DELETE", &format!("/{bucket}/{key}"), &[])
+            .expect(204);
+    }
+}
+
+/// The packer stopped (as by a crash) after each of its steps. Every object
+/// reads back throughout; reconciliation then settles the pack; a second
+/// pass finds nothing to do; and deleting every object gives back all the
+/// space, so nothing leaked and nothing still pointed at was freed.
+#[test]
+fn a_packer_that_dies_at_any_step_is_reconciled() {
+    for (stop, aborted, released, finished) in [
+        ("intend", 1, 0, 0),
+        ("write", 1, 0, 0),
+        ("seal", 0, 8, 0),
+        ("switch-one", 0, 7, 1),
+    ] {
+        let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+        let empty = c.total_used_bytes();
+        let objects = put_small(&c, "crash", 8);
+        let unpacked = await_used(&c, "written", Duration::from_secs(15), |u| u > empty);
+
+        pack_stopping(&c, "crash", &objects, stop);
+        assert_readable(&c, "crash", &objects, &format!("stopped after {stop}"));
+
+        let report = reconcile(&c);
+        assert_eq!(
+            (
+                count(&report, "aborted"),
+                count(&report, "released"),
+                count(&report, "finished"),
+                count(&report, "unknown"),
+            ),
+            (aborted, released, finished, 0),
+            "{stop}: {report}"
+        );
+        assert_readable(&c, "crash", &objects, &format!("reconciled after {stop}"));
+        let again = reconcile(&c);
+        assert_eq!(
+            count(&again, "aborted") + count(&again, "released") + count(&again, "finished"),
+            0,
+            "{stop}: a second pass had work: {again}"
+        );
+        if aborted + released == 8 || aborted == 1 {
+            // Nothing stayed packed: the space is what it was unpacked.
+            await_used(
+                &c,
+                &format!("{stop}: back to unpacked"),
+                Duration::from_secs(15),
+                |u| u <= unpacked,
+            );
+        }
+
+        delete_all(&c, "crash", &objects);
+        await_used(
+            &c,
+            &format!("{stop}: all deleted"),
+            Duration::from_secs(15),
+            |u| u <= empty,
+        );
+    }
+}
+
+/// Objects overwritten and deleted between the pack's seal and their
+/// switch: the client's writes win, the pack lets go of them, and the
+/// other objects' slices stay readable.
+#[test]
+fn objects_changed_while_being_packed_keep_what_the_client_wrote() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let empty = c.total_used_bytes();
+    let objects = put_small(&c, "race", 6);
+    pack_stopping(&c, "race", &objects, "seal");
+
+    let fresh = payload(7_000, 99);
+    c.request("PUT", "/race/o0", &fresh).expect(200);
+    c.request("DELETE", "/race/o1", &[]).expect(204);
+    // The rest switched by the next attempt; o0 and o1 are no longer
+    // the objects that were read.
+    let report = reconcile(&c);
+    assert_eq!(count(&report, "released"), 6, "{report}");
+    assert_eq!(c.request("GET", "/race/o0", &[]).bytes, fresh);
+    c.request("GET", "/race/o1", &[]).expect(404);
+    assert_readable(&c, "race", &objects[2..], "after the race");
+
+    // Packed for real now, the survivors read and delete cleanly.
+    let rest: Vec<&str> = objects[2..].iter().map(|(k, _)| k.as_str()).collect();
+    let report = pack(&c, "race", &rest);
+    assert_eq!(
+        report["packed"].as_array().map(Vec::len),
+        Some(4),
+        "{report}"
+    );
+    assert_readable(&c, "race", &objects[2..], "packed after the race");
+    c.request("DELETE", "/race/o0", &[]).expect(204);
+    delete_all(&c, "race", &objects[2..]);
+    await_used(&c, "all deleted", Duration::from_secs(15), |u| u <= empty);
+}
+
+/// A locked object packs and stays locked: its retention and legal hold
+/// travel with it, and its version still can't be deleted.
+#[test]
+fn a_locked_object_packs_and_stays_locked() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    c.request_with_headers(
+        "PUT",
+        "/worm",
+        &[],
+        &[("x-amz-bucket-object-lock-enabled", "true")],
+    )
+    .expect(200);
+    let mut versions = Vec::new();
+    let mut objects = Vec::new();
+    for i in 0..3u8 {
+        let body = payload(6_000 + usize::from(i) * 1_000, i);
+        let r = c.request_with_headers(
+            "PUT",
+            &format!("/worm/o{i}"),
+            &body,
+            &[
+                ("x-amz-object-lock-mode", "COMPLIANCE"),
+                (
+                    "x-amz-object-lock-retain-until-date",
+                    "2099-01-01T00:00:00Z",
+                ),
+                ("x-amz-object-lock-legal-hold", "ON"),
+            ],
+        );
+        r.expect(200);
+        versions.push(r.header("x-amz-version-id").expect("a version"));
+        objects.push((format!("o{i}"), body));
+    }
+    pack_all(&c, "worm", &objects);
+    assert_readable(&c, "worm", &objects, "packed");
+    for (i, v) in versions.iter().enumerate() {
+        let head = c.request("HEAD", &format!("/worm/o{i}"), &[]);
+        assert_eq!(
+            head.header("x-amz-object-lock-mode").as_deref(),
+            Some("COMPLIANCE")
+        );
+        assert_eq!(
+            head.header("x-amz-object-lock-legal-hold").as_deref(),
+            Some("ON")
+        );
+        let del = c.request("DELETE", &format!("/worm/o{i}?versionId={v}"), &[]);
+        assert_eq!(
+            del.status,
+            403,
+            "a locked, packed version was deleted: {}",
+            del.text()
+        );
+    }
+}
+
+fn metric(c: &Cluster, name: &str) -> u64 {
+    c.request("GET", "/metrics", &[])
+        .text()
+        .lines()
+        .filter(|l| l.split(['{', ' ']).next() == Some(name))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// The background packer, on: small objects old enough end up in packs
+/// and read back; tiny (inline) and large objects are left alone. (One
+/// small object left over on its own is not packed: it would save
+/// nothing.)
+#[test]
+fn the_packer_packs_small_objects_in_the_background() {
+    let c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        // Old enough a moment after the writes finish, so they're packed
+        // together, not as they arrive.
+        &["--pack-interval-secs", "1", "--pack-min-age-secs", "3"],
+    );
+    c.json("POST", "/_admin/buckets", json!({ "name": "bg" }))
+        .expect_ok();
+    // Twenty objects, all within the packing cut-off (64 KiB).
+    let objects: Vec<(String, Vec<u8>)> = (0..20u8)
+        .map(|i| {
+            let body = payload(5_000 + usize::from(i) * 2_500, i);
+            let key = format!("o{i}");
+            c.request("PUT", &format!("/bg/{key}"), &body).expect(200);
+            (key, body)
+        })
+        .collect();
+    c.request("PUT", "/bg/tiny", b"inline").expect(200);
+    let large = payload(300_000, 77);
+    c.request("PUT", "/bg/large", &large).expect(200);
+    let written = c.total_used_bytes();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while metric(&c, "objectio_pack_objects_total") < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "the packer never packed the objects"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_readable(&c, "bg", &objects, "packed in the background");
+    assert_eq!(c.request("GET", "/bg/tiny", &[]).bytes, b"inline");
+    assert!(c.request("GET", "/bg/large", &[]).bytes == large);
+    await_used(&c, "after packing", Duration::from_secs(15), |u| {
+        u < written
+    });
+    // Settled: nothing left for reconciliation.
+    assert_eq!(metric(&c, "objectio_pack_reconciled_total"), 0);
+    // Packed once: later passes leave packed objects alone.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(metric(&c, "objectio_pack_objects_total"), 20);
+}

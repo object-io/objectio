@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod origin;
 pub mod osd_pool;
+pub mod packer;
 pub mod packs;
 pub mod post_object;
 pub mod prom;
@@ -343,6 +344,15 @@ pub struct Args {
     /// named objects now). For testing only.
     #[arg(long, hide = true)]
     pub test_hooks: bool,
+
+    /// How often the packer moves small objects into packs (seconds). 0,
+    /// the default, leaves packing off.
+    #[arg(long, default_value_t = 0)]
+    pub pack_interval_secs: u64,
+
+    /// Objects written more recently than this many seconds aren't packed.
+    #[arg(long, default_value_t = 3600)]
+    pub pack_min_age_secs: u64,
 
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
@@ -948,6 +958,17 @@ pub async fn run(
         },
     );
 
+    // Packing: off unless asked for; a lease in meta lets one gateway pack.
+    if args.pack_interval_secs > 0 {
+        packer::spawn_worker(
+            Arc::clone(&state),
+            packer::Timing {
+                interval: std::time::Duration::from_secs(args.pack_interval_secs),
+                min_age: std::time::Duration::from_secs(args.pack_min_age_secs),
+            },
+        );
+    }
+
     // Build router
     // Allow up to 100MB for single-part uploads (larger objects need multipart)
     let body_limit = DefaultBodyLimit::max(100 * 1024 * 1024);
@@ -1198,7 +1219,12 @@ pub async fn run(
     // Hooks a test drives directly, never mounted otherwise.
     let admin_routes = if args.test_hooks {
         warn!("--test-hooks: /_admin/test/* is mounted");
-        admin_routes.route("/_admin/test/pack", post(packs::admin_test_pack))
+        admin_routes
+            .route("/_admin/test/pack", post(packs::admin_test_pack))
+            .route(
+                "/_admin/test/pack-reconcile",
+                post(packs::admin_test_reconcile),
+            )
     } else {
         admin_routes
     };
