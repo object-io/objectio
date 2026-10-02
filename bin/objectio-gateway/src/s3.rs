@@ -1230,25 +1230,49 @@ fn overlapping_stripes(
 /// read these values from `RequestContext.variables`.
 pub(crate) fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String, String> {
     let mut vars = HashMap::new();
-    // Currently the gateway terminates TLS upstream (Cloudflare/ingress), so
-    // every request here effectively came in over HTTPS. Mark it so
-    // `aws:SecureTransport = "true"` conditions work.
-    vars.insert("aws:SecureTransport".to_string(), "true".to_string());
-    let Some(h) = headers else { return vars };
-    if let Some(v) = h
-        .get("x-amz-server-side-encryption")
-        .and_then(|v| v.to_str().ok())
-    {
-        vars.insert("s3:x-amz-server-side-encryption".to_string(), v.to_string());
+    let Some(h) = headers else {
+        vars.insert("aws:SecureTransport".to_string(), "false".to_string());
+        return vars;
+    };
+    let header = |name: &str| h.get(name).and_then(|v| v.to_str().ok());
+    // TLS ends at the proxy in front of the gateway, which says so in
+    // X-Forwarded-Proto. This was "true" for every request, so a policy
+    // denying plain HTTP denied nothing on a gateway reached over HTTP.
+    let secure = header("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    vars.insert("aws:SecureTransport".to_string(), secure.to_string());
+    // Request headers S3 exposes as condition keys.
+    for name in [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-acl",
+        "x-amz-copy-source",
+        "x-amz-metadata-directive",
+        "x-amz-storage-class",
+        "x-amz-content-sha256",
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-legal-hold",
+    ] {
+        if let Some(v) = header(name) {
+            vars.insert(format!("s3:{name}"), v.to_string());
+        }
     }
-    if let Some(v) = h
-        .get("x-amz-server-side-encryption-aws-kms-key-id")
-        .and_then(|v| v.to_str().ok())
+    // Tags the request puts on the object.
+    if let Some(tagging) = header("x-amz-tagging")
+        && let Ok(tags) = parse_tagging(tagging)
     {
+        let mut keys: Vec<&String> = tags.keys().collect();
+        keys.sort();
         vars.insert(
-            "s3:x-amz-server-side-encryption-aws-kms-key-id".to_string(),
-            v.to_string(),
+            "s3:RequestObjectTagKeys".to_string(),
+            keys.iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
         );
+        for (k, v) in &tags {
+            vars.insert(format!("s3:RequestObjectTag/{k}"), v.clone());
+        }
     }
     vars
 }
@@ -1415,6 +1439,11 @@ pub struct ListObjectsParams {
     /// ListObjectsV2: put each object's owner in the answer.
     #[serde(rename = "fetch-owner")]
     fetch_owner: Option<String>,
+    /// If present, a GetBucketAcl request
+    acl: Option<String>,
+    /// If present, a GetBucketOwnershipControls request
+    #[serde(rename = "ownershipControls")]
+    ownership_controls: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list object versions request
@@ -1488,6 +1517,11 @@ pub struct PutBucketParams {
     lifecycle: Option<String>,
     /// If present, this is a put bucket encryption request
     encryption: Option<String>,
+    /// If present, a PutBucketAcl request
+    acl: Option<String>,
+    /// If present, a PutBucketOwnershipControls request
+    #[serde(rename = "ownershipControls")]
+    ownership_controls: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
@@ -1526,6 +1560,8 @@ pub struct PutObjectParams {
     /// The version a retention, legal hold or tagging request is for
     #[serde(rename = "versionId")]
     version_id: Option<String>,
+    /// If present, a PutObjectAcl request
+    acl: Option<String>,
 }
 
 /// Query parameters for GET object operations (handles both GET and list parts)
@@ -1548,6 +1584,8 @@ pub struct GetObjectParams {
     part_number: Option<u32>,
     /// If present, this is a GetObjectAttributes request
     attributes: Option<String>,
+    /// If present, a GetObjectAcl request
+    acl: Option<String>,
     /// If present, this is a get object retention request
     retention: Option<String>,
     /// If present, this is a get legal hold request
@@ -2323,11 +2361,35 @@ pub async fn list_buckets(
 
     let mut client = state.meta_client.clone();
 
+    // Least privilege: a user lists the buckets it owns; a tenant's admins
+    // list the tenant's; the system admin lists all. Every user used to
+    // see every bucket of its tenant (and, in system scope, of all
+    // tenants), whether or not it could touch them.
+    let owner = match auth.as_ref() {
+        Some(Extension(a)) if a.user_arn != crate::admin::SYSTEM_ADMIN_USER_ARN => {
+            let tenant_admin = !a.tenant.is_empty()
+                && client
+                    .get_tenant(objectio_proto::metadata::GetTenantRequest {
+                        name: a.tenant.clone(),
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_inner().tenant)
+                    .is_some_and(|t| {
+                        t.admin_users
+                            .iter()
+                            .any(|u| u == &a.user_id || u == &a.user_arn)
+                    });
+            if tenant_admin {
+                String::new()
+            } else {
+                a.user_id.clone()
+            }
+        }
+        _ => String::new(),
+    };
     match client
-        .list_buckets(ListBucketsRequest {
-            owner: String::new(),
-            tenant,
-        })
+        .list_buckets(ListBucketsRequest { owner, tenant })
         .await
     {
         Ok(response) => {
@@ -2404,6 +2466,15 @@ pub async fn create_bucket(
 ) -> Response {
     if params.tagging.is_some() {
         return bucket_tagging_unsupported();
+    }
+    if params.acl.is_some() {
+        return put_acl(&state, &bucket, None, &headers, &body).await;
+    }
+    if params.ownership_controls.is_some() {
+        return put_ownership_controls(&state, &bucket, &body).await;
+    }
+    if let Some(refused) = acl_header_refusal(&headers) {
+        return refused;
     }
     if params.policy.is_some() {
         return put_bucket_policy_internal(state, bucket, body).await;
@@ -2759,6 +2830,12 @@ pub async fn list_objects(
     params.max_keys = max_keys.map(|m| m.to_string());
     if params.tagging.is_some() {
         return bucket_tagging_unsupported();
+    }
+    if params.acl.is_some() {
+        return get_acl(&state, &bucket, None, None).await;
+    }
+    if params.ownership_controls.is_some() {
+        return get_ownership_controls(&state, &bucket).await;
     }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
@@ -3957,6 +4034,231 @@ fn range_not_satisfiable(size: u64) -> Response {
         resp.headers_mut().insert(header::CONTENT_RANGE, v);
     }
     resp
+}
+
+// ── ACLs: bucket owner enforced ──────────────────────────────────────────
+//
+// As AWS has it by default since 2023 (Object Ownership "BucketOwnerEnforced"):
+// the bucket's owner owns every object in it with FULL_CONTROL, ACLs are
+// read-only in effect, and access is granted by IAM and bucket policies
+// only. An ACL that says just that is accepted (it changes nothing); any
+// other is refused, so no request can make data public through an ACL.
+
+/// The refusal S3 gives an ACL a bucket owner enforced bucket won't take.
+fn acls_not_supported() -> Response {
+    S3Error::xml_response(
+        "AccessControlListNotSupported",
+        "The bucket does not allow ACLs",
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// A write's `x-amz-acl` / `x-amz-grant-*` headers asking for more than
+/// the owner's FULL_CONTROL.
+fn acl_header_refusal(headers: &HeaderMap) -> Option<Response> {
+    let canned_ok = headers
+        .get("x-amz-acl")
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| v == "private" || v == "bucket-owner-full-control");
+    let grants = headers
+        .keys()
+        .any(|k| k.as_str().starts_with("x-amz-grant-"));
+    (!canned_ok || grants).then(acls_not_supported)
+}
+
+/// The owner of `bucket` (who owns everything in it), or the response.
+async fn bucket_owner(state: &AppState, bucket: &str) -> Result<String, Response> {
+    match state
+        .meta_client
+        .clone()
+        .get_bucket(GetBucketRequest {
+            name: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(r) => Ok(r.into_inner().bucket.map(|b| b.owner).unwrap_or_default()),
+        Err(e) if e.code() == tonic::Code::NotFound => Err(S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        )),
+        Err(e) => Err(S3Error::xml_response(
+            "InternalError",
+            &e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+/// GetBucketAcl / GetObjectAcl: the owner, with FULL_CONTROL.
+async fn get_acl(
+    state: &AppState,
+    bucket: &str,
+    key: Option<&str>,
+    version_id: Option<&str>,
+) -> Response {
+    let owner = match bucket_owner(state, bucket).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    if let Some(key) = key {
+        let nodes = match get_placement_nodes_for_object(state, bucket, key).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version_id).await {
+            return resp;
+        }
+    }
+    let id = quick_xml::escape::escape(&owner);
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Owner><ID>{id}</ID><DisplayName>{id}</DisplayName></Owner>\
+         <AccessControlList><Grant>\
+         <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+         <ID>{id}</ID><DisplayName>{id}</DisplayName></Grantee>\
+         <Permission>FULL_CONTROL</Permission></Grant></AccessControlList>\
+         </AccessControlPolicy>"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
+/// PutBucketAcl / PutObjectAcl: accepted only if it grants the owner
+/// FULL_CONTROL and no one anything. It changes nothing either way. A
+/// PutObjectAcl used to be taken as a PutObject: the ACL document became
+/// the object's data.
+async fn put_acl(
+    state: &AppState,
+    bucket: &str,
+    key: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    let owner = match bucket_owner(state, bucket).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    if let Some(key) = key {
+        let nodes = match get_placement_nodes_for_object(state, bucket, key).await {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
+        let version = headers
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok());
+        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version).await {
+            return resp;
+        }
+    }
+    if let Some(refused) = acl_header_refusal(headers) {
+        return refused;
+    }
+    if !body.is_empty() && !acl_body_is_owner_only(body, &owner) {
+        return acls_not_supported();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Whether an `AccessControlPolicy` body grants FULL_CONTROL to `owner`
+/// and nothing to anyone else.
+fn acl_body_is_owner_only(body: &[u8], owner: &str) -> bool {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(body);
+    let mut buf = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut grants = 0;
+    let mut grant_id: Option<String> = None;
+    let mut grant_other = false;
+    let mut permission = String::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                path.push(String::from_utf8_lossy(e.local_name().as_ref()).into_owned());
+                if path.last().is_some_and(|n| n == "Grant") {
+                    grant_id = None;
+                    grant_other = false;
+                    permission.clear();
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let text = t
+                    .unescape()
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_default();
+                let n = path.len();
+                if n >= 2 && path[n - 2] == "Grantee" {
+                    match path[n - 1].as_str() {
+                        "ID" => grant_id = Some(text),
+                        "URI" | "EmailAddress" => grant_other = true,
+                        _ => {}
+                    }
+                } else if path.last().is_some_and(|p| p == "Permission") {
+                    permission = text;
+                }
+            }
+            Ok(Event::End(_)) => {
+                if path.pop().is_some_and(|n| n == "Grant") {
+                    grants += 1;
+                    if grant_other
+                        || grant_id.as_deref() != Some(owner)
+                        || permission != "FULL_CONTROL"
+                    {
+                        return false;
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return false,
+            _ => {}
+        }
+        buf.clear();
+    }
+    grants > 0
+}
+
+/// GetBucketOwnershipControls: always bucket owner enforced.
+async fn get_ownership_controls(state: &AppState, bucket: &str) -> Response {
+    if let Err(resp) = bucket_owner(state, bucket).await {
+        return resp;
+    }
+    let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+               <OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+               <Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>\
+               </OwnershipControls>";
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
+/// PutBucketOwnershipControls: only BucketOwnerEnforced, which is how it is.
+async fn put_ownership_controls(state: &AppState, bucket: &str, body: &[u8]) -> Response {
+    if let Err(resp) = bucket_owner(state, bucket).await {
+        return resp;
+    }
+    if String::from_utf8_lossy(body)
+        .contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>")
+    {
+        Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap()
+    } else {
+        S3Error::xml_response(
+            "InvalidRequest",
+            "Only BucketOwnerEnforced object ownership is supported: ACLs are disabled",
+            StatusCode::BAD_REQUEST,
+        )
+    }
 }
 
 /// What a PUT's `If-Match` / `If-None-Match` ask: "*" or an ETag each.
@@ -7996,6 +8298,9 @@ async fn initiate_multipart_upload_internal(
     if let Some(refused) = sse_header_conflict(headers) {
         return refused;
     }
+    if let Some(refused) = acl_header_refusal(headers) {
+        return refused;
+    }
     let mut client = state.meta_client.clone();
 
     // What the object will carry, fixed now as AWS fixes it: content type,
@@ -8355,6 +8660,12 @@ pub async fn put_object_with_params(
         }
         return upload_part_internal(state, bucket, key, upload_id, part_number, headers, body)
             .await;
+    }
+    if params.acl.is_some() {
+        return put_acl(&state, &bucket, Some(&key), &headers, &body).await;
+    }
+    if let Some(refused) = acl_header_refusal(&headers) {
+        return refused;
     }
     if params.retention.is_some() {
         if let Some(refused) =
@@ -9567,6 +9878,9 @@ pub async fn get_object_with_params(
     let _ = auth;
     if params.attributes.is_some() {
         return get_object_attributes(state, bucket, key, params.version_id, &headers).await;
+    }
+    if params.acl.is_some() {
+        return get_acl(&state, &bucket, Some(&key), params.version_id.as_deref()).await;
     }
     if let Some(n) = params.part_number {
         return get_object_part(state, bucket, key, params.version_id, n, headers).await;
@@ -12504,8 +12818,17 @@ mod s3_tests {
         assert!(!vars.contains_key("s3:x-amz-server-side-encryption"));
         // Absent must stay absent: a policy that denies on a value would
         // otherwise match an empty string and refuse every plain PUT.
+        // Secure only when the proxy in front says the client used HTTPS.
         assert_eq!(
             vars.get("aws:SecureTransport").map(String::as_str),
+            Some("false")
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            sse_condition_vars(Some(&h))
+                .get("aws:SecureTransport")
+                .map(String::as_str),
             Some("true")
         );
     }
