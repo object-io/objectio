@@ -4343,10 +4343,17 @@ impl MetadataService for MetaService {
         let mut stripes = Vec::new();
         let mut total_size = 0u64;
 
-        for part_info in &req.parts {
+        for (i, part_info) in req.parts.iter().enumerate() {
             let stored_part = upload.parts.get(&part_info.part_number).ok_or_else(|| {
                 Status::invalid_argument(format!("part {} not found", part_info.part_number))
             })?;
+            // Every part but the last is at least 5 MiB, as S3 requires.
+            if i + 1 < req.parts.len() && stored_part.size < 5 * 1024 * 1024 {
+                return Err(Status::invalid_argument(format!(
+                    "EntityTooSmall: part {} is {} bytes; all parts but the last must be at least 5 MiB",
+                    part_info.part_number, stored_part.size
+                )));
+            }
 
             // Verify ETag matches (normalize by removing quotes)
             let req_etag = part_info.etag.trim_matches('"');
@@ -4478,6 +4485,10 @@ impl MetadataService for MetaService {
                 "Abort for unknown upload_id={} (may already be completed)",
                 req.upload_id
             );
+            return Err(Status::not_found(format!(
+                "multipart upload not found: {}",
+                req.upload_id
+            )));
         }
 
         // The parts' shards are freed by the caller, from the stripes taken
@@ -12069,7 +12080,8 @@ mod multipart_reclaim_tests {
             upload_id: upload_id.into(),
             part_number: part,
             etag: format!("\"{id:032x}\""),
-            size: 1,
+            // At S3's minimum, so any part may come before another.
+            size: 5 * 1024 * 1024,
             stripes: vec![stripe(id)],
         }))
         .await
@@ -12117,19 +12129,18 @@ mod multipart_reclaim_tests {
         assert_eq!(ids(&resp.object.unwrap().stripes), [2]);
         assert_eq!(ids(&resp.unused_stripes), [1, 3]);
 
-        // The upload is gone: an abort now frees nothing.
+        // The upload is gone: an abort now finds nothing, and frees nothing.
         let abort = svc
             .abort_multipart_upload(Request::new(AbortMultipartUploadRequest {
                 bucket: "b".into(),
                 key: "k".into(),
                 upload_id: id,
             }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(
-            abort.stripes.is_empty(),
-            "abort freed a completed object's parts"
+            .await;
+        assert_eq!(
+            abort.map(|r| r.into_inner().stripes.len()).map_err(|e| e.code()),
+            Err(tonic::Code::NotFound),
+            "abort of a completed upload"
         );
     }
 

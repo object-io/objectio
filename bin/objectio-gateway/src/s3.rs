@@ -1125,18 +1125,109 @@ pub(crate) fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String,
 /// V1 (`GET /{bucket}`) paginates on Marker/NextMarker; V2
 /// (`?list-type=2`) on ContinuationToken/KeyCount. Answering a V1
 /// request with a V2-only body leaves the client nothing to page with.
+#[cfg(test)]
 fn apply_listing_version(
     result: &mut ListBucketResult,
     is_v2: bool,
     marker: Option<String>,
     start_after: Option<String>,
 ) {
+    apply_listing_echo(result, is_v2, marker, start_after, ListingEcho::default());
+}
+
+/// What a listing request asked that its answer echoes or acts on, beyond
+/// the markers.
+#[derive(Default)]
+struct ListingEcho {
+    continuation_token: Option<String>,
+    /// The bucket's owner, shown on each object for V1, and for V2 with
+    /// ?fetch-owner=true (objects record no owner of their own).
+    owner: Option<String>,
+    fetch_owner: bool,
+}
+
+fn apply_listing_echo(
+    result: &mut ListBucketResult,
+    is_v2: bool,
+    marker: Option<String>,
+    start_after: Option<String>,
+    echo: ListingEcho,
+) {
+    // max-keys=0 asks for no keys at all.
+    if result.max_keys == 0 {
+        result.contents.clear();
+        result.common_prefixes.clear();
+        result.is_truncated = false;
+        result.next_continuation_token = None;
+        result.key_count = Some(0);
+    }
+    if let Some(owner) = echo.owner.filter(|_| !is_v2 || echo.fetch_owner) {
+        for c in &mut result.contents {
+            c.owner = Some(Owner {
+                id: owner.clone(),
+                display_name: owner.clone(),
+            });
+        }
+    }
+    apply_listing_markers(result, is_v2, marker, start_after, echo.continuation_token);
+    if result.encoding_type.as_deref() == Some("url") {
+        url_encode_listing(result);
+    }
+}
+
+/// With ?encoding-type=url, S3 percent-encodes every key and prefix in the
+/// answer, and clients (boto3 always asks for it) decode them. Echoing the
+/// encoding type while sending keys raw made a client decode them anyway:
+/// "a+b" listed as "a b", "x%2By" as "x+y".
+fn url_encode_listing(result: &mut ListBucketResult) {
+    let enc = |s: &mut String| *s = s3_url_encode(s);
+    let enc_opt = |s: &mut Option<String>| {
+        if let Some(v) = s {
+            *v = s3_url_encode(v);
+        }
+    };
+    enc(&mut result.prefix);
+    enc_opt(&mut result.delimiter);
+    enc_opt(&mut result.marker);
+    enc_opt(&mut result.next_marker);
+    enc_opt(&mut result.start_after);
+    for c in &mut result.contents {
+        enc(&mut c.key);
+    }
+    for p in &mut result.common_prefixes {
+        enc(&mut p.prefix);
+    }
+}
+
+/// Percent-encoding as S3's `encoding-type=url` does it: everything but
+/// unreserved characters and "/".
+fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn apply_listing_markers(
+    result: &mut ListBucketResult,
+    is_v2: bool,
+    marker: Option<String>,
+    start_after: Option<String>,
+    continuation_token: Option<String>,
+) {
     if is_v2 {
         result.start_after = start_after;
+        result.continuation_token = continuation_token;
         result.marker = None;
         result.next_marker = None;
         return;
     }
+    result.continuation_token = None;
     result.marker = Some(marker.unwrap_or_default());
     result.start_after = None;
     result.key_count = None;
@@ -1169,7 +1260,7 @@ pub struct ListObjectsParams {
     prefix: Option<String>,
     delimiter: Option<String>,
     #[serde(rename = "max-keys")]
-    max_keys: Option<u32>,
+    max_keys: Option<String>,
     #[serde(rename = "continuation-token")]
     continuation_token: Option<String>,
     /// V1 pagination position (`?marker=`). Was unparsed, so a V1
@@ -1187,6 +1278,9 @@ pub struct ListObjectsParams {
     /// not currently encode keys, so this is recorded, not honored.
     #[serde(rename = "encoding-type")]
     encoding_type: Option<String>,
+    /// ListObjectsV2: put each object's owner in the answer.
+    #[serde(rename = "fetch-owner")]
+    fetch_owner: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list object versions request
@@ -1315,6 +1409,9 @@ pub struct GetObjectParams {
     /// Version ID for retrieving specific version (used by version-aware GET)
     #[serde(rename = "versionId")]
     version_id: Option<String>,
+    /// One part of a multipart object
+    #[serde(rename = "partNumber")]
+    part_number: Option<u32>,
     /// If present, this is a get object retention request
     retention: Option<String>,
     /// If present, this is a get legal hold request
@@ -1361,6 +1458,20 @@ pub struct ListBucketsResult {
     pub owner: Owner,
     #[serde(rename = "Buckets")]
     pub buckets: Buckets,
+    /// Where the next page starts, when there is one.
+    #[serde(rename = "ContinuationToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+}
+
+/// Query parameters for ListBuckets.
+#[derive(Debug, Deserialize, Default)]
+pub struct ListBucketsParams {
+    #[serde(rename = "max-buckets")]
+    max_buckets: Option<u32>,
+    #[serde(rename = "continuation-token")]
+    continuation_token: Option<String>,
+    prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1408,6 +1519,10 @@ pub struct ListBucketResult {
     #[serde(rename = "StartAfter")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_after: Option<String>,
+    /// V2 only: echo of the requested ?continuation-token=
+    #[serde(rename = "ContinuationToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
     #[serde(rename = "EncodingType")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding_type: Option<String>,
@@ -1447,6 +1562,10 @@ pub struct ObjectContent {
     pub size: u64,
     #[serde(rename = "StorageClass")]
     pub storage_class: String,
+    /// V1 always, V2 with ?fetch-owner=true.
+    #[serde(rename = "Owner")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
 }
 
 #[derive(Serialize)]
@@ -1820,9 +1939,27 @@ async fn upload_part_copy_internal(
         return resp;
     }
 
-    // The source range, read the way a ranged GET reads it.
+    // The source range, read the way a ranged GET reads it. Stricter than a
+    // GET's Range: "bytes=first-last", both given, first <= last, and within
+    // the source (checked once its size is known), as S3 requires.
     let mut get_headers = copy_source_conditions(&headers);
+    let mut copy_last: Option<u64> = None;
     if let Some(range) = headers.get("x-amz-copy-source-range") {
+        let bounds = range
+            .to_str()
+            .ok()
+            .and_then(|r| r.strip_prefix("bytes="))
+            .and_then(|r| r.split_once('-'))
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+            .filter(|(a, b)| a <= b);
+        let Some((_, last)) = bounds else {
+            return S3Error::xml_response(
+                "InvalidArgument",
+                "x-amz-copy-source-range must be bytes=first-last",
+                StatusCode::BAD_REQUEST,
+            );
+        };
+        copy_last = Some(last);
         get_headers.insert(header::RANGE, range.clone());
     }
     let _ = auth;
@@ -1836,6 +1973,21 @@ async fn upload_part_copy_internal(
     .await;
     if !got.status().is_success() {
         return copy_condition_failed(got);
+    }
+    let source_size = got
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('/').next())
+        .and_then(|t| t.parse::<u64>().ok());
+    if let (Some(last), Some(size)) = (copy_last, source_size)
+        && last >= size
+    {
+        return S3Error::xml_response(
+            "InvalidRange",
+            "The requested range is not satisfiable",
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        );
     }
     let data = match axum::body::to_bytes(got.into_body(), MAX_COPY_PART).await {
         Ok(b) => b,
@@ -1926,6 +2078,7 @@ fn timestamp_to_http_date(ts: u64) -> String {
 /// List all buckets (GET /)
 pub async fn list_buckets(
     State(state): State<Arc<AppState>>,
+    Query(params): Query<ListBucketsParams>,
     auth: Option<Extension<AuthResult>>,
 ) -> Response {
     let tenant = auth
@@ -1957,7 +2110,25 @@ pub async fn list_buckets(
             if let Some(only) = &scoped_bucket {
                 buckets.buckets.retain(|b| &b.name == only);
             }
+            // Pages by name: ?max-buckets=, resumed after ?continuation-token=.
+            buckets.buckets.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Some(after) = &params.continuation_token {
+                buckets.buckets.retain(|b| &b.name > after);
+            }
+            if let Some(prefix) = &params.prefix {
+                buckets
+                    .buckets
+                    .retain(|b| b.name.starts_with(prefix.as_str()));
+            }
+            let mut continuation_token = None;
+            if let Some(max) = params.max_buckets.filter(|m| *m > 0)
+                && buckets.buckets.len() > max as usize
+            {
+                buckets.buckets.truncate(max as usize);
+                continuation_token = buckets.buckets.last().map(|b| b.name.clone());
+            }
             let result = ListBucketsResult {
+                continuation_token,
                 owner: Owner {
                     id: "objectio".to_string(),
                     display_name: "ObjectIO User".to_string(),
@@ -2023,6 +2194,15 @@ pub async fn create_bucket(
     }
     if params.encryption.is_some() {
         return put_bucket_encryption_internal(state, bucket, body).await;
+    }
+
+    // S3's naming rules, for a bucket created through S3.
+    if let Err(e) = objectio_common::BucketName::new(bucket.clone()) {
+        return S3Error::xml_response(
+            "InvalidBucketName",
+            &format!("The specified bucket is not valid: {e}"),
+            StatusCode::BAD_REQUEST,
+        );
     }
 
     // Check for object lock at bucket creation
@@ -2115,9 +2295,30 @@ pub async fn create_bucket(
         }
         Err(e) => {
             if e.code() == tonic::Code::AlreadyExists {
+                // Asked again by its owner: S3 (us-east-1) answers success
+                // and leaves the bucket as it is. Anyone else: it's taken.
+                let caller = auth
+                    .as_ref()
+                    .map(|Extension(a)| a.user_id.clone())
+                    .unwrap_or_default();
+                let owner = client
+                    .get_bucket(GetBucketRequest {
+                        name: bucket.clone(),
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_inner().bucket)
+                    .map(|b| b.owner);
+                if owner.is_some_and(|o| o == caller) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Location", format!("/{bucket}"))
+                        .body(Body::empty())
+                        .unwrap();
+                }
                 S3Error::xml_response(
                     "BucketAlreadyExists",
-                    "Bucket already exists",
+                    "The requested bucket name is not available",
                     StatusCode::CONFLICT,
                 )
             } else {
@@ -2318,6 +2519,19 @@ pub async fn list_objects(
     // Authorized by `authz::authz_layer` before this handler runs.
     _auth: Option<Extension<AuthResult>>,
 ) -> Response {
+    let mut params = params;
+    let max_keys = match params.max_keys.as_deref().map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(n)) if n >= 0 => Some(u32::try_from(n).unwrap_or(u32::MAX)),
+        Some(_) => {
+            return S3Error::xml_response(
+                "InvalidArgument",
+                "max-keys must be a non-negative integer",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    params.max_keys = max_keys.map(|m| m.to_string());
     if params.tagging.is_some() {
         return bucket_tagging_unsupported();
     }
@@ -2353,15 +2567,17 @@ pub async fn list_objects(
                 delimiter: params.delimiter.clone().filter(|d| !d.is_empty()),
                 key_marker: params.key_marker.clone().unwrap_or_default(),
                 version_id_marker: params.version_id_marker.clone().unwrap_or_default(),
-                max_keys: params.max_keys.unwrap_or(1000).min(1000),
+                max_keys: max_keys.unwrap_or(1000).min(1000),
+                url_encoded: params.encoding_type.as_deref() == Some("url"),
             },
         )
         .await;
     }
 
     let prefix = params.prefix.clone().unwrap_or_default();
-    let delimiter = params.delimiter.clone();
-    let max_keys = params.max_keys.unwrap_or(1000);
+    // An empty delimiter is no delimiter, and isn't echoed.
+    let delimiter = params.delimiter.clone().filter(|d| !d.is_empty());
+    let max_keys = max_keys.unwrap_or(1000);
     let continuation_token = params.continuation_token.as_deref();
     let is_v2 = params.list_type.as_deref() == Some("2");
     // V2 resumes from ?start-after=, V1 from ?marker=. A continuation
@@ -2374,13 +2590,13 @@ pub async fn list_objects(
 
     // First verify bucket exists
     let mut client = state.meta_client.clone();
-    match client
+    let bucket_owner = match client
         .get_bucket(GetBucketRequest {
             name: bucket.clone(),
         })
         .await
     {
-        Ok(_) => {}
+        Ok(resp) => resp.into_inner().bucket.map(|b| b.owner),
         Err(e) => {
             if e.code() == tonic::Code::NotFound {
                 return S3Error::xml_response(
@@ -2396,7 +2612,12 @@ pub async fn list_objects(
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
-    }
+    };
+    let echo = || ListingEcho {
+        continuation_token: params.continuation_token.clone(),
+        owner: bucket_owner.clone(),
+        fetch_owner: params.fetch_owner.as_deref() == Some("true"),
+    };
 
     // Prefer Meta's serializable listing index. Fall back to the
     // scatter-gather path only when Meta has no entries for this
@@ -2432,6 +2653,7 @@ pub async fn list_objects(
                         } else {
                             e.storage_class
                         },
+                        owner: None,
                     })
                     .collect();
                 let common_prefixes: Vec<CommonPrefix> = r
@@ -2447,6 +2669,7 @@ pub async fn list_objects(
                     marker: None,
                     next_marker: None,
                     start_after: None,
+                    continuation_token: None,
                     encoding_type: params.encoding_type.clone(),
                     max_keys,
                     is_truncated: r.is_truncated,
@@ -2459,11 +2682,12 @@ pub async fn list_objects(
                     common_prefixes,
                     contents,
                 };
-                apply_listing_version(
+                apply_listing_echo(
                     &mut result,
                     is_v2,
                     params.marker.clone(),
                     params.start_after.clone(),
+                    echo(),
                 );
                 let xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
@@ -2520,6 +2744,7 @@ pub async fn list_objects(
                             etag: obj.etag,
                             size: obj.size,
                             storage_class: obj.storage_class,
+                            owner: None,
                         });
                     }
                 }
@@ -2541,6 +2766,7 @@ pub async fn list_objects(
                         etag: o.etag,
                         size: o.size,
                         storage_class: o.storage_class,
+                        owner: None,
                     })
                     .collect();
                 (contents, Vec::new())
@@ -2554,6 +2780,7 @@ pub async fn list_objects(
                 marker: None,
                 next_marker: None,
                 start_after: None,
+                continuation_token: None,
                 encoding_type: params.encoding_type.clone(),
                 max_keys,
                 is_truncated: list_result.is_truncated,
@@ -2562,11 +2789,12 @@ pub async fn list_objects(
                 common_prefixes,
                 contents,
             };
-            apply_listing_version(
+            apply_listing_echo(
                 &mut result,
                 is_v2,
                 params.marker.clone(),
                 params.start_after.clone(),
+                echo(),
             );
 
             let xml = format!(
@@ -2593,6 +2821,7 @@ pub async fn list_objects(
                         marker: None,
                         next_marker: None,
                         start_after: None,
+                        continuation_token: None,
                         encoding_type: params.encoding_type.clone(),
                         max_keys,
                         is_truncated: false,
@@ -2601,11 +2830,12 @@ pub async fn list_objects(
                         common_prefixes: vec![],
                         contents: vec![],
                     };
-                    apply_listing_version(
+                    apply_listing_echo(
                         &mut result,
                         is_v2,
                         params.marker.clone(),
                         params.start_after.clone(),
+                        echo(),
                     );
                     let xml = format!(
                         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
@@ -3491,6 +3721,19 @@ impl DeleteCondition {
     }
 }
 
+/// 416 InvalidRange, with the object's size in `Content-Range` as S3 sends.
+fn range_not_satisfiable(size: u64) -> Response {
+    let mut resp = S3Error::xml_response(
+        "InvalidRange",
+        "The requested range is not satisfiable",
+        StatusCode::RANGE_NOT_SATISFIABLE,
+    );
+    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes */{size}")) {
+        resp.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    resp
+}
+
 /// What a PUT's `If-Match` / `If-None-Match` ask: "*" or an ETag each.
 #[derive(Default)]
 struct PutCondition {
@@ -3815,6 +4058,33 @@ pub async fn put_object(
         }
         let source_bucket = parts[0];
         let source_key = parts[1];
+
+        // A copy onto itself must change something, or it is refused, as S3
+        // refuses it: metadata or tags replaced, encryption or storage class.
+        let replaces = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("REPLACE"))
+        };
+        if source_bucket == bucket
+            && source_key == key
+            && copy_source_version.is_none()
+            && !replaces("x-amz-metadata-directive")
+            && !replaces("x-amz-tagging-directive")
+            && !headers.contains_key("x-amz-storage-class")
+            && !headers
+                .keys()
+                .any(|k| k.as_str().starts_with("x-amz-server-side-encryption"))
+        {
+            return S3Error::xml_response(
+                "InvalidRequest",
+                "This copy request is illegal because it is trying to copy an object to itself \
+                 without changing the object's metadata, storage class, website redirect \
+                 location or encryption attributes.",
+                StatusCode::BAD_REQUEST,
+            );
+        }
 
         // CopyObject reads the source as well as writing the destination.
         // The middleware authorized the destination; the source is a
@@ -4645,6 +4915,106 @@ pub async fn get_object(
     get_object_version(state, bucket, key, None, headers).await
 }
 
+/// GET of one part of a multipart object (`?partNumber=`): the part's bytes,
+/// as a range of the object (206), with `x-amz-mp-parts-count`.
+async fn get_object_part(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    part_number: u32,
+    mut headers: HeaderMap,
+) -> Response {
+    let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let object = match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref()).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    let (start, end, count) = match part_bounds(&object, part_number) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    headers.remove(header::RANGE);
+    if end >= start
+        && let Ok(v) = header::HeaderValue::from_str(&format!("bytes={start}-{end}"))
+    {
+        headers.insert(header::RANGE, v);
+    }
+    let mut resp = get_object_version(state, bucket, key, version_id, headers).await;
+    if resp.status().is_success() && is_multipart(&object) {
+        resp.headers_mut()
+            .insert("x-amz-mp-parts-count", header::HeaderValue::from(count));
+    }
+    resp
+}
+
+/// Whether `object` was made by CompleteMultipartUpload (its ETag ends in
+/// "-<parts>"), so that it has parts to count, even just one.
+fn is_multipart(object: &ObjectMeta) -> bool {
+    object
+        .etag
+        .trim_matches('"')
+        .rsplit_once('-')
+        .is_some_and(|(_, c)| c.parse::<u32>().is_ok())
+}
+
+/// Where part `n` (1-based) of `object` lies in it, inclusive, and how many
+/// parts it has. A multipart object's parts are its runs of stripes written
+/// under one part's id; its ETag ends in "-<parts>". Anything else is one
+/// part, the whole object.
+#[allow(clippy::result_large_err)] // Err is a fully-formed Response built once per request.
+fn part_bounds(object: &ObjectMeta, n: u32) -> Result<(u64, u64, u32), Response> {
+    let invalid = || {
+        S3Error::xml_response(
+            "InvalidPart",
+            "The requested partnumber is not satisfiable",
+            StatusCode::BAD_REQUEST,
+        )
+    };
+    let multipart = object
+        .etag
+        .trim_matches('"')
+        .rsplit_once('-')
+        .and_then(|(_, c)| c.parse::<u32>().ok());
+    let Some(count) = multipart else {
+        return if n == 1 {
+            Ok((0, object.size.saturating_sub(1), 1))
+        } else {
+            Err(invalid())
+        };
+    };
+    let mut parts: Vec<(u64, u64)> = Vec::new(); // (start, len)
+    let mut offset = 0u64;
+    let mut last_id: Option<&[u8]> = None;
+    for stripe in &object.stripes {
+        if last_id == Some(stripe.object_id.as_slice()) {
+            if let Some(p) = parts.last_mut() {
+                p.1 += stripe.data_size;
+            }
+        } else {
+            parts.push((offset, stripe.data_size));
+            last_id = Some(stripe.object_id.as_slice());
+        }
+        offset += stripe.data_size;
+    }
+    if parts.len() != count as usize {
+        // Parts that can't be told apart (one source copied in twice):
+        // say so rather than serve the wrong bytes.
+        return Err(S3Error::xml_response(
+            "NotImplemented",
+            "This object's part boundaries are not recorded",
+            StatusCode::NOT_IMPLEMENTED,
+        ));
+    }
+    let (start, len) = *parts
+        .get((n as usize).wrapping_sub(1))
+        .ok_or_else(invalid)?;
+    Ok((start, start + len.saturating_sub(1), count))
+}
+
 /// GET one version of an object (`?versionId=`), or the current one.
 async fn get_object_version(
     state: Arc<AppState>,
@@ -4780,11 +5150,7 @@ async fn get_object_version(
         // `parse_range_header` already says; answer it the way the ranged path
         // below would rather than returning a body the client did not ask for.
         if headers.contains_key(header::RANGE) {
-            return Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header("Content-Range", "bytes */0")
-                .body(Body::empty())
-                .unwrap();
+            return range_not_satisfiable(0);
         }
         builder = add_metadata_headers(builder, &object.user_metadata);
         builder = add_tagging_count(builder, &object.tags);
@@ -4900,11 +5266,7 @@ async fn get_object_version(
             Some(range) => Some(range),
             None => {
                 // Invalid range — return 416 without fetching any stripes
-                return Response::builder()
-                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                    .header("Content-Range", format!("bytes */{total_size}"))
-                    .body(Body::empty())
-                    .unwrap();
+                return range_not_satisfiable(total_size);
             }
         },
         None => None,
@@ -5663,10 +6025,25 @@ pub async fn head_object(
             resp
         }
         Ok(obj) => {
+            // One part: its length, and how many parts there are.
+            let (length, status, parts) = match params.part_number {
+                None => (obj.size, StatusCode::OK, None),
+                Some(n) => match part_bounds(&obj, n) {
+                    Ok((start, end, count)) => (
+                        (end + 1).saturating_sub(start),
+                        StatusCode::PARTIAL_CONTENT,
+                        is_multipart(&obj).then_some(count),
+                    ),
+                    Err(mut resp) => {
+                        *resp.body_mut() = Body::empty();
+                        return resp;
+                    }
+                },
+            };
             let mut builder = with_version_id(Response::builder(), &obj)
-                .status(StatusCode::OK)
+                .status(status)
                 .header(header::CONTENT_TYPE, &obj.content_type)
-                .header(header::CONTENT_LENGTH, obj.size.to_string())
+                .header(header::CONTENT_LENGTH, length.to_string())
                 .header("ETag", &obj.etag)
                 .header(
                     header::LAST_MODIFIED,
@@ -5703,7 +6080,10 @@ pub async fn head_object(
             // Add user metadata headers
             let builder = add_metadata_headers(builder, &obj.user_metadata);
             let builder = add_tagging_count(builder, &obj.tags);
-            let builder = add_checksum_header(builder, &headers, &obj);
+            let mut builder = add_checksum_header(builder, &headers, &obj);
+            if let Some(count) = parts {
+                builder = builder.header("x-amz-mp-parts-count", count);
+            }
 
             builder.body(Body::empty()).unwrap()
         }
@@ -5719,6 +6099,8 @@ pub async fn head_object(
 pub struct HeadObjectParams {
     #[serde(rename = "versionId")]
     version_id: Option<String>,
+    #[serde(rename = "partNumber")]
+    part_number: Option<u32>,
 }
 
 /// The headers that describe a stored object beyond its content:
@@ -8178,6 +8560,8 @@ async fn complete_multipart_upload_internal(
         })
         .collect();
 
+    let part_etags: Vec<String> = parts.iter().map(|p| p.etag.clone()).collect();
+
     // Complete the multipart upload via metadata service
     match meta_client
         .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
@@ -8348,11 +8732,21 @@ async fn complete_multipart_upload_internal(
         Err(e) => {
             error!("Failed to complete multipart upload: {}", e);
             if e.code() == tonic::Code::NotFound {
+                // Completed already, by this request sent again (a client
+                // retrying after a lost response): the object these parts
+                // make is the current one. Answer as the first time.
+                if let Some(resp) = already_completed(&state, &bucket, &key, &part_etags).await {
+                    return resp;
+                }
                 S3Error::xml_response(
                     "NoSuchUpload",
                     "The specified multipart upload does not exist",
                     StatusCode::NOT_FOUND,
                 )
+            } else if e.code() == tonic::Code::InvalidArgument
+                && e.message().starts_with("EntityTooSmall")
+            {
+                S3Error::xml_response("EntityTooSmall", e.message(), StatusCode::BAD_REQUEST)
             } else if e.code() == tonic::Code::InvalidArgument {
                 S3Error::xml_response("InvalidPart", e.message(), StatusCode::BAD_REQUEST)
             } else {
@@ -8366,6 +8760,58 @@ async fn complete_multipart_upload_internal(
     }
 }
 
+/// The ETag S3 gives an object made of parts with these ETags: the MD5 of
+/// their MD5s, then "-" and how many.
+fn multipart_etag(part_etags: &[String]) -> Option<String> {
+    let mut md5s = Vec::with_capacity(part_etags.len() * 16);
+    for etag in part_etags {
+        md5s.extend(hex::decode(etag.trim_matches('"')).ok()?);
+    }
+    Some(format!(
+        "\"{}-{}\"",
+        crate::digest::md5_hex(&md5s),
+        part_etags.len()
+    ))
+}
+
+/// The CompleteMultipartUpload answer for an upload completed before with
+/// these parts, if the key's current object is what they made.
+async fn already_completed(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    part_etags: &[String],
+) -> Option<Response> {
+    let want = multipart_etag(part_etags)?;
+    let nodes = get_placement_nodes_for_object(state, bucket, key)
+        .await
+        .ok()?;
+    let current = get_object_meta_from_any(&state.osd_pool, &nodes, bucket, key)
+        .await
+        .ok()??;
+    if current.is_delete_marker || current.etag.trim_matches('"') != want.trim_matches('"') {
+        return None;
+    }
+    let result = CompleteMultipartUploadResult {
+        location: format!("/{bucket}/{key}"),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        etag: current.etag.clone(),
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        to_xml(&result).unwrap_or_default()
+    );
+    Some(
+        with_version_id(Response::builder(), &current)
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .header("ETag", &current.etag)
+            .body(Body::from(xml))
+            .unwrap(),
+    )
+}
+
 /// GET /{bucket}/{key}?uploadId=X - List parts
 pub async fn get_object_with_params(
     State(state): State<Arc<AppState>>,
@@ -8377,7 +8823,7 @@ pub async fn get_object_with_params(
     // If key is empty (trailing slash on bucket), treat as list_objects
     if key.is_empty() {
         let list_params = ListObjectsParams {
-            max_keys: params.max_parts,
+            max_keys: params.max_parts.map(|m| m.to_string()),
             ..Default::default()
         };
         return list_objects(State(state), Path(bucket), Query(list_params), auth).await;
@@ -8422,6 +8868,9 @@ pub async fn get_object_with_params(
 
     // Otherwise, it's a regular GET object
     let _ = auth;
+    if let Some(n) = params.part_number {
+        return get_object_part(state, bucket, key, params.version_id, n, headers).await;
+    }
     get_object_version(state, bucket, key, params.version_id, headers).await
 }
 
@@ -9927,6 +10376,8 @@ struct ListVersionsResult {
     max_keys: u32,
     #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
     delimiter: Option<String>,
+    #[serde(rename = "EncodingType", skip_serializing_if = "Option::is_none")]
+    encoding_type: Option<String>,
     #[serde(rename = "IsTruncated")]
     is_truncated: bool,
     /// Versions and delete markers in listing order, as S3 interleaves
@@ -9980,6 +10431,8 @@ struct VersionListing {
     key_marker: String,
     version_id_marker: String,
     max_keys: u32,
+    /// ?encoding-type=url: keys and prefixes percent-encoded in the answer.
+    url_encoded: bool,
 }
 
 /// One OSD's version listing, read a page of whole keys at a time.
@@ -10212,7 +10665,7 @@ async fn list_object_versions_internal(
         _ => (None, None),
     };
 
-    let result = ListVersionsResult {
+    let mut result = ListVersionsResult {
         name: bucket,
         prefix: req.prefix,
         key_marker: req.key_marker,
@@ -10221,10 +10674,31 @@ async fn list_object_versions_internal(
         next_version_id_marker,
         max_keys: req.max_keys,
         delimiter: req.delimiter,
+        encoding_type: req.url_encoded.then(|| "url".to_string()),
         is_truncated,
         entries,
         common_prefixes,
     };
+    if req.url_encoded {
+        let enc = |s: &mut String| *s = s3_url_encode(s);
+        enc(&mut result.prefix);
+        enc(&mut result.key_marker);
+        if let Some(d) = &mut result.delimiter {
+            enc(d);
+        }
+        if let Some(k) = &mut result.next_key_marker {
+            enc(k);
+        }
+        for e in &mut result.entries {
+            match e {
+                VersionEntryXml::Version(v) => enc(&mut v.key),
+                VersionEntryXml::DeleteMarker(m) => enc(&mut m.key),
+            }
+        }
+        for p in &mut result.common_prefixes {
+            enc(&mut p.prefix);
+        }
+    }
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
         to_xml(&result).unwrap_or_default()
@@ -11407,6 +11881,7 @@ mod s3_tests {
             marker: None,
             next_marker: None,
             start_after: None,
+            continuation_token: None,
             encoding_type: None,
             max_keys: 1000,
             key_count: Some(1),
@@ -11419,6 +11894,7 @@ mod s3_tests {
                 etag: "\"x\"".to_string(),
                 size: 1,
                 storage_class: "STANDARD".to_string(),
+                owner: None,
             }],
         };
         let xml = to_xml(&result).expect("serialize");
@@ -11565,6 +12041,7 @@ mod list_uploads_tests {
             marker: None,
             next_marker: None,
             start_after: None,
+            continuation_token: None,
             encoding_type: None,
             max_keys: 100,
             is_truncated,
@@ -11579,6 +12056,7 @@ mod list_uploads_tests {
                     etag: "\"e\"".into(),
                     size: 1,
                     storage_class: "STANDARD".into(),
+                    owner: None,
                 })
                 .collect(),
         }
