@@ -2785,6 +2785,19 @@ pub async fn create_bucket(
     if params.cors.is_some() {
         return crate::cors::put_bucket(&state, &bucket, &headers, &body).await;
     }
+    // Ownership other than BucketOwnerEnforced can't be honoured (ACLs are
+    // off): refused, as PutBucketOwnershipControls refuses it, rather than
+    // a bucket created that quietly behaves otherwise.
+    if headers
+        .get("x-amz-object-ownership")
+        .is_some_and(|v| v.as_bytes() != b"BucketOwnerEnforced")
+    {
+        return S3Error::xml_response(
+            "InvalidRequest",
+            "Only BucketOwnerEnforced object ownership is supported: ACLs are disabled",
+            StatusCode::BAD_REQUEST,
+        );
+    }
     if let Some(refused) = acl_header_refusal(&headers) {
         return refused;
     }

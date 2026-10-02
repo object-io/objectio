@@ -127,7 +127,10 @@ fn the_content_coding_under_aws_chunked_is_kept() {
         "PUT",
         "/enc/gz",
         &chunked(b"compressed"),
-        &[("Content-Encoding", "gzip, aws-chunked")],
+        &[
+            ("Content-Encoding", "gzip, aws-chunked"),
+            ("x-amz-decoded-content-length", "10"),
+        ],
     )
     .expect(200);
     let r = c.request("GET", "/enc/gz", &[]);
@@ -138,12 +141,44 @@ fn the_content_coding_under_aws_chunked_is_kept() {
         "PUT",
         "/enc/plain",
         &chunked(b"plain"),
-        &[("Content-Encoding", "aws-chunked")],
+        &[
+            ("Content-Encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", "5"),
+        ],
     )
     .expect(200);
     let r = c.request("GET", "/enc/plain", &[]);
     assert_eq!(r.bytes, b"plain");
     assert_eq!(r.header("content-encoding"), None);
+}
+
+/// `aws-chunked` named over a plain body (no streaming hash, no decoded
+/// length) is no framing: the body is stored as sent, under its other
+/// codings. A strict decoder refused it as a broken chunked body. A
+/// complete framed body with only the header is still decoded.
+#[test]
+fn aws_chunked_named_over_a_plain_body_is_not_decoded() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    bucket(&c, "plainenc");
+    c.request_with_headers(
+        "PUT",
+        "/plainenc/o",
+        b"gzipped bytes",
+        &[("Content-Encoding", "gzip, aws-chunked")],
+    )
+    .expect(200);
+    let r = c.request("GET", "/plainenc/o", &[]);
+    assert_eq!(r.bytes, b"gzipped bytes");
+    assert_eq!(r.header("content-encoding").as_deref(), Some("gzip"));
+
+    c.request_with_headers(
+        "PUT",
+        "/plainenc/framed",
+        &chunked(b"framed"),
+        &[("Content-Encoding", "aws-chunked")],
+    )
+    .expect(200);
+    assert_eq!(c.request("GET", "/plainenc/framed", &[]).bytes, b"framed");
 }
 
 /// An `aws-chunked` body cut short, or of the wrong length, is refused. It
@@ -154,7 +189,15 @@ fn a_broken_aws_chunked_body_is_refused() {
     bucket(&c, "cut");
     let whole = chunked(b"hello world");
     let cut = &whole[..whole.len() - 24];
-    let r = c.request_with_headers("PUT", "/cut/a", cut, &[("Content-Encoding", "aws-chunked")]);
+    let r = c.request_with_headers(
+        "PUT",
+        "/cut/a",
+        cut,
+        &[
+            ("Content-Encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", "11"),
+        ],
+    );
     assert_eq!(
         (r.status, code(&r).as_str()),
         (400, "IncompleteBody"),
@@ -252,4 +295,33 @@ fn bucket_tags_are_set_read_and_removed() {
     c.request("DELETE", "/tagged?tagging", &[]).expect(204);
     c.request("GET", "/tagged?tagging", &[]).expect(404);
     c.request("HEAD", "/tagged", &[]).expect(200);
+}
+
+/// Object ownership other than `BucketOwnerEnforced` is refused at
+/// `CreateBucket`, as `PutBucketOwnershipControls` refuses it: the bucket
+/// used to be created and quietly behave as `BucketOwnerEnforced`.
+#[test]
+fn a_bucket_is_not_created_with_ownership_it_cannot_have() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    for ownership in ["BucketOwnerPreferred", "ObjectWriter"] {
+        let r = c.request_with_headers(
+            "PUT",
+            "/owned",
+            &[],
+            &[("x-amz-object-ownership", ownership)],
+        );
+        assert_eq!(
+            (r.status, code(&r).as_str()),
+            (400, "InvalidRequest"),
+            "{ownership}"
+        );
+        c.request("HEAD", "/owned", &[]).expect(404);
+    }
+    c.request_with_headers(
+        "PUT",
+        "/owned",
+        &[],
+        &[("x-amz-object-ownership", "BucketOwnerEnforced")],
+    )
+    .expect(200);
 }

@@ -19,24 +19,45 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use tracing::{debug, warn};
 
-/// Returns true if the request uses S3 chunked transfer encoding.
+/// Whether the request says its body is in AWS-chunked framing: a
+/// streaming payload hash (`STREAMING-*`), or `aws-chunked` together with
+/// the decoded length an SDK sends with it. `aws-chunked` in
+/// Content-Encoding alone is weaker: clients name it over plain bodies too,
+/// so such a body is decoded only if it parses as complete framing.
 fn is_s3_chunked(request: &Request<Body>) -> bool {
-    // Check Content-Encoding header
-    if request
-        .headers()
-        .get("content-encoding")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("aws-chunked"))
-    {
-        return true;
-    }
-
-    // Check x-amz-content-sha256 for streaming signature variants
-    request
-        .headers()
+    let headers = request.headers();
+    let streaming = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("STREAMING-"))
+        .is_some_and(|v| v.starts_with("STREAMING-"));
+    streaming
+        || (names_aws_chunked(headers) && headers.contains_key("x-amz-decoded-content-length"))
+}
+
+fn names_aws_chunked(headers: &http::HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|c| c.trim().eq_ignore_ascii_case("aws-chunked"))
+        })
+}
+
+/// Content-Encoding with `aws-chunked` taken out (and removed if that was
+/// all), so the object keeps only its own codings.
+fn strip_aws_chunked(headers: &mut http::HeaderMap) {
+    let remaining = headers
+        .get("content-encoding")
+        .map(|v| without_aws_chunked(&crate::auth_middleware::header_text(v)));
+    match remaining.and_then(|r| http::HeaderValue::from_str(&r).ok()) {
+        Some(v) if !v.is_empty() => {
+            headers.insert("content-encoding", v);
+        }
+        _ => {
+            headers.remove("content-encoding");
+        }
+    }
 }
 
 /// An AWS-chunked body, decoded.
@@ -150,7 +171,8 @@ fn incomplete_body(message: &str) -> Response {
 
 /// Middleware that decodes S3 chunked transfer encoding before handlers see the body.
 pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Response {
-    if !is_s3_chunked(&request) {
+    let signalled = is_s3_chunked(&request);
+    if !signalled && !names_aws_chunked(request.headers()) {
         return next.run(request).await;
     }
 
@@ -192,9 +214,18 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
             }
             payload
         }
-        Err(e) => {
+        // Framing the request says it has (a streaming hash, a decoded
+        // length), broken: refused.
+        Err(e) if signalled => {
             warn!("Failed to decode s3-chunked body: {}", e);
             return incomplete_body(&format!("Malformed aws-chunked body: {e}"));
+        }
+        // Only named in Content-Encoding, and not complete framing: a
+        // plain body, stored as sent. (A body that does parse as complete
+        // framing, terminal chunk and all, is framed.)
+        Err(_) => {
+            strip_aws_chunked(&mut parts.headers);
+            return next.run(Request::from_parts(parts, Body::from(raw))).await;
         }
     };
 
@@ -215,18 +246,7 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
     // transfer framing: any other coding (`gzip, aws-chunked`) belongs to
     // the object and is kept.
     parts.headers.insert("content-length", decoded.len().into());
-    let remaining = parts
-        .headers
-        .get("content-encoding")
-        .map(|v| without_aws_chunked(&crate::auth_middleware::header_text(v)));
-    match remaining.and_then(|r| http::HeaderValue::from_str(&r).ok()) {
-        Some(v) if !v.is_empty() => {
-            parts.headers.insert("content-encoding", v);
-        }
-        _ => {
-            parts.headers.remove("content-encoding");
-        }
-    }
+    strip_aws_chunked(&mut parts.headers);
     // Remove the streaming hash header so downstream doesn't expect chunked format
     if parts
         .headers
