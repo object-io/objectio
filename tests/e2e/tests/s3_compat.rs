@@ -325,3 +325,84 @@ fn a_bucket_is_not_created_with_ownership_it_cannot_have() {
     )
     .expect(200);
 }
+
+/// `x-amz-expiration` on PUT, HEAD and GET of an object a lifecycle rule
+/// will expire: the rule's id and a UTC midnight. None for one no rule
+/// covers.
+#[test]
+fn lifecycle_expiry_is_announced_on_the_object() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    bucket(&c, "exp");
+    c.request(
+        "PUT",
+        "/exp?lifecycle",
+        b"<LifecycleConfiguration>\
+          <Rule><ID>rule1</ID><Filter><Prefix>days1/</Prefix></Filter><Status>Enabled</Status>\
+          <Expiration><Days>1</Days></Expiration></Rule>\
+          <Rule><ID>tagged</ID><Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>\
+          <Status>Enabled</Status><Expiration><Days>3</Days></Expiration></Rule>\
+          </LifecycleConfiguration>",
+    )
+    .expect(200);
+    let announced = |r: &objectio_e2e::Response, rule: &str| {
+        let h = r
+            .header("x-amz-expiration")
+            .unwrap_or_else(|| panic!("no x-amz-expiration: {:?}", r.headers));
+        assert!(h.starts_with("expiry-date=\""), "{h}");
+        assert!(h.contains(" 00:00:00 GMT\""), "not a midnight: {h}");
+        assert!(h.ends_with(&format!("rule-id=\"{rule}\"")), "{h}");
+    };
+    let put = c.request("PUT", "/exp/days1/foo", b"bar");
+    put.expect(200);
+    announced(&put, "rule1");
+    announced(&c.request("HEAD", "/exp/days1/foo", &[]), "rule1");
+    announced(&c.request("GET", "/exp/days1/foo", &[]), "rule1");
+
+    let other = c.request("PUT", "/exp/other", b"bar");
+    other.expect(200);
+    assert_eq!(other.header("x-amz-expiration"), None);
+    // Tagged later: the tag rule now covers it.
+    c.request(
+        "PUT",
+        "/exp/other?tagging",
+        b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>",
+    )
+    .expect(200);
+    announced(&c.request("HEAD", "/exp/other", &[]), "tagged");
+
+    // No rules: nothing announced.
+    c.request("DELETE", "/exp?lifecycle", &[]).expect(204);
+    assert_eq!(
+        c.request("HEAD", "/exp/days1/foo", &[])
+            .header("x-amz-expiration"),
+        None
+    );
+}
+
+/// `ListObjectVersions` names each version's owner (the bucket owner's),
+/// as S3 does.
+#[test]
+fn listed_versions_name_their_owner() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    bucket(&c, "ver");
+    c.request(
+        "PUT",
+        "/ver?versioning",
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+    )
+    .expect(200);
+    c.request("PUT", "/ver/k", b"one").expect(200);
+    c.request("DELETE", "/ver/k", &[]).expect(204);
+    let xml = c.request("GET", "/ver?versions", &[]).text();
+    for (open, close) in [
+        ("<Version>", "</Version>"),
+        ("<DeleteMarker>", "</DeleteMarker>"),
+    ] {
+        let entry = xml
+            .split(open)
+            .nth(1)
+            .and_then(|rest| rest.split(close).next())
+            .unwrap_or_else(|| panic!("no {open}: {xml}"));
+        assert!(entry.contains("<Owner><ID>"), "{open} has no owner: {xml}");
+    }
+}

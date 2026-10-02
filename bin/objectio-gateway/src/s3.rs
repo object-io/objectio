@@ -1954,7 +1954,7 @@ pub struct ListBucketsParams {
     prefix: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Owner {
     #[serde(rename = "ID")]
     pub id: String,
@@ -5351,6 +5351,13 @@ pub async fn put_object(
 
         // Listed as well: this path used to write only the ObjectMeta, so a
         // replicated object never appeared in ListObjects.
+        // What lifecycle filters on, for x-amz-expiration once it's stored.
+        let expiration_of = ObjectMeta {
+            key: object_meta.key.clone(),
+            size: object_meta.size,
+            tags: object_meta.tags.clone(),
+            ..ObjectMeta::default()
+        };
         let sent = pending.disarm();
         if let Err(resp) = commit_put(
             &state,
@@ -5378,6 +5385,13 @@ pub async fn put_object(
             bucket, key, original_size, num_stripes, total_success,
         );
 
+        let expiration = crate::lifecycle::expiration_header(
+            &state,
+            &bucket,
+            &expiration_of,
+            crate::lifecycle::now_ms(),
+        )
+        .await;
         let mut resp = Response::builder()
             .status(StatusCode::OK)
             .header("ETag", etag);
@@ -5386,6 +5400,9 @@ pub async fn put_object(
         }
         if !version_id.is_empty() {
             resp = resp.header("x-amz-version-id", &version_id);
+        }
+        if let Some(v) = expiration {
+            resp = resp.header("x-amz-expiration", v);
         }
         if let Some(v) = sse_response_header {
             resp = resp.header("x-amz-server-side-encryption", v);
@@ -5731,6 +5748,13 @@ pub async fn put_object(
         part_checksums: Vec::new(),
     };
 
+    // What lifecycle filters on, for x-amz-expiration once it's stored.
+    let expiration_of = ObjectMeta {
+        key: object_meta.key.clone(),
+        size: object_meta.size,
+        tags: object_meta.tags.clone(),
+        ..ObjectMeta::default()
+    };
     let sent = pending.disarm();
     if let Err(resp) = commit_put(
         &state,
@@ -5766,6 +5790,13 @@ pub async fn put_object(
         crate::gateway_metrics::record_inline(original_size);
     }
 
+    let expiration = crate::lifecycle::expiration_header(
+        &state,
+        &bucket,
+        &expiration_of,
+        crate::lifecycle::now_ms(),
+    )
+    .await;
     let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header("ETag", etag);
@@ -5774,6 +5805,9 @@ pub async fn put_object(
     }
     if !version_id.is_empty() {
         resp = resp.header("x-amz-version-id", &version_id);
+    }
+    if let Some(v) = expiration {
+        resp = resp.header("x-amz-expiration", v);
     }
     if let Some(v) = sse_response_header {
         resp = resp.header("x-amz-server-side-encryption", v);
@@ -6055,40 +6089,45 @@ pub(crate) async fn get_object_version(
     version_id: Option<String>,
     headers: HeaderMap,
 ) -> Response {
-    let mut cached_packs = Vec::new();
-    let resp = get_object_version_once(
+    let mut notes = ReadNotes::default();
+    let mut resp = get_object_version_once(
         state.clone(),
         bucket.clone(),
         key.clone(),
         version_id.clone(),
         headers.clone(),
         false,
-        &mut cached_packs,
+        &mut notes,
     )
     .await;
     // A packed object read through a cached pack record that failed: the
     // pack may have moved (repair, drain). Once more, asking meta.
-    if resp.status().is_server_error() && !cached_packs.is_empty() {
+    if resp.status().is_server_error() && !notes.cached_packs.is_empty() {
         state
             .pack_cache
-            .forget(cached_packs.iter().map(Vec::as_slice));
-        return get_object_version_once(
-            state,
-            bucket,
-            key,
-            version_id,
-            headers,
-            true,
-            &mut Vec::new(),
-        )
-        .await;
+            .forget(notes.cached_packs.iter().map(Vec::as_slice));
+        resp = get_object_version_once(state, bucket, key, version_id, headers, true, &mut notes)
+            .await;
+    }
+    if resp.status().is_success()
+        && let Some(v) = notes.expiration
+    {
+        resp.headers_mut().insert("x-amz-expiration", v);
     }
     resp
 }
 
+/// What one attempt at a read learned, for [`get_object_version`].
+#[derive(Default)]
+struct ReadNotes {
+    /// Packs resolved from the cache.
+    cached_packs: Vec<Vec<u8>>,
+    /// `x-amz-expiration` for the object read.
+    expiration: Option<header::HeaderValue>,
+}
+
 /// One attempt at [`get_object_version`]. `fresh_packs` resolves packs
-/// from meta, not the cache; `cached_packs` gets the packs that were
-/// resolved from the cache.
+/// from meta, not the cache; `notes` gets what the caller needs to know.
 async fn get_object_version_once(
     state: Arc<AppState>,
     bucket: String,
@@ -6096,7 +6135,7 @@ async fn get_object_version_once(
     version_id: Option<String>,
     headers: HeaderMap,
     fresh_packs: bool,
-    cached_packs: &mut Vec<Vec<u8>>,
+    notes: &mut ReadNotes,
 ) -> Response {
     debug!("GET object: {}/{}", bucket, key);
     if let Some(refused) = sse_headers_on_read(&headers) {
@@ -6205,7 +6244,7 @@ async fn get_object_version_once(
     // shards are comes from the pack's record.
     match crate::packs::resolve(&state, &mut object, fresh_packs).await {
         Ok(true) => {
-            cached_packs.extend(
+            notes.cached_packs.extend(
                 crate::packs::packs_of(&object)
                     .into_iter()
                     .map(<[u8]>::to_vec),
@@ -6223,6 +6262,12 @@ async fn get_object_version_once(
     }
     if let Some(resp) = read_preconditions(&headers, &object) {
         return resp;
+    }
+    // The current version: when lifecycle will expire it.
+    if version_id.is_none() {
+        notes.expiration =
+            crate::lifecycle::expiration_header(&state, &bucket, &object, version_time_ms(&object))
+                .await;
     }
     phases.mark("object_meta");
 
@@ -7193,6 +7238,17 @@ pub async fn head_object(
             let mut builder = add_checksum_header(builder, &headers, &obj);
             if let Some(count) = parts {
                 builder = builder.header("x-amz-mp-parts-count", count);
+            }
+            if params.version_id.is_none()
+                && let Some(v) = crate::lifecycle::expiration_header(
+                    &state,
+                    &bucket,
+                    &obj,
+                    version_time_ms(&obj),
+                )
+                .await
+            {
+                builder = builder.header("x-amz-expiration", v);
             }
 
             builder.body(Body::empty()).unwrap()
@@ -11788,6 +11844,8 @@ struct ObjectVersionXml {
     size: u64,
     #[serde(rename = "StorageClass")]
     storage_class: String,
+    #[serde(rename = "Owner", skip_serializing_if = "Option::is_none")]
+    owner: Option<Owner>,
 }
 
 #[derive(Serialize)]
@@ -11800,6 +11858,8 @@ struct DeleteMarkerXml {
     is_latest: bool,
     #[serde(rename = "LastModified")]
     last_modified: String,
+    #[serde(rename = "Owner", skip_serializing_if = "Option::is_none")]
+    owner: Option<Owner>,
 }
 
 /// What a ListObjectVersions request asks for.
@@ -11988,6 +12048,23 @@ async fn list_object_versions_internal(
         Err(resp) => return resp,
     };
 
+    // Every version is the bucket owner's (BucketOwnerEnforced), and S3
+    // names it on each entry.
+    let owner = state
+        .meta_client
+        .clone()
+        .get_bucket(GetBucketRequest {
+            name: bucket.clone(),
+        })
+        .await
+        .ok()
+        .and_then(|r| r.into_inner().bucket)
+        .map(|b| Owner {
+            id: b.owner.clone(),
+            display_name: b.owner,
+        })
+        .filter(|o| !o.id.is_empty());
+
     // Each key's versions once, newest first; the newest is the latest.
     let mut ordered: Vec<(ObjectMeta, bool)> = Vec::new();
     for (_, mut versions) in found {
@@ -12058,6 +12135,7 @@ async fn list_object_versions_internal(
                 version_id,
                 is_latest,
                 last_modified,
+                owner: owner.clone(),
             })
         } else {
             VersionEntryXml::Version(ObjectVersionXml {
@@ -12072,6 +12150,7 @@ async fn list_object_versions_internal(
                 } else {
                     v.storage_class
                 },
+                owner: owner.clone(),
             })
         });
     }

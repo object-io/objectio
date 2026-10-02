@@ -33,9 +33,9 @@
 //! and renews it as it goes, so two never act on the same key at once, and
 //! another takes over within the lease's time if the scanning one dies.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -571,6 +571,7 @@ pub async fn put_config(state: &AppState, bucket: &str, body: &[u8]) -> Response
             config: Some(ProtoConfig { rules }),
         })
         .await
+        .inspect(|_| state.policy_cache.lifecycle.invalidate(bucket))
     {
         Ok(_) => Response::builder()
             .status(StatusCode::OK)
@@ -624,6 +625,7 @@ pub async fn delete_config(state: &AppState, bucket: &str) -> Response {
             bucket: bucket.to_string(),
         })
         .await
+        .inspect(|_| state.policy_cache.lifecycle.invalidate(bucket))
     {
         Ok(_) => Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -631,6 +633,107 @@ pub async fn delete_config(state: &AppState, bucket: &str) -> Response {
             .unwrap(),
         Err(e) => meta_error(&e),
     }
+}
+
+// ── x-amz-expiration ────────────────────────────────────────────────────
+
+/// Buckets past this many cached rule sets are dropped from the cache.
+const MAX_CACHED_BUCKETS: usize = 10_000;
+
+/// Each bucket's lifecycle rules (`None`: it has none), cached for the
+/// `x-amz-expiration` header so a GET or HEAD doesn't ask meta. This
+/// gateway's own changes invalidate it; others' show within the TTL.
+type CachedRules = (Option<Arc<Vec<ProtoRule>>>, Instant);
+
+pub struct RulesCache {
+    entries: parking_lot::RwLock<HashMap<String, CachedRules>>,
+    ttl: Duration,
+}
+
+impl RulesCache {
+    #[must_use]
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            entries: parking_lot::RwLock::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    pub fn invalidate(&self, bucket: &str) {
+        self.entries.write().remove(bucket);
+    }
+}
+
+/// A bucket's rules, from the cache or meta. `None` when it has none, or
+/// they can't be read now (the header is then left out, never guessed).
+async fn bucket_rules(state: &AppState, bucket: &str) -> Option<Arc<Vec<ProtoRule>>> {
+    let cache = &state.policy_cache.lifecycle;
+    if let Some((rules, at)) = cache.entries.read().get(bucket)
+        && at.elapsed() < cache.ttl
+    {
+        return rules.clone();
+    }
+    let resp = state
+        .meta_client
+        .clone()
+        .get_bucket_lifecycle(GetBucketLifecycleRequest {
+            bucket: bucket.to_string(),
+        })
+        .await
+        .ok()?
+        .into_inner();
+    let rules = resp
+        .config
+        .filter(|c| resp.found && !c.rules.is_empty())
+        .map(|c| Arc::new(c.rules));
+    let mut entries = cache.entries.write();
+    if entries.len() >= MAX_CACHED_BUCKETS {
+        entries.clear();
+    }
+    entries.insert(bucket.to_string(), (rules.clone(), Instant::now()));
+    rules
+}
+
+/// When `object` (a current version, made at `made_ms`) expires under
+/// `rules`, and by which rule: the earliest of the enabled expiration rules
+/// that filter it in. A `Days` rule expires it at the first UTC midnight at
+/// least that many days after it was made, as S3 computes it. (The
+/// worker's test-only day length doesn't change this.)
+fn expiry(rules: &[ProtoRule], object: &ObjectMeta, made_ms: u64) -> Option<(u64, String)> {
+    const DAY: u64 = 86_400;
+    rules
+        .iter()
+        .filter(|r| r.enabled && matches(r, object))
+        .filter_map(|r| {
+            let at = if r.expiration_days > 0 {
+                let after = made_ms / 1000 + u64::from(r.expiration_days) * DAY;
+                after.div_ceil(DAY) * DAY
+            } else if r.expiration_date > 0 {
+                r.expiration_date
+            } else {
+                return None;
+            };
+            Some((at, r.id.clone()))
+        })
+        .min_by_key(|(at, _)| *at)
+}
+
+/// The `x-amz-expiration` header for `object` in `bucket`, if a lifecycle
+/// rule will expire it: `expiry-date="<HTTP date>", rule-id="<id>"`.
+pub async fn expiration_header(
+    state: &AppState,
+    bucket: &str,
+    object: &ObjectMeta,
+    made_ms: u64,
+) -> Option<axum::http::HeaderValue> {
+    if object.is_delete_marker {
+        return None;
+    }
+    let rules = bucket_rules(state, bucket).await?;
+    let (at, rule) = expiry(&rules, object, made_ms)?;
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(i64::try_from(at).ok()?, 0)?
+        .format("%a, %d %b %Y %H:%M:%S GMT");
+    axum::http::HeaderValue::from_str(&format!("expiry-date=\"{date}\", rule-id=\"{rule}\"")).ok()
 }
 
 // ── Matching ────────────────────────────────────────────────────────────
@@ -787,7 +890,7 @@ async fn lease(state: &AppState, holder: &str, timing: Timing) -> bool {
         .is_ok_and(|r| r.into_inner().acquired)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1069,6 +1172,44 @@ mod tests {
             size: 10,
             ..ObjectMeta::default()
         }
+    }
+
+    /// `x-amz-expiration`: the earliest matching rule, a `Days` rule rounded
+    /// up to the next UTC midnight; rules that don't filter it in, or are
+    /// disabled, don't count.
+    #[test]
+    fn an_object_expires_at_the_midnight_after_its_days() {
+        let all = rules(
+            "<LifecycleConfiguration>\
+             <Rule><ID>late</ID><Filter/><Status>Enabled</Status><Expiration><Days>5</Days></Expiration></Rule>\
+             <Rule><ID>logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>\
+             <Rule><ID>off</ID><Filter/><Status>Disabled</Status><Expiration><Days>1</Days></Expiration></Rule>\
+             <Rule><ID>old</ID><Filter/><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>\
+             </LifecycleConfiguration>",
+        );
+        // Made on day 10 at 13:00.
+        let made_ms = 10 * DAY + 13 * 3_600_000;
+        let log = v("logs/a", "", 10, false);
+        assert_eq!(
+            expiry(&all, &log, made_ms),
+            Some((12 * 86_400, "logs".to_string())),
+            "day 11 13:00, rounded up to day 12 00:00"
+        );
+        let other = v("data/a", "", 10, false);
+        assert_eq!(
+            expiry(&all, &other, made_ms),
+            Some((16 * 86_400, "late".to_string()))
+        );
+        // Made exactly at midnight: already on a midnight, not a day later.
+        assert_eq!(
+            expiry(&all, &log, 10 * DAY),
+            Some((11 * 86_400, "logs".to_string()))
+        );
+        let none = rules(
+            "<LifecycleConfiguration><Rule><ID>off</ID><Filter/><Status>Disabled</Status>\
+             <Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        );
+        assert_eq!(expiry(&none, &other, made_ms), None);
     }
 
     #[test]
