@@ -3714,8 +3714,18 @@ impl MetadataService for MetaService {
         };
         let expected_bytes = current.encode_to_vec();
 
-        // Note: The check for whether bucket is empty should be done by
-        // the Gateway using scatter-gather before calling delete_bucket.
+        // Refuse while it holds objects: deleting it orphaned them, their
+        // data still on disk with no bucket to reach it through. The
+        // listing index is the record of current objects; the gateway
+        // checks the OSDs for noncurrent versions before calling this.
+        if let Some(store) = &self.store {
+            let (entries, _, _) = store
+                .list_object_listings(&req.name, "", "", 1)
+                .map_err(|e| Status::unavailable(format!("cannot read the listing: {e}")))?;
+            if !entries.is_empty() {
+                return Err(Status::failed_precondition("bucket is not empty"));
+            }
+        }
 
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
@@ -3801,6 +3811,14 @@ impl MetadataService for MetaService {
         let req = request.into_inner();
         if req.bucket.is_empty() || req.key.is_empty() {
             return Err(Status::invalid_argument("bucket and key required"));
+        }
+        // Never list an object into a bucket that isn't there (deleted
+        // meanwhile, or never created).
+        if !self.buckets.read().contains_key(&req.bucket) {
+            return Err(Status::not_found(format!(
+                "bucket '{}' not found",
+                req.bucket
+            )));
         }
 
         // Build the listing entry. primary_osd_id is optional (the

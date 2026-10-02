@@ -6,9 +6,10 @@ const MAX_SHARD_SIZE: usize = 4 * 1024 * 1024 - 4096; // ~4MB per shard
 
 use crate::osd_pool::{
     Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget,
-    delete_object_meta_from_all, get_object_meta_from_any, get_object_version_meta_from_any,
-    put_object_meta_to_all, read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite,
-    referenced_object_ids, stripe_targets, stripe_targets_of, write_shard_to_osd,
+    delete_object_meta_from_all, delete_version_from_all, get_object_meta_from_any,
+    get_object_version_meta_from_any, put_object_meta_to_all, read_shard_from_osd, reclaim_shards,
+    reclaimable_after_overwrite, referenced_object_ids, stripe_targets, stripe_targets_of,
+    write_shard_to_osd,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{
@@ -1608,24 +1609,79 @@ pub struct CompletePart {
 // ============================================================================
 
 /// Request body for DeleteObjects (XML from client)
-#[derive(Debug, Deserialize)]
-#[serde(rename = "Delete")]
+#[derive(Debug, Default)]
 pub struct DeleteObjectsRequest {
-    #[serde(rename = "Quiet", default)]
-    #[allow(dead_code)]
+    /// Report only the keys that could not be deleted.
     pub quiet: bool,
-    #[serde(rename = "Object", default)]
     pub objects: Vec<DeleteObjectIdentifier>,
 }
 
 /// Object identifier in DeleteObjects request
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 pub struct DeleteObjectIdentifier {
-    #[serde(rename = "Key")]
     pub key: String,
-    #[serde(rename = "VersionId")]
-    #[serde(default)]
     pub version_id: Option<String>,
+}
+
+impl DeleteObjectsRequest {
+    /// Parse the body keeping every key exactly as sent. quick-xml's serde
+    /// deserializer trims text, so a key with leading or trailing spaces
+    /// (" ", "a ") came out as another key: that one was "deleted" and
+    /// reported, and the object asked for stayed.
+    pub fn parse(body: &[u8]) -> Result<Self, String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_reader(body);
+        let mut buf = Vec::new();
+        let mut req = Self::default();
+        let mut path: Vec<Vec<u8>> = Vec::new();
+        let mut text = String::new();
+        let mut current: Option<DeleteObjectIdentifier> = None;
+        loop {
+            match reader
+                .read_event_into(&mut buf)
+                .map_err(|e| e.to_string())?
+            {
+                Event::Start(e) => {
+                    let name = e.local_name().as_ref().to_vec();
+                    if name == b"Object" {
+                        current = Some(DeleteObjectIdentifier::default());
+                    }
+                    path.push(name);
+                    text.clear();
+                }
+                Event::Text(t) => {
+                    text.push_str(&t.unescape().map_err(|e| e.to_string())?);
+                }
+                Event::CData(t) => {
+                    text.push_str(&String::from_utf8_lossy(&t.into_inner()));
+                }
+                Event::End(_) => {
+                    let name = path.pop().unwrap_or_default();
+                    match (name.as_slice(), current.as_mut()) {
+                        (b"Key", Some(o)) => o.key = std::mem::take(&mut text),
+                        (b"VersionId", Some(o)) => {
+                            o.version_id = Some(std::mem::take(&mut text));
+                        }
+                        (b"Object", _) => {
+                            if let Some(o) = current.take() {
+                                req.objects.push(o);
+                            }
+                        }
+                        (b"Quiet", None) => req.quiet = text.trim() == "true",
+                        _ => {}
+                    }
+                    text.clear();
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        if !path.is_empty() {
+            return Err("unclosed element".into());
+        }
+        Ok(req)
+    }
 }
 
 /// Response for DeleteObjects
@@ -1662,6 +1718,10 @@ pub struct DeletedObject {
 pub struct DeleteError {
     #[serde(rename = "Key")]
     pub key: String,
+    /// The version the delete named, as S3 echoes it.
+    #[serde(rename = "VersionId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
     #[serde(rename = "Code")]
     pub code: String,
     #[serde(rename = "Message")]
@@ -2076,6 +2136,20 @@ pub async fn delete_bucket(
         return delete_bucket_encryption_internal(state, bucket).await;
     }
 
+    // Noncurrent versions and delete markers count as contents, as in S3;
+    // they live only on the OSDs. Meta checks current objects itself.
+    match holds_versions(&state, &bucket).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return S3Error::xml_response(
+                "BucketNotEmpty",
+                "The bucket you tried to delete is not empty",
+                StatusCode::CONFLICT,
+            );
+        }
+        Err(resp) => return resp,
+    }
+
     let mut client = state.meta_client.clone();
 
     match client
@@ -2110,6 +2184,51 @@ pub async fn delete_bucket(
             }
         }
     }
+}
+
+/// Whether any OSD holds a version or delete marker in `bucket`. Every
+/// OSD in the listing must answer: one that can't might hold the only one.
+async fn holds_versions(state: &AppState, bucket: &str) -> Result<bool, Response> {
+    use objectio_proto::storage::ListObjectVersionsMetaRequest;
+    let unavailable = |what: String| {
+        warn!("{bucket}: cannot tell whether it is empty: {what}");
+        S3Error::xml_response(
+            "ServiceUnavailable",
+            "Cannot check that the bucket is empty; retry",
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    };
+    let nodes = state
+        .meta_client
+        .clone()
+        .get_listing_nodes(GetListingNodesRequest {
+            bucket: bucket.to_string(),
+            include_all_states: false,
+        })
+        .await
+        .map_err(|e| unavailable(e.to_string()))?
+        .into_inner()
+        .nodes;
+    for node in nodes {
+        let mut client = state
+            .osd_pool
+            .get_or_connect(&node.node_id, &node.address)
+            .await
+            .map_err(|e| unavailable(format!("OSD {}: {e}", node.address)))?;
+        let page = client
+            .list_object_versions_meta(ListObjectVersionsMetaRequest {
+                bucket: bucket.to_string(),
+                max_keys: 1,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| unavailable(format!("OSD {}: {e}", node.address)))?
+            .into_inner();
+        if !page.versions.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Head bucket (HEAD /{bucket})
@@ -2707,12 +2826,13 @@ async fn copy_by_reference(
             ));
         }
     };
-    let versioning_enabled = meta_client
-        .get_bucket_versioning(GetBucketVersioningRequest {
-            bucket: dest_bucket.to_string(),
-        })
-        .await
-        .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
+    let versioning_enabled = match bucket_versioning(&mut meta_client, dest_bucket).await {
+        Ok(v) => v == VersioningState::VersioningEnabled,
+        Err(resp) => {
+            back_out(state, format!("copy to {dest_bucket}/{dest_key}"));
+            return Some(resp);
+        }
+    };
     let version_id = if versioning_enabled {
         new_version_id()
     } else {
@@ -3431,15 +3551,10 @@ pub async fn put_object(
     };
     phases.mark("sse");
 
-    // Check bucket versioning state
-    let versioning_enabled = match meta_client
-        .get_bucket_versioning(GetBucketVersioningRequest {
-            bucket: bucket.clone(),
-        })
-        .await
-    {
-        Ok(resp) => resp.into_inner().state() == VersioningState::VersioningEnabled,
-        Err(_) => false,
+    // Check bucket versioning state: a missing bucket refuses the PUT.
+    let versioning_enabled = match bucket_versioning(&mut meta_client, &bucket).await {
+        Ok(v) => v == VersioningState::VersioningEnabled,
+        Err(resp) => return resp,
     };
     let version_id = if versioning_enabled {
         new_version_id()
@@ -5359,12 +5474,12 @@ async fn object_to_read(
     }
 }
 
-/// DELETE `?versionId=`: remove that version for good. When it was the
-/// current one, the newest remaining version (or delete marker) becomes
-/// current, and the listing follows: the object reappears, or is gone.
+/// DELETE `?versionId=`: remove that version for good. Each OSD replica,
+/// under the key's lock, also makes the newest remaining version current if
+/// this one was; the listing then follows whatever is current.
 ///
-/// Metadata goes first and the version's shards last, so a failure part
-/// way leaks blocks rather than leaving metadata pointing at freed ones.
+/// The version's shards are freed last, and only once every replica has
+/// let go of it: one that hasn't may still have it current.
 async fn delete_version(
     state: &Arc<AppState>,
     nodes: &[objectio_proto::metadata::NodePlacement],
@@ -5372,16 +5487,6 @@ async fn delete_version(
     key: &str,
     vid: &str,
 ) -> Response {
-    use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
-
-    let internal = |what: &str, e: &dyn std::fmt::Display| {
-        error!("{bucket}/{key} version {vid}: {what}: {e}");
-        S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
-    };
     let done = |marker: bool| {
         let mut b = Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -5396,98 +5501,35 @@ async fn delete_version(
         Ok(Some(v)) => v,
         // Deleting what isn't there succeeds, as S3 has it.
         Ok(None) => return done(false),
-        Err(e) => return internal("cannot read it", &e),
-    };
-    let current = match get_object_meta_from_any(pool, nodes, bucket, key).await {
-        Ok(c) => c,
-        Err(e) => return internal("cannot read the current version", &e),
-    };
-    let is_current = current
-        .as_ref()
-        .is_some_and(|c| c.object_id == version.object_id && c.version_id == version.version_id);
-
-    if let Err(e) = delete_object_meta_from_all(pool, nodes, bucket, key, vid).await {
-        return internal("cannot remove its version entry", &e);
-    }
-    if is_current {
-        let mut meta_client = state.meta_client.clone();
-        // The listing leaves out inline data: read the version whole.
-        let next = match newest_version(pool, nodes, bucket, key, &version).await {
-            Ok(Some(listed)) => get_object_version_meta_from_any(
-                pool,
-                nodes,
-                bucket,
-                key,
-                version_label(&listed.version_id),
-            )
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|v| v.ok_or_else(|| "it went while being read".to_string()))
-            .map(Some),
-            other => other,
-        };
-        match next {
-            Ok(Some(next)) => {
-                if let Err(e) = put_object_meta_to_all(
-                    pool,
-                    nodes,
-                    bucket,
-                    key,
-                    next.clone(),
-                    false,
-                    &version.object_id,
-                )
-                .await
-                {
-                    return internal("cannot make the previous version current", &e);
-                }
-                if next.is_delete_marker {
-                    let _ = meta_client
-                        .delete_object(MetaDelReq {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            version_id: String::new(),
-                            forget_home: false,
-                        })
-                        .await;
-                } else if let Err(e) = meta_client
-                    .create_object(objectio_proto::metadata::CreateObjectRequest {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        size: next.size,
-                        content_type: next.content_type.clone(),
-                        etag: next.etag.clone(),
-                        user_metadata: next.user_metadata.clone(),
-                        stripes: next.stripes.clone(),
-                        object_id: next.object_id.clone(),
-                        pg_id: 0,
-                        pool: String::new(),
-                        home_osd_ids: home_of(nodes),
-                    })
-                    .await
-                {
-                    // Readable by key; the repairer puts the listing back.
-                    warn!("{bucket}/{key}: cannot list the version now current: {e}");
-                }
-            }
-            Ok(None) => {
-                if let Err(e) = delete_object_meta_from_all(pool, nodes, bucket, key, "").await {
-                    return internal("cannot remove the current version", &e);
-                }
-                let _ = meta_client
-                    .delete_object(MetaDelReq {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        version_id: String::new(),
-                        forget_home: false,
-                    })
-                    .await;
-            }
-            Err(e) => return internal("cannot read the remaining versions", &e),
+        Err(e) => {
+            error!("{bucket}/{key} version {vid}: cannot read it: {e}");
+            return S3Error::xml_response(
+                "InternalError",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
         }
-    }
+    };
 
-    if !version.stripes.is_empty() {
+    let (ok, of) = delete_version_from_all(pool, nodes, bucket, key, vid).await;
+    if ok == 0 {
+        return S3Error::xml_response(
+            "ServiceUnavailable",
+            "No replica of the object's metadata could be reached; retry",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    let current = sync_listing(state, nodes, bucket, key).await;
+
+    let still_current = current
+        .as_ref()
+        .is_some_and(|c| c.object_id == version.object_id);
+    if ok < of || still_current {
+        warn!(
+            "{bucket}/{key} version {vid}: {ok} of {of} replicas let it go; \
+             its blocks stay allocated"
+        );
+    } else if !version.stripes.is_empty() {
         let failed = reclaim_shards(
             pool,
             &mut state.meta_client.clone(),
@@ -5505,49 +5547,95 @@ async fn delete_version(
     done(version.is_delete_marker)
 }
 
-/// The newest version of `bucket/key` other than `gone`, from the first of
-/// `nodes` that answers.
-async fn newest_version(
-    pool: &OsdPool,
+/// Make meta's listing entry for `bucket/key` match its current object on
+/// the OSDs: listed if it is an object, unlisted if a delete marker or
+/// nothing. Re-checked after the write, since another request may have
+/// changed the current object meanwhile. Returns the current object.
+async fn sync_listing(
+    state: &Arc<AppState>,
     nodes: &[objectio_proto::metadata::NodePlacement],
     bucket: &str,
     key: &str,
-    gone: &ObjectMeta,
-) -> Result<Option<ObjectMeta>, String> {
-    use objectio_proto::storage::ListObjectVersionsMetaRequest;
-    let mut last = String::from("no OSD to ask");
-    for node in nodes {
-        let mut client = match pool.get_client_for_placement(node).await {
-            Ok(c) => c,
-            Err(e) => {
-                last = e.to_string();
-                continue;
-            }
+) -> Option<ObjectMeta> {
+    use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+    let mut meta_client = state.meta_client.clone();
+    let mut current = get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
+        .await
+        .ok()
+        .flatten();
+    for _ in 0..3 {
+        let written = match &current {
+            Some(c) if !c.is_delete_marker => meta_client
+                .create_object(objectio_proto::metadata::CreateObjectRequest {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    size: c.size,
+                    content_type: c.content_type.clone(),
+                    etag: c.etag.clone(),
+                    user_metadata: c.user_metadata.clone(),
+                    stripes: c.stripes.clone(),
+                    object_id: c.object_id.clone(),
+                    pg_id: 0,
+                    pool: String::new(),
+                    home_osd_ids: home_of(nodes),
+                })
+                .await
+                .map(drop),
+            _ => meta_client
+                .delete_object(MetaDelReq {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: String::new(),
+                    forget_home: false,
+                })
+                .await
+                .map(drop),
         };
-        match client
-            .list_object_versions_meta(ListObjectVersionsMetaRequest {
-                bucket: bucket.to_string(),
-                prefix: key.to_string(),
-                // The key itself, first: its versions come in one page.
-                key_marker: key.to_string(),
-                version_id_marker: "-".to_string(),
-                max_keys: 1,
-            })
+        if let Err(e) = written {
+            // Readable by key regardless; the repairer restores listings.
+            warn!("{bucket}/{key}: cannot update its listing: {e}");
+        }
+        let now = get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
             .await
-        {
-            Ok(resp) => {
-                return Ok(resp
-                    .into_inner()
-                    .versions
-                    .into_iter()
-                    .filter(|v| v.key == key)
-                    .filter(|v| v.object_id != gone.object_id || v.version_id != gone.version_id)
-                    .max_by(|a, b| version_age(a).cmp(&version_age(b))));
-            }
-            Err(e) => last = e.to_string(),
+            .ok()
+            .flatten();
+        let same = now.as_ref().map(|o| &o.object_id) == current.as_ref().map(|o| &o.object_id);
+        current = now;
+        if same {
+            break;
         }
     }
-    Err(last)
+    current
+}
+
+/// The bucket's versioning state, or the response to give: NoSuchBucket,
+/// or 503 when it can't be read. Never a guess: taking "unversioned" for
+/// a versioned bucket frees the version a write replaces.
+async fn bucket_versioning(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+) -> Result<VersioningState, Response> {
+    match meta_client
+        .get_bucket_versioning(GetBucketVersioningRequest {
+            bucket: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(resp) => Ok(resp.into_inner().state()),
+        Err(e) if e.code() == tonic::Code::NotFound => Err(S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        )),
+        Err(e) => {
+            warn!("{bucket}: cannot read its versioning state: {e}");
+            Err(S3Error::xml_response(
+                "ServiceUnavailable",
+                "Cannot read the bucket's versioning state; retry",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ))
+        }
+    }
 }
 
 /// What a copy reads: an object, at a version or the current one.
@@ -5734,13 +5822,10 @@ pub async fn delete_object(
     }
 
     // Check versioning state
-    let versioning = meta_client
-        .get_bucket_versioning(GetBucketVersioningRequest {
-            bucket: bucket.clone(),
-        })
-        .await
-        .map(|resp| resp.into_inner().state())
-        .ok();
+    let versioning = match bucket_versioning(&mut meta_client, &bucket).await {
+        Ok(v) => Some(v),
+        Err(resp) => return resp,
+    };
     let versioning_enabled = versioning == Some(VersioningState::VersioningEnabled);
     // Known never to have had versions, so nothing of the key outlives
     // this delete and its home can go. Not when the state is unknown.
@@ -5914,7 +5999,7 @@ pub async fn delete_objects(
     debug!("DELETE objects: {} (batch)", bucket);
 
     // Parse XML request body
-    let delete_request: DeleteObjectsRequest = match quick_xml::de::from_reader(body.as_ref()) {
+    let delete_request = match DeleteObjectsRequest::parse(body.as_ref()) {
         Ok(req) => req,
         Err(e) => {
             error!("Failed to parse DeleteObjects request: {}", e);
@@ -5947,6 +6032,7 @@ pub async fn delete_objects(
     let mut errors = Vec::new();
 
     // Delete each object
+    let quiet = delete_request.quiet;
     for obj in delete_request.objects {
         // Batch delete reports per-key outcomes inside a 200 response, so
         // each key is evaluated here instead of by the middleware, which
@@ -5969,6 +6055,7 @@ pub async fn delete_objects(
         {
             errors.push(DeleteError {
                 key: obj.key,
+                version_id: obj.version_id,
                 code: "AccessDenied".to_string(),
                 message: "Access Denied".to_string(),
             });
@@ -6009,6 +6096,7 @@ pub async fn delete_objects(
                 .map_or_else(|| "InternalError".to_string(), |c| c.0.clone());
             errors.push(DeleteError {
                 key: obj.key,
+                version_id: obj.version_id,
                 message: code.clone(),
                 code,
             });
@@ -6022,7 +6110,10 @@ pub async fn delete_objects(
         errors.len()
     );
 
-    // Build response
+    // Build response: in quiet mode, only what could not be deleted.
+    if quiet {
+        deleted.clear();
+    }
     let result = DeleteObjectsResult { deleted, errors };
 
     let xml = format!(
@@ -7559,12 +7650,12 @@ async fn complete_multipart_upload_internal(
 
                 // With versioning on, an object this replaces is kept (the
                 // OSDs also say so per replica); otherwise it is freed.
-                let versioning_enabled = meta_client
-                    .get_bucket_versioning(GetBucketVersioningRequest {
-                        bucket: bucket.clone(),
-                    })
+                // Not knowing, keep what this replaces: a leak at worst,
+                // where guessing "unversioned" would free a version. The
+                // upload is already gone from meta, so it is not refused.
+                let versioning_enabled = bucket_versioning(&mut meta_client, &bucket)
                     .await
-                    .is_ok_and(|r| r.into_inner().state() == VersioningState::VersioningEnabled);
+                    .map_or(true, |v| v == VersioningState::VersioningEnabled);
                 // A new version, as a single-part PUT makes.
                 if versioning_enabled {
                     object.version_id = new_version_id();
@@ -10598,12 +10689,23 @@ mod s3_tests {
             <Object><Key>a.txt</Key></Object>\
             <Object><Key>b.txt</Key><VersionId>v2</VersionId></Object>\
             </Delete>";
-        let parsed: DeleteObjectsRequest = quick_xml::de::from_str(body).expect("parse");
+        let parsed = DeleteObjectsRequest::parse(body.as_bytes()).expect("parse");
         assert!(parsed.quiet);
         assert_eq!(parsed.objects.len(), 2);
         assert_eq!(parsed.objects[0].key, "a.txt");
         assert_eq!(parsed.objects[0].version_id, None);
         assert_eq!(parsed.objects[1].version_id.as_deref(), Some("v2"));
+    }
+
+    /// A key is exactly what was sent: spaces at either end are part of it.
+    #[test]
+    fn a_batch_delete_keeps_keys_with_spaces_as_sent() {
+        let body = "<Delete><Object><Key> </Key></Object>\
+            <Object><Key>_ </Key></Object><Object><Key> a&amp;b </Key></Object></Delete>";
+        let parsed = DeleteObjectsRequest::parse(body.as_bytes()).expect("parse");
+        let keys: Vec<&str> = parsed.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, [" ", "_ ", " a&b "]);
+        assert!(!parsed.quiet);
     }
 
     // ── XML the gateway sends ─────────────────────────────────────────────
