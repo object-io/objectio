@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use objectio_proto::block::{
     AttachVolumeRequest, CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
-    DeleteSnapshotRequest, DeleteVolumeRequest, FlushRequest, ListVolumesRequest, ReadRequest,
-    TargetType, WriteRequest,
+    DeleteSnapshotRequest, DeleteVolumeRequest, DetachVolumeRequest, FlushRequest,
+    ListVolumesRequest, ReadRequest, TargetType, TrimRequest, WriteRequest,
 };
 use tonic::transport::Channel;
 
@@ -424,7 +424,15 @@ mod nbd {
     pub const WRITE: u16 = 1;
     pub const FLUSH: u16 = 3;
 
+    pub const DISC: u16 = 2;
+
     pub fn connect(port: u16, export: &str) -> TcpStream {
+        go(port, export).0
+    }
+
+    /// `NBD_OPT_GO`: the connection, and the export's size and
+    /// transmission flags from its `NBD_INFO_EXPORT`.
+    pub fn go(port: u16, export: &str) -> (TcpStream, u64, u16) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_nodelay(true).unwrap();
         let mut hello = [0u8; 18];
@@ -443,21 +451,86 @@ mod nbd {
         opt.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
         opt.extend_from_slice(&data);
         s.write_all(&opt).unwrap();
-        // Option replies until ACK (1).
+        // Option replies until ACK (1); NBD_REP_INFO (3) with
+        // NBD_INFO_EXPORT (0) on the way.
+        let mut export_info = None;
         loop {
             let mut h = [0u8; 20];
             s.read_exact(&mut h).unwrap();
+            assert_eq!(&h[..8], &0x0003_e889_0455_65a9u64.to_be_bytes());
             let kind = u32::from_be_bytes(h[12..16].try_into().unwrap());
             let len = u32::from_be_bytes(h[16..20].try_into().unwrap());
             let mut body = vec![0u8; len as usize];
             s.read_exact(&mut body).unwrap();
             assert!(kind < 0x8000_0000, "option error {kind:#x}");
+            if kind == 3 && body[..2] == [0, 0] {
+                assert_eq!(body.len(), 12);
+                export_info = Some((
+                    u64::from_be_bytes(body[2..10].try_into().unwrap()),
+                    u16::from_be_bytes(body[10..12].try_into().unwrap()),
+                ));
+            }
             if kind == 1 {
-                return s;
+                let (size, flags) = export_info.expect("no NBD_INFO_EXPORT before the ACK");
+                return (s, size, flags);
             }
         }
     }
 
+    /// The fixed-newstyle greeting read, and `client_flags` sent.
+    pub fn greet(port: u16, client_flags: u32) -> TcpStream {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_nodelay(true).unwrap();
+        let mut hello = [0u8; 18];
+        s.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello[..8], b"NBDMAGIC");
+        assert_eq!(&hello[8..16], b"IHAVEOPT");
+        assert_eq!(&hello[16..], &[0, 3], "FIXED_NEWSTYLE | NO_ZEROES");
+        s.write_all(&client_flags.to_be_bytes()).unwrap();
+        s
+    }
+
+    /// `NBD_OPT_EXPORT_NAME` (1), the way older clients choose an export.
+    pub fn send_export_name(s: &mut TcpStream, export: &str) {
+        let mut opt = Vec::new();
+        opt.extend_from_slice(b"IHAVEOPT");
+        opt.extend_from_slice(&1u32.to_be_bytes());
+        opt.extend_from_slice(&u32::try_from(export.len()).unwrap().to_be_bytes());
+        opt.extend_from_slice(export.as_bytes());
+        s.write_all(&opt).unwrap();
+    }
+
+    /// Write `data` at `offset`; the reply's error.
+    pub fn write(s: &mut TcpStream, handle: u64, offset: u64, data: &[u8]) -> u32 {
+        let len = u32::try_from(data.len()).unwrap();
+        s.write_all(&request(WRITE, handle, offset, data, len))
+            .unwrap();
+        let (err, h) = reply(s);
+        assert_eq!(h, handle);
+        err
+    }
+
+    /// Read `len` bytes at `offset`: the data, or the reply's error.
+    pub fn read(s: &mut TcpStream, handle: u64, offset: u64, len: u32) -> Result<Vec<u8>, u32> {
+        s.write_all(&request(READ, handle, offset, &[], len))
+            .unwrap();
+        let (err, h) = reply(s);
+        assert_eq!(h, handle);
+        if err != 0 {
+            return Err(err);
+        }
+        let mut data = vec![0u8; len as usize];
+        s.read_exact(&mut data).unwrap();
+        Ok(data)
+    }
+
+    pub fn disconnect(mut s: TcpStream) {
+        s.write_all(&request(DISC, 0, 0, &[], 0)).unwrap();
+        // The server closes its end once outstanding requests are done.
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{} bytes after a disconnect", rest.len());
+    }
     pub fn request(cmd: u16, handle: u64, offset: u64, data: &[u8], length: u32) -> Vec<u8> {
         let mut r = Vec::with_capacity(28 + data.len());
         r.extend_from_slice(&0x2560_9513u32.to_be_bytes());
@@ -480,6 +553,126 @@ mod nbd {
             u64::from_be_bytes(h[8..].try_into().unwrap()),
         )
     }
+}
+
+const NBD_FLAG_READ_ONLY: u16 = 1 << 1;
+
+fn attach(b: &Block, vol: &str, read_only: bool) {
+    b.rt.block_on(b.client().attach_volume(AttachVolumeRequest {
+        volume_id: vol.into(),
+        target_type: TargetType::Nbd.into(),
+        read_only,
+        ..Default::default()
+    }))
+    .unwrap();
+}
+
+/// An attached volume is exported again when the gateway restarts, the
+/// way it was attached: a client reconnects to the same export name and
+/// reads what it wrote, unflushed writes included (replayed from the
+/// journal before the export serves anything). Nothing re-attaches it.
+#[test]
+fn nbd_exports_come_back_after_a_restart() {
+    let mut b = Block::start();
+    let vol = b.create("nbd-rw", 16 * MIB);
+    let ro = b.create("nbd-ro", 8 * MIB);
+    let ro_data = pattern(4096, 13);
+    // Data for the read-only volume goes in over gRPC before it is
+    // attached read-only.
+    b.write(&ro, 0, &ro_data);
+    attach(&b, &vol, false);
+    attach(&b, &ro, true);
+
+    let flushed = pattern(64 * 1024, 11);
+    let unflushed = pattern(64 * 1024, 12);
+    let mut s = nbd::connect(b.nbd_port, &vol);
+    assert_eq!(nbd::write(&mut s, 1, CHUNK, &flushed), 0);
+    nbd::disconnect(s);
+    b.flush(&vol);
+    let mut s = nbd::connect(b.nbd_port, &vol);
+    // Acknowledged, never flushed: only the journal holds it.
+    assert_eq!(nbd::write(&mut s, 2, 2 * CHUNK + 4096, &unflushed), 0);
+    drop(s);
+
+    b.restart(); // kills the process: nothing is flushed on the way down
+
+    let (mut s, size, flags) = nbd::go(b.nbd_port, &vol);
+    assert_eq!(size, 16 * MIB);
+    assert_eq!(flags & NBD_FLAG_READ_ONLY, 0, "attached read-write");
+    assert_eq!(nbd::read(&mut s, 3, CHUNK, 64 * 1024), Ok(flushed));
+    assert_eq!(
+        nbd::read(&mut s, 4, 2 * CHUNK + 4096, 64 * 1024),
+        Ok(unflushed),
+        "an acknowledged write was not read back after the restart"
+    );
+    // And it still takes writes.
+    let more = pattern(4096, 14);
+    assert_eq!(nbd::write(&mut s, 5, 0, &more), 0);
+    assert_eq!(nbd::read(&mut s, 6, 0, 4096), Ok(more));
+    nbd::disconnect(s);
+
+    let (mut s, size, flags) = nbd::go(b.nbd_port, &ro);
+    assert_eq!(size, 8 * MIB);
+    assert_ne!(flags & NBD_FLAG_READ_ONLY, 0, "attached read-only");
+    assert_eq!(nbd::read(&mut s, 7, 0, 4096), Ok(ro_data));
+    assert_eq!(nbd::write(&mut s, 8, 0, &[1; 512]), 1, "EPERM");
+    nbd::disconnect(s);
+}
+
+/// `NBD_OPT_EXPORT_NAME` is answered with the export's size (64 bits) and
+/// transmission flags (16 bits), then 124 zero bytes unless the client set
+/// `NO_ZEROES` — no option-reply header — and the connection goes straight
+/// to transmission. An unknown name closes the connection.
+#[test]
+fn export_name_handshake_replies_size_flags_and_padding() {
+    use std::io::Read;
+
+    let b = Block::start();
+    let vol = b.create("nbd-old", 8 * MIB);
+    attach(&b, &vol, false);
+    let data = pattern(4096, 21);
+
+    // Fixed newstyle, no NO_ZEROES: the padding comes.
+    let mut s = nbd::greet(b.nbd_port, 1);
+    nbd::send_export_name(&mut s, &vol);
+    let mut reply = [0u8; 8 + 2 + 124];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[..8], &(8 * MIB).to_be_bytes());
+    let flags = u16::from_be_bytes([reply[8], reply[9]]);
+    // HAS_FLAGS, SEND_FLUSH, SEND_FUA; not READ_ONLY, not SEND_TRIM.
+    assert_eq!(flags, 0b1101, "transmission flags {flags:#06x}");
+    assert!(reply[10..].iter().all(|&b| b == 0));
+    // In step: the next bytes are the reply to a request.
+    assert_eq!(nbd::write(&mut s, 1, 4096, &data), 0);
+    assert_eq!(nbd::read(&mut s, 2, 4096, 4096), Ok(data.clone()));
+    nbd::disconnect(s);
+
+    // With NO_ZEROES: size and flags only.
+    let mut s = nbd::greet(b.nbd_port, 3);
+    nbd::send_export_name(&mut s, &vol);
+    let mut reply = [0u8; 10];
+    s.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply[..8], &(8 * MIB).to_be_bytes());
+    assert_eq!(u16::from_be_bytes([reply[8], reply[9]]), flags);
+    assert_eq!(nbd::read(&mut s, 3, 4096, 4096), Ok(data));
+    // Past the end, or too large: refused, and the connection stays in
+    // step.
+    assert_eq!(nbd::read(&mut s, 4, 8 * MIB - 512, 1024), Err(22), "EINVAL");
+    assert_eq!(nbd::write(&mut s, 5, 8 * MIB, &[0; 512]), 28, "ENOSPC");
+    assert_eq!(nbd::read(&mut s, 6, 0, 33 << 20), Err(22), "EINVAL");
+    assert_eq!(nbd::read(&mut s, 7, 0, 512).map(|d| d.len()), Ok(512));
+    nbd::disconnect(s);
+
+    // An unknown export: no reply, the connection closed.
+    let mut s = nbd::greet(b.nbd_port, 3);
+    nbd::send_export_name(&mut s, "no-such-volume");
+    let mut rest = Vec::new();
+    let _ = s.read_to_end(&mut rest);
+    assert!(
+        rest.is_empty(),
+        "sent {} bytes for an unknown export",
+        rest.len()
+    );
 }
 
 /// Requests pipelined on one NBD connection are served concurrently and
@@ -639,4 +832,192 @@ fn a_volume_with_small_chunks_keeps_its_data_and_its_chunk_size() {
         .volume
         .unwrap();
     assert_eq!(u64::from(cloned.chunk_size_bytes), SMALL);
+}
+
+/// What the server sends until it closes the connection. A close with
+/// requests left unread is a reset rather than an EOF; either ends it.
+/// Panics if it is still open after 10 s.
+fn read_until_closed(s: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return got,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("the connection is still open")
+            }
+            Err(_) => return got, // reset
+        }
+    }
+}
+
+/// A force delete of an attached volume disconnects its NBD clients
+/// before it answers.
+#[test]
+fn force_deleting_an_attached_volume_disconnects_its_nbd_clients() {
+    let b = Block::start();
+    let vol = b.create("nbd-delete", 8 * MIB);
+    attach(&b, &vol, false);
+    let mut s = nbd::connect(b.nbd_port, &vol);
+    assert_eq!(nbd::write(&mut s, 1, 0, &[5; 4096]), 0);
+    b.rt.block_on(b.client().delete_volume(DeleteVolumeRequest {
+        volume_id: vol,
+        force: true,
+    }))
+    .unwrap();
+    assert!(
+        read_until_closed(&mut s).is_empty(),
+        "no reply after the delete"
+    );
+}
+
+fn detach(b: &Block, vol: &str) {
+    b.rt.block_on(b.client().detach_volume(DetachVolumeRequest {
+        volume_id: vol.into(),
+        force: false,
+    }))
+    .unwrap();
+}
+
+/// Detaching disconnects the volume's NBD clients before it answers:
+/// writes the client had sent are each acknowledged and kept, or refused
+/// and not done, and nothing reaches the volume once it is detached. The
+/// export is gone; attaching again serves the same data.
+#[test]
+fn detach_disconnects_nbd_clients_and_keeps_acknowledged_writes() {
+    use std::io::{Read, Write};
+
+    const N: u64 = 32;
+    const BS: u32 = 4096;
+    let b = Block::start();
+    let vol = b.create("nbd-detach", 64 * MIB);
+    attach(&b, &vol, false);
+    let mut s = nbd::connect(b.nbd_port, &vol);
+    let offset = |i: u64| (i % 8) * CHUNK + (i / 8) * 65_536;
+    let block = |i: u64| pattern(u64::from(BS), u8::try_from(i + 40).unwrap());
+
+    // Pipelined writes, then a detach while they are being served.
+    let mut burst = Vec::new();
+    for i in 0..N {
+        burst.extend(nbd::request(nbd::WRITE, i, offset(i), &block(i), BS));
+    }
+    s.write_all(&burst).unwrap();
+    detach(&b, &vol);
+
+    // Detach has returned: the connection is closed. Every reply the
+    // client got says done (0) or not done (ESHUTDOWN), nothing else.
+    let rest = read_until_closed(&mut s);
+    assert_eq!(rest.len() % 16, 0, "replies are whole");
+    let mut acked = Vec::new();
+    for r in rest.chunks(16) {
+        assert_eq!(&r[..4], &0x6744_6698u32.to_be_bytes());
+        let err = u32::from_be_bytes(r[4..8].try_into().unwrap());
+        let handle = u64::from_be_bytes(r[8..].try_into().unwrap());
+        match err {
+            0 => acked.push(handle),
+            108 => {}
+            e => panic!("write {handle} failed with {e}"),
+        }
+    }
+    for &i in &acked {
+        assert_eq!(
+            b.read(&vol, offset(i), u64::from(BS)),
+            block(i),
+            "acknowledged write {i} was lost in the detach"
+        );
+    }
+
+    // No export any more: GO is refused.
+    let mut g = nbd::greet(b.nbd_port, 3);
+    let mut opt = Vec::new();
+    opt.extend_from_slice(b"IHAVEOPT");
+    opt.extend_from_slice(&7u32.to_be_bytes());
+    let mut data = Vec::new();
+    data.extend_from_slice(&u32::try_from(vol.len()).unwrap().to_be_bytes());
+    data.extend_from_slice(vol.as_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+    opt.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+    opt.extend_from_slice(&data);
+    g.write_all(&opt).unwrap();
+    let mut h = [0u8; 20];
+    g.read_exact(&mut h).unwrap();
+    assert_eq!(
+        u32::from_be_bytes(h[12..16].try_into().unwrap()),
+        0x8000_0006,
+        "NBD_REP_ERR_UNKNOWN"
+    );
+
+    // Attached again, the same data is served.
+    attach(&b, &vol, false);
+    let mut s = nbd::connect(b.nbd_port, &vol);
+    for &i in &acked {
+        assert_eq!(nbd::read(&mut s, 100 + i, offset(i), BS), Ok(block(i)));
+    }
+    nbd::disconnect(s);
+}
+
+/// gRPC refuses writes and trims to a volume attached read-only, as NBD
+/// does; reads are served, and once detached it is writable again.
+#[test]
+fn grpc_writes_to_a_read_only_attachment_are_refused() {
+    let b = Block::start();
+    let vol = b.create("ro-grpc", 8 * MIB);
+    let data = pattern(4096, 31);
+    b.write(&vol, 0, &data);
+    attach(&b, &vol, true);
+
+    let write = b.rt.block_on(b.client().write(WriteRequest {
+        volume_id: vol.clone(),
+        offset_bytes: 0,
+        data: vec![0; 4096],
+    }));
+    assert_eq!(write.unwrap_err().code(), tonic::Code::PermissionDenied);
+    let trim = b.rt.block_on(b.client().trim(TrimRequest {
+        volume_id: vol.clone(),
+        offset_bytes: 0,
+        length_bytes: 4096,
+    }));
+    assert_eq!(trim.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        b.read(&vol, 0, 4096),
+        data,
+        "a refused write changed the data"
+    );
+
+    detach(&b, &vol);
+    b.write(&vol, 0, &[7; 4096]);
+    assert_eq!(b.read(&vol, 0, 4096), vec![7; 4096]);
+}
+
+/// A gRPC trim longer than a chunk zeroes exactly its range (it is
+/// written a piece at a time, not as one buffer of its whole length).
+#[test]
+fn a_long_grpc_trim_zeroes_exactly_its_range() {
+    let b = Block::start();
+    let vol = b.create("trim", 16 * MIB);
+    let data = pattern(16 * MIB, 32);
+    b.write(&vol, 0, &data[..usize::try_from(8 * MIB).unwrap()]);
+    b.write(&vol, 8 * MIB, &data[usize::try_from(8 * MIB).unwrap()..]);
+    let (off, len) = (MIB + 4096, 9 * MIB + 512);
+    b.rt.block_on(b.client().trim(TrimRequest {
+        volume_id: vol.clone(),
+        offset_bytes: off,
+        length_bytes: len,
+    }))
+    .unwrap();
+    let mut want = data;
+    let (o, l) = (usize::try_from(off).unwrap(), usize::try_from(len).unwrap());
+    want[o..o + l].fill(0);
+    let mut got = b.read(&vol, 0, 8 * MIB);
+    got.extend(b.read(&vol, 8 * MIB, 8 * MIB));
+    let wrong = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    assert_eq!(wrong, 0, "{wrong} bytes wrong after the trim");
 }
