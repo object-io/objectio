@@ -136,7 +136,15 @@ impl StsProvider {
         let (payload, signature) = token_raw.rsplit_once('|')?;
 
         let expected = self.sign(payload);
-        if signature != expected {
+        // Constant time: how much of a forged signature matches says
+        // nothing about the right one.
+        let same = signature.len() == expected.len()
+            && signature
+                .bytes()
+                .zip(expected.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !same {
             return None;
         }
 

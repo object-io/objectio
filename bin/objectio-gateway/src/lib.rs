@@ -529,17 +529,22 @@ pub async fn run(
         info!("Connected to initial OSD at {}", args.osd_endpoint);
     }
 
-    // STS provider for vended Iceberg credentials + S3 temporary auth
-    let sts_signing_key = format!("objectio-sts-{}", args.region);
-    let sts_provider = objectio_auth::sts::StsProvider::new(sts_signing_key.as_bytes());
+    // STS provider for vended Iceberg credentials + S3 temporary auth.
+    // Keyed by the cluster's secret from meta, shared by every gateway.
+    let cluster_secret = load_cluster_secret(meta_client.clone()).await;
+    console_auth::set_session_key(derive_key(&cluster_secret, "console-session"));
+    let sts_provider =
+        objectio_auth::sts::StsProvider::new(&derive_key(&cluster_secret, "sts-session"));
 
     // Create auth state using metadata service for credential lookup
     let auth_state =
         Arc::new(AuthState::new(meta_client.clone(), &args.region).with_sts(sts_provider.clone()));
 
-    // Create scatter-gather engine with a signing key derived from region
-    let signing_key = format!("objectio-scatter-gather-{}", args.region);
-    let scatter_gather = ScatterGatherEngine::new(osd_pool.clone(), signing_key.as_bytes());
+    // Listing continuation tokens, signed under the cluster's secret too.
+    let scatter_gather = ScatterGatherEngine::new(
+        osd_pool.clone(),
+        &derive_key(&cluster_secret, "scatter-gather"),
+    );
 
     // Build admin principals list from OIDC admin roles config. Used by
     // the Iceberg catalog router.
@@ -1496,4 +1501,43 @@ fn start_rdma(args: &Args, protocol: &str) -> Result<rdma::GatewayRdma> {
         args.rdma_read_slots
     );
     Ok(rdma)
+}
+
+/// The cluster's secret signing key, from meta (created there on first
+/// use). Both signing keys used to be derived from the region name alone,
+/// which anyone can know. Without meta answering, a random key for this
+/// gateway only: secure, though other gateways won't accept what it signs.
+async fn load_cluster_secret(
+    meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+) -> Vec<u8> {
+    for attempt in 0..30 {
+        match meta
+            .clone()
+            .get_sts_signing_key(objectio_proto::metadata::GetStsSigningKeyRequest {})
+            .await
+        {
+            Ok(r) => return r.into_inner().key,
+            Err(e) if attempt == 29 => {
+                tracing::error!(
+                    "cannot load the cluster signing key from meta ({e}); using a key local to \
+                     this gateway: its temporary credentials work only here"
+                );
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    let mut key = vec![0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    key
+}
+
+/// A key for one purpose from the cluster secret: HMAC-SHA256(secret, label).
+fn derive_key(secret: &[u8], label: &str) -> Vec<u8> {
+    use hmac::Mac;
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
+    mac.update(label.as_bytes());
+    mac.finalize().into_bytes().to_vec()
 }
