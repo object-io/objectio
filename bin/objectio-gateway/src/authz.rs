@@ -284,6 +284,9 @@ pub struct AuthzCache {
     accounts: RwLock<HashMap<String, (Option<serde_json::Value>, Instant)>>,
     /// Each bucket's CORS configuration (see `crate::cors`).
     pub cors: crate::cors::CorsCache,
+    /// Each bucket's lifecycle rules, for `x-amz-expiration` (see
+    /// `crate::lifecycle`).
+    pub lifecycle: crate::lifecycle::RulesCache,
     ttl: Duration,
 }
 
@@ -322,6 +325,7 @@ impl AuthzCache {
             identities: RwLock::new(HashMap::new()),
             accounts: RwLock::new(HashMap::new()),
             cors: crate::cors::CorsCache::new(ttl_secs),
+            lifecycle: crate::lifecycle::RulesCache::new(ttl_secs),
             ttl: Duration::from_secs(ttl_secs),
         }
     }
@@ -358,6 +362,7 @@ impl AuthzCache {
     pub fn invalidate(&self, bucket: &str) {
         self.buckets.write().remove(bucket);
         self.cors.invalidate(bucket);
+        self.lifecycle.invalidate(bucket);
     }
 
     /// Drop the cached policies for one user or group, after an attach or

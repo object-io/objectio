@@ -88,7 +88,6 @@ test_s3::test_bucket_head_extended,not-implemented-by-design,RGW x-rgw-object-co
 test_s3::test_bucket_header_acl_grants,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_bucket_list_objects_anonymous,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_bucket_list_prefix_unreadable,aws-compatible-already,ListObjects v1 with encoding-type=url percent-encodes Prefix as AWS documents; botocore does not decode v1 Prefix (RGW sends it raw)
-test_s3::test_bucket_list_return_data_versioning,gap,ListObjectVersions entries carry no Owner element
 test_s3::test_bucket_list_unordered,not-implemented-by-design,RGW allow-unordered listing extension
 test_s3::test_bucket_listv2_objects_anonymous,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_bucket_listv2_unordered,not-implemented-by-design,RGW allow-unordered listing extension
@@ -162,9 +161,6 @@ test_s3::test_get_publicpolicy_acl_bucket_policy_status,aws-compatible-already,"
 test_s3::test_head_bucket_usage,not-implemented-by-design,RGW X-RGW-* usage headers
 test_s3::test_head_object_404_with_policy_prefix,aws-compatible-already,alt has no s3:GetObject; 403 as AWS; RGW maps s3:prefix ListBucket to 404
 test_s3::test_ignore_public_acls,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
-test_s3::test_lifecycle_expiration_header_head,gap,no x-amz-expiration response header
-test_s3::test_lifecycle_expiration_header_put,gap,no x-amz-expiration response header
-test_s3::test_lifecycle_expiration_header_tags_head,gap,no x-amz-expiration response header
 test_s3::test_lifecycle_expiration_noncur_tags1,aws-compatible-already,"Prefix+Tag without <And> rejected, as AWS (fails_on_aws)"
 test_s3::test_lifecycle_expiration_size_gt,aws-compatible-already,"several filter conditions without <And> rejected, as AWS (fails_on_aws)"
 test_s3::test_lifecycle_expiration_size_lt,aws-compatible-already,"several filter conditions without <And> rejected, as AWS (fails_on_aws)"
