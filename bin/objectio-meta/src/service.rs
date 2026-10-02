@@ -1243,6 +1243,50 @@ impl MetaService {
         }
     }
 
+    /// A drained OSD's purge state (`drain_observer::PURGE_*`), if any.
+    pub fn purge_state(&self, node_id: [u8; 16]) -> Option<String> {
+        self.store
+            .as_ref()
+            .and_then(|s| s.read_named(OSD_PURGE_TABLE, &hex::encode(node_id)))
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// Drained OSDs whose purge isn't confirmed yet.
+    pub fn pending_purges(&self) -> Vec<[u8; 16]> {
+        self.store
+            .as_ref()
+            .map(|s| s.list_named(OSD_PURGE_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, v)| v.as_slice() == crate::drain_observer::PURGE_PENDING.as_bytes())
+            .filter_map(|(k, _)| hex::decode(k).ok()?.try_into().ok())
+            .collect()
+    }
+
+    /// Record (or, with `None`, forget) a drained OSD's purge state.
+    pub async fn set_purge_state(
+        &self,
+        node_id: [u8; 16],
+        state: Option<&str>,
+    ) -> Result<(), Status> {
+        let key = hex::encode(node_id);
+        let current = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(OSD_PURGE_TABLE, &key));
+        if current.is_none() && state.is_none() {
+            return Ok(());
+        }
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(OSD_PURGE_TABLE.into()),
+            &key,
+            current,
+            state.map(|s| s.as_bytes().to_vec()),
+            "osd-purge-state",
+        )
+        .await
+    }
+
     /// The pool a new bucket in `tenant` goes to, `requested` or not.
     ///
     /// A system bucket may go to any enabled pool. A tenant's bucket goes to
@@ -3320,6 +3364,10 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// Roles, prost-encoded `RoleObject` by name. Written through
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
+
+/// Drained OSDs' purge state, by node id (hex): "pending" until the OSD
+/// confirms it was wiped, then "done".
+const OSD_PURGE_TABLE: &str = "osd_purge";
 
 /// Named leases (`AcquireLease`), JSON `{holder, expires_at}`.
 const LEASES_TABLE: &str = "leases";
@@ -8026,6 +8074,18 @@ impl MetadataService for MetaService {
             req.requested_by.clone()
         };
 
+        // A drained OSD comes back only once it's been wiped: until then it
+        // holds stale copies of metadata (objects deleted since would
+        // reappear) and shards nothing refers to.
+        let purge = self.purge_state(node_id);
+        if state != objectio_common::OsdAdminState::Out
+            && purge.as_deref() == Some(crate::drain_observer::PURGE_PENDING)
+        {
+            return Err(Status::failed_precondition(
+                "this OSD was drained and is still being purged; it can rejoin once that's done",
+            ));
+        }
+
         // Raft is the only write path. set_osd_admin_state persists to
         // OSD_NODES inside apply, which every follower also observes.
         let raft = self.raft_handle().ok_or_else(|| {
@@ -8079,6 +8139,16 @@ impl MetadataService for MetaService {
                 "set_osd_admin_state: no OSD with node_id={}",
                 hex::encode(node_id)
             );
+        }
+
+        // Back in service after a purge: it starts clean, and a later
+        // drain starts a new record.
+        if found
+            && state != objectio_common::OsdAdminState::Out
+            && purge.as_deref() == Some(crate::drain_observer::PURGE_DONE)
+            && let Err(e) = self.set_purge_state(node_id, None).await
+        {
+            warn!("clearing purge state for {}: {e}", hex::encode(node_id));
         }
 
         Ok(Response::new(SetOsdAdminStateResponse {
