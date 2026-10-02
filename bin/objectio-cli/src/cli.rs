@@ -998,6 +998,26 @@ pub enum VolumeCmd {
         #[arg(short, long)]
         force: bool,
     },
+    /// Export a volume over NBD (the export name is the volume id)
+    Attach {
+        volume_id: String,
+        /// Export it read-only
+        #[arg(long)]
+        read_only: bool,
+    },
+    /// Stop exporting a volume; its NBD clients are disconnected first
+    Detach {
+        volume_id: String,
+        /// Even if the volume is busy
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// List attachments (exports)
+    Attachments {
+        /// Only this volume's
+        #[arg(long, default_value = "")]
+        volume_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

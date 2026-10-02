@@ -6,9 +6,10 @@ use crate::commands::{format_size, parse_size};
 use crate::output::{Out, key_values};
 use anyhow::{Context, Result};
 use objectio_proto::block::{
-    CloneVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest, DeleteSnapshotRequest,
-    DeleteVolumeRequest, GetSnapshotRequest, GetVolumeRequest, ListSnapshotsRequest,
-    ListVolumesRequest, ResizeVolumeRequest, Snapshot, Volume,
+    AttachVolumeRequest, Attachment, CloneVolumeRequest, CreateSnapshotRequest,
+    CreateVolumeRequest, DeleteSnapshotRequest, DeleteVolumeRequest, DetachVolumeRequest,
+    GetSnapshotRequest, GetVolumeRequest, ListAttachmentsRequest, ListSnapshotsRequest,
+    ListVolumesRequest, ResizeVolumeRequest, Snapshot, TargetType, Volume,
     block_service_client::BlockServiceClient,
 };
 use serde_json::{Value, json};
@@ -178,8 +179,63 @@ pub async fn volume(cmd: VolumeCmd, endpoint: &str, out: &mut Out<'_>) -> Result
                 .map_err(rpc)?;
             out.done(&format!("Deleted volume {volume_id}"))?;
         }
+        VolumeCmd::Attach {
+            volume_id,
+            read_only,
+        } => {
+            let att = client
+                .attach_volume(AttachVolumeRequest {
+                    volume_id,
+                    target_type: TargetType::Nbd.into(),
+                    initiator: String::new(),
+                    read_only,
+                })
+                .await
+                .map_err(rpc)?
+                .into_inner()
+                .attachment
+                .context("the block gateway returned no attachment")?;
+            out.emit(&attachment_json(&att), key_values)?;
+        }
+        VolumeCmd::Detach { volume_id, force } => {
+            client
+                .detach_volume(DetachVolumeRequest {
+                    volume_id: volume_id.clone(),
+                    force,
+                })
+                .await
+                .map_err(rpc)?;
+            out.done(&format!("Detached volume {volume_id}"))?;
+        }
+        VolumeCmd::Attachments { volume_id } => {
+            let resp = client
+                .list_attachments(ListAttachmentsRequest { volume_id })
+                .await
+                .map_err(rpc)?
+                .into_inner();
+            let rows: Vec<Value> = resp.attachments.iter().map(attachment_json).collect();
+            out.list(
+                &json!({ "attachments": rows }),
+                &rows,
+                &[
+                    ("VOLUME", "volume_id"),
+                    ("TARGET", "target"),
+                    ("READ-ONLY", "read_only"),
+                ],
+                "No attachments",
+            )?;
+        }
     }
     Ok(())
+}
+
+fn attachment_json(a: &Attachment) -> Value {
+    json!({
+        "volume_id": a.volume_id,
+        "target": a.target_address,
+        "read_only": a.read_only,
+        "attached_at": a.attached_at,
+    })
 }
 
 #[allow(clippy::significant_drop_tightening)] // the client is used in every arm

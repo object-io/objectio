@@ -141,7 +141,9 @@ Secrets are printed only once, when they are created: by `key create`,
 | `warehouse list [--tenant]` / `create N [--property k=v --tenant]` / `delete N` | `/_admin/warehouses[/N]` |
 | `config list [--prefix]` / `get K` / `set K --value J \| --file F` / `delete K` | `/_admin/config[/K]` |
 | `metrics query Q [--time]` / `query-range Q --start --end --step` | `GET /_admin/metrics/query[_range]` |
-| `volume …`, `snapshot …` | gRPC `BlockService` at `--block-endpoint` |
+| `volume list` / `create N --size 10G [--pool]` / `show ID` / `resize ID --size` / `delete ID [--force]` | gRPC `BlockService` at `--block-endpoint` |
+| `volume attach ID [--read-only]` / `detach ID [--force]` / `attachments [--volume-id]` | gRPC: exports the volume over NBD (export name = volume id); detach disconnects its clients first |
+| `snapshot list VOL` / `create VOL --name` / `show ID` / `delete ID` / `clone ID --name` | gRPC `BlockService` |
 
 For `provision`, `--user` defaults to `$OBJECTIO_PROVISIONER_USER_ID`.
 

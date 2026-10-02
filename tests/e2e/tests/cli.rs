@@ -303,3 +303,32 @@ fn errors_exit_non_zero_with_the_servers_message() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("403"));
 }
+
+/// Block volumes through the CLI: create, attach (an NBD export), list the
+/// attachment, detach, delete.
+#[test]
+fn volumes_are_created_attached_and_detached_through_the_cli() {
+    let c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        &["--block-port", "{free}", "--nbd-port", "{free}"],
+    );
+    let block = format!("http://127.0.0.1:{}", c.arg("--block-port").unwrap());
+    let cli = Cli::new(&c);
+    let run = |args: &[&str]| {
+        let mut all = vec!["--block-endpoint", block.as_str(), "-o", "json"];
+        all.extend_from_slice(args);
+        cli.admin(&all)
+    };
+    let vol = json(&run(&["volume", "create", "disk1", "--size", "16M"]));
+    let id = vol["volume_id"].as_str().expect("volume_id").to_string();
+    let att = json(&run(&["volume", "attach", &id, "--read-only"]));
+    assert_eq!(att["read_only"], true, "{att}");
+    let list = json(&run(&["volume", "attachments"]));
+    assert!(list.to_string().contains(&id), "{list}");
+    ok(&run(&["volume", "detach", &id]));
+    let list = json(&run(&["volume", "attachments", "--volume-id", &id]));
+    assert!(!list.to_string().contains("\"read_only\":true"), "{list}");
+    ok(&run(&["volume", "delete", &id]));
+}
