@@ -252,6 +252,20 @@ service MetadataService {
     rpc AttachPolicy(AttachPolicyRequest) returns (AttachPolicyResponse);
     rpc DetachPolicy(DetachPolicyRequest) returns (DetachPolicyResponse);
     rpc ListAttachedPolicies(ListAttachedPoliciesRequest) returns (ListAttachedPoliciesResponse);
+    // Replace a named policy's document (it stays attached where it is).
+    rpc UpdatePolicy(UpdatePolicyRequest) returns (UpdatePolicyResponse);
+    // Suspend or reactivate a user, or change its display name or email.
+    rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+    // Deactivate or reactivate an access key.
+    rpc UpdateAccessKey(UpdateAccessKeyRequest) returns (UpdateAccessKeyResponse);
+    // Roles: identities that are assumed (STS), with a trust policy saying
+    // who may assume them, and named policies attached saying what they
+    // may do.
+    rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+    rpc GetRole(GetRoleRequest) returns (GetRoleResponse);
+    rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+    rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
+    rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
 
     // This node's Prometheus exposition, so the gateway can serve it from
     // its own /metrics instead of every meta node needing a scrape target.
@@ -1322,10 +1336,14 @@ message GroupMeta {
     string arn = 3;
     repeated string member_user_ids = 4;
     uint64 created_at = 5;
+    // The tenant that owns it (empty = system scope), as in its ARN's
+    // account segment: arn:obio:iam::<tenant|objectio>:group/<name>.
+    string tenant = 6;
 }
 
 message CreateGroupRequest {
     string group_name = 1;
+    string tenant = 2;      // empty = system scope; names are unique per tenant
 }
 
 message CreateGroupResponse {
@@ -2432,11 +2450,19 @@ message PolicyObject {
     string policy_json = 2;         // AWS IAM JSON policy document
     uint64 created_at = 3;
     uint64 updated_at = 4;
+    // The tenant that owns it (empty = system scope). Stored under
+    // "<tenant>/<name>" for a tenant's, "<name>" for a system one.
+    string tenant = 5;
+    // A system policy tenant admins may attach to their own users and
+    // groups (but not change): the operator's catalogue.
+    bool shared = 6;
 }
 
 message CreatePolicyRequest {
-    string name = 1;
+    string name = 1;          // no "/"
     string policy_json = 2;
+    string tenant = 3;        // empty = system scope
+    bool shared = 4;          // system scope only
 }
 message CreatePolicyResponse { PolicyObject policy = 1; }
 
@@ -2452,8 +2478,9 @@ message DeletePolicyResponse { bool success = 1; }
 // Attach/detach a named policy to a user or group
 message AttachPolicyRequest {
     string policy_name = 1;
-    string user_id = 2;            // Attach to user (set one of user_id or group_id)
+    string user_id = 2;            // Attach to user (set one of user_id, group_id, role_name)
     string group_id = 3;           // Attach to group
+    string role_name = 4;          // Attach to role
 }
 message AttachPolicyResponse { bool success = 1; }
 
@@ -2461,13 +2488,61 @@ message DetachPolicyRequest {
     string policy_name = 1;
     string user_id = 2;
     string group_id = 3;
+    string role_name = 4;
 }
 message DetachPolicyResponse { bool success = 1; }
 
 message ListAttachedPoliciesRequest {
     string user_id = 1;            // List policies for user (set one)
     string group_id = 2;           // List policies for group
+    string role_name = 3;          // List policies for role
 }
+
+message UpdatePolicyRequest { string name = 1; string policy_json = 2; }
+message UpdatePolicyResponse { PolicyObject policy = 1; }
+
+message UpdateUserRequest {
+    string user_id = 1;
+    // Each field: unset leaves it as it is.
+    optional UserStatus status = 2;   // ACTIVE or SUSPENDED only
+    optional string display_name = 3;
+    optional string email = 4;
+}
+message UpdateUserResponse { UserMeta user = 1; }
+
+message UpdateAccessKeyRequest {
+    string access_key_id = 1;
+    KeyStatus status = 2;
+}
+message UpdateAccessKeyResponse { AccessKeyMeta key = 1; }
+
+message RoleObject {
+    string name = 1;
+    string arn = 2;                       // arn:obio:iam::<tenant|objectio>:role/<name>
+    string tenant = 3;                    // empty = system scope
+    string description = 4;
+    // Who may assume it: an IAM trust policy (Principal, sts:AssumeRole*
+    // actions, conditions such as the OIDC token's issuer and claims).
+    string trust_policy_json = 5;
+    uint32 max_session_seconds = 6;       // 0 = default (3600)
+    uint64 created_at = 7;
+    uint64 updated_at = 8;
+}
+message CreateRoleRequest { RoleObject role = 1; }
+message CreateRoleResponse { RoleObject role = 1; }
+message GetRoleRequest { string name = 1; }
+message GetRoleResponse { RoleObject role = 1; bool found = 2; }
+message ListRolesRequest { string tenant = 1; }   // empty = all
+message ListRolesResponse { repeated RoleObject roles = 1; }
+message UpdateRoleRequest {
+    string name = 1;
+    optional string description = 2;
+    optional string trust_policy_json = 3;
+    optional uint32 max_session_seconds = 4;
+}
+message UpdateRoleResponse { RoleObject role = 1; }
+message DeleteRoleRequest { string name = 1; }
+message DeleteRoleResponse { bool success = 1; }
 message ListAttachedPoliciesResponse { repeated string policy_names = 1; }
 
 // ============================================================

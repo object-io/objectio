@@ -12031,7 +12031,7 @@ pub async fn admin_create_user(
 
 /// Resolve a user_id to its tenant via meta. Returns `None` if the user
 /// does not exist, letting callers respond 404 appropriately.
-async fn lookup_user_tenant(state: &AppState, user_id: &str) -> Option<String> {
+pub(crate) async fn lookup_user_tenant(state: &AppState, user_id: &str) -> Option<String> {
     let mut client = state.meta_client.clone();
     let resp = client
         .get_user(GetUserRequest {

@@ -16,6 +16,7 @@ pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;
 pub mod host_provider;
+pub mod iam_admin;
 pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
@@ -914,6 +915,23 @@ pub async fn run(
         .route("/_admin/users", get(s3::admin_list_users))
         .route("/_admin/users", post(s3::admin_create_user))
         .route("/_admin/users/{user_id}", delete(s3::admin_delete_user))
+        .route("/_admin/users/{user_id}", get(admin::admin_get_user))
+        .route("/_admin/users/{user_id}", put(admin::admin_update_user))
+        .route(
+            "/_admin/access-keys/{access_key_id}",
+            put(admin::admin_update_access_key),
+        )
+        .route(
+            "/_admin/policies/{name}",
+            get(iam_admin::get_policy_handler),
+        )
+        .route("/_admin/policies/{name}", put(iam_admin::update_policy))
+        .route("/_admin/groups/{group_id}", get(iam_admin::get_group))
+        .route("/_admin/roles", get(iam_admin::list_roles))
+        .route("/_admin/roles", post(iam_admin::create_role))
+        .route("/_admin/roles/{name}", get(iam_admin::get_role))
+        .route("/_admin/roles/{name}", put(iam_admin::update_role))
+        .route("/_admin/roles/{name}", delete(iam_admin::delete_role))
         .route(
             "/_admin/users/{user_id}/access-keys",
             get(s3::admin_list_access_keys),
@@ -990,36 +1008,27 @@ pub async fn run(
             get(admin::admin_validate_placement),
         )
         // IAM Policies
-        .route("/_admin/policies", get(admin::admin_list_policies))
-        .route("/_admin/policies", post(admin::admin_create_policy))
-        .route(
-            "/_admin/policies/{name}",
-            delete(admin::admin_delete_policy),
-        )
+        .route("/_admin/policies", get(iam_admin::list_policies))
+        .route("/_admin/policies", post(iam_admin::create_policy))
+        .route("/_admin/policies/{name}", delete(iam_admin::delete_policy))
         .route(
             "/_admin/buckets/{bucket}/owner",
             put(admin::admin_set_bucket_owner),
         )
-        .route("/_admin/policies/attach", post(admin::admin_attach_policy))
-        .route("/_admin/policies/detach", post(admin::admin_detach_policy))
-        .route(
-            "/_admin/policies/attached",
-            get(admin::admin_list_attached_policies),
-        )
+        .route("/_admin/policies/attach", post(iam_admin::attach_policy))
+        .route("/_admin/policies/detach", post(iam_admin::detach_policy))
+        .route("/_admin/policies/attached", get(iam_admin::list_attached))
         // IAM groups
-        .route("/_admin/groups", get(admin::admin_list_groups))
-        .route("/_admin/groups", post(admin::admin_create_group))
-        .route(
-            "/_admin/groups/{group_id}",
-            delete(admin::admin_delete_group),
-        )
+        .route("/_admin/groups", get(iam_admin::list_groups))
+        .route("/_admin/groups", post(iam_admin::create_group))
+        .route("/_admin/groups/{group_id}", delete(iam_admin::delete_group))
         .route(
             "/_admin/groups/{group_id}/members",
-            post(admin::admin_add_group_member),
+            post(iam_admin::add_group_member),
         )
         .route(
             "/_admin/groups/{group_id}/members/{user_id}",
-            delete(admin::admin_remove_group_member),
+            delete(iam_admin::remove_group_member),
         )
         // Tenant-aware Table Sharing admin
         .route("/_admin/shares", get(admin::admin_list_shares_tenant))

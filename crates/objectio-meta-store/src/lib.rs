@@ -10,7 +10,7 @@ pub mod types;
 
 pub use raft::{ApplyEvent, CasOp, CasTable, MetaCommand, MetaResponse, MetaTypeConfig};
 pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
-pub use raft_storage::MetaRaftStorage;
+pub use raft_storage::{MetaRaftStorage, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
 pub use types::{
     EcConfig, MultipartUploadState, OsdNode, PartState, StoredAccessKey, StoredAttachment,

@@ -592,6 +592,43 @@ impl MetaStore {
         table.get(key).ok()?.map(|v| v.value().to_vec())
     }
 
+    /// One row of a table written through `CasTable::Named(table)`.
+    pub fn read_named(&self, table: &str, key: &str) -> Option<Vec<u8>> {
+        let read_txn = self.db.begin_read().ok()?;
+        let t = read_txn
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new(table))
+            .ok()?;
+        t.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// Every row of a table written through `CasTable::Named(table)`.
+    pub fn list_named(&self, table: &str) -> Vec<(String, Vec<u8>)> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(t) = read_txn.open_table(redb::TableDefinition::<&str, &[u8]>::new(table)) else {
+            return Vec::new();
+        };
+        let Ok(iter) = t.iter() else {
+            return Vec::new();
+        };
+        iter.filter_map(Result::ok)
+            .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            .collect()
+    }
+
+    /// Write or delete one row of a named table directly (no Raft).
+    pub fn write_named(&self, table: &str, key: &str, value: Option<&[u8]>) {
+        let def = redb::TableDefinition::<&str, &[u8]>::new(table);
+        let result = match value {
+            Some(v) => self.put_bytes(def, key, v),
+            None => self.delete_key(def, key),
+        };
+        if let Err(e) = result {
+            error!("Failed to write {table}/{key}: {e}");
+        }
+    }
+
     /// The home of a key ("{bucket}/{key}"): prost-encoded `ObjectHome`.
     pub fn read_object_home(&self, key: &str) -> Option<Vec<u8>> {
         let read_txn = self.db.begin_read().ok()?;

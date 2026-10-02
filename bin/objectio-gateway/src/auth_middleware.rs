@@ -76,7 +76,9 @@ impl AuthState {
         Self {
             meta_client,
             credential_cache: RwLock::new(HashMap::new()),
-            cache_ttl_secs: 300, // 5 minutes
+            // How long a suspended user or a deactivated or deleted key
+            // still works on a gateway. It was 5 minutes.
+            cache_ttl_secs: 15,
             region: region.into(),
             sts_provider: None,
         }

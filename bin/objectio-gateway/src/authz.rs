@@ -333,6 +333,12 @@ impl AuthzCache {
     pub fn invalidate_identity(&self, principal: &str) {
         self.identities.write().remove(principal);
     }
+
+    /// Drop every identity's cached policies (a named policy's document
+    /// changed, and any of them may hold it).
+    pub fn invalidate_all_identities(&self) {
+        self.identities.write().clear();
+    }
 }
 
 impl Default for AuthzCache {
@@ -437,11 +443,13 @@ async fn load_identity_policies(
         ListAttachedPoliciesRequest {
             user_id: String::new(),
             group_id: principal_id.to_string(),
+            role_name: String::new(),
         }
     } else {
         ListAttachedPoliciesRequest {
             user_id: principal_id.to_string(),
             group_id: String::new(),
+            role_name: String::new(),
         }
     };
 
