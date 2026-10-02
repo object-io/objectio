@@ -120,6 +120,19 @@ impl AuthState {
         }
     }
 
+    /// Drop one key from the cache, so a change to it holds here at once
+    /// (other gateways pick it up within the cache TTL).
+    pub fn forget_key(&self, access_key_id: &str) {
+        self.credential_cache.write().remove(access_key_id);
+    }
+
+    /// Drop every cached key of one user.
+    pub fn forget_user(&self, user_id: &str) {
+        self.credential_cache
+            .write()
+            .retain(|_, c| c.user_id != user_id);
+    }
+
     /// Look up credentials from cache or metadata service
     pub async fn lookup_credential(
         &self,

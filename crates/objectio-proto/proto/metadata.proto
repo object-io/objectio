@@ -69,6 +69,9 @@ service MetadataService {
     rpc ListAccessKeys(ListAccessKeysRequest) returns (ListAccessKeysResponse);
     rpc DeleteAccessKey(DeleteAccessKeyRequest) returns (DeleteAccessKeyResponse);
     rpc GetAccessKeyForAuth(GetAccessKeyForAuthRequest) returns (GetAccessKeyForAuthResponse);
+    // A key's record whatever its status, without its secret: for the admin
+    // API to find whose key it is (GetAccessKeyForAuth refuses inactive ones).
+    rpc GetAccessKey(GetAccessKeyRequest) returns (GetAccessKeyResponse);
 
     // Iceberg catalog operations
     rpc IcebergCreateNamespace(IcebergCreateNamespaceRequest) returns (IcebergCreateNamespaceResponse);
@@ -1117,6 +1120,15 @@ message DeleteAccessKeyResponse {
 }
 
 // Get access key for authentication (includes secret for verification)
+message GetAccessKeyRequest {
+    string access_key_id = 1;
+}
+
+message GetAccessKeyResponse {
+    bool found = 1;
+    AccessKeyMeta access_key = 2;   // secret_access_key always empty
+}
+
 message GetAccessKeyForAuthRequest {
     string access_key_id = 1;
 }

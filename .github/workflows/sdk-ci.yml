@@ -70,7 +70,7 @@ jobs:
       - name: assert the package has no runtime dependencies
         working-directory: sdk/python
         run: |
-          deps="$(pip show objectio | sed -n 's/^Requires: //p')"
+          deps="$(pip show objectio-sdk | sed -n 's/^Requires: //p')"
           if [ -n "$deps" ]; then
             echo "expected no runtime dependencies, found: $deps" >&2
             exit 1

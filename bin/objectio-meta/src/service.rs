@@ -5724,6 +5724,29 @@ impl MetadataService for MetaService {
         Ok(Response::new(DeleteAccessKeyResponse { success: true }))
     }
 
+    async fn get_access_key(
+        &self,
+        request: Request<objectio_proto::metadata::GetAccessKeyRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetAccessKeyResponse>, Status> {
+        let id = request.into_inner().access_key_id;
+        let key = self.access_keys.read().get(&id).cloned();
+        Ok(Response::new(
+            objectio_proto::metadata::GetAccessKeyResponse {
+                found: key.is_some(),
+                access_key: key.map(|k| AccessKeyMeta {
+                    access_key_id: k.access_key_id,
+                    secret_access_key: String::new(),
+                    user_id: k.user_id,
+                    status: k.status,
+                    created_at: k.created_at,
+                    tenant: k.tenant,
+                    scope: k.scope,
+                    operation: k.operation,
+                }),
+            },
+        ))
+    }
+
     async fn get_access_key_for_auth(
         &self,
         request: Request<GetAccessKeyForAuthRequest>,

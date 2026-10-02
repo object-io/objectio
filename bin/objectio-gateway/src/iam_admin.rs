@@ -70,6 +70,10 @@ pub(crate) async fn admin_in(
     headers: &HeaderMap,
     requested: Option<&str>,
 ) -> Result<Admin, Response> {
+    // An empty tenant names nothing: clients send it for "my own" as often
+    // as for "system", and taking it as system scope refused every tenant
+    // admin that sent one. For the system admin both mean system scope.
+    let requested = requested.filter(|t| !t.is_empty());
     let caller = extract_caller(auth, headers);
     if !caller.authenticated {
         return Err(error(StatusCode::UNAUTHORIZED, "authentication required"));
@@ -925,6 +929,12 @@ pub async fn get_role(
         .await
         .map(|r| r.into_inner().policy_names)
         .unwrap_or_default();
+    // By name, as the tenant knows them (and as /policies/attached lists them).
+    let prefix = format!("{}/", role.tenant);
+    let attached: Vec<String> = attached
+        .into_iter()
+        .map(|n| n.strip_prefix(&prefix).map_or(n.clone(), str::to_string))
+        .collect();
     let mut j = role_json(&role);
     j["attached_policies"] = json!(attached);
     Json(j).into_response()

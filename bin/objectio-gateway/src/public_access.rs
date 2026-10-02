@@ -417,7 +417,19 @@ pub async fn admin_put(
     let Ok(block) = serde_json::from_value::<PublicAccessBlock>(body.clone()) else {
         return admin_error(StatusCode::BAD_REQUEST, "flags must be booleans");
     };
+    let key = admin_key(&admin.tenant);
     let mut doc = serde_json::to_value(block).unwrap_or_default();
+    // The flags are the document; the cluster's new-bucket default is kept
+    // unless the body says otherwise.
+    if admin.tenant.is_empty() {
+        state.policy_cache.forget_account(&key);
+        if let Some(v) = account_doc(&state, &key)
+            .await
+            .and_then(|d| d.get("new_buckets_blocked").cloned())
+        {
+            doc["new_buckets_blocked"] = v;
+        }
+    }
     if let Some(v) = body.get("new_buckets_blocked") {
         if !admin.tenant.is_empty() {
             return admin_error(
@@ -433,7 +445,6 @@ pub async fn admin_put(
         };
         doc["new_buckets_blocked"] = json!(v);
     }
-    let key = admin_key(&admin.tenant);
     let updated_by = auth
         .as_ref()
         .map(|Extension(a)| a.user_id.clone())
@@ -449,7 +460,10 @@ pub async fn admin_put(
         .await;
     state.policy_cache.forget_account(&key);
     match result {
-        Ok(_) => Json(doc).into_response(),
+        Ok(_) => {
+            doc["tenant"] = json!(admin.tenant);
+            Json(doc).into_response()
+        }
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, e.message()),
     }
 }

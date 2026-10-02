@@ -109,5 +109,5 @@ def test_canonical_query_sorts_and_escapes():
 
 
 def test_non_ascii_is_utf8_percent_encoded():
-    # A workspace named in a non-Latin script must still sign.
+    # A key or display name in a non-Latin script must still sign.
     assert escape("é") == "%C3%A9"
