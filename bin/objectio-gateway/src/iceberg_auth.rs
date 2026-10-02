@@ -139,6 +139,8 @@ pub async fn iceberg_unified_auth_layer(
                     tenant: String::new(),
                     auth_mode: objectio_auth::AuthMode::Permanent,
                     scope: None,
+                    source_ip: None,
+                    source_endpoint: None,
                 };
                 request.extensions_mut().insert(auth_result);
                 return next.run(request).await;
@@ -184,6 +186,8 @@ pub async fn iceberg_unified_auth_layer(
                             tenant: user.tenant,
                             auth_mode: objectio_auth::AuthMode::Permanent,
                             scope: None,
+                            source_ip: None,
+                            source_endpoint: None,
                         }
                     }
                     None => {
@@ -220,6 +224,8 @@ pub async fn iceberg_unified_auth_layer(
                         tenant: cred.tenant,
                         auth_mode: objectio_auth::AuthMode::Permanent,
                         scope: None,
+                        source_ip: None,
+                        source_endpoint: None,
                     }
                 }
                 Err(e) => {

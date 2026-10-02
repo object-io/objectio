@@ -37,6 +37,6 @@ spec:
               service:
                 name: {{ include "objectio.gateway.fullname" $ }}
                 port:
-                  number: {{ $.Values.gateway.service.port }}
+                  number: {{ $.Values.gateway.endpoints.external.port | default $.Values.gateway.service.port }}
     {{- end }}
 {{- end }}

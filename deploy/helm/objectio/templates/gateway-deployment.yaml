@@ -62,6 +62,20 @@ spec:
             - {{ .Values.gateway.deltaSharing.secretKey | quote }}
             - "--log-level"
             - {{ .Values.gateway.logLevel | quote }}
+            {{- with .Values.gateway.endpoints }}
+            {{- if .internalName }}
+            - "--endpoint-name"
+            - {{ .internalName | quote }}
+            {{- end }}
+            {{- if .external.port }}
+            - "--data-listen"
+            - "0.0.0.0:{{ .external.port }}={{ .external.name }}"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.gateway.trustedProxies }}
+            - "--trusted-proxies"
+            - {{ .Values.gateway.trustedProxies | quote }}
+            {{- end }}
             {{- if .Values.gateway.hostProvider.enabled }}
             - "--host-provider"
             - {{ .Values.gateway.hostProvider.kind | quote }}
@@ -146,6 +160,11 @@ spec:
             - name: http
               containerPort: {{ .Values.gateway.service.port }}
               protocol: TCP
+            {{- if .Values.gateway.endpoints.external.port }}
+            - name: http-external
+              containerPort: {{ .Values.gateway.endpoints.external.port }}
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

@@ -148,6 +148,8 @@ pub struct AppState {
     pub inline_max_size: usize,
     /// Dedup dry-run queue (objectio-docs `architecture/design/dedup.md`).
     pub dedup: crate::dedup::DryRun,
+    /// Proxies whose `X-Forwarded-For` names the client (`aws:SourceIp`).
+    pub trusted_proxies: crate::origin::TrustedProxies,
 }
 
 impl AppState {
@@ -1444,6 +1446,12 @@ pub struct ListObjectsParams {
     /// If present, a GetBucketOwnershipControls request
     #[serde(rename = "ownershipControls")]
     ownership_controls: Option<String>,
+    /// If present, a GetPublicAccessBlock request
+    #[serde(rename = "publicAccessBlock")]
+    public_access_block: Option<String>,
+    /// If present, a GetBucketPolicyStatus request
+    #[serde(rename = "policyStatus")]
+    policy_status: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list object versions request
@@ -1522,6 +1530,9 @@ pub struct PutBucketParams {
     /// If present, a PutBucketOwnershipControls request
     #[serde(rename = "ownershipControls")]
     ownership_controls: Option<String>,
+    /// If present, a PutPublicAccessBlock request
+    #[serde(rename = "publicAccessBlock")]
+    public_access_block: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
@@ -1539,6 +1550,9 @@ pub struct DeleteBucketParams {
     lifecycle: Option<String>,
     /// If present, this is a bucket encryption delete request
     encryption: Option<String>,
+    /// If present, a DeletePublicAccessBlock request
+    #[serde(rename = "publicAccessBlock")]
+    public_access_block: Option<String>,
 }
 
 /// Query parameters for PUT object operations (handles both simple PUT and multipart)
@@ -2473,6 +2487,9 @@ pub async fn create_bucket(
     if params.ownership_controls.is_some() {
         return put_ownership_controls(&state, &bucket, &body).await;
     }
+    if params.public_access_block.is_some() {
+        return crate::public_access::put_bucket(&state, &bucket, &body).await;
+    }
     if let Some(refused) = acl_header_refusal(&headers) {
         return refused;
     }
@@ -2527,6 +2544,7 @@ pub async fn create_bucket(
             storage_class: "STANDARD".to_string(),
             region: "us-east-1".to_string(),
             tenant,
+            settings: crate::public_access::initial_settings(&state).await,
         })
         .await
     {
@@ -2671,6 +2689,9 @@ pub async fn delete_bucket(
     }
     if params.encryption.is_some() {
         return delete_bucket_encryption_internal(state, bucket).await;
+    }
+    if params.public_access_block.is_some() {
+        return crate::public_access::delete_bucket(&state, &bucket).await;
     }
 
     // Noncurrent versions and delete markers count as contents, as in S3;
@@ -2836,6 +2857,12 @@ pub async fn list_objects(
     }
     if params.ownership_controls.is_some() {
         return get_ownership_controls(&state, &bucket).await;
+    }
+    if params.public_access_block.is_some() {
+        return crate::public_access::get_bucket(&state, &bucket).await;
+    }
+    if params.policy_status.is_some() {
+        return crate::public_access::get_policy_status(&state, &bucket).await;
     }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
@@ -4067,7 +4094,7 @@ fn acl_header_refusal(headers: &HeaderMap) -> Option<Response> {
 }
 
 /// The owner of `bucket` (who owns everything in it), or the response.
-async fn bucket_owner(state: &AppState, bucket: &str) -> Result<String, Response> {
+pub(crate) async fn bucket_owner(state: &AppState, bucket: &str) -> Result<String, Response> {
     match state
         .meta_client
         .clone()
@@ -7845,7 +7872,11 @@ async fn get_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> Res
 }
 
 /// Set bucket policy (PUT /{bucket}?policy) - internal implementation
-async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: Bytes) -> Response {
+pub(crate) async fn put_bucket_policy_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    body: Bytes,
+) -> Response {
     let mut client = state.meta_client.clone();
 
     // Parse the policy JSON to validate it
@@ -7873,11 +7904,21 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
     // as nothing at authorization time, and the bucket then behaves as though
     // no policy were set — a grant that silently does nothing, visible only as
     // a log line. Reject it here instead.
-    if let Err(e) = BucketPolicy::from_json(&policy_json) {
+    let parsed = match BucketPolicy::from_json(&policy_json) {
+        Ok(p) => p,
+        Err(e) => {
+            return S3Error::xml_response(
+                "MalformedPolicy",
+                &format!("The policy is not a valid bucket policy: {e}"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    if crate::public_access::refuses_policy(&state, &bucket, &parsed).await {
         return S3Error::xml_response(
-            "MalformedPolicy",
-            &format!("The policy is not a valid bucket policy: {e}"),
-            StatusCode::BAD_REQUEST,
+            "AccessDenied",
+            "The bucket policy would make the bucket public, and public access is blocked",
+            StatusCode::FORBIDDEN,
         );
     }
 
@@ -7920,7 +7961,10 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
 }
 
 /// Delete bucket policy (DELETE /{bucket}?policy) - internal implementation
-async fn delete_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> Response {
+pub(crate) async fn delete_bucket_policy_internal(
+    state: Arc<AppState>,
+    bucket: String,
+) -> Response {
     let mut client = state.meta_client.clone();
 
     match client

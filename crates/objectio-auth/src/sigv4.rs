@@ -104,6 +104,8 @@ impl SigV4Verifier {
             tenant: String::new(),
             auth_mode: crate::AuthMode::Permanent,
             scope: None,
+            source_ip: None,
+            source_endpoint: None,
         })
     }
 

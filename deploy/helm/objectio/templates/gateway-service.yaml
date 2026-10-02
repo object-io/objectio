@@ -12,6 +12,12 @@ spec:
       port: {{ .Values.gateway.service.port }}
       targetPort: http
       protocol: TCP
+    {{- if .Values.gateway.endpoints.external.port }}
+    - name: http-external
+      port: {{ .Values.gateway.endpoints.external.port }}
+      targetPort: http-external
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "objectio.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: gateway

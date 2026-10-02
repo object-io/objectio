@@ -223,13 +223,25 @@ pub async fn auth_layer(
         return run_presigned(auth_state, presigned, request, next).await;
     }
 
-    // Parse authorization header to get access key ID
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .ok_or(AuthError::AccessDenied(
-            "missing authorization header".to_string(),
-        ))?
+    // No signature at all: an anonymous request. It carries no identity,
+    // and authorization lets it reach only what a bucket policy grants to
+    // everyone, where public access isn't blocked.
+    let Some(auth_header) = request.headers().get("authorization") else {
+        request.extensions_mut().insert(AuthResult {
+            user_id: String::new(),
+            user_arn: crate::authz::ANONYMOUS_PRINCIPAL.to_string(),
+            access_key_id: String::new(),
+            group_arns: Vec::new(),
+            group_ids: Vec::new(),
+            tenant: String::new(),
+            auth_mode: objectio_auth::AuthMode::Anonymous,
+            scope: None,
+            source_ip: None,
+            source_endpoint: None,
+        });
+        return Ok(next.run(request).await);
+    };
+    let auth_header = auth_header
         .to_str()
         .map_err(|_| AuthError::AccessDenied("invalid authorization header".to_string()))?;
 
@@ -312,6 +324,8 @@ pub async fn auth_layer(
                 tenant,
                 auth_mode: objectio_auth::AuthMode::AssumedRole,
                 scope: None,
+                source_ip: None,
+                source_endpoint: None,
             }
         } else {
             AuthResult {
@@ -323,6 +337,8 @@ pub async fn auth_layer(
                 tenant: String::new(),
                 auth_mode: objectio_auth::AuthMode::Sts,
                 scope: cred.scope.clone(),
+                source_ip: None,
+                source_endpoint: None,
             }
         };
         request.extensions_mut().insert(auth_result);
@@ -692,6 +708,8 @@ pub fn verify_presigned_v4<B>(
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
         scope: cred.scope.clone(),
+        source_ip: None,
+        source_endpoint: None,
     })
 }
 
@@ -808,6 +826,8 @@ pub fn verify_request_v4<B>(
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
         scope: cred.scope.clone(),
+        source_ip: None,
+        source_endpoint: None,
     })
 }
 

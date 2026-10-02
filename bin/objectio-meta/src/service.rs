@@ -1237,8 +1237,50 @@ impl MetaService {
             },
             None => {
                 buckets.remove(key);
+                drop(buckets);
+                self.forget_bucket_config(key);
             }
         }
+    }
+
+    /// The stored rows configuring `bucket` beyond its `BucketMeta`, as
+    /// `(table, key, current bytes)`: what deleting the bucket removes.
+    fn bucket_config_rows(
+        &self,
+        bucket: &str,
+    ) -> Vec<(objectio_meta_store::CasTable, String, Vec<u8>)> {
+        use objectio_meta_store::CasTable;
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for table in [
+            CasTable::BucketPolicies,
+            CasTable::Named("object_lock_configs".into()),
+            CasTable::Named("lifecycle_configs".into()),
+            CasTable::Named("bucket_encryption_configs".into()),
+        ] {
+            if let Some(v) = store.read_named(objectio_meta_store::cas_table_name(&table), bucket) {
+                rows.push((table, bucket.to_string(), v));
+            }
+        }
+        let prefix = format!("{bucket}/");
+        rows.extend(
+            store
+                .list_named(BUCKET_SETTINGS_TABLE)
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, v)| (CasTable::Named(BUCKET_SETTINGS_TABLE.into()), k, v)),
+        );
+        rows
+    }
+
+    /// Drop a deleted bucket's configuration from the in-memory caches.
+    fn forget_bucket_config(&self, bucket: &str) {
+        self.bucket_policies.write().remove(bucket);
+        self.object_lock_configs.write().remove(bucket);
+        self.lifecycle_configs.write().remove(bucket);
+        self.bucket_encryption_configs.write().remove(bucket);
     }
 
     fn apply_bucket_policy_event(&self, key: &str, new_value: Option<&[u8]>) {
@@ -3236,6 +3278,13 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
 
+/// Per-bucket settings, keyed `<bucket>/<name>`.
+const BUCKET_SETTINGS_TABLE: &str = "bucket_settings";
+
+fn bucket_setting_key(bucket: &str, name: &str) -> String {
+    format!("{bucket}/{name}")
+}
+
 impl MetaService {
     /// Commit one compare-and-set write through Raft (or straight to the
     /// store without Raft). `expected` is the row as read; a change since
@@ -3760,15 +3809,57 @@ impl MetadataService for MetaService {
         // on another pod raced us, the CAS fails and we surface it as
         // AlreadyExists (same error the in-memory precheck above returns).
         let bucket_bytes = bucket.encode_to_vec();
+        // Configuration a deleted bucket of this name left behind (from
+        // before deletes removed it) is cleared, and the initial settings
+        // written, all in the bucket's own commit.
+        let mut config_ops: Vec<(
+            objectio_meta_store::CasTable,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = Vec::new();
+        let stale = self.bucket_config_rows(&req.name);
+        for (name, value) in &req.settings {
+            if name.is_empty() || name.contains('/') {
+                return Err(Status::invalid_argument("invalid setting name"));
+            }
+            let key = bucket_setting_key(&req.name, name);
+            let current = stale
+                .iter()
+                .find(|(_, k, _)| *k == key)
+                .map(|(_, _, v)| v.clone());
+            config_ops.push((
+                objectio_meta_store::CasTable::Named(BUCKET_SETTINGS_TABLE.into()),
+                key,
+                current,
+                Some(value.clone()),
+            ));
+        }
+        for (table, key, value) in stale {
+            if !config_ops.iter().any(|(_, k, _, _)| *k == key) {
+                config_ops.push((table, key, Some(value), None));
+            }
+        }
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let mut ops = vec![CasOp {
+                table: CasTable::Buckets,
+                key: req.name.clone(),
+                expected: None,
+                new_value: Some(bucket_bytes),
+            }];
+            ops.extend(
+                config_ops
+                    .iter()
+                    .map(|(table, key, expected, new_value)| CasOp {
+                        table: table.clone(),
+                        key: key.clone(),
+                        expected: expected.clone(),
+                        new_value: new_value.clone(),
+                    }),
+            );
             let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Buckets,
-                    key: req.name.clone(),
-                    expected: None,
-                    new_value: Some(bucket_bytes),
-                }],
+                ops,
                 requested_by: "create-bucket".into(),
             };
             match raft.client_write(cmd).await {
@@ -3786,8 +3877,16 @@ impl MetadataService for MetaService {
             }
         } else if let Some(store) = &self.store {
             store.put_bucket(&req.name, &bucket);
+            for (table, key, _, new_value) in &config_ops {
+                store.write_named(
+                    objectio_meta_store::cas_table_name(table),
+                    key,
+                    new_value.as_deref(),
+                );
+            }
         }
 
+        self.forget_bucket_config(&req.name);
         self.buckets
             .write()
             .insert(req.name.clone(), bucket.clone());
@@ -3828,15 +3927,27 @@ impl MetadataService for MetaService {
             }
         }
 
+        // Everything configured on the bucket goes with it, in the same
+        // commit: a bucket created later under the same name — by anyone —
+        // must not inherit this one's policy, lock, lifecycle or settings.
+        let config_rows = self.bucket_config_rows(&req.name);
+
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let mut ops = vec![CasOp {
+                table: CasTable::Buckets,
+                key: req.name.clone(),
+                expected: Some(expected_bytes),
+                new_value: None, // delete
+            }];
+            ops.extend(config_rows.iter().map(|(table, key, value)| CasOp {
+                table: table.clone(),
+                key: key.clone(),
+                expected: Some(value.clone()),
+                new_value: None,
+            }));
             let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Buckets,
-                    key: req.name.clone(),
-                    expected: Some(expected_bytes),
-                    new_value: None, // delete
-                }],
+                ops,
                 requested_by: "delete-bucket".into(),
             };
             match raft.client_write(cmd).await {
@@ -3854,9 +3965,13 @@ impl MetadataService for MetaService {
             }
         } else if let Some(store) = &self.store {
             store.delete_bucket(&req.name);
+            for (table, key, _) in &config_rows {
+                store.write_named(objectio_meta_store::cas_table_name(table), key, None);
+            }
         }
 
         self.buckets.write().remove(&req.name);
+        self.forget_bucket_config(&req.name);
 
         info!("Deleted bucket: {}", req.name);
 
@@ -11177,6 +11292,60 @@ impl MetadataService for MetaService {
                 found: false,
             })),
         }
+    }
+
+    async fn get_bucket_setting(
+        &self,
+        request: Request<objectio_proto::metadata::GetBucketSettingRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetBucketSettingResponse>, Status> {
+        let req = request.into_inner();
+        let value = self.store.as_ref().and_then(|s| {
+            s.read_named(
+                BUCKET_SETTINGS_TABLE,
+                &bucket_setting_key(&req.bucket, &req.name),
+            )
+        });
+        Ok(Response::new(
+            objectio_proto::metadata::GetBucketSettingResponse {
+                found: value.is_some(),
+                value: value.unwrap_or_default(),
+            },
+        ))
+    }
+
+    async fn put_bucket_setting(
+        &self,
+        request: Request<objectio_proto::metadata::PutBucketSettingRequest>,
+    ) -> Result<Response<objectio_proto::metadata::PutBucketSettingResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() || req.name.contains('/') {
+            return Err(Status::invalid_argument("invalid setting name"));
+        }
+        if !self.buckets.read().contains_key(&req.bucket) {
+            return Err(Status::not_found("bucket not found"));
+        }
+        let key = bucket_setting_key(&req.bucket, &req.name);
+        let current = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(BUCKET_SETTINGS_TABLE, &key));
+        let existed = current.is_some();
+        if req.delete && !existed {
+            return Ok(Response::new(
+                objectio_proto::metadata::PutBucketSettingResponse { existed },
+            ));
+        }
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(BUCKET_SETTINGS_TABLE.into()),
+            &key,
+            current,
+            (!req.delete).then_some(req.value),
+            "put-bucket-setting",
+        )
+        .await?;
+        Ok(Response::new(
+            objectio_proto::metadata::PutBucketSettingResponse { existed },
+        ))
     }
 
     async fn delete_bucket_encryption(

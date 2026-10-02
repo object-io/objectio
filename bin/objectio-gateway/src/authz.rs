@@ -123,6 +123,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutBucketAcl"
             } else if has(query, "ownershipControls") {
                 "s3:PutBucketOwnershipControls"
+            } else if has(query, "publicAccessBlock") {
+                "s3:PutBucketPublicAccessBlock"
             } else {
                 "s3:CreateBucket"
             }
@@ -134,6 +136,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutLifecycleConfiguration"
             } else if has(query, "encryption") {
                 "s3:PutEncryptionConfiguration"
+            } else if has(query, "publicAccessBlock") {
+                "s3:PutBucketPublicAccessBlock"
             } else {
                 "s3:DeleteBucket"
             }
@@ -154,6 +158,10 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetBucketAcl"
             } else if has(query, "ownershipControls") {
                 "s3:GetBucketOwnershipControls"
+            } else if has(query, "publicAccessBlock") {
+                "s3:GetBucketPublicAccessBlock"
+            } else if has(query, "policyStatus") {
+                "s3:GetBucketPolicyStatus"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -258,6 +266,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
 pub struct AuthzCache {
     buckets: RwLock<HashMap<String, BucketEntry>>,
     identities: RwLock<HashMap<String, IdentityEntry>>,
+    /// Tenant- and cluster-wide documents (public access block), by config key.
+    accounts: RwLock<HashMap<String, (Option<serde_json::Value>, Instant)>>,
     ttl: Duration,
 }
 
@@ -272,6 +282,9 @@ struct BucketEntry {
     /// Owning tenant. Empty = the system tenant, which is also what every
     /// bucket created before tenancy carries.
     tenant: String,
+    /// The bucket's own public access block (its tenant's and the
+    /// cluster's are added when it matters).
+    public_block: crate::public_access::PublicAccessBlock,
     cached_at: Instant,
 }
 
@@ -291,6 +304,7 @@ impl AuthzCache {
         Self {
             buckets: RwLock::new(HashMap::new()),
             identities: RwLock::new(HashMap::new()),
+            accounts: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(ttl_secs),
         }
     }
@@ -332,6 +346,24 @@ impl AuthzCache {
     /// detach.
     pub fn invalidate_identity(&self, principal: &str) {
         self.identities.write().remove(principal);
+    }
+
+    /// A cached tenant- or cluster-wide document: `Some(None)` is a cached
+    /// absence.
+    pub fn account(&self, key: &str) -> Option<Option<serde_json::Value>> {
+        let entries = self.accounts.read();
+        let (doc, at) = entries.get(key)?;
+        (at.elapsed() < self.ttl).then(|| doc.clone())
+    }
+
+    pub fn put_account(&self, key: &str, doc: Option<serde_json::Value>) {
+        self.accounts
+            .write()
+            .insert(key.to_string(), (doc, Instant::now()));
+    }
+
+    pub fn forget_account(&self, key: &str) {
+        self.accounts.write().remove(key);
     }
 
     /// Drop every identity's cached policies (a named policy's document
@@ -405,10 +437,18 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         }
     };
 
+    let public_block = if found {
+        crate::public_access::bucket_block(state, bucket)
+            .await
+            .unwrap_or_default()
+    } else {
+        crate::public_access::PublicAccessBlock::ALL
+    };
     let entry = BucketEntry {
         policy,
         owner,
         tenant,
+        public_block,
         cached_at: Instant::now(),
     };
 
@@ -593,6 +633,10 @@ pub async fn authorize(
 
     let bucket = load_bucket(state, req.bucket).await;
 
+    if auth.auth_mode == objectio_auth::AuthMode::Anonymous {
+        return authorize_anonymous(state, auth, req, &bucket).await;
+    }
+
     if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant, auth.auth_mode) {
         debug!(
             "Tenant boundary denied {} ({}) on {} ({})",
@@ -602,28 +646,7 @@ pub async fn authorize(
     }
 
     let resource = build_s3_arn(req.bucket, req.key);
-    let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
-    for (k, v) in sse_condition_vars(req.headers) {
-        context = context.with_variable(k, v);
-    }
-    // A listing's prefix.
-    if req.key.is_none() && !req.scope_key.is_empty() {
-        context = context.with_variable("s3:prefix", req.scope_key);
-    }
-    // The object's own tags, read only when the bucket policy asks.
-    if let (Some(key), Some(policy)) = (req.key, &bucket.policy)
-        && format!("{policy:?}").contains("s3:ExistingObjectTag/")
-    {
-        for (k, v) in existing_object_tags(state, req.bucket, key).await {
-            context = context.with_variable(format!("s3:ExistingObjectTag/{k}"), v);
-        }
-    }
-    // Surface credential-type so policies can deny permanent-key direct
-    // access while still allowing STS-vended sessions through.
-    context = context.with_variable(
-        "obio:CredentialType".to_string(),
-        auth.auth_mode.as_str().to_string(),
-    );
+    let context = request_context(state, auth, req, &bucket).await;
 
     let mut any_allow = false;
 
@@ -653,7 +676,23 @@ pub async fn authorize(
         }
     }
 
-    if let Some(policy) = &bucket.policy {
+    // RestrictPublicBuckets: a public grant reaches no one outside the
+    // bucket's tenant (anonymous callers are handled above).
+    let restricted;
+    let mut bucket_policy = bucket.policy.as_deref();
+    if let Some(policy) = bucket_policy
+        && auth.tenant != bucket.tenant
+        && auth.auth_mode != objectio_auth::AuthMode::Sts
+        && policy.is_public()
+        && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
+            .await
+            .restrict_public_buckets
+    {
+        restricted = policy.without_public_grants();
+        bucket_policy = Some(&restricted);
+    }
+
+    if let Some(policy) = bucket_policy {
         match state.policy_evaluator.evaluate(policy, &context) {
             PolicyDecision::Deny => {
                 debug!(
@@ -694,6 +733,79 @@ pub async fn authorize(
         req.action
     )))
 }
+
+/// The policy-evaluation context of a request by `principal`.
+async fn request_context(
+    state: &AppState,
+    auth: &AuthResult,
+    req: &AuthzRequest<'_>,
+    bucket: &BucketEntry,
+) -> RequestContext {
+    let resource = build_s3_arn(req.bucket, req.key);
+    let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
+    // Where it came from: the client's address, and the named endpoint.
+    if let Some(ip) = auth.source_ip {
+        context = context.with_source_ip(ip);
+    }
+    if let Some(endpoint) = &auth.source_endpoint {
+        context = context.with_variable("aws:SourceVpce", endpoint.clone());
+    }
+    for (k, v) in sse_condition_vars(req.headers) {
+        context = context.with_variable(k, v);
+    }
+    // A listing's prefix.
+    if req.key.is_none() && !req.scope_key.is_empty() {
+        context = context.with_variable("s3:prefix", req.scope_key);
+    }
+    // The object's own tags, read only when the bucket policy asks.
+    if let (Some(key), Some(policy)) = (req.key, &bucket.policy)
+        && format!("{policy:?}").contains("s3:ExistingObjectTag/")
+    {
+        for (k, v) in existing_object_tags(state, req.bucket, key).await {
+            context = context.with_variable(format!("s3:ExistingObjectTag/{k}"), v);
+        }
+    }
+    // Surface credential-type so policies can deny permanent-key direct
+    // access while still allowing STS-vended sessions through.
+    context = context.with_variable(
+        "obio:CredentialType".to_string(),
+        auth.auth_mode.as_str().to_string(),
+    );
+    context
+}
+
+/// An unsigned request: only a bucket policy's grants to everyone can let
+/// it in. A grant open to anyone anywhere (a public policy) is shut off by
+/// `RestrictPublicBuckets`; one pinned to a network or an endpoint ("anyone
+/// inside the cluster") isn't public, and is not.
+async fn authorize_anonymous(
+    state: &AppState,
+    auth: &AuthResult,
+    req: &AuthzRequest<'_>,
+    bucket: &BucketEntry,
+) -> Option<Response> {
+    let refused = || deny("Anonymous access is not allowed");
+    let Some(policy) = bucket.policy.as_deref() else {
+        return Some(refused());
+    };
+    let mut anonymous = policy.for_anonymous();
+    if policy.is_public()
+        && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
+            .await
+            .restrict_public_buckets
+    {
+        anonymous = anonymous.without_public_grants();
+    }
+    let context = request_context(state, auth, req, bucket).await;
+    match state.policy_evaluator.evaluate(&anonymous, &context) {
+        PolicyDecision::Allow => None,
+        _ => Some(refused()),
+    }
+}
+
+/// Who an unsigned request is, to policy evaluation: no ARN, so only `"*"`
+/// can name it.
+pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
 
 /// Decide whether a caller in `caller_tenant` may touch a bucket in
 /// `bucket_tenant`, returning the denial reason when it may not.
@@ -776,17 +888,50 @@ pub fn scope_bucket(scope: &str) -> String {
 /// Authorization middleware. Runs after `auth_layer`, before any handler.
 pub async fn authz_layer(
     State(state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     // No identity on the request means `--no-auth`, or a route that sits ahead
     // of the auth layer. Either way there is no principal to evaluate.
-    let Some(auth) = request.extensions().get::<AuthResult>().cloned() else {
+    // What a proxy forwards is believed only from a trusted one: anyone
+    // could send "X-Forwarded-Proto: https" over plain HTTP and pass a
+    // policy that requires TLS.
+    let peer = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| c.0.ip());
+    if peer.is_some_and(|p| !state.trusted_proxies.trusts(p)) {
+        request.headers_mut().remove("x-forwarded-proto");
+    }
+    if request.extensions().get::<AuthResult>().is_none() {
+        return next.run(request).await;
+    }
+    // Where the request came from, on its identity, for every check made
+    // of it — here and in the handlers (a copy's source, a batch delete).
+    let source_ip = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| state.trusted_proxies.client_ip(c.0.ip(), request.headers()));
+    let source_endpoint = request
+        .extensions()
+        .get::<crate::origin::Endpoint>()
+        .and_then(|e| e.0.clone());
+    let Some(auth) = request.extensions_mut().get_mut::<AuthResult>() else {
         return next.run(request).await;
     };
+    auth.source_ip = source_ip;
+    auth.source_endpoint = source_endpoint;
+    let auth = auth.clone();
 
     let uri = request.uri().clone();
     let classification = classify(request.method(), uri.path(), uri.query().unwrap_or(""));
+
+    // An anonymous caller reaches only what a bucket policy grants it.
+    if auth.auth_mode == objectio_auth::AuthMode::Anonymous
+        && !matches!(classification, Authz::Check { .. } | Authz::DeferToHandler)
+    {
+        return deny("Anonymous access is not allowed");
+    }
 
     let Authz::Check {
         action,
@@ -1033,6 +1178,7 @@ mod tests {
             policy: None,
             owner: "u1".to_string(),
             tenant: String::new(),
+            public_block: crate::public_access::PublicAccessBlock::ALL,
             cached_at: Instant::now(),
         }
     }
@@ -1071,6 +1217,7 @@ mod tests {
                 policy: None,
                 owner: "u1".to_string(),
                 tenant: "globex".to_string(),
+                public_block: crate::public_access::PublicAccessBlock::ALL,
                 cached_at: Instant::now(),
             },
         );

@@ -21,8 +21,10 @@ pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
 pub mod metrics_middleware;
+pub mod origin;
 pub mod osd_pool;
 pub mod prom;
+pub mod public_access;
 pub mod rdma;
 pub mod s3;
 pub mod scatter_gather;
@@ -299,6 +301,24 @@ pub struct Args {
         action = clap::ArgAction::Set
     )]
     pub authz_legacy_open_buckets: bool,
+
+    /// Name of the `--listen` endpoint, for policies (`aws:SourceVpce`).
+    /// Empty: unnamed, as a request over the internet is in AWS.
+    #[arg(long, env = "OBJECTIO_ENDPOINT_NAME", default_value = "")]
+    pub endpoint_name: String,
+
+    /// A further data-plane listener (S3, Iceberg, Delta Sharing; no admin
+    /// API or console), as `ADDR=NAME`: e.g. `0.0.0.0:9010=external` for the
+    /// port the ingress reaches while `--listen` serves pods in the cluster.
+    /// Repeatable.
+    #[arg(long = "data-listen")]
+    pub data_listen: Vec<String>,
+
+    /// Proxies (CIDRs or addresses, comma-separated) whose
+    /// `X-Forwarded-For` is believed for the client's address
+    /// (`aws:SourceIp`). Empty: the connection's peer is the client.
+    #[arg(long, env = "OBJECTIO_TRUSTED_PROXIES", default_value = "")]
+    pub trusted_proxies: String,
 
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
@@ -888,6 +908,8 @@ pub async fn run(
         rdma,
         inline_max_size: args.inline_max_size,
         dedup: dedup::DryRun::start(dedup_meta, Arc::clone(&dedup_pool)),
+        trusted_proxies: origin::TrustedProxies::parse(&args.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("--trusted-proxies: {e}"))?,
     });
 
     // Build router
@@ -940,6 +962,12 @@ pub async fn run(
         )
         .route("/_admin/policies/{name}", put(iam_admin::update_policy))
         .route("/_admin/groups/{group_id}", get(iam_admin::get_group))
+        .route(
+            "/_admin/public-access-block",
+            get(public_access::admin_get)
+                .put(public_access::admin_put)
+                .delete(public_access::admin_delete),
+        )
         .route("/_admin/roles", get(iam_admin::list_roles))
         .route("/_admin/roles", post(iam_admin::create_role))
         .route("/_admin/roles/{name}", get(iam_admin::get_role))
@@ -1264,8 +1292,41 @@ pub async fn run(
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid --listen {}: {}", args.listen, e))?;
 
-    // Each entry: (bind addr, router, label-for-logs).
-    let mut listeners: Vec<(SocketAddr, Router, &'static str)> = Vec::new();
+    // Each entry: (bind addr, router, label-for-logs, endpoint name).
+    let mut listeners: Vec<(SocketAddr, Router, String, Option<String>)> = Vec::new();
+    let main_endpoint = if args.endpoint_name.is_empty() {
+        None
+    } else if origin::valid_name(&args.endpoint_name) {
+        Some(args.endpoint_name.clone())
+    } else {
+        anyhow::bail!("invalid --endpoint-name {:?}", args.endpoint_name);
+    };
+    let mut extra_data: Vec<(SocketAddr, String)> = Vec::new();
+    for spec in &args.data_listen {
+        let (addr, name) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--data-listen {spec}: expected ADDR=NAME"))?;
+        let addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--data-listen {spec}: {e}"))?;
+        if !origin::valid_name(name)
+            || main_endpoint.as_deref() == Some(name)
+            || extra_data.iter().any(|(_, n)| n == name)
+        {
+            anyhow::bail!("--data-listen {spec}: invalid or duplicate endpoint name");
+        }
+        extra_data.push((addr, name.to_string()));
+    }
+    let data_only_router = || {
+        Router::new()
+            .merge(build_s3_protected())
+            .nest("/iceberg", iceberg_router.clone())
+            .merge(unity_router.clone())
+            .nest("/delta-sharing", delta_sharing_router.clone())
+            .layer(middleware::from_fn(metrics_middleware::metrics_layer))
+            .layer(Extension(ListenerKind::Data))
+            .layer(TraceLayer::new_for_http())
+    };
 
     if !split_mode {
         // ---------- Legacy single-port: everything on --listen ----------
@@ -1312,22 +1373,20 @@ pub async fn run(
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Legacy))
             .layer(TraceLayer::new_for_http());
-        listeners.push((data_addr, combined, "data (legacy: + admin + console)"));
+        listeners.push((
+            data_addr,
+            combined,
+            "data (legacy: + admin + console)".into(),
+            main_endpoint.clone(),
+        ));
     } else {
         // ---------- Split mode ----------
         // Data plane only.
-        let data_router = Router::new()
-            .merge(build_s3_protected())
-            .nest("/iceberg", iceberg_router.clone())
-            .merge(unity_router.clone())
-            .nest("/delta-sharing", delta_sharing_router.clone())
-            .layer(middleware::from_fn(metrics_middleware::metrics_layer))
-            .layer(Extension(ListenerKind::Data))
-            .layer(TraceLayer::new_for_http());
         listeners.push((
             data_addr,
-            data_router,
-            "data plane (S3 + Iceberg + Delta Sharing)",
+            data_only_router(),
+            "data plane (S3 + Iceberg + Delta Sharing)".into(),
+            main_endpoint.clone(),
         ));
 
         if let Some(addr) = admin_addr {
@@ -1348,7 +1407,7 @@ pub async fn run(
                 .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .layer(Extension(ListenerKind::AdminApi))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, admin_only, "admin API + metrics"));
+            listeners.push((addr, admin_only, "admin API + metrics".into(), None));
         }
 
         if let Some(addr) = ops_console_addr {
@@ -1380,7 +1439,7 @@ pub async fn run(
                 )
                 .layer(Extension(ListenerKind::OpsConsole))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, ops_router, "ops console"));
+            listeners.push((addr, ops_router, "ops console".into(), None));
         }
 
         if let Some(addr) = tenant_console_addr {
@@ -1410,8 +1469,17 @@ pub async fn run(
                 )
                 .layer(Extension(ListenerKind::TenantConsole))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, tenant_router, "tenant console"));
+            listeners.push((addr, tenant_router, "tenant console".into(), None));
         }
+    }
+
+    for (addr, name) in extra_data {
+        listeners.push((
+            addr,
+            data_only_router(),
+            format!("data plane, endpoint {name:?}"),
+            Some(name),
+        ));
     }
 
     // Bind all listeners and serve concurrently. A shared broadcast channel
@@ -1424,7 +1492,8 @@ pub async fn run(
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());
-    for (addr, router, label) in listeners {
+    for (addr, router, label, endpoint) in listeners {
+        let router = router.layer(Extension(origin::Endpoint(endpoint)));
         // axum serves accepted sockets with Nagle on unless told otherwise;
         // Nagle holding back the tail of a response while the client delays
         // its ACK stalls a lone request by ~40 ms on Linux.
@@ -1442,11 +1511,21 @@ pub async fn run(
             .service(router);
         let mut rx = shutdown_tx.subscribe();
         tasks.push(tokio::spawn(async move {
-            axum::serve(listener, tower::make::Shared::new(app))
-                .with_graceful_shutdown(async move {
-                    let _ = rx.recv().await;
-                })
-                .await
+            // Each connection's peer address rides on its requests.
+            axum::serve(
+                listener,
+                tower::service_fn(move |stream: axum::serve::IncomingStream<'_, _>| {
+                    let svc = origin::WithClientAddr {
+                        inner: app.clone(),
+                        addr: *stream.remote_addr(),
+                    };
+                    async move { Ok::<_, std::convert::Infallible>(svc) }
+                }),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.recv().await;
+            })
+            .await
         }));
     }
 

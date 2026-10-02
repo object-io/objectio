@@ -79,6 +79,49 @@ impl BucketPolicy {
         Ok(policy)
     }
 
+    /// Whether this policy makes the bucket public, as AWS defines it: some
+    /// statement allows everyone (`"*"`) and no condition pins it to fixed
+    /// callers (source IPs short of the whole internet, source ARNs or
+    /// accounts, VPCs, organisations, user ids).
+    pub fn is_public(&self) -> bool {
+        self.statements
+            .iter()
+            .any(|st| st.effect == Effect::Allow && st.principal.is_everyone() && !st.is_pinned())
+    }
+
+    /// This policy as it applies to an anonymous caller: every Deny, and
+    /// only the Allows that name everyone. A grant to particular principals
+    /// never reaches someone who presented no identity.
+    #[must_use]
+    pub fn for_anonymous(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            id: self.id.clone(),
+            statements: self
+                .statements
+                .iter()
+                .filter(|st| st.effect == Effect::Deny || st.principal.is_everyone())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// This policy without its grants to everyone: what still holds for a
+    /// caller that `RestrictPublicBuckets` keeps from public grants.
+    #[must_use]
+    pub fn without_public_grants(&self) -> Self {
+        Self {
+            version: self.version.clone(),
+            id: self.id.clone(),
+            statements: self
+                .statements
+                .iter()
+                .filter(|st| st.effect == Effect::Deny || !st.principal.is_everyone())
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// A role's trust policy. As in AWS its statements name no `Resource`:
     /// the resource is the role it is attached to, so one is implied.
     pub fn from_trust_json(json: &str) -> Result<Self, serde_json::Error> {
@@ -141,6 +184,45 @@ pub struct PolicyStatement {
 }
 
 impl PolicyStatement {
+    /// Whether a condition confines this statement to fixed callers, so that
+    /// allowing `"*"` does not make it public.
+    fn is_pinned(&self) -> bool {
+        const PINNING_KEYS: &[&str] = &[
+            "aws:sourcearn",
+            "aws:sourcevpc",
+            "aws:sourcevpce",
+            "aws:sourceaccount",
+            "aws:sourceowner",
+            "aws:principalorgid",
+            "aws:principalaccount",
+            "aws:principalarn",
+            "aws:userid",
+            "aws:username",
+            "aws:sourceip",
+        ];
+        let Some(conditions) = &self.condition else {
+            return false;
+        };
+        conditions.0.iter().any(|(op, keys)| {
+            // Only a positive, exact match pins: "not this one" or a
+            // wildcard pattern still lets strangers in.
+            let op = op.trim_end_matches("IfExists");
+            let exact = matches!(
+                op,
+                "StringEquals" | "StringEqualsIgnoreCase" | "ArnEquals" | "IpAddress"
+            ) || (op == "ArnLike" || op == "StringLike");
+            exact
+                && keys.iter().any(|(key, values)| {
+                    let key = key.to_ascii_lowercase();
+                    PINNING_KEYS.contains(&key.as_str())
+                        && values.as_vec().iter().all(|v| {
+                            !v.contains('*')
+                                && !(key == "aws:sourceip" && (v.ends_with("/0") || v.is_empty()))
+                        })
+                })
+        })
+    }
+
     /// Create a new Allow statement
     pub fn allow() -> PolicyStatementBuilder {
         PolicyStatementBuilder::new(Effect::Allow)
@@ -242,6 +324,16 @@ pub enum Principal {
     Wildcard,
     /// Specific OBIO principals (user/role ARNs)
     OBIO(Vec<String>),
+}
+
+impl Principal {
+    /// Names everyone: `"*"`, `{"AWS": "*"}` or a list holding `"*"`.
+    pub fn is_everyone(&self) -> bool {
+        match self {
+            Self::Wildcard => true,
+            Self::OBIO(arns) => arns.iter().any(|a| a == "*"),
+        }
+    }
 }
 
 impl Serialize for Principal {
@@ -999,7 +1091,12 @@ impl PolicyEvaluator {
         match key {
             "aws:SourceIp" => context.source_ip.map(|ip| ip.to_string()),
             "aws:username" => Some(context.user_arn.clone()),
-            "s3:prefix" => context.variables.get("prefix").cloned(),
+            // Set as "s3:prefix" by the gateway; "prefix" is the older spelling.
+            "s3:prefix" => context
+                .variables
+                .get("s3:prefix")
+                .or_else(|| context.variables.get("prefix"))
+                .cloned(),
             "obio:CurrentTime" | "aws:CurrentTime" => Some(chrono::Utc::now().to_rfc3339()),
             "aws:EpochTime" => Some(chrono::Utc::now().timestamp().to_string()),
             _ => context.variables.get(key).cloned(),
@@ -1041,38 +1138,45 @@ impl PolicyEvaluator {
     /// Supports both IPv4 and IPv6 CIDR notation. Falls back to exact IP match
     /// if no prefix length is specified.
     fn ip_matches_cidr(&self, ip: &IpAddr, cidr: &str) -> bool {
-        if let Some((network_str, prefix_str)) = cidr.split_once('/')
-            && let Ok(prefix_len) = prefix_str.parse::<u32>()
-            && let Ok(network_ip) = network_str.parse::<IpAddr>()
-        {
-            return match (ip, &network_ip) {
-                (IpAddr::V4(addr), IpAddr::V4(net)) => {
-                    if prefix_len == 0 {
-                        return true;
-                    }
-                    if prefix_len > 32 {
-                        return false;
-                    }
-                    let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
-                    u32::from(*addr) & mask == u32::from(*net) & mask
-                }
-                (IpAddr::V6(addr), IpAddr::V6(net)) => {
-                    if prefix_len == 0 {
-                        return true;
-                    }
-                    if prefix_len > 128 {
-                        return false;
-                    }
-                    let mask = u128::MAX.checked_shl(128 - prefix_len).unwrap_or(0);
-                    u128::from(*addr) & mask == u128::from(*net) & mask
-                }
-                _ => false, // IPv4 vs IPv6 mismatch
-            };
-        }
-
-        // No prefix — try exact IP match
-        cidr.parse::<IpAddr>().is_ok_and(|cidr_ip| ip == &cidr_ip)
+        cidr_contains(cidr, ip)
     }
+}
+
+/// Whether `ip` is in `cidr` (`10.0.0.0/8`, `fd00::/8`, or a bare address).
+/// An IPv4 address seen as IPv6 (`::ffff:10.1.2.3`) counts as IPv4.
+pub fn cidr_contains(cidr: &str, ip: &IpAddr) -> bool {
+    let ip = &ip.to_canonical();
+    if let Some((network_str, prefix_str)) = cidr.split_once('/')
+        && let Ok(prefix_len) = prefix_str.parse::<u32>()
+        && let Ok(network_ip) = network_str.parse::<IpAddr>()
+    {
+        return match (ip, &network_ip) {
+            (IpAddr::V4(addr), IpAddr::V4(net)) => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                if prefix_len > 32 {
+                    return false;
+                }
+                let mask = u32::MAX.checked_shl(32 - prefix_len).unwrap_or(0);
+                u32::from(*addr) & mask == u32::from(*net) & mask
+            }
+            (IpAddr::V6(addr), IpAddr::V6(net)) => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                if prefix_len > 128 {
+                    return false;
+                }
+                let mask = u128::MAX.checked_shl(128 - prefix_len).unwrap_or(0);
+                u128::from(*addr) & mask == u128::from(*net) & mask
+            }
+            _ => false, // IPv4 vs IPv6 mismatch
+        };
+    }
+
+    // No prefix — try exact IP match
+    cidr.parse::<IpAddr>().is_ok_and(|cidr_ip| ip == &cidr_ip)
 }
 
 #[cfg(test)]
@@ -1936,6 +2040,110 @@ mod principal_spelling_tests {
         assert_eq!(
             PolicyEvaluator::new().evaluate(&trust, &ctx),
             PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_policy_is_public_when_it_allows_everyone_unpinned() {
+        let p = |doc: &str| BucketPolicy::from_json(doc).unwrap();
+        let st = |principal: &str, cond: &str| {
+            format!(
+                r#"{{"Statement":[{{"Effect":"Allow","Principal":{principal},
+                "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"{cond}}}]}}"#
+            )
+        };
+        assert!(p(&st(r#""*""#, "")).is_public());
+        assert!(p(&st(r#"{"AWS":"*"}"#, "")).is_public());
+        assert!(p(&st(r#"{"AWS":["*"]}"#, "")).is_public());
+        assert!(!p(&st(r#"{"AWS":"arn:aws:iam::acme:user/u"}"#, "")).is_public());
+        // Pinned to a network or a source: not public.
+        let ip = r#","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}"#;
+        assert!(!p(&st(r#""*""#, ip)).is_public());
+        // ... unless the network is the internet, or the match is negative.
+        let any = r#","Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}"#;
+        assert!(p(&st(r#""*""#, any)).is_public());
+        let not = r#","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}"#;
+        assert!(p(&st(r#""*""#, not)).is_public());
+        // A condition on something else doesn't pin the caller.
+        let tls = r#","Condition":{"Bool":{"aws:SecureTransport":"true"}}"#;
+        assert!(p(&st(r#""*""#, tls)).is_public());
+        // A Deny for everyone isn't public.
+        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*",
+            "Action":"s3:*","Resource":"arn:aws:s3:::b/*"}]}"#;
+        assert!(!p(deny).is_public());
+    }
+
+    #[test]
+    fn an_anonymous_caller_gets_only_grants_to_everyone() {
+        let doc = r#"{"Statement":[
+            {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::acme:user/u"},
+             "Action":"s3:PutObject","Resource":"arn:aws:s3:::b/*"},
+            {"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"},
+            {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/secret"}]}"#;
+        let anon = BucketPolicy::from_json(doc).unwrap().for_anonymous();
+        assert_eq!(anon.statements.len(), 2);
+        let eval = |action: &str, res: &str| {
+            PolicyEvaluator::new().evaluate(&anon, &RequestContext::new("anonymous", action, res))
+        };
+        assert_eq!(
+            eval("s3:GetObject", "arn:obio:s3:::b/k"),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            eval("s3:GetObject", "arn:obio:s3:::b/secret"),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            eval("s3:PutObject", "arn:obio:s3:::b/k"),
+            PolicyDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn a_prefix_condition_sees_the_listings_prefix() {
+        let p = BucketPolicy::from_json(
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket",
+            "Resource":"arn:aws:s3:::b","Condition":{"StringLike":{"s3:prefix":"home/u/*"}}}]}"#,
+        )
+        .unwrap();
+        let list = |prefix: &str| {
+            PolicyEvaluator::new().evaluate(
+                &p,
+                &RequestContext::new("u", "s3:ListBucket", "arn:obio:s3:::b")
+                    .with_variable("s3:prefix", prefix),
+            )
+        };
+        assert_eq!(list("home/u/docs"), PolicyDecision::Allow);
+        assert_eq!(list("home/other/"), PolicyDecision::ImplicitDeny);
+    }
+
+    #[test]
+    fn source_conditions_see_the_address_and_endpoint() {
+        let p = BucketPolicy::from_json(
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",
+            "Resource":"arn:aws:s3:::b/*","Condition":{
+              "IpAddress":{"aws:SourceIp":"10.0.0.0/8"},
+              "StringEquals":{"aws:SourceVpce":"internal"}}}]}"#,
+        )
+        .unwrap();
+        assert!(!p.is_public());
+        let get = |ip: &str, endpoint: Option<&str>| {
+            let mut ctx = RequestContext::new("anonymous", "s3:GetObject", "arn:obio:s3:::b/k")
+                .with_source_ip(ip.parse().unwrap());
+            if let Some(e) = endpoint {
+                ctx = ctx.with_variable("aws:SourceVpce", e);
+            }
+            PolicyEvaluator::new().evaluate(&p, &ctx)
+        };
+        assert_eq!(get("10.1.2.3", Some("internal")), PolicyDecision::Allow);
+        assert_eq!(get("10.1.2.3", None), PolicyDecision::ImplicitDeny);
+        assert_eq!(
+            get("10.1.2.3", Some("external")),
+            PolicyDecision::ImplicitDeny
+        );
+        assert_eq!(
+            get("203.0.113.1", Some("internal")),
+            PolicyDecision::ImplicitDeny
         );
     }
 }
