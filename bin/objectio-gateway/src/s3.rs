@@ -616,6 +616,15 @@ const MAX_TAGS: usize = 10;
 /// `x-amz-meta-*` header can collide with it.
 const UPLOAD_TAGS_KEY: &str = "objectio tagging";
 
+/// The object-lock headers a CreateMultipartUpload carries, kept in the
+/// upload's metadata under this prefix until CompleteMultipartUpload.
+const UPLOAD_LOCK_PREFIX: &str = "objectio lock ";
+const UPLOAD_LOCK_HEADERS: &[&str] = &[
+    "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date",
+    "x-amz-object-lock-legal-hold",
+];
+
 /// Check tags against S3's rules: at most 10, keys of 1–128 characters and
 /// values of at most 256, no key twice, none in the reserved `aws:` space.
 #[allow(clippy::result_large_err)]
@@ -2040,23 +2049,44 @@ pub async fn create_bucket(
             // entry so the next request reads the newly recorded values rather
             // than anything stale.
             state.policy_cache.invalidate(&bucket);
-            // If object lock requested, enable versioning and lock config
+            // Object lock needs versioning, both set before the bucket is
+            // used. These errors used to be ignored, which could leave a
+            // "lock" bucket unversioned (an overwrite then destroys a locked
+            // object) or without the lock; such a bucket is removed again
+            // and the create refused.
             if enable_lock {
-                let _ = client
+                let versioned = client
                     .put_bucket_versioning(PutBucketVersioningRequest {
                         bucket: bucket.clone(),
                         state: VersioningState::VersioningEnabled.into(),
                     })
                     .await;
-                let _ = client
-                    .put_object_lock_configuration(PutObjectLockConfigRequest {
-                        bucket: bucket.clone(),
-                        config: Some(ProtoObjectLockConfig {
-                            enabled: true,
-                            default_retention: None,
-                        }),
-                    })
-                    .await;
+                let locked = match versioned {
+                    Ok(_) => client
+                        .put_object_lock_configuration(PutObjectLockConfigRequest {
+                            bucket: bucket.clone(),
+                            config: Some(ProtoObjectLockConfig {
+                                enabled: true,
+                                default_retention: None,
+                            }),
+                        })
+                        .await
+                        .map(drop),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = locked {
+                    error!("{bucket}: cannot set up object lock, removing the bucket: {e}");
+                    let _ = client
+                        .delete_bucket(DeleteBucketRequest {
+                            name: bucket.clone(),
+                        })
+                        .await;
+                    return S3Error::xml_response(
+                        "ServiceUnavailable",
+                        "Could not enable object lock on the new bucket; retry",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                }
             }
             info!(
                 "Created bucket: {}{}",
@@ -2833,6 +2863,16 @@ async fn copy_by_reference(
             return Some(resp);
         }
     };
+    // A copy is a new object: its lock is the request's or the bucket's
+    // default, never the source's.
+    let (lock_retention, lock_hold) =
+        match object_lock_for_write(&mut meta_client, dest_bucket, copy_headers).await {
+            Ok(lock) => lock,
+            Err(resp) => {
+                back_out(state, format!("copy to {dest_bucket}/{dest_key}"));
+                return Some(resp);
+            }
+        };
     let version_id = if versioning_enabled {
         new_version_id()
     } else {
@@ -2882,6 +2922,8 @@ async fn copy_by_reference(
         inline_data: source.inline_data.clone(),
         checksum: source.checksum.clone(),
         tags,
+        retention: lock_retention,
+        legal_hold: lock_hold,
         ..Default::default()
     };
 
@@ -3093,6 +3135,12 @@ async fn copy_object_data(
     }
     for (name, value) in metadata_from.iter() {
         if is_object_metadata_header(name.as_str()) {
+            put_headers.insert(name.clone(), value.clone());
+        }
+    }
+    // The copy's own lock, if the request asks for one.
+    for (name, value) in copy_headers.iter() {
+        if name.as_str().starts_with("x-amz-object-lock-") {
             put_headers.insert(name.clone(), value.clone());
         }
     }
@@ -3556,6 +3604,11 @@ pub async fn put_object(
         Ok(v) => v == VersioningState::VersioningEnabled,
         Err(resp) => return resp,
     };
+    let (lock_retention, lock_hold) =
+        match object_lock_for_write(&mut meta_client, &bucket, &headers).await {
+            Ok(lock) => lock,
+            Err(resp) => return resp,
+        };
     let version_id = if versioning_enabled {
         new_version_id()
     } else {
@@ -3771,8 +3824,8 @@ pub async fn put_object(
             version_id: version_id.clone(),
             storage_class: "STANDARD".to_string(),
             is_delete_marker: false,
-            retention: None,
-            legal_hold: None,
+            retention: lock_retention,
+            legal_hold: lock_hold,
             encryption_algorithm: sse_algorithm as i32,
             kms_key_id: sse_kms_key_id.clone(),
             encrypted_dek: sse_encrypted_dek.clone(),
@@ -4165,8 +4218,8 @@ pub async fn put_object(
         version_id: version_id.clone(),
         storage_class: "STANDARD".to_string(),
         is_delete_marker: false,
-        retention: None,
-        legal_hold: None,
+        retention: lock_retention,
+        legal_hold: lock_hold,
         encryption_algorithm: sse_algorithm as i32,
         kms_key_id: sse_kms_key_id.clone(),
         encrypted_dek: sse_encrypted_dek,
@@ -5380,16 +5433,173 @@ pub struct HeadObjectParams {
     version_id: Option<String>,
 }
 
-/// `x-amz-version-id` for an object that has a version (not the null one).
+/// The headers that describe a stored object beyond its content:
+/// `x-amz-version-id` (not for the null version) and its object lock.
 fn with_version_id(
     builder: axum::http::response::Builder,
     object: &ObjectMeta,
 ) -> axum::http::response::Builder {
-    if object.version_id.is_empty() {
+    let mut builder = if object.version_id.is_empty() {
         builder
     } else {
         builder.header("x-amz-version-id", &object.version_id)
+    };
+    if let Some(r) = &object.retention
+        && let Some(mode) = retention_mode_name(r.mode())
+    {
+        builder = builder.header("x-amz-object-lock-mode", mode).header(
+            "x-amz-object-lock-retain-until-date",
+            iso8601(r.retain_until_date),
+        );
     }
+    if let Some(h) = &object.legal_hold {
+        builder = builder.header(
+            "x-amz-object-lock-legal-hold",
+            if h.status { "ON" } else { "OFF" },
+        );
+    }
+    builder
+}
+
+fn retention_mode_name(mode: RetentionMode) -> Option<&'static str> {
+    match mode {
+        RetentionMode::RetentionGovernance => Some("GOVERNANCE"),
+        RetentionMode::RetentionCompliance => Some("COMPLIANCE"),
+        RetentionMode::RetentionNone => None,
+    }
+}
+
+/// A unix time as S3 writes dates in object-lock headers and bodies.
+fn iso8601(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_default()
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The bucket's object-lock configuration, if object lock is on for it.
+async fn bucket_lock(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+) -> Result<Option<ProtoObjectLockConfig>, Response> {
+    match meta_client
+        .get_object_lock_configuration(GetObjectLockConfigRequest {
+            bucket: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(resp) => {
+            let inner = resp.into_inner();
+            Ok(inner.config.filter(|c| inner.found && c.enabled))
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => Err(S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        )),
+        Err(e) => {
+            warn!("{bucket}: cannot read its object lock configuration: {e}");
+            Err(S3Error::xml_response(
+                "ServiceUnavailable",
+                "Cannot read the bucket's object lock configuration; retry",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ))
+        }
+    }
+}
+
+/// Object lock asked of a bucket without it: S3's answer.
+fn lock_not_configured() -> Response {
+    S3Error::xml_response(
+        "InvalidRequest",
+        "Bucket is missing Object Lock Configuration",
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// The lock a new object gets: what its `x-amz-object-lock-*` headers ask
+/// for, otherwise the bucket's default retention. A WORM bucket used to
+/// store objects with no lock at all, whatever it was configured or asked
+/// to do: deletable at once.
+async fn object_lock_for_write(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+    headers: &HeaderMap,
+) -> Result<(Option<ObjectRetention>, Option<LegalHold>), Response> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let mode = header("x-amz-object-lock-mode");
+    let until = header("x-amz-object-lock-retain-until-date");
+    let hold = header("x-amz-object-lock-legal-hold");
+    let invalid =
+        |msg: &str| S3Error::xml_response("InvalidArgument", msg, StatusCode::BAD_REQUEST);
+
+    let config = bucket_lock(meta_client, bucket).await?;
+    let Some(config) = config else {
+        if mode.is_some() || until.is_some() || hold.is_some() {
+            return Err(lock_not_configured());
+        }
+        return Ok((None, None));
+    };
+
+    let retention = match (mode, until) {
+        (Some(mode), Some(until)) => {
+            let mode = match mode.as_str() {
+                "GOVERNANCE" => RetentionMode::RetentionGovernance,
+                "COMPLIANCE" => RetentionMode::RetentionCompliance,
+                _ => return Err(invalid("Unknown wormMode directive")),
+            };
+            let until = chrono::DateTime::parse_from_rfc3339(&until)
+                .ok()
+                .and_then(|d| u64::try_from(d.timestamp()).ok())
+                .ok_or_else(|| invalid("The retain until date is not a valid date"))?;
+            if until <= unix_now() {
+                return Err(invalid("The retain until date must be in the future!"));
+            }
+            Some(ObjectRetention {
+                mode: mode.into(),
+                retain_until_date: until,
+            })
+        }
+        (None, None) => config.default_retention.and_then(|d| {
+            let now = chrono::Utc::now();
+            let until = if d.days > 0 {
+                now.checked_add_days(chrono::Days::new(u64::from(d.days)))
+            } else if d.years > 0 {
+                now.checked_add_months(chrono::Months::new(d.years.saturating_mul(12)))
+            } else {
+                None
+            }?;
+            Some(ObjectRetention {
+                mode: d.mode,
+                retain_until_date: u64::try_from(until.timestamp()).ok()?,
+            })
+        }),
+        _ => {
+            return Err(invalid(
+                "x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied",
+            ));
+        }
+    };
+    let legal_hold = match hold.as_deref() {
+        None => None,
+        Some("ON") => Some(LegalHold { status: true }),
+        Some("OFF") => Some(LegalHold { status: false }),
+        Some(_) => return Err(invalid("Legal Hold must be either of 'ON' or 'OFF'")),
+    };
+    Ok((retention, legal_hold))
 }
 
 /// The ObjectMeta a GET or HEAD reads: `version_id`'s, or the current
@@ -6656,6 +6866,16 @@ async fn initiate_multipart_upload_internal(
     if !tags.is_empty() {
         user_metadata.insert(UPLOAD_TAGS_KEY.to_string(), encode_tagging(&tags));
     }
+    // Object lock asked for now, checked now, applied at completion (with
+    // the bucket's default retention when none is asked for).
+    if let Err(resp) = object_lock_for_write(&mut client, &bucket, headers).await {
+        return resp;
+    }
+    for name in UPLOAD_LOCK_HEADERS {
+        if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            user_metadata.insert(format!("{UPLOAD_LOCK_PREFIX}{name}"), v.to_string());
+        }
+    }
 
     // SSE-C multipart: validate the customer key at CreateMultipartUpload
     // and stash its MD5 on meta. UploadPart requests must resupply the same
@@ -6923,7 +7143,7 @@ pub async fn put_object_with_params(
         {
             return refused;
         }
-        return put_object_retention_internal(state, bucket, key, body).await;
+        return put_object_retention_internal(state, bucket, key, body, &headers).await;
     }
     if params.legal_hold.is_some() {
         if let Some(refused) =
@@ -7660,6 +7880,34 @@ async fn complete_multipart_upload_internal(
                 if versioning_enabled {
                     object.version_id = new_version_id();
                 }
+                // The lock asked for at CreateMultipartUpload, or the
+                // bucket's default retention. Past refusing (the upload is
+                // gone), a lock that can't be had now (a date passed
+                // meanwhile) gives way to the default rather than to none.
+                let mut asked = HeaderMap::new();
+                for name in UPLOAD_LOCK_HEADERS {
+                    if let Some(v) = object
+                        .user_metadata
+                        .remove(&format!("{UPLOAD_LOCK_PREFIX}{name}"))
+                        && let Ok(v) = header::HeaderValue::from_str(&v)
+                    {
+                        asked.insert(*name, v);
+                    }
+                }
+                let lock = match object_lock_for_write(&mut meta_client, &bucket, &asked).await {
+                    Ok(lock) => Ok(lock),
+                    Err(_) => {
+                        object_lock_for_write(&mut meta_client, &bucket, &HeaderMap::new()).await
+                    }
+                };
+                if let Ok((retention, legal_hold)) = lock {
+                    object.retention = retention;
+                    object.legal_hold = legal_hold;
+                } else {
+                    warn!(
+                        "{bucket}/{key}: cannot read the bucket's object lock; stored without one"
+                    );
+                }
                 let outcome = put_object_meta_to_all(
                     &state.osd_pool,
                     &placement.nodes,
@@ -8262,11 +8510,11 @@ struct DefaultRetentionXml {
     #[serde(rename = "Days")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    days: Option<u32>,
+    days: Option<i64>,
     #[serde(rename = "Years")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    years: Option<u32>,
+    years: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -8301,19 +8549,65 @@ async fn put_object_lock_config_internal(
         }
     };
 
-    let default_retention = config.rule.and_then(|r| r.default_retention).map(|dr| {
-        let mode = match dr.mode.as_str() {
-            "GOVERNANCE" => RetentionMode::RetentionGovernance,
-            _ => RetentionMode::RetentionCompliance,
-        };
-        RetentionRule {
-            mode: mode.into(),
-            days: dr.days.unwrap_or(0),
-            years: dr.years.unwrap_or(0),
-        }
-    });
-
+    let malformed = |msg: &str| S3Error::xml_response("MalformedXML", msg, StatusCode::BAD_REQUEST);
+    if config.object_lock_enabled.as_deref() != Some("Enabled") {
+        return malformed("ObjectLockEnabled must be Enabled");
+    }
     let mut client = state.meta_client.clone();
+    // Object lock needs versioning on, for good (meta then refuses to
+    // suspend it): that is what keeps a locked version from being
+    // overwritten. A bucket created with lock has it; an existing one may
+    // turn lock on once versioning is enabled, as S3 allows.
+    match bucket_lock(&mut client, &bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => match bucket_versioning(&mut client, &bucket).await {
+            Ok(VersioningState::VersioningEnabled) => {}
+            Ok(_) => {
+                return S3Error::xml_response(
+                    "InvalidBucketState",
+                    "Versioning must be enabled on the bucket to enable Object Lock",
+                    StatusCode::CONFLICT,
+                );
+            }
+            Err(resp) => return resp,
+        },
+        Err(resp) => return resp,
+    }
+    let default_retention = match config.rule.and_then(|r| r.default_retention) {
+        None => None,
+        Some(dr) => {
+            let mode = match dr.mode.as_str() {
+                "GOVERNANCE" => RetentionMode::RetentionGovernance,
+                "COMPLIANCE" => RetentionMode::RetentionCompliance,
+                _ => return malformed("Mode must be GOVERNANCE or COMPLIANCE"),
+            };
+            let period = |v: i64| u32::try_from(v).ok().filter(|v| *v > 0);
+            let bad_period = || {
+                S3Error::xml_response(
+                    "InvalidRetentionPeriod",
+                    "Default retention period must be a positive integer value",
+                    StatusCode::BAD_REQUEST,
+                )
+            };
+            let (days, years) = match (dr.days, dr.years) {
+                (Some(d), None) => match period(d) {
+                    Some(d) => (d, 0),
+                    None => return bad_period(),
+                },
+                (None, Some(y)) => match period(y) {
+                    Some(y) => (0, y),
+                    None => return bad_period(),
+                },
+                _ => return malformed("Exactly one of Days and Years is required"),
+            };
+            Some(RetentionRule {
+                mode: mode.into(),
+                days,
+                years,
+            })
+        }
+    };
+
     match client
         .put_object_lock_configuration(PutObjectLockConfigRequest {
             bucket: bucket.clone(),
@@ -8369,8 +8663,8 @@ async fn get_object_lock_config_internal(state: Arc<AppState>, bucket: String) -
                 ObjectLockRuleResponseXml {
                     default_retention: DefaultRetentionXml {
                         mode: mode.to_string(),
-                        days: if dr.days > 0 { Some(dr.days) } else { None },
-                        years: if dr.years > 0 { Some(dr.years) } else { None },
+                        days: (dr.days > 0).then_some(i64::from(dr.days)),
+                        years: (dr.years > 0).then_some(i64::from(dr.years)),
                     },
                 }
             });
@@ -8916,7 +9210,13 @@ async fn put_object_retention_internal(
     bucket: String,
     key: String,
     body: Bytes,
+    headers: &HeaderMap,
 ) -> Response {
+    match bucket_lock(&mut state.meta_client.clone(), &bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return lock_not_configured(),
+        Err(resp) => return resp,
+    }
     let req: RetentionRequest = match quick_xml::de::from_reader(body.as_ref()) {
         Ok(r) => r,
         Err(e) => {
@@ -9012,6 +9312,33 @@ async fn put_object_retention_internal(
         }
     };
 
+    // A lock in force can be tightened, never loosened: COMPLIANCE can only
+    // be extended; GOVERNANCE can be shortened or changed in mode only with
+    // x-amz-bypass-governance-retention. Any change used to be accepted, so
+    // a COMPLIANCE lock could be shortened to tomorrow and the object
+    // deleted then.
+    if let Some(old) = object_meta.retention.as_ref()
+        && old.retain_until_date > now_secs
+        && retention_mode_name(old.mode()).is_some()
+    {
+        let loosens = mode != old.mode() || retain_until < old.retain_until_date;
+        let bypass = headers
+            .get("x-amz-bypass-governance-retention")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let allowed = match old.mode() {
+            RetentionMode::RetentionCompliance => !loosens,
+            _ => !loosens || bypass,
+        };
+        if !allowed {
+            return S3Error::xml_response(
+                "AccessDenied",
+                "The object is locked: its retention can be extended but not shortened or changed",
+                StatusCode::FORBIDDEN,
+            );
+        }
+    }
+
     object_meta.retention = Some(ObjectRetention {
         mode: mode.into(),
         retain_until_date: retain_until,
@@ -9050,6 +9377,11 @@ async fn get_object_retention_internal(
     bucket: String,
     key: String,
 ) -> Response {
+    match bucket_lock(&mut state.meta_client.clone(), &bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return lock_not_configured(),
+        Err(resp) => return resp,
+    }
     let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
         Ok(n) => n,
         Err(resp) => return resp,
@@ -9120,7 +9452,22 @@ async fn put_object_legal_hold_internal(
         }
     };
 
-    let status = req.status == "ON";
+    let status = match req.status.as_str() {
+        "ON" => true,
+        "OFF" => false,
+        _ => {
+            return S3Error::xml_response(
+                "MalformedXML",
+                "Legal hold status must be ON or OFF",
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    };
+    match bucket_lock(&mut state.meta_client.clone(), &bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return lock_not_configured(),
+        Err(resp) => return resp,
+    }
 
     let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
         Ok(n) => n,
@@ -9179,6 +9526,11 @@ async fn get_object_legal_hold_internal(
     bucket: String,
     key: String,
 ) -> Response {
+    match bucket_lock(&mut state.meta_client.clone(), &bucket).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return lock_not_configured(),
+        Err(resp) => return resp,
+    }
     let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
         Ok(n) => n,
         Err(resp) => return resp,

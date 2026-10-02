@@ -414,7 +414,14 @@ fn version_sub_resources_and_copies_use_the_version_named() {
 #[test]
 fn a_locked_older_version_cannot_be_deleted_by_its_id() {
     let c = Cluster::start_with_ec(6, 4, 2);
-    versioned(&c, "v");
+    // Object lock on: versioned, and able to hold a lock.
+    c.request_with_headers(
+        "PUT",
+        "/v",
+        &[],
+        &[("x-amz-bucket-object-lock-enabled", "true")],
+    )
+    .expect(200);
     let a = body(12, 2_000);
     let va = put(&c, "/v/k", &a);
     c.request(
