@@ -104,9 +104,12 @@ impl BucketName {
             }
         }
 
-        // No consecutive periods
+        // No consecutive periods, nor a period next to a hyphen
         if name.contains("..") {
             return Err(BucketNameError::ConsecutivePeriods);
+        }
+        if name.contains(".-") || name.contains("-.") {
+            return Err(BucketNameError::InvalidChar('.'));
         }
 
         // Cannot be formatted as IP address

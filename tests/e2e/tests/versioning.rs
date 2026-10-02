@@ -417,30 +417,30 @@ fn a_locked_older_version_cannot_be_deleted_by_its_id() {
     // Object lock on: versioned, and able to hold a lock.
     c.request_with_headers(
         "PUT",
-        "/v",
+        "/vlock",
         &[],
         &[("x-amz-bucket-object-lock-enabled", "true")],
     )
     .expect(200);
     let a = body(12, 2_000);
-    let va = put(&c, "/v/k", &a);
+    let va = put(&c, "/vlock/k", &a);
     c.request(
         "PUT",
-        "/v/k?retention",
+        "/vlock/k?retention",
         b"<Retention><Mode>COMPLIANCE</Mode><RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention>",
     )
     .expect(200);
-    put(&c, "/v/k", &body(13, 2_000));
+    put(&c, "/vlock/k", &body(13, 2_000));
 
     assert_eq!(
-        c.request("DELETE", &format!("/v/k?versionId={va}"), &[])
+        c.request("DELETE", &format!("/vlock/k?versionId={va}"), &[])
             .status,
         403,
         "the locked version was deleted"
     );
-    assert_eq!(c.request("DELETE", "/v/k", &[]).status, 204, "a marker");
+    assert_eq!(c.request("DELETE", "/vlock/k", &[]).status, 204, "a marker");
     expect_bytes(
-        &c.request("GET", &format!("/v/k?versionId={va}"), &[]),
+        &c.request("GET", &format!("/vlock/k?versionId={va}"), &[]),
         &a,
         "the locked version",
     );
