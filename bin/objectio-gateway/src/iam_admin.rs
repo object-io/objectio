@@ -55,16 +55,16 @@ fn key(tenant: &str, name: &str) -> String {
 }
 
 /// Who is asking, as far as IAM objects go.
-struct Admin {
-    system: bool,
+pub(crate) struct Admin {
+    pub(crate) system: bool,
     /// The tenant it acts in (empty: system scope).
-    tenant: String,
+    pub(crate) tenant: String,
 }
 
 /// The tenant an admin request acts in, or the refusal. The system admin
 /// acts in `requested` (default: system scope); a tenant admin acts in its
 /// own tenant, and may not name another.
-async fn admin_in(
+pub(crate) async fn admin_in(
     state: &AppState,
     auth: &Option<Extension<AuthResult>>,
     headers: &HeaderMap,

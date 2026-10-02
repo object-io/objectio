@@ -444,7 +444,10 @@ pub fn extract_caller(
     auth: &Option<Extension<AuthResult>>,
     headers: &axum::http::HeaderMap,
 ) -> CallerIdentity {
-    if let Some(Extension(a)) = auth {
+    // An anonymous request has an identity only to say it has none.
+    if let Some(Extension(a)) = auth
+        && a.auth_mode != objectio_auth::AuthMode::Anonymous
+    {
         return CallerIdentity {
             user_id: a.user_id.clone(),
             user_arn: a.user_arn.clone(),
@@ -1320,6 +1323,7 @@ pub async fn admin_create_bucket(
             storage_class: "STANDARD".to_string(),
             region: String::new(),
             tenant,
+            settings: crate::public_access::initial_settings(&state).await,
         })
         .await
     {

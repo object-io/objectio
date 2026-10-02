@@ -23,6 +23,7 @@ pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod osd_pool;
 pub mod prom;
+pub mod public_access;
 pub mod rdma;
 pub mod s3;
 pub mod scatter_gather;
@@ -940,6 +941,12 @@ pub async fn run(
         )
         .route("/_admin/policies/{name}", put(iam_admin::update_policy))
         .route("/_admin/groups/{group_id}", get(iam_admin::get_group))
+        .route(
+            "/_admin/public-access-block",
+            get(public_access::admin_get)
+                .put(public_access::admin_put)
+                .delete(public_access::admin_delete),
+        )
         .route("/_admin/roles", get(iam_admin::list_roles))
         .route("/_admin/roles", post(iam_admin::create_role))
         .route("/_admin/roles/{name}", get(iam_admin::get_role))

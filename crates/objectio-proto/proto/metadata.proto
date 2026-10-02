@@ -236,6 +236,11 @@ service MetadataService {
     rpc GetBucketEncryption(GetBucketEncryptionRequest) returns (GetBucketEncryptionResponse);
     rpc DeleteBucketEncryption(DeleteBucketEncryptionRequest) returns (DeleteBucketEncryptionResponse);
 
+    // Small per-bucket settings (public access block, CORS, ...), each a
+    // named opaque value. Removed with the bucket.
+    rpc GetBucketSetting(GetBucketSettingRequest) returns (GetBucketSettingResponse);
+    rpc PutBucketSetting(PutBucketSettingRequest) returns (PutBucketSettingResponse);
+
     // KMS key management (for SSE-KMS). Key material is wrapped by the
     // service master key before it reaches meta, so meta never sees
     // plaintext KEKs — they're encrypted-at-rest in Redb.
@@ -449,6 +454,9 @@ message CreateBucketRequest {
     string storage_class = 3;
     string region = 4;
     string tenant = 5;              // Owning tenant (empty = system tenant)
+    // Settings the bucket starts with (see GetBucketSetting), written in the
+    // same commit as the bucket: it never exists without them.
+    map<string, bytes> settings = 6;
 }
 
 message SetBucketOwnerRequest {
@@ -2593,6 +2601,26 @@ message GetBucketEncryptionResponse {
 
 message DeleteBucketEncryptionRequest { string bucket = 1; }
 message DeleteBucketEncryptionResponse { bool success = 1; }
+
+message GetBucketSettingRequest {
+    string bucket = 1;
+    string name = 2;
+}
+message GetBucketSettingResponse {
+    bool found = 1;
+    bytes value = 2;
+}
+// `value` empty with `delete` set removes the setting.
+message PutBucketSettingRequest {
+    string bucket = 1;
+    string name = 2;
+    bytes value = 3;
+    bool delete = 4;
+}
+message PutBucketSettingResponse {
+    // Whether a setting was there before (for a delete: whether one was removed).
+    bool existed = 1;
+}
 
 // ============================================================
 // KMS Keys (for SSE-KMS)
