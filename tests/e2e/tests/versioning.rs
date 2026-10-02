@@ -466,7 +466,8 @@ fn concurrent_deletes_of_every_version_leave_nothing_current() {
         );
         let head = c.request("HEAD", "/v/k", &[]);
         assert_eq!(
-            head.status, 404,
+            head.status,
+            404,
             "round {round}: a key with no versions is still current ({:?})",
             head.header("x-amz-version-id")
         );
@@ -475,5 +476,9 @@ fn concurrent_deletes_of_every_version_leave_nothing_current() {
             "round {round}: still listed"
         );
     }
-    assert_eq!(c.request("DELETE", "/v", &[]).status, 204, "the bucket is empty");
+    assert_eq!(
+        c.request("DELETE", "/v", &[]).status,
+        204,
+        "the bucket is empty"
+    );
 }

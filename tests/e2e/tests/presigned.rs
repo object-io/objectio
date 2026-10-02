@@ -267,3 +267,42 @@ fn a_bare_url_with_no_credentials_is_still_refused() {
     let partial = format!("{bare}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc");
     assert_eq!(c.fetch("GET", &partial, &[]).status, 403);
 }
+
+/// Signature version 2, as a presigned URL or an `Authorization` header, is
+/// refused with S3's `InvalidRequest` and the fix, not a bare `AccessDenied`.
+/// `boto3` still presigns with it for a custom endpoint unless told otherwise.
+#[test]
+fn sigv2_is_refused_with_how_to_sign_instead() {
+    let c = setup("presign-v2");
+    c.request("PUT", "/presign-v2/k", b"data").expect(200);
+
+    let v2_url = format!(
+        "{}/presign-v2/k?AWSAccessKeyId={}&Signature=c2lnbmF0dXJl&Expires=4102444800",
+        c.endpoint, c.access_key
+    );
+    let header = format!("AWS {}:c2lnbmF0dXJl", c.access_key);
+    for (what, got) in [
+        ("a SigV2 presigned URL", c.fetch("GET", &v2_url, &[])),
+        (
+            "a SigV2 Authorization header",
+            c.fetch_with_headers(
+                "GET",
+                &format!("{}/presign-v2/k", c.endpoint),
+                &[("authorization", header.as_str())],
+            ),
+        ),
+    ] {
+        assert_eq!(got.status, 400, "{what}: {}", got.text());
+        let text = got.text();
+        assert!(
+            text.contains("<Code>InvalidRequest</Code>"),
+            "{what}: {text}"
+        );
+        assert!(text.contains("AWS4-HMAC-SHA256"), "{what}: {text}");
+        assert!(text.contains("s3v4"), "{what}: {text}");
+    }
+
+    // SigV4 still works.
+    let url = c.presign("GET", "/presign-v2/k", 60);
+    assert_eq!(c.fetch("GET", &url, &[]).text(), "data");
+}

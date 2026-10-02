@@ -34,7 +34,6 @@ pub mod error;
 pub mod policy;
 pub mod presign;
 pub mod scope;
-pub mod sigv2;
 pub mod sigv4;
 pub mod store;
 pub mod sts;
@@ -55,7 +54,6 @@ pub use policy::{
     BucketPolicy, Effect, PolicyDecision, PolicyEvaluator, PolicyStatement, Principal,
 };
 pub use scope::{CredentialScope, Operation, is_mutating_method, scope_allows, validate_scope};
-pub use sigv2::SigV2Verifier;
 pub use sigv4::SigV4Verifier;
 pub use store::UserStore;
 pub use user::{AccessKey, AuthMode, AuthResult, KeyStatus, User, UserStatus};

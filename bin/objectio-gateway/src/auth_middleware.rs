@@ -10,7 +10,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use objectio_auth::{AuthResult, CredentialScope, Operation};
@@ -20,7 +19,6 @@ use objectio_proto::metadata::{
 };
 use parking_lot::RwLock;
 use regex::Regex;
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -28,7 +26,6 @@ use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
-type HmacSha1 = Hmac<Sha1>;
 
 /// Cached credential for SigV4 verification
 #[derive(Clone)]
@@ -193,7 +190,7 @@ pub async fn optional_auth_layer(
     let presigned = request
         .uri()
         .query()
-        .is_some_and(|q| parse_presigned_query(q).is_some());
+        .is_some_and(|q| parse_presigned_query(q).is_some() || is_presigned_v2(q));
     if presigned || request.headers().get("authorization").is_some() {
         auth_layer(state, request, next).await
     } else {
@@ -216,6 +213,9 @@ pub async fn auth_layer(
     // A presigned URL puts its credentials in the query string and cannot
     // carry an Authorization header — the client is handed a URL, not a
     // request. Check for one before concluding the request is unauthenticated.
+    if request.uri().query().is_some_and(is_presigned_v2) {
+        return Err(AuthError::UnsupportedSigV2);
+    }
     if let Some(presigned) = request.uri().query().and_then(parse_presigned_query) {
         let presigned = presigned?;
         return run_presigned(auth_state, presigned, request, next).await;
@@ -272,24 +272,13 @@ pub async fn auth_layer(
             }),
             cached_at: std::time::Instant::now(),
         };
-        match &parsed {
-            ParsedAuth::V4 {
-                signed_headers,
-                signature,
-                ..
-            } => {
-                verify_request_v4(
-                    &request,
-                    signed_headers,
-                    signature,
-                    &cred,
-                    &auth_state.region,
-                )?;
-            }
-            ParsedAuth::V2 { signature, .. } => {
-                verify_request_v2(&request, signature, &cred)?;
-            }
-        }
+        verify_request_v4(
+            &request,
+            &parsed.signed_headers,
+            &parsed.signature,
+            &cred,
+            &auth_state.region,
+        )?;
 
         debug!(
             "STS auth ok: user_arn={} scope={} op={:?}",
@@ -313,20 +302,13 @@ pub async fn auth_layer(
     let cred = auth_state.lookup_credential(access_key_id).await?;
 
     // Verify the signature based on auth version
-    let mut auth_result = match &parsed {
-        ParsedAuth::V4 {
-            signed_headers,
-            signature,
-            ..
-        } => verify_request_v4(
-            &request,
-            signed_headers,
-            signature,
-            &cred,
-            &auth_state.region,
-        )?,
-        ParsedAuth::V2 { signature, .. } => verify_request_v2(&request, signature, &cred)?,
-    };
+    let mut auth_result = verify_request_v4(
+        &request,
+        &parsed.signed_headers,
+        &parsed.signature,
+        &cred,
+        &auth_state.region,
+    )?;
 
     // Stitch IAM group memberships onto the AuthResult so policies attached
     // to a group cascade to its members. Mirrors the OIDC bridge — same
@@ -455,6 +437,15 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 /// an `Authorization` header instead. `Some(Err(..))` means it announced itself
 /// as one and is malformed, which is worth saying rather than falling through
 /// to "missing authorization header".
+pub fn is_presigned_v2(query: &str) -> bool {
+    let has = |name: &str| {
+        query
+            .split('&')
+            .any(|p| p.split('=').next().is_some_and(|k| k == name))
+    };
+    has("AWSAccessKeyId") && has("Signature")
+}
+
 pub fn parse_presigned_query(query: &str) -> Option<Result<PresignedAuth, AuthError>> {
     // `X-Amz-Signature` is the marker: `X-Amz-Algorithm` alone also appears in
     // POST policy form uploads, which are a different mechanism.
@@ -673,29 +664,22 @@ pub fn verify_presigned_v4<B>(
     })
 }
 
-/// Parsed authorization header (supports both V4 and V2)
-pub enum ParsedAuth {
-    V4 {
-        access_key_id: String,
-        signed_headers: Vec<String>,
-        signature: String,
-    },
-    V2 {
-        access_key_id: String,
-        signature: String,
-    },
+/// A parsed SigV4 Authorization header.
+pub struct ParsedAuth {
+    pub access_key_id: String,
+    pub signed_headers: Vec<String>,
+    pub signature: String,
 }
 
 impl ParsedAuth {
     pub fn access_key_id(&self) -> &str {
-        match self {
-            ParsedAuth::V4 { access_key_id, .. } => access_key_id,
-            ParsedAuth::V2 { access_key_id, .. } => access_key_id,
-        }
+        &self.access_key_id
     }
 }
 
-/// Parse the Authorization header (supports both SigV4 and SigV2)
+/// Parse the Authorization header. SigV4 only: SigV2 ("AWS key:sig") is
+/// refused with [`AuthError::UnsupportedSigV2`], as S3 refuses it on every
+/// bucket created since June 2020.
 pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, AuthError> {
     if header.starts_with("AWS4-HMAC-SHA256") {
         // SigV4 format: AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request,
@@ -708,7 +692,7 @@ pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, AuthError>
             AuthError::AccessDenied("invalid authorization header format".to_string())
         })?;
 
-        Ok(ParsedAuth::V4 {
+        Ok(ParsedAuth {
             access_key_id: captures.get(1).unwrap().as_str().to_string(),
             signed_headers: captures
                 .get(2)
@@ -719,20 +703,8 @@ pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, AuthError>
                 .collect(),
             signature: captures.get(3).unwrap().as_str().to_string(),
         })
-    } else if let Some(credentials) = header.strip_prefix("AWS ") {
-        // SigV2 format: AWS AccessKeyId:Signature
-        let parts: Vec<&str> = credentials.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(AuthError::AccessDenied(
-                "invalid SigV2 authorization header".to_string(),
-            ));
-        }
-
-        debug!("Using SigV2 authentication (legacy)");
-        Ok(ParsedAuth::V2 {
-            access_key_id: parts[0].to_string(),
-            signature: parts[1].to_string(),
-        })
+    } else if header.starts_with("AWS ") {
+        Err(AuthError::UnsupportedSigV2)
     } else {
         Err(AuthError::AccessDenied(
             "unsupported signature version".to_string(),
@@ -806,219 +778,6 @@ pub fn verify_request_v4<B>(
         auth_mode: objectio_auth::AuthMode::Permanent,
         scope: cred.scope.clone(),
     })
-}
-
-/// Sub-resources that should be included in the canonical resource for SigV2
-const SIGV2_SUB_RESOURCES: &[&str] = &[
-    "acl",
-    "cors",
-    "delete",
-    "lifecycle",
-    "location",
-    "logging",
-    "notification",
-    "partNumber",
-    "policy",
-    "requestPayment",
-    "response-cache-control",
-    "response-content-disposition",
-    "response-content-encoding",
-    "response-content-language",
-    "response-content-type",
-    "response-expires",
-    "restore",
-    "tagging",
-    "torrent",
-    "uploadId",
-    "uploads",
-    "versionId",
-    "versioning",
-    "versions",
-    "website",
-];
-
-/// Verify SigV2 request signature
-pub fn verify_request_v2<B>(
-    request: &Request<B>,
-    signature: &str,
-    cred: &CachedCredential,
-) -> Result<AuthResult, AuthError> {
-    // Get the request date
-    let date_str = get_request_date(request)?;
-
-    // Try to parse and validate date
-    if let Ok(date) = parse_date_v2(&date_str) {
-        let now = Utc::now();
-        let diff = now.signed_duration_since(date);
-        if diff.num_minutes().abs() > 15 {
-            return Err(AuthError::RequestTimeTooSkewed);
-        }
-    }
-
-    // Build string to sign for SigV2
-    let string_to_sign = build_string_to_sign_v2(request, &date_str)?;
-
-    // Calculate signature using HMAC-SHA1
-    let calculated_signature = calculate_signature_v2(&cred.secret_access_key, &string_to_sign);
-
-    // Compare signatures
-    if !constant_time_eq(&calculated_signature, signature) {
-        debug!(
-            "SigV2 mismatch:\n  String to Sign:\n{}\n  Calculated: {}\n  Provided: {}",
-            string_to_sign, calculated_signature, signature
-        );
-        return Err(AuthError::SignatureDoesNotMatch);
-    }
-
-    Ok(AuthResult {
-        user_id: cred.user_id.clone(),
-        user_arn: cred.user_arn.clone(),
-        access_key_id: cred.access_key_id.clone(),
-        group_arns: Vec::new(),
-        group_ids: Vec::new(),
-        tenant: cred.tenant.clone(),
-        auth_mode: objectio_auth::AuthMode::Permanent,
-        scope: cred.scope.clone(),
-    })
-}
-
-/// Build string to sign for SigV2
-fn build_string_to_sign_v2<B>(request: &Request<B>, date_str: &str) -> Result<String, AuthError> {
-    let method = request.method().as_str();
-
-    // Get Content-MD5 header (empty if not present)
-    let content_md5 = request
-        .headers()
-        .get("content-md5")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    // Get Content-Type header (empty if not present)
-    let content_type = request
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    // Use x-amz-date if present, otherwise use Date header value
-    let date_field = if request.headers().contains_key("x-amz-date") {
-        ""
-    } else {
-        date_str
-    };
-
-    // Build canonicalized AMZ headers
-    let canonicalized_amz_headers = build_canonicalized_amz_headers(request);
-
-    // Build canonicalized resource
-    let canonicalized_resource = build_canonicalized_resource_v2(request);
-
-    Ok(format!(
-        "{}\n{}\n{}\n{}\n{}{}",
-        method,
-        content_md5,
-        content_type,
-        date_field,
-        canonicalized_amz_headers,
-        canonicalized_resource
-    ))
-}
-
-/// Build canonicalized AMZ headers for SigV2
-fn build_canonicalized_amz_headers<B>(request: &Request<B>) -> String {
-    let mut amz_headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for (name, value) in request.headers().iter() {
-        let name_lower = name.as_str().to_lowercase();
-        if name_lower.starts_with("x-amz-")
-            && let Ok(value_str) = value.to_str()
-        {
-            let trimmed = value_str.split_whitespace().collect::<Vec<_>>().join(" ");
-            amz_headers.entry(name_lower).or_default().push(trimmed);
-        }
-    }
-
-    let mut result = String::new();
-    for (name, values) in amz_headers {
-        result.push_str(&format!("{}:{}\n", name, values.join(",")));
-    }
-    result
-}
-
-/// Build canonicalized resource for SigV2
-fn build_canonicalized_resource_v2<B>(request: &Request<B>) -> String {
-    let uri = request.uri();
-    let path = uri.path();
-
-    let mut resource = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
-
-    // Add sub-resources if present in query string
-    if let Some(query) = uri.query() {
-        let mut sub_resources: Vec<(String, Option<String>)> = Vec::new();
-
-        for param in query.split('&') {
-            let mut parts = param.splitn(2, '=');
-            let key = parts.next().unwrap_or("");
-            let value = parts.next();
-
-            if SIGV2_SUB_RESOURCES.contains(&key) {
-                sub_resources.push((key.to_string(), value.map(|s| s.to_string())));
-            }
-        }
-
-        if !sub_resources.is_empty() {
-            sub_resources.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let sub_resource_str: Vec<String> = sub_resources
-                .into_iter()
-                .map(|(k, v)| {
-                    if let Some(val) = v {
-                        format!("{}={}", k, val)
-                    } else {
-                        k
-                    }
-                })
-                .collect();
-
-            resource.push('?');
-            resource.push_str(&sub_resource_str.join("&"));
-        }
-    }
-
-    resource
-}
-
-/// Calculate SigV2 signature using HMAC-SHA1
-fn calculate_signature_v2(secret_key: &str, string_to_sign: &str) -> String {
-    let mut mac =
-        HmacSha1::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(string_to_sign.as_bytes());
-    let result = mac.finalize().into_bytes();
-    BASE64.encode(result)
-}
-
-/// Parse date for SigV2 (supports multiple formats)
-fn parse_date_v2(date_str: &str) -> Result<DateTime<Utc>, AuthError> {
-    // Try RFC 2822 format first
-    if let Ok(dt) = DateTime::parse_from_rfc2822(date_str) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-
-    // Try ISO 8601 format
-    if let Ok(dt) = NaiveDateTime::parse_from_str(date_str, "%Y%m%dT%H%M%SZ") {
-        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
-    }
-
-    // Try common HTTP date format
-    if let Ok(dt) = NaiveDateTime::parse_from_str(date_str, "%a, %d %b %Y %H:%M:%S GMT") {
-        return Ok(DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc));
-    }
-
-    Err(AuthError::AccessDenied("invalid date format".to_string()))
 }
 
 /// Get the request date from headers
@@ -1266,6 +1025,8 @@ pub enum AuthError {
     RequestTimeTooSkewed,
     /// A presigned URL is past its `X-Amz-Expires` window
     ExpiredToken(String),
+    /// Signed with SigV2 (header or presigned URL), which is not accepted.
+    UnsupportedSigV2,
     /// Internal error
     #[allow(dead_code)]
     InternalError,
@@ -1292,6 +1053,7 @@ impl AuthError {
             AuthError::SignatureDoesNotMatch => "signature",
             AuthError::RequestTimeTooSkewed => "clock_skew",
             AuthError::ExpiredToken(_) => "expired",
+            AuthError::UnsupportedSigV2 => "sigv2",
             AuthError::InternalError => "internal",
         }
     }
@@ -1319,6 +1081,17 @@ impl IntoResponse for AuthError {
             // key off it to decide whether to ask for a fresh link rather than
             // to report a permissions problem.
             AuthError::ExpiredToken(msg) => (StatusCode::FORBIDDEN, "ExpiredToken", msg),
+            // S3's own answer to SigV2 on a bucket that doesn't take it,
+            // plus what to change: boto3 still presigns with SigV2 for a
+            // custom endpoint unless told otherwise.
+            AuthError::UnsupportedSigV2 => (
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "The authorization mechanism you have provided is not supported. Please use \
+                 AWS4-HMAC-SHA256 (Signature Version 4). For boto3 presigned URLs, create the \
+                 client with botocore.config.Config(signature_version=\"s3v4\")."
+                    .to_string(),
+            ),
             AuthError::InternalError => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -1366,9 +1139,9 @@ impl<B> AuthExt for Request<B> {
 #[cfg(test)]
 mod sigv4_tests {
     use super::{
-        ParsedAuth, build_canonical_query_string, build_string_to_sign, calculate_signature_v4,
-        constant_time_eq, derive_signing_key, hex_sha256, parse_authorization_header, url_decode,
-        url_encode,
+        AuthError, build_canonical_query_string, build_string_to_sign, calculate_signature_v4,
+        constant_time_eq, derive_signing_key, hex_sha256, is_presigned_v2,
+        parse_authorization_header, url_decode, url_encode,
     };
 
     // ── AWS's own published vectors ───────────────────────────────────────
@@ -1534,21 +1307,13 @@ mod sigv4_tests {
                       Credential=AKIDEXAMPLE/20150830/us-east-1/s3/aws4_request, \
                       SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
                       Signature=deadbeef";
-        match parse_authorization_header(header).expect("parse") {
-            ParsedAuth::V4 {
-                access_key_id,
-                signed_headers,
-                signature,
-            } => {
-                assert_eq!(access_key_id, "AKIDEXAMPLE");
-                assert_eq!(
-                    signed_headers,
-                    vec!["host", "x-amz-content-sha256", "x-amz-date"]
-                );
-                assert_eq!(signature, "deadbeef");
-            }
-            ParsedAuth::V2 { .. } => panic!("parsed a SigV4 header as SigV2"),
-        }
+        let parsed = parse_authorization_header(header).expect("parse");
+        assert_eq!(parsed.access_key_id, "AKIDEXAMPLE");
+        assert_eq!(
+            parsed.signed_headers,
+            vec!["host", "x-amz-content-sha256", "x-amz-date"]
+        );
+        assert_eq!(parsed.signature, "deadbeef");
     }
 
     /// Signed header names are matched against the request case-insensitively,
@@ -1557,28 +1322,25 @@ mod sigv4_tests {
     fn signed_header_names_are_lowercased() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20150830/us-east-1/s3/aws4_request, \
                       SignedHeaders=Host;X-Amz-Date, Signature=abc123";
-        match parse_authorization_header(header).expect("parse") {
-            ParsedAuth::V4 { signed_headers, .. } => {
-                assert_eq!(signed_headers, vec!["host", "x-amz-date"]);
-            }
-            ParsedAuth::V2 { .. } => panic!("wrong variant"),
-        }
+        let parsed = parse_authorization_header(header).expect("parse");
+        assert_eq!(parsed.signed_headers, vec!["host", "x-amz-date"]);
     }
 
+    /// SigV2, in a header or a presigned URL, is refused as such, so the
+    /// client is told what to change rather than that its key is wrong.
     #[test]
-    fn a_sigv2_header_splits_on_the_first_colon_only() {
-        // A secret-derived signature is base64 and can itself contain no
-        // colon, but the key id must not be allowed to eat one either.
-        match parse_authorization_header("AWS AKIDEXAMPLE:abc:def").expect("parse") {
-            ParsedAuth::V2 {
-                access_key_id,
-                signature,
-            } => {
-                assert_eq!(access_key_id, "AKIDEXAMPLE");
-                assert_eq!(signature, "abc:def");
-            }
-            ParsedAuth::V4 { .. } => panic!("parsed a SigV2 header as SigV4"),
-        }
+    fn sigv2_is_refused_with_its_own_error() {
+        assert!(matches!(
+            parse_authorization_header("AWS AKIDEXAMPLE:c2lnbmF0dXJl"),
+            Err(AuthError::UnsupportedSigV2)
+        ));
+        assert!(is_presigned_v2(
+            "AWSAccessKeyId=AKID&Signature=abc%3D&Expires=1790914946"
+        ));
+        assert!(!is_presigned_v2(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a&X-Amz-Signature=b"
+        ));
+        assert!(!is_presigned_v2("versioning"));
     }
 
     #[test]
