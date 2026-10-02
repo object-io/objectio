@@ -15,6 +15,21 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Largest piece [`WriteCache::write_zeroes`] writes at once.
+pub const ZERO_PIECE: u64 = 4 * 1024 * 1024;
+
+/// Run journal I/O (appends, fsyncs, rotation) on the blocking pool: an
+/// fsync on an async worker stalls every task scheduled on it.
+async fn blocking<T, F>(f: F) -> BlockResult<T>
+where
+    F: FnOnce() -> BlockResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| BlockError::Internal(format!("journal task: {e}")))?
+}
+
 /// A dirty chunk that needs to be flushed to storage
 #[derive(Debug, Clone)]
 pub struct DirtyChunk {
@@ -578,6 +593,72 @@ impl WriteCache {
         Ok(())
     }
 
+    /// [`Self::write`] from async code: run on the blocking pool, since it
+    /// appends to the journal and fsyncs it. Returns once the write is
+    /// durable, as `write` does; dropping the future does not undo it.
+    ///
+    /// # Errors
+    /// As [`Self::write`], or if the blocking task cannot run.
+    pub async fn write_durable(
+        self: &Arc<Self>,
+        volume_id: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> BlockResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let cache = Arc::clone(self);
+        let volume_id = volume_id.to_string();
+        blocking(move || cache.write(&volume_id, offset, &data)).await
+    }
+
+    /// Write `length` zero bytes at `offset` (a trim), a piece of at most
+    /// [`ZERO_PIECE`] at a time, so a large range is never one allocation
+    /// of its whole length. Each piece is durable as [`Self::write_durable`].
+    ///
+    /// # Errors
+    /// As [`Self::write`]; the pieces before a failed one stay written.
+    pub async fn write_zeroes(
+        self: &Arc<Self>,
+        volume_id: &str,
+        offset: u64,
+        length: u64,
+    ) -> BlockResult<()> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| BlockError::InvalidSize(format!("{length} bytes at {offset}")))?;
+        let zeros = Bytes::from(vec![0u8; length.min(ZERO_PIECE) as usize]);
+        let mut at = offset;
+        while at < end {
+            let piece = (end - at).min(ZERO_PIECE);
+            self.write_durable(volume_id, at, zeros.slice(..piece as usize))
+                .await?;
+            at += piece;
+        }
+        Ok(())
+    }
+
+    /// [`Self::sync`] from async code, on the blocking pool.
+    ///
+    /// # Errors
+    /// As [`Self::sync`], or if the blocking task cannot run.
+    pub async fn sync_durable(self: &Arc<Self>) -> BlockResult<()> {
+        let cache = Arc::clone(self);
+        blocking(move || cache.sync()).await
+    }
+
+    /// [`Self::reset_journal_if_clean`] from async code, on the blocking
+    /// pool.
+    ///
+    /// # Errors
+    /// As [`Self::reset_journal_if_clean`], or if the blocking task cannot
+    /// run.
+    pub async fn reset_journal_if_clean_async(self: &Arc<Self>) -> BlockResult<bool> {
+        let cache = Arc::clone(self);
+        blocking(move || cache.reset_journal_if_clean()).await
+    }
+
     /// Every dirty chunk of a volume with its version, to flush now. They
     /// stay dirty until [`Self::mark_flushed`], so a chunk whose flush fails
     /// is retried rather than dropped.
@@ -849,5 +930,56 @@ mod tests {
         cache.mark_flushed("vol1", &[(dirty[0].0, dirty[0].2)]);
         assert!(cache.reset_journal_if_clean().unwrap());
         assert!(cache.recover().unwrap().is_empty());
+    }
+
+    /// A write from async code is journaled before it returns: a cache
+    /// opened on the same journal recovers it.
+    #[tokio::test]
+    async fn write_durable_is_journaled_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block.journal");
+        let mapper = Arc::new(ChunkMapper::default());
+        let cache = Arc::new(WriteCache::with_journal(Arc::clone(&mapper), &path));
+        cache.init_volume("vol1");
+        cache
+            .write_durable("vol1", 8192, Bytes::from_static(b"durable"))
+            .await
+            .unwrap();
+        cache.sync_durable().await.unwrap();
+        settle(&cache, "vol1");
+        assert_eq!(cache.read("vol1", 8192, 7).unwrap(), b"durable");
+
+        let reopened = WriteCache::with_journal(mapper, &path);
+        let recovered: Vec<_> = reopened
+            .recover()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.3)
+            .collect();
+        assert_eq!(recovered, vec![&b"durable"[..]]);
+        assert!(
+            !cache.reset_journal_if_clean_async().await.unwrap(),
+            "reset with dirty data"
+        );
+    }
+
+    /// Zeroes go in a piece at a time across chunks, and only the range
+    /// given is zeroed.
+    #[tokio::test]
+    async fn write_zeroes_zeroes_just_the_range_in_pieces() {
+        let cache = Arc::new(test_cache()); // 1 MiB chunks
+        cache.init_volume("vol1");
+        let len = 3 * ZERO_PIECE;
+        cache.write("vol1", 0, &vec![0xab; len as usize]).unwrap();
+        // Unaligned, longer than one piece, across many chunks.
+        let (off, n) = (4097, ZERO_PIECE + 12_345);
+        cache.write_zeroes("vol1", off, n).await.unwrap();
+        settle(&cache, "vol1");
+        let got = cache.read("vol1", 0, len).unwrap();
+        for (i, b) in got.iter().enumerate() {
+            let zeroed = (off..off + n).contains(&(i as u64));
+            assert_eq!(*b, if zeroed { 0 } else { 0xab }, "byte {i}");
+        }
+        assert!(cache.write_zeroes("vol1", u64::MAX, 2).await.is_err());
     }
 }
