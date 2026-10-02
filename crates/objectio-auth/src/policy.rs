@@ -45,6 +45,27 @@ impl BucketPolicy {
     /// Parse a policy from JSON
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         let policy: Self = serde_json::from_str(json)?;
+        // Principal and NotPrincipal are exclusive; NotPrincipal only denies.
+        let raw: serde_json::Value = serde_json::from_str(json)?;
+        let statements = match raw.get("Statement") {
+            Some(serde_json::Value::Array(a)) => a.clone(),
+            Some(one) => vec![one.clone()],
+            None => Vec::new(),
+        };
+        for st in &statements {
+            if st.get("NotPrincipal").is_some() {
+                if st.get("Principal").is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a statement can't have both Principal and NotPrincipal",
+                    ));
+                }
+                if st.get("Effect").and_then(|e| e.as_str()) != Some("Deny") {
+                    return Err(serde::de::Error::custom(
+                        "NotPrincipal is allowed only with \"Effect\": \"Deny\"",
+                    ));
+                }
+            }
+        }
         if let Some(op) = policy
             .statements
             .iter()
@@ -84,6 +105,12 @@ pub struct PolicyStatement {
     /// having to be hand-edited.
     #[serde(default)]
     pub principal: Principal,
+    /// NotPrincipal: the statement applies to everyone *but* these. Only on
+    /// a Deny, as AWS allows it. It used to be ignored, and Principal
+    /// defaulted to everyone: an "Allow, NotPrincipal X" allowed everyone,
+    /// a "Deny, NotPrincipal admins" denied the admins too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_principal: Option<Principal>,
     /// Actions this statement covers
     pub action: ActionList,
     /// Resources this statement covers
@@ -169,6 +196,7 @@ impl PolicyStatementBuilder {
 
     pub fn build(self) -> PolicyStatement {
         PolicyStatement {
+            not_principal: None,
             sid: self.sid,
             effect: self.effect,
             principal: self.principal.unwrap_or(Principal::Wildcard),
@@ -293,6 +321,22 @@ impl<'de> Deserialize<'de> for Principal {
                                 ));
                             }
                         }
+                    } else if key == "Service" || key == "CanonicalUser" || key == "Federated" {
+                        // Principals that are never one of our users (a
+                        // logging service, say): kept so the policy parses,
+                        // and named so they match no user ARN.
+                        let value: serde_json::Value = map.next_value()?;
+                        let names: Vec<String> = match value {
+                            serde_json::Value::String(s) => vec![s],
+                            serde_json::Value::Array(a) => a
+                                .into_iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        obio_principals
+                            .get_or_insert_with(Vec::new)
+                            .extend(names.into_iter().map(|n| format!("{key}:{n}")));
                     } else {
                         // Skip unknown keys
                         let _: serde_json::Value = map.next_value()?;
@@ -668,7 +712,11 @@ impl PolicyEvaluator {
 
         for statement in &policy.statements {
             // Check if statement applies to this request
-            if !self.matches_principal(&statement.principal, &context.user_arn) {
+            let principal_applies = match &statement.not_principal {
+                Some(excepted) => !self.matches_principal(excepted, &context.user_arn),
+                None => self.matches_principal(&statement.principal, &context.user_arn),
+            };
+            if !principal_applies {
                 continue;
             }
             if !self.matches_action(&statement.action, &context.action) {
@@ -711,7 +759,11 @@ impl PolicyEvaluator {
         let mut allow_stmt: Option<&PolicyStatement> = None;
 
         for statement in &policy.statements {
-            if !self.matches_principal(&statement.principal, &context.user_arn) {
+            let principal_applies = match &statement.not_principal {
+                Some(excepted) => !self.matches_principal(excepted, &context.user_arn),
+                None => self.matches_principal(&statement.principal, &context.user_arn),
+            };
+            if !principal_applies {
                 continue;
             }
             if !self.matches_action(&statement.action, &context.action) {
@@ -1812,5 +1864,31 @@ mod principal_spelling_tests {
             r#"{"Null":{"s3:x-amz-server-side-encryption":"true"}}"#,
         );
         assert_eq!(allows(&null, &get_request(&[])), PolicyDecision::Deny);
+    }
+
+    /// NotPrincipal only on a Deny, and then it spares exactly those named.
+    #[test]
+    fn not_principal_spares_whom_it_names_and_only_denies() {
+        let allow = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "NotPrincipal":{"AWS":"arn:obio:iam::objectio:user/x"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+        assert!(BucketPolicy::from_json(allow).is_err());
+        let deny = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny",
+            "NotPrincipal":{"AWS":"arn:obio:iam::objectio:user/admin"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+        let evaluate = |user: &str| {
+            PolicyEvaluator::new().evaluate(
+                &BucketPolicy::from_json(deny).unwrap(),
+                &RequestContext::new(user, "s3:GetObject", "arn:obio:s3:::b/k"),
+            )
+        };
+        assert_eq!(
+            evaluate("arn:obio:iam::objectio:user/admin"),
+            PolicyDecision::ImplicitDeny
+        );
+        assert_eq!(
+            evaluate("arn:obio:iam::objectio:user/eve"),
+            PolicyDecision::Deny
+        );
     }
 }

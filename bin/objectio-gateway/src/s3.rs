@@ -2361,11 +2361,35 @@ pub async fn list_buckets(
 
     let mut client = state.meta_client.clone();
 
+    // Least privilege: a user lists the buckets it owns; a tenant's admins
+    // list the tenant's; the system admin lists all. Every user used to
+    // see every bucket of its tenant (and, in system scope, of all
+    // tenants), whether or not it could touch them.
+    let owner = match auth.as_ref() {
+        Some(Extension(a)) if a.user_arn != crate::admin::SYSTEM_ADMIN_USER_ARN => {
+            let tenant_admin = !a.tenant.is_empty()
+                && client
+                    .get_tenant(objectio_proto::metadata::GetTenantRequest {
+                        name: a.tenant.clone(),
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.into_inner().tenant)
+                    .is_some_and(|t| {
+                        t.admin_users
+                            .iter()
+                            .any(|u| u == &a.user_id || u == &a.user_arn)
+                    });
+            if tenant_admin {
+                String::new()
+            } else {
+                a.user_id.clone()
+            }
+        }
+        _ => String::new(),
+    };
     match client
-        .list_buckets(ListBucketsRequest {
-            owner: String::new(),
-            tenant,
-        })
+        .list_buckets(ListBucketsRequest { owner, tenant })
         .await
     {
         Ok(response) => {
@@ -12794,8 +12818,17 @@ mod s3_tests {
         assert!(!vars.contains_key("s3:x-amz-server-side-encryption"));
         // Absent must stay absent: a policy that denies on a value would
         // otherwise match an empty string and refuse every plain PUT.
+        // Secure only when the proxy in front says the client used HTTPS.
         assert_eq!(
             vars.get("aws:SecureTransport").map(String::as_str),
+            Some("false")
+        );
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            sse_condition_vars(Some(&h))
+                .get("aws:SecureTransport")
+                .map(String::as_str),
             Some("true")
         );
     }
