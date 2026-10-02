@@ -788,6 +788,7 @@ async fn restore_listing(
             pool: String::new(),
             // Its home, if it has one, is where it was found.
             home_osd_ids: Vec::new(),
+            ..Default::default()
         }),
     )
     .await

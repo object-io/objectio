@@ -3860,6 +3860,29 @@ impl MetadataService for MetaService {
             .as_ref()
             .and_then(|s| s.read_object_listing(&listing_key));
 
+        // A conditional write is decided here, against the entry the
+        // MultiCas below expects: a write that changes it meanwhile makes
+        // the MultiCas conflict, so two conditional writers can't both win.
+        if !req.if_match.is_empty() || !req.if_none_match.is_empty() {
+            let current_etag = expected_bytes
+                .as_deref()
+                .and_then(|b| ObjectListingEntry::decode(b).ok())
+                .map(|e| e.etag.trim_matches('"').to_string());
+            let matches = |want: &str| {
+                current_etag
+                    .as_deref()
+                    .is_some_and(|e| want == "*" || e == want.trim_matches('"'))
+            };
+            if !req.if_match.is_empty() && current_etag.is_none() {
+                return Err(Status::failed_precondition("NoSuchKey"));
+            }
+            if (!req.if_match.is_empty() && !matches(&req.if_match))
+                || (!req.if_none_match.is_empty() && matches(&req.if_none_match))
+            {
+                return Err(Status::failed_precondition("PreconditionFailed"));
+            }
+        }
+
         // The key's home, recorded with its listing when it moved (or is
         // new): where the gateway just wrote its ObjectMeta.
         let home_key = format!("{}/{}", req.bucket, req.key);
@@ -3899,6 +3922,13 @@ impl MetadataService for MetaService {
             match raft.client_write(cmd).await {
                 Ok(r) => match r.data {
                     MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. }
+                        if !req.if_match.is_empty() || !req.if_none_match.is_empty() =>
+                    {
+                        // Another write to the key won: the condition was
+                        // decided on a state that is gone.
+                        return Err(Status::failed_precondition("PreconditionFailed"));
+                    }
                     MetaResponse::MultiCasConflict { .. } => {
                         return Err(Status::aborted(
                             "listing changed during PUT; client should retry",
