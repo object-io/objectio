@@ -398,9 +398,25 @@ pub enum ListenerKind {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Secret used to sign session tokens — derived from a fixed prefix.
-/// In production this should be a configurable secret.
-const TOKEN_SECRET: &[u8] = b"objectio-console-session-v1";
+/// The key console session tokens are signed with: derived from the
+/// cluster's secret at startup (`set_session_key`), so every gateway
+/// accepts every gateway's sessions. It was a constant in this source file.
+static SESSION_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Set the session signing key, once, at startup.
+pub fn set_session_key(key: Vec<u8>) {
+    let _ = SESSION_KEY.set(key);
+}
+
+fn session_key() -> &'static [u8] {
+    // Unset (a test, or a gateway not started through `run`): a random key
+    // for this process, never a guessable one.
+    SESSION_KEY.get_or_init(|| {
+        let mut k = vec![0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+        k
+    })
+}
 
 /// Session token validity: 24 hours
 const SESSION_TTL_SECS: u64 = 86400;
@@ -631,7 +647,7 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
 
     // Verify HMAC
     let expected_sig = sign_payload(payload);
-    if sig != expected_sig {
+    if !constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
         // Try legacy format (colon-delimited, no tenant)
         return validate_legacy_token(&token);
     }
@@ -669,7 +685,7 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
 fn validate_legacy_token(token: &str) -> Option<SessionInfo> {
     let (payload, sig) = token.rsplit_once(':')?;
     let expected_sig = sign_payload(payload);
-    if sig != expected_sig {
+    if !constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
         return None;
     }
     let fields: Vec<&str> = payload.splitn(3, ':').collect();
@@ -694,8 +710,13 @@ fn validate_legacy_token(token: &str) -> Option<SessionInfo> {
     })
 }
 
+/// Equal, compared in time that doesn't depend on where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn sign_payload(payload: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(TOKEN_SECRET).expect("HMAC key");
+    let mut mac = HmacSha256::new_from_slice(session_key()).expect("HMAC key");
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

@@ -11855,6 +11855,46 @@ impl MetadataService for MetaService {
         }))
     }
 
+    async fn get_sts_signing_key(
+        &self,
+        _request: Request<objectio_proto::metadata::GetStsSigningKeyRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetStsSigningKeyResponse>, Status> {
+        const TABLE: &str = "cluster_secrets";
+        const KEY: &str = "sts-signing-key";
+        let read = || {
+            self.store
+                .as_ref()
+                .and_then(|s| s.read_named(TABLE, KEY))
+                .filter(|k| k.len() >= 32)
+        };
+        if let Some(key) = read() {
+            return Ok(Response::new(
+                objectio_proto::metadata::GetStsSigningKeyResponse { key },
+            ));
+        }
+        // First use: one random key, created only if none exists, so two
+        // racing creators end up with the same one.
+        let mut fresh = vec![0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut fresh);
+        match self
+            .cas_one(
+                objectio_meta_store::CasTable::Named(TABLE.into()),
+                KEY,
+                None,
+                Some(fresh),
+                "create-sts-signing-key",
+            )
+            .await
+        {
+            Ok(()) => info!("Created the cluster's STS signing key"),
+            Err(e) if e.code() == tonic::Code::Aborted => {}
+            Err(e) => return Err(e),
+        }
+        read()
+            .map(|key| Response::new(objectio_proto::metadata::GetStsSigningKeyResponse { key }))
+            .ok_or_else(|| Status::unavailable("STS signing key not readable yet; retry"))
+    }
+
     async fn create_role(
         &self,
         request: Request<CreateRoleRequest>,

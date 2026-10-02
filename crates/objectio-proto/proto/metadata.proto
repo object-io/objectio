@@ -258,6 +258,10 @@ service MetadataService {
     rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
     // Deactivate or reactivate an access key.
     rpc UpdateAccessKey(UpdateAccessKeyRequest) returns (UpdateAccessKeyResponse);
+    // The cluster's STS signing key: random, created on first use, shared
+    // by every gateway so each accepts the others' temporary credentials.
+    // Internal (gateway to meta); never exposed through an admin API.
+    rpc GetStsSigningKey(GetStsSigningKeyRequest) returns (GetStsSigningKeyResponse);
     // Roles: identities that are assumed (STS), with a trust policy saying
     // who may assume them, and named policies attached saying what they
     // may do.
@@ -2515,6 +2519,9 @@ message UpdateAccessKeyRequest {
     KeyStatus status = 2;
 }
 message UpdateAccessKeyResponse { AccessKeyMeta key = 1; }
+
+message GetStsSigningKeyRequest {}
+message GetStsSigningKeyResponse { bytes key = 1; }
 
 message RoleObject {
     string name = 1;
