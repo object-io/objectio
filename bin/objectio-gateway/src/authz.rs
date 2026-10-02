@@ -893,6 +893,16 @@ pub async fn authz_layer(
 ) -> Response {
     // No identity on the request means `--no-auth`, or a route that sits ahead
     // of the auth layer. Either way there is no principal to evaluate.
+    // What a proxy forwards is believed only from a trusted one: anyone
+    // could send "X-Forwarded-Proto: https" over plain HTTP and pass a
+    // policy that requires TLS.
+    let peer = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| c.0.ip());
+    if peer.is_some_and(|p| !state.trusted_proxies.trusts(p)) {
+        request.headers_mut().remove("x-forwarded-proto");
+    }
     if request.extensions().get::<AuthResult>().is_none() {
         return next.run(request).await;
     }

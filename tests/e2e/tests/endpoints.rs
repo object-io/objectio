@@ -165,3 +165,40 @@ fn source_ip_is_the_peer_unless_a_trusted_proxy_says_otherwise() {
         403
     );
 }
+
+#[test]
+fn only_a_trusted_proxy_can_say_the_client_used_tls() {
+    let tls_only = policy(
+        &json!({"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::tls/*",
+        "Condition": {"Bool": {"aws:SecureTransport": "true"}}}),
+    );
+    let open = b"<PublicAccessBlockConfiguration></PublicAccessBlockConfiguration>";
+    let via_https = |base: &str| {
+        reqwest::blocking::Client::new()
+            .get(format!("{base}/tls/k"))
+            .header("X-Forwarded-Proto", "https")
+            .send()
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+    let setup = |c: &Cluster| {
+        c.request("PUT", "/tls", &[]).expect(200);
+        c.request("PUT", "/tls/k", b"x").expect(200);
+        c.request("PUT", "/tls?publicAccessBlock", open).expect(200);
+        c.request("PUT", "/tls?policy", &tls_only).expect_ok();
+    };
+
+    // Plain HTTP from the client itself: the header is its own claim.
+    let c = Cluster::start();
+    setup(&c);
+    assert_eq!(via_https(&c.endpoint), 403);
+    drop(c);
+
+    // From a trusted proxy, it says what the proxy saw.
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--trusted-proxies", "127.0.0.1"]);
+    setup(&c);
+    assert_eq!(via_https(&c.endpoint), 200);
+    assert_eq!(anonymous(&c.endpoint, "/tls/k").status, 403);
+}

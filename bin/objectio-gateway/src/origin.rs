@@ -1,11 +1,13 @@
 //! Where a request came from, for policies: the client's address
 //! (`aws:SourceIp`) and the named endpoint it arrived on (`aws:SourceVpce`).
 //!
-//! Both come from the connection, never from what the client says. The one
-//! exception is `X-Forwarded-For`, believed only as far back as the chain of
-//! proxies the operator lists as trusted (`--trusted-proxies`): a load
-//! balancer in front of the gateway is the peer every request arrives from,
-//! and the client is the address it forwarded for.
+//! Both come from the connection, never from what the client says. The
+//! exception is what a proxy forwards — `X-Forwarded-For` (the client) and
+//! `X-Forwarded-Proto` (whether it used TLS, `aws:SecureTransport`) —
+//! believed only from the proxies the operator lists as trusted
+//! (`--trusted-proxies`): a load balancer in front of the gateway is the
+//! peer every request arrives from, and these say what it saw. From anyone
+//! else they are dropped before anything reads them.
 //!
 //! An endpoint is a data-plane listener with a name: `--endpoint-name` for
 //! `--listen`, and `--data-listen ADDR=NAME` for more. Run one inside the
@@ -52,6 +54,12 @@ impl TrustedProxies {
             out.push(entry.to_string());
         }
         Ok(Self(out))
+    }
+
+    /// Whether `peer` is a proxy whose forwarding headers are believed.
+    #[must_use]
+    pub fn trusts(&self, peer: IpAddr) -> bool {
+        self.contains(&peer.to_canonical())
     }
 
     fn contains(&self, ip: &IpAddr) -> bool {
