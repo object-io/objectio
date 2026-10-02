@@ -27,8 +27,7 @@ type Tenant struct {
 	UpdatedAt    int64             `json:"updated_at,omitempty"`
 	// Dedup is the tenant's deduplication policy ({"mode", "scope"}) or null
 	// to inherit. Kept as raw JSON so that UpdateTenant sends back exactly
-	// what it read: the server replaces the whole tenant, and a field left
-	// out resets to inherit.
+	// what it read.
 	Dedup json.RawMessage `json:"dedup,omitempty"`
 }
 
@@ -62,13 +61,9 @@ func (c *Client) ListTenants(ctx context.Context) ([]Tenant, error) {
 }
 
 // UpdateTenant changes a tenant by reading it, applying update, and writing
-// the whole thing back. System admin only.
-//
-// It is read-modify-write rather than a partial PUT because the server
-// replaces the tenant wholesale: any field a PUT leaves out — admins,
-// quotas, labels, the dedup policy — is reset, and `enabled` defaults to
-// true. Taking a function keeps a caller from having to restate every field
-// to change one. The name cannot be changed; update's edits to it are
+// it back. System admin only. The server applies the fields sent to what it
+// stores, so this is also safe against an older server that replaced the
+// whole tenant. The name cannot be changed; update's edits to it are
 // ignored.
 //
 // Two concurrent updates are not merged: the server compares against what
@@ -301,10 +296,7 @@ func (c *Client) DeactivateAccessKey(ctx context.Context, accessKeyID string) (*
 
 // ActivateAccessKey reverses DeactivateAccessKey.
 //
-// Only the system admin can reactivate a key: the server finds a key's owner
-// through the lookup authentication uses, which does not return inactive
-// keys, so it cannot tell which tenant an inactive key belongs to and falls
-// back to requiring the system admin.
+// The system admin, or an admin of the key's tenant, may reactivate it.
 func (c *Client) ActivateAccessKey(ctx context.Context, accessKeyID string) (*AccessKey, error) {
 	return c.UpdateAccessKey(ctx, accessKeyID, AccessKeyUpdate{Status: KeyActive})
 }
