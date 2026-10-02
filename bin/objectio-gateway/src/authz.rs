@@ -480,6 +480,38 @@ async fn load_identity_policies(
     policies
 }
 
+/// The tags of the object at `bucket/key`, if it exists.
+async fn existing_object_tags(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> std::collections::HashMap<String, String> {
+    let Ok(placement) = state
+        .meta_client
+        .clone()
+        .get_placement(objectio_proto::metadata::GetPlacementRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: 0,
+            storage_class: String::new(),
+        })
+        .await
+    else {
+        return std::collections::HashMap::new();
+    };
+    crate::osd_pool::get_object_meta_from_any(
+        &state.osd_pool,
+        &placement.into_inner().nodes,
+        bucket,
+        key,
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|o| o.tags)
+    .unwrap_or_default()
+}
+
 /// Everything one authorization decision needs.
 ///
 /// Grouped into a struct because the two resource identities differ: `key`
@@ -557,6 +589,18 @@ pub async fn authorize(
     let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
     for (k, v) in sse_condition_vars(req.headers) {
         context = context.with_variable(k, v);
+    }
+    // A listing's prefix.
+    if req.key.is_none() && !req.scope_key.is_empty() {
+        context = context.with_variable("s3:prefix", req.scope_key);
+    }
+    // The object's own tags, read only when the bucket policy asks.
+    if let (Some(key), Some(policy)) = (req.key, &bucket.policy)
+        && format!("{policy:?}").contains("s3:ExistingObjectTag/")
+    {
+        for (k, v) in existing_object_tags(state, req.bucket, key).await {
+            context = context.with_variable(format!("s3:ExistingObjectTag/{k}"), v);
+        }
     }
     // Surface credential-type so policies can deny permanent-key direct
     // access while still allowing STS-vended sessions through.

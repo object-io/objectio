@@ -44,7 +44,18 @@ impl BucketPolicy {
 
     /// Parse a policy from JSON
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let policy: Self = serde_json::from_str(json)?;
+        if let Some(op) = policy
+            .statements
+            .iter()
+            .filter_map(|s| s.condition.as_ref())
+            .find_map(Conditions::unknown_operator)
+        {
+            return Err(serde::de::Error::custom(format!(
+                "unknown condition operator {op:?}"
+            )));
+        }
+        Ok(policy)
     }
 
     /// Serialize to JSON
@@ -200,6 +211,17 @@ impl Serialize for Principal {
             }
         }
     }
+}
+
+/// An ARN in ObjectIO's partition. Policies are written for S3 with
+/// `arn:aws:` ARNs (every tool, tutorial and generated policy does); they
+/// name the same buckets, keys and users as `arn:obio:` ones. Matching only
+/// `arn:obio:` made a correct S3 policy grant (and deny) nothing.
+fn obio_partition(arn: &str) -> std::borrow::Cow<'_, str> {
+    arn.strip_prefix("arn:aws:")
+        .map_or(std::borrow::Cow::Borrowed(arn), |rest| {
+            std::borrow::Cow::Owned(format!("arn:obio:{rest}"))
+        })
 }
 
 impl<'de> Deserialize<'de> for Principal {
@@ -397,39 +419,138 @@ impl<'de> Deserialize<'de> for ResourceList {
     }
 }
 
-/// Policy conditions
+/// Policy conditions: operator → condition key → values, as IAM writes
+/// them (`{"StringEquals": {"s3:prefix": ["a/", "b/"]}}`).
+///
+/// Every IAM operator is understood, with the `IfExists` suffix and the
+/// `ForAnyValue:` / `ForAllValues:` qualifiers. An operator that isn't
+/// (see [`Conditions::unknown_operator`]) is refused when a policy is put,
+/// and if one is ever met in a stored policy its statement can only deny:
+/// an Allow under it never matches, a Deny under it always does. The
+/// conditions used to be a fixed set of fields, so any other operator was
+/// dropped on parsing, and an Allow it guarded became unconditional.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "PascalCase")]
-pub struct Conditions {
-    /// String equals conditions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub string_equals: Option<HashMap<String, StringOrList>>,
-    /// String not equals conditions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub string_not_equals: Option<HashMap<String, StringOrList>>,
-    /// String like (wildcard) conditions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub string_like: Option<HashMap<String, StringOrList>>,
-    /// IP address conditions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip_address: Option<HashMap<String, StringOrList>>,
-    /// Not IP address conditions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_ip_address: Option<HashMap<String, StringOrList>>,
-    /// Date greater than conditions (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_greater_than: Option<HashMap<String, StringOrList>>,
-    /// Date less than conditions (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_less_than: Option<HashMap<String, StringOrList>>,
+#[serde(transparent)]
+pub struct Conditions(pub std::collections::BTreeMap<String, HashMap<String, StringOrList>>);
+
+/// The operators IAM defines, without `IfExists` or a set qualifier.
+const CONDITION_OPERATORS: &[&str] = &[
+    "StringEquals",
+    "StringNotEquals",
+    "StringEqualsIgnoreCase",
+    "StringNotEqualsIgnoreCase",
+    "StringLike",
+    "StringNotLike",
+    "NumericEquals",
+    "NumericNotEquals",
+    "NumericLessThan",
+    "NumericLessThanEquals",
+    "NumericGreaterThan",
+    "NumericGreaterThanEquals",
+    "DateEquals",
+    "DateNotEquals",
+    "DateLessThan",
+    "DateLessThanEquals",
+    "DateGreaterThan",
+    "DateGreaterThanEquals",
+    "Bool",
+    "BinaryEquals",
+    "IpAddress",
+    "NotIpAddress",
+    "ArnEquals",
+    "ArnLike",
+    "ArnNotEquals",
+    "ArnNotLike",
+    "Null",
+];
+
+/// An operator split into its parts: the base operator, whether `IfExists`
+/// was appended, and its set qualifier.
+struct Operator<'a> {
+    base: &'a str,
+    if_exists: bool,
+    for_all: bool,
 }
 
-/// String or list of strings (for conditions)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'a> Operator<'a> {
+    fn parse(name: &'a str) -> Option<Self> {
+        let (for_all, rest) = if let Some(r) = name.strip_prefix("ForAllValues:") {
+            (true, r)
+        } else if let Some(r) = name.strip_prefix("ForAnyValue:") {
+            (false, r)
+        } else {
+            (false, name)
+        };
+        let (base, if_exists) = match rest.strip_suffix("IfExists") {
+            Some(b) if b != "Null" => (b, true),
+            _ => (rest, false),
+        };
+        CONDITION_OPERATORS.contains(&base).then_some(Self {
+            base,
+            if_exists,
+            for_all,
+        })
+    }
+
+    /// A negated operator holds when nothing matches, and when the key is
+    /// missing.
+    fn negated(&self) -> bool {
+        matches!(
+            self.base,
+            "StringNotEquals"
+                | "StringNotEqualsIgnoreCase"
+                | "StringNotLike"
+                | "NumericNotEquals"
+                | "DateNotEquals"
+                | "NotIpAddress"
+                | "ArnNotEquals"
+                | "ArnNotLike"
+        )
+    }
+}
+
+impl Conditions {
+    /// The first operator in these conditions that isn't IAM's, if any.
+    pub fn unknown_operator(&self) -> Option<&str> {
+        self.0
+            .keys()
+            .find(|op| Operator::parse(op).is_none())
+            .map(String::as_str)
+    }
+}
+
+/// String or list of strings (for conditions). Booleans and numbers are
+/// taken as their text, as IAM takes them (`"Bool": {"k": true}`); they
+/// used to fail the whole policy's parse.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum StringOrList {
     Single(String),
     List(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for StringOrList {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        fn text(v: &serde_json::Value) -> Option<String> {
+            match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        }
+        let v = serde_json::Value::deserialize(d)?;
+        match &v {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|i| text(i).ok_or_else(|| serde::de::Error::custom("condition value")))
+                .collect::<Result<Vec<_>, _>>()
+                .map(StringOrList::List),
+            other => text(other)
+                .map(StringOrList::Single)
+                .ok_or_else(|| serde::de::Error::custom("condition value")),
+        }
+    }
 }
 
 impl StringOrList {
@@ -556,7 +677,7 @@ impl PolicyEvaluator {
             if !self.matches_resource(&statement.resource, &context.resource) {
                 continue;
             }
-            if !self.matches_conditions(&statement.condition, context) {
+            if !self.matches_conditions(&statement.condition, context, statement.effect) {
                 continue;
             }
 
@@ -599,7 +720,7 @@ impl PolicyEvaluator {
             if !self.matches_resource(&statement.resource, &context.resource) {
                 continue;
             }
-            if !self.matches_conditions(&statement.condition, context) {
+            if !self.matches_conditions(&statement.condition, context, statement.effect) {
                 continue;
             }
 
@@ -651,7 +772,7 @@ impl PolicyEvaluator {
                 if arn == "*" {
                     true
                 } else {
-                    self.matches_pattern(arn, user_arn)
+                    self.matches_pattern(&obio_partition(arn), user_arn)
                 }
             }),
         }
@@ -673,138 +794,123 @@ impl PolicyEvaluator {
         resources
             .0
             .iter()
-            .any(|resource| self.matches_pattern(resource, request_resource))
+            .any(|resource| self.matches_pattern(&obio_partition(resource), request_resource))
     }
 
-    /// Check if conditions match
+    /// Whether a statement's conditions hold for the request: every
+    /// operator, and for each every key (IAM's AND), with any of a key's
+    /// values matching (OR).
     fn matches_conditions(
         &self,
         conditions: &Option<Conditions>,
         context: &RequestContext,
+        effect: Effect,
     ) -> bool {
-        let conditions = match conditions {
-            Some(c) => c,
-            None => return true, // No conditions means match
+        let Some(conditions) = conditions else {
+            return true;
         };
-
-        // Check StringEquals
-        if let Some(ref string_equals) = conditions.string_equals {
-            for (key, expected) in string_equals {
-                let actuals = self.get_condition_values(key, context);
-                if actuals.is_empty()
-                    || !expected
-                        .as_vec()
-                        .iter()
-                        .any(|e| actuals.iter().any(|a| a == e))
-                {
+        for (name, keys) in &conditions.0 {
+            let Some(op) = Operator::parse(name) else {
+                // Not understood: fail toward denying.
+                return effect == Effect::Deny;
+            };
+            for (key, expected) in keys {
+                if !self.matches_condition(&op, key, &expected.as_vec(), context) {
                     return false;
                 }
             }
         }
-
-        // Check StringNotEquals
-        if let Some(ref string_not_equals) = conditions.string_not_equals {
-            for (key, not_expected) in string_not_equals {
-                let actuals = self.get_condition_values(key, context);
-                if not_expected
-                    .as_vec()
-                    .iter()
-                    .any(|e| actuals.iter().any(|a| a == e))
-                {
-                    return false;
-                }
-            }
-        }
-
-        // Check StringLike (with wildcards)
-        if let Some(ref string_like) = conditions.string_like {
-            for (key, patterns) in string_like {
-                let actuals = self.get_condition_values(key, context);
-                if actuals.is_empty() {
-                    return false;
-                }
-                if !patterns
-                    .as_vec()
-                    .iter()
-                    .any(|p| actuals.iter().any(|a| self.matches_pattern(p, a)))
-                {
-                    return false;
-                }
-            }
-        }
-
-        // Check IpAddress
-        if let (Some(ip_conditions), Some(source_ip)) = (&conditions.ip_address, context.source_ip)
-        {
-            for cidrs in ip_conditions.values() {
-                if !cidrs
-                    .as_vec()
-                    .iter()
-                    .any(|cidr| self.ip_matches_cidr(&source_ip, cidr))
-                {
-                    return false;
-                }
-            }
-        }
-
-        // Check NotIpAddress
-        if let (Some(not_ip_conditions), Some(source_ip)) =
-            (&conditions.not_ip_address, context.source_ip)
-        {
-            for cidrs in not_ip_conditions.values() {
-                if cidrs
-                    .as_vec()
-                    .iter()
-                    .any(|cidr| self.ip_matches_cidr(&source_ip, cidr))
-                {
-                    return false;
-                }
-            }
-        }
-
-        // Check DateGreaterThan
-        if let Some(ref date_gt) = conditions.date_greater_than {
-            for (key, thresholds) in date_gt {
-                let actual = match self.get_condition_value(key, context) {
-                    Some(v) => v,
-                    None => return false,
-                };
-                let actual_dt = match chrono::DateTime::parse_from_rfc3339(&actual) {
-                    Ok(dt) => dt,
-                    Err(_) => return false,
-                };
-                // All threshold values must be less than actual (actual > threshold)
-                if !thresholds.as_vec().iter().any(|t| {
-                    chrono::DateTime::parse_from_rfc3339(t)
-                        .is_ok_and(|threshold_dt| actual_dt > threshold_dt)
-                }) {
-                    return false;
-                }
-            }
-        }
-
-        // Check DateLessThan
-        if let Some(ref date_lt) = conditions.date_less_than {
-            for (key, thresholds) in date_lt {
-                let actual = match self.get_condition_value(key, context) {
-                    Some(v) => v,
-                    None => return false,
-                };
-                let actual_dt = match chrono::DateTime::parse_from_rfc3339(&actual) {
-                    Ok(dt) => dt,
-                    Err(_) => return false,
-                };
-                // All threshold values must be greater than actual (actual < threshold)
-                if !thresholds.as_vec().iter().any(|t| {
-                    chrono::DateTime::parse_from_rfc3339(t)
-                        .is_ok_and(|threshold_dt| actual_dt < threshold_dt)
-                }) {
-                    return false;
-                }
-            }
-        }
-
         true
+    }
+
+    /// One operator on one condition key.
+    fn matches_condition(
+        &self,
+        op: &Operator<'_>,
+        key: &str,
+        expected: &[&str],
+        context: &RequestContext,
+    ) -> bool {
+        let actuals = self.get_condition_values(key, context);
+        if op.base == "Null" {
+            // "true": the key must be absent; "false": present.
+            let want_absent = expected.iter().any(|e| e.eq_ignore_ascii_case("true"));
+            return actuals.is_empty() == want_absent;
+        }
+        if actuals.is_empty() {
+            return op.if_exists || op.negated() || op.for_all;
+        }
+        let one = |actual: &str| {
+            expected
+                .iter()
+                .any(|e| self.condition_value_matches(op.base, e, actual))
+        };
+        if op.negated() {
+            // Holds when no request value matches a policy value.
+            let positive = |actual: &str| {
+                expected
+                    .iter()
+                    .any(|e| self.condition_value_matches(op.base, e, actual))
+            };
+            return if op.for_all {
+                actuals.iter().all(|a| !positive(a))
+            } else {
+                !actuals.iter().any(|a| positive(a))
+            };
+        }
+        if op.for_all {
+            actuals.iter().all(|a| one(a))
+        } else {
+            actuals.iter().any(|a| one(a))
+        }
+    }
+
+    /// Whether `actual` matches policy value `expected` under `base`.
+    /// Negated operators compare as their positive form; the caller negates.
+    fn condition_value_matches(&self, base: &str, expected: &str, actual: &str) -> bool {
+        let number = |v: &str| v.trim().parse::<f64>().ok();
+        let date = |v: &str| {
+            chrono::DateTime::parse_from_rfc3339(v)
+                .map(|d| d.timestamp())
+                .ok()
+                .or_else(|| v.trim().parse::<i64>().ok())
+        };
+        let cmp_num = |f: fn(f64, f64) -> bool| {
+            number(actual)
+                .zip(number(expected))
+                .is_some_and(|(a, e)| f(a, e))
+        };
+        let cmp_date = |f: fn(i64, i64) -> bool| {
+            date(actual)
+                .zip(date(expected))
+                .is_some_and(|(a, e)| f(a, e))
+        };
+        match base {
+            "StringEquals" | "StringNotEquals" | "ArnEquals" | "ArnNotEquals" | "BinaryEquals" => {
+                actual == expected
+            }
+            "StringEqualsIgnoreCase" | "StringNotEqualsIgnoreCase" => {
+                actual.eq_ignore_ascii_case(expected)
+            }
+            "StringLike" | "StringNotLike" | "ArnLike" | "ArnNotLike" => {
+                self.matches_pattern(expected, actual)
+            }
+            "Bool" => actual.eq_ignore_ascii_case(expected),
+            "NumericEquals" | "NumericNotEquals" => cmp_num(|a, e| (a - e).abs() < f64::EPSILON),
+            "NumericLessThan" => cmp_num(|a, e| a < e),
+            "NumericLessThanEquals" => cmp_num(|a, e| a <= e),
+            "NumericGreaterThan" => cmp_num(|a, e| a > e),
+            "NumericGreaterThanEquals" => cmp_num(|a, e| a >= e),
+            "DateEquals" | "DateNotEquals" => cmp_date(|a, e| a == e),
+            "DateLessThan" => cmp_date(|a, e| a < e),
+            "DateLessThanEquals" => cmp_date(|a, e| a <= e),
+            "DateGreaterThan" => cmp_date(|a, e| a > e),
+            "DateGreaterThanEquals" => cmp_date(|a, e| a >= e),
+            "IpAddress" | "NotIpAddress" => actual
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| self.ip_matches_cidr(&ip, expected)),
+            _ => false,
+        }
     }
 
     /// Get condition value from context (single-valued).
@@ -813,7 +919,8 @@ impl PolicyEvaluator {
             "aws:SourceIp" => context.source_ip.map(|ip| ip.to_string()),
             "aws:username" => Some(context.user_arn.clone()),
             "s3:prefix" => context.variables.get("prefix").cloned(),
-            "obio:CurrentTime" => Some(chrono::Utc::now().to_rfc3339()),
+            "obio:CurrentTime" | "aws:CurrentTime" => Some(chrono::Utc::now().to_rfc3339()),
+            "aws:EpochTime" => Some(chrono::Utc::now().timestamp().to_string()),
             _ => context.variables.get(key).cloned(),
         }
     }
@@ -1599,5 +1706,111 @@ mod principal_spelling_tests {
             "Effect":"Allow","Principal":{"Nonsense":["x"]},
             "Action":["s3:GetObject"],"Resource":["arn:obio:s3:::b/*"]}]}"#;
         assert!(BucketPolicy::from_json(json).is_err());
+    }
+
+    /// A policy written for S3, with `arn:aws:` resources, grants what it says.
+    #[test]
+    fn aws_partition_arns_name_the_same_resources() {
+        let policy: BucketPolicy = serde_json::from_str(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+                "Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/*"}]}"#,
+        )
+        .unwrap();
+        let evaluator = PolicyEvaluator::new();
+        assert!(
+            evaluator.matches_resource(&policy.statements[0].resource, "arn:obio:s3:::mybucket/k")
+        );
+        assert!(
+            !evaluator.matches_resource(&policy.statements[0].resource, "arn:obio:s3:::other/k")
+        );
+    }
+
+    fn allows(policy: &str, context: &RequestContext) -> PolicyDecision {
+        PolicyEvaluator::new().evaluate(&BucketPolicy::from_json(policy).unwrap(), context)
+    }
+
+    fn get_request(vars: &[(&str, &str)]) -> RequestContext {
+        let mut c = RequestContext::new(
+            "arn:obio:iam::objectio:user/u",
+            "s3:GetObject",
+            "arn:obio:s3:::b/k",
+        );
+        for (k, v) in vars {
+            c = c.with_variable(*k, *v);
+        }
+        c
+    }
+
+    fn policy_with(effect: &str, condition: &str) -> String {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":"*",
+                "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*","Condition":{condition}}}]}}"#
+        )
+    }
+
+    /// An operator not understood is refused, not dropped: dropping it made
+    /// an Allow it guarded unconditional.
+    #[test]
+    fn a_policy_with_an_unknown_operator_is_refused() {
+        let p = policy_with("Allow", r#"{"StringLooksLike":{"s3:prefix":"a"}}"#);
+        assert!(BucketPolicy::from_json(&p).is_err());
+    }
+
+    #[test]
+    fn bool_and_numeric_conditions_hold_only_when_true() {
+        let p = policy_with("Allow", r#"{"Bool":{"aws:SecureTransport":true}}"#);
+        assert_eq!(
+            allows(&p, &get_request(&[("aws:SecureTransport", "true")])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            allows(&p, &get_request(&[("aws:SecureTransport", "false")])),
+            PolicyDecision::ImplicitDeny
+        );
+        assert_eq!(allows(&p, &get_request(&[])), PolicyDecision::ImplicitDeny);
+        let p = policy_with("Allow", r#"{"NumericLessThanEquals":{"s3:max-keys":"10"}}"#);
+        assert_eq!(
+            allows(&p, &get_request(&[("s3:max-keys", "10")])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            allows(&p, &get_request(&[("s3:max-keys", "11")])),
+            PolicyDecision::ImplicitDeny
+        );
+    }
+
+    /// A missing key: positive operators don't hold, negated ones and
+    /// IfExists do, and Null tests for exactly that.
+    #[test]
+    fn a_missing_key_is_handled_as_iam_does() {
+        let deny_unencrypted = policy_with(
+            "Deny",
+            r#"{"StringNotEquals":{"s3:x-amz-server-side-encryption":"AES256"}}"#,
+        );
+        assert_eq!(
+            allows(&deny_unencrypted, &get_request(&[])),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            allows(
+                &deny_unencrypted,
+                &get_request(&[("s3:x-amz-server-side-encryption", "AES256")])
+            ),
+            PolicyDecision::ImplicitDeny
+        );
+        let if_exists = policy_with(
+            "Allow",
+            r#"{"StringEqualsIfExists":{"s3:x-amz-acl":"private"}}"#,
+        );
+        assert_eq!(allows(&if_exists, &get_request(&[])), PolicyDecision::Allow);
+        assert_eq!(
+            allows(&if_exists, &get_request(&[("s3:x-amz-acl", "public-read")])),
+            PolicyDecision::ImplicitDeny
+        );
+        let null = policy_with(
+            "Deny",
+            r#"{"Null":{"s3:x-amz-server-side-encryption":"true"}}"#,
+        );
+        assert_eq!(allows(&null, &get_request(&[])), PolicyDecision::Deny);
     }
 }

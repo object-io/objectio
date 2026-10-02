@@ -1230,25 +1230,49 @@ fn overlapping_stripes(
 /// read these values from `RequestContext.variables`.
 pub(crate) fn sse_condition_vars(headers: Option<&HeaderMap>) -> HashMap<String, String> {
     let mut vars = HashMap::new();
-    // Currently the gateway terminates TLS upstream (Cloudflare/ingress), so
-    // every request here effectively came in over HTTPS. Mark it so
-    // `aws:SecureTransport = "true"` conditions work.
-    vars.insert("aws:SecureTransport".to_string(), "true".to_string());
-    let Some(h) = headers else { return vars };
-    if let Some(v) = h
-        .get("x-amz-server-side-encryption")
-        .and_then(|v| v.to_str().ok())
-    {
-        vars.insert("s3:x-amz-server-side-encryption".to_string(), v.to_string());
+    let Some(h) = headers else {
+        vars.insert("aws:SecureTransport".to_string(), "false".to_string());
+        return vars;
+    };
+    let header = |name: &str| h.get(name).and_then(|v| v.to_str().ok());
+    // TLS ends at the proxy in front of the gateway, which says so in
+    // X-Forwarded-Proto. This was "true" for every request, so a policy
+    // denying plain HTTP denied nothing on a gateway reached over HTTP.
+    let secure = header("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    vars.insert("aws:SecureTransport".to_string(), secure.to_string());
+    // Request headers S3 exposes as condition keys.
+    for name in [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-acl",
+        "x-amz-copy-source",
+        "x-amz-metadata-directive",
+        "x-amz-storage-class",
+        "x-amz-content-sha256",
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-legal-hold",
+    ] {
+        if let Some(v) = header(name) {
+            vars.insert(format!("s3:{name}"), v.to_string());
+        }
     }
-    if let Some(v) = h
-        .get("x-amz-server-side-encryption-aws-kms-key-id")
-        .and_then(|v| v.to_str().ok())
+    // Tags the request puts on the object.
+    if let Some(tagging) = header("x-amz-tagging")
+        && let Ok(tags) = parse_tagging(tagging)
     {
+        let mut keys: Vec<&String> = tags.keys().collect();
+        keys.sort();
         vars.insert(
-            "s3:x-amz-server-side-encryption-aws-kms-key-id".to_string(),
-            v.to_string(),
+            "s3:RequestObjectTagKeys".to_string(),
+            keys.iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
         );
+        for (k, v) in &tags {
+            vars.insert(format!("s3:RequestObjectTag/{k}"), v.clone());
+        }
     }
     vars
 }
