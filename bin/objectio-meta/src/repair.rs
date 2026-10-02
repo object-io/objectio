@@ -219,6 +219,20 @@ pub async fn pass(meta: &Arc<MetaService>) {
             .fetch_add(objects.len() as u64, Ordering::Relaxed);
         audit(meta, Source::Block, &objects).await;
     }
+    // Packs: their shards are recorded once, in meta's pack table; the
+    // objects in them name the pack and hold no shards of their own.
+    let packs: Vec<ObjectMeta> = meta
+        .packs()
+        .into_iter()
+        .filter(|p| p.sealed)
+        .filter_map(pack_object)
+        .collect();
+    for page in packs.chunks(PAGE as usize) {
+        if !meta.is_raft_leader() {
+            return;
+        }
+        audit(meta, Source::Pack, page).await;
+    }
     STATS.passes.fetch_add(1, Ordering::Relaxed);
     STATS.last_pass_ms.store(
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -240,6 +254,24 @@ enum Source<'a> {
     Osd(&'a str),
     /// Block chunk stripes, recorded in meta's block tables.
     Block,
+    /// Pack stripes, recorded in meta's pack table.
+    Pack,
+}
+
+/// Prefix of the key a pack is placed under, in its bucket.
+pub const PACK_KEY_PREFIX: &str = ".objectio-pack/";
+
+/// A pack in the shape `audit` takes, named and placed as it was written.
+fn pack_object(pack: objectio_proto::metadata::PackRecord) -> Option<ObjectMeta> {
+    let stripe = pack.stripe?;
+    Some(ObjectMeta {
+        key: format!("{PACK_KEY_PREFIX}{}", hex::encode(&pack.pack_id)),
+        bucket: pack.bucket,
+        object_id: pack.pack_id,
+        size: stripe.data_size,
+        stripes: vec![stripe],
+        ..Default::default()
+    })
 }
 
 /// A block stripe in the shape `audit` takes. The key is only a name for
@@ -338,10 +370,12 @@ fn verdict(seen: &[Seen], k: usize) -> Verdict {
     }
 }
 
-/// Stripes this pass can repair: erasure-coded with parity.
+/// Stripes this pass can repair: erasure-coded with parity. An object's
+/// slice of a pack is not a stripe of its own: the pack is repaired from
+/// its record.
 fn repairable(stripe: &StripeMeta) -> bool {
     let ec = ErasureType::try_from(stripe.ec_type).unwrap_or(ErasureType::ErasureMds);
-    ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0
+    ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0 && stripe.pack_id.is_empty()
 }
 
 fn shard_object_id<'a>(object: &'a ObjectMeta, stripe: &'a StripeMeta) -> &'a [u8] {
@@ -592,6 +626,11 @@ async fn rebuild(
                 meta.block_add_shard_locations(&object.object_id, &added)
                     .await
                     .map_err(|e| anyhow::anyhow!("record block shard locations: {e}"))?;
+            }
+            Source::Pack => {
+                meta.pack_add_shard_locations(&object.object_id, &added)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("record pack shard locations: {e}"))?;
             }
         }
     }

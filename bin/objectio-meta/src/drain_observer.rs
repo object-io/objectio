@@ -368,6 +368,8 @@ struct Move {
     objects: Vec<ObjectRef>,
     /// The stripe as a block chunk record has it, when one does.
     block_stripe: Option<StripeMeta>,
+    /// The stripe as a pack record has it, when the shard is a pack's.
+    pack_stripe: Option<StripeMeta>,
 }
 
 struct ObjectRef {
@@ -411,6 +413,7 @@ async fn migrate_batch(
                 shard,
                 objects: Vec::new(),
                 block_stripe: None,
+                pack_stripe: None,
             });
             moves.len() - 1
         })
@@ -463,7 +466,37 @@ async fn migrate_batch(
             }
         }
     }
-    scan.found = moves.len();
+    // Packs, recorded in meta's pack table. One not sealed yet can't be
+    // moved (its writer is about to record where its shards landed), but it
+    // holds the drain open: the OSD isn't empty until it is sealed and
+    // moved, or abandoned.
+    let mut unsealed = 0;
+    for pack in meta.packs() {
+        let Some(stripe) = pack.stripe else { continue };
+        for loc in &stripe.shards {
+            if loc.node_id != draining {
+                continue;
+            }
+            if !pack.sealed {
+                unsealed += 1;
+                continue;
+            }
+            let i = slot(
+                &mut moves,
+                ShardId {
+                    object_id: if stripe.object_id.is_empty() {
+                        pack.pack_id.clone()
+                    } else {
+                        stripe.object_id.clone()
+                    },
+                    stripe_id: stripe.stripe_id,
+                    position: loc.position,
+                },
+            );
+            moves[i].pack_stripe = Some(stripe.clone());
+        }
+    }
+    scan.found = moves.len() + unsealed;
 
     // A few at a time: each reads and writes a shard.
     use futures::StreamExt;
@@ -517,7 +550,7 @@ async fn move_shard(
         .try_into()
         .map_err(|_| anyhow::anyhow!("shard id is not 16 bytes"))?;
     // The stripe as recorded: whose other shards are where.
-    let stripe = match &mv.block_stripe {
+    let stripe = match mv.block_stripe.as_ref().or(mv.pack_stripe.as_ref()) {
         Some(s) => s.clone(),
         None => stripe_of(mv).await?,
     };
@@ -566,6 +599,12 @@ async fn move_shard(
         meta.block_move_shard(&mv.shard.object_id, mv.shard.position, draining, &to)
             .await
             .map_err(|e| anyhow::anyhow!("block chunk records: {e}"))?;
+    }
+    if mv.pack_stripe.is_some() {
+        // The pack id is the shard's object id.
+        meta.pack_move_shard(&mv.shard.object_id, mv.shard.position, *draining, &to)
+            .await
+            .map_err(|e| anyhow::anyhow!("pack record: {e}"))?;
     }
     Ok(())
 }
