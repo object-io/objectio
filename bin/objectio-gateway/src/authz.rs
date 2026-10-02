@@ -119,6 +119,10 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutLifecycleConfiguration"
             } else if has(query, "encryption") {
                 "s3:PutEncryptionConfiguration"
+            } else if has(query, "acl") {
+                "s3:PutBucketAcl"
+            } else if has(query, "ownershipControls") {
+                "s3:PutBucketOwnershipControls"
             } else {
                 "s3:CreateBucket"
             }
@@ -146,6 +150,10 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetLifecycleConfiguration"
             } else if has(query, "encryption") {
                 "s3:GetEncryptionConfiguration"
+            } else if has(query, "acl") {
+                "s3:GetBucketAcl"
+            } else if has(query, "ownershipControls") {
+                "s3:GetBucketOwnershipControls"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -192,6 +200,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
                 "s3:PutObjectLegalHold"
             } else if has(query, "tagging") {
                 "s3:PutObjectTagging"
+            } else if has(query, "acl") {
+                "s3:PutObjectAcl"
             } else {
                 "s3:PutObject"
             }
@@ -203,6 +213,8 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
                 "s3:GetObjectLegalHold"
             } else if has(query, "tagging") {
                 "s3:GetObjectTagging"
+            } else if has(query, "acl") {
+                "s3:GetObjectAcl"
             } else if has(query, "uploadId") {
                 "s3:ListMultipartUploadParts"
             } else {
