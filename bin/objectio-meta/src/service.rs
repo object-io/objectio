@@ -4232,11 +4232,17 @@ impl MetadataService for MetaService {
         }
 
         // Register the part (overwrites if same part_number uploaded again)
+        let (checksum_algorithm, checksum) = req
+            .checksum
+            .map(|c| (c.algorithm, c.value))
+            .unwrap_or_default();
         let part_state = PartState {
             part_number: req.part_number,
             etag: req.etag.clone(),
             size: req.size,
             last_modified: now,
+            checksum_algorithm,
+            checksum,
             stripes: req.stripes, // Multiple stripes for large parts
         };
         // The part this replaces is referenced by nothing once the insert
@@ -4296,6 +4302,12 @@ impl MetadataService for MetaService {
                 size: p.size,
                 last_modified: p.last_modified,
                 stripes: p.stripes.clone(), // Multiple stripes for large parts
+                checksum: (!p.checksum.is_empty()).then(|| {
+                    objectio_proto::metadata::ObjectChecksum {
+                        algorithm: p.checksum_algorithm.clone(),
+                        value: p.checksum.clone(),
+                    }
+                }),
             })
             .collect();
 
@@ -4413,6 +4425,11 @@ impl MetadataService for MetaService {
             kms_key_id: upload.kms_key_id.clone(),
             encrypted_dek: upload.encrypted_dek.clone(),
             encryption_iv: Vec::new(),
+            // SSE-KMS: the context the DEK was wrapped under, needed to
+            // unwrap it. SSE-C: what identifies the customer's key. Both
+            // used to be dropped here, so a multipart object's DEK
+            // couldn't be unwrapped under a context, and any key read it.
+            encryption_context: upload.encryption_context.clone(),
             ..Default::default()
         };
 
@@ -12083,6 +12100,7 @@ mod multipart_reclaim_tests {
             // At S3's minimum, so any part may come before another.
             size: 5 * 1024 * 1024,
             stripes: vec![stripe(id)],
+            checksum: None,
         }))
         .await
         .unwrap()

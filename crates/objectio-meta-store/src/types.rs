@@ -243,6 +243,11 @@ pub struct PartState {
     pub etag: String,
     pub size: u64,
     pub last_modified: u64,
+    /// The part's flexible checksum: S3 algorithm name and base64 value.
+    #[serde(default)]
+    pub checksum_algorithm: String,
+    #[serde(default)]
+    pub checksum: String,
     #[serde(with = "stripe_meta_vec")]
     pub stripes: Vec<objectio_proto::metadata::StripeMeta>,
 }
