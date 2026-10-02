@@ -58,6 +58,9 @@ fn a_new_bucket_is_blocked_and_cannot_be_made_public() {
 
     let r = c.request("PUT", "/blk?policy", &public_read("blk"));
     assert_eq!(r.status, 403, "{}", r.text());
+    // Nor through the admin API's bucket-policy endpoint.
+    let r = c.request("PUT", "/_admin/buckets/blk/policy", &public_read("blk"));
+    assert_eq!(r.status, 403, "{}", r.text());
     assert_eq!(anonymous(&c, "GET", "/blk/k").status, 403);
 
     // A policy pinned to a network isn't public, and is taken.

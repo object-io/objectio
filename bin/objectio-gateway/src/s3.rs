@@ -7872,7 +7872,11 @@ async fn get_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> Res
 }
 
 /// Set bucket policy (PUT /{bucket}?policy) - internal implementation
-async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: Bytes) -> Response {
+pub(crate) async fn put_bucket_policy_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    body: Bytes,
+) -> Response {
     let mut client = state.meta_client.clone();
 
     // Parse the policy JSON to validate it
@@ -7957,7 +7961,10 @@ async fn put_bucket_policy_internal(state: Arc<AppState>, bucket: String, body: 
 }
 
 /// Delete bucket policy (DELETE /{bucket}?policy) - internal implementation
-async fn delete_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> Response {
+pub(crate) async fn delete_bucket_policy_internal(
+    state: Arc<AppState>,
+    bucket: String,
+) -> Response {
     let mut client = state.meta_client.clone();
 
     match client

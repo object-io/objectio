@@ -1448,22 +1448,10 @@ pub async fn admin_put_bucket_policy(
     if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
         return deny;
     }
-    let policy_json = String::from_utf8_lossy(&body).to_string();
-    // Validate JSON
-    if serde_json::from_str::<serde_json::Value>(&policy_json).is_err() {
-        return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .set_bucket_policy(objectio_proto::metadata::SetBucketPolicyRequest {
-            bucket: bucket.clone(),
-            policy_json,
-        })
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
+    // The same path as S3's PutBucketPolicy: the document checked as
+    // authorization will read it, Block Public Access applied, caches
+    // dropped. This endpoint used to store any JSON, public or not.
+    crate::s3::put_bucket_policy_internal(state, bucket, body).await
 }
 
 pub async fn admin_delete_bucket_policy(
@@ -1475,16 +1463,7 @@ pub async fn admin_delete_bucket_policy(
     if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
         return deny;
     }
-    let mut client = state.meta_client.clone();
-    match client
-        .delete_bucket_policy(objectio_proto::metadata::DeleteBucketPolicyRequest {
-            bucket: bucket.clone(),
-        })
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
+    crate::s3::delete_bucket_policy_internal(state, bucket).await
 }
 
 // ============================================================================
