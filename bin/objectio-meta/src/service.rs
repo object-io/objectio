@@ -1243,6 +1243,49 @@ impl MetaService {
         }
     }
 
+    /// The pool a new bucket in `tenant` goes to, `requested` or not.
+    ///
+    /// A system bucket may go to any enabled pool. A tenant's bucket goes to
+    /// the pool it asks for only if the tenant may use it (its default, or
+    /// one of its allowed pools), otherwise to the tenant's default pool;
+    /// empty means the cluster's default placement.
+    #[allow(clippy::result_large_err)]
+    fn resolve_bucket_pool(&self, tenant: &str, requested: &str) -> Result<String, Status> {
+        let (default_pool, allowed) = if tenant.is_empty() {
+            (String::new(), None)
+        } else {
+            let tenants = self.tenants.read();
+            let t = tenants.get(tenant);
+            (
+                t.map(|t| t.default_pool.clone()).unwrap_or_default(),
+                Some(t.map(|t| t.allowed_pools.clone()).unwrap_or_default()),
+            )
+        };
+        let pool = if requested.is_empty() {
+            default_pool.clone()
+        } else {
+            requested.to_string()
+        };
+        if pool.is_empty() {
+            return Ok(pool);
+        }
+        if let Some(allowed) = &allowed
+            && pool != default_pool
+            && !allowed.contains(&pool)
+        {
+            return Err(Status::permission_denied(format!(
+                "tenant '{tenant}' may not use pool '{pool}'"
+            )));
+        }
+        match self.pools.read().get(&pool) {
+            Some(p) if p.enabled => Ok(pool),
+            Some(_) => Err(Status::failed_precondition(format!(
+                "pool '{pool}' is disabled"
+            ))),
+            None => Err(Status::not_found(format!("pool '{pool}' does not exist"))),
+        }
+    }
+
     /// The stored rows configuring `bucket` beyond its `BucketMeta`, as
     /// `(table, key, current bytes)`: what deleting the bucket removes.
     fn bucket_config_rows(
@@ -3788,6 +3831,8 @@ impl MetadataService for MetaService {
             }
         }
 
+        let pool = self.resolve_bucket_pool(&tenant, &req.pool)?;
+
         let bucket = BucketMeta {
             dedup: None,
             name: req.name.clone(),
@@ -3799,7 +3844,7 @@ impl MetadataService for MetaService {
                 req.storage_class
             },
             versioning: VersioningState::VersioningDisabled.into(),
-            pool: String::new(),
+            pool,
             tenant,
             quota_bytes: 0,
             quota_objects: 0,
@@ -8268,6 +8313,36 @@ impl MetadataService for MetaService {
         let name = request.into_inner().name;
         if name == "default" {
             return Err(Status::invalid_argument("cannot delete the default pool"));
+        }
+        // Its buckets' objects were placed by it: without it they'd be
+        // looked for where the default placement puts them.
+        let users: Vec<String> = self
+            .buckets
+            .read()
+            .values()
+            .filter(|b| b.pool == name)
+            .map(|b| b.name.clone())
+            .take(5)
+            .collect();
+        if !users.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "pool '{name}' holds buckets ({}{}); delete them first",
+                users.join(", "),
+                if users.len() == 5 { ", ..." } else { "" }
+            )));
+        }
+        // Tenants that default to it, or may choose it, are reconfigured
+        // first.
+        if let Some(t) = self
+            .tenants
+            .read()
+            .values()
+            .find(|t| t.default_pool == name || t.allowed_pools.contains(&name))
+        {
+            return Err(Status::failed_precondition(format!(
+                "tenant '{}' refers to pool '{name}'; change its pools first",
+                t.name
+            )));
         }
         let expected_bytes = self.pools.read().get(&name).map(|p| p.encode_to_vec());
         if expected_bytes.is_none() {

@@ -433,12 +433,19 @@ class Client(IAMMixin, STSMixin, ConfigMixin, AccessMixin, ClusterMixin):
 
     # -- buckets ----------------------------------------------------------
 
-    def create_bucket(self, name: str, tenant: str = "") -> None:
+    def create_bucket(self, name: str, tenant: str = "", pool: str = "") -> None:
         """Create a bucket. The caller becomes its owner, which matters: with
-        no policy attached, ownership is what grants access."""
+        no policy attached, ownership is what grants access.
+
+        ``pool`` puts its data in that pool (default: the tenant's default
+        pool, else the cluster's default placement). A tenant may use only
+        its default and allowed pools; the pool is fixed for the bucket's
+        life."""
         body = {"name": name}
         if tenant:
             body["tenant"] = tenant
+        if pool:
+            body["pool"] = pool
         self._request("POST", "/_admin/buckets", body=body)
 
     def list_buckets(self) -> list[Bucket]:
