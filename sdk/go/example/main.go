@@ -1,4 +1,4 @@
-// Command example provisions a workspace end to end against a running
+// Command example provisions a bucket end to end against a running
 // ObjectIO, then tears it down. It is the Go mirror of the README walkthrough.
 //
 //	go run ./example -endpoint http://127.0.0.1:9000 -access-key AKIA… -secret-key …
@@ -70,14 +70,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	ws, err := app.ProvisionWorkspace(ctx, objectio.ProvisionWorkspaceInput{
-		Bucket:            "ws-go",
+	ba, err := app.ProvisionBucket(ctx, objectio.ProvisionBucketInput{
+		Bucket:            "app-go",
 		ProvisionerUserID: prov.UserID,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("  workspace        : bucket=%s key=%s scope=%s\n", ws.Bucket, ws.AccessKeyID, ws.Scope)
+	fmt.Printf("  bucket access    : bucket=%s key=%s scope=%s\n", ba.Bucket, ba.AccessKeyID, ba.Scope)
 
 	buckets, err := app.ListBuckets(ctx)
 	if err != nil {
@@ -89,19 +89,19 @@ func main() {
 	}
 	fmt.Println()
 
-	fmt.Println("== the workspace credential is confined ==")
-	wsc, err := objectio.New(objectio.Config{Endpoint: *endpoint, AccessKey: ws.AccessKeyID, SecretKey: ws.SecretKey})
+	fmt.Println("== the bucket credential is confined ==")
+	bc, err := objectio.New(objectio.Config{Endpoint: *endpoint, AccessKey: ba.AccessKeyID, SecretKey: ba.SecretKey})
 	if err != nil {
 		log.Fatal(err)
 	}
-	if _, err := wsc.ListBuckets(ctx); err == nil {
+	if _, err := bc.ListBuckets(ctx); err == nil {
 		fmt.Println("  management API   : ALLOWED  <-- would be a bug")
 	} else {
 		fmt.Printf("  management API   : refused, forbidden=%v\n    %v\n", objectio.IsForbidden(err), err)
 	}
 
 	fmt.Println("== deprovision ==")
-	if err := app.DeprovisionWorkspace(ctx, prov.UserID, "ws-go"); err != nil {
+	if err := app.DeprovisionBucket(ctx, prov.UserID, "app-go"); err != nil {
 		log.Fatal(err)
 	}
 	left, _ := app.ListBuckets(ctx)

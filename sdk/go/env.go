@@ -27,7 +27,7 @@ const (
 	EnvAccessKeyFile = "OBJECTIO_ACCESS_KEY_FILE"
 	EnvRegion        = "OBJECTIO_REGION"
 	// EnvProvisionerUserID is the provisioner's own user_id, which
-	// ProvisionWorkspace needs. Not used by ConfigFromEnv; read it with
+	// ProvisionBucket needs. Not used by ConfigFromEnv; read it with
 	// ProvisionerUserIDFromEnv.
 	EnvProvisionerUserID = "OBJECTIO_PROVISIONER_USER_ID"
 )
@@ -117,7 +117,7 @@ func NewFromEnv() (*Client, error) {
 }
 
 // ProvisionerUserIDFromEnv reads OBJECTIO_PROVISIONER_USER_ID, the user that
-// ProvisionWorkspace mints workspace credentials on. Empty when unset —
+// ProvisionBucket mints bucket credentials on. Empty when unset —
 // callers that can discover it another way need not set it.
 func ProvisionerUserIDFromEnv() string {
 	return strings.TrimSpace(os.Getenv(EnvProvisionerUserID))

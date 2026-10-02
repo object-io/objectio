@@ -24,6 +24,12 @@ type Tenant struct {
 	Labels       map[string]string `json:"labels,omitempty"`
 	Enabled      bool              `json:"enabled"`
 	CreatedAt    int64             `json:"created_at,omitempty"`
+	UpdatedAt    int64             `json:"updated_at,omitempty"`
+	// Dedup is the tenant's deduplication policy ({"mode", "scope"}) or null
+	// to inherit. Kept as raw JSON so that UpdateTenant sends back exactly
+	// what it read: the server replaces the whole tenant, and a field left
+	// out resets to inherit.
+	Dedup json.RawMessage `json:"dedup,omitempty"`
 }
 
 // CreateTenant creates a tenant. System admin only.
@@ -53,6 +59,33 @@ func (c *Client) ListTenants(ctx context.Context) ([]Tenant, error) {
 		return nil, err
 	}
 	return decodeList[Tenant](raw, "tenants")
+}
+
+// UpdateTenant changes a tenant by reading it, applying update, and writing
+// the whole thing back. System admin only.
+//
+// It is read-modify-write rather than a partial PUT because the server
+// replaces the tenant wholesale: any field a PUT leaves out — admins,
+// quotas, labels, the dedup policy — is reset, and `enabled` defaults to
+// true. Taking a function keeps a caller from having to restate every field
+// to change one. The name cannot be changed; update's edits to it are
+// ignored.
+//
+// Two concurrent updates are not merged: the server compares against what
+// it had and answers 409 to the loser (IsAlreadyExists does not match that;
+// check the StatusCode), which can simply call again.
+func (c *Client) UpdateTenant(ctx context.Context, name string, update func(*Tenant)) (*Tenant, error) {
+	t, err := c.GetTenant(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	update(t)
+	t.Name = name
+	var out Tenant
+	if err := c.do(ctx, "PUT", "/_admin/tenants/"+name, nil, t, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // DeleteTenant removes a tenant. Its buckets must be gone first.
@@ -115,6 +148,54 @@ func (c *Client) ListUsers(ctx context.Context) ([]User, error) {
 // DeleteUser removes a user and its access keys.
 func (c *Client) DeleteUser(ctx context.Context, userID string) error {
 	return c.do(ctx, "DELETE", "/_admin/users/"+userID, nil, nil, nil)
+}
+
+// GetUser returns one user. A tenant admin may read its own tenant's users.
+func (c *Client) GetUser(ctx context.Context, userID string) (*User, error) {
+	var out User
+	if err := c.do(ctx, "GET", "/_admin/users/"+userID, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// User statuses, as UpdateUser takes and User.Status reports them.
+const (
+	UserActive    = "active"
+	UserSuspended = "suspended"
+)
+
+// UserUpdate is a partial change to a user: nil fields are left as they are.
+type UserUpdate struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	Email       *string `json:"email,omitempty"`
+	// Status is UserActive or UserSuspended.
+	Status *string `json:"status,omitempty"`
+}
+
+// UpdateUser changes a user's display name, email or status and returns the
+// result.
+func (c *Client) UpdateUser(ctx context.Context, userID string, in UserUpdate) (*User, error) {
+	var out User
+	if err := c.do(ctx, "PUT", "/_admin/users/"+userID, nil, in, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SuspendUser refuses every key the user holds without deleting anything,
+// so ActivateUser restores it exactly. It holds at once on the gateway that
+// made the change and within 15 seconds on the others (their credential
+// cache). The server refuses to let a caller suspend itself.
+func (c *Client) SuspendUser(ctx context.Context, userID string) (*User, error) {
+	s := UserSuspended
+	return c.UpdateUser(ctx, userID, UserUpdate{Status: &s})
+}
+
+// ActivateUser lifts a suspension.
+func (c *Client) ActivateUser(ctx context.Context, userID string) (*User, error) {
+	s := UserActive
+	return c.UpdateUser(ctx, userID, UserUpdate{Status: &s})
 }
 
 // ---------------------------------------------------------------------------
@@ -186,89 +267,46 @@ func (c *Client) DeleteAccessKey(ctx context.Context, accessKeyID string) error 
 	return c.do(ctx, "DELETE", "/_admin/access-keys/"+accessKeyID, nil, nil, nil)
 }
 
-// ---------------------------------------------------------------------------
-// Buckets
-// ---------------------------------------------------------------------------
+// Access key statuses, as UpdateAccessKey takes and AccessKey.Status
+// reports them.
+const (
+	KeyActive   = "active"
+	KeyInactive = "inactive"
+)
 
-// Bucket as the management API reports it.
-type Bucket struct {
-	Name      string `json:"name"`
-	CreatedAt int64  `json:"created_at,omitempty"`
-	// Owner is the creator's user_id. With no policy attached, ObjectIO
-	// authorizes on ownership alone — so this decides who can reach the
-	// bucket by default.
-	Owner      string `json:"owner,omitempty"`
-	Versioning int    `json:"versioning,omitempty"`
-	Pool       string `json:"pool,omitempty"`
-	Tenant     string `json:"tenant,omitempty"`
+// AccessKeyUpdate is a change to an access key. Status is the only thing
+// that can change; the scope and operation are fixed when a key is minted.
+type AccessKeyUpdate struct {
+	// Status is KeyActive or KeyInactive.
+	Status string `json:"status"`
 }
 
-// CreateBucket creates a bucket. Pass tenant "" to use the caller's own
-// tenant; a tenant admin cannot create outside its tenant.
-//
-// The caller becomes the owner, which matters: with no policy attached,
-// ownership is what grants access.
-func (c *Client) CreateBucket(ctx context.Context, name, tenant string) error {
-	body := map[string]string{"name": name}
-	if tenant != "" {
-		body["tenant"] = tenant
-	}
-	return c.do(ctx, "POST", "/_admin/buckets", nil, body, nil)
-}
-
-// ListBuckets returns the buckets the caller can see.
-func (c *Client) ListBuckets(ctx context.Context) ([]Bucket, error) {
-	var out struct {
-		Buckets []Bucket `json:"buckets"`
-	}
-	if err := c.do(ctx, "GET", "/_admin/buckets", nil, nil, &out); err != nil {
+// UpdateAccessKey changes a key's status. The returned AccessKey carries
+// AccessKeyID, UserID and Status only.
+func (c *Client) UpdateAccessKey(ctx context.Context, accessKeyID string, in AccessKeyUpdate) (*AccessKey, error) {
+	var out AccessKey
+	if err := c.do(ctx, "PUT", "/_admin/access-keys/"+accessKeyID, nil, in, &out); err != nil {
 		return nil, err
 	}
-	return out.Buckets, nil
+	return &out, nil
 }
 
-// DeleteBucket removes an empty bucket.
-func (c *Client) DeleteBucket(ctx context.Context, name string) error {
-	return c.do(ctx, "DELETE", "/_admin/buckets/"+name, nil, nil, nil)
+// DeactivateAccessKey stops a key working without deleting it — the
+// reversible half of revocation, for a key suspected leaked while the
+// investigation runs. The server refuses to deactivate the key the request
+// is signed with.
+func (c *Client) DeactivateAccessKey(ctx context.Context, accessKeyID string) (*AccessKey, error) {
+	return c.UpdateAccessKey(ctx, accessKeyID, AccessKeyUpdate{Status: KeyInactive})
 }
 
-// SetBucketOwner reassigns ownership. Use it to backfill a bucket created
-// before the creator was recorded, or to hand a bucket to another identity.
-func (c *Client) SetBucketOwner(ctx context.Context, bucket, ownerUserID string) error {
-	return c.do(ctx, "PUT", "/_admin/buckets/"+bucket+"/owner",
-		nil, map[string]string{"owner": ownerUserID}, nil)
-}
-
-// GetBucketPolicy returns the attached policy, or nil when there is none.
+// ActivateAccessKey reverses DeactivateAccessKey.
 //
-// No policy does not mean open: ObjectIO then falls back to owner-only.
-func (c *Client) GetBucketPolicy(ctx context.Context, bucket string) (json.RawMessage, error) {
-	var out struct {
-		HasPolicy bool            `json:"has_policy"`
-		Policy    json.RawMessage `json:"policy"`
-	}
-	if err := c.do(ctx, "GET", "/_admin/buckets/"+bucket+"/policy", nil, nil, &out); err != nil {
-		return nil, err
-	}
-	if !out.HasPolicy {
-		return nil, nil
-	}
-	return out.Policy, nil
-}
-
-// PutBucketPolicy attaches a policy document. Needed only when an identity
-// other than the owner must reach the bucket — a workspace's own users, say,
-// rather than the provisioner that created it.
-//
-// Principals are ARNs under {"OBIO": [...]}; {"AWS": [...]} is accepted as a
-// synonym.
-func (c *Client) PutBucketPolicy(ctx context.Context, bucket string, policy json.RawMessage) error {
-	return c.do(ctx, "PUT", "/_admin/buckets/"+bucket+"/policy", nil, policy, nil)
-}
-
-// DeleteBucketPolicy detaches the policy, returning the bucket to owner-only.
-func (c *Client) DeleteBucketPolicy(ctx context.Context, bucket string) error {
-	return c.do(ctx, "DELETE", "/_admin/buckets/"+bucket+"/policy", nil, nil, nil)
+// Only the system admin can reactivate a key: the server finds a key's owner
+// through the lookup authentication uses, which does not return inactive
+// keys, so it cannot tell which tenant an inactive key belongs to and falls
+// back to requiring the system admin.
+func (c *Client) ActivateAccessKey(ctx context.Context, accessKeyID string) (*AccessKey, error) {
+	return c.UpdateAccessKey(ctx, accessKeyID, AccessKeyUpdate{Status: KeyActive})
 }
 
 // ---------------------------------------------------------------------------

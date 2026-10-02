@@ -10,13 +10,25 @@ class ObjectIOError(Exception):
 class APIError(ObjectIOError):
     """A non-2xx response from the management API."""
 
-    def __init__(self, status_code: int, method: str, path: str, message: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        method: str,
+        path: str,
+        message: str = "",
+        code: str = "",
+    ):
         self.status_code = status_code
         self.method = method
         self.path = path
         #: The server's body. The management API answers in plain text for
         #: denials and JSON for handler errors, so this is whatever it sent.
         self.message = message
+        #: The machine-readable error code when the server sent one: the
+        #: ``<Code>`` of an S3 or STS XML error (``AccessDenied``,
+        #: ``NoSuchBucket``, ``ExpiredTokenException`` …). The JSON admin
+        #: errors carry only a human message, so this is empty for them.
+        self.code = code
         super().__init__(f"{method} {path}: {status_code}: {message}")
 
     @property
