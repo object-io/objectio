@@ -139,6 +139,15 @@ struct Args {
     #[arg(long, hide = true)]
     test_hooks: bool,
 
+    /// How often the packer moves small objects into packs (seconds);
+    /// forwarded to the gateway. 0 leaves packing off.
+    #[arg(long)]
+    pack_interval_secs: Option<u64>,
+
+    /// Objects written more recently than this aren't packed (seconds).
+    #[arg(long)]
+    pack_min_age_secs: Option<u64>,
+
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
@@ -871,6 +880,12 @@ async fn main() -> Result<()> {
     }
     if args.test_hooks {
         gw_argv.push("--test-hooks".to_string());
+    }
+    if let Some(secs) = args.pack_interval_secs {
+        gw_argv.extend(["--pack-interval-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.pack_min_age_secs {
+        gw_argv.extend(["--pack-min-age-secs".to_string(), secs.to_string()]);
     }
     if let Some(path) = &args.audit_log {
         gw_argv.extend(["--audit-log".to_string(), path.clone()]);

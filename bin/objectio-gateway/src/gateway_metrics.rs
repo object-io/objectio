@@ -38,6 +38,10 @@ static COPIES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static COPIED_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static LIFECYCLE_ACTIONS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static LIFECYCLE_SCANS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACKS_WRITTEN: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACK_OBJECTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACK_BYTES_SAVED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACK_RECONCILED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static LIFECYCLE_SCAN_SECONDS: LazyLock<HistogramVec> =
     LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 
@@ -52,6 +56,21 @@ pub fn record_inline(bytes: u64) {
 pub fn record_copy(mode: &str, bytes: u64) {
     COPIES.inc(&format!("mode=\"{mode}\""));
     COPIED_BYTES.add(&format!("mode=\"{mode}\""), bytes);
+}
+
+/// A pack written and sealed holding `objects` objects, which their own
+/// stripes would have stored in `before` raw bytes; the pack takes `after`.
+pub fn record_pack(objects: u64, before: u64, after: u64) {
+    PACKS_WRITTEN.inc("");
+    PACK_OBJECTS.add("", objects);
+    PACK_BYTES_SAVED.add("", before.saturating_sub(after));
+}
+
+/// A reconciliation outcome: `aborted` (an unsealed pack), `released` (an
+/// object never switched lets go of the pack), `finished` (a switch
+/// completed, the old stripe released).
+pub fn record_pack_reconciled(action: &str) {
+    PACK_RECONCILED.inc(&format!("action=\"{action}\""));
 }
 
 /// One lifecycle action: `expire`, `delete_marker`, `abort_upload`.
@@ -352,6 +371,26 @@ pub fn render() -> String {
         &mut out,
         "objectio_lifecycle_scans_total",
         "Lifecycle scans over every bucket, by result",
+    );
+    PACKS_WRITTEN.render(
+        &mut out,
+        "objectio_packs_written_total",
+        "Packs written and sealed by the packer (small objects stored together)",
+    );
+    PACK_OBJECTS.render(
+        &mut out,
+        "objectio_pack_objects_total",
+        "Small objects moved into packs",
+    );
+    PACK_BYTES_SAVED.render(
+        &mut out,
+        "objectio_pack_bytes_saved_total",
+        "Raw bytes (shards, before padding and headers) saved by packing: the objects' own stripes less the packs'",
+    );
+    PACK_RECONCILED.render(
+        &mut out,
+        "objectio_pack_reconciled_total",
+        "Pack reconciliation outcomes, by action (aborted, released, finished)",
     );
     LIFECYCLE_SCAN_SECONDS.render(
         &mut out,

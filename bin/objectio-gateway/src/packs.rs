@@ -23,8 +23,8 @@ use objectio_common::ErasureConfig;
 use objectio_erasure::ErasureCodec;
 use objectio_proto::metadata::{
     AbortPackRequest, ErasureType, GetBucketVersioningRequest, GetPackRequest, GetPlacementRequest,
-    IntendPackRequest, NodePlacement, ObjectMeta, PackRecord, SealPackRequest, ShardLocation,
-    SseAlgorithm, StripeMeta, VersioningState,
+    IntendPackRequest, ListPacksRequest, NodePlacement, ObjectMeta, PackMember, PackRecord,
+    PackSettleRequest, SealPackRequest, ShardLocation, SseAlgorithm, StripeMeta, VersioningState,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::osd_pool::{
-    Reclaim, ShardTarget, get_object_meta_from_any, put_object_meta_to_all, stripe_targets,
-    stripe_targets_of, write_shard_to_osd,
+    Reclaim, ShardTarget, get_object_meta_from_any, get_object_version_meta_from_osd,
+    put_object_meta_to_all, stripe_targets, stripe_targets_of, write_shard_to_osd,
 };
 use crate::s3::{AppState, spawn_reclaim};
 
@@ -182,6 +182,25 @@ pub const PACK_KEY_PREFIX: &str = ".objectio-pack/";
 pub struct PackRequest {
     pub bucket: String,
     pub keys: Vec<String>,
+    /// Stop just after this step, as a crash there would (tests only).
+    #[serde(default)]
+    pub stop_after: Option<StopAfter>,
+}
+
+/// A point in [`pack_objects`] where a test stops it, standing for a
+/// crash there. Reconciliation must then leave every object readable and
+/// free only what nothing points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StopAfter {
+    /// The pack is recorded, unsealed; nothing written.
+    Intend,
+    /// Its shards are written; still unsealed.
+    Write,
+    /// Sealed with its referrers; no object switched.
+    Seal,
+    /// The first object switched; its old stripe not yet released.
+    SwitchOne,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -207,7 +226,7 @@ pub async fn admin_test_pack(
     if !crate::admin::is_system_admin(&caller) {
         return (StatusCode::FORBIDDEN, "system admin only").into_response();
     }
-    match pack_objects(&state, &req.bucket, &req.keys).await {
+    match pack_objects(&state, &req.bucket, &req.keys, req.stop_after).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -218,7 +237,7 @@ pub async fn admin_test_pack(
 }
 
 /// Why `object` can't be packed, if it can't.
-fn unpackable(object: &ObjectMeta, versioned_bucket: bool) -> Option<&'static str> {
+pub(crate) fn unpackable(object: &ObjectMeta, versioned_bucket: bool) -> Option<&'static str> {
     let encrypted = SseAlgorithm::try_from(object.encryption_algorithm)
         .is_ok_and(|a| a != SseAlgorithm::SseNone);
     if object.is_delete_marker {
@@ -266,6 +285,7 @@ pub async fn pack_objects(
     state: &Arc<AppState>,
     bucket: &str,
     keys: &[String],
+    stop_after: Option<StopAfter>,
 ) -> Result<PackReport, String> {
     let mut report = PackReport::default();
     let mut meta = state.meta_client.clone();
@@ -393,11 +413,16 @@ pub async fn pack_objects(
             stripe: Some(intended.clone()),
             data_len: data.len() as u64,
             bucket: bucket.to_string(),
+            members: candidates.iter().map(member).collect(),
             ..Default::default()
         }),
     })
     .await
     .map_err(|e| format!("intend pack: {e}"))?;
+    report.pack_id = hex::encode(&pack_id);
+    if stop_after == Some(StopAfter::Intend) {
+        return Ok(report);
+    }
 
     // 2. Write.
     let codec = ErasureCodec::new(ErasureConfig::new(
@@ -447,6 +472,9 @@ pub async fn pack_objects(
             written.len()
         ));
     }
+    if stop_after == Some(StopAfter::Write) {
+        return Ok(report);
+    }
 
     // 3. Seal: the shards as written, and the objects as its referrers.
     let sealed = StripeMeta {
@@ -467,29 +495,47 @@ pub async fn pack_objects(
         abort(state, &pack_id).await;
         return Err(format!("seal pack: {e}"));
     }
-    report.pack_id = hex::encode(&pack_id);
     report.shard_nodes = sealed
         .shards
         .iter()
         .map(|l| hex::encode(&l.node_id))
         .collect();
+    crate::gateway_metrics::record_pack(
+        candidates.len() as u64,
+        candidates
+            .iter()
+            .map(|c| raw_size(c.object.size, k, m))
+            .sum(),
+        raw_size(data.len() as u64, k, m),
+    );
+    if stop_after == Some(StopAfter::Seal) {
+        return Ok(report);
+    }
 
     // 4. Switch, and 5. release.
-    for c in candidates {
+    let mut settled = Vec::new();
+    for (i, c) in candidates.into_iter().enumerate() {
         let mut packed = c.object.clone();
-        packed.stripes = vec![StripeMeta {
-            stripe_id: sealed.stripe_id,
-            ec_k: k,
-            ec_m: m,
-            ec_type: sealed.ec_type,
-            data_size: sealed.data_size,
-            object_id: pack_id.clone(),
-            pack_id: pack_id.clone(),
-            slice_offset: c.offset,
-            slice_length: c.object.size,
-            ..Default::default()
-        }];
+        packed.stripes = vec![slice_stripe(&pack_id, &sealed, c.offset, c.object.size)];
         let what = format!("{bucket}/{}", c.key);
+        if i == 1 && stop_after == Some(StopAfter::SwitchOne) {
+            return Ok(report);
+        }
+        if stop_after == Some(StopAfter::SwitchOne) {
+            // Switched, and stopped before its old stripe is released.
+            let _ = put_object_meta_to_all(
+                &state.osd_pool,
+                &c.nodes,
+                bucket,
+                &c.key,
+                packed,
+                false,
+                &c.object.object_id,
+            )
+            .await;
+            report.packed.push(c.key);
+            continue;
+        }
         match put_object_meta_to_all(
             &state.osd_pool,
             &c.nodes,
@@ -510,6 +556,7 @@ pub async fn pack_objects(
             {
                 // Every copy now names the pack: its own stripe is nobody's.
                 spawn_reclaim(state, stripe_targets_of(&c.object), Reclaim::Packed, what);
+                settled.push(c.object.object_id.clone());
                 report.packed.push(c.key);
             }
             Ok(_) => {
@@ -527,6 +574,7 @@ pub async fn pack_objects(
                     Reclaim::Packed,
                     what,
                 );
+                settled.push(c.object.object_id.clone());
                 report
                     .skipped
                     .push((c.key, "changed while it was packed".into()));
@@ -542,7 +590,275 @@ pub async fn pack_objects(
             }
         }
     }
+    // What's done needn't be looked at again; the rest (left partly
+    // switched, or switched over the unexpected) is reconciliation's.
+    settle(state, &pack_id, settled).await;
     Ok(report)
+}
+
+/// A pack's member, as recorded for reconciliation.
+fn member(c: &Candidate) -> PackMember {
+    let mut old_stripe = c.object.stripes.first().cloned().unwrap_or_default();
+    if old_stripe.object_id.is_empty() {
+        old_stripe.object_id.clone_from(&c.object.object_id);
+    }
+    PackMember {
+        object_id: c.object.object_id.clone(),
+        key: c.key.clone(),
+        version_id: c.object.version_id.clone(),
+        slice_offset: c.offset,
+        slice_length: c.object.size,
+        old_stripe: Some(old_stripe),
+    }
+}
+
+/// A packed object's one stripe: its slice of the pack.
+fn slice_stripe(pack_id: &[u8], pack: &StripeMeta, offset: u64, length: u64) -> StripeMeta {
+    StripeMeta {
+        stripe_id: pack.stripe_id,
+        ec_k: pack.ec_k,
+        ec_m: pack.ec_m,
+        ec_type: pack.ec_type,
+        data_size: pack.data_size,
+        object_id: pack_id.to_vec(),
+        pack_id: pack_id.to_vec(),
+        slice_offset: offset,
+        slice_length: length,
+        ..Default::default()
+    }
+}
+
+/// Raw bytes `size` bytes take as one k+m stripe: each shard rounded up to
+/// whole 4 KiB blocks with its 96-byte header and footer.
+pub(crate) const fn raw_size(size: u64, k: u32, m: u32) -> u64 {
+    let k = if k == 0 { 1 } else { k as u64 };
+    let shard = size.div_ceil(k) + 96;
+    shard.div_ceil(4096) * 4096 * (k + m as u64)
+}
+
+async fn settle(state: &AppState, pack_id: &[u8], object_ids: Vec<Vec<u8>>) {
+    if object_ids.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .meta_client
+        .clone()
+        .pack_settle(PackSettleRequest {
+            pack_id: pack_id.to_vec(),
+            object_ids,
+        })
+        .await
+    {
+        // Left for reconciliation, which finds them done.
+        warn!("pack {}: settling members: {e}", hex::encode(pack_id));
+    }
+}
+
+// ── Reconciliation ──────────────────────────────────────────────────────────
+
+/// What a reconciliation pass did.
+#[derive(Debug, Default, Serialize)]
+pub struct ReconcileReport {
+    /// Unsealed packs dropped, with their shards.
+    pub aborted: usize,
+    /// Members never switched (or gone): their pack reference released.
+    pub released: usize,
+    /// Members whose switch was finished: their old stripe released.
+    pub finished: usize,
+    /// Members left for a later pass: a copy unreadable, or disagreeing in
+    /// a way that isn't safe to settle now.
+    pub unknown: usize,
+}
+
+/// Bring every pack older than `min_age` to a settled state: an unsealed
+/// one (its packer died before sealing) is dropped with its shards; each
+/// unsettled member of a sealed one is looked up on every copy of its
+/// ObjectMeta and either released from the pack (no copy names it), has its
+/// switch finished (some do), or has its old stripe released (all do).
+/// Nothing is freed while any copy that could be read points at it, and a
+/// member with a copy that can't be read is left for later.
+pub async fn reconcile(
+    state: &Arc<AppState>,
+    min_age: Duration,
+) -> Result<ReconcileReport, String> {
+    let mut report = ReconcileReport::default();
+    let now = crate::lifecycle::now_ms() / 1000;
+    let mut after = Vec::new();
+    loop {
+        let page = state
+            .meta_client
+            .clone()
+            .list_packs(ListPacksRequest {
+                start_after: after.clone(),
+                limit: 500,
+            })
+            .await
+            .map_err(|e| format!("list packs: {e}"))?
+            .into_inner();
+        for pack in &page.packs {
+            if now.saturating_sub(pack.created_at) < min_age.as_secs() {
+                continue;
+            }
+            if !pack.sealed {
+                abort(state, &pack.pack_id).await;
+                crate::gateway_metrics::record_pack_reconciled("aborted");
+                report.aborted += 1;
+                continue;
+            }
+            let Some(stripe) = pack.stripe.as_ref() else {
+                continue;
+            };
+            let mut settled = Vec::new();
+            for m in &pack.members {
+                match reconcile_member(state, pack, stripe, m).await {
+                    Some(action) => {
+                        crate::gateway_metrics::record_pack_reconciled(action);
+                        if action == "released" {
+                            report.released += 1;
+                        } else {
+                            report.finished += 1;
+                        }
+                        settled.push(m.object_id.clone());
+                    }
+                    None => report.unknown += 1,
+                }
+            }
+            settle(state, &pack.pack_id, settled).await;
+        }
+        match page.packs.last() {
+            Some(last) if page.truncated => after.clone_from(&last.pack_id),
+            _ => return Ok(report),
+        }
+    }
+}
+
+/// Settle one member: `Some("released")`, `Some("finished")`, or `None` to
+/// leave it for a later pass.
+async fn reconcile_member(
+    state: &Arc<AppState>,
+    pack: &PackRecord,
+    stripe: &StripeMeta,
+    m: &PackMember,
+) -> Option<&'static str> {
+    let bucket = pack.bucket.as_str();
+    let what = format!("{bucket}/{}", m.key);
+    let nodes = crate::s3::get_placement_nodes_for_object(state, bucket, &m.key)
+        .await
+        .ok()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut copies = Vec::new();
+    for node in nodes.iter().filter(|n| seen.insert(n.node_id.clone())) {
+        // A copy that can't be read could name either: decide nothing.
+        let copy =
+            get_object_version_meta_from_osd(&state.osd_pool, node, bucket, &m.key, &m.version_id)
+                .await
+                .ok()?;
+        copies.push(copy);
+    }
+    let holders: Vec<&ObjectMeta> = copies
+        .iter()
+        .flatten()
+        .filter(|o| o.object_id == m.object_id && !o.is_delete_marker)
+        .collect();
+    let names_pack = |o: &ObjectMeta| o.stripes.first().is_some_and(|s| s.pack_id == pack.pack_id);
+    let old_stripe = || {
+        let mut t = stripe_targets(std::slice::from_ref(m.old_stripe.as_ref()?));
+        for x in &mut t {
+            x.owner.clone_from(&m.object_id);
+        }
+        Some(t)
+    };
+
+    if holders.is_empty() {
+        // Gone from every copy: deleted or overwritten through the S3
+        // path, which released what it held. Releasing again is a no-op
+        // for what's already gone, and frees what a crash left held.
+        spawn_reclaim(
+            state,
+            pack_reference(&pack.pack_id, &m.object_id),
+            Reclaim::Packed,
+            what.clone(),
+        );
+        if let Some(t) = old_stripe() {
+            spawn_reclaim(state, t, Reclaim::Packed, what);
+        }
+        return Some("released");
+    }
+    if holders.len() != copies.len() {
+        // Some copies have it, some don't: repair restores the missing
+        // ones first.
+        return None;
+    }
+    let at_pack = holders.iter().filter(|o| names_pack(o)).count();
+    if at_pack == 0 {
+        // Never switched: it keeps its stripe and lets go of the pack.
+        spawn_reclaim(
+            state,
+            pack_reference(&pack.pack_id, &m.object_id),
+            Reclaim::Packed,
+            what,
+        );
+        return Some("released");
+    }
+    if at_pack < holders.len() {
+        // Partly switched: finish it, over the object as it stands.
+        let mut packed = holders
+            .iter()
+            .find(|o| !names_pack(o))
+            .map(|o| (*o).clone())?;
+        packed.stripes = vec![slice_stripe(
+            &pack.pack_id,
+            stripe,
+            m.slice_offset,
+            m.slice_length,
+        )];
+        let done = put_object_meta_to_all(
+            &state.osd_pool,
+            &nodes,
+            bucket,
+            &m.key,
+            packed,
+            false,
+            &m.object_id,
+        )
+        .await;
+        if done.is_err() {
+            return None;
+        }
+    }
+    // Every copy names the pack: the old stripe is nobody's.
+    if let Some(t) = old_stripe() {
+        spawn_reclaim(state, t, Reclaim::Packed, what);
+    }
+    Some("finished")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileRequest {
+    #[serde(default)]
+    pub min_age_secs: u64,
+}
+
+/// `POST /_admin/test/pack-reconcile {"min_age_secs"}`: run a
+/// reconciliation pass now. Mounted only with `--test-hooks`.
+pub async fn admin_test_reconcile(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<ReconcileRequest>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    match reconcile(&state, Duration::from_secs(req.min_age_secs)).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 /// `object_id`'s reference to the pack, for reclaim to release.
@@ -611,6 +927,7 @@ mod tests {
             created_at: 0,
             sealed: true,
             bucket: String::new(),
+            members: Vec::new(),
         }
     }
 
