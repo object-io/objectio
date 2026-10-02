@@ -2431,6 +2431,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "http-body",
  "http-body-util",
  "hyperscan",
  "k8s-openapi",

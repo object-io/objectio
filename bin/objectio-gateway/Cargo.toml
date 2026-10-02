@@ -38,6 +38,7 @@ uuid = { workspace = true }
 hex = { workspace = true }
 quick-xml = { workspace = true }
 bytes = { workspace = true }
+http-body = "1"
 http-body-util = "0.1"
 md-5 = { workspace = true }
 crc32c = { workspace = true }

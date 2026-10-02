@@ -73,7 +73,7 @@ pub async fn iceberg_unified_auth_layer(
                             "Iceberg SigV4 auth: user={} groups={:?}",
                             auth_result.user_id, auth_result.group_ids
                         );
-                        request.extensions_mut().insert(auth_result);
+                        crate::audit::attach(&mut request, auth_result);
                         return next.run(request).await;
                     }
                 }
@@ -142,7 +142,7 @@ pub async fn iceberg_unified_auth_layer(
                     source_ip: None,
                     source_endpoint: None,
                 };
-                request.extensions_mut().insert(auth_result);
+                crate::audit::attach(&mut request, auth_result);
                 return next.run(request).await;
             }
             Err(e) => {
@@ -244,7 +244,7 @@ pub async fn iceberg_unified_auth_layer(
                 }
             }
         };
-        request.extensions_mut().insert(auth_result);
+        crate::audit::attach(&mut request, auth_result);
         return next.run(request).await;
     }
 

@@ -646,3 +646,23 @@ def test_list_status_numbers_are_normalised(client, stub):
     assert [u.status for u in client.list_users()] == ["suspended", "active"]
     stub.json({"access_keys": [{"access_key_id": "A", "status": "1"}]})
     assert client.list_access_keys("u1")[0].status == "inactive"
+
+
+def test_audit_config(client, stub):
+    stub.json({"targets": [], "tenant": "acme"})
+    client.get_audit_config(tenant="acme")
+    assert (stub.last["method"], stub.last["path"], stub.last["query"]) == (
+        "GET",
+        "/_admin/audit",
+        {"tenant": "acme"},
+    )
+    stub.json({"targets": []})
+    client.put_audit_config(
+        {"tenant": "x", "allowed_tenant_hosts": ["siem.acme.example"]}
+    )
+    assert stub.last["method"] == "PUT"
+    assert stub.body() == {"allowed_tenant_hosts": ["siem.acme.example"], "targets": []}
+    stub.json(None, status=204)
+    client.delete_audit_config()
+    assert (stub.last["method"], stub.last["query"]) == ("DELETE", {})
+

@@ -240,18 +240,21 @@ pub async fn auth_layer(
     // and authorization lets it reach only what a bucket policy grants to
     // everyone, where public access isn't blocked.
     let Some(auth_header) = request.headers().get("authorization") else {
-        request.extensions_mut().insert(AuthResult {
-            user_id: String::new(),
-            user_arn: crate::authz::ANONYMOUS_PRINCIPAL.to_string(),
-            access_key_id: String::new(),
-            group_arns: Vec::new(),
-            group_ids: Vec::new(),
-            tenant: String::new(),
-            auth_mode: objectio_auth::AuthMode::Anonymous,
-            scope: None,
-            source_ip: None,
-            source_endpoint: None,
-        });
+        crate::audit::attach(
+            &mut request,
+            AuthResult {
+                user_id: String::new(),
+                user_arn: crate::authz::ANONYMOUS_PRINCIPAL.to_string(),
+                access_key_id: String::new(),
+                group_arns: Vec::new(),
+                group_ids: Vec::new(),
+                tenant: String::new(),
+                auth_mode: objectio_auth::AuthMode::Anonymous,
+                scope: None,
+                source_ip: None,
+                source_endpoint: None,
+            },
+        );
         return Ok(next.run(request).await);
     };
     let auth_header = auth_header
@@ -354,7 +357,7 @@ pub async fn auth_layer(
                 source_endpoint: None,
             }
         };
-        request.extensions_mut().insert(auth_result);
+        crate::audit::attach(&mut request, auth_result);
         return Ok(next.run(request).await);
     }
 
@@ -385,7 +388,7 @@ pub async fn auth_layer(
     );
 
     // Store auth result in request extensions for handlers to access
-    request.extensions_mut().insert(auth_result);
+    crate::audit::attach(&mut request, auth_result);
     Ok(next.run(request).await)
 }
 
@@ -448,7 +451,7 @@ async fn run_presigned(
         auth_result.user_id, auth_result.access_key_id
     );
 
-    request.extensions_mut().insert(auth_result);
+    crate::audit::attach(&mut request, auth_result);
     Ok(next.run(request).await)
 }
 
@@ -1168,9 +1171,11 @@ impl IntoResponse for AuthError {
 <Error>
     <Code>{}</Code>
     <Message>{}</Message>
-    <RequestId>unknown</RequestId>
+    <RequestId>{}</RequestId>
 </Error>"#,
-            error_code, message
+            error_code,
+            message,
+            crate::audit::request_id().unwrap_or_default()
         );
 
         Response::builder()
