@@ -127,6 +127,14 @@ struct Args {
     #[arg(long)]
     audit_log: Option<String>,
 
+    /// How often the lifecycle worker scans (seconds).
+    #[arg(long)]
+    lifecycle_interval_secs: Option<u64>,
+
+    /// Length of a lifecycle "day" in seconds (testing only).
+    #[arg(long, hide = true)]
+    lifecycle_day_secs: Option<u64>,
+
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
@@ -850,6 +858,12 @@ async fn main() -> Result<()> {
             "--data-listen".to_string(),
             format!("{}:{port}={name}", args.listen_addr),
         ]);
+    }
+    if let Some(secs) = args.lifecycle_interval_secs {
+        gw_argv.extend(["--lifecycle-interval-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.lifecycle_day_secs {
+        gw_argv.extend(["--lifecycle-day-secs".to_string(), secs.to_string()]);
     }
     if let Some(path) = &args.audit_log {
         gw_argv.extend(["--audit-log".to_string(), path.clone()]);

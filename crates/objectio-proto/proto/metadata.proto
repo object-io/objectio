@@ -242,6 +242,9 @@ service MetadataService {
     // Small per-bucket settings (public access block, CORS, ...), each a
     // named opaque value. Removed with the bucket.
     rpc GetBucketSetting(GetBucketSettingRequest) returns (GetBucketSettingResponse);
+    // A named lease held by one caller at a time, for cluster-wide
+    // background work only one gateway should do (the lifecycle scan).
+    rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
     rpc PutBucketSetting(PutBucketSettingRequest) returns (PutBucketSettingResponse);
 
     // KMS key management (for SSE-KMS). Key material is wrapped by the
@@ -2376,6 +2379,15 @@ message LifecycleRule {
     uint32 noncurrent_version_expiration_days = 6;      // Delete non-current versions after N days
     bool expired_object_delete_marker = 7;              // Remove expired delete markers
     uint32 abort_incomplete_multipart_upload_days = 8;  // Abort incomplete uploads after N days
+    // The rule's filter, as S3 has it. has_filter: written as <Filter>
+    // (false: the legacy top-level <Prefix>), so it reads back as written.
+    bool has_filter = 9;
+    map<string, string> filter_tags = 10;               // every tag must match
+    uint64 object_size_greater_than = 11;               // 0 = no lower bound
+    uint64 object_size_less_than = 12;                  // 0 = no upper bound
+    // NoncurrentVersionExpiration: keep this many newest noncurrent versions
+    // whatever their age (0 = none kept).
+    uint32 newer_noncurrent_versions = 13;
 }
 
 // ============================================================
@@ -2613,6 +2625,18 @@ message GetBucketEncryptionResponse {
 
 message DeleteBucketEncryptionRequest { string bucket = 1; }
 message DeleteBucketEncryptionResponse { bool success = 1; }
+
+message AcquireLeaseRequest {
+    string name = 1;
+    string holder = 2;       // the caller's unique id
+    uint64 ttl_secs = 3;
+    bool release = 4;        // give it up (if held by `holder`)
+}
+message AcquireLeaseResponse {
+    bool acquired = 1;
+    string holder = 2;       // who holds it now
+    uint64 expires_at = 3;   // unix seconds
+}
 
 message GetBucketSettingRequest {
     string bucket = 1;

@@ -117,7 +117,8 @@ pub struct AuditEvent {
     pub id: String,
     /// RFC 3339, UTC, milliseconds.
     pub time: String,
-    /// `s3`, `admin`, `console`, `sts`, `iceberg`, `unity`, `delta-sharing`.
+    /// `s3`, `admin`, `console`, `sts`, `iceberg`, `unity`, `delta-sharing`,
+    /// or `internal` for what the gateway does on its own (lifecycle).
     pub api: &'static str,
     pub method: String,
     pub path: String,
@@ -407,6 +408,42 @@ impl Auditor {
         if self.tx.try_send(event).is_err() {
             DROPPED.inc(&label("ingest"));
         }
+    }
+
+    /// Record something the gateway did on its own (lifecycle), as the
+    /// request it stands for.
+    pub fn record_internal(&self, a: InternalAction<'_>) {
+        if !self.active.load(Ordering::Relaxed) {
+            return;
+        }
+        self.submit(AuditEvent {
+            version: 1,
+            id: uuid::Uuid::new_v4().simple().to_string().to_uppercase(),
+            time: now_rfc3339(),
+            api: "internal",
+            method: a.method.to_string(),
+            path: format!("/{}/{}", a.bucket, a.key.unwrap_or_default()),
+            query: a
+                .version_id
+                .map(|v| format!("versionId={v}"))
+                .unwrap_or_default(),
+            action: Some(a.action.to_string()),
+            bucket: Some(a.bucket.to_string()),
+            key: a.key.map(str::to_string),
+            bucket_tenant: Some(a.bucket_tenant.to_string()),
+            principal: Principal {
+                arn: a.principal,
+                auth: a.auth.to_string(),
+                ..Principal::default()
+            },
+            source: Source::default(),
+            status: a.status,
+            error_code: None,
+            request_bytes: 0,
+            response_bytes: 0,
+            duration_ms: 0,
+            complete: true,
+        });
     }
 
     /// Re-read the configuration now (after this gateway changed it).
@@ -733,6 +770,20 @@ async fn run_webhook(name: String, w: Webhook, mut rx: mpsc::Receiver<AuditEvent
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     }
+}
+
+/// An action the gateway took on its own, for [`Auditor::record_internal`].
+pub struct InternalAction<'a> {
+    /// Who, e.g. `lifecycle:<rule id>`.
+    pub principal: String,
+    pub auth: &'static str,
+    pub method: &'static str,
+    pub action: &'static str,
+    pub bucket: &'a str,
+    pub bucket_tenant: &'a str,
+    pub key: Option<&'a str>,
+    pub version_id: Option<&'a str>,
+    pub status: u16,
 }
 
 // ── The middleware ──────────────────────────────────────────────────────
