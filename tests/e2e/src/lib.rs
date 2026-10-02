@@ -655,24 +655,7 @@ impl Cluster {
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
-        let resp = req.send().expect("request");
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_ascii_lowercase(),
-                    v.to_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let bytes = resp.bytes().expect("body").to_vec();
-        Response {
-            status,
-            bytes,
-            headers,
-        }
+        Response::from(req.send().expect("request"))
     }
 
     /// Signed request. `body` is sent as-is; pass `&[]` for none.
@@ -838,24 +821,102 @@ impl Cluster {
             req = req.body(body.to_vec());
         }
 
-        let resp = req.send().expect("request");
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_ascii_lowercase(),
-                    v.to_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let bytes = resp.bytes().expect("body").to_vec();
-        Response {
-            status,
-            bytes,
-            headers,
+        Response::from(req.send().expect("request"))
+    }
+
+    /// A request that signs `signed` too, each value as the raw bytes sent
+    /// (a value that isn't UTF-8 is signed as Latin-1, as Python's
+    /// http.client sends it). With `date_header` the time goes in `Date`,
+    /// RFC 1123, and there is no `X-Amz-Date`: what botocore does when the
+    /// caller sets `Date`.
+    pub fn request_signed(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        signed: &[(&str, &[u8])],
+        date_header: bool,
+    ) -> Response {
+        let payload_hash = hex::encode(Sha256::digest(body));
+        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+        let escaped_path = escape_path(path_only);
+        let (amz_date, date_stamp) = time_now();
+        let text = |v: &[u8]| {
+            std::str::from_utf8(v).map_or_else(
+                |_| v.iter().map(|&b| char::from(b)).collect(),
+                str::to_string,
+            )
+        };
+        let mut headers: Vec<(String, Vec<u8>)> = vec![
+            ("host".into(), host.into_bytes()),
+            (
+                "x-amz-content-sha256".into(),
+                payload_hash.clone().into_bytes(),
+            ),
+        ];
+        if date_header {
+            headers.push(("date".into(), http_date().into_bytes()));
+        } else {
+            headers.push(("x-amz-date".into(), amz_date.clone().into_bytes()));
         }
+        for (k, v) in signed {
+            headers.push((k.to_ascii_lowercase(), v.to_vec()));
+        }
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}:{}\n", text(v).trim()))
+            .collect();
+        let signed_headers = headers
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_request = format!(
+            "{method}\n{escaped_path}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            canonical_query(query),
+        );
+        let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let mut key = hmac(format!("AWS4{}", self.secret_key).as_bytes(), &date_stamp);
+        key = hmac(&key, "us-east-1");
+        key = hmac(&key, "s3");
+        key = hmac(&key, "aws4_request");
+        let signature = hex::encode(hmac(&key, &string_to_sign));
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let url = if query.is_empty() {
+            format!("{}{escaped_path}", self.endpoint)
+        } else {
+            format!("{}{escaped_path}?{}", self.endpoint, canonical_query(query))
+        };
+        let mut req = client.request(method.parse().expect("method"), url).header(
+            "Authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/{scope}, \
+                 SignedHeaders={signed_headers}, Signature={signature}",
+                self.access_key
+            ),
+        );
+        for (k, v) in &headers {
+            if k != "host" {
+                req = req.header(
+                    k.as_str(),
+                    reqwest::header::HeaderValue::from_bytes(v).expect("header value"),
+                );
+            }
+        }
+        if !body.is_empty() {
+            req = req.body(body.to_vec());
+        }
+        Response::from(req.send().expect("request"))
     }
 
     /// Convenience: signed request whose body is JSON.
@@ -921,6 +982,28 @@ pub struct Response {
     pub headers: Vec<(String, String)>,
 }
 
+impl From<reqwest::blocking::Response> for Response {
+    fn from(resp: reqwest::blocking::Response) -> Self {
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_ascii_lowercase(),
+                    v.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let bytes = resp.bytes().expect("body").to_vec();
+        Self {
+            status,
+            bytes,
+            headers,
+        }
+    }
+}
+
 impl Response {
     /// A response header, lowercased name.
     pub fn header(&self, name: &str) -> Option<String> {
@@ -973,6 +1056,29 @@ fn hmac(key: &[u8], data: &str) -> Vec<u8> {
 }
 
 /// `(amz_date, date_stamp)` in UTC, without pulling in chrono.
+/// Now as an HTTP date (RFC 1123): `Fri, 02 Oct 2026 14:03:00 GMT`.
+fn http_date() -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let (y, m, d) = civil_from_days(days as i64);
+    format!(
+        "{}, {d:02} {} {y:04} {:02}:{:02}:{:02} GMT",
+        DAYS[(days % 7) as usize],
+        MONTHS[(m - 1) as usize],
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
 fn time_now() -> (String, String) {
     time_at(0)
 }

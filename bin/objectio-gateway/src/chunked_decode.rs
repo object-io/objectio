@@ -55,12 +55,13 @@ struct Decoded {
 /// chunk-signature extensions.
 fn decode_s3_chunked(raw: &[u8]) -> Result<Decoded, String> {
     let mut output = Vec::with_capacity(raw.len());
-    let mut trailers = Vec::new();
     let mut pos = 0;
 
     loop {
+        // A body that stops before the terminal chunk is a cut-off upload,
+        // not a short object.
         if pos >= raw.len() {
-            break;
+            return Err("body ended before the terminal chunk".to_string());
         }
 
         // Find the end of the chunk-size line (\r\n)
@@ -83,8 +84,10 @@ fn decode_s3_chunked(raw: &[u8]) -> Result<Decoded, String> {
         if chunk_size == 0 {
             // Terminal chunk — remaining bytes are trailing headers, one
             // `name:value` per line, ended by an empty line.
-            trailers = parse_trailers(&raw[pos.min(raw.len())..]);
-            break;
+            return Ok(Decoded {
+                payload: output,
+                trailers: parse_trailers(&raw[pos.min(raw.len())..]),
+            });
         }
 
         // Read chunk_size bytes of data
@@ -99,16 +102,13 @@ fn decode_s3_chunked(raw: &[u8]) -> Result<Decoded, String> {
         output.extend_from_slice(&raw[pos..pos + chunk_size]);
         pos += chunk_size;
 
-        // Skip the trailing \r\n after chunk data
-        if pos + 2 <= raw.len() && raw[pos] == b'\r' && raw[pos + 1] == b'\n' {
-            pos += 2;
+        // The chunk's data is followed by CRLF; anything else means the
+        // declared size was wrong.
+        if raw.get(pos..pos + 2) != Some(b"\r\n".as_slice()) {
+            return Err(format!("missing CRLF after chunk data at offset {pos}"));
         }
+        pos += 2;
     }
-
-    Ok(Decoded {
-        payload: output,
-        trailers,
-    })
 }
 
 /// Trailing headers after the terminal chunk. Lines that are not
@@ -134,6 +134,20 @@ fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// `Content-Encoding` with the `aws-chunked` coding taken out.
+fn without_aws_chunked(value: &str) -> String {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("aws-chunked"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn incomplete_body(message: &str) -> Response {
+    crate::s3::S3Error::xml_response("IncompleteBody", message, http::StatusCode::BAD_REQUEST)
+}
+
 /// Middleware that decodes S3 chunked transfer encoding before handlers see the body.
 pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Response {
     if !is_s3_chunked(&request) {
@@ -142,13 +156,14 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
 
     let (mut parts, body) = request.into_parts();
 
-    // Read the full body
+    // Read the full body. A body that can't be read, or decoded, fails the
+    // request: handing the handler an empty or still-framed body would
+    // store the wrong bytes under the key.
     let raw = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
             warn!("Failed to read s3-chunked body: {}", e);
-            let rebuilt = Request::from_parts(parts, Body::empty());
-            return next.run(rebuilt).await;
+            return incomplete_body("The request body could not be read in full");
         }
     };
 
@@ -178,14 +193,40 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
             payload
         }
         Err(e) => {
-            warn!("Failed to decode s3-chunked body: {}; passing raw body", e);
-            raw.to_vec()
+            warn!("Failed to decode s3-chunked body: {}", e);
+            return incomplete_body(&format!("Malformed aws-chunked body: {e}"));
         }
     };
 
-    // Update Content-Length to the decoded size and remove s3-chunked encoding
+    if let Some(expected) = parts
+        .headers
+        .get("x-amz-decoded-content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        && expected != decoded.len()
+    {
+        return incomplete_body(&format!(
+            "x-amz-decoded-content-length is {expected}, the body decoded to {} bytes",
+            decoded.len()
+        ));
+    }
+
+    // Update Content-Length to the decoded size. `aws-chunked` is only the
+    // transfer framing: any other coding (`gzip, aws-chunked`) belongs to
+    // the object and is kept.
     parts.headers.insert("content-length", decoded.len().into());
-    parts.headers.remove("content-encoding");
+    let remaining = parts
+        .headers
+        .get("content-encoding")
+        .map(|v| without_aws_chunked(&crate::auth_middleware::header_text(v)));
+    match remaining.and_then(|r| http::HeaderValue::from_str(&r).ok()) {
+        Some(v) if !v.is_empty() => {
+            parts.headers.insert("content-encoding", v);
+        }
+        _ => {
+            parts.headers.remove("content-encoding");
+        }
+    }
     // Remove the streaming hash header so downstream doesn't expect chunked format
     if parts
         .headers
@@ -205,6 +246,23 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_without_its_terminal_chunk_is_refused() {
+        assert!(decode_s3_chunked(b"5;chunk-signature=aaa\r\nhello\r\n").is_err());
+        assert!(decode_s3_chunked(b"").is_err());
+        // Declared longer than sent.
+        assert!(decode_s3_chunked(b"9\r\nhello\r\n0\r\n\r\n").is_err());
+        // Declared shorter than sent.
+        assert!(decode_s3_chunked(b"3\r\nhello\r\n0\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn only_the_aws_chunked_coding_is_dropped() {
+        assert_eq!(without_aws_chunked("gzip, aws-chunked"), "gzip");
+        assert_eq!(without_aws_chunked("aws-chunked"), "");
+        assert_eq!(without_aws_chunked("aws-chunked,br"), "br");
+    }
 
     #[test]
     fn test_decode_simple_s3_chunked() {

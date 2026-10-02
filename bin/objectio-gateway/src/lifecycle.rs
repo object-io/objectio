@@ -687,7 +687,12 @@ fn due(
         // A marker alone: nothing behind it to bring back.
         if versions.len() == 1
             && let Some(r) = enabled().find(|r| {
-                (r.expired_object_delete_marker || (versioned && r.expiration_days > 0))
+                // ExpiredObjectDeleteMarker: whenever it's alone. Days in
+                // a versioned bucket: once the marker is that old too.
+                (r.expired_object_delete_marker
+                    || (versioned
+                        && r.expiration_days > 0
+                        && age_ms(current) >= u64::from(r.expiration_days) * day_ms))
                     && matches_marker(r, &current.key)
             })
         {
@@ -1212,5 +1217,19 @@ mod tests {
         tagged.size = 3;
         assert!(due(&r, &[tagged], 5 * DAY, DAY, false).is_empty());
         assert!(due(&r, &[v("a", "v1", 0, false)], 5 * DAY, DAY, false).is_empty());
+    }
+
+    #[test]
+    fn days_remove_a_lone_marker_only_once_it_is_that_old() {
+        let r = rules(
+            "<LifecycleConfiguration><Rule><ID>d</ID><Filter/><Status>Enabled</Status>\
+                       <Expiration><Days>5</Days></Expiration></Rule></LifecycleConfiguration>",
+        );
+        let alone = vec![v("k", "dm", 10, true)];
+        assert!(due(&r, &alone, 12 * DAY, DAY, true).is_empty());
+        assert_eq!(
+            due(&r, &alone, 15 * DAY, DAY, true),
+            vec![Action::RemoveMarker("d".into(), "dm".into())]
+        );
     }
 }
