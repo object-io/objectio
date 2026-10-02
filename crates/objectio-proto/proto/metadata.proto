@@ -207,6 +207,13 @@ service MetadataService {
     // later block snapshots and dedup). Unshared stripes have no entry.
     rpc ShareStripes(ShareStripesRequest) returns (ShareStripesResponse);
     rpc ReleaseStripes(ReleaseStripesRequest) returns (ReleaseStripesResponse);
+    // Small-object packs (objectio-docs architecture/design/small-object-packing.md).
+    rpc IntendPack(IntendPackRequest) returns (IntendPackResponse);
+    rpc SealPack(SealPackRequest) returns (SealPackResponse);
+    rpc AbortPack(AbortPackRequest) returns (AbortPackResponse);
+    rpc GetPack(GetPackRequest) returns (GetPackResponse);
+    rpc ListPacks(ListPacksRequest) returns (ListPacksResponse);
+    rpc PackMoveShard(PackMoveShardRequest) returns (PackMoveShardResponse);
 
     // Block storage metadata, replicated through Raft: volumes, each
     // volume's chunk map, snapshots, clones. The block gateway keeps none
@@ -432,6 +439,25 @@ message StripeMeta {
     // slice_length 0: the whole stripe is this object's.
     uint64 slice_offset = 14;
     uint64 slice_length = 15;
+    // Set for a packed object: its stripe is the pack recorded under this id
+    // in meta (GetPack), which holds the shard locations; `shards` is empty
+    // here and `object_id` is the pack id.
+    bytes pack_id = 16;
+}
+
+// A pack: one erasure-coded stripe holding many small objects' bytes,
+// recorded once so repair and drain update one record. Its referrers are
+// the objects in it, in the shared-stripe registry under `pack_id`.
+message PackRecord {
+    bytes pack_id = 1;
+    StripeMeta stripe = 2;      // ec scheme, shard locations, data size
+    uint64 data_len = 3;
+    uint64 version = 4;         // bumped on every location change
+    uint64 created_at = 5;
+    bool sealed = 6;            // false from IntendPack until SealPack
+    // The bucket whose objects it holds: its shards are placed in that
+    // bucket's pool, under the key `.objectio-pack/<hex pack id>`.
+    string bucket = 7;
 }
 
 // Shard location
@@ -2794,7 +2820,55 @@ message ReleaseStripesRequest {
 }
 message ReleaseStripesResponse {
     repeated bytes freeable = 1;
+    // Packs whose last referrer this was: their records are gone (in the
+    // same commit), and these are their stripes, for their shards to be
+    // reclaimed.
+    repeated StripeMeta freed_packs = 2;
 }
+
+// Record a pack about to be written (unsealed): its shards are known
+// before any is written. ALREADY_EXISTS if the id is taken.
+message IntendPackRequest { PackRecord pack = 1; }
+message IntendPackResponse {}
+
+// Seal a written pack and register its referrers, in one commit.
+// FAILED_PRECONDITION unless it is recorded unsealed.
+message SealPackRequest {
+    bytes pack_id = 1;
+    repeated bytes referrers = 2;   // the object ids packed into it
+    // The stripe as written: where each shard landed. Replaces the
+    // intended locations IntendPack recorded.
+    StripeMeta stripe = 3;
+}
+message SealPackResponse {}
+
+// Drop an unsealed pack's record (a pack abandoned before sealing); the
+// record is returned so its written shards can be deleted. A sealed pack
+// is refused.
+message AbortPackRequest { bytes pack_id = 1; }
+message AbortPackResponse { PackRecord pack = 1; bool found = 2; }
+
+message GetPackRequest { bytes pack_id = 1; }
+message GetPackResponse { PackRecord pack = 1; bool found = 2; }
+
+message ListPacksRequest {
+    bytes start_after = 1;
+    uint32 limit = 2;
+}
+message ListPacksResponse {
+    repeated PackRecord packs = 1;
+    bool truncated = 2;
+}
+
+// A pack shard moved (drain, repair): the record's location for
+// `position` changes from `from_node` to `to`, and its version is bumped.
+message PackMoveShardRequest {
+    bytes pack_id = 1;
+    uint32 position = 2;
+    bytes from_node = 3;
+    ShardLocation to = 4;
+}
+message PackMoveShardResponse {}
 
 // ---- Block storage metadata ----
 

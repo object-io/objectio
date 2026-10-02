@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod metrics_middleware;
 pub mod origin;
 pub mod osd_pool;
+pub mod packs;
 pub mod post_object;
 pub mod prom;
 pub mod public_access;
@@ -337,6 +338,11 @@ pub struct Args {
     /// rule's Days count in units of this.
     #[arg(long, default_value_t = 86_400, hide = true)]
     pub lifecycle_day_secs: u64,
+
+    /// Mount `/_admin/test/*`, endpoints tests drive directly (packing
+    /// named objects now). For testing only.
+    #[arg(long, hide = true)]
+    pub test_hooks: bool,
 
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
@@ -929,6 +935,7 @@ pub async fn run(
         trusted_proxies,
         auth_state: Arc::clone(&auth_state),
         auditor: Arc::clone(&auditor),
+        pack_cache: crate::packs::PackCache::default(),
     });
 
     // Lifecycle: every gateway runs a worker; a lease in meta lets one scan
@@ -1187,7 +1194,15 @@ pub async fn run(
         // are both recognised. Inert when --prometheus-url is unset.
         .route("/_admin/metrics/capabilities", get(prom::capabilities))
         .route("/_admin/metrics/query", get(prom::query))
-        .route("/_admin/metrics/query_range", get(prom::query_range))
+        .route("/_admin/metrics/query_range", get(prom::query_range));
+    // Hooks a test drives directly, never mounted otherwise.
+    let admin_routes = if args.test_hooks {
+        warn!("--test-hooks: /_admin/test/* is mounted");
+        admin_routes.route("/_admin/test/pack", post(packs::admin_test_pack))
+    } else {
+        admin_routes
+    };
+    let admin_routes = admin_routes
         .with_state(Arc::clone(&state))
         // Layer SigV4 verification that is optional — if a request carries
         // `Authorization: AWS4-HMAC-SHA256 ...`, verify it and inject

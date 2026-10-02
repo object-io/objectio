@@ -1024,6 +1024,8 @@ pub enum Reclaim {
     UnusedPart,
     /// The multipart upload was aborted.
     Abort,
+    /// The object moved into a pack: its own stripe goes.
+    Packed,
 }
 
 impl Reclaim {
@@ -1033,6 +1035,7 @@ impl Reclaim {
             Self::Delete => "delete",
             Self::Overwrite => "overwrite",
             Self::FailedWrite => "failed_write",
+            Self::Packed => "packed",
             Self::ReplacedPart => "replaced_part",
             Self::UnusedPart => "unused_part",
             Self::Abort => "abort",
@@ -1077,20 +1080,47 @@ pub fn stripe_targets(stripes: &[objectio_proto::metadata::StripeMeta]) -> Vec<S
     let mut seen = std::collections::HashSet::new();
     stripes
         .iter()
-        .filter(|stripe| !stripe.object_id.is_empty())
+        .filter(|stripe| !stripe.object_id.is_empty() || !stripe.pack_id.is_empty())
         .flat_map(|stripe| {
-            stripe.shards.iter().map(move |shard| ShardTarget {
-                node_id: shard.node_id.clone(),
+            // A slice of a pack holds no shards of its own: one marker
+            // stands for its reference to the pack, which reclaim releases
+            // and, if it was the pack's last, expands into the pack's shards.
+            let marker = (!stripe.pack_id.is_empty()).then(|| ShardTarget {
+                node_id: Vec::new(),
                 address: String::new(),
-                object_id: stripe.object_id.clone(),
+                object_id: stripe.pack_id.clone(),
                 stripe_id: stripe.stripe_id,
-                position: shard.position,
-                // Unless the caller knows better: the stripe's own writer.
-                owner: stripe.object_id.clone(),
-            })
+                position: PACK_MARKER,
+                owner: stripe.pack_id.clone(),
+            });
+            let shards = stripe
+                .shards
+                .iter()
+                .filter(|_| stripe.pack_id.is_empty())
+                .map(move |shard| ShardTarget {
+                    node_id: shard.node_id.clone(),
+                    address: String::new(),
+                    object_id: stripe.object_id.clone(),
+                    stripe_id: stripe.stripe_id,
+                    position: shard.position,
+                    // Unless the caller knows better: the stripe's own writer.
+                    owner: stripe.object_id.clone(),
+                });
+            marker.into_iter().chain(shards)
         })
-        .filter(|t| !t.node_id.is_empty() && seen.insert(t.clone()))
+        .filter(|t| (t.is_pack_marker() || !t.node_id.is_empty()) && seen.insert(t.clone()))
         .collect()
+}
+
+/// [`ShardTarget::position`] of a pack marker.
+const PACK_MARKER: u32 = u32::MAX;
+
+impl ShardTarget {
+    /// A packed object's reference to its pack, not a shard.
+    #[must_use]
+    pub const fn is_pack_marker(&self) -> bool {
+        self.position == PACK_MARKER && self.node_id.is_empty()
+    }
 }
 
 /// The object ids whose shards `object` refers to: its own, and each
@@ -1156,10 +1186,18 @@ pub fn reclaimable_after_overwrite(
 
 /// Release each target's stripe on its owner's behalf, and return the
 /// `(owner, stripe)` pairs whose stripes no object references any more.
+/// What releasing `targets` freed: `(owner, stripe id)` pairs whose shards
+/// may go, and the packs whose last object let go.
 async fn freeable(
     meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
     targets: &[ShardTarget],
-) -> Result<std::collections::HashSet<(Vec<u8>, Vec<u8>)>, tonic::Status> {
+) -> Result<
+    (
+        std::collections::HashSet<(Vec<u8>, Vec<u8>)>,
+        Vec<objectio_proto::metadata::StripeMeta>,
+    ),
+    tonic::Status,
+> {
     let mut by_owner: HashMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = HashMap::new();
     for t in targets {
         by_owner
@@ -1168,6 +1206,7 @@ async fn freeable(
             .insert(t.object_id.clone());
     }
     let mut free = std::collections::HashSet::new();
+    let mut packs = Vec::new();
     for (owner, ids) in by_owner {
         let resp = meta
             .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
@@ -1177,8 +1216,9 @@ async fn freeable(
             .await?
             .into_inner();
         free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
+        packs.extend(resp.freed_packs);
     }
-    Ok(free)
+    Ok((free, packs))
 }
 
 /// Drop `owner`'s reference to `stripe_ids` without deleting anything: an
@@ -1288,10 +1328,21 @@ pub async fn reclaim_shards(
     // — a leak can be reclaimed later, deleted shared data cannot.
     let total = targets.len();
     let targets = match freeable(meta, &targets).await {
-        Ok(free) => targets
-            .into_iter()
-            .filter(|t| free.contains(&(t.owner.clone(), t.object_id.clone())))
-            .collect::<Vec<_>>(),
+        Ok((free, packs)) => {
+            let mut freed: Vec<ShardTarget> = targets
+                .into_iter()
+                .filter(|t| {
+                    !t.is_pack_marker() && free.contains(&(t.owner.clone(), t.object_id.clone()))
+                })
+                .collect();
+            // A pack its last object let go: meta dropped its record in
+            // the same commit, so its shards are nobody's.
+            for mut pack in packs {
+                pack.pack_id.clear();
+                freed.extend(stripe_targets(std::slice::from_ref(&pack)));
+            }
+            freed
+        }
         Err(e) => {
             warn!("reclaim: cannot ask meta which stripes are still shared, keeping them: {e}");
             crate::gateway_metrics::record_reclaim(reason.label(), 0, total as u64);

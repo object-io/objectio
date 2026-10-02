@@ -149,6 +149,8 @@ pub struct AppState {
     pub auth_state: Arc<crate::auth_middleware::AuthState>,
     /// The audit stream, for the admin API to reload after a change.
     pub auditor: Arc<crate::audit::Auditor>,
+    /// Pack records of packed objects, for reads.
+    pub pack_cache: crate::packs::PackCache,
 }
 
 impl AppState {
@@ -4829,7 +4831,12 @@ async fn verify_upload_checksums(
 
 /// Free `targets` off the request's critical path, logging what could not
 /// be freed. `what` names the object or upload for the log.
-fn spawn_reclaim(state: &Arc<AppState>, targets: Vec<ShardTarget>, reason: Reclaim, what: String) {
+pub(crate) fn spawn_reclaim(
+    state: &Arc<AppState>,
+    targets: Vec<ShardTarget>,
+    reason: Reclaim,
+    what: String,
+) {
     if targets.is_empty() {
         return;
     }
@@ -6028,12 +6035,55 @@ fn part_bounds(object: &ObjectMeta, n: u32) -> Result<(u64, u64, u32), Response>
 }
 
 /// GET one version of an object (`?versionId=`), or the current one.
-async fn get_object_version(
+pub(crate) async fn get_object_version(
     state: Arc<AppState>,
     bucket: String,
     key: String,
     version_id: Option<String>,
     headers: HeaderMap,
+) -> Response {
+    let mut cached_packs = Vec::new();
+    let resp = get_object_version_once(
+        state.clone(),
+        bucket.clone(),
+        key.clone(),
+        version_id.clone(),
+        headers.clone(),
+        false,
+        &mut cached_packs,
+    )
+    .await;
+    // A packed object read through a cached pack record that failed: the
+    // pack may have moved (repair, drain). Once more, asking meta.
+    if resp.status().is_server_error() && !cached_packs.is_empty() {
+        state
+            .pack_cache
+            .forget(cached_packs.iter().map(Vec::as_slice));
+        return get_object_version_once(
+            state,
+            bucket,
+            key,
+            version_id,
+            headers,
+            true,
+            &mut Vec::new(),
+        )
+        .await;
+    }
+    resp
+}
+
+/// One attempt at [`get_object_version`]. `fresh_packs` resolves packs
+/// from meta, not the cache; `cached_packs` gets the packs that were
+/// resolved from the cache.
+async fn get_object_version_once(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    headers: HeaderMap,
+    fresh_packs: bool,
+    cached_packs: &mut Vec<Vec<u8>>,
 ) -> Response {
     debug!("GET object: {}/{}", bucket, key);
     if let Some(refused) = sse_headers_on_read(&headers) {
@@ -6126,7 +6176,7 @@ async fn get_object_version(
     // This is done lazily below only if a node_id is missing from the map.
     phases.mark("meta_lookup");
 
-    let object = match object_to_read(
+    let mut object = match object_to_read(
         &state,
         &placement.nodes,
         &bucket,
@@ -6138,6 +6188,26 @@ async fn get_object_version(
         Ok(obj) => obj,
         Err(resp) => return resp,
     };
+    // A packed object's stripe is a slice of its pack: where the pack's
+    // shards are comes from the pack's record.
+    match crate::packs::resolve(&state, &mut object, fresh_packs).await {
+        Ok(true) => {
+            cached_packs.extend(
+                crate::packs::packs_of(&object)
+                    .into_iter()
+                    .map(<[u8]>::to_vec),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            error!("GET {bucket}/{key}: {e}");
+            return S3Error::xml_response(
+                "InternalError",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    }
     if let Some(resp) = read_preconditions(&headers, &object) {
         return resp;
     }
@@ -12050,7 +12120,7 @@ fn home_of(nodes: &[objectio_proto::metadata::NodePlacement]) -> Vec<Vec<u8>> {
 }
 
 /// Helper to get the primary OSD placement for an object
-async fn get_placement_nodes_for_object(
+pub(crate) async fn get_placement_nodes_for_object(
     state: &AppState,
     bucket: &str,
     key: &str,

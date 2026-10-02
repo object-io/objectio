@@ -1243,6 +1243,160 @@ impl MetaService {
         }
     }
 
+    /// Apply several compare-and-set writes in one commit. `Ok(false)` on
+    /// a conflict, for the caller to re-read and retry.
+    async fn cas_many(
+        &self,
+        ops: Vec<objectio_meta_store::CasOp>,
+        what: &str,
+    ) -> Result<bool, Status> {
+        use objectio_meta_store::{MetaCommand, MetaResponse};
+        if ops.is_empty() {
+            return Ok(true);
+        }
+        if let Some(raft) = self.raft_handle() {
+            let cmd = MetaCommand::MultiCas {
+                ops,
+                requested_by: what.into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => Ok(true),
+                    MetaResponse::MultiCasConflict { .. } => Ok(false),
+                    other => {
+                        error!("unexpected raft response for {what}: {other:?}");
+                        Err(Status::internal("raft commit wrong variant"))
+                    }
+                },
+                Err(e) => Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            for op in ops {
+                store.write_named(
+                    objectio_meta_store::cas_table_name(&op.table),
+                    &op.key,
+                    op.new_value.as_deref(),
+                );
+            }
+            Ok(true)
+        } else {
+            Err(Status::unavailable("no store"))
+        }
+    }
+
+    /// A pack's record and its stored bytes (for compare-and-set).
+    fn pack_record(
+        &self,
+        pack_id: &[u8],
+    ) -> Option<(objectio_proto::metadata::PackRecord, Vec<u8>)> {
+        let bytes = self
+            .store
+            .as_ref()?
+            .read_named(PACKS_TABLE, &hex::encode(pack_id))?;
+        let record = objectio_proto::metadata::PackRecord::decode(bytes.as_slice()).ok()?;
+        Some((record, bytes))
+    }
+
+    /// Every pack, sealed or not, for drain and repair (as block chunks).
+    pub fn packs(&self) -> Vec<objectio_proto::metadata::PackRecord> {
+        self.store
+            .as_ref()
+            .map(|s| s.list_named(PACKS_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, v)| objectio_proto::metadata::PackRecord::decode(v.as_slice()).ok())
+            .filter(|p| p.stripe.is_some())
+            .collect()
+    }
+
+    /// Record shards of a pack rebuilt where it had none.
+    pub async fn pack_add_shard_locations(
+        &self,
+        pack_id: &[u8],
+        added: &[objectio_proto::metadata::ShardLocation],
+    ) -> Result<(), Status> {
+        for _ in 0..8 {
+            let Some((mut record, bytes)) = self.pack_record(pack_id) else {
+                return Err(Status::not_found("pack not found"));
+            };
+            let Some(stripe) = record.stripe.as_mut() else {
+                return Err(Status::internal("pack has no stripe"));
+            };
+            let mut changed = false;
+            for loc in added {
+                if stripe.shards.iter().all(|l| l.position != loc.position) {
+                    stripe.shards.push(loc.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+            stripe.shards.sort_by_key(|l| l.position);
+            record.version += 1;
+            let ok = self
+                .cas_many(
+                    vec![objectio_meta_store::CasOp {
+                        table: objectio_meta_store::CasTable::Named(PACKS_TABLE.into()),
+                        key: hex::encode(pack_id),
+                        expected: Some(bytes),
+                        new_value: Some(record.encode_to_vec()),
+                    }],
+                    "pack-add-shards",
+                )
+                .await?;
+            if ok {
+                return Ok(());
+            }
+        }
+        Err(Status::aborted("pack kept changing; retry"))
+    }
+
+    /// Record that a pack's shard at `position` moved from `from` to `to`.
+    pub async fn pack_move_shard(
+        &self,
+        pack_id: &[u8],
+        position: u32,
+        from: [u8; 16],
+        to: &objectio_proto::metadata::ShardLocation,
+    ) -> Result<(), Status> {
+        for _ in 0..8 {
+            let Some((mut record, bytes)) = self.pack_record(pack_id) else {
+                return Err(Status::not_found("pack not found"));
+            };
+            let Some(stripe) = record.stripe.as_mut() else {
+                return Err(Status::internal("pack has no stripe"));
+            };
+            let mut moved = false;
+            for loc in &mut stripe.shards {
+                if loc.position == position && loc.node_id.as_slice() == from.as_slice() {
+                    *loc = to.clone();
+                    moved = true;
+                }
+            }
+            if !moved {
+                // Already moved (a retry), or the record names another node.
+                return Ok(());
+            }
+            record.version += 1;
+            let ok = self
+                .cas_many(
+                    vec![objectio_meta_store::CasOp {
+                        table: objectio_meta_store::CasTable::Named(PACKS_TABLE.into()),
+                        key: hex::encode(pack_id),
+                        expected: Some(bytes),
+                        new_value: Some(record.encode_to_vec()),
+                    }],
+                    "pack-move-shard",
+                )
+                .await?;
+            if ok {
+                return Ok(());
+            }
+        }
+        Err(Status::aborted("pack kept changing; retry"))
+    }
+
     /// A drained OSD's purge state (`drain_observer::PURGE_*`), if any.
     pub fn purge_state(&self, node_id: [u8; 16]) -> Option<String> {
         self.store
@@ -3364,6 +3518,9 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// Roles, prost-encoded `RoleObject` by name. Written through
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
+
+/// Small-object packs, by pack id (hex): prost `PackRecord`.
+const PACKS_TABLE: &str = "packs";
 
 /// Drained OSDs' purge state, by node id (hex): "pending" until the OSD
 /// confirms it was wiped, then "done".
@@ -10757,6 +10914,13 @@ impl MetadataService for MetaService {
                             )));
                         }
                         Some(r) => r.clone(),
+                        // A pack is registered while anything is in it: no
+                        // entry means the source's slice is gone already.
+                        None if self.pack_record(id).is_some() => {
+                            return Err(Status::failed_precondition(format!(
+                                "pack {key} is no longer referenced by the copy's source"
+                            )));
+                        }
                         None => StripeRefs {
                             referrers: vec![req.owner.clone()],
                         },
@@ -10780,23 +10944,46 @@ impl MetadataService for MetaService {
         &self,
         request: Request<objectio_proto::metadata::ReleaseStripesRequest>,
     ) -> Result<Response<objectio_proto::metadata::ReleaseStripesResponse>, Status> {
+        use objectio_meta_store::{CasOp, CasTable};
         let req = request.into_inner();
         for _ in 0..8 {
-            let mut changes = Vec::new();
+            let mut changes: Vec<(String, Option<objectio_proto::metadata::StripeRefs>)> =
+                Vec::new();
             let mut freeable = Vec::new();
+            let mut pack_ops = Vec::new();
+            let mut freed_packs = Vec::new();
             {
                 let map = self.stripe_refs.read();
                 for id in &req.stripe_ids {
                     let key = hex::encode(id);
+                    let pack = self.pack_record(id);
                     match map.get(&key) {
+                        // A pack is always registered while anything is in
+                        // it: no entry means nothing here to release, never
+                        // "free" — that would delete other objects' bytes.
+                        None if pack.is_some() => {}
                         // Never shared: its only referrer is letting it go.
                         None => freeable.push(id.clone()),
                         Some(r) if r.referrers.contains(&req.referrer) => {
                             let mut refs = r.clone();
                             refs.referrers.retain(|x| x != &req.referrer);
                             if refs.referrers.is_empty() {
-                                freeable.push(id.clone());
-                                changes.push((key, None));
+                                changes.push((key.clone(), None));
+                                if let Some((record, bytes)) = pack {
+                                    // The last object in the pack: the pack
+                                    // goes in the same commit.
+                                    pack_ops.push(CasOp {
+                                        table: CasTable::Named(PACKS_TABLE.into()),
+                                        key,
+                                        expected: Some(bytes),
+                                        new_value: None,
+                                    });
+                                    if let Some(stripe) = record.stripe {
+                                        freed_packs.push(stripe);
+                                    }
+                                } else {
+                                    freeable.push(id.clone());
+                                }
                             } else {
                                 changes.push((key, Some(refs)));
                             }
@@ -10806,13 +10993,246 @@ impl MetadataService for MetaService {
                     }
                 }
             }
-            if self.write_stripe_refs(changes, "release-stripes").await? {
+            let ok = if pack_ops.is_empty() {
+                self.write_stripe_refs(changes, "release-stripes").await?
+            } else {
+                let expected: Vec<Option<Vec<u8>>> = {
+                    let map = self.stripe_refs.read();
+                    changes
+                        .iter()
+                        .map(|(k, _)| map.get(k).map(Message::encode_to_vec))
+                        .collect()
+                };
+                let mut ops: Vec<CasOp> = changes
+                    .iter()
+                    .zip(expected)
+                    .map(|((key, new), expected)| CasOp {
+                        table: CasTable::Named("stripe_refs".into()),
+                        key: key.clone(),
+                        expected,
+                        new_value: new.as_ref().map(Message::encode_to_vec),
+                    })
+                    .collect();
+                ops.extend(pack_ops);
+                let ok = self.cas_many(ops, "release-stripes").await?;
+                if ok {
+                    let mut map = self.stripe_refs.write();
+                    for (key, new) in changes {
+                        match new {
+                            Some(r) => {
+                                map.insert(key, r);
+                            }
+                            None => {
+                                map.remove(&key);
+                            }
+                        }
+                    }
+                }
+                ok
+            };
+            if ok {
                 return Ok(Response::new(
-                    objectio_proto::metadata::ReleaseStripesResponse { freeable },
+                    objectio_proto::metadata::ReleaseStripesResponse {
+                        freeable,
+                        freed_packs,
+                    },
                 ));
             }
         }
         Err(Status::aborted("stripe references kept changing; retry"))
+    }
+
+    async fn intend_pack(
+        &self,
+        request: Request<objectio_proto::metadata::IntendPackRequest>,
+    ) -> Result<Response<objectio_proto::metadata::IntendPackResponse>, Status> {
+        let mut pack = request
+            .into_inner()
+            .pack
+            .ok_or_else(|| Status::invalid_argument("pack is required"))?;
+        if pack.pack_id.len() != 16 || pack.stripe.is_none() {
+            return Err(Status::invalid_argument(
+                "a pack needs a 16-byte id and a stripe",
+            ));
+        }
+        pack.sealed = false;
+        pack.version = 1;
+        pack.created_at = Self::current_timestamp();
+        let ok = self
+            .cas_many(
+                vec![objectio_meta_store::CasOp {
+                    table: objectio_meta_store::CasTable::Named(PACKS_TABLE.into()),
+                    key: hex::encode(&pack.pack_id),
+                    expected: None,
+                    new_value: Some(pack.encode_to_vec()),
+                }],
+                "intend-pack",
+            )
+            .await?;
+        if ok {
+            Ok(Response::new(
+                objectio_proto::metadata::IntendPackResponse {},
+            ))
+        } else {
+            Err(Status::already_exists("pack id is taken"))
+        }
+    }
+
+    async fn seal_pack(
+        &self,
+        request: Request<objectio_proto::metadata::SealPackRequest>,
+    ) -> Result<Response<objectio_proto::metadata::SealPackResponse>, Status> {
+        use objectio_meta_store::{CasOp, CasTable};
+        let req = request.into_inner();
+        if req.referrers.is_empty() {
+            return Err(Status::invalid_argument("a pack holds at least one object"));
+        }
+        let Some((mut record, bytes)) = self.pack_record(&req.pack_id) else {
+            return Err(Status::failed_precondition("pack is not recorded"));
+        };
+        if record.sealed {
+            return Err(Status::failed_precondition("pack is already sealed"));
+        }
+        record.sealed = true;
+        if let Some(stripe) = req.stripe {
+            if stripe.shards.is_empty() {
+                return Err(Status::invalid_argument(
+                    "a sealed pack needs its shard locations",
+                ));
+            }
+            record.stripe = Some(stripe);
+        }
+        let key = hex::encode(&req.pack_id);
+        if self.stripe_refs.read().contains_key(&key) {
+            return Err(Status::failed_precondition("pack id is already registered"));
+        }
+        let refs = objectio_proto::metadata::StripeRefs {
+            referrers: req.referrers,
+        };
+        let ok = self
+            .cas_many(
+                vec![
+                    CasOp {
+                        table: CasTable::Named(PACKS_TABLE.into()),
+                        key: key.clone(),
+                        expected: Some(bytes),
+                        new_value: Some(record.encode_to_vec()),
+                    },
+                    CasOp {
+                        table: CasTable::Named("stripe_refs".into()),
+                        key: key.clone(),
+                        expected: None,
+                        new_value: Some(refs.encode_to_vec()),
+                    },
+                ],
+                "seal-pack",
+            )
+            .await?;
+        if !ok {
+            return Err(Status::aborted("pack changed while sealing; retry"));
+        }
+        self.stripe_refs.write().insert(key, refs);
+        Ok(Response::new(objectio_proto::metadata::SealPackResponse {}))
+    }
+
+    async fn abort_pack(
+        &self,
+        request: Request<objectio_proto::metadata::AbortPackRequest>,
+    ) -> Result<Response<objectio_proto::metadata::AbortPackResponse>, Status> {
+        let id = request.into_inner().pack_id;
+        let Some((record, bytes)) = self.pack_record(&id) else {
+            return Ok(Response::new(objectio_proto::metadata::AbortPackResponse {
+                pack: None,
+                found: false,
+            }));
+        };
+        if record.sealed {
+            return Err(Status::failed_precondition(
+                "a sealed pack is freed by releasing its objects, not aborted",
+            ));
+        }
+        let ok = self
+            .cas_many(
+                vec![objectio_meta_store::CasOp {
+                    table: objectio_meta_store::CasTable::Named(PACKS_TABLE.into()),
+                    key: hex::encode(&id),
+                    expected: Some(bytes),
+                    new_value: None,
+                }],
+                "abort-pack",
+            )
+            .await?;
+        if !ok {
+            return Err(Status::aborted("pack changed; retry"));
+        }
+        Ok(Response::new(objectio_proto::metadata::AbortPackResponse {
+            pack: Some(record),
+            found: true,
+        }))
+    }
+
+    async fn get_pack(
+        &self,
+        request: Request<objectio_proto::metadata::GetPackRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetPackResponse>, Status> {
+        let pack = self
+            .pack_record(&request.into_inner().pack_id)
+            .map(|(r, _)| r);
+        Ok(Response::new(objectio_proto::metadata::GetPackResponse {
+            found: pack.is_some(),
+            pack,
+        }))
+    }
+
+    async fn list_packs(
+        &self,
+        request: Request<objectio_proto::metadata::ListPacksRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ListPacksResponse>, Status> {
+        let req = request.into_inner();
+        let after = hex::encode(&req.start_after);
+        let limit = if req.limit == 0 {
+            1000
+        } else {
+            req.limit as usize
+        };
+        let mut all: Vec<(String, Vec<u8>)> = self
+            .store
+            .as_ref()
+            .map(|s| s.list_named(PACKS_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| req.start_after.is_empty() || *k > after)
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        let truncated = all.len() > limit;
+        let packs = all
+            .into_iter()
+            .take(limit)
+            .filter_map(|(_, v)| objectio_proto::metadata::PackRecord::decode(v.as_slice()).ok())
+            .collect();
+        Ok(Response::new(objectio_proto::metadata::ListPacksResponse {
+            packs,
+            truncated,
+        }))
+    }
+
+    async fn pack_move_shard(
+        &self,
+        request: Request<objectio_proto::metadata::PackMoveShardRequest>,
+    ) -> Result<Response<objectio_proto::metadata::PackMoveShardResponse>, Status> {
+        let req = request.into_inner();
+        let from: [u8; 16] = req
+            .from_node
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::invalid_argument("from_node must be 16 bytes"))?;
+        let to = req
+            .to
+            .ok_or_else(|| Status::invalid_argument("to is required"))?;
+        MetaService::pack_move_shard(self, &req.pack_id, req.position, from, &to).await?;
+        Ok(Response::new(
+            objectio_proto::metadata::PackMoveShardResponse {},
+        ))
     }
 
     async fn block_create_volume(
@@ -13065,5 +13485,202 @@ mod multipart_reclaim_tests {
             .unwrap()
             .into_inner();
         assert_eq!(ids(&abort.stripes), [1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    //! A pack's record from intent to the last object letting go: nothing
+    //! frees a pack anything is still in, and the last release takes the
+    //! record with it.
+
+    use super::*;
+    use objectio_proto::metadata::{
+        AbortPackRequest, IntendPackRequest, PackRecord, ReleaseStripesRequest, SealPackRequest,
+        ShardLocation, ShareStripesRequest, StripeMeta,
+    };
+
+    fn service() -> (tempfile::TempDir, MetaService) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MetaStore::open(dir.path().join("meta.redb")).unwrap());
+        (dir, MetaService::with_store(EcConfig::default(), store))
+    }
+
+    fn stripe(pack: &[u8], node: u8) -> StripeMeta {
+        StripeMeta {
+            ec_k: 4,
+            ec_m: 2,
+            object_id: pack.to_vec(),
+            shards: (0..6)
+                .map(|position| ShardLocation {
+                    position,
+                    node_id: vec![node + u8::try_from(position).unwrap(); 16],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    async fn intend(svc: &MetaService, pack: &[u8]) {
+        svc.intend_pack(Request::new(IntendPackRequest {
+            pack: Some(PackRecord {
+                pack_id: pack.to_vec(),
+                stripe: Some(stripe(pack, 0)),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+    }
+
+    async fn release(svc: &MetaService, pack: &[u8], who: u8) -> (Vec<Vec<u8>>, usize) {
+        let r = svc
+            .release_stripes(Request::new(ReleaseStripesRequest {
+                stripe_ids: vec![pack.to_vec()],
+                referrer: vec![who; 16],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        (r.freeable, r.freed_packs.len())
+    }
+
+    #[tokio::test]
+    async fn a_pack_goes_with_its_last_object_and_not_before() {
+        let (_dir, svc) = service();
+        let pack = [7u8; 16];
+        intend(&svc, &pack).await;
+        assert!(svc.packs().iter().all(|p| !p.sealed));
+        svc.seal_pack(Request::new(SealPackRequest {
+            pack_id: pack.to_vec(),
+            referrers: vec![vec![1; 16], vec![2; 16]],
+            // Where the shards landed, not where they were meant to.
+            stripe: Some(stripe(&pack, 100)),
+        }))
+        .await
+        .unwrap();
+        let sealed = svc.packs();
+        assert_eq!(sealed.len(), 1);
+        assert!(sealed[0].sealed);
+        assert_eq!(
+            sealed[0].stripe.as_ref().unwrap().shards[0].node_id,
+            vec![100; 16]
+        );
+
+        // Not a referrer: nothing changes. The first object: nothing freed.
+        assert_eq!(release(&svc, &pack, 9).await, (vec![], 0));
+        assert_eq!(release(&svc, &pack, 1).await, (vec![], 0));
+        assert_eq!(svc.packs().len(), 1);
+        // The last: the pack's shards are handed back, and its record goes.
+        assert_eq!(release(&svc, &pack, 2).await, (vec![], 1));
+        assert!(svc.packs().is_empty());
+        // Released again (a retry): never "free" — the pack is gone.
+        assert_eq!(release(&svc, &pack, 2).await, (vec![pack.to_vec()], 0));
+    }
+
+    #[tokio::test]
+    async fn a_copy_shares_a_pack_only_while_its_source_is_in_it() {
+        let (_dir, svc) = service();
+        let pack = [8u8; 16];
+        intend(&svc, &pack).await;
+        svc.seal_pack(Request::new(SealPackRequest {
+            pack_id: pack.to_vec(),
+            referrers: vec![vec![1; 16]],
+            stripe: None,
+        }))
+        .await
+        .unwrap();
+        svc.share_stripes(Request::new(ShareStripesRequest {
+            stripe_ids: vec![pack.to_vec()],
+            owner: vec![1; 16],
+            sharer: vec![3; 16],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(release(&svc, &pack, 1).await, (vec![], 0));
+        // The source has let go: a second copy from it is refused.
+        let refused = svc
+            .share_stripes(Request::new(ShareStripesRequest {
+                stripe_ids: vec![pack.to_vec()],
+                owner: vec![1; 16],
+                sharer: vec![4; 16],
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(release(&svc, &pack, 3).await, (vec![], 1));
+    }
+
+    #[tokio::test]
+    async fn only_an_unsealed_pack_is_aborted() {
+        let (_dir, svc) = service();
+        let pack = [9u8; 16];
+        intend(&svc, &pack).await;
+        // An unsealed pack has no referrers: a release frees nothing.
+        assert_eq!(release(&svc, &pack, 1).await, (vec![], 0));
+        let aborted = svc
+            .abort_pack(Request::new(AbortPackRequest {
+                pack_id: pack.to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(aborted.found && aborted.pack.is_some());
+        assert!(svc.packs().is_empty());
+
+        intend(&svc, &pack).await;
+        svc.seal_pack(Request::new(SealPackRequest {
+            pack_id: pack.to_vec(),
+            referrers: vec![vec![1; 16]],
+            stripe: None,
+        }))
+        .await
+        .unwrap();
+        let refused = svc
+            .abort_pack(Request::new(AbortPackRequest {
+                pack_id: pack.to_vec(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn moved_and_rebuilt_shards_are_recorded_once_in_the_pack() {
+        let (_dir, svc) = service();
+        let pack = [10u8; 16];
+        intend(&svc, &pack).await;
+        let mut partial = stripe(&pack, 0);
+        partial.shards.retain(|l| l.position != 5);
+        svc.seal_pack(Request::new(SealPackRequest {
+            pack_id: pack.to_vec(),
+            referrers: vec![vec![1; 16]],
+            stripe: Some(partial),
+        }))
+        .await
+        .unwrap();
+        let to = ShardLocation {
+            position: 2,
+            node_id: vec![50; 16],
+            ..Default::default()
+        };
+        svc.pack_move_shard(&pack, 2, [2; 16], &to).await.unwrap();
+        // A retry finds it moved already.
+        svc.pack_move_shard(&pack, 2, [2; 16], &to).await.unwrap();
+        let rebuilt = ShardLocation {
+            position: 5,
+            node_id: vec![60; 16],
+            ..Default::default()
+        };
+        svc.pack_add_shard_locations(&pack, &[rebuilt])
+            .await
+            .unwrap();
+        let record = &svc.packs()[0];
+        let shards = &record.stripe.as_ref().unwrap().shards;
+        assert_eq!(shards.len(), 6);
+        assert_eq!(shards[2].node_id, vec![50; 16]);
+        assert_eq!(shards[5].node_id, vec![60; 16]);
+        assert_eq!(record.version, 3, "intended at 1, bumped by each change");
     }
 }

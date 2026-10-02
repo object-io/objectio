@@ -135,6 +135,10 @@ struct Args {
     #[arg(long, hide = true)]
     lifecycle_day_secs: Option<u64>,
 
+    /// Mount the gateway's `/_admin/test/*` hooks (testing only).
+    #[arg(long, hide = true)]
+    test_hooks: bool,
+
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
@@ -864,6 +868,9 @@ async fn main() -> Result<()> {
     }
     if let Some(secs) = args.lifecycle_day_secs {
         gw_argv.extend(["--lifecycle-day-secs".to_string(), secs.to_string()]);
+    }
+    if args.test_hooks {
+        gw_argv.push("--test-hooks".to_string());
     }
     if let Some(path) = &args.audit_log {
         gw_argv.extend(["--audit-log".to_string(), path.clone()]);
