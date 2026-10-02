@@ -1630,6 +1630,11 @@ pub struct DeleteObjectsRequest {
 pub struct DeleteObjectIdentifier {
     pub key: String,
     pub version_id: Option<String>,
+    /// Conditions: delete only if the object has this ETag, last-modified
+    /// time (ISO 8601) or size.
+    pub etag: Option<String>,
+    pub last_modified_time: Option<String>,
+    pub size: Option<String>,
 }
 
 impl DeleteObjectsRequest {
@@ -1671,6 +1676,11 @@ impl DeleteObjectsRequest {
                         (b"VersionId", Some(o)) => {
                             o.version_id = Some(std::mem::take(&mut text));
                         }
+                        (b"ETag", Some(o)) => o.etag = Some(std::mem::take(&mut text)),
+                        (b"LastModifiedTime", Some(o)) => {
+                            o.last_modified_time = Some(std::mem::take(&mut text));
+                        }
+                        (b"Size", Some(o)) => o.size = Some(std::mem::take(&mut text)),
                         (b"Object", _) => {
                             if let Some(o) = current.take() {
                                 req.objects.push(o);
@@ -1811,7 +1821,7 @@ async fn upload_part_copy_internal(
     }
 
     // The source range, read the way a ranged GET reads it.
-    let mut get_headers = HeaderMap::new();
+    let mut get_headers = copy_source_conditions(&headers);
     if let Some(range) = headers.get("x-amz-copy-source-range") {
         get_headers.insert(header::RANGE, range.clone());
     }
@@ -1825,7 +1835,7 @@ async fn upload_part_copy_internal(
     )
     .await;
     if !got.status().is_success() {
-        return got;
+        return copy_condition_failed(got);
     }
     let data = match axum::body::to_bytes(got.into_body(), MAX_COPY_PART).await {
         Ok(b) => b,
@@ -2939,6 +2949,7 @@ async fn copy_by_reference(
         pg_id: dest_placement.pg_id,
         pool: dest_placement.pool.clone(),
         home_osd_ids: home_of(&dest_placement.nodes),
+        ..Default::default()
     };
     let new_object = referenced_object_ids(&object_meta);
     let mut listing_client = state.meta_client.clone();
@@ -3068,9 +3079,12 @@ async fn copy_object_data(
         source_bucket, source_key, dest_bucket, dest_key
     );
 
-    // By reference only from the current version: it re-reads the source's
-    // current object to know the stripes are still held.
+    // By reference only from the current version (it re-reads the source's
+    // current object to know the stripes are still held), and without
+    // conditions on the source, which the read below checks.
+    let source_conditions = copy_source_conditions(&copy_headers);
     if source_version.is_none()
+        && source_conditions.is_empty()
         && let Some(resp) = copy_by_reference(
             &state,
             &dest_bucket,
@@ -3091,11 +3105,11 @@ async fn copy_object_data(
         source_bucket.clone(),
         source_key.clone(),
         source_version.clone(),
-        HeaderMap::new(),
+        source_conditions,
     )
     .await;
     if !get_resp.status().is_success() {
-        return get_resp;
+        return copy_condition_failed(get_resp);
     }
     let (source_parts, body) = get_resp.into_parts();
     let plaintext = match axum::body::to_bytes(body, usize::MAX).await {
@@ -3336,6 +3350,330 @@ where
             }
             Err(e)
         }
+    }
+}
+
+/// A GET or HEAD's conditions on `object` (RFC 7232 order): 412 when
+/// If-Match fails, or If-Unmodified-Since without an If-Match; 304 (with
+/// the ETag) when If-None-Match matches, or If-Modified-Since without an
+/// If-None-Match. They used to be ignored: every conditional read was 200.
+fn read_preconditions(headers: &HeaderMap, object: &ObjectMeta) -> Option<Response> {
+    let get = |name: header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let etag = object.etag.trim_matches('"');
+    let etag_in = |list: &str| {
+        list.split(',')
+            .map(|t| t.trim().trim_start_matches("W/").trim_matches('"'))
+            .any(|t| t == "*" || t == etag)
+    };
+    let date = |v: &str| {
+        chrono::DateTime::parse_from_rfc2822(v)
+            .ok()
+            .and_then(|d| u64::try_from(d.timestamp()).ok())
+    };
+    let failed = || {
+        S3Error::xml_response(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            StatusCode::PRECONDITION_FAILED,
+        )
+    };
+    match get(header::IF_MATCH) {
+        Some(m) if !etag_in(m) => return Some(failed()),
+        Some(_) => {}
+        None => {
+            if get(header::IF_UNMODIFIED_SINCE)
+                .and_then(date)
+                .is_some_and(|since| object.modified_at > since)
+            {
+                return Some(failed());
+            }
+        }
+    }
+    let not_modified = match get(header::IF_NONE_MATCH) {
+        Some(m) => etag_in(m),
+        None => get(header::IF_MODIFIED_SINCE)
+            .and_then(date)
+            .is_some_and(|since| object.modified_at <= since),
+    };
+    not_modified.then(|| {
+        Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &object.etag)
+            .header(
+                header::LAST_MODIFIED,
+                timestamp_to_http_date(object.modified_at),
+            )
+            .body(Body::empty())
+            .unwrap()
+    })
+}
+
+/// The newest version of `bucket/key` that is an object, not a delete
+/// marker, from the first of `nodes` that answers.
+async fn newest_object(
+    pool: &OsdPool,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Option<ObjectMeta> {
+    use objectio_proto::storage::ListObjectVersionsMetaRequest;
+    for node in nodes {
+        let Ok(mut client) = pool.get_client_for_placement(node).await else {
+            continue;
+        };
+        if let Ok(resp) = client
+            .list_object_versions_meta(ListObjectVersionsMetaRequest {
+                bucket: bucket.to_string(),
+                prefix: key.to_string(),
+                // The key itself, first: its versions come in one page.
+                key_marker: key.to_string(),
+                version_id_marker: "-".to_string(),
+                max_keys: 1,
+            })
+            .await
+        {
+            return resp
+                .into_inner()
+                .versions
+                .into_iter()
+                .filter(|v| v.key == key && !v.is_delete_marker)
+                .max_by(|a, b| version_age(a).cmp(&version_age(b)));
+        }
+    }
+    None
+}
+
+/// A conditional DELETE: the object it acts on must have this ETag ("*":
+/// any), last-modified time and size.
+struct DeleteCondition {
+    etag: Option<String>,
+    modified: Option<String>,
+    size: Option<String>,
+}
+
+impl DeleteCondition {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let get = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().to_string())
+        };
+        Self {
+            etag: get("if-match"),
+            modified: get("x-amz-if-match-last-modified-time"),
+            size: get("x-amz-if-match-size"),
+        }
+    }
+
+    const fn is_set(&self) -> bool {
+        self.etag.is_some() || self.modified.is_some() || self.size.is_some()
+    }
+
+    fn holds(&self, target: &ObjectMeta) -> bool {
+        let etag_ok = self
+            .etag
+            .as_deref()
+            .is_none_or(|e| e == "*" || e.trim_matches('"') == target.etag.trim_matches('"'));
+        // An HTTP date in the header; ISO 8601 in a DeleteObjects body.
+        let modified_ok = self.modified.as_deref().is_none_or(|m| {
+            chrono::DateTime::parse_from_rfc2822(m)
+                .or_else(|_| chrono::DateTime::parse_from_rfc3339(m))
+                .ok()
+                .and_then(|d| u64::try_from(d.timestamp()).ok())
+                .is_some_and(|t| t == target.modified_at)
+        });
+        let size_ok = self
+            .size
+            .as_deref()
+            .is_none_or(|s| s.parse::<u64>().is_ok_and(|s| s == target.size));
+        etag_ok && modified_ok && size_ok
+    }
+}
+
+/// What a PUT's `If-Match` / `If-None-Match` ask: "*" or an ETag each.
+#[derive(Default)]
+struct PutCondition {
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+}
+
+impl PutCondition {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let get = |name: header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim().to_string())
+        };
+        Self {
+            if_match: get(header::IF_MATCH),
+            if_none_match: get(header::IF_NONE_MATCH),
+        }
+    }
+
+    const fn is_set(&self) -> bool {
+        self.if_match.is_some() || self.if_none_match.is_some()
+    }
+
+    /// The refusal, if `current` (the key's object, if any) fails it.
+    fn refuse(&self, current: Option<&ObjectMeta>) -> Option<Response> {
+        let matches = |want: &str| {
+            current
+                .is_some_and(|o| want == "*" || o.etag.trim_matches('"') == want.trim_matches('"'))
+        };
+        if self.if_match.is_some() && current.is_none() {
+            return Some(condition_refused("NoSuchKey"));
+        }
+        if self.if_match.as_deref().is_some_and(|m| !matches(m))
+            || self.if_none_match.as_deref().is_some_and(matches)
+        {
+            return Some(condition_refused("PreconditionFailed"));
+        }
+        None
+    }
+}
+
+fn condition_refused(code: &str) -> Response {
+    if code == "NoSuchKey" {
+        S3Error::xml_response(
+            "NoSuchKey",
+            "The specified key does not exist.",
+            StatusCode::NOT_FOUND,
+        )
+    } else {
+        S3Error::xml_response(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            StatusCode::PRECONDITION_FAILED,
+        )
+    }
+}
+
+/// Make `object_meta` the key's current object: its listing entry in meta
+/// and its ObjectMeta on every OSD of the placement. `sent` are the shards
+/// already written for it, freed if the commit is refused.
+///
+/// Unconditional, the two commits run together (see `commit_object`). A
+/// conditional PUT commits the listing first: meta decides the condition
+/// there, in one Raft write, so two racing conditional writers can't both
+/// win, or win on different replicas.
+async fn commit_put(
+    state: &Arc<AppState>,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+    object_meta: ObjectMeta,
+    versioning_enabled: bool,
+    sent: Vec<ShardTarget>,
+    condition: &PutCondition,
+) -> Result<(), Response> {
+    let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
+    let what = format!("{bucket}/{key}");
+    let nodes = &placement.nodes;
+    let listing_req = objectio_proto::metadata::CreateObjectRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        size: object_meta.size,
+        content_type: object_meta.content_type.clone(),
+        etag: object_meta.etag.clone(),
+        user_metadata: object_meta.user_metadata.clone(),
+        stripes: object_meta.stripes.clone(),
+        object_id: object_meta.object_id.clone(),
+        pg_id: placement.pg_id,
+        pool: placement.pool.clone(),
+        home_osd_ids: home_of(nodes),
+        if_match: condition.if_match.clone().unwrap_or_default(),
+        if_none_match: condition.if_none_match.clone().unwrap_or_default(),
+    };
+    let new_object = referenced_object_ids(&object_meta);
+    let failed = |e: &dyn std::fmt::Display| {
+        error!("Failed to store object metadata on OSDs: {e}");
+        S3Error::xml_response(
+            "InternalError",
+            &format!("Failed to store object metadata: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    };
+
+    if condition.is_set() {
+        if let Err(s) = state.meta_client.clone().create_object(listing_req).await {
+            spawn_reclaim(state, sent, Reclaim::FailedWrite, what);
+            return Err(match s.code() {
+                tonic::Code::FailedPrecondition => condition_refused(s.message()),
+                tonic::Code::NotFound => S3Error::xml_response(
+                    "NoSuchBucket",
+                    "The specified bucket does not exist",
+                    StatusCode::NOT_FOUND,
+                ),
+                _ => S3Error::xml_response(
+                    "ServiceUnavailable",
+                    &format!("could not commit the object: {}", s.message()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            });
+        }
+        let outcome = put_object_meta_to_all(
+            &state.osd_pool,
+            nodes,
+            &bucket,
+            &key,
+            object_meta,
+            versioning_enabled,
+            &[],
+        )
+        .await;
+        settle_commit(
+            state,
+            outcome.as_deref(),
+            sent,
+            &new_object,
+            versioning_enabled,
+            &what,
+        );
+        if let Err(e) = outcome {
+            sync_listing(state, nodes, &bucket, &key).await;
+            return Err(failed(&e));
+        }
+        return Ok(());
+    }
+
+    let mut listing_client = state.meta_client.clone();
+    let committed = commit_object(
+        put_object_meta_to_all(
+            &state.osd_pool,
+            nodes,
+            &bucket,
+            &key,
+            object_meta,
+            versioning_enabled,
+            &[],
+        ),
+        async { listing_client.create_object(listing_req).await.map(drop) },
+        // The listing follows whatever is current on the OSDs: the object
+        // this write would have replaced, if any. Unlisting it, as this
+        // did, hid an object a failed overwrite left in place.
+        || async {
+            sync_listing(state, nodes, &bucket, &key).await;
+        },
+    )
+    .await;
+    settle_commit(
+        state,
+        committed.as_ref().map(|(d, _)| d.as_slice()),
+        sent,
+        &new_object,
+        versioning_enabled,
+        &what,
+    );
+    match committed {
+        Ok((_, Committed::Both)) => Ok(()),
+        Ok((_, Committed::Unlisted(e))) => {
+            warn!(
+                "create_object on meta failed ({e}); {what} is readable by key \
+                 but will not appear in ListObjects until repair",
+            );
+            Ok(())
+        }
+        Err(e) => Err(failed(&e)),
     }
 }
 
@@ -3637,6 +3975,20 @@ pub async fn put_object(
     };
     phases.mark("meta_lookup");
 
+    // If-Match / If-None-Match: refused now if the current object already
+    // says no, before any data is written. The commit decides for good.
+    let condition = PutCondition::from_headers(&headers);
+    if condition.is_set() {
+        let current = get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
+            .await
+            .ok()
+            .flatten()
+            .filter(|o| !o.is_delete_marker);
+        if let Some(refused) = condition.refuse(current.as_ref()) {
+            return refused;
+        }
+    }
+
     let ec_k = placement.ec_k;
     let ec_m = placement.ec_m;
     let ec_type = ErasureType::try_from(placement.ec_type).unwrap_or(ErasureType::ErasureMds);
@@ -3837,33 +4189,20 @@ pub async fn put_object(
             tags: tags.clone(),
         };
 
-        let new_object = referenced_object_ids(&object_meta);
+        // Listed as well: this path used to write only the ObjectMeta, so a
+        // replicated object never appeared in ListObjects.
         let sent = pending.disarm();
-        let outcome = put_object_meta_to_all(
-            &state.osd_pool,
-            &placement.nodes,
-            &bucket,
-            &key,
+        if let Err(resp) = commit_put(
+            &state,
+            &placement,
             object_meta,
             versioning_enabled,
-            &[],
-        )
-        .await;
-        settle_commit(
-            &state,
-            outcome.as_deref(),
             sent,
-            &new_object,
-            versioning_enabled,
-            &format!("{bucket}/{key}"),
-        );
-        if let Err(e) = outcome {
-            error!("Failed to store object metadata on OSDs: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to store object metadata: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            &condition,
+        )
+        .await
+        {
+            return resp;
         }
         phases.mark("object_meta");
 
@@ -4231,79 +4570,20 @@ pub async fn put_object(
         tags,
     };
 
-    // Two commits make the object, at the same time: see `commit_object`.
-    let listing_req = {
-        use objectio_proto::metadata::CreateObjectRequest;
-        CreateObjectRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            size: original_size,
-            content_type,
-            etag: etag.clone(),
-            user_metadata: object_meta.user_metadata.clone(),
-            stripes: object_meta.stripes.clone(),
-            object_id: object_id.to_vec(),
-            pg_id: placement.pg_id,
-            pool: placement.pool.clone(),
-            home_osd_ids: home_of(&placement.nodes),
-        }
-    };
-    let mut listing_client = state.meta_client.clone();
-    let mut unlist_client = state.meta_client.clone();
-    let new_object = referenced_object_ids(&object_meta);
     let sent = pending.disarm();
-    let committed = commit_object(
-        put_object_meta_to_all(
-            &state.osd_pool,
-            &placement.nodes,
-            &bucket,
-            &key,
-            object_meta,
-            versioning_enabled,
-            &[],
-        ),
-        async { listing_client.create_object(listing_req).await.map(drop) },
-        || async {
-            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
-            if let Err(e) = unlist_client
-                .delete_object(MetaDelReq {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id: String::new(),
-                    forget_home: false,
-                })
-                .await
-            {
-                warn!("could not take {bucket}/{key} out of the listing after a failed PUT: {e}");
-            }
-        },
-    )
-    .await;
-    phases.mark("commit");
-
-    settle_commit(
+    if let Err(resp) = commit_put(
         &state,
-        committed.as_ref().map(|(d, _)| d.as_slice()),
-        sent,
-        &new_object,
+        &placement,
+        object_meta,
         versioning_enabled,
-        &format!("{bucket}/{key}"),
-    );
-    match committed {
-        Ok((_, Committed::Both)) => {}
-        Ok((_, Committed::Unlisted(e))) => warn!(
-            "create_object on meta failed ({e}); object is readable by key \
-             but will not appear in ListObjects until repair",
-        ),
-        Err(e) => {
-            error!("Failed to store object metadata on OSDs: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to store object metadata: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
+        sent,
+        &condition,
+    )
+    .await
+    {
+        return resp;
     }
+    phases.mark("commit");
 
     dedup_dry_run(
         &state,
@@ -4473,6 +4753,9 @@ async fn get_object_version(
         Ok(obj) => obj,
         Err(resp) => return resp,
     };
+    if let Some(resp) = read_preconditions(&headers, &object) {
+        return resp;
+    }
     phases.mark("object_meta");
 
     // A zero-byte object legitimately has no stripes — there are no bytes to
@@ -5374,6 +5657,11 @@ pub async fn head_object(
     )
     .await
     {
+        Ok(obj) if read_preconditions(&headers, &obj).is_some() => {
+            let mut resp = read_preconditions(&headers, &obj).unwrap_or_default();
+            *resp.body_mut() = Body::empty();
+            resp
+        }
         Ok(obj) => {
             let mut builder = with_version_id(Response::builder(), &obj)
                 .status(StatusCode::OK)
@@ -5788,6 +6076,7 @@ async fn sync_listing(
                     pg_id: 0,
                     pool: String::new(),
                     home_osd_ids: home_of(nodes),
+                    ..Default::default()
                 })
                 .await
                 .map(drop),
@@ -5846,6 +6135,37 @@ async fn bucket_versioning(
             ))
         }
     }
+}
+
+/// A copy's `x-amz-copy-source-if-*` conditions as the GET conditions
+/// they are on the source. Any that fails refuses the copy with 412.
+fn copy_source_conditions(copy_headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (from, to) in [
+        ("x-amz-copy-source-if-match", header::IF_MATCH),
+        ("x-amz-copy-source-if-none-match", header::IF_NONE_MATCH),
+        (
+            "x-amz-copy-source-if-modified-since",
+            header::IF_MODIFIED_SINCE,
+        ),
+        (
+            "x-amz-copy-source-if-unmodified-since",
+            header::IF_UNMODIFIED_SINCE,
+        ),
+    ] {
+        if let Some(v) = copy_headers.get(from) {
+            out.insert(to, v.clone());
+        }
+    }
+    out
+}
+
+/// A source read refused by its conditions: 304 too is a 412 for a copy.
+fn copy_condition_failed(resp: Response) -> Response {
+    if resp.status() == StatusCode::NOT_MODIFIED {
+        return condition_refused("PreconditionFailed");
+    }
+    resp
 }
 
 /// What a copy reads: an object, at a version or the current one.
@@ -6040,6 +6360,31 @@ pub async fn delete_object(
     // Known never to have had versions, so nothing of the key outlives
     // this delete and its home can go. Not when the state is unknown.
     let never_versioned = versioning == Some(VersioningState::VersioningDisabled);
+
+    // Conditional delete (If-Match, x-amz-if-match-last-modified-time,
+    // x-amz-if-match-size): on the version named, or else the key's object:
+    // the current one, or behind a delete marker the newest version that
+    // is an object. No object at all: the delete succeeds, as S3 has it.
+    if DeleteCondition::from_headers(&headers).is_set() {
+        let pool = &state.osd_pool;
+        let nodes = &placement.nodes;
+        let target = match &version_id {
+            Some(vid) => find_version(pool, nodes, &bucket, &key, vid)
+                .await
+                .ok()
+                .flatten(),
+            None => match get_object_meta_from_any(pool, nodes, &bucket, &key).await {
+                Ok(Some(c)) if c.is_delete_marker => {
+                    newest_object(pool, nodes, &bucket, &key).await
+                }
+                Ok(current) => current,
+                Err(_) => None,
+            },
+        };
+        if target.is_some_and(|t| !DeleteCondition::from_headers(&headers).holds(&t)) {
+            return condition_refused("PreconditionFailed");
+        }
+    }
 
     // Lock enforcement: retention and legal hold protect the version a
     // delete would destroy. A versioned delete without a version destroys
@@ -6276,12 +6621,24 @@ pub async fn delete_objects(
         // the same versioning, object-lock and listing handling, and frees
         // the shards. Deleting only the ObjectMeta here, as this did, left
         // every object's shards allocated and its listing entry behind.
+        let mut object_headers = headers.clone();
+        for (name, value) in [
+            ("if-match", &obj.etag),
+            ("x-amz-if-match-last-modified-time", &obj.last_modified_time),
+            ("x-amz-if-match-size", &obj.size),
+        ] {
+            if let Some(v) = value
+                && let Ok(v) = header::HeaderValue::from_str(v)
+            {
+                object_headers.insert(name, v);
+            }
+        }
         let resp = delete_object(
             State(Arc::clone(&state)),
             Path((bucket.clone(), obj.key.clone())),
             None,
             obj.version_id.clone(),
-            headers.clone(),
+            object_headers,
         )
         .await;
         if resp.status().is_success() {
@@ -6528,7 +6885,7 @@ pub async fn post_object(
         initiate_multipart_upload_internal(state, bucket, key, &headers).await
     } else if let Some(upload_id) = params.upload_id {
         // Complete multipart upload
-        complete_multipart_upload_internal(state, bucket, key, upload_id, body).await
+        complete_multipart_upload_internal(state, bucket, key, upload_id, body, &headers).await
     } else if params.grep.is_some() {
         grep_object_internal(state, bucket, key, auth, headers, body).await
     } else {
@@ -7766,7 +8123,24 @@ async fn complete_multipart_upload_internal(
     key: String,
     upload_id: String,
     body: Bytes,
+    headers: &HeaderMap,
 ) -> Response {
+    // If-Match / If-None-Match: refused now, while the upload still exists
+    // for the client to retry. The commit decides for good.
+    let condition = PutCondition::from_headers(headers);
+    if condition.is_set() {
+        let current = match get_placement_nodes_for_object(&state, &bucket, &key).await {
+            Ok(nodes) => get_object_meta_from_any(&state.osd_pool, &nodes, &bucket, &key)
+                .await
+                .ok()
+                .flatten()
+                .filter(|o| !o.is_delete_marker),
+            Err(resp) => return resp,
+        };
+        if let Some(refused) = condition.refuse(current.as_ref()) {
+            return refused;
+        }
+    }
     // Parse the CompleteMultipartUpload XML request
     let xml_str = match String::from_utf8(body.to_vec()) {
         Ok(s) => s,
@@ -7908,61 +8282,20 @@ async fn complete_multipart_upload_internal(
                         "{bucket}/{key}: cannot read the bucket's object lock; stored without one"
                     );
                 }
-                let outcome = put_object_meta_to_all(
-                    &state.osd_pool,
-                    &placement.nodes,
-                    &bucket,
-                    &key,
+                // Listed with its ObjectMeta, as a single-part PUT is. On
+                // failure the parts belong to nothing: meta has already
+                // dropped the upload, and commit_put frees them.
+                if let Err(resp) = commit_put(
+                    &state,
+                    &placement,
                     object.clone(),
                     versioning_enabled,
-                    &[],
-                )
-                .await;
-                // On failure the parts belong to nothing: meta has already
-                // dropped the upload.
-                settle_commit(
-                    &state,
-                    outcome.as_deref(),
                     stripe_targets(&object.stripes),
-                    &referenced_object_ids(&object),
-                    versioning_enabled,
-                    &format!("{bucket}/{key}"),
-                );
-                if let Err(e) = outcome {
-                    error!("Failed to store object metadata on OSDs: {}", e);
-                    return S3Error::xml_response(
-                        "InternalError",
-                        &format!("Failed to store object metadata: {}", e),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
-
-                // Register with Meta's listing index, as a single-part PUT
-                // does. ListObjects reads that index first, so without this
-                // a multipart object was readable by key but missing from
-                // listings — or listed with the size of whatever single-part
-                // object last had that key.
+                    &condition,
+                )
+                .await
                 {
-                    use objectio_proto::metadata::CreateObjectRequest;
-                    let req = CreateObjectRequest {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        size: object.size,
-                        content_type: object.content_type.clone(),
-                        etag: object.etag.clone(),
-                        user_metadata: object.user_metadata.clone(),
-                        stripes: object.stripes.clone(),
-                        object_id: object.object_id.clone(),
-                        pg_id: placement.pg_id,
-                        pool: placement.pool.clone(),
-                        home_osd_ids: home_of(&placement.nodes),
-                    };
-                    if let Err(e) = state.meta_client.clone().create_object(req).await {
-                        warn!(
-                            "create_object on meta failed ({e}); multipart object is \
-                             readable by key but will not appear in ListObjects",
-                        );
-                    }
+                    return resp;
                 }
 
                 let result = CompleteMultipartUploadResult {

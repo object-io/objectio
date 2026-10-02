@@ -492,6 +492,13 @@ message CreateObjectRequest {
     // metadata is found where it was written whatever joins or leaves the
     // cluster. Empty leaves the home as it is.
     repeated bytes home_osd_ids = 11;
+    // A conditional PUT (If-Match / If-None-Match): the listing entry, the
+    // key's current object as Raft knows it, must be in this state when
+    // this write commits, or it is refused (FAILED_PRECONDITION with the
+    // message "PreconditionFailed", or "NoSuchKey" for If-Match on a key
+    // with no object). "*" or an ETag; empty = no condition.
+    string if_match = 12;
+    string if_none_match = 13;
 }
 
 // Where a key's ObjectMeta lives: the OSDs it was written to, by position.
