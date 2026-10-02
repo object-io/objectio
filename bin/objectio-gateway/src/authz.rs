@@ -127,6 +127,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutBucketPublicAccessBlock"
             } else if has(query, "cors") {
                 "s3:PutBucketCORS"
+            } else if has(query, "tagging") {
+                "s3:PutBucketTagging"
             } else {
                 "s3:CreateBucket"
             }
@@ -143,6 +145,9 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
             } else if has(query, "cors") {
                 // S3 authorizes DeleteBucketCors as s3:PutBucketCORS.
                 "s3:PutBucketCORS"
+            } else if has(query, "tagging") {
+                // S3 authorizes DeleteBucketTagging as s3:PutBucketTagging.
+                "s3:PutBucketTagging"
             } else {
                 "s3:DeleteBucket"
             }
@@ -169,6 +174,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetBucketPolicyStatus"
             } else if has(query, "cors") {
                 "s3:GetBucketCORS"
+            } else if has(query, "tagging") {
+                "s3:GetBucketTagging"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -984,6 +991,18 @@ pub async fn authz_layer(
     )
     .await
     {
+        // Bucket names are one namespace: asking to create one that someone
+        // else holds is answered as S3 does, "taken", not "forbidden".
+        if action == "s3:CreateBucket" {
+            let entry = load_bucket(&state, &bucket).await;
+            if !entry.owner.is_empty() && entry.owner != auth.user_id {
+                return crate::s3::S3Error::xml_response(
+                    "BucketAlreadyExists",
+                    "The requested bucket name is not available",
+                    StatusCode::CONFLICT,
+                );
+            }
+        }
         return deny;
     }
 

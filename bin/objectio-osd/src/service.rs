@@ -2345,17 +2345,29 @@ impl StorageService for OsdService {
 const NULL_VERSION: &str = "null";
 
 /// Where a version sorts among its key's: when it was made, in ms. A
-/// UUIDv7 id carries it; the null version and older ids use the
-/// modification time. The gateway orders versions the same way.
+/// UUIDv7 version id carries it; the null version has no id, so its object
+/// id (a UUIDv7 too) does; older ids fall back to the modification time,
+/// in seconds. The gateway orders versions the same way.
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
+    let ms_of = |u: uuid::Uuid| {
+        (u.get_version_num() == 7)
+            .then(|| u.get_timestamp())
+            .flatten()
+            .map(|t| {
+                let (secs, nanos) = t.to_unix();
+                secs * 1000 + u64::from(nanos / 1_000_000)
+            })
+    };
     let ms = uuid::Uuid::parse_str(&object.version_id)
         .ok()
-        .filter(|u| u.get_version_num() == 7)
-        .and_then(|u| u.get_timestamp())
-        .map_or(object.modified_at.saturating_mul(1000), |t| {
-            let (secs, nanos) = t.to_unix();
-            secs * 1000 + u64::from(nanos / 1_000_000)
-        });
+        .and_then(ms_of)
+        .or_else(|| {
+            uuid::Uuid::from_slice(&object.object_id)
+                .ok()
+                .and_then(ms_of)
+                .filter(|_| object.version_id.is_empty())
+        })
+        .unwrap_or_else(|| object.modified_at.saturating_mul(1000));
     (ms, object.version_id.as_str())
 }
 

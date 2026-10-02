@@ -713,12 +713,8 @@ fn extract_user_metadata(headers: &HeaderMap) -> HashMap<String, String> {
     }
     for (name, value) in headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        if name_str.starts_with("x-amz-meta-")
-            && let Ok(value_str) = value.to_str()
-        {
-            // Strip the x-amz-meta- prefix for storage
-            let key = name_str.strip_prefix("x-amz-meta-").unwrap_or(&name_str);
-            metadata.insert(key.to_string(), value_str.to_string());
+        if let Some(key) = name_str.strip_prefix("x-amz-meta-") {
+            metadata.insert(key.to_string(), crate::auth_middleware::header_text(value));
         }
     }
     metadata
@@ -742,10 +738,20 @@ fn add_metadata_headers(
         // whole response (a panic, the connection dropped) for every read
         // of the object.
         let name = format!("x-amz-meta-{key}");
-        if http::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
-            && http::HeaderValue::from_str(value).is_ok()
-        {
-            builder = builder.header(name, value);
+        if http::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            continue;
+        }
+        if value.is_ascii() {
+            if let Ok(v) = http::HeaderValue::from_str(value) {
+                builder = builder.header(name, v);
+            }
+        } else if !value.chars().any(char::is_control) {
+            // Non-ASCII goes out as AWS sends it: RFC 2047, UTF-8, base64.
+            let encoded = format!(
+                "=?UTF-8?B?{}?=",
+                base64::engine::general_purpose::STANDARD.encode(value)
+            );
+            builder = builder.header(name, encoded);
         }
     }
     builder
@@ -778,6 +784,11 @@ pub async fn unsupported_subresource_layer(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if request.method() == Method::DELETE
+        && let Some(refused) = delete_refusal(request.uri().path(), request.uri().query())
+    {
+        return refused;
+    }
     let named = request.uri().query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let name = pair.split('=').next().unwrap_or_default();
@@ -798,15 +809,179 @@ pub async fn unsupported_subresource_layer(
     }
 }
 
-/// Bucket tagging is not implemented. Said plainly: a GET of `?tagging`
-/// used to answer with the bucket's listing, and a PUT tried to create
-/// the bucket.
-fn bucket_tagging_unsupported() -> Response {
-    S3Error::xml_response(
-        "NotImplemented",
-        "Bucket tagging is not supported",
-        StatusCode::NOT_IMPLEMENTED,
-    )
+/// The query parameters each DELETE takes. Anything else named a
+/// sub-resource the handlers don't delete, and fell through to deleting
+/// the bucket or object itself: `DELETE /b?acl`, `?versioning`,
+/// `?ownershipControls` deleted an empty bucket; `DELETE /b/k?retention`,
+/// `?legal-hold` the object.
+const BUCKET_DELETE_PARAMS: [&str; 7] = [
+    "tagging",
+    "policy",
+    "lifecycle",
+    "encryption",
+    "publicAccessBlock",
+    "cors",
+    "x-id",
+];
+const OBJECT_DELETE_PARAMS: [&str; 4] = ["versionId", "uploadId", "tagging", "x-id"];
+
+/// A DELETE naming something other than what a delete acts on: refused,
+/// never read as "delete the bucket/object".
+fn delete_refusal(path: &str, query: Option<&str>) -> Option<Response> {
+    let query = query?;
+    let trimmed = path.trim_start_matches('/');
+    let object = trimmed
+        .split_once('/')
+        .is_some_and(|(_, key)| !key.is_empty());
+    let allowed: &[&str] = if object {
+        &OBJECT_DELETE_PARAMS
+    } else {
+        &BUCKET_DELETE_PARAMS
+    };
+    let other = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .find_map(|pair| {
+            let name = pair.split('=').next().unwrap_or_default();
+            // A presigned DELETE carries its signature in the query.
+            let presign = name.len() > 6 && name[..6].eq_ignore_ascii_case("x-amz-");
+            (!presign && !allowed.contains(&name)).then(|| name.to_string())
+        })?;
+    if !object && other == "ownershipControls" {
+        return Some(S3Error::xml_response(
+            "InvalidRequest",
+            "Object ownership is BucketOwnerEnforced and can't be removed",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    Some(S3Error::xml_response(
+        "MethodNotAllowed",
+        &format!("DELETE is not allowed on the {other} sub-resource"),
+        StatusCode::METHOD_NOT_ALLOWED,
+    ))
+}
+
+// ── Bucket tagging ───────────────────────────────────────────────────────────
+
+/// Bucket setting that holds the bucket's tags: a JSON array of
+/// `[key, value]` pairs, sorted by key.
+const BUCKET_TAGS_SETTING: &str = "tagging";
+
+/// Tags a bucket may carry (S3's limit).
+const MAX_BUCKET_TAGS: usize = 50;
+
+fn bucket_setting_error(e: &tonic::Status) -> Response {
+    if e.code() == tonic::Code::NotFound {
+        S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        )
+    } else {
+        error!("bucket setting: {e}");
+        S3Error::xml_response(
+            "InternalError",
+            e.message(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    }
+}
+
+/// `GET /{bucket}?tagging`
+async fn get_bucket_tagging(state: &AppState, bucket: &str) -> Response {
+    if let Err(resp) = bucket_owner(state, bucket).await {
+        return resp;
+    }
+    let setting = match state
+        .meta_client
+        .clone()
+        .get_bucket_setting(objectio_proto::metadata::GetBucketSettingRequest {
+            bucket: bucket.to_string(),
+            name: BUCKET_TAGS_SETTING.to_string(),
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => return bucket_setting_error(&e),
+    };
+    let stored: Option<Vec<(String, String)>> = setting
+        .found
+        .then(|| serde_json::from_slice(&setting.value).ok())
+        .flatten();
+    let Some(pairs) = stored else {
+        return S3Error::xml_response(
+            "NoSuchTagSet",
+            "The TagSet does not exist",
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let body = TaggingXml {
+        tag_set: TagSetXml {
+            tags: pairs
+                .into_iter()
+                .map(|(key, value)| TagXml { key, value })
+                .collect(),
+        },
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        to_xml(&body).unwrap_or_default()
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
+/// `PUT /{bucket}?tagging` (a whole new tag set) and `DELETE
+/// /{bucket}?tagging` (`None`).
+async fn set_bucket_tagging(state: &AppState, bucket: &str, body: Option<&[u8]>) -> Response {
+    let value = match body {
+        None => Vec::new(),
+        Some(body) => {
+            let parsed: TaggingXml = match quick_xml::de::from_reader(body) {
+                Ok(t) => t,
+                Err(e) => {
+                    return S3Error::xml_response(
+                        "MalformedXML",
+                        &format!("Invalid tagging XML: {e}"),
+                        StatusCode::BAD_REQUEST,
+                    );
+                }
+            };
+            let pairs = parsed
+                .tag_set
+                .tags
+                .into_iter()
+                .map(|t| (t.key, t.value))
+                .collect();
+            let tags = match validate_tags(pairs, MAX_BUCKET_TAGS) {
+                Ok(t) => t,
+                Err(resp) => return resp,
+            };
+            let mut sorted: Vec<(String, String)> = tags.into_iter().collect();
+            sorted.sort();
+            serde_json::to_vec(&sorted).unwrap_or_default()
+        }
+    };
+    match state
+        .meta_client
+        .clone()
+        .put_bucket_setting(objectio_proto::metadata::PutBucketSettingRequest {
+            bucket: bucket.to_string(),
+            name: BUCKET_TAGS_SETTING.to_string(),
+            delete: body.is_none(),
+            value,
+        })
+        .await
+    {
+        Ok(_) => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())
+            .unwrap(),
+        Err(e) => bucket_setting_error(&e),
+    }
 }
 
 /// Tags an object may carry (S3's limit).
@@ -835,7 +1010,10 @@ const UPLOAD_LOCK_HEADERS: &[&str] = &[
 /// Check tags against S3's rules: at most 10, keys of 1–128 characters and
 /// values of at most 256, no key twice, none in the reserved `aws:` space.
 #[allow(clippy::result_large_err)]
-fn validate_tags(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, Response> {
+fn validate_tags(
+    pairs: Vec<(String, String)>,
+    max: usize,
+) -> Result<HashMap<String, String>, Response> {
     let invalid = |msg: String| {
         Err(S3Error::xml_response(
             "InvalidTag",
@@ -843,8 +1021,8 @@ fn validate_tags(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>
             StatusCode::BAD_REQUEST,
         ))
     };
-    if pairs.len() > MAX_TAGS {
-        return invalid(format!("Object tags cannot be greater than {MAX_TAGS}"));
+    if pairs.len() > max {
+        return invalid(format!("Tags cannot be more than {max}"));
     }
     let mut tags = HashMap::new();
     for (k, v) in pairs {
@@ -884,7 +1062,7 @@ fn parse_tagging(value: &str) -> Result<HashMap<String, String>, Response> {
             (decode(k), decode(v))
         })
         .collect();
-    validate_tags(pairs)
+    validate_tags(pairs, MAX_TAGS)
 }
 
 /// Tags a request sets with `x-amz-tagging`; none when it has no such
@@ -1077,7 +1255,7 @@ async fn put_object_tagging_internal(
         .into_iter()
         .map(|t| (t.key, t.value))
         .collect();
-    let tags = match validate_tags(pairs) {
+    let tags = match validate_tags(pairs, MAX_TAGS) {
         Ok(t) => t,
         Err(resp) => return resp,
     };
@@ -1491,8 +1669,7 @@ pub(crate) fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
 /// Query parameters for list objects
 #[derive(Debug, Deserialize, Default)]
 pub struct ListObjectsParams {
-    /// If present, a bucket tagging request: not supported (see
-    /// `bucket_tagging_unsupported`).
+    /// If present, a bucket tagging request.
     tagging: Option<String>,
     prefix: Option<String>,
     delimiter: Option<String>,
@@ -1590,8 +1767,7 @@ impl PostBucketParams {
 /// Query parameters for PUT bucket operations
 #[derive(Debug, Deserialize, Default)]
 pub struct PutBucketParams {
-    /// If present, a bucket tagging request: not supported (see
-    /// `bucket_tagging_unsupported`).
+    /// If present, a bucket tagging request.
     tagging: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
@@ -1619,8 +1795,7 @@ pub struct PutBucketParams {
 /// Query parameters for DELETE bucket operations
 #[derive(Debug, Deserialize, Default)]
 pub struct DeleteBucketParams {
-    /// If present, a bucket tagging request: not supported (see
-    /// `bucket_tagging_unsupported`).
+    /// If present, a bucket tagging request.
     tagging: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
@@ -2594,7 +2769,7 @@ pub async fn create_bucket(
     body: Bytes,
 ) -> Response {
     if params.tagging.is_some() {
-        return bucket_tagging_unsupported();
+        return set_bucket_tagging(&state, &bucket, Some(&body)).await;
     }
     if params.acl.is_some() {
         return put_acl(&state, &bucket, None, &headers, &body).await;
@@ -2813,7 +2988,7 @@ pub async fn delete_bucket(
     Query(params): Query<DeleteBucketParams>,
 ) -> Response {
     if params.tagging.is_some() {
-        return bucket_tagging_unsupported();
+        return set_bucket_tagging(&state, &bucket, None).await;
     }
     if params.policy.is_some() {
         return delete_bucket_policy_internal(state, bucket).await;
@@ -2987,7 +3162,7 @@ pub async fn list_objects(
     };
     params.max_keys = max_keys.map(|m| m.to_string());
     if params.tagging.is_some() {
-        return bucket_tagging_unsupported();
+        return get_bucket_tagging(&state, &bucket).await;
     }
     if params.acl.is_some() {
         return get_acl(&state, &bucket, None, None).await;
@@ -3485,7 +3660,7 @@ async fn copy_by_reference(
         return None;
     }
 
-    let new_id = Uuid::new_v4().as_bytes().to_vec();
+    let new_id = Uuid::now_v7().as_bytes().to_vec();
     let mut stripes = source.stripes.clone();
     for stripe in &mut stripes {
         if stripe.object_id.is_empty() {
@@ -4854,7 +5029,7 @@ pub async fn put_object(
     // and written, instead of in front of all of that. The `etag` phase is the
     // time still spent waiting for it afterwards.
     let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
-    let object_id = *Uuid::new_v4().as_bytes();
+    let object_id = *Uuid::now_v7().as_bytes();
 
     // A body that does not match the checksum the client sent is refused
     // here, before any shard is written or metadata committed, so a mismatch
@@ -7544,15 +7719,31 @@ pub(crate) fn sort_versions(versions: &mut Vec<ObjectMeta>) {
     versions.dedup_by(|a, b| a.version_id == b.version_id);
 }
 
+/// Where a version sorts among its key's: when it was made, in ms. A
+/// UUIDv7 version id carries it; the null version has no id, so its object
+/// id (a UUIDv7 too) does. `modified_at`, in seconds, is the last resort:
+/// a null version timed by it can sort behind a version made later in the
+/// same second. The OSDs order versions the same way.
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
+    let ms_of = |u: Uuid| {
+        (u.get_version_num() == 7)
+            .then(|| u.get_timestamp())
+            .flatten()
+            .map(|t| {
+                let (secs, nanos) = t.to_unix();
+                secs * 1000 + u64::from(nanos / 1_000_000)
+            })
+    };
     let ms = Uuid::parse_str(&object.version_id)
         .ok()
-        .filter(|u| u.get_version_num() == 7)
-        .and_then(|u| u.get_timestamp())
-        .map_or(object.modified_at.saturating_mul(1000), |t| {
-            let (secs, nanos) = t.to_unix();
-            secs * 1000 + u64::from(nanos / 1_000_000)
-        });
+        .and_then(ms_of)
+        .or_else(|| {
+            Uuid::from_slice(&object.object_id)
+                .ok()
+                .and_then(ms_of)
+                .filter(|_| object.version_id.is_empty())
+        })
+        .unwrap_or_else(|| object.modified_at.saturating_mul(1000));
     (ms, object.version_id.as_str())
 }
 
@@ -7585,10 +7776,36 @@ async fn find_version(
 }
 
 /// Delete object (DELETE /{bucket}/{key})
+///
+/// Runs to the end even if the client hangs up. A delete is several steps —
+/// the OSDs' metadata, the listing in meta, the shards — and a request
+/// future dropped between them (a client timeout) left a key listed that
+/// no longer existed, and a bucket that then couldn't be deleted.
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
     // Authorized by `authz::authz_layer` before this handler runs.
+    auth: Option<Extension<AuthResult>>,
+    version_id: Option<String>,
+    headers: HeaderMap,
+) -> Response {
+    let task = tokio::spawn(delete_object_to_the_end(
+        state, bucket, key, auth, version_id, headers,
+    ));
+    task.await.unwrap_or_else(|e| {
+        error!("delete task failed: {e}");
+        S3Error::xml_response(
+            "InternalError",
+            "the delete did not complete",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    })
+}
+
+async fn delete_object_to_the_end(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
     _auth: Option<Extension<AuthResult>>,
     version_id: Option<String>,
     headers: HeaderMap,
@@ -7684,7 +7901,7 @@ pub async fn delete_object(
         let delete_marker = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
-            object_id: Uuid::new_v4().as_bytes().to_vec(),
+            object_id: Uuid::now_v7().as_bytes().to_vec(),
             size: 0,
             etag: String::new(),
             content_type: String::new(),
@@ -7748,6 +7965,79 @@ pub async fn delete_object(
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("x-amz-version-id", &marker_version_id)
+            .header("x-amz-delete-marker", "true")
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    // Suspended versioning, no version named: S3 puts a delete marker
+    // whose version is "null" on top. It replaces the null version, if
+    // that's what is current (its data then goes), and leaves older real
+    // versions as they are. Removing the current entry instead hid the
+    // object with no marker, and the version under it still listed as
+    // latest.
+    if versioning == Some(VersioningState::VersioningSuspended) && version_id.is_none() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let marker = ObjectMeta {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            object_id: Uuid::now_v7().as_bytes().to_vec(),
+            created_at: now,
+            modified_at: now,
+            version_id: String::new(),
+            is_delete_marker: true,
+            ..Default::default()
+        };
+        let displaced = match put_object_meta_to_all(
+            &state.osd_pool,
+            &placement.nodes,
+            &bucket,
+            &key,
+            marker,
+            false,
+            &[],
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Failed to put the null delete marker: {}", e.error);
+                return S3Error::xml_response(
+                    "InternalError",
+                    &e.error.to_string(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        };
+        // A null version it replaced: its shards, once every replica agrees.
+        spawn_reclaim(
+            &state,
+            crate::osd_pool::reclaimable_after_overwrite(
+                &displaced,
+                &std::collections::HashSet::new(),
+            ),
+            Reclaim::Overwrite,
+            format!("{bucket}/{key} null version under a delete marker"),
+        );
+        {
+            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
+            let _ = state
+                .meta_client
+                .clone()
+                .delete_object(MetaDelReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: String::new(),
+                    forget_home: false,
+                })
+                .await;
+        }
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("x-amz-version-id", "null")
             .header("x-amz-delete-marker", "true")
             .body(Body::empty())
             .unwrap();
@@ -9094,7 +9384,7 @@ async fn upload_part_internal(
     let replication_count = placement.replication_count;
 
     // Generate a unique object ID for this part
-    let part_object_id = *Uuid::new_v4().as_bytes();
+    let part_object_id = *Uuid::now_v7().as_bytes();
     let mut pending = pending_shards(
         &state,
         format!("{bucket}/{key} upload {upload_id} part {part_number}"),
@@ -12411,6 +12701,34 @@ mod s3_tests {
         parse_sse_c_headers, sse_condition_vars, timestamp_to_http_date, timestamp_to_iso, to_xml,
     };
     use http::{HeaderMap, HeaderName, HeaderValue};
+
+    /// A null version (or null delete marker) made after a versioned one in
+    /// the same second is the newer: it is timed by its UUIDv7 object id,
+    /// not by `modified_at`, which only has seconds.
+    #[test]
+    fn a_null_version_made_later_in_the_same_second_sorts_newer() {
+        use objectio_proto::metadata::ObjectMeta;
+        let versioned = ObjectMeta {
+            version_id: uuid::Uuid::now_v7().to_string(),
+            object_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            modified_at: 1000,
+            ..Default::default()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let null_marker = ObjectMeta {
+            version_id: String::new(),
+            object_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            is_delete_marker: true,
+            modified_at: 1000,
+            ..Default::default()
+        };
+        let mut versions = vec![versioned, null_marker];
+        super::sort_versions(&mut versions);
+        assert!(
+            versions[0].version_id.is_empty(),
+            "the null marker is the latest"
+        );
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

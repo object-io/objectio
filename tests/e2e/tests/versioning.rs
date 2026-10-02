@@ -489,3 +489,42 @@ fn concurrent_deletes_of_every_version_leave_nothing_current() {
         "the bucket is empty"
     );
 }
+
+/// With versioning suspended, a DELETE without a version id puts a null
+/// delete marker in front of the versions kept (S3's rule). It used to
+/// remove the listing entry only: the object read as gone, yet its version
+/// listing showed no marker and the old version still latest.
+#[test]
+fn a_suspended_delete_leaves_a_null_marker() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    versioned(&c, "susp");
+    let kept = put(&c, "/susp/k", &body(1, 5000));
+    c.request(
+        "PUT",
+        "/susp?versioning",
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+    )
+    .expect(200);
+
+    let r = c.request("DELETE", "/susp/k", &[]);
+    r.expect(204);
+    assert_eq!(r.header("x-amz-delete-marker").as_deref(), Some("true"));
+    assert_eq!(r.header("x-amz-version-id").as_deref(), Some("null"));
+    c.request("GET", "/susp/k", &[]).expect(404);
+
+    let xml = c.request("GET", "/susp?versions", &[]).text();
+    let entries = listed(&xml);
+    assert_eq!(
+        entries,
+        vec![
+            ("k".to_string(), "null".to_string(), true, true),
+            ("k".to_string(), kept, false, false),
+        ],
+        "{xml}"
+    );
+
+    // Removing the marker brings the kept version back.
+    c.request("DELETE", "/susp/k?versionId=null", &[])
+        .expect(204);
+    expect_bytes(&c.request("GET", "/susp/k", &[]), &body(1, 5000), "after");
+}

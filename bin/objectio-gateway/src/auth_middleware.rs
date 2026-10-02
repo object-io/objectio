@@ -850,13 +850,28 @@ fn get_request_date<B>(request: &Request<B>) -> Result<String, AuthError> {
             .map(|s| s.to_string())
             .map_err(|_| AuthError::AccessDenied("invalid date format".to_string()));
     }
+    // Without X-Amz-Date, SigV4 signs the Date header (RFC 1123); the
+    // string to sign still carries the time in ISO 8601 basic form.
     if let Some(date) = request.headers().get("date") {
         return date
             .to_str()
-            .map(|s| s.to_string())
-            .map_err(|_| AuthError::AccessDenied("invalid date format".to_string()));
+            .ok()
+            .and_then(|s| DateTime::parse_from_rfc2822(s.trim()).ok())
+            .map(|d| d.with_timezone(&Utc).format("%Y%m%dT%H%M%SZ").to_string())
+            .ok_or_else(|| AuthError::AccessDenied("invalid date format".to_string()));
     }
     Err(AuthError::AccessDenied("missing date header".to_string()))
+}
+
+/// A header value as the text a client signed. HTTP carries bytes: a UTF-8
+/// client sends a non-ASCII x-amz-meta value as UTF-8, Python's http.client
+/// as Latin-1. `to_str` refuses both.
+pub fn header_text(value: &http::HeaderValue) -> String {
+    let bytes = value.as_bytes();
+    std::str::from_utf8(bytes).map_or_else(
+        |_| bytes.iter().map(|&b| char::from(b)).collect(),
+        str::to_string,
+    )
 }
 
 /// Parse ISO8601 date format for SigV4
@@ -881,9 +896,7 @@ fn build_canonical_request<B>(
     let mut headers_map: BTreeMap<String, String> = BTreeMap::new();
     for header_name in signed_headers {
         let value = match request.headers().get(header_name.as_str()) {
-            Some(v) => v
-                .to_str()
-                .map_err(|_| AuthError::AccessDenied("invalid header value".to_string()))?,
+            Some(v) => header_text(v),
             None => {
                 // Diagnostic dump: when a signed header is missing, log the
                 // full SignedHeaders list and every header actually on the
