@@ -293,7 +293,7 @@ fn a_tenant_admin_manages_its_tenants_roles() {
     )
     .expect(200);
     let role = as_admin(&c, &ak, &sk, "GET", "/_admin/roles/ci", &Value::Null).json();
-    assert_eq!(role["attached_policies"], json!(["acme/auditors"]));
+    assert_eq!(role["attached_policies"], json!(["auditors"]));
     assert_eq!(
         as_admin(&c, &bk, &bs, "GET", "/_admin/roles/ci", &Value::Null).status,
         404

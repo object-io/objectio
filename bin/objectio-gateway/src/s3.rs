@@ -46,7 +46,6 @@ use objectio_proto::metadata::{
     DeleteBucketRequest,
     DeleteUserRequest,
     ErasureType,
-    GetAccessKeyForAuthRequest,
     GetBucketEncryptionRequest,
     GetBucketLifecycleRequest,
     GetBucketPolicyRequest,
@@ -150,6 +149,9 @@ pub struct AppState {
     pub dedup: crate::dedup::DryRun,
     /// Proxies whose `X-Forwarded-For` names the client (`aws:SourceIp`).
     pub trusted_proxies: crate::origin::TrustedProxies,
+    /// The SigV4 layer's state, for the admin API to drop cached
+    /// credentials it has just changed.
+    pub auth_state: Arc<crate::auth_middleware::AuthState>,
 }
 
 impl AppState {
@@ -11949,7 +11951,7 @@ pub async fn admin_list_users(
                         user_id: u.user_id,
                         display_name: u.display_name,
                         arn: u.arn,
-                        status: format!("{:?}", u.status),
+                        status: crate::admin::user_status_label(u.status).to_string(),
                         created_at: u.created_at,
                         email: u.email,
                         tenant: u.tenant,
@@ -12036,7 +12038,7 @@ pub async fn admin_create_user(
                 user_id: user.user_id,
                 display_name: user.display_name,
                 arn: user.arn,
-                status: format!("{:?}", user.status),
+                status: crate::admin::user_status_label(user.status).to_string(),
                 created_at: user.created_at,
                 email: user.email,
                 tenant: user.tenant,
@@ -12088,16 +12090,19 @@ pub(crate) async fn lookup_user_tenant(state: &AppState, user_id: &str) -> Optio
 }
 
 /// Resolve an access_key_id to its tenant via meta.
+/// Whatever the key's status: an inactive key, or one of a suspended user,
+/// is still its tenant's to delete.
 async fn lookup_access_key_tenant(state: &AppState, access_key_id: &str) -> Option<String> {
     let mut client = state.meta_client.clone();
-    let resp = client
-        .get_access_key_for_auth(GetAccessKeyForAuthRequest {
+    let key = client
+        .get_access_key(objectio_proto::metadata::GetAccessKeyRequest {
             access_key_id: access_key_id.to_string(),
         })
         .await
         .ok()?
-        .into_inner();
-    resp.user.map(|u| u.tenant)
+        .into_inner()
+        .access_key?;
+    lookup_user_tenant(state, &key.user_id).await
 }
 
 /// Delete user (DELETE /_admin/users/{user_id})
@@ -12138,6 +12143,7 @@ pub async fn admin_delete_user(
         .await
     {
         Ok(_) => {
+            state.auth_state.forget_user(&user_id);
             info!("Deleted user: {}", user_id);
             Response::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -12208,7 +12214,7 @@ pub async fn admin_list_access_keys(
                         access_key_id: k.access_key_id,
                         secret_access_key: None, // Don't return secret on list
                         user_id: k.user_id,
-                        status: format!("{:?}", k.status),
+                        status: crate::admin::key_status_label(k.status).to_string(),
                         created_at: k.created_at,
                         scope: k.scope,
                         operation: operation_label(k.operation),
@@ -12325,7 +12331,7 @@ pub async fn admin_create_access_key(
                 access_key_id: key.access_key_id,
                 secret_access_key: Some(key.secret_access_key), // Include secret on create
                 user_id: key.user_id,
-                status: format!("{:?}", key.status),
+                status: crate::admin::key_status_label(key.status).to_string(),
                 created_at: key.created_at,
                 scope: key.scope,
                 operation: operation_label(key.operation),
@@ -12396,6 +12402,7 @@ pub async fn admin_delete_access_key(
         .await
     {
         Ok(_) => {
+            state.auth_state.forget_key(&access_key_id);
             info!("Deleted access key: {}", access_key_id);
             Response::builder()
                 .status(StatusCode::NO_CONTENT)

@@ -910,6 +910,7 @@ pub async fn run(
         dedup: dedup::DryRun::start(dedup_meta, Arc::clone(&dedup_pool)),
         trusted_proxies: origin::TrustedProxies::parse(&args.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("--trusted-proxies: {e}"))?,
+        auth_state: Arc::clone(&auth_state),
     });
 
     // Build router

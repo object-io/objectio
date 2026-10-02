@@ -27,6 +27,16 @@ use objectio_proto::metadata::{
 };
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 
+/// `base` with each top-level field of `update` put over it.
+fn overlay(mut base: serde_json::Value, update: &serde_json::Value) -> serde_json::Value {
+    if let (Some(base), Some(update)) = (base.as_object_mut(), update.as_object()) {
+        for (k, v) in update {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    base
+}
+
 /// Convert JSON to PoolConfig (prost types don't implement Deserialize)
 fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
     PoolConfig {
@@ -314,6 +324,30 @@ pub async fn admin_set_config(
             .into_response();
     }
 
+    // Reads redact a provider's client secret to "********". Writing back
+    // what was read must keep the real secret, not store the asterisks.
+    let mut value = body.to_vec();
+    if section.starts_with("identity/openid/")
+        && new_value
+            .get("client_secret")
+            .and_then(serde_json::Value::as_str)
+            == Some(REDACTED)
+    {
+        let existing = state
+            .meta_client
+            .clone()
+            .get_config(GetConfigRequest {
+                key: section.clone(),
+            })
+            .await
+            .ok()
+            .and_then(|r| r.into_inner().entry)
+            .and_then(|e| serde_json::from_slice::<serde_json::Value>(&e.value).ok());
+        value = keep_stored_secret(&new_value, existing.as_ref())
+            .to_string()
+            .into_bytes();
+    }
+
     let updated_by = auth
         .as_ref()
         .map(|Extension(a)| a.user_id.clone())
@@ -323,7 +357,7 @@ pub async fn admin_set_config(
     match client
         .set_config(SetConfigRequest {
             key: section.clone(),
-            value: body.to_vec(),
+            value,
             updated_by,
         })
         .await
@@ -731,6 +765,22 @@ fn extract_tenant(auth: &Option<Extension<AuthResult>>, headers: &axum::http::He
         .unwrap_or_default()
 }
 
+/// What a stored client secret reads as.
+const REDACTED: &str = "********";
+
+/// A provider config written back with its secret as read (redacted): the
+/// stored secret in place of the placeholder.
+fn keep_stored_secret(
+    new: &serde_json::Value,
+    stored: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut merged = new.clone();
+    merged["client_secret"] = stored
+        .and_then(|v| v.get("client_secret").cloned())
+        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+    merged
+}
+
 /// Redact sensitive fields in OIDC config responses
 fn redact_if_secret(key: &str, value: &[u8]) -> serde_json::Value {
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(value) else {
@@ -747,7 +797,7 @@ fn redact_if_secret(key: &str, value: &[u8]) -> serde_json::Value {
         && let Some(secret) = obj.get_mut("client_secret")
         && secret.as_str().is_some_and(|s| !s.is_empty())
     {
-        *secret = serde_json::Value::String("********".to_string());
+        *secret = serde_json::Value::String(REDACTED.to_string());
     }
 
     json
@@ -897,9 +947,22 @@ pub async fn admin_update_pool(
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
-    let mut pool = json_to_pool(&body);
-    pool.name = name;
     let mut client = state.meta_client.clone();
+    // An update changes what it names: the rest is read and kept, so a
+    // partial body can't reset the pool's coding or failure domain.
+    let existing = match client.get_pool(GetPoolRequest { name: name.clone() }).await {
+        Ok(r) => match r.into_inner() {
+            r if r.found => r.pool,
+            _ => None,
+        },
+        Err(e) => return (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+    };
+    let Some(existing) = existing else {
+        return (StatusCode::NOT_FOUND, "Pool not found").into_response();
+    };
+    let mut pool = json_to_pool(&overlay(pool_to_json(&existing), &body));
+    pool.name = name;
+    pool.created_at = existing.created_at;
     match client
         .update_pool(UpdatePoolRequest { pool: Some(pool) })
         .await
@@ -1030,9 +1093,25 @@ pub async fn admin_update_tenant(
     if let Some(e) = tenant_dedup_error(&body) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
-    let mut tenant = json_to_tenant(&body);
-    tenant.name = name;
     let mut client = state.meta_client.clone();
+    // An update changes what it names: the rest is read and kept, so a
+    // partial body can't clear the tenant's admins, quotas or labels.
+    let existing = match client
+        .get_tenant(GetTenantRequest { name: name.clone() })
+        .await
+    {
+        Ok(r) => match r.into_inner() {
+            r if r.found => r.tenant,
+            _ => None,
+        },
+        Err(e) => return (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+    };
+    let Some(existing) = existing else {
+        return (StatusCode::NOT_FOUND, "Tenant not found").into_response();
+    };
+    let mut tenant = json_to_tenant(&overlay(tenant_to_json(&existing), &body));
+    tenant.name = name;
+    tenant.created_at = existing.created_at;
     match client
         .update_tenant(UpdateTenantRequest {
             tenant: Some(tenant),
@@ -3131,12 +3210,22 @@ fn user_json(u: &objectio_proto::metadata::UserMeta) -> serde_json::Value {
         "email": u.email,
         "tenant": u.tenant,
         "created_at": u.created_at,
-        "status": match u.status {
-            0 => "active",
-            1 => "suspended",
-            _ => "deleted",
-        },
+        "status": user_status_label(u.status),
     })
+}
+
+/// A user's status as the API spells it.
+pub(crate) const fn user_status_label(status: i32) -> &'static str {
+    match status {
+        0 => "active",
+        1 => "suspended",
+        _ => "deleted",
+    }
+}
+
+/// An access key's status as the API spells it.
+pub(crate) const fn key_status_label(status: i32) -> &'static str {
+    if status == 0 { "active" } else { "inactive" }
 }
 
 /// `GET /_admin/users/{user_id}`
@@ -3193,6 +3282,7 @@ pub async fn admin_update_user(
     {
         return json_error(StatusCode::BAD_REQUEST, "you can't suspend yourself");
     }
+    state.auth_state.forget_user(&user_id);
     match state
         .meta_client
         .clone()
@@ -3204,7 +3294,13 @@ pub async fn admin_update_user(
         })
         .await
     {
-        Ok(r) => Json(user_json(&r.into_inner().user.unwrap_or_default())).into_response(),
+        Ok(r) => {
+            let user = r.into_inner().user.unwrap_or_default();
+            // Dropped again after the commit: a request in between may have
+            // cached the old status.
+            state.auth_state.forget_user(&user.user_id);
+            Json(user_json(&user)).into_response()
+        }
         Err(e) => grpc_error(&e),
     }
 }
@@ -3218,8 +3314,10 @@ pub async fn admin_update_access_key(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let mut client = state.meta_client.clone();
+    // Whose key, whatever its status: a tenant admin reactivates its own
+    // tenant's inactive keys.
     let owner = match client
-        .get_access_key_for_auth(objectio_proto::metadata::GetAccessKeyForAuthRequest {
+        .get_access_key(objectio_proto::metadata::GetAccessKeyRequest {
             access_key_id: access_key_id.clone(),
         })
         .await
@@ -3229,8 +3327,6 @@ pub async fn admin_update_access_key(
             .access_key
             .map(|k| k.user_id)
             .unwrap_or_default(),
-        // An inactive key isn't returned for auth: find its owner by tenant
-        // check on the update itself below (system admin only).
         Err(_) => String::new(),
     };
     let deny = if owner.is_empty() {
@@ -3265,10 +3361,11 @@ pub async fn admin_update_access_key(
     {
         Ok(r) => {
             let k = r.into_inner().key.unwrap_or_default();
+            state.auth_state.forget_key(&k.access_key_id);
             Json(serde_json::json!({
                 "access_key_id": k.access_key_id,
                 "user_id": k.user_id,
-                "status": if k.status == 0 { "active" } else { "inactive" },
+                "status": key_status_label(k.status),
             }))
             .into_response()
         }
@@ -3316,5 +3413,16 @@ mod tests {
         // to `Some(CredentialScope { scope: "" })` rather than `None`. Reading
         // that as scoped would lock every pre-existing key out of the console.
         assert!(deny_scoped_credential(&auth_with(Some(""))).is_none());
+    }
+
+    #[test]
+    fn a_redacted_secret_written_back_keeps_the_stored_one() {
+        let stored = serde_json::json!({"client_id": "a", "client_secret": "s3cret"});
+        let back = serde_json::json!({"client_id": "b", "client_secret": REDACTED});
+        let merged = keep_stored_secret(&back, Some(&stored));
+        assert_eq!(merged["client_secret"], "s3cret");
+        assert_eq!(merged["client_id"], "b");
+        // Nothing stored: no secret, never the placeholder.
+        assert_eq!(keep_stored_secret(&back, None)["client_secret"], "");
     }
 }

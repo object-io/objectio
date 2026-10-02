@@ -425,7 +425,7 @@ function UsersTabContent(p: UsersTabProps) {
                     )}
                   </Cell>
                   <Cell>
-                    <Badge kind={u.status === "Active" ? "ok" : "neutral"}>{u.status}</Badge>
+                    <Badge kind={u.status === "active" ? "ok" : "neutral"}>{u.status}</Badge>
                   </Cell>
                   <Cell>
                     {u.created_at
@@ -535,7 +535,7 @@ function UsersTabContent(p: UsersTabProps) {
                               )}
                               {k.operation === "READ" && <Chip>read-only</Chip>}
                               <Badge
-                                kind={k.status === "Active" ? "ok" : "neutral"}
+                                kind={k.status === "active" ? "ok" : "neutral"}
                                 className="ml-auto"
                               >
                                 {k.status}
