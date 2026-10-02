@@ -217,6 +217,13 @@ pub struct AuthResult {
     /// Enforced as a narrowing filter: it can only subtract from what the
     /// identity's policies already allow, never add.
     pub scope: Option<crate::scope::CredentialScope>,
+    /// Where the request came from, set by the gateway from the connection
+    /// (never from anything the client says, unless it came through a
+    /// trusted proxy): `aws:SourceIp` in policies.
+    pub source_ip: Option<std::net::IpAddr>,
+    /// The named gateway endpoint it arrived on: `aws:SourceVpce` in
+    /// policies. `None` on an unnamed endpoint.
+    pub source_endpoint: Option<String>,
 }
 
 impl AuthResult {

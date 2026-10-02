@@ -108,6 +108,20 @@ struct Args {
     #[arg(long)]
     auth: bool,
 
+    /// Name of the `--port` endpoint, for policies (`aws:SourceVpce`).
+    #[arg(long, default_value = "")]
+    endpoint_name: String,
+
+    /// A further S3 endpoint as `PORT=NAME` on `--listen-addr` (data plane
+    /// only). Repeatable.
+    #[arg(long = "data-port")]
+    data_port: Vec<String>,
+
+    /// Proxies whose `X-Forwarded-For` names the client (comma-separated
+    /// CIDRs or addresses).
+    #[arg(long, default_value = "")]
+    trusted_proxies: String,
+
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
@@ -819,6 +833,24 @@ async fn main() -> Result<()> {
     if args.tenant_console_port != 0 {
         gw_argv.push("--tenant-console-listen".into());
         gw_argv.push(format!("{}:{}", args.listen_addr, args.tenant_console_port));
+    }
+    if !args.endpoint_name.is_empty() {
+        gw_argv.extend(["--endpoint-name".to_string(), args.endpoint_name.clone()]);
+    }
+    for spec in &args.data_port {
+        let (port, name) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--data-port {spec}: expected PORT=NAME"))?;
+        gw_argv.extend([
+            "--data-listen".to_string(),
+            format!("{}:{port}={name}", args.listen_addr),
+        ]);
+    }
+    if !args.trusted_proxies.is_empty() {
+        gw_argv.extend([
+            "--trusted-proxies".to_string(),
+            args.trusted_proxies.clone(),
+        ]);
     }
     let gw_args = <objectio_gateway::Args as clap::Parser>::parse_from(&gw_argv);
     let gw_handle: JoinHandle<Result<()>> = {

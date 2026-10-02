@@ -148,6 +148,8 @@ pub struct AppState {
     pub inline_max_size: usize,
     /// Dedup dry-run queue (objectio-docs `architecture/design/dedup.md`).
     pub dedup: crate::dedup::DryRun,
+    /// Proxies whose `X-Forwarded-For` names the client (`aws:SourceIp`).
+    pub trusted_proxies: crate::origin::TrustedProxies,
 }
 
 impl AppState {

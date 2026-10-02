@@ -236,6 +236,8 @@ pub async fn auth_layer(
             tenant: String::new(),
             auth_mode: objectio_auth::AuthMode::Anonymous,
             scope: None,
+            source_ip: None,
+            source_endpoint: None,
         });
         return Ok(next.run(request).await);
     };
@@ -322,6 +324,8 @@ pub async fn auth_layer(
                 tenant,
                 auth_mode: objectio_auth::AuthMode::AssumedRole,
                 scope: None,
+                source_ip: None,
+                source_endpoint: None,
             }
         } else {
             AuthResult {
@@ -333,6 +337,8 @@ pub async fn auth_layer(
                 tenant: String::new(),
                 auth_mode: objectio_auth::AuthMode::Sts,
                 scope: cred.scope.clone(),
+                source_ip: None,
+                source_endpoint: None,
             }
         };
         request.extensions_mut().insert(auth_result);
@@ -702,6 +708,8 @@ pub fn verify_presigned_v4<B>(
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
         scope: cred.scope.clone(),
+        source_ip: None,
+        source_endpoint: None,
     })
 }
 
@@ -818,6 +826,8 @@ pub fn verify_request_v4<B>(
         tenant: cred.tenant.clone(),
         auth_mode: objectio_auth::AuthMode::Permanent,
         scope: cred.scope.clone(),
+        source_ip: None,
+        source_endpoint: None,
     })
 }
 

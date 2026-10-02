@@ -115,6 +115,21 @@ gateway:
     limits:
       cpu: "2"
       memory: 1Gi
+  # Named endpoints, for bucket policies that care where a request came
+  # from (aws:SourceVpce): e.g. "readable without keys from inside the
+  # cluster only", or "this key works only from inside".
+  endpoints:
+    # Name of the in-cluster endpoint (the gateway Service). "" = unnamed.
+    internalName: ""
+    # A separate port for traffic from outside, with its own name; the
+    # ingress is pointed at it. port 0 = the ingress uses the main port.
+    external:
+      port: 0
+      name: external
+  # Proxies (CIDRs, comma-separated) whose X-Forwarded-For names the
+  # client for aws:SourceIp — typically the ingress controller's pod CIDR.
+  # Empty: the connecting peer is the client.
+  trustedProxies: ""
   ingress:
     enabled: false
     className: ""

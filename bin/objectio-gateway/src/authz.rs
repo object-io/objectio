@@ -634,7 +634,7 @@ pub async fn authorize(
     let bucket = load_bucket(state, req.bucket).await;
 
     if auth.auth_mode == objectio_auth::AuthMode::Anonymous {
-        return authorize_anonymous(state, req, &bucket).await;
+        return authorize_anonymous(state, auth, req, &bucket).await;
     }
 
     if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant, auth.auth_mode) {
@@ -646,7 +646,7 @@ pub async fn authorize(
     }
 
     let resource = build_s3_arn(req.bucket, req.key);
-    let context = request_context(state, &auth.user_arn, auth.auth_mode, req, &bucket).await;
+    let context = request_context(state, auth, req, &bucket).await;
 
     let mut any_allow = false;
 
@@ -737,13 +737,19 @@ pub async fn authorize(
 /// The policy-evaluation context of a request by `principal`.
 async fn request_context(
     state: &AppState,
-    principal: &str,
-    auth_mode: objectio_auth::AuthMode,
+    auth: &AuthResult,
     req: &AuthzRequest<'_>,
     bucket: &BucketEntry,
 ) -> RequestContext {
     let resource = build_s3_arn(req.bucket, req.key);
-    let mut context = RequestContext::new(principal, req.action, &resource);
+    let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
+    // Where it came from: the client's address, and the named endpoint.
+    if let Some(ip) = auth.source_ip {
+        context = context.with_source_ip(ip);
+    }
+    if let Some(endpoint) = &auth.source_endpoint {
+        context = context.with_variable("aws:SourceVpce", endpoint.clone());
+    }
     for (k, v) in sse_condition_vars(req.headers) {
         context = context.with_variable(k, v);
     }
@@ -763,40 +769,35 @@ async fn request_context(
     // access while still allowing STS-vended sessions through.
     context = context.with_variable(
         "obio:CredentialType".to_string(),
-        auth_mode.as_str().to_string(),
+        auth.auth_mode.as_str().to_string(),
     );
     context
 }
 
 /// An unsigned request: only a bucket policy's grants to everyone can let
-/// it in, and not when public access to the bucket is restricted.
+/// it in. A grant open to anyone anywhere (a public policy) is shut off by
+/// `RestrictPublicBuckets`; one pinned to a network or an endpoint ("anyone
+/// inside the cluster") isn't public, and is not.
 async fn authorize_anonymous(
     state: &AppState,
+    auth: &AuthResult,
     req: &AuthzRequest<'_>,
     bucket: &BucketEntry,
 ) -> Option<Response> {
     let refused = || deny("Anonymous access is not allowed");
-    let Some(policy) = bucket.policy.as_deref().filter(|p| p.is_public()) else {
+    let Some(policy) = bucket.policy.as_deref() else {
         return Some(refused());
     };
-    if crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
-        .await
-        .restrict_public_buckets
+    let mut anonymous = policy.for_anonymous();
+    if policy.is_public()
+        && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
+            .await
+            .restrict_public_buckets
     {
-        return Some(refused());
+        anonymous = anonymous.without_public_grants();
     }
-    let context = request_context(
-        state,
-        ANONYMOUS_PRINCIPAL,
-        objectio_auth::AuthMode::Anonymous,
-        req,
-        bucket,
-    )
-    .await;
-    match state
-        .policy_evaluator
-        .evaluate(&policy.for_anonymous(), &context)
-    {
+    let context = request_context(state, auth, req, bucket).await;
+    match state.policy_evaluator.evaluate(&anonymous, &context) {
         PolicyDecision::Allow => None,
         _ => Some(refused()),
     }
@@ -887,14 +888,30 @@ pub fn scope_bucket(scope: &str) -> String {
 /// Authorization middleware. Runs after `auth_layer`, before any handler.
 pub async fn authz_layer(
     State(state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     // No identity on the request means `--no-auth`, or a route that sits ahead
     // of the auth layer. Either way there is no principal to evaluate.
-    let Some(auth) = request.extensions().get::<AuthResult>().cloned() else {
+    if request.extensions().get::<AuthResult>().is_none() {
+        return next.run(request).await;
+    }
+    // Where the request came from, on its identity, for every check made
+    // of it — here and in the handlers (a copy's source, a batch delete).
+    let source_ip = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| state.trusted_proxies.client_ip(c.0.ip(), request.headers()));
+    let source_endpoint = request
+        .extensions()
+        .get::<crate::origin::Endpoint>()
+        .and_then(|e| e.0.clone());
+    let Some(auth) = request.extensions_mut().get_mut::<AuthResult>() else {
         return next.run(request).await;
     };
+    auth.source_ip = source_ip;
+    auth.source_endpoint = source_endpoint;
+    let auth = auth.clone();
 
     let uri = request.uri().clone();
     let classification = classify(request.method(), uri.path(), uri.query().unwrap_or(""));
