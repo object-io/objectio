@@ -429,6 +429,7 @@ impl MetaService {
                 }
                 if req.state() != VolumeState::Unknown {
                     v.set_state(req.state());
+                    v.attached_read_only = req.state() == VolumeState::Attached && req.read_only;
                 }
                 v.updated_at = now();
                 Ok((vec![put(VOLUMES, v.volume_id.clone(), &v)], v))
@@ -1320,6 +1321,30 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(shrink.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// A read-only attachment is recorded with the volume, so a restarted
+    /// gateway exports it read-only again; any other state clears it.
+    #[tokio::test]
+    async fn a_read_only_attachment_is_recorded_until_the_state_changes() {
+        let svc = MetaService::new();
+        let vol = volume(&svc, "v").await;
+        let set = |state: VolumeState, read_only: bool| {
+            svc.block_update_volume_impl(BlockUpdateVolumeRequest {
+                volume_id: vol.clone(),
+                state: state.into(),
+                read_only,
+                ..Default::default()
+            })
+        };
+        let v = set(VolumeState::Attached, true).await.unwrap();
+        let v = v.volume.unwrap();
+        assert_eq!(v.state(), VolumeState::Attached);
+        assert!(v.attached_read_only);
+        let v = set(VolumeState::Available, true).await.unwrap();
+        assert!(!v.volume.unwrap().attached_read_only, "not attached");
+        let v = set(VolumeState::Attached, false).await.unwrap();
+        assert!(!v.volume.unwrap().attached_read_only);
     }
 
     /// A shard the repairer rebuilt where none was recorded is recorded on

@@ -79,8 +79,14 @@ impl BlockGatewayState {
         }
     }
 
-    /// Record a volume's new state in meta, then here.
-    async fn set_state(&self, volume_id: &str, state: ProtoVolumeState) -> Result<(), Status> {
+    /// Record a volume's new state in meta, then here. `read_only` is
+    /// recorded with an attachment, so a restart exports it the same way.
+    async fn set_state(
+        &self,
+        volume_id: &str,
+        state: ProtoVolumeState,
+        read_only: bool,
+    ) -> Result<(), Status> {
         let v = self
             .meta
             .client()
@@ -89,6 +95,7 @@ impl BlockGatewayState {
                 volume_id: volume_id.to_string(),
                 size_bytes: 0,
                 state: state.into(),
+                read_only,
             })
             .await?
             .into_inner()
@@ -121,6 +128,16 @@ impl BlockGatewayService {
             return Err(Status::out_of_range(format!(
                 "{len} bytes at {offset} run past the end of the {}-byte volume",
                 vol.size_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse writes to a volume attached read-only, as NBD does.
+    fn check_writable(&self, volume_id: &str) -> Result<(), Status> {
+        if self.state.nbd_server.is_read_only(volume_id) {
+            return Err(Status::permission_denied(format!(
+                "volume {volume_id} is attached read-only"
             )));
         }
         Ok(())
@@ -264,9 +281,10 @@ impl BlockService for BlockGatewayService {
                     objectio_block::error::BlockError::VolumeAttached(req.volume_id),
                 ));
             }
-            self.state.nbd_server.unregister(&req.volume_id);
+            // Its NBD clients are disconnected, their I/O finished, first.
+            self.state.nbd_server.unregister(&req.volume_id).await;
             self.state
-                .set_state(&req.volume_id, ProtoVolumeState::Available)
+                .set_state(&req.volume_id, ProtoVolumeState::Available, false)
                 .await?;
         }
 
@@ -364,7 +382,7 @@ impl BlockService for BlockGatewayService {
                 .block_update_volume(BlockUpdateVolumeRequest {
                     volume_id: req.volume_id,
                     size_bytes: req.new_size_bytes,
-                    state: 0,
+                    ..Default::default()
                 })
                 .await?
                 .into_inner()
@@ -580,7 +598,7 @@ impl BlockService for BlockGatewayService {
         let read_only = req.read_only;
 
         self.state
-            .set_state(&req.volume_id, ProtoVolumeState::Attached)
+            .set_state(&req.volume_id, ProtoVolumeState::Attached, read_only)
             .await?;
         self.state
             .nbd_server
@@ -610,6 +628,12 @@ impl BlockService for BlockGatewayService {
     ) -> Result<Response<DetachVolumeResponse>, Status> {
         let req = request.into_inner();
 
+        // Disconnect its NBD clients first, and wait for the I/O they had
+        // under way: nothing writes to the volume once it is detached (it
+        // may be attached elsewhere next). Every write acknowledged is
+        // journaled by now.
+        self.state.nbd_server.unregister(&req.volume_id).await;
+
         // Store what is dirty. Anything that fails stays journaled and is
         // flushed later; detaching does not lose it.
         let dirty = flush_volume_all(&req.volume_id, &self.state).await;
@@ -620,9 +644,8 @@ impl BlockService for BlockGatewayService {
             );
         }
 
-        self.state.nbd_server.unregister(&req.volume_id);
         self.state
-            .set_state(&req.volume_id, ProtoVolumeState::Available)
+            .set_state(&req.volume_id, ProtoVolumeState::Available, false)
             .await?;
 
         info!("Detached volume {}", req.volume_id);
@@ -676,13 +699,15 @@ impl BlockService for BlockGatewayService {
         let len = req.data.len() as u32;
 
         self.check_bounds(&req.volume_id, req.offset_bytes, req.data.len() as u64)?;
+        self.check_writable(&req.volume_id)?;
         self.state
             .cache
-            .write(&req.volume_id, req.offset_bytes, &req.data)
+            .write_durable(&req.volume_id, req.offset_bytes, req.data.into())
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
         self.state
             .resolver
-            .kick(&req.volume_id, req.offset_bytes, req.data.len() as u64);
+            .kick(&req.volume_id, req.offset_bytes, u64::from(len));
 
         io.done(u64::from(len));
         Ok(Response::new(WriteResponse { bytes_written: len }))
@@ -710,14 +735,16 @@ impl BlockService for BlockGatewayService {
         let io = Io::start(Protocol::Grpc, "trim");
         let req = request.into_inner();
 
-        // Zero-fill the trimmed range in cache
+        // Zero-fill the trimmed range in cache, a piece at a time: it used
+        // to allocate the whole range's zeros at once.
         self.check_bounds(&req.volume_id, req.offset_bytes, req.length_bytes)?;
-        let zeros = vec![0u8; req.length_bytes as usize];
+        self.check_writable(&req.volume_id)?;
         // A failed trim is an error to the caller. (It used to be logged
         // and reported as success.)
         self.state
             .cache
-            .write(&req.volume_id, req.offset_bytes, &zeros)
+            .write_zeroes(&req.volume_id, req.offset_bytes, req.length_bytes)
+            .await
             .map_err(|e| Status::internal(format!("trim: {e}")))?;
         self.state
             .resolver
