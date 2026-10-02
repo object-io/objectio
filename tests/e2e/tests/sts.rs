@@ -329,6 +329,26 @@ fn a_tenants_idp_vouches_only_for_its_tenants_roles() {
     assert_eq!(with(&c, &k, "GET", "/globex-data/k", &[]).status, 403);
     // Not the admin API.
     assert_eq!(with(&c, &k, "GET", "/_admin/users", &[]).status, 403);
+    // A URL presigned with the role's keys is the role too: it reads what
+    // the role's policy allows (it used to be a tenant-less session the
+    // role's policies never reached), and not another tenant's data.
+    let presigned = |path: &str| {
+        c.presign_as(
+            "GET",
+            &format!("{path}?X-Amz-Security-Token={}", k.2),
+            300,
+            &k.0,
+            &k.1,
+        )
+    };
+    let r = c.fetch("GET", &presigned("/acme-data/k"), &[]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.bytes, b"from ci");
+    assert_eq!(
+        c.fetch("GET", &presigned("/globex-data/k"), &[]).status,
+        403
+    );
+    assert_eq!(c.fetch("GET", &presigned("/acme-other/k"), &[]).status, 403);
     // A tampered session token is worthless.
     let forged = (k.0.clone(), k.1.clone(), format!("{}x", k.2));
     assert_eq!(with(&c, &forged, "GET", "/acme-data/k", &[]).status, 403);

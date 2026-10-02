@@ -65,6 +65,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 regex = "1"
 urlencoding = "2"
+# Boundary search in browser form uploads (src/post_object.rs).
+memchr = "2"
 tokio-stream = "0.1"
 # `io` feature = StreamReader — turn an axum body stream back into
 # an AsyncRead so the grep scanner can walk large objects without

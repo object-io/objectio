@@ -125,6 +125,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutBucketOwnershipControls"
             } else if has(query, "publicAccessBlock") {
                 "s3:PutBucketPublicAccessBlock"
+            } else if has(query, "cors") {
+                "s3:PutBucketCORS"
             } else {
                 "s3:CreateBucket"
             }
@@ -138,6 +140,9 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutEncryptionConfiguration"
             } else if has(query, "publicAccessBlock") {
                 "s3:PutBucketPublicAccessBlock"
+            } else if has(query, "cors") {
+                // S3 authorizes DeleteBucketCors as s3:PutBucketCORS.
+                "s3:PutBucketCORS"
             } else {
                 "s3:DeleteBucket"
             }
@@ -162,6 +167,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetBucketPublicAccessBlock"
             } else if has(query, "policyStatus") {
                 "s3:GetBucketPolicyStatus"
+            } else if has(query, "cors") {
+                "s3:GetBucketCORS"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -268,6 +275,8 @@ pub struct AuthzCache {
     identities: RwLock<HashMap<String, IdentityEntry>>,
     /// Tenant- and cluster-wide documents (public access block), by config key.
     accounts: RwLock<HashMap<String, (Option<serde_json::Value>, Instant)>>,
+    /// Each bucket's CORS configuration (see `crate::cors`).
+    pub cors: crate::cors::CorsCache,
     ttl: Duration,
 }
 
@@ -305,6 +314,7 @@ impl AuthzCache {
             buckets: RwLock::new(HashMap::new()),
             identities: RwLock::new(HashMap::new()),
             accounts: RwLock::new(HashMap::new()),
+            cors: crate::cors::CorsCache::new(ttl_secs),
             ttl: Duration::from_secs(ttl_secs),
         }
     }
@@ -340,6 +350,7 @@ impl AuthzCache {
     /// immediately; other gateways pick it up within [`POLICY_CACHE_TTL_SECS`].
     pub fn invalidate(&self, bucket: &str) {
         self.buckets.write().remove(bucket);
+        self.cors.invalidate(bucket);
     }
 
     /// Drop the cached policies for one user or group, after an attach or
@@ -1023,6 +1034,14 @@ mod tests {
             check_of(Method::GET, "/b", "uploads").0,
             "s3:ListBucketMultipartUploads"
         );
+    }
+
+    #[test]
+    fn cors_configuration_has_its_own_permissions() {
+        assert_eq!(check_of(Method::GET, "/b", "cors").0, "s3:GetBucketCORS");
+        assert_eq!(check_of(Method::PUT, "/b", "cors").0, "s3:PutBucketCORS");
+        // As in S3, deleting the configuration is putting it.
+        assert_eq!(check_of(Method::DELETE, "/b", "cors").0, "s3:PutBucketCORS");
     }
 
     #[test]
