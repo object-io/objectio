@@ -63,15 +63,26 @@ impl Drop for Cluster {
 }
 
 fn aio_binary() -> PathBuf {
-    // CARGO_BIN_EXE_ is only set for the package that declares the binary, so
-    // walk out of the test executable's directory instead. `cargo test`
-    // places integration tests in target/<profile>/deps/.
+    binary("objectio-aio")
+}
+
+/// A workspace binary, found the way the harness finds `objectio-aio`.
+///
+/// `CARGO_BIN_EXE_` is only set for the package that declares the binary,
+/// so walk out of the test executable's directory instead: `cargo test`
+/// places integration tests in `target/<profile>/deps/`.
+///
+/// # Panics
+///
+/// When the binary has not been built; the message says what to build.
+#[must_use]
+pub fn binary(name: &str) -> PathBuf {
     let mut dir = std::env::current_exe().expect("current_exe");
     dir.pop();
     if dir.ends_with("deps") {
         dir.pop();
     }
-    let direct = dir.join("objectio-aio");
+    let direct = dir.join(name);
     if direct.exists() {
         return direct;
     }
@@ -82,13 +93,13 @@ fn aio_binary() -> PathBuf {
         .canonicalize()
         .expect("workspace root");
     for profile in ["debug", "release"] {
-        let candidate = root.join("target").join(profile).join("objectio-aio");
+        let candidate = root.join("target").join(profile).join(name);
         if candidate.exists() {
             return candidate;
         }
     }
     panic!(
-        "objectio-aio binary not found — run `cargo build --bin objectio-aio` first \
+        "{name} binary not found — run `cargo build --bin {name}` first \
          (looked in {})",
         dir.display()
     );

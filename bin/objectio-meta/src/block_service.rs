@@ -300,6 +300,8 @@ impl BlockMetaService {
             chunk_size_bytes: vol.chunk_size_bytes,
             metadata: vol.metadata.clone(),
             qos: vol.qos,
+            // The legacy service records no attachments.
+            attached_read_only: false,
         }
     }
 

@@ -133,12 +133,16 @@ entrypoint on (gateway / meta / osd / block-gateway / cli).
 aws --endpoint-url http://localhost:9000 s3 mb s3://my-bucket
 aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://my-bucket/
 
+# Management: tenants, users, keys, policies, buckets, pools, ...
+# (a SigV4 client of the gateway's admin API; see bin/objectio-cli/README.md)
+objectio-cli configure --endpoint http://localhost:9000   # prompts for the admin key
+objectio-cli tenant create acme
+objectio-cli user list -o json
+
 # Iceberg REST (PyIceberg / Spark / Trino point at)
 #   http://localhost:9000/iceberg/v1
 # Create a warehouse first:
-curl -s -u $AK:$SK -X POST -H 'Content-Type: application/json' \
-    -d '{"name":"analytics"}' \
-  http://localhost:9000/_admin/warehouses
+objectio-cli warehouse create analytics
 
 # Delta Sharing (bearer-token auth)
 #   http://localhost:9000/delta-sharing/v1/

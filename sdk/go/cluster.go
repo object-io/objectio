@@ -166,10 +166,9 @@ func (c *Client) GetPool(ctx context.Context, name string) (*Pool, error) {
 	return &out, nil
 }
 
-// UpdatePool changes a pool by reading it, applying update, and writing the
-// whole thing back — the server replaces a pool wholesale, and a field left
-// out of the PUT falls back to the server's default (EC 3+2, failure domain
-// "rack", enabled), not to the pool's current value. The name cannot change.
+// UpdatePool changes a pool by reading it, applying update, and writing it
+// back. The server applies the fields sent to what it stores. The name
+// cannot change.
 func (c *Client) UpdatePool(ctx context.Context, name string, update func(*Pool)) (*Pool, error) {
 	p, err := c.GetPool(ctx, name)
 	if err != nil {

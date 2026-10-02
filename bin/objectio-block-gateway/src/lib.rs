@@ -221,6 +221,19 @@ pub async fn run(args: Args) -> Result<()> {
     // used to be discarded: a crash lost every write of the last ~30 s.
     replay_journal(&state).await?;
 
+    // ── NBD exports ───────────────────────────────────────────────────────────
+    // Every volume meta records as attached is exported again, the way it
+    // was attached: the attachment outlives the gateway, so a client
+    // reconnects to the same export name after a restart. They used to be
+    // lost, and a volume left attached in meta could not be attached
+    // again. Only now, after the journal replay, and before the NBD
+    // listener starts: an export serves reads, which must see every write
+    // acknowledged before the stop.
+    let restored = restore_exports(&nbd_server, &volumes);
+    if restored > 0 {
+        info!("Restored {restored} NBD exports");
+    }
+
     // ── Background flush loop ─────────────────────────────────────────────────
     {
         let flush_state = Arc::clone(&state);
@@ -254,6 +267,21 @@ pub async fn run(args: Args) -> Result<()> {
         .context("gRPC server error")?;
 
     Ok(())
+}
+
+/// Export every volume meta records as attached; the number exported.
+fn restore_exports(
+    nbd_server: &nbd::NbdServer,
+    volumes: &[objectio_proto::block::Volume],
+) -> usize {
+    let mut restored = 0;
+    for v in volumes {
+        if v.state() == objectio_proto::block::VolumeState::Attached {
+            nbd_server.register(&v.volume_id, v.size_bytes, v.attached_read_only);
+            restored += 1;
+        }
+    }
+    restored
 }
 
 /// Re-apply the journal's writes to the cache, each onto its chunk's

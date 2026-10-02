@@ -1598,7 +1598,7 @@ pub async fn admin_set_bucket_owner(
                 return (
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "owner is in tenant '{t}' but bucket '{bucket}' is in tenant                          '{bucket_tenant}'; the owner would not be able to access it"
+                        "owner is in tenant '{t}' but bucket '{bucket}' is in tenant '{bucket_tenant}'; the owner would not be able to access it"
                     ),
                 )
                     .into_response();

@@ -1,6 +1,6 @@
 [package]
 name = "objectio-cli"
-description = "Admin CLI for ObjectIO"
+description = "Management CLI for ObjectIO: a SigV4 client of the gateway's admin API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,9 +10,10 @@ name = "objectio-cli"
 path = "src/main.rs"
 
 [dependencies]
-objectio-common = { workspace = true }
-objectio-client = { workspace = true }
+# Block volume/snapshot commands speak gRPC to the block gateway; nothing
+# else in the CLI uses the proto crate (there is no metadata client).
 objectio-proto = { workspace = true }
+# validate_scope, to refuse a malformed key scope before sending it.
 objectio-auth = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
@@ -20,5 +21,18 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+http = "1"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

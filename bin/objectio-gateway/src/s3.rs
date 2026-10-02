@@ -684,6 +684,13 @@ fn is_warehouse_bucket(bucket: &str) -> bool {
 }
 
 /// Extract user metadata from request headers (x-amz-meta-* headers)
+/// An admin API error body: `{"error": message}`, escaped properly. These
+/// were built with `format!`, which made invalid JSON of a message holding a
+/// quote, and carried tonic's whole status rather than its message.
+fn admin_error_json(message: &str) -> String {
+    serde_json::json!({ "error": message }).to_string()
+}
+
 /// The standard headers an object keeps and serves back, as S3 does. They
 /// ride in `user_metadata` under this prefix (a space can't be in a header
 /// name, so no `x-amz-meta-` key can collide) and are served under their own
@@ -12233,7 +12240,7 @@ pub async fn admin_list_users(
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                .body(Body::from(admin_error_json(e.message())))
                 .unwrap()
         }
     }
@@ -12254,7 +12261,7 @@ pub async fn admin_create_user(
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(format!(r#"{{"error":"Invalid JSON: {}"}}"#, e)))
+                .body(Body::from(admin_error_json(&format!("Invalid JSON: {e}"))))
                 .unwrap();
         }
     };
@@ -12419,7 +12426,7 @@ pub async fn admin_delete_user(
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                    .body(Body::from(admin_error_json(e.message())))
                     .unwrap()
             }
         }
@@ -12497,7 +12504,7 @@ pub async fn admin_list_access_keys(
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                    .body(Body::from(admin_error_json(e.message())))
                     .unwrap()
             }
         }
@@ -12616,7 +12623,7 @@ pub async fn admin_create_access_key(
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                    .body(Body::from(admin_error_json(e.message())))
                     .unwrap()
             }
         }
@@ -12678,7 +12685,7 @@ pub async fn admin_delete_access_key(
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                    .body(Body::from(admin_error_json(e.message())))
                     .unwrap()
             }
         }

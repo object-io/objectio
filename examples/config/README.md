@@ -152,13 +152,20 @@ objectio-osd --config /etc/objectio/osd.toml
 After starting OSDs, verify the topology:
 
 ```bash
-# Check registered OSDs and their failure domains
-objectio-cli cluster status
+# Check registered OSDs and their failure domains. objectio-cli talks to
+# the gateway's admin API, signed with the admin key:
+export OBJECTIO_ENDPOINT=http://gateway:9000
+export OBJECTIO_ACCESS_KEY=... OBJECTIO_SECRET_KEY=...
+objectio-cli cluster topology
+objectio-cli node list
 
-# Example output:
-# Topology Version: 3
-# Nodes:
-#   osd-node1 (us-east/dc1/rack-01): 12 disks, ACTIVE
-#   osd-node2 (us-east/dc1/rack-02): 12 disks, ACTIVE
-#   osd-node3 (us-east/dc1/rack-03): 12 disks, ACTIVE
+# Example output (cluster topology):
+# 3 OSD(s): 1 region(s), 1 zone(s), 1 datacenter(s), 3 rack(s), 3 host(s)
+#   region us-east
+#     zone (none)
+#       datacenter dc1
+#         rack rack-01
+#           host osd-node1
+#             osd 3e3cbac67af045cd988f9bb353941aed
+#         ...
 ```

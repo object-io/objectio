@@ -2832,6 +2832,10 @@ message BlockUpdateVolumeRequest {
     string volume_id = 1;
     uint64 size_bytes = 2;
     objectio.block.VolumeState state = 3;
+    // With a state set: whether the volume is attached read-only. Recorded
+    // as the volume's `attached_read_only` (cleared by any other state), so
+    // a restarted gateway exports it again the way it was attached.
+    bool read_only = 4;
 }
 message BlockDeleteVolumeRequest {
     string volume_id = 1;

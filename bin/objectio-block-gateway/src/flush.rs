@@ -132,7 +132,7 @@ pub async fn flush_volume_all_locked(vol_id: &str, state: &BlockGatewayState) ->
     if !chunks.is_empty() {
         info!("Force-flushed {n}/{} chunks for vol {vol_id}", chunks.len());
     }
-    reset_journal(state);
+    reset_journal(state).await;
     chunks.len() - n + unresolved
 }
 
@@ -144,8 +144,8 @@ pub async fn flush_volume_all(vol_id: &str, state: &BlockGatewayState) -> usize 
 }
 
 /// Empty the journal once nothing is left dirty.
-fn reset_journal(state: &BlockGatewayState) {
-    if let Err(e) = state.cache.reset_journal_if_clean() {
+async fn reset_journal(state: &BlockGatewayState) {
+    if let Err(e) = state.cache.reset_journal_if_clean_async().await {
         warn!("Could not reset the block journal: {e}");
     }
 }
@@ -168,6 +168,6 @@ pub async fn flush_loop(state: Arc<BlockGatewayState>, interval: Duration) {
         for vol_id in &volume_ids {
             flush_volume(vol_id, &state).await;
         }
-        reset_journal(&state);
+        reset_journal(&state).await;
     }
 }

@@ -121,7 +121,7 @@ The `objectio-block` crate provides block storage on top of the distributed obje
 - **Snapshots and clones**: share stripes through the shared-stripe registry; an overwrite or delete frees only stripes nothing else uses
 - **Repair**: the meta repairer walks block stripes from meta's tables as well as objects
 
-Not implemented yet, though the types and RPCs exist: QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate legacy `BlockMetaService` (bincode tables, used by the CLI) that the block gateway does not use. aio runs the block gateway with `--block-port`.
+Not implemented yet, though the types and RPCs exist: QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate legacy `BlockMetaService` (bincode tables) that neither the block gateway nor the CLI uses — the CLI's `volume`/`snapshot` commands talk to the block gateway (`--block-endpoint`, default `:9300`). aio runs the block gateway with `--block-port`.
 
 The block gRPC service is defined in `crates/objectio-proto/proto/block.proto` (BlockService) and runs on the Block Gateway.
 
@@ -188,7 +188,7 @@ Binaries live in `bin/`, not `src/`:
 - `bin/objectio-gateway` — S3 API gateway + Iceberg REST Catalog (Axum router + auth middleware)
 - `bin/objectio-meta` — Metadata/Raft service
 - `bin/objectio-osd` — Storage daemon (also hosts block storage gRPC)
-- `bin/objectio-cli` — Admin CLI for user/volume/cluster management
+- `bin/objectio-cli` — Management CLI: a SigV4 client of the gateway admin API (`/_admin/*` plus S3 `?lifecycle`/`?cors`/`?publicAccessBlock` and STS), like the SDKs; never talks to meta directly. Block `volume`/`snapshot` use gRPC to the block gateway. See `bin/objectio-cli/README.md`
 - `bin/objectio-block-gateway` — Block storage gateway (gRPC BlockService :9300 + NBD :10809), EC-encodes block writes to OSDs
 - `bin/objectio-install` — Installation helper
 
