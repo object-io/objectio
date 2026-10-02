@@ -112,7 +112,12 @@ fn policy_document(v: &Value, what: &str) -> Result<String, Response> {
         || serde_json::to_string(v).unwrap_or_default(),
         str::to_string,
     );
-    objectio_auth::BucketPolicy::from_json(&text)
+    let parsed = if what == "trust policy" {
+        objectio_auth::BucketPolicy::from_trust_json(&text)
+    } else {
+        objectio_auth::BucketPolicy::from_json(&text)
+    };
+    parsed
         .map(|_| text)
         .map_err(|e| error(StatusCode::BAD_REQUEST, &format!("invalid {what}: {e}")))
 }

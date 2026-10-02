@@ -516,9 +516,11 @@ impl OidcProvider {
 
     /// Extract groups from claims using the configured claim name
     pub fn extract_groups(&self, claims: &Claims) -> Vec<String> {
-        claims
-            .extra
-            .get(&self.config.groups_claim)
+        // A dotted path reaches into nested claims: Keycloak's realm roles
+        // are `realm_access.roles`.
+        let mut path = self.config.groups_claim.split('.');
+        let first = path.next().unwrap_or_default();
+        path.fold(claims.extra.get(first), |v, k| v.and_then(|v| v.get(k)))
             .and_then(|v| {
                 // Handle both array of strings and single string
                 if let Some(arr) = v.as_array() {

@@ -21,6 +21,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 objectio-proto = { workspace = true }
 objectio-common = { workspace = true }
+ring = { workspace = true }
 
 [lints]
 workspace = true

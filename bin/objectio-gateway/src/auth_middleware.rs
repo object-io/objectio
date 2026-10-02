@@ -257,6 +257,16 @@ pub async fn auth_layer(
         let session_info = sts.validate(token).ok_or_else(|| {
             AuthError::AccessDenied("invalid or expired session token".to_string())
         })?;
+        // A role's session: "arn:obio:sts::<tenant|objectio>:assumed-role/<role>/<session>".
+        let role = session_info
+            .user_arn
+            .strip_prefix("arn:obio:sts::")
+            .and_then(|r| r.split_once(":assumed-role/"))
+            .and_then(|(account, rest)| {
+                let role = rest.split('/').next()?;
+                let tenant = if account == "objectio" { "" } else { account };
+                Some((tenant.to_string(), role.to_string()))
+            });
 
         // Recover the derived secret and run the SAME SigV4 verify path as
         // permanent keys — without this the session token is the only
@@ -286,15 +296,34 @@ pub async fn auth_layer(
             "STS auth ok: user_arn={} scope={} op={:?}",
             session_info.user_arn, session_info.scope, session_info.operation
         );
-        let auth_result = AuthResult {
-            user_id: session_info.user_arn.clone(),
-            user_arn: session_info.user_arn,
-            access_key_id: access_key_id.to_string(),
-            group_arns: Vec::new(),
-            group_ids: Vec::new(),
-            tenant: String::new(),
-            auth_mode: objectio_auth::AuthMode::Sts,
-            scope: cred.scope.clone(),
+        let auth_result = if let Some((tenant, role)) = role {
+            // The role's policies decide; the tenant boundary holds.
+            let key = if tenant.is_empty() {
+                role
+            } else {
+                format!("{tenant}/{role}")
+            };
+            AuthResult {
+                user_id: format!("role:{key}"),
+                user_arn: session_info.user_arn,
+                access_key_id: access_key_id.to_string(),
+                group_arns: Vec::new(),
+                group_ids: Vec::new(),
+                tenant,
+                auth_mode: objectio_auth::AuthMode::AssumedRole,
+                scope: None,
+            }
+        } else {
+            AuthResult {
+                user_id: session_info.user_arn.clone(),
+                user_arn: session_info.user_arn,
+                access_key_id: access_key_id.to_string(),
+                group_arns: Vec::new(),
+                group_ids: Vec::new(),
+                tenant: String::new(),
+                auth_mode: objectio_auth::AuthMode::Sts,
+                scope: cred.scope.clone(),
+            }
         };
         request.extensions_mut().insert(auth_result);
         return Ok(next.run(request).await);

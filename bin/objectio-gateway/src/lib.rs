@@ -26,6 +26,7 @@ pub mod prom;
 pub mod rdma;
 pub mod s3;
 pub mod scatter_gather;
+pub mod sts_api;
 
 use anyhow::Result;
 use auth_middleware::{AuthState, auth_layer, optional_auth_layer};
@@ -596,6 +597,13 @@ pub async fn run(
     } else {
         None
     };
+
+    // STS (AssumeRoleWithWebIdentity) on the S3 endpoint.
+    let sts_state = Arc::new(sts_api::StsState {
+        meta_client: meta_client.clone(),
+        system_oidc: oidc_provider.clone(),
+        sts: sts_provider.clone(),
+    });
 
     // Build Iceberg REST Catalog router and Delta Sharing router.
     //
@@ -1214,7 +1222,7 @@ pub async fn run(
             .merge(s3_routes.clone())
             .layer(middleware::from_fn(chunked_decode::s3_chunked_decode_layer))
             .layer(body_limit);
-        if args.no_auth {
+        let r = if args.no_auth {
             r
         } else {
             // Layers wrap in reverse application order, so the authorization
@@ -1228,7 +1236,11 @@ pub async fn run(
                 Arc::clone(&auth_state),
                 auth_layer,
             ))
-        }
+        };
+        r.layer(middleware::from_fn_with_state(
+            Arc::clone(&sts_state),
+            sts_api::sts_layer,
+        ))
     };
 
     // Parse the optional split-mode addrs.
