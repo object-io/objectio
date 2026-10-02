@@ -214,3 +214,90 @@ fn a_drained_osd_can_be_pulled_with_two_more_lost() {
         "the block volume changed"
     );
 }
+
+/// The shards and metadata copies a drained OSD still holds once nothing
+/// refers to them.
+async fn osd_shards(address: String) -> u64 {
+    use objectio_proto::storage::GetStatusRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    let uri = if address.starts_with("http") {
+        address
+    } else {
+        format!("http://{address}")
+    };
+    let mut client = StorageServiceClient::connect(uri)
+        .await
+        .expect("connect OSD");
+    client
+        .get_status(GetStatusRequest::default())
+        .await
+        .expect("status")
+        .into_inner()
+        .shard_count
+}
+
+/// A drained OSD is wiped once it's Out, and can come back without
+/// bringing stale copies with it: an object deleted after the drain stays
+/// deleted.
+#[test]
+fn a_drained_osd_is_purged_and_rejoins_clean() {
+    let c = Cluster::start_with_ec_and_args(7, 4, 2, &["--drain-interval-secs", "1"]);
+    c.json("POST", "/_admin/buckets", json!({"name": "pur"}))
+        .expect_ok();
+    let bodies: Vec<Vec<u8>> = (0..6).map(|i| payload(200_000, i)).collect();
+    for (i, body) in bodies.iter().enumerate() {
+        c.request("PUT", &format!("/pur/o{i}"), body).expect(200);
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = c.osd_address(0);
+    assert!(
+        rt.block_on(osd_shards(addr.clone())) > 0,
+        "OSD 0 holds nothing to drain"
+    );
+
+    let drained = osd_id(&c, 0);
+    c.json(
+        "PUT",
+        &format!("/_admin/osds/{drained}/admin-state"),
+        json!({"state": "draining"}),
+    )
+    .expect_ok();
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while admin_state(&c, &drained) != "out" {
+        assert!(Instant::now() < deadline, "never drained");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // Then wiped: its space comes back.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while rt.block_on(osd_shards(addr.clone())) > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drained OSD was never purged"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // Deleted while it's out; then it rejoins.
+    c.request("DELETE", "/pur/o1", &[]).expect(204);
+    c.json(
+        "PUT",
+        &format!("/_admin/osds/{drained}/admin-state"),
+        json!({"state": "in"}),
+    )
+    .expect_ok();
+    assert_eq!(admin_state(&c, &drained), "in");
+    let listing = c.request("GET", "/pur?list-type=2", &[]).text();
+    assert!(
+        !listing.contains("<Key>o1</Key>"),
+        "a deleted object came back: {listing}"
+    );
+    assert_eq!(c.request("GET", "/pur/o1", &[]).status, 404);
+    for (i, body) in bodies.iter().enumerate().filter(|(i, _)| *i != 1) {
+        let got = c.request("GET", &format!("/pur/o{i}"), &[]);
+        assert_eq!(got.status, 200, "o{i}: {}", got.text());
+        assert_eq!(&got.bytes, body, "o{i} changed");
+    }
+    // And it takes new data again.
+    c.request("PUT", "/pur/after", b"new").expect(200);
+    assert_eq!(c.request("GET", "/pur/after", &[]).bytes, b"new");
+}

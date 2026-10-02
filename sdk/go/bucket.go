@@ -29,9 +29,20 @@ type Bucket struct {
 // The caller becomes the owner, which matters: with no policy attached,
 // ownership is what grants access.
 func (c *Client) CreateBucket(ctx context.Context, name, tenant string) error {
+	return c.CreateBucketInPool(ctx, name, tenant, "")
+}
+
+// CreateBucketInPool creates a bucket whose data goes to pool. Empty pool
+// means the tenant's default pool (or the cluster's default placement). A
+// tenant may use only its default pool and its allowed pools; the pool is
+// fixed for the bucket's life.
+func (c *Client) CreateBucketInPool(ctx context.Context, name, tenant, pool string) error {
 	body := map[string]string{"name": name}
 	if tenant != "" {
 		body["tenant"] = tenant
+	}
+	if pool != "" {
+		body["pool"] = pool
 	}
 	return c.do(ctx, "POST", "/_admin/buckets", nil, body, nil)
 }

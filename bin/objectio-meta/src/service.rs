@@ -1243,6 +1243,93 @@ impl MetaService {
         }
     }
 
+    /// A drained OSD's purge state (`drain_observer::PURGE_*`), if any.
+    pub fn purge_state(&self, node_id: [u8; 16]) -> Option<String> {
+        self.store
+            .as_ref()
+            .and_then(|s| s.read_named(OSD_PURGE_TABLE, &hex::encode(node_id)))
+            .and_then(|v| String::from_utf8(v).ok())
+    }
+
+    /// Drained OSDs whose purge isn't confirmed yet.
+    pub fn pending_purges(&self) -> Vec<[u8; 16]> {
+        self.store
+            .as_ref()
+            .map(|s| s.list_named(OSD_PURGE_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, v)| v.as_slice() == crate::drain_observer::PURGE_PENDING.as_bytes())
+            .filter_map(|(k, _)| hex::decode(k).ok()?.try_into().ok())
+            .collect()
+    }
+
+    /// Record (or, with `None`, forget) a drained OSD's purge state.
+    pub async fn set_purge_state(
+        &self,
+        node_id: [u8; 16],
+        state: Option<&str>,
+    ) -> Result<(), Status> {
+        let key = hex::encode(node_id);
+        let current = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(OSD_PURGE_TABLE, &key));
+        if current.is_none() && state.is_none() {
+            return Ok(());
+        }
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(OSD_PURGE_TABLE.into()),
+            &key,
+            current,
+            state.map(|s| s.as_bytes().to_vec()),
+            "osd-purge-state",
+        )
+        .await
+    }
+
+    /// The pool a new bucket in `tenant` goes to, `requested` or not.
+    ///
+    /// A system bucket may go to any enabled pool. A tenant's bucket goes to
+    /// the pool it asks for only if the tenant may use it (its default, or
+    /// one of its allowed pools), otherwise to the tenant's default pool;
+    /// empty means the cluster's default placement.
+    #[allow(clippy::result_large_err)]
+    fn resolve_bucket_pool(&self, tenant: &str, requested: &str) -> Result<String, Status> {
+        let (default_pool, allowed) = if tenant.is_empty() {
+            (String::new(), None)
+        } else {
+            let tenants = self.tenants.read();
+            let t = tenants.get(tenant);
+            (
+                t.map(|t| t.default_pool.clone()).unwrap_or_default(),
+                Some(t.map(|t| t.allowed_pools.clone()).unwrap_or_default()),
+            )
+        };
+        let pool = if requested.is_empty() {
+            default_pool.clone()
+        } else {
+            requested.to_string()
+        };
+        if pool.is_empty() {
+            return Ok(pool);
+        }
+        if let Some(allowed) = &allowed
+            && pool != default_pool
+            && !allowed.contains(&pool)
+        {
+            return Err(Status::permission_denied(format!(
+                "tenant '{tenant}' may not use pool '{pool}'"
+            )));
+        }
+        match self.pools.read().get(&pool) {
+            Some(p) if p.enabled => Ok(pool),
+            Some(_) => Err(Status::failed_precondition(format!(
+                "pool '{pool}' is disabled"
+            ))),
+            None => Err(Status::not_found(format!("pool '{pool}' does not exist"))),
+        }
+    }
+
     /// The stored rows configuring `bucket` beyond its `BucketMeta`, as
     /// `(table, key, current bytes)`: what deleting the bucket removes.
     fn bucket_config_rows(
@@ -3278,6 +3365,10 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
 
+/// Drained OSDs' purge state, by node id (hex): "pending" until the OSD
+/// confirms it was wiped, then "done".
+const OSD_PURGE_TABLE: &str = "osd_purge";
+
 /// Named leases (`AcquireLease`), JSON `{holder, expires_at}`.
 const LEASES_TABLE: &str = "leases";
 
@@ -3788,6 +3879,8 @@ impl MetadataService for MetaService {
             }
         }
 
+        let pool = self.resolve_bucket_pool(&tenant, &req.pool)?;
+
         let bucket = BucketMeta {
             dedup: None,
             name: req.name.clone(),
@@ -3799,7 +3892,7 @@ impl MetadataService for MetaService {
                 req.storage_class
             },
             versioning: VersioningState::VersioningDisabled.into(),
-            pool: String::new(),
+            pool,
             tenant,
             quota_bytes: 0,
             quota_objects: 0,
@@ -7981,6 +8074,18 @@ impl MetadataService for MetaService {
             req.requested_by.clone()
         };
 
+        // A drained OSD comes back only once it's been wiped: until then it
+        // holds stale copies of metadata (objects deleted since would
+        // reappear) and shards nothing refers to.
+        let purge = self.purge_state(node_id);
+        if state != objectio_common::OsdAdminState::Out
+            && purge.as_deref() == Some(crate::drain_observer::PURGE_PENDING)
+        {
+            return Err(Status::failed_precondition(
+                "this OSD was drained and is still being purged; it can rejoin once that's done",
+            ));
+        }
+
         // Raft is the only write path. set_osd_admin_state persists to
         // OSD_NODES inside apply, which every follower also observes.
         let raft = self.raft_handle().ok_or_else(|| {
@@ -8034,6 +8139,16 @@ impl MetadataService for MetaService {
                 "set_osd_admin_state: no OSD with node_id={}",
                 hex::encode(node_id)
             );
+        }
+
+        // Back in service after a purge: it starts clean, and a later
+        // drain starts a new record.
+        if found
+            && state != objectio_common::OsdAdminState::Out
+            && purge.as_deref() == Some(crate::drain_observer::PURGE_DONE)
+            && let Err(e) = self.set_purge_state(node_id, None).await
+        {
+            warn!("clearing purge state for {}: {e}", hex::encode(node_id));
         }
 
         Ok(Response::new(SetOsdAdminStateResponse {
@@ -8268,6 +8383,36 @@ impl MetadataService for MetaService {
         let name = request.into_inner().name;
         if name == "default" {
             return Err(Status::invalid_argument("cannot delete the default pool"));
+        }
+        // Its buckets' objects were placed by it: without it they'd be
+        // looked for where the default placement puts them.
+        let users: Vec<String> = self
+            .buckets
+            .read()
+            .values()
+            .filter(|b| b.pool == name)
+            .map(|b| b.name.clone())
+            .take(5)
+            .collect();
+        if !users.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "pool '{name}' holds buckets ({}{}); delete them first",
+                users.join(", "),
+                if users.len() == 5 { ", ..." } else { "" }
+            )));
+        }
+        // Tenants that default to it, or may choose it, are reconfigured
+        // first.
+        if let Some(t) = self
+            .tenants
+            .read()
+            .values()
+            .find(|t| t.default_pool == name || t.allowed_pools.contains(&name))
+        {
+            return Err(Status::failed_precondition(format!(
+                "tenant '{}' refers to pool '{name}'; change its pools first",
+                t.name
+            )));
         }
         let expected_bytes = self.pools.read().get(&name).map(|p| p.encode_to_vec());
         if expected_bytes.is_none() {

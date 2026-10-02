@@ -158,6 +158,10 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
         return Ok(());
     }
 
+    // Drained OSDs whose purge hasn't been confirmed yet (it was offline,
+    // or this is a new leader): try again.
+    purge_pending(meta).await;
+
     let draining: Vec<([u8; 16], String)> = {
         let osds = meta.osd_nodes_read().clone();
         osds.into_iter()
@@ -231,7 +235,21 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
                 )
                 .await
             {
-                Ok(()) => meta.clear_drain_progress(&node_id),
+                Ok(()) => {
+                    meta.clear_drain_progress(&node_id);
+                    // Nothing refers to anything on it now: its shards and
+                    // metadata copies are garbage. Recorded first, so a purge
+                    // that can't run now is retried, and the OSD can't be put
+                    // back In with them.
+                    if let Err(e) = meta.set_purge_state(node_id, Some(PURGE_PENDING)).await {
+                        warn!(
+                            "drain observer: recording purge for {}: {e}",
+                            hex::encode(node_id)
+                        );
+                    } else {
+                        purge_one(meta, node_id, &address).await;
+                    }
+                }
                 Err(e) => warn!(
                     "drain observer: failed to flip {} → Out: {e}",
                     hex::encode(node_id)
@@ -241,6 +259,72 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+/// Recorded for a drained OSD until its purge is confirmed.
+pub const PURGE_PENDING: &str = "pending";
+/// Recorded once a drained OSD has been purged.
+pub const PURGE_DONE: &str = "done";
+
+/// Retry the purge of every drained OSD still pending.
+async fn purge_pending(meta: &Arc<MetaService>) {
+    let pending = meta.pending_purges();
+    if pending.is_empty() {
+        return;
+    }
+    let osds = meta.osd_nodes_read().clone();
+    for node_id in pending {
+        let Some(node) = osds.iter().find(|n| n.node_id == node_id) else {
+            // Removed from the cluster: nothing to purge any more.
+            let _ = meta.set_purge_state(node_id, None).await;
+            continue;
+        };
+        if node.admin_state != objectio_common::OsdAdminState::Out {
+            // Only ever a drained, Out OSD. (It can't be put back In while
+            // pending; anything else is left alone.)
+            continue;
+        }
+        purge_one(meta, node_id, &node.address).await;
+    }
+}
+
+/// Wipe a drained OSD and record it done.
+async fn purge_one(meta: &Arc<MetaService>, node_id: [u8; 16], address: &str) {
+    let uri = canonical_uri(address);
+    let result = async {
+        let channel = tokio::time::timeout(
+            PER_OSD_TIMEOUT,
+            Channel::from_shared(uri.clone())?.connect(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+        let mut client = StorageServiceClient::new(channel);
+        let r = client
+            .purge(objectio_proto::storage::PurgeRequest {
+                node_id: node_id.to_vec(),
+            })
+            .await?
+            .into_inner();
+        anyhow::Ok(r)
+    }
+    .await;
+    match result {
+        Ok(r) => {
+            info!(
+                "drain observer: purged drained OSD {} ({} shards, {} metadata entries)",
+                hex::encode(node_id),
+                r.shards,
+                r.entries
+            );
+            if let Err(e) = meta.set_purge_state(node_id, Some(PURGE_DONE)).await {
+                warn!("drain observer: recording purge done: {e}");
+            }
+        }
+        Err(e) => debug!(
+            "drain observer: purge of {} not done yet: {e}",
+            hex::encode(node_id)
+        ),
+    }
 }
 
 /// Ask one OSD for its shard count via GetStatus. Opens a fresh

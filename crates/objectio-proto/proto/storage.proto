@@ -75,6 +75,11 @@ service StorageService {
     // measurement window.
     rpc NoteChunks(NoteChunksRequest) returns (NoteChunksResponse);
     rpc ResetChunkNotes(ResetChunkNotesRequest) returns (ResetChunkNotesResponse);
+    // Wipe this OSD: every shard (its blocks freed) and every object and
+    // version metadata entry. Only for an OSD meta has drained and marked
+    // Out, when nothing refers to anything on it. Refused unless node_id is
+    // this OSD's, so a mixed-up address can't wipe the wrong one.
+    rpc Purge(PurgeRequest) returns (PurgeResponse);
 }
 
 // Shard identifier
@@ -434,4 +439,12 @@ message NoteChunksResponse {
 message ResetChunkNotesRequest {}
 message ResetChunkNotesResponse {
     uint64 forgotten = 1;
+}
+
+message PurgeRequest {
+    bytes node_id = 1;   // must be this OSD's
+}
+message PurgeResponse {
+    uint64 shards = 1;    // shards removed
+    uint64 entries = 2;   // object/version metadata entries removed
 }

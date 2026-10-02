@@ -122,6 +122,10 @@ func TestRequestShapes(t *testing.T) {
 		{"ActivateAccessKey", `{}`, func(c *Client) error { _, err := c.ActivateAccessKey(ctx, "AK1"); return err },
 			"PUT", "/_admin/access-keys/AK1", "", `{"status":"active"}`},
 
+		// buckets in pools
+		{"CreateBucketInPool", `{"name":"b"}`, func(c *Client) error { return c.CreateBucketInPool(ctx, "b", "acme", "gold") },
+			"POST", "/_admin/buckets", "", `{"name":"b","pool":"gold","tenant":"acme"}`},
+
 		// audit
 		{"GetAuditConfig", `{"targets":[]}`, func(c *Client) error { _, err := c.GetAuditConfig(ctx, "acme"); return err },
 			"GET", "/_admin/audit", "tenant=acme", ""},

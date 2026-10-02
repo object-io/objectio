@@ -734,6 +734,19 @@ impl Cluster {
         )
     }
 
+    /// As [`Self::request_as`], with extra headers that are not signed.
+    pub fn request_as_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        access_key: &str,
+        secret_key: &str,
+        extra: &[(&str, &str)],
+    ) -> Response {
+        self.request_inner(method, path, body, access_key, secret_key, extra)
+    }
+
     fn request_inner(
         &self,
         method: &str,

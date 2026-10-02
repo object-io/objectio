@@ -463,6 +463,9 @@ message CreateBucketRequest {
     // Settings the bucket starts with (see GetBucketSetting), written in the
     // same commit as the bucket: it never exists without them.
     map<string, bytes> settings = 6;
+    // The pool its data goes to. Empty: the tenant's default pool, else the
+    // cluster's default placement. Fixed for the bucket's life.
+    string pool = 7;
 }
 
 message SetBucketOwnerRequest {
