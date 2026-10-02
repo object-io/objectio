@@ -772,6 +772,7 @@ async fn main() -> Result<()> {
                         .create_policy(CreatePolicyRequest {
                             name: name.clone(),
                             policy_json,
+                            ..Default::default()
                         })
                         .await?;
                     println!("Policy '{name}' saved");
@@ -789,6 +790,7 @@ async fn main() -> Result<()> {
                             policy_name: name.clone(),
                             user_id: user_id.clone(),
                             group_id: group_id.clone(),
+                            role_name: String::new(),
                         })
                         .await?;
                     println!(
@@ -803,6 +805,7 @@ async fn main() -> Result<()> {
                             policy_name: name.clone(),
                             user_id: user_id.clone(),
                             group_id: group_id.clone(),
+                            role_name: String::new(),
                         })
                         .await?;
                     println!(
@@ -816,6 +819,7 @@ async fn main() -> Result<()> {
                         .list_attached_policies(ListAttachedPoliciesRequest {
                             user_id: user_id.clone(),
                             group_id: group_id.clone(),
+                            role_name: String::new(),
                         })
                         .await?
                         .into_inner();
@@ -1081,6 +1085,7 @@ async fn main() -> Result<()> {
                     let response = client
                         .create_group(CreateGroupRequest {
                             group_name: group_name.clone(),
+                            ..Default::default()
                         })
                         .await?;
 

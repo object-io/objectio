@@ -167,6 +167,7 @@ async fn check_iam_policies(
         .list_attached_policies(ListAttachedPoliciesRequest {
             user_id: auth_result.user_id.clone(),
             group_id: String::new(),
+            role_name: String::new(),
         })
         .await;
     match user_lookup {
@@ -187,6 +188,7 @@ async fn check_iam_policies(
             .list_attached_policies(ListAttachedPoliciesRequest {
                 user_id: String::new(),
                 group_id: gid.clone(),
+                role_name: String::new(),
             })
             .await
         {

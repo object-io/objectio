@@ -49,6 +49,8 @@ use objectio_proto::metadata::{
     // Pool types
     CreatePoolRequest,
     CreatePoolResponse,
+    CreateRoleRequest,
+    CreateRoleResponse,
     // Tenant types
     CreateTenantRequest,
     CreateTenantResponse,
@@ -79,6 +81,8 @@ use objectio_proto::metadata::{
     DeletePolicyResponse,
     DeletePoolRequest,
     DeletePoolResponse,
+    DeleteRoleRequest,
+    DeleteRoleResponse,
     DeleteTenantRequest,
     DeleteTenantResponse,
     DeleteUserRequest,
@@ -152,6 +156,8 @@ use objectio_proto::metadata::{
     GetPoolResponse,
     GetRebalanceStatusRequest,
     GetRebalanceStatusResponse,
+    GetRoleRequest,
+    GetRoleResponse,
     GetTenantRequest,
     GetTenantResponse,
     GetUserGroupsRequest,
@@ -232,6 +238,8 @@ use objectio_proto::metadata::{
     ListPoliciesResponse,
     ListPoolsRequest,
     ListPoolsResponse,
+    ListRolesRequest,
+    ListRolesResponse,
     ListTenantsRequest,
     ListTenantsResponse,
     ListUsersRequest,
@@ -261,6 +269,7 @@ use objectio_proto::metadata::{
     RegisterPartResponse,
     RemoveUserFromGroupRequest,
     RemoveUserFromGroupResponse,
+    RoleObject,
     SetBucketOwnerRequest,
     SetBucketOwnerResponse,
     SetBucketPolicyRequest,
@@ -358,10 +367,18 @@ use objectio_proto::metadata::{
     UnityUpdateSchemaResponse,
     // Volumes
     UnityVolume,
+    UpdateAccessKeyRequest,
+    UpdateAccessKeyResponse,
+    UpdatePolicyRequest,
+    UpdatePolicyResponse,
     UpdatePoolRequest,
     UpdatePoolResponse,
+    UpdateRoleRequest,
+    UpdateRoleResponse,
     UpdateTenantRequest,
     UpdateTenantResponse,
+    UpdateUserRequest,
+    UpdateUserResponse,
     UserMeta,
     UserStatus,
     VersioningState,
@@ -2619,12 +2636,21 @@ impl MetaService {
             ];
             let now = Self::current_timestamp();
             for (name, json) in builtins {
-                if !map.contains_key(name) {
+                // Tenant admins may attach these to their own users; the
+                // tenant boundary keeps them to the tenant's buckets.
+                // consoleAdmin (admin:*) is the operator's alone.
+                let shared = name != "consoleAdmin";
+                if let Some(existing) = map.get_mut(name) {
+                    // Stored before policies had a scope.
+                    existing.shared = existing.tenant.is_empty() && shared;
+                } else {
                     let policy = PolicyObject {
                         name: name.to_string(),
                         policy_json: json.to_string(),
                         created_at: now,
                         updated_at: now,
+                        tenant: String::new(),
+                        shared,
                     };
                     store.put_iam_policy(name, &policy.encode_to_vec());
                     map.insert(name.to_string(), policy);
@@ -3187,7 +3213,82 @@ where
     Ok(page)
 }
 
+/// The tenant in an IAM ARN's account segment ("objectio" = system scope).
+fn group_tenant(arn: &str) -> String {
+    arn.split(':')
+        .nth(4)
+        .filter(|a| *a != "objectio")
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Where a policy or role is stored: "<name>" in system scope,
+/// "<tenant>/<name>" in a tenant's.
+fn iam_key(tenant: &str, name: &str) -> String {
+    if tenant.is_empty() {
+        name.to_string()
+    } else {
+        format!("{tenant}/{name}")
+    }
+}
+
+/// Roles, prost-encoded `RoleObject` by name. Written through
+/// `CasTable::Named(ROLES_TABLE)`.
+const ROLES_TABLE: &str = "iam_roles";
+
 impl MetaService {
+    /// Commit one compare-and-set write through Raft (or straight to the
+    /// store without Raft). `expected` is the row as read; a change since
+    /// is ABORTED, for the caller to retry.
+    async fn cas_one(
+        &self,
+        table: objectio_meta_store::CasTable,
+        key: &str,
+        expected: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+        what: &str,
+    ) -> Result<(), Status> {
+        use objectio_meta_store::{CasOp, MetaCommand, MetaResponse};
+        if let Some(raft) = self.raft_handle() {
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table,
+                    key: key.to_string(),
+                    expected,
+                    new_value,
+                }],
+                requested_by: what.into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => Ok(()),
+                    MetaResponse::MultiCasConflict { .. } => {
+                        Err(Status::aborted(format!("{what}: changed meanwhile; retry")))
+                    }
+                    other => {
+                        error!("unexpected raft response for {what}: {other:?}");
+                        Err(Status::internal("raft commit wrong variant"))
+                    }
+                },
+                Err(e) => Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.write_named(
+                objectio_meta_store::cas_table_name(&table),
+                key,
+                new_value.as_deref(),
+            );
+            Ok(())
+        } else {
+            Err(Status::unavailable("no store"))
+        }
+    }
+
+    fn role(&self, name: &str) -> Option<RoleObject> {
+        let bytes = self.store.as_ref()?.read_named(ROLES_TABLE, name)?;
+        RoleObject::decode(bytes.as_slice()).ok()
+    }
+
     /// The OSDs `bucket/key`'s ObjectMeta was written to, by position, if
     /// it has been written.
     fn object_home(&self, bucket: &str, key: &str) -> Option<ObjectHome> {
@@ -6565,13 +6666,17 @@ impl MetadataService for MetaService {
             return Err(Status::invalid_argument("group_name is required"));
         }
 
-        // Check uniqueness
-        if self
-            .groups
-            .read()
-            .values()
-            .any(|g| g.group_name == req.group_name)
-        {
+        // Unique within its tenant (the ARN names both).
+        let arn = format!(
+            "arn:obio:iam::{}:group/{}",
+            if req.tenant.is_empty() {
+                "objectio"
+            } else {
+                &req.tenant
+            },
+            req.group_name
+        );
+        if self.groups.read().values().any(|g| g.arn == arn) {
             return Err(Status::already_exists(
                 "group with this name already exists",
             ));
@@ -6583,7 +6688,7 @@ impl MetadataService for MetaService {
         let group = StoredGroup {
             group_id: group_id.clone(),
             group_name: req.group_name.clone(),
-            arn: format!("arn:obio:iam::objectio:group/{}", req.group_name),
+            arn,
             member_user_ids: Vec::new(),
             created_at: now,
         };
@@ -6627,6 +6732,7 @@ impl MetadataService for MetaService {
             group: Some(GroupMeta {
                 group_id: group.group_id,
                 group_name: group.group_name,
+                tenant: group_tenant(&group.arn),
                 arn: group.arn,
                 member_user_ids: group.member_user_ids,
                 created_at: group.created_at,
@@ -6702,6 +6808,7 @@ impl MetadataService for MetaService {
                 group_id: g.group_id.clone(),
                 group_name: g.group_name.clone(),
                 arn: g.arn.clone(),
+                tenant: group_tenant(&g.arn),
                 member_user_ids: g.member_user_ids.clone(),
                 created_at: g.created_at,
             })
@@ -6869,6 +6976,7 @@ impl MetadataService for MetaService {
                 group_id: g.group_id.clone(),
                 group_name: g.group_name.clone(),
                 arn: g.arn.clone(),
+                tenant: group_tenant(&g.arn),
                 member_user_ids: g.member_user_ids.clone(),
                 created_at: g.created_at,
             })
@@ -11238,10 +11346,18 @@ impl MetadataService for MetaService {
         request: Request<CreatePolicyRequest>,
     ) -> Result<Response<CreatePolicyResponse>, Status> {
         let req = request.into_inner();
-        let name = req.name.trim().to_string();
-        if name.is_empty() {
-            return Err(Status::invalid_argument("Policy name is required"));
+        let plain = req.name.trim().to_string();
+        if plain.is_empty() || plain.contains('/') {
+            return Err(Status::invalid_argument(
+                "Policy name is required, without \"/\"",
+            ));
         }
+        if req.shared && !req.tenant.is_empty() {
+            return Err(Status::invalid_argument(
+                "only system policies can be shared",
+            ));
+        }
+        let name = iam_key(&req.tenant, &plain);
         if req.policy_json.trim().is_empty() {
             return Err(Status::invalid_argument("Policy JSON is required"));
         }
@@ -11258,10 +11374,12 @@ impl MetadataService for MetaService {
         }
         let now = Self::current_timestamp();
         let policy = PolicyObject {
-            name: name.clone(),
+            name: plain,
             policy_json: req.policy_json,
             created_at: now,
             updated_at: now,
+            tenant: req.tenant,
+            shared: req.shared,
         };
         let bytes = policy.encode_to_vec();
 
@@ -11447,9 +11565,11 @@ impl MetadataService for MetaService {
             format!("user:{}", req.user_id)
         } else if !req.group_id.is_empty() {
             format!("group:{}", req.group_id)
+        } else if !req.role_name.is_empty() {
+            format!("role:{}", req.role_name)
         } else {
             return Err(Status::invalid_argument(
-                "Either user_id or group_id is required",
+                "One of user_id, group_id or role_name is required",
             ));
         };
 
@@ -11519,9 +11639,11 @@ impl MetadataService for MetaService {
             format!("user:{}", req.user_id)
         } else if !req.group_id.is_empty() {
             format!("group:{}", req.group_id)
+        } else if !req.role_name.is_empty() {
+            format!("role:{}", req.role_name)
         } else {
             return Err(Status::invalid_argument(
-                "Either user_id or group_id is required",
+                "One of user_id, group_id or role_name is required",
             ));
         };
 
@@ -11587,6 +11709,290 @@ impl MetadataService for MetaService {
         Ok(Response::new(DetachPolicyResponse { success: removed }))
     }
 
+    async fn update_policy(
+        &self,
+        request: Request<UpdatePolicyRequest>,
+    ) -> Result<Response<UpdatePolicyResponse>, Status> {
+        let req = request.into_inner();
+        if serde_json::from_str::<serde_json::Value>(&req.policy_json).is_err() {
+            return Err(Status::invalid_argument("Invalid JSON in policy document"));
+        }
+        let old = self
+            .iam_policies
+            .read()
+            .get(&req.name)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("Policy '{}' not found", req.name)))?;
+        let mut new = old.clone();
+        new.policy_json = req.policy_json;
+        new.updated_at = Self::current_timestamp();
+        self.cas_one(
+            objectio_meta_store::CasTable::IamPolicies,
+            &req.name,
+            Some(old.encode_to_vec()),
+            Some(new.encode_to_vec()),
+            "update-iam-policy",
+        )
+        .await?;
+        self.iam_policies
+            .write()
+            .insert(req.name.clone(), new.clone());
+        info!("Updated IAM policy '{}'", req.name);
+        Ok(Response::new(UpdatePolicyResponse { policy: Some(new) }))
+    }
+
+    async fn update_user(
+        &self,
+        request: Request<UpdateUserRequest>,
+    ) -> Result<Response<UpdateUserResponse>, Status> {
+        let req = request.into_inner();
+        let old = self
+            .users
+            .read()
+            .get(&req.user_id)
+            .cloned()
+            .filter(|u| u.status != UserStatus::UserDeleted as i32)
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        let mut new = old.clone();
+        if let Some(status) = req.status {
+            if status != UserStatus::UserActive as i32 && status != UserStatus::UserSuspended as i32
+            {
+                return Err(Status::invalid_argument(
+                    "status must be ACTIVE or SUSPENDED",
+                ));
+            }
+            new.status = status;
+        }
+        if let Some(name) = req.display_name {
+            new.display_name = name;
+        }
+        if let Some(email) = req.email {
+            new.email = email;
+        }
+        let enc = |u: &StoredUser| -> Result<Vec<u8>, Box<Status>> {
+            bincode::serialize(u)
+                .map_err(|e| Box::new(Status::internal(format!("user encode: {e}"))))
+        };
+        self.cas_one(
+            objectio_meta_store::CasTable::Users,
+            &req.user_id,
+            Some(enc(&old).map_err(|e| *e)?),
+            Some(enc(&new).map_err(|e| *e)?),
+            "update-user",
+        )
+        .await?;
+        self.users.write().insert(req.user_id.clone(), new.clone());
+        info!("Updated user {} (status {})", req.user_id, new.status);
+        Ok(Response::new(UpdateUserResponse {
+            user: Some(UserMeta {
+                user_id: new.user_id,
+                display_name: new.display_name,
+                arn: new.arn,
+                status: new.status,
+                created_at: new.created_at,
+                email: new.email,
+                tenant: new.tenant,
+            }),
+        }))
+    }
+
+    async fn update_access_key(
+        &self,
+        request: Request<UpdateAccessKeyRequest>,
+    ) -> Result<Response<UpdateAccessKeyResponse>, Status> {
+        let req = request.into_inner();
+        if req.status != KeyStatus::KeyActive as i32 && req.status != KeyStatus::KeyInactive as i32
+        {
+            return Err(Status::invalid_argument(
+                "status must be ACTIVE or INACTIVE",
+            ));
+        }
+        let old = self
+            .access_keys
+            .read()
+            .get(&req.access_key_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("access key not found"))?;
+        // A deleted user's keys stay off.
+        if req.status == KeyStatus::KeyActive as i32
+            && self
+                .users
+                .read()
+                .get(&old.user_id)
+                .is_none_or(|u| u.status == UserStatus::UserDeleted as i32)
+        {
+            return Err(Status::failed_precondition("the key's user is deleted"));
+        }
+        let mut new = old.clone();
+        new.status = req.status;
+        let enc = |k: &StoredAccessKey| -> Result<Vec<u8>, Box<Status>> {
+            bincode::serialize(k)
+                .map_err(|e| Box::new(Status::internal(format!("key encode: {e}"))))
+        };
+        self.cas_one(
+            objectio_meta_store::CasTable::AccessKeys,
+            &req.access_key_id,
+            Some(enc(&old).map_err(|e| *e)?),
+            Some(enc(&new).map_err(|e| *e)?),
+            "update-access-key",
+        )
+        .await?;
+        self.access_keys
+            .write()
+            .insert(req.access_key_id.clone(), new.clone());
+        info!("Access key {} status {}", req.access_key_id, new.status);
+        Ok(Response::new(UpdateAccessKeyResponse {
+            key: Some(AccessKeyMeta {
+                access_key_id: new.access_key_id,
+                secret_access_key: String::new(),
+                user_id: new.user_id,
+                status: new.status,
+                created_at: new.created_at,
+                tenant: new.tenant,
+                scope: new.scope,
+                operation: new.operation,
+            }),
+        }))
+    }
+
+    async fn create_role(
+        &self,
+        request: Request<CreateRoleRequest>,
+    ) -> Result<Response<CreateRoleResponse>, Status> {
+        let mut role = request
+            .into_inner()
+            .role
+            .ok_or_else(|| Status::invalid_argument("role is required"))?;
+        role.name = role.name.trim().to_string();
+        if role.name.is_empty()
+            || !role
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+        {
+            return Err(Status::invalid_argument(
+                "role name: letters, digits and +=,.@_- only",
+            ));
+        }
+        if serde_json::from_str::<serde_json::Value>(&role.trust_policy_json).is_err() {
+            return Err(Status::invalid_argument(
+                "trust policy must be a JSON document",
+            ));
+        }
+        let now = Self::current_timestamp();
+        role.arn = format!(
+            "arn:obio:iam::{}:role/{}",
+            if role.tenant.is_empty() {
+                "objectio"
+            } else {
+                &role.tenant
+            },
+            role.name
+        );
+        role.created_at = now;
+        role.updated_at = now;
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
+            &iam_key(&role.tenant, &role.name),
+            None,
+            Some(role.encode_to_vec()),
+            "create-role",
+        )
+        .await
+        .map_err(|e| {
+            if e.code() == tonic::Code::Aborted {
+                Status::already_exists(format!("role '{}' already exists", role.name))
+            } else {
+                e
+            }
+        })?;
+        info!("Created role {}", role.arn);
+        Ok(Response::new(CreateRoleResponse { role: Some(role) }))
+    }
+
+    async fn get_role(
+        &self,
+        request: Request<GetRoleRequest>,
+    ) -> Result<Response<GetRoleResponse>, Status> {
+        let role = self.role(&request.into_inner().name);
+        Ok(Response::new(GetRoleResponse {
+            found: role.is_some(),
+            role,
+        }))
+    }
+
+    async fn list_roles(
+        &self,
+        request: Request<ListRolesRequest>,
+    ) -> Result<Response<ListRolesResponse>, Status> {
+        let tenant = request.into_inner().tenant;
+        let roles = self
+            .store
+            .as_ref()
+            .map(|s| s.list_named(ROLES_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, b)| RoleObject::decode(b.as_slice()).ok())
+            .filter(|r| tenant.is_empty() || r.tenant == tenant)
+            .collect();
+        Ok(Response::new(ListRolesResponse { roles }))
+    }
+
+    async fn update_role(
+        &self,
+        request: Request<UpdateRoleRequest>,
+    ) -> Result<Response<UpdateRoleResponse>, Status> {
+        let req = request.into_inner();
+        let old = self
+            .role(&req.name)
+            .ok_or_else(|| Status::not_found(format!("role '{}' not found", req.name)))?;
+        let mut new = old.clone();
+        if let Some(d) = req.description {
+            new.description = d;
+        }
+        if let Some(t) = req.trust_policy_json {
+            if serde_json::from_str::<serde_json::Value>(&t).is_err() {
+                return Err(Status::invalid_argument(
+                    "trust policy must be a JSON document",
+                ));
+            }
+            new.trust_policy_json = t;
+        }
+        if let Some(m) = req.max_session_seconds {
+            new.max_session_seconds = m;
+        }
+        new.updated_at = Self::current_timestamp();
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
+            &req.name,
+            Some(old.encode_to_vec()),
+            Some(new.encode_to_vec()),
+            "update-role",
+        )
+        .await?;
+        Ok(Response::new(UpdateRoleResponse { role: Some(new) }))
+    }
+
+    async fn delete_role(
+        &self,
+        request: Request<DeleteRoleRequest>,
+    ) -> Result<Response<DeleteRoleResponse>, Status> {
+        let name = request.into_inner().name;
+        let old = self
+            .role(&name)
+            .ok_or_else(|| Status::not_found(format!("role '{name}' not found")))?;
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
+            &name,
+            Some(old.encode_to_vec()),
+            None,
+            "delete-role",
+        )
+        .await?;
+        info!("Deleted role {}", old.arn);
+        Ok(Response::new(DeleteRoleResponse { success: true }))
+    }
+
     async fn list_attached_policies(
         &self,
         request: Request<ListAttachedPoliciesRequest>,
@@ -11596,9 +12002,11 @@ impl MetadataService for MetaService {
             format!("user:{}", req.user_id)
         } else if !req.group_id.is_empty() {
             format!("group:{}", req.group_id)
+        } else if !req.role_name.is_empty() {
+            format!("role:{}", req.role_name)
         } else {
             return Err(Status::invalid_argument(
-                "Either user_id or group_id is required",
+                "One of user_id, group_id or role_name is required",
             ));
         };
 

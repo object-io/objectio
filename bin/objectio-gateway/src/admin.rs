@@ -1836,208 +1836,6 @@ pub async fn admin_delete_warehouse(
 // IAM Policies (PBAC)
 // ============================================================================
 
-pub async fn admin_list_policies(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-) -> Response {
-    // Policies are cluster-global. Tenant admins don't manage them.
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .list_policies(objectio_proto::metadata::ListPoliciesRequest {})
-        .await
-    {
-        Ok(resp) => {
-            let policies: Vec<serde_json::Value> = resp
-                .into_inner()
-                .policies
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "name": p.name,
-                        "policy": serde_json::from_str::<serde_json::Value>(&p.policy_json).unwrap_or_default(),
-                        "created_at": p.created_at,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({ "policies": policies })).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
-    }
-}
-
-pub async fn admin_create_policy(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let name = body["name"].as_str().unwrap_or_default().to_string();
-    let policy_json = if body["policy"].is_string() {
-        body["policy"].as_str().unwrap_or("{}").to_string()
-    } else {
-        serde_json::to_string(&body["policy"]).unwrap_or_default()
-    };
-    if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "name must not be empty").into_response();
-    }
-    // Validate at write time. Without this a body with a misspelled field
-    // stores the literal `null`, which parses fine as JSON but fails as a
-    // policy on every authorization decision from then on — visible only as a
-    // log warning while the grant silently never applies.
-    if let Err(e) = objectio_auth::BucketPolicy::from_json(&policy_json) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("invalid policy document: {e}"),
-        )
-            .into_response();
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .create_policy(objectio_proto::metadata::CreatePolicyRequest { name, policy_json })
-        .await
-    {
-        Ok(resp) => {
-            let p = resp.into_inner().policy.unwrap_or_default();
-            Json(serde_json::json!({ "name": p.name })).into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
-}
-
-pub async fn admin_delete_policy(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .delete_policy(objectio_proto::metadata::DeletePolicyRequest { name })
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
-}
-
-pub async fn admin_attach_policy(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let user_id = body["user_id"].as_str().unwrap_or_default().to_string();
-    let group_id = body["group_id"].as_str().unwrap_or_default().to_string();
-    // If targeting a specific user, scope the check to that user's tenant.
-    // Group targets remain system-admin-only (groups aren't tenant-scoped yet).
-    if !user_id.is_empty() {
-        if let Some(deny) = require_user_tenant_admin(&state, &auth, &headers, &user_id).await {
-            return deny;
-        }
-    } else if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let cache_key = if user_id.is_empty() {
-        group_id.clone()
-    } else {
-        user_id.clone()
-    };
-    let mut client = state.meta_client.clone();
-    match client
-        .attach_policy(objectio_proto::metadata::AttachPolicyRequest {
-            policy_name: body["policy_name"].as_str().unwrap_or_default().to_string(),
-            user_id,
-            group_id,
-        })
-        .await
-    {
-        Ok(_) => {
-            // The authorization chain caches a principal's policy set;
-            // drop it so the change takes effect now rather than at TTL.
-            state.policy_cache.invalidate_identity(&cache_key);
-            StatusCode::OK.into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
-}
-
-pub async fn admin_detach_policy(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let user_id = body["user_id"].as_str().unwrap_or_default().to_string();
-    let group_id = body["group_id"].as_str().unwrap_or_default().to_string();
-    if !user_id.is_empty() {
-        if let Some(deny) = require_user_tenant_admin(&state, &auth, &headers, &user_id).await {
-            return deny;
-        }
-    } else if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let cache_key = if user_id.is_empty() {
-        group_id.clone()
-    } else {
-        user_id.clone()
-    };
-    let mut client = state.meta_client.clone();
-    match client
-        .detach_policy(objectio_proto::metadata::DetachPolicyRequest {
-            policy_name: body["policy_name"].as_str().unwrap_or_default().to_string(),
-            user_id,
-            group_id,
-        })
-        .await
-    {
-        Ok(_) => {
-            // The authorization chain caches a principal's policy set;
-            // drop it so the change takes effect now rather than at TTL.
-            state.policy_cache.invalidate_identity(&cache_key);
-            StatusCode::OK.into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
-    }
-}
-
-pub async fn admin_list_attached_policies(
-    State(state): State<Arc<AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    let user_id = params.get("user_id").cloned().unwrap_or_default();
-    if !user_id.is_empty() {
-        if let Some(deny) = require_user_tenant_admin(&state, &auth, &headers, &user_id).await {
-            return deny;
-        }
-    } else if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .list_attached_policies(objectio_proto::metadata::ListAttachedPoliciesRequest {
-            user_id: params.get("user_id").cloned().unwrap_or_default(),
-            group_id: params.get("group_id").cloned().unwrap_or_default(),
-        })
-        .await
-    {
-        Ok(resp) => Json(serde_json::json!({ "policy_names": resp.into_inner().policy_names }))
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
-    }
-}
-
 // ============================================================================
 // Table Sharing (tenant-aware wrappers)
 // ============================================================================
@@ -3038,183 +2836,14 @@ fn offline_node(node_id: &[u8], addr: &str) -> serde_json::Value {
 // ARNs — attaching a policy to a group is identical to attaching it to a
 // user, just with `group_id` set instead of `user_id`.
 
-pub async fn admin_list_groups(
-    State(state): State<Arc<crate::AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .list_groups(objectio_proto::metadata::ListGroupsRequest {
-            max_results: 1000,
-            marker: String::new(),
-        })
-        .await
-    {
-        Ok(r) => {
-            let resp = r.into_inner();
-            let groups: Vec<serde_json::Value> = resp
-                .groups
-                .into_iter()
-                .map(|g| {
-                    serde_json::json!({
-                        "group_id": g.group_id,
-                        "group_name": g.group_name,
-                        "arn": g.arn,
-                        "member_user_ids": g.member_user_ids,
-                        "created_at": g.created_at,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({ "groups": groups })).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
-    }
-}
-
 #[derive(serde::Deserialize)]
 pub struct AdminCreateGroupBody {
     pub group_name: String,
 }
 
-pub async fn admin_create_group(
-    State(state): State<Arc<crate::AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Json(body): Json<AdminCreateGroupBody>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    if body.group_name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "group_name is required").into_response();
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .create_group(objectio_proto::metadata::CreateGroupRequest {
-            group_name: body.group_name,
-        })
-        .await
-    {
-        Ok(r) => {
-            let g = r.into_inner().group.unwrap_or_default();
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "group_id": g.group_id,
-                    "group_name": g.group_name,
-                    "arn": g.arn,
-                    "member_user_ids": g.member_user_ids,
-                    "created_at": g.created_at,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code()))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            e.message().to_string(),
-        )
-            .into_response(),
-    }
-}
-
-pub async fn admin_delete_group(
-    State(state): State<Arc<crate::AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Path(group_id): Path<String>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .delete_group(objectio_proto::metadata::DeleteGroupRequest { group_id })
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code()))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            e.message().to_string(),
-        )
-            .into_response(),
-    }
-}
-
 #[derive(serde::Deserialize)]
 pub struct AdminGroupMemberBody {
     pub user_id: String,
-}
-
-pub async fn admin_add_group_member(
-    State(state): State<Arc<crate::AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Path(group_id): Path<String>,
-    Json(body): Json<AdminGroupMemberBody>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .add_user_to_group(objectio_proto::metadata::AddUserToGroupRequest {
-            group_id,
-            user_id: body.user_id,
-        })
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code()))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            e.message().to_string(),
-        )
-            .into_response(),
-    }
-}
-
-pub async fn admin_remove_group_member(
-    State(state): State<Arc<crate::AppState>>,
-    auth: Option<Extension<AuthResult>>,
-    headers: HeaderMap,
-    Path((group_id, user_id)): Path<(String, String)>,
-) -> Response {
-    if let Some(deny) = require_system_admin(&auth, &headers) {
-        return deny;
-    }
-    let mut client = state.meta_client.clone();
-    match client
-        .remove_user_from_group(objectio_proto::metadata::RemoveUserFromGroupRequest {
-            group_id,
-            user_id,
-        })
-        .await
-    {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
-            StatusCode::from_u16(grpc_to_http(e.code()))
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            e.message().to_string(),
-        )
-            .into_response(),
-    }
-}
-
-fn grpc_to_http(code: tonic::Code) -> u16 {
-    match code {
-        tonic::Code::Ok => 200,
-        tonic::Code::InvalidArgument => 400,
-        tonic::Code::NotFound => 404,
-        tonic::Code::AlreadyExists => 409,
-        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => 403,
-        _ => 500,
-    }
 }
 
 // ============================================================================
@@ -3457,6 +3086,175 @@ pub async fn admin_reset_dedup_dry_run(
         }
     }
     Json(serde_json::json!({ "forgotten": forgotten, "failed": failed })).into_response()
+}
+
+// ── Users, keys, policies, groups, roles: reading and changing ───────────
+
+fn json_error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+fn grpc_error(e: &tonic::Status) -> Response {
+    let status = match e.code() {
+        tonic::Code::NotFound => StatusCode::NOT_FOUND,
+        tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_error(status, e.message())
+}
+
+fn user_json(u: &objectio_proto::metadata::UserMeta) -> serde_json::Value {
+    serde_json::json!({
+        "user_id": u.user_id,
+        "display_name": u.display_name,
+        "arn": u.arn,
+        "email": u.email,
+        "tenant": u.tenant,
+        "created_at": u.created_at,
+        "status": match u.status {
+            0 => "active",
+            1 => "suspended",
+            _ => "deleted",
+        },
+    })
+}
+
+/// `GET /_admin/users/{user_id}`
+pub async fn admin_get_user(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Some(deny) = require_user_tenant_admin(&state, &auth, &headers, &user_id).await {
+        return deny;
+    }
+    match state
+        .meta_client
+        .clone()
+        .get_user(objectio_proto::metadata::GetUserRequest { user_id })
+        .await
+    {
+        Ok(r) => r.into_inner().user.map_or_else(
+            || json_error(StatusCode::NOT_FOUND, "user not found"),
+            |u| Json(user_json(&u)).into_response(),
+        ),
+        Err(e) => grpc_error(&e),
+    }
+}
+
+/// `PUT /_admin/users/{user_id}` `{"status": "active"|"suspended",
+/// "display_name", "email"}`: suspending refuses the user's every key
+/// (within the gateways' 15 s credential cache) without deleting anything.
+pub async fn admin_update_user(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(deny) = require_user_tenant_admin(&state, &auth, &headers, &user_id).await {
+        return deny;
+    }
+    let status = match body["status"].as_str() {
+        None => None,
+        Some("active") => Some(objectio_proto::metadata::UserStatus::UserActive as i32),
+        Some("suspended") => Some(objectio_proto::metadata::UserStatus::UserSuspended as i32),
+        Some(other) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("status must be active or suspended, not {other:?}"),
+            );
+        }
+    };
+    // Nobody suspends themselves out of the cluster.
+    if status == Some(objectio_proto::metadata::UserStatus::UserSuspended as i32)
+        && extract_caller(&auth, &headers).user_id == user_id
+    {
+        return json_error(StatusCode::BAD_REQUEST, "you can't suspend yourself");
+    }
+    match state
+        .meta_client
+        .clone()
+        .update_user(objectio_proto::metadata::UpdateUserRequest {
+            user_id,
+            status,
+            display_name: body["display_name"].as_str().map(str::to_string),
+            email: body["email"].as_str().map(str::to_string),
+        })
+        .await
+    {
+        Ok(r) => Json(user_json(&r.into_inner().user.unwrap_or_default())).into_response(),
+        Err(e) => grpc_error(&e),
+    }
+}
+
+/// `PUT /_admin/access-keys/{access_key_id}` `{"status": "active"|"inactive"}`
+pub async fn admin_update_access_key(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(access_key_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let mut client = state.meta_client.clone();
+    let owner = match client
+        .get_access_key_for_auth(objectio_proto::metadata::GetAccessKeyForAuthRequest {
+            access_key_id: access_key_id.clone(),
+        })
+        .await
+    {
+        Ok(r) => r
+            .into_inner()
+            .access_key
+            .map(|k| k.user_id)
+            .unwrap_or_default(),
+        // An inactive key isn't returned for auth: find its owner by tenant
+        // check on the update itself below (system admin only).
+        Err(_) => String::new(),
+    };
+    let deny = if owner.is_empty() {
+        require_system_admin(&auth, &headers)
+    } else {
+        require_user_tenant_admin(&state, &auth, &headers, &owner).await
+    };
+    if let Some(deny) = deny {
+        return deny;
+    }
+    let status = match body["status"].as_str() {
+        Some("active") => objectio_proto::metadata::KeyStatus::KeyActive as i32,
+        Some("inactive") => objectio_proto::metadata::KeyStatus::KeyInactive as i32,
+        _ => return json_error(StatusCode::BAD_REQUEST, "status must be active or inactive"),
+    };
+    if status == objectio_proto::metadata::KeyStatus::KeyInactive as i32
+        && auth
+            .as_ref()
+            .is_some_and(|Extension(a)| a.access_key_id == access_key_id)
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "you can't deactivate the key you are using",
+        );
+    }
+    match client
+        .update_access_key(objectio_proto::metadata::UpdateAccessKeyRequest {
+            access_key_id,
+            status,
+        })
+        .await
+    {
+        Ok(r) => {
+            let k = r.into_inner().key.unwrap_or_default();
+            Json(serde_json::json!({
+                "access_key_id": k.access_key_id,
+                "user_id": k.user_id,
+                "status": if k.status == 0 { "active" } else { "inactive" },
+            }))
+            .into_response()
+        }
+        Err(e) => grpc_error(&e),
+    }
 }
 
 #[cfg(test)]

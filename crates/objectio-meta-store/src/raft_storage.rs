@@ -358,7 +358,7 @@ fn apply_multi_cas(
 /// Map a [`CasTable`] tag to the redb table name used by the rest of the
 /// meta store. Stays in lock-step with `tables.rs` — if you add a new
 /// long-lived table, add a `CasTable` variant here too.
-fn cas_table_name(t: &CasTable) -> &str {
+pub fn cas_table_name(t: &CasTable) -> &str {
     match t {
         CasTable::Buckets => "buckets",
         CasTable::BucketPolicies => "bucket_policies",

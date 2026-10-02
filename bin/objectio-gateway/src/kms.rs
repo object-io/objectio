@@ -582,6 +582,7 @@ async fn check_kms_policy(
         .list_attached_policies(ListAttachedPoliciesRequest {
             user_id: auth_result.user_id.clone(),
             group_id: String::new(),
+            role_name: String::new(),
         })
         .await
     {
