@@ -628,10 +628,15 @@ pub async fn authorize(
     // The system admin bypasses the chain, so a misconfigured policy can never
     // lock every operator out of the cluster.
     if auth.user_arn == crate::admin::SYSTEM_ADMIN_USER_ARN {
+        // Its tenant still learns of it: the event goes to the bucket's
+        // tenant's audit stream like anyone else's.
+        let bucket = load_bucket(state, req.bucket).await;
+        crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
         return None;
     }
 
     let bucket = load_bucket(state, req.bucket).await;
+    crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
 
     if auth.auth_mode == objectio_auth::AuthMode::Anonymous {
         return authorize_anonymous(state, auth, req, &bucket).await;
@@ -948,6 +953,11 @@ pub async fn authz_layer(
     let scope_key = key.clone().unwrap_or_else(|| {
         extract_query_param(uri.query().unwrap_or(""), "prefix").unwrap_or_default()
     });
+
+    // What the request acts on, for its audit event: as the request names
+    // it (checks made inside handlers, of a copy's source say, don't
+    // change it).
+    crate::audit::note_target(action, &bucket, key.as_deref());
 
     if let Some(deny) = authorize(
         &state,

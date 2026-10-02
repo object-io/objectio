@@ -152,6 +152,8 @@ pub struct AppState {
     /// The SigV4 layer's state, for the admin API to drop cached
     /// credentials it has just changed.
     pub auth_state: Arc<crate::auth_middleware::AuthState>,
+    /// The audit stream, for the admin API to reload after a change.
+    pub auditor: Arc<crate::audit::Auditor>,
 }
 
 impl AppState {
@@ -1778,7 +1780,7 @@ impl S3Error {
             code: code.to_string(),
             message: message.to_string(),
             resource: None,
-            request_id: Uuid::new_v4().to_string(),
+            request_id: crate::audit::request_id().unwrap_or_else(|| Uuid::new_v4().to_string()),
         };
 
         let xml = format!(

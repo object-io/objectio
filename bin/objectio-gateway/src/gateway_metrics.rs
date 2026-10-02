@@ -359,6 +359,7 @@ pub fn render() -> String {
         "Time one lifecycle scan took",
         "",
     );
+    crate::audit::render_metrics(&mut out);
     objectio_erasure::metrics::render(&mut out);
     out
 }

@@ -202,6 +202,9 @@ pub async fn sts_handler(
     body: Bytes,
 ) -> Response {
     let params = form(&body, uri.query());
+    if let Some(action) = params.get("Action") {
+        crate::audit::note_action(&format!("sts:{action}"));
+    }
     match params.get("Action").map(String::as_str) {
         Some("AssumeRoleWithWebIdentity") => assume_role_with_web_identity(&state, &params).await,
         Some(other) => sts_error(
@@ -425,6 +428,14 @@ async fn assume_role_with_web_identity(state: &StsState, p: &HashMap<String, Str
         .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
         .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         .unwrap_or_default();
+    crate::audit::note_identity(&objectio_auth::AuthResult {
+        user_id: claims.sub.clone(),
+        user_arn: session_arn.clone(),
+        access_key_id: creds.access_key_id.clone(),
+        tenant: tenant.clone(),
+        auth_mode: objectio_auth::AuthMode::AssumedRole,
+        ..Default::default()
+    });
     info!(
         "sts: {} assumed {} as {session_arn} via {}",
         claims.sub, role.arn, candidate.name
@@ -458,7 +469,7 @@ async fn assume_role_with_web_identity(state: &StsState, p: &HashMap<String, Str
         esc(&claims.sub),
         esc(&issuer),
         esc(&audience),
-        uuid::Uuid::new_v4(),
+        crate::audit::request_id().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
     );
     (StatusCode::OK, [(header::CONTENT_TYPE, "text/xml")], body).into_response()
 }

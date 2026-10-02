@@ -4,6 +4,7 @@
 //! Credentials are managed by the metadata service for persistence.
 
 pub mod admin;
+pub mod audit;
 pub mod auth_middleware;
 pub mod authz;
 pub mod checksum;
@@ -319,6 +320,12 @@ pub struct Args {
     /// (`aws:SourceIp`). Empty: the connection's peer is the client.
     #[arg(long, env = "OBJECTIO_TRUSTED_PROXIES", default_value = "")]
     pub trusted_proxies: String,
+
+    /// Append every request's audit event, as JSON lines, to this file
+    /// (`-` for stdout). Further targets are configured at
+    /// `/_admin/audit`.
+    #[arg(long, env = "OBJECTIO_AUDIT_LOG")]
+    pub audit_log: Option<String>,
 
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
@@ -890,6 +897,13 @@ pub async fn run(
     // Create application state. KMS fields are held behind RwLocks so
     // `PUT /_admin/kms/config` can hot-swap the backend at runtime; we seed
     // them here with whatever the CLI flag + env / meta config resolved to.
+    let trusted_proxies = origin::TrustedProxies::parse(&args.trusted_proxies)
+        .map_err(|e| anyhow::anyhow!("--trusted-proxies: {e}"))?;
+    let auditor = audit::Auditor::start(
+        meta_client.clone(),
+        args.audit_log.clone(),
+        trusted_proxies.clone(),
+    );
     let state = Arc::new(AppState {
         meta_client,
         osd_pool,
@@ -908,9 +922,9 @@ pub async fn run(
         rdma,
         inline_max_size: args.inline_max_size,
         dedup: dedup::DryRun::start(dedup_meta, Arc::clone(&dedup_pool)),
-        trusted_proxies: origin::TrustedProxies::parse(&args.trusted_proxies)
-            .map_err(|e| anyhow::anyhow!("--trusted-proxies: {e}"))?,
+        trusted_proxies,
         auth_state: Arc::clone(&auth_state),
+        auditor: Arc::clone(&auditor),
     });
 
     // Build router
@@ -963,6 +977,12 @@ pub async fn run(
         )
         .route("/_admin/policies/{name}", put(iam_admin::update_policy))
         .route("/_admin/groups/{group_id}", get(iam_admin::get_group))
+        .route(
+            "/_admin/audit",
+            get(audit::admin_get)
+                .put(audit::admin_put)
+                .delete(audit::admin_delete),
+        )
         .route(
             "/_admin/public-access-block",
             get(public_access::admin_get)
@@ -1494,7 +1514,14 @@ pub async fn run(
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());
     for (addr, router, label, endpoint) in listeners {
-        let router = router.layer(Extension(origin::Endpoint(endpoint)));
+        // Audited outermost (inside only the endpoint's name), so every
+        // refusal on the way in is recorded too.
+        let router = router
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&auditor),
+                audit::audit_layer,
+            ))
+            .layer(Extension(origin::Endpoint(endpoint)));
         // axum serves accepted sockets with Nagle on unless told otherwise;
         // Nagle holding back the tail of a response while the client delays
         // its ACK stalls a lone request by ~40 ms on Linux.

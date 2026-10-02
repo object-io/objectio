@@ -3,8 +3,8 @@
 Clients for the ObjectIO **management API** — everything under `/_admin/*`,
 plus STS: tenants and their admins, users and access keys, IAM policies,
 groups and roles, identity providers, temporary credentials from an OIDC
-token, Block Public Access, buckets, pools, nodes, KMS, warehouses, usage
-and metrics.
+token, Block Public Access, the audit stream, buckets, pools, nodes, KMS,
+warehouses, usage and metrics.
 
 They deliberately do **not** do S3 data operations. Use the S3 SDK you already
 have — aws-sdk-go-v2, boto3, mountpoint-s3, s3fs, rclone — pointed at the same
@@ -47,6 +47,7 @@ drift apart. Method names match across the two: Go `CreatePolicy` is Python
 | public access | `PutPublicAccessBlock`, `PutBucketPublicAccessBlock`, `GetBucketPolicyStatus` | `put_public_access_block`, `put_bucket_public_access_block`, `get_bucket_policy_status` |
 | buckets | `CreateBucket`, `PutBucketPolicy`, `ProvisionBucket`, … | `create_bucket`, `put_bucket_policy`, `provision_bucket`, … |
 | cluster | `ClusterInfo`, `ListNodes`, `ListPools`, `SetOSDAdminState`, `Usage`, `MetricsQuery`, … | `cluster_info`, `list_nodes`, `list_pools`, `set_osd_admin_state`, `usage`, `metrics_query`, … |
+| audit stream | `GetAuditConfig`, `PutAuditConfig`, `DeleteAuditConfig` | `get_audit_config`, `put_audit_config`, `delete_audit_config` |
 | KMS, warehouses, config | `ListKMSKeys`, `CreateWarehouse`, `SetConfig`, … | `list_kms_keys`, `create_warehouse`, `set_config`, … |
 
 IAM objects come back typed; large operational shapes (cluster info, nodes,

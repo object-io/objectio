@@ -91,3 +91,36 @@ class ConfigMixin:
 
     def delete_oidc_provider(self, name: str) -> None:
         self.delete_config(OIDC_CONFIG_PREFIX + name)
+
+    # -- audit stream -----------------------------------------------------
+
+    def get_audit_config(self, tenant: str = "") -> dict:
+        """The cluster's audit configuration (system admin, no ``tenant``) or
+        a tenant's. Webhook tokens read back as ``********``. Raises
+        :class:`APIError` (``not_found``) if none is set.
+
+        Shape: ``{"enabled", "include_reads", "targets": [{"type":
+        "webhook"|"stdout", "name", "url", "auth_token", "batch_size",
+        "flush_ms", "queue_size"}], "allowed_tenant_hosts" (cluster only),
+        "tenant"}``.
+        """
+        return self._request("GET", "/_admin/audit", query=self._tenant_query(tenant))
+
+    def put_audit_config(self, config: dict, *, tenant: str = "") -> dict:
+        """Replace the cluster's or a tenant's audit configuration.
+
+        A tenant's targets must be ``https`` webhooks on a host the operator
+        lists in the cluster's ``allowed_tenant_hosts``. A token written back
+        as read (``********``) keeps the stored one. Gateways pick changes up
+        within ten seconds.
+        """
+        body = {k: v for k, v in config.items() if k != "tenant"}
+        body.setdefault("targets", [])
+        return self._request(
+            "PUT", "/_admin/audit", query=self._tenant_query(tenant), body=body
+        )
+
+    def delete_audit_config(self, tenant: str = "") -> None:
+        """Remove the cluster's or a tenant's audit configuration."""
+        self._request("DELETE", "/_admin/audit", query=self._tenant_query(tenant))
+
