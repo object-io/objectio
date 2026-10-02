@@ -208,13 +208,14 @@ fn a_multipart_object_keeps_what_its_upload_was_created_with() {
 }
 
 #[test]
-fn bucket_tagging_says_it_is_not_supported() {
+fn bucket_tagging_never_touches_the_bucket() {
     let c = Cluster::start_with_ec(6, 4, 2);
     bucket(&c, "bt");
     c.request("PUT", "/bt/o", b"x").expect(200);
-    for method in ["GET", "PUT", "DELETE"] {
-        c.request(method, "/bt?tagging", &[]).expect(501);
-    }
+    // No tags yet; an empty PUT is malformed; a DELETE removes no bucket.
+    c.request("GET", "/bt?tagging", &[]).expect(404);
+    c.request("PUT", "/bt?tagging", &[]).expect(400);
+    c.request("DELETE", "/bt?tagging", &[]).expect(204);
     // And the bucket is still there, with its object.
     c.request("GET", "/bt/o", &[]).expect(200);
 }

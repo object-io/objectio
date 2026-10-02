@@ -4711,7 +4711,7 @@ impl MetadataService for MetaService {
             format!("\"{:x}-{}\"", hash, req.parts.len())
         };
 
-        let object_id = *Uuid::new_v4().as_bytes();
+        let object_id = *Uuid::now_v7().as_bytes();
         let now = Self::current_timestamp();
 
         let object = ObjectMeta {

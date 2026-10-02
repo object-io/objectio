@@ -3653,7 +3653,7 @@ async fn copy_by_reference(
         return None;
     }
 
-    let new_id = Uuid::new_v4().as_bytes().to_vec();
+    let new_id = Uuid::now_v7().as_bytes().to_vec();
     let mut stripes = source.stripes.clone();
     for stripe in &mut stripes {
         if stripe.object_id.is_empty() {
@@ -5022,7 +5022,7 @@ pub async fn put_object(
     // and written, instead of in front of all of that. The `etag` phase is the
     // time still spent waiting for it afterwards.
     let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
-    let object_id = *Uuid::new_v4().as_bytes();
+    let object_id = *Uuid::now_v7().as_bytes();
 
     // A body that does not match the checksum the client sent is refused
     // here, before any shard is written or metadata committed, so a mismatch
@@ -7712,15 +7712,31 @@ pub(crate) fn sort_versions(versions: &mut Vec<ObjectMeta>) {
     versions.dedup_by(|a, b| a.version_id == b.version_id);
 }
 
+/// Where a version sorts among its key's: when it was made, in ms. A
+/// UUIDv7 version id carries it; the null version has no id, so its object
+/// id (a UUIDv7 too) does. `modified_at`, in seconds, is the last resort:
+/// a null version timed by it can sort behind a version made later in the
+/// same second. The OSDs order versions the same way.
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
+    let ms_of = |u: Uuid| {
+        (u.get_version_num() == 7)
+            .then(|| u.get_timestamp())
+            .flatten()
+            .map(|t| {
+                let (secs, nanos) = t.to_unix();
+                secs * 1000 + u64::from(nanos / 1_000_000)
+            })
+    };
     let ms = Uuid::parse_str(&object.version_id)
         .ok()
-        .filter(|u| u.get_version_num() == 7)
-        .and_then(|u| u.get_timestamp())
-        .map_or(object.modified_at.saturating_mul(1000), |t| {
-            let (secs, nanos) = t.to_unix();
-            secs * 1000 + u64::from(nanos / 1_000_000)
-        });
+        .and_then(ms_of)
+        .or_else(|| {
+            Uuid::from_slice(&object.object_id)
+                .ok()
+                .and_then(ms_of)
+                .filter(|_| object.version_id.is_empty())
+        })
+        .unwrap_or_else(|| object.modified_at.saturating_mul(1000));
     (ms, object.version_id.as_str())
 }
 
@@ -7878,7 +7894,7 @@ async fn delete_object_to_the_end(
         let delete_marker = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
-            object_id: Uuid::new_v4().as_bytes().to_vec(),
+            object_id: Uuid::now_v7().as_bytes().to_vec(),
             size: 0,
             etag: String::new(),
             content_type: String::new(),
@@ -7961,7 +7977,7 @@ async fn delete_object_to_the_end(
         let marker = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
-            object_id: Uuid::new_v4().as_bytes().to_vec(),
+            object_id: Uuid::now_v7().as_bytes().to_vec(),
             created_at: now,
             modified_at: now,
             version_id: String::new(),
@@ -9361,7 +9377,7 @@ async fn upload_part_internal(
     let replication_count = placement.replication_count;
 
     // Generate a unique object ID for this part
-    let part_object_id = *Uuid::new_v4().as_bytes();
+    let part_object_id = *Uuid::now_v7().as_bytes();
     let mut pending = pending_shards(
         &state,
         format!("{bucket}/{key} upload {upload_id} part {part_number}"),
@@ -12678,6 +12694,34 @@ mod s3_tests {
         parse_sse_c_headers, sse_condition_vars, timestamp_to_http_date, timestamp_to_iso, to_xml,
     };
     use http::{HeaderMap, HeaderName, HeaderValue};
+
+    /// A null version (or null delete marker) made after a versioned one in
+    /// the same second is the newer: it is timed by its UUIDv7 object id,
+    /// not by `modified_at`, which only has seconds.
+    #[test]
+    fn a_null_version_made_later_in_the_same_second_sorts_newer() {
+        use objectio_proto::metadata::ObjectMeta;
+        let versioned = ObjectMeta {
+            version_id: uuid::Uuid::now_v7().to_string(),
+            object_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            modified_at: 1000,
+            ..Default::default()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let null_marker = ObjectMeta {
+            version_id: String::new(),
+            object_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            is_delete_marker: true,
+            modified_at: 1000,
+            ..Default::default()
+        };
+        let mut versions = vec![versioned, null_marker];
+        super::sort_versions(&mut versions);
+        assert!(
+            versions[0].version_id.is_empty(),
+            "the null marker is the latest"
+        );
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
