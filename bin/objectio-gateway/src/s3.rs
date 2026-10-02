@@ -295,6 +295,119 @@ struct SseCKey {
     md5_b64: String,
 }
 
+/// A write's encryption headers that contradict each other: SSE-C with
+/// server-side encryption, or a KMS key without `aws:kms`. 400, as S3.
+fn sse_header_conflict(headers: &HeaderMap) -> Option<Response> {
+    let has = |name: &str| headers.contains_key(name);
+    let customer = has("x-amz-server-side-encryption-customer-algorithm")
+        || has("x-amz-server-side-encryption-customer-key")
+        || has("x-amz-server-side-encryption-customer-key-md5");
+    let algorithm = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok());
+    let kms_key = has("x-amz-server-side-encryption-aws-kms-key-id");
+    let refuse = |msg: &str| {
+        Some(S3Error::xml_response(
+            "InvalidArgument",
+            msg,
+            StatusCode::BAD_REQUEST,
+        ))
+    };
+    if customer && (algorithm.is_some() || kms_key) {
+        return refuse(
+            "Server Side Encryption with Customer provided key is incompatible with the encryption method specified",
+        );
+    }
+    if kms_key && algorithm != Some("aws:kms") {
+        return refuse("Specifying a KMS key id requires x-amz-server-side-encryption: aws:kms");
+    }
+    None
+}
+
+/// A read carrying server-side encryption headers, which belong on writes:
+/// S3 refuses it (400) rather than ignore them.
+fn sse_headers_on_read(headers: &HeaderMap) -> Option<Response> {
+    (headers.contains_key("x-amz-server-side-encryption")
+        || headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id"))
+    .then(|| {
+        S3Error::xml_response(
+            "InvalidArgument",
+            "x-amz-server-side-encryption headers are not supported for this operation",
+            StatusCode::BAD_REQUEST,
+        )
+    })
+}
+
+/// Where an SSE-C object keeps what identifies its customer key: a random
+/// salt and SHA-256(salt || key). Never the key, nor anything that reveals
+/// it without guessing all 2^256.
+const SSE_C_SALT: &str = "objectio-sse-c-salt";
+const SSE_C_HASH: &str = "objectio-sse-c-key-sha256";
+
+/// The record of `key` an SSE-C object is stored with.
+fn sse_c_verifier(key: &[u8]) -> HashMap<String, String> {
+    use rand::RngCore;
+    use sha2::Digest;
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let hash = sha2::Sha256::new()
+        .chain_update(salt)
+        .chain_update(key)
+        .finalize();
+    HashMap::from([
+        (SSE_C_SALT.to_string(), hex::encode(salt)),
+        (SSE_C_HASH.to_string(), hex::encode(hash)),
+    ])
+}
+
+/// Whether `key` is the one an SSE-C object was stored with. Objects
+/// stored before keys were recorded can't be checked, and pass.
+fn sse_c_key_matches(context: &HashMap<String, String>, key: &[u8]) -> bool {
+    use sha2::Digest;
+    let (Some(salt), Some(want)) = (context.get(SSE_C_SALT), context.get(SSE_C_HASH)) else {
+        return true;
+    };
+    let Ok(salt) = hex::decode(salt) else {
+        return false;
+    };
+    let got = hex::encode(
+        sha2::Sha256::new()
+            .chain_update(&salt)
+            .chain_update(key)
+            .finalize(),
+    );
+    // Constant time: how much matches says nothing about the key.
+    got.len() == want.len()
+        && got
+            .bytes()
+            .zip(want.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+/// The response to a read of an SSE-C object, when its headers don't
+/// carry the key it was stored with: 400 without one, 403 with another.
+/// A wrong key used to decrypt to garbage served with 200.
+fn sse_c_read_refusal(headers: &HeaderMap, object: &ObjectMeta) -> Option<Response> {
+    if SseAlgorithm::try_from(object.encryption_algorithm) != Ok(SseAlgorithm::SseC) {
+        return None;
+    }
+    match parse_sse_c_headers(headers) {
+        Ok(Some(cust)) if sse_c_key_matches(&object.encryption_context, &cust.key) => None,
+        Ok(Some(_)) => Some(S3Error::xml_response(
+            "InvalidRequest",
+            "The provided customer encryption key is not the one the object was stored with",
+            StatusCode::BAD_REQUEST,
+        )),
+        Ok(None) => Some(S3Error::xml_response(
+            "InvalidRequest",
+            "The object was stored using a form of SSE-C; the customer key must be provided",
+            StatusCode::BAD_REQUEST,
+        )),
+        Err(resp) => Some(resp),
+    }
+}
+
 /// Parse + validate SSE-C customer-key headers.
 ///
 /// Returns `Ok(None)` when the headers are absent (i.e. this request isn't
@@ -430,6 +543,9 @@ async fn apply_put_sse(
     ),
     Response,
 > {
+    if let Some(refused) = sse_header_conflict(headers) {
+        return Err(refused);
+    }
     // SSE-C takes precedence over everything. AWS rejects a PUT that mixes
     // SSE-C customer-* headers with server-side algorithm headers, so the
     // presence of *any* SSE-C header activates this path. Warehouse-bucket
@@ -454,7 +570,7 @@ async fn apply_put_sse(
             String::new(), // no KMS key
             Vec::new(),    // no wrapped DEK — the client holds the key
             iv.to_vec(),
-            HashMap::new(),
+            sse_c_verifier(&cust.key),
             None, // SSE-C uses customer-algorithm headers, not x-amz-server-side-encryption
             cust.md5_b64,
         ));
@@ -588,8 +704,15 @@ fn add_metadata_headers(
     user_metadata: &HashMap<String, String>,
 ) -> http::response::Builder {
     for (key, value) in user_metadata {
-        let header_name = format!("x-amz-meta-{}", key);
-        builder = builder.header(header_name, value);
+        // Only what makes a valid header: one that doesn't would fail the
+        // whole response (a panic, the connection dropped) for every read
+        // of the object.
+        let name = format!("x-amz-meta-{key}");
+        if http::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && http::HeaderValue::from_str(value).is_ok()
+        {
+            builder = builder.header(name, value);
+        }
     }
     builder
 }
@@ -615,6 +738,11 @@ const MAX_TAGS: usize = 10;
 /// on the object. A header name cannot contain a space, so no
 /// `x-amz-meta-*` header can collide with it.
 const UPLOAD_TAGS_KEY: &str = "objectio tagging";
+
+/// The flexible checksum algorithm a CreateMultipartUpload declares (its
+/// `x-amz-checksum-algorithm`), kept in the upload's metadata.
+const UPLOAD_CHECKSUM_KEY: &str = "objectio checksum-algorithm";
+const UPLOAD_CHECKSUM_TYPE_KEY: &str = "objectio checksum-type";
 
 /// The object-lock headers a CreateMultipartUpload carries, kept in the
 /// upload's metadata under this prefix until CompleteMultipartUpload.
@@ -895,7 +1023,13 @@ fn add_checksum_header(
             .map(|a| (a.header_name(), c.value.as_str()))
     });
     match stored {
-        Some((name, value)) if enabled => builder.header(name, value),
+        Some((name, value)) if enabled => builder.header(name, value).header(
+            "x-amz-checksum-type",
+            object
+                .checksum
+                .as_ref()
+                .map_or("FULL_OBJECT", checksum_type_of),
+        ),
         _ => builder,
     }
 }
@@ -1412,6 +1546,8 @@ pub struct GetObjectParams {
     /// One part of a multipart object
     #[serde(rename = "partNumber")]
     part_number: Option<u32>,
+    /// If present, this is a GetObjectAttributes request
+    attributes: Option<String>,
     /// If present, this is a get object retention request
     retention: Option<String>,
     /// If present, this is a get legal hold request
@@ -1633,6 +1769,67 @@ pub struct CompleteMultipartUploadResult {
     pub key: String,
     #[serde(rename = "ETag")]
     pub etag: String,
+    // A checksum as S3 puts it in a body: one Checksum<ALG> element, and
+    // its type. (quick-xml can't serialize #[serde(flatten)]: a flattened
+    // struct here emptied the whole body.)
+    #[serde(rename = "ChecksumCRC32", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32: Option<String>,
+    #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
+    #[serde(rename = "ChecksumCRC64NVME", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc64nvme: Option<String>,
+    #[serde(rename = "ChecksumSHA1", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha1: Option<String>,
+    #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+    #[serde(rename = "ChecksumType", skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<String>,
+}
+
+/// A checksum's values for a response body's `Checksum<ALG>` and
+/// `ChecksumType` elements.
+#[derive(Default)]
+pub struct ChecksumXml {
+    crc32: Option<String>,
+    crc32c: Option<String>,
+    crc64nvme: Option<String>,
+    sha1: Option<String>,
+    sha256: Option<String>,
+    checksum_type: Option<String>,
+}
+
+impl ChecksumXml {
+    fn of(checksum: Option<&ObjectChecksum>, with_type: bool) -> Self {
+        let mut x = Self::default();
+        let Some(c) = checksum else {
+            return x;
+        };
+        let v = Some(c.value.clone());
+        match c.algorithm.as_str() {
+            "CRC32" => x.crc32 = v,
+            "CRC32C" => x.crc32c = v,
+            "CRC64NVME" => x.crc64nvme = v,
+            "SHA1" => x.sha1 = v,
+            "SHA256" => x.sha256 = v,
+            _ => {}
+        }
+        if with_type {
+            x.checksum_type = Some(checksum_type_of(c).to_string());
+        }
+        x
+    }
+}
+
+/// A multipart object's checksum type: a composite ends in "-<parts>".
+fn checksum_type_of(c: &ObjectChecksum) -> &'static str {
+    if c.value
+        .rsplit_once('-')
+        .is_some_and(|(_, n)| n.parse::<u32>().is_ok())
+    {
+        "COMPOSITE"
+    } else {
+        "FULL_OBJECT"
+    }
 }
 
 /// Response for ListParts
@@ -1670,6 +1867,18 @@ pub struct PartItem {
     pub etag: String,
     #[serde(rename = "Size")]
     pub size: u64,
+    #[serde(rename = "ChecksumCRC32", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32: Option<String>,
+    #[serde(rename = "ChecksumCRC32C", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc32c: Option<String>,
+    #[serde(rename = "ChecksumCRC64NVME", skip_serializing_if = "Option::is_none")]
+    pub checksum_crc64nvme: Option<String>,
+    #[serde(rename = "ChecksumSHA1", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha1: Option<String>,
+    #[serde(rename = "ChecksumSHA256", skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
+    #[serde(rename = "ChecksumType", skip_serializing_if = "Option::is_none")]
+    pub checksum_type: Option<String>,
 }
 
 /// Response for ListMultipartUploads
@@ -1943,6 +2152,7 @@ async fn upload_part_copy_internal(
     // GET's Range: "bytes=first-last", both given, first <= last, and within
     // the source (checked once its size is known), as S3 requires.
     let mut get_headers = copy_source_conditions(&headers);
+    get_headers.extend(copy_source_customer_headers(&headers));
     let mut copy_last: Option<u64> = None;
     if let Some(range) = headers.get("x-amz-copy-source-range") {
         let bounds = range
@@ -2000,13 +2210,23 @@ async fn upload_part_copy_internal(
         }
     };
 
+    // The upload's own SSE-C key, as an UploadPart to it carries.
+    let mut part_headers = HeaderMap::new();
+    for (name, value) in &headers {
+        if name
+            .as_str()
+            .starts_with("x-amz-server-side-encryption-customer-")
+        {
+            part_headers.insert(name.clone(), value.clone());
+        }
+    }
     let put = upload_part_internal(
         state,
         bucket,
         key,
         upload_id,
         part_number,
-        HeaderMap::new(),
+        part_headers,
         data,
     )
     .await;
@@ -2031,11 +2251,16 @@ async fn upload_part_copy_internal(
         })
         .unwrap_or_default()
     );
-    Response::builder()
+    // The part's encryption, as UploadPart reports it.
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/xml")
-        .body(Body::from(xml))
-        .unwrap()
+        .header(header::CONTENT_TYPE, "application/xml");
+    for (name, value) in put.headers() {
+        if name.as_str().starts_with("x-amz-server-side-encryption") {
+            builder = builder.header(name, value);
+        }
+    }
+    builder.body(Body::from(xml)).unwrap()
 }
 
 /// CopyObject response
@@ -2945,27 +3170,18 @@ async fn check_copy_sse(
         }
     };
 
-    let src_algo =
-        SseAlgorithm::try_from(source_meta.encryption_algorithm).unwrap_or(SseAlgorithm::SseNone);
-    if src_algo == SseAlgorithm::SseC {
-        return Err(S3Error::xml_response(
-            "NotImplemented",
-            "CopyObject for SSE-C source objects is not yet supported",
-            StatusCode::NOT_IMPLEMENTED,
-        ));
-    }
-
-    let dst_decision = resolve_sse_decision(meta_client, dest_bucket, Some(copy_headers)).await?;
-    if let Some(ref d) = dst_decision
-        && d.algorithm == SseAlgorithm::SseC
+    // An SSE-C source is read with its key, from the copy-source-*
+    // customer headers, checked as a GET checks it.
+    if let Some(refused) =
+        sse_c_read_refusal(&copy_source_customer_headers(copy_headers), &source_meta)
     {
-        return Err(S3Error::xml_response(
-            "NotImplemented",
-            "CopyObject with an SSE-C destination is not yet supported",
-            StatusCode::NOT_IMPLEMENTED,
-        ));
+        return Err(refused);
     }
-
+    // The destination's encryption headers must agree with each other.
+    if let Some(refused) = sse_header_conflict(copy_headers) {
+        return Err(refused);
+    }
+    resolve_sse_decision(meta_client, dest_bucket, Some(copy_headers)).await?;
     Ok(())
 }
 
@@ -3010,7 +3226,11 @@ async fn copy_by_reference(
     .ok()??;
     let encrypted = SseAlgorithm::try_from(source.encryption_algorithm)
         .is_ok_and(|a| a != SseAlgorithm::SseNone);
-    if source.is_delete_marker || encrypted || source.object_id.is_empty() {
+    if source.is_delete_marker
+        || encrypted
+        || source.object_id.is_empty()
+        || asks_sse_c(copy_headers)
+    {
         return None;
     }
     if resolve_sse_decision(&mut meta_client, dest_bucket, Some(copy_headers))
@@ -3313,8 +3533,11 @@ async fn copy_object_data(
     // current object to know the stripes are still held), and without
     // conditions on the source, which the read below checks.
     let source_conditions = copy_source_conditions(&copy_headers);
+    // Nor when the copy is to be encrypted with a customer key: sharing the
+    // source's stripes stored it in the clear, an SSE-C copy unencrypted.
     if source_version.is_none()
         && source_conditions.is_empty()
+        && !asks_sse_c(&copy_headers)
         && let Some(resp) = copy_by_reference(
             &state,
             &dest_bucket,
@@ -3330,12 +3553,14 @@ async fn copy_object_data(
 
     // 1. Read the source object as plaintext. The existing GET handler takes
     //    care of reconstruction + decryption.
+    let mut source_read = source_conditions;
+    source_read.extend(copy_source_customer_headers(&copy_headers));
     let get_resp = get_object_version(
         Arc::clone(&state),
         source_bucket.clone(),
         source_key.clone(),
         source_version.clone(),
-        source_conditions,
+        source_read,
     )
     .await;
     if !get_resp.status().is_success() {
@@ -4457,6 +4682,7 @@ pub async fn put_object(
             inline_data: Vec::new(),
             checksum: stored_checksum.clone(),
             tags: tags.clone(),
+            part_checksums: Vec::new(),
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -4838,6 +5064,7 @@ pub async fn put_object(
         inline_data: if inline { body.to_vec() } else { Vec::new() },
         checksum: stored_checksum,
         tags,
+        part_checksums: Vec::new(),
     };
 
     let sent = pending.disarm();
@@ -4915,6 +5142,128 @@ pub async fn get_object(
     get_object_version(state, bucket, key, None, headers).await
 }
 
+/// GetObjectAttributes (`GET ?attributes`): what `x-amz-object-attributes`
+/// names of ETag, Checksum, ObjectParts, StorageClass and ObjectSize,
+/// without the data. Parts page with `x-amz-max-parts` and
+/// `x-amz-part-number-marker`.
+async fn get_object_attributes(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    headers: &HeaderMap,
+) -> Response {
+    let nodes = match get_placement_nodes_for_object(&state, &bucket, &key).await {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let object = match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref()).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    if let Some(refused) = sse_c_read_refusal(headers, &object) {
+        return refused;
+    }
+    let wanted: Vec<String> = headers
+        .get("x-amz-object-attributes")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return S3Error::xml_response(
+            "InvalidArgument",
+            "x-amz-object-attributes must name at least one attribute",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let wants = |name: &str| wanted.iter().any(|w| w == name);
+    let number = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok())
+    };
+
+    let mut xml =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse>");
+    if wants("ETag") {
+        xml.push_str(&format!(
+            "<ETag>{}</ETag>",
+            quick_xml::escape::escape(object.etag.trim_matches('"'))
+        ));
+    }
+    let checksum_xml = |c: &ObjectChecksum| {
+        let tag = format!("Checksum{}", c.algorithm);
+        format!("<{tag}>{}</{tag}>", quick_xml::escape::escape(&c.value))
+    };
+    if wants("Checksum")
+        && let Some(c) = &object.checksum
+    {
+        xml.push_str(&format!(
+            "<Checksum>{}<ChecksumType>{}</ChecksumType></Checksum>",
+            checksum_xml(c),
+            checksum_type_of(c)
+        ));
+    }
+    if wants("ObjectParts") && is_multipart(&object) {
+        let count = part_bounds(&object, 1).map_or(0, |(_, _, c)| c);
+        let max_parts = number("x-amz-max-parts").unwrap_or(1000).max(1);
+        let marker = number("x-amz-part-number-marker").unwrap_or(0);
+        let mut parts = String::new();
+        let mut last = marker;
+        for n in ((marker + 1)..=count).take(max_parts as usize) {
+            let Ok((start, end, _)) = part_bounds(&object, n) else {
+                break;
+            };
+            let checksum = object
+                .part_checksums
+                .get((n - 1) as usize)
+                .map(checksum_xml)
+                .unwrap_or_default();
+            parts.push_str(&format!(
+                "<Part><PartNumber>{n}</PartNumber><Size>{}</Size>{checksum}</Part>",
+                end + 1 - start
+            ));
+            last = n;
+        }
+        let truncated = last < count;
+        xml.push_str(&format!(
+            "<ObjectParts><PartsCount>{count}</PartsCount>\
+             <PartNumberMarker>{marker}</PartNumberMarker>\
+             <NextPartNumberMarker>{last}</NextPartNumberMarker>\
+             <MaxParts>{max_parts}</MaxParts><IsTruncated>{truncated}</IsTruncated>\
+             {parts}</ObjectParts>"
+        ));
+    }
+    if wants("StorageClass") {
+        let class = if object.storage_class.is_empty() {
+            "STANDARD"
+        } else {
+            object.storage_class.as_str()
+        };
+        xml.push_str(&format!(
+            "<StorageClass>{}</StorageClass>",
+            quick_xml::escape::escape(class)
+        ));
+    }
+    if wants("ObjectSize") {
+        xml.push_str(&format!("<ObjectSize>{}</ObjectSize>", object.size));
+    }
+    xml.push_str("</GetObjectAttributesResponse>");
+    with_version_id(Response::builder(), &object)
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .header(
+            header::LAST_MODIFIED,
+            timestamp_to_http_date(object.modified_at),
+        )
+        .body(Body::from(xml))
+        .unwrap()
+}
+
 /// GET of one part of a multipart object (`?partNumber=`): the part's bytes,
 /// as a range of the object (206), with `x-amz-mp-parts-count`.
 async fn get_object_part(
@@ -4944,6 +5293,25 @@ async fn get_object_part(
         headers.insert(header::RANGE, v);
     }
     let mut resp = get_object_version(state, bucket, key, version_id, headers).await;
+    // The part's own checksum, not the object's, and always: a client
+    // reading parts checks each against what it uploaded.
+    if resp.status().is_success()
+        && let Some(c) = object
+            .part_checksums
+            .get((part_number as usize).wrapping_sub(1))
+        && let Some(a) = crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
+        && let Ok(v) = header::HeaderValue::from_str(&c.value)
+    {
+        let kind = object
+            .checksum
+            .as_ref()
+            .map_or("COMPOSITE", checksum_type_of);
+        resp.headers_mut().insert(a.header_name(), v);
+        resp.headers_mut().insert(
+            "x-amz-checksum-type",
+            header::HeaderValue::from_static(kind),
+        );
+    }
     if resp.status().is_success() && is_multipart(&object) {
         resp.headers_mut()
             .insert("x-amz-mp-parts-count", header::HeaderValue::from(count));
@@ -5024,6 +5392,9 @@ async fn get_object_version(
     headers: HeaderMap,
 ) -> Response {
     debug!("GET object: {}/{}", bucket, key);
+    if let Some(refused) = sse_headers_on_read(&headers) {
+        return refused;
+    }
 
     // Parse Range header if present
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
@@ -5244,6 +5615,9 @@ async fn get_object_version(
             }
         }
         SseAlgorithm::SseC => {
+            if let Some(refused) = sse_c_read_refusal(&headers, &object) {
+                return refused;
+            }
             let cust = match parse_sse_c_headers(&headers) {
                 Ok(Some(c)) => c,
                 Ok(None) => {
@@ -5981,6 +6355,10 @@ pub async fn head_object(
     if key.is_empty() {
         return head_bucket(State(state), Path(bucket)).await;
     }
+    if let Some(mut refused) = sse_headers_on_read(&headers) {
+        *refused.body_mut() = Body::empty();
+        return refused;
+    }
 
     let mut meta_client = state.meta_client.clone();
 
@@ -6019,6 +6397,11 @@ pub async fn head_object(
     )
     .await
     {
+        Ok(obj) if sse_c_read_refusal(&headers, &obj).is_some() => {
+            let mut resp = sse_c_read_refusal(&headers, &obj).unwrap_or_default();
+            *resp.body_mut() = Body::empty();
+            resp
+        }
         Ok(obj) if read_preconditions(&headers, &obj).is_some() => {
             let mut resp = read_preconditions(&headers, &obj).unwrap_or_default();
             *resp.body_mut() = Body::empty();
@@ -6517,6 +6900,30 @@ async fn bucket_versioning(
             ))
         }
     }
+}
+
+/// A copy's `x-amz-copy-source-server-side-encryption-customer-*` headers
+/// (the SSE-C source's key) as the headers a GET of the source takes.
+fn copy_source_customer_headers(copy_headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for suffix in ["algorithm", "key", "key-md5"] {
+        if let Some(v) = copy_headers.get(format!(
+            "x-amz-copy-source-server-side-encryption-customer-{suffix}"
+        )) && let Ok(name) = header::HeaderName::from_bytes(
+            format!("x-amz-server-side-encryption-customer-{suffix}").as_bytes(),
+        ) {
+            out.insert(name, v.clone());
+        }
+    }
+    out
+}
+
+/// Whether a request asks for SSE-C on what it writes.
+fn asks_sse_c(headers: &HeaderMap) -> bool {
+    headers.keys().any(|k| {
+        k.as_str()
+            .starts_with("x-amz-server-side-encryption-customer-")
+    })
 }
 
 /// A copy's `x-amz-copy-source-if-*` conditions as the GET conditions
@@ -7586,6 +7993,9 @@ async fn initiate_multipart_upload_internal(
     key: String,
     headers: &HeaderMap,
 ) -> Response {
+    if let Some(refused) = sse_header_conflict(headers) {
+        return refused;
+    }
     let mut client = state.meta_client.clone();
 
     // What the object will carry, fixed now as AWS fixes it: content type,
@@ -7614,6 +8024,63 @@ async fn initiate_multipart_upload_internal(
         if let Some(v) = headers.get(*name).and_then(|v| v.to_str().ok()) {
             user_metadata.insert(format!("{UPLOAD_LOCK_PREFIX}{name}"), v.to_string());
         }
+    }
+    // The checksum algorithm its parts are checked with, and its composite
+    // checksum made from.
+    let checksum_algorithm = match headers
+        .get("x-amz-checksum-algorithm")
+        .and_then(|v| v.to_str().ok())
+    {
+        None => None,
+        Some(name) => match crate::checksum::ChecksumAlgorithm::from_aws_name(name) {
+            Some(a) => Some(a),
+            None => {
+                return S3Error::xml_response(
+                    "InvalidRequest",
+                    &format!("Checksum algorithm {name} is not supported"),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        },
+    };
+    // COMPOSITE (a checksum of the parts' checksums) or FULL_OBJECT (the
+    // whole object's CRC, combined from the parts'): S3's default by
+    // algorithm, CRC64NVME being FULL_OBJECT only.
+    let checksum_type = match headers
+        .get("x-amz-checksum-type")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(t) if t.eq_ignore_ascii_case("COMPOSITE") || t.eq_ignore_ascii_case("FULL_OBJECT") => {
+            Some(t.to_ascii_uppercase())
+        }
+        Some(t) => {
+            return S3Error::xml_response(
+                "InvalidRequest",
+                &format!("Checksum type {t} is not supported"),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        None => checksum_algorithm.map(|a| {
+            if a == crate::checksum::ChecksumAlgorithm::Crc64Nvme {
+                "FULL_OBJECT".to_string()
+            } else {
+                "COMPOSITE".to_string()
+            }
+        }),
+    };
+    if let (Some(a), Some(t)) = (checksum_algorithm, &checksum_type) {
+        if t == "FULL_OBJECT" && !a.can_combine() {
+            return S3Error::xml_response(
+                "InvalidRequest",
+                &format!(
+                    "The FULL_OBJECT checksum type is not supported for {}",
+                    a.aws_name()
+                ),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        user_metadata.insert(UPLOAD_CHECKSUM_KEY.to_string(), a.aws_name().to_string());
+        user_metadata.insert(UPLOAD_CHECKSUM_TYPE_KEY.to_string(), t.clone());
     }
 
     // SSE-C multipart: validate the customer key at CreateMultipartUpload
@@ -7657,9 +8124,9 @@ async fn initiate_multipart_upload_internal(
                 kms_key_id: String::new(),
                 encrypted_dek: Vec::new(),
                 customer_key_md5: md5.clone(),
-                // SSE-C never uses a KMS encryption context — the customer key
-                // stands in for KMS entirely.
-                encryption_context: HashMap::new(),
+                // No KMS context for SSE-C: what identifies the customer's
+                // key, for reads of the object to check.
+                encryption_context: sse_c_verifier(&cust.key),
             })
             .await
         {
@@ -7675,7 +8142,14 @@ async fn initiate_multipart_upload_internal(
                     to_xml(&result).unwrap_or_default()
                 );
                 info!("Initiated multipart upload (SSE-C): {}/{}", bucket, key);
-                return Response::builder()
+                let mut builder = Response::builder();
+                if let Some(a) = checksum_algorithm {
+                    builder = builder.header("x-amz-checksum-algorithm", a.aws_name());
+                }
+                if let Some(t) = &checksum_type {
+                    builder = builder.header("x-amz-checksum-type", t);
+                }
+                return builder
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/xml")
                     .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
@@ -7820,6 +8294,12 @@ async fn initiate_multipart_upload_internal(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/xml");
+            if let Some(a) = checksum_algorithm {
+                builder = builder.header("x-amz-checksum-algorithm", a.aws_name());
+            }
+            if let Some(t) = &checksum_type {
+                builder = builder.header("x-amz-checksum-type", t);
+            }
             if let Some(v) = sse_response_header {
                 builder = builder.header("x-amz-server-side-encryption", v);
                 if v == "aws:kms" && !response_kms_key_id.is_empty() {
@@ -7956,6 +8436,7 @@ async fn upload_part_internal(
     // SSE-C the client must resupply their customer key on every part and we
     // validate against the stored MD5. If encryption is on, we unwrap the DEK
     // once and generate a fresh IV per stripe below.
+    let declared_checksum: Option<String>;
     let (mpu_dek, sse_response_header, sse_kms_key_id, sse_c_key_md5_for_resp) = match meta_client
         .get_multipart_upload(GetMultipartUploadRequest {
             bucket: bucket.clone(),
@@ -7973,6 +8454,7 @@ async fn upload_part_internal(
                     StatusCode::NOT_FOUND,
                 );
             }
+            declared_checksum = mpu.user_metadata.get(UPLOAD_CHECKSUM_KEY).cloned();
             let algo =
                 SseAlgorithm::try_from(mpu.encryption_algorithm).unwrap_or(SseAlgorithm::SseNone);
             match algo {
@@ -8057,6 +8539,24 @@ async fn upload_part_internal(
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
         }
+    };
+
+    // The part's checksum, kept for the object's composite: the one the
+    // request sent (verified above), else computed with the algorithm the
+    // upload declared. Over the plaintext, as the client sees the part.
+    let part_checksum = match (&checksums.flexible, declared_checksum.as_deref()) {
+        (Some(c), _) => Some(ObjectChecksum {
+            algorithm: c.algorithm.aws_name().to_string(),
+            value: c.value_b64(),
+        }),
+        (None, Some(name)) => crate::checksum::ChecksumAlgorithm::from_aws_name(name).map(|a| {
+            use base64::Engine;
+            ObjectChecksum {
+                algorithm: a.aws_name().to_string(),
+                value: base64::engine::general_purpose::STANDARD.encode(a.compute(&body)),
+            }
+        }),
+        (None, None) => None,
     };
 
     // Get placement for this part (using a unique key for the part)
@@ -8425,6 +8925,7 @@ async fn upload_part_internal(
             etag: etag.clone(),
             size: part_size,
             stripes: all_stripes, // Multiple stripes for large parts
+            checksum: part_checksum.clone(),
         })
         .await;
     let what = format!("{bucket}/{key} upload {upload_id} part {part_number}");
@@ -8446,8 +8947,10 @@ async fn upload_part_internal(
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("ETag", &etag);
-            if let Some(c) = &checksums.flexible {
-                builder = builder.header(c.algorithm.header_name(), c.value_b64());
+            if let Some(c) = &part_checksum
+                && let Some(a) = crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
+            {
+                builder = builder.header(a.header_name(), &c.value);
             }
             if let Some(v) = sse_response_header {
                 builder = builder.header("x-amz-server-side-encryption", v);
@@ -8507,6 +9010,32 @@ async fn complete_multipart_upload_internal(
     body: Bytes,
     headers: &HeaderMap,
 ) -> Response {
+    // An SSE-C upload completes only with its key, as each part was sent:
+    // checked against the key the upload was started with.
+    if let Ok(resp) = state
+        .meta_client
+        .clone()
+        .get_multipart_upload(GetMultipartUploadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+        })
+        .await
+    {
+        let mpu = resp.into_inner();
+        if mpu.found && mpu.encryption_algorithm == SseAlgorithm::SseC as i32 {
+            let refused = match parse_sse_c_headers(headers) {
+                Ok(Some(cust)) if cust.md5_b64 == mpu.customer_key_md5 => None,
+                Ok(Some(_)) => Some("The customer key is not the one the upload was started with"),
+                Ok(None) => Some("This upload is SSE-C: the customer key must be provided"),
+                Err(resp) => return resp,
+            };
+            if let Some(msg) = refused {
+                return S3Error::xml_response("InvalidRequest", msg, StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
     // If-Match / If-None-Match: refused now, while the upload still exists
     // for the client to retry. The commit decides for good.
     let condition = PutCondition::from_headers(headers);
@@ -8562,6 +9091,54 @@ async fn complete_multipart_upload_internal(
 
     let part_etags: Vec<String> = parts.iter().map(|p| p.etag.clone()).collect();
 
+    // The composite checksum (each part's checksum, checksummed, "-N"),
+    // and the request's own, checked now while the upload still exists.
+    let numbers: Vec<u32> = parts.iter().map(|p| p.part_number).collect();
+    let (composite, part_checksums) =
+        match composite_checksum(&state, &bucket, &key, &upload_id, &numbers).await {
+            Some((c, parts)) => (Some(c), parts),
+            None => (None, Vec::new()),
+        };
+    if let Some(asked) = crate::checksum::ChecksumAlgorithm::all()
+        .into_iter()
+        .find_map(|a| {
+            headers
+                .get(a.header_name())
+                .and_then(|v| v.to_str().ok())
+                .map(|v| (a, v.to_string()))
+        })
+    {
+        // The upload already completed (a retry): nothing to compute from;
+        // the completed object answers below.
+        let gone = composite.is_none()
+            && state
+                .meta_client
+                .clone()
+                .get_multipart_upload(GetMultipartUploadRequest {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                })
+                .await
+                .is_ok_and(|r| !r.into_inner().found);
+        let matches = gone
+            || composite.as_ref().is_some_and(|c| {
+                c.algorithm == asked.0.aws_name()
+                    && (asked.1 == c.value
+                        || c.value.split_once('-').is_some_and(|(b, _)| b == asked.1))
+            });
+        if !matches {
+            return S3Error::xml_response(
+                "BadDigest",
+                &format!(
+                    "The {} you specified did not match the calculated checksum.",
+                    asked.0.aws_name()
+                ),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+    }
+
     // Complete the multipart upload via metadata service
     match meta_client
         .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
@@ -8586,6 +9163,10 @@ async fn complete_multipart_upload_internal(
                 if let Some(t) = object.user_metadata.remove(UPLOAD_TAGS_KEY) {
                     object.tags = parse_tagging(&t).unwrap_or_default();
                 }
+                // What the upload kept for its parts' checksums, not the
+                // object's metadata.
+                object.user_metadata.remove(UPLOAD_CHECKSUM_KEY);
+                object.user_metadata.remove(UPLOAD_CHECKSUM_TYPE_KEY);
                 // Log multipart assembly details
                 let stripe_sizes: Vec<u64> = object.stripes.iter().map(|s| s.data_size).collect();
                 let stripe_total: u64 = stripe_sizes.iter().sum();
@@ -8666,6 +9247,10 @@ async fn complete_multipart_upload_internal(
                         "{bucket}/{key}: cannot read the bucket's object lock; stored without one"
                     );
                 }
+                if let Some(c) = &composite {
+                    object.checksum = Some(c.clone());
+                    object.part_checksums = part_checksums;
+                }
                 // Listed with its ObjectMeta, as a single-part PUT is. On
                 // failure the parts belong to nothing: meta has already
                 // dropped the upload, and commit_put frees them.
@@ -8682,11 +9267,18 @@ async fn complete_multipart_upload_internal(
                     return resp;
                 }
 
+                let cx = ChecksumXml::of(object.checksum.as_ref(), true);
                 let result = CompleteMultipartUploadResult {
                     location: format!("/{}/{}", bucket, key),
                     bucket: bucket.clone(),
                     key: key.clone(),
                     etag: object.etag.clone(),
+                    checksum_crc32: cx.crc32,
+                    checksum_crc32c: cx.crc32c,
+                    checksum_crc64nvme: cx.crc64nvme,
+                    checksum_sha1: cx.sha1,
+                    checksum_sha256: cx.sha256,
+                    checksum_type: cx.checksum_type,
                 };
 
                 let xml = format!(
@@ -8703,6 +9295,13 @@ async fn complete_multipart_upload_internal(
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/xml")
                     .header("ETag", &object.etag);
+                if let Some(c) = &composite
+                    && let Some(a) = crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
+                {
+                    builder = builder
+                        .header(a.header_name(), &c.value)
+                        .header("x-amz-checksum-type", checksum_type_of(c));
+                }
                 let sse_algo = SseAlgorithm::try_from(object.encryption_algorithm)
                     .unwrap_or(SseAlgorithm::SseNone);
                 match sse_algo {
@@ -8718,7 +9317,18 @@ async fn complete_multipart_upload_internal(
                             );
                         }
                     }
-                    SseAlgorithm::SseNone | SseAlgorithm::SseC => {}
+                    // SSE-C: the key it was completed with (checked above).
+                    SseAlgorithm::SseC => {
+                        if let Some(md5) = headers
+                            .get("x-amz-server-side-encryption-customer-key-md5")
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            builder = builder
+                                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+                                .header("x-amz-server-side-encryption-customer-key-md5", md5);
+                        }
+                    }
+                    SseAlgorithm::SseNone => {}
                 }
                 builder.body(Body::from(xml)).unwrap()
             } else {
@@ -8760,6 +9370,86 @@ async fn complete_multipart_upload_internal(
     }
 }
 
+/// The composite checksum of an object made of `numbers`' parts, when they
+/// all have one, of one algorithm: that algorithm over their checksums
+/// end to end, base64, then "-" and how many.
+async fn composite_checksum(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    numbers: &[u32],
+) -> Option<(ObjectChecksum, Vec<ObjectChecksum>)> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let listed = state
+        .meta_client
+        .clone()
+        .list_parts(ListPartsRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_number_marker: 0,
+            max_parts: 10_000,
+        })
+        .await
+        .ok()?
+        .into_inner()
+        .parts;
+    let by_number: HashMap<u32, (&ObjectChecksum, u64)> = listed
+        .iter()
+        .filter_map(|p| p.checksum.as_ref().map(|c| (p.part_number, (c, p.size))))
+        .collect();
+    let full_object = state
+        .meta_client
+        .clone()
+        .get_multipart_upload(GetMultipartUploadRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+        })
+        .await
+        .ok()
+        .and_then(|r| {
+            r.into_inner()
+                .user_metadata
+                .get(UPLOAD_CHECKSUM_TYPE_KEY)
+                .cloned()
+        })
+        .is_some_and(|t| t == "FULL_OBJECT");
+    let mut algorithm: Option<&str> = None;
+    let mut joined = Vec::new();
+    let mut raw = Vec::with_capacity(numbers.len());
+    let mut each = Vec::with_capacity(numbers.len());
+    for n in numbers {
+        let (c, size) = by_number.get(n)?;
+        if *algorithm.get_or_insert(&c.algorithm) != c.algorithm {
+            return None;
+        }
+        let value = b64.decode(&c.value).ok()?;
+        joined.extend(&value);
+        raw.push((value, *size));
+        each.push((*c).clone());
+    }
+    let algorithm = crate::checksum::ChecksumAlgorithm::from_aws_name(algorithm?)?;
+    let value = if full_object {
+        b64.encode(algorithm.combine(&raw)?)
+    } else {
+        format!(
+            "{}-{}",
+            b64.encode(algorithm.compute(&joined)),
+            numbers.len()
+        )
+    };
+    Some((
+        ObjectChecksum {
+            algorithm: algorithm.aws_name().to_string(),
+            value,
+        },
+        each,
+    ))
+}
+
 /// The ETag S3 gives an object made of parts with these ETags: the MD5 of
 /// their MD5s, then "-" and how many.
 fn multipart_etag(part_etags: &[String]) -> Option<String> {
@@ -8792,11 +9482,18 @@ async fn already_completed(
     if current.is_delete_marker || current.etag.trim_matches('"') != want.trim_matches('"') {
         return None;
     }
+    let cx = ChecksumXml::of(current.checksum.as_ref(), true);
     let result = CompleteMultipartUploadResult {
         location: format!("/{bucket}/{key}"),
         bucket: bucket.to_string(),
         key: key.to_string(),
         etag: current.etag.clone(),
+        checksum_crc32: cx.crc32,
+        checksum_crc32c: cx.crc32c,
+        checksum_crc64nvme: cx.crc64nvme,
+        checksum_sha1: cx.sha1,
+        checksum_sha256: cx.sha256,
+        checksum_type: cx.checksum_type,
     };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
@@ -8868,6 +9565,9 @@ pub async fn get_object_with_params(
 
     // Otherwise, it's a regular GET object
     let _ = auth;
+    if params.attributes.is_some() {
+        return get_object_attributes(state, bucket, key, params.version_id, &headers).await;
+    }
     if let Some(n) = params.part_number {
         return get_object_part(state, bucket, key, params.version_id, n, headers).await;
     }
@@ -8913,11 +9613,20 @@ async fn list_parts_internal(
                 parts: resp
                     .parts
                     .into_iter()
-                    .map(|p| PartItem {
-                        part_number: p.part_number,
-                        last_modified: timestamp_to_iso(p.last_modified),
-                        etag: p.etag,
-                        size: p.size,
+                    .map(|p| {
+                        let cx = ChecksumXml::of(p.checksum.as_ref(), false);
+                        PartItem {
+                            part_number: p.part_number,
+                            last_modified: timestamp_to_iso(p.last_modified),
+                            etag: p.etag,
+                            size: p.size,
+                            checksum_crc32: cx.crc32,
+                            checksum_crc32c: cx.crc32c,
+                            checksum_crc64nvme: cx.crc64nvme,
+                            checksum_sha1: cx.sha1,
+                            checksum_sha256: cx.sha256,
+                            checksum_type: cx.checksum_type,
+                        }
                     })
                     .collect(),
             };
@@ -12224,5 +12933,38 @@ mod write_quorum_tests {
     fn without_parity_every_shard_is_needed() {
         assert_eq!(write_quorum(1, 0), 1);
         assert_eq!(write_quorum(4, 0), 4);
+    }
+
+    #[test]
+    fn a_completion_answer_carries_its_checksum() {
+        use super::*;
+        let cx = ChecksumXml::of(
+            Some(&ObjectChecksum {
+                algorithm: "SHA256".into(),
+                value: "abc=-2".into(),
+            }),
+            true,
+        );
+        let r = CompleteMultipartUploadResult {
+            location: "l".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            etag: "e".into(),
+            checksum_crc32: cx.crc32,
+            checksum_crc32c: cx.crc32c,
+            checksum_crc64nvme: cx.crc64nvme,
+            checksum_sha1: cx.sha1,
+            checksum_sha256: cx.sha256,
+            checksum_type: cx.checksum_type,
+        };
+        let xml = to_xml(&r).expect("a CompleteMultipartUpload answer serializes");
+        assert!(
+            xml.contains("<ChecksumSHA256>abc=-2</ChecksumSHA256>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "{xml}"
+        );
     }
 }

@@ -39,6 +39,12 @@ impl ChecksumAlgorithm {
         Self::Sha256,
     ];
 
+    /// Every algorithm S3 has.
+    #[must_use]
+    pub const fn all() -> [Self; 5] {
+        Self::ALL
+    }
+
     /// The name S3 uses for it: `x-amz-sdk-checksum-algorithm` values and
     /// error messages.
     #[must_use]
@@ -85,6 +91,93 @@ impl ChecksumAlgorithm {
         Self::ALL
             .into_iter()
             .find(|a| a.header_name().eq_ignore_ascii_case(name))
+    }
+
+    /// For a CRC, its reflected polynomial: what combining two CRCs needs.
+    const fn crc_poly(self) -> Option<u64> {
+        match self {
+            Self::Crc32 => Some(0xEDB8_8320),
+            Self::Crc32c => Some(0x82F6_3B78),
+            Self::Crc64Nvme => Some(0x9A6C_9329_AC4B_C9B5),
+            Self::Sha1 | Self::Sha256 => None,
+        }
+    }
+
+    /// Whether S3 can give a multipart object of this algorithm a checksum
+    /// of the whole object (`FULL_OBJECT`), made from its parts' checksums.
+    #[must_use]
+    pub const fn can_combine(self) -> bool {
+        self.crc_poly().is_some()
+    }
+
+    /// The CRC of a whole object from its parts' CRCs (big-endian bytes)
+    /// and lengths, without the data: zlib's `crc32_combine`, in GF(2), for
+    /// any of the three reflected CRCs. None for a hash, or bad input.
+    #[must_use]
+    pub fn combine(self, parts: &[(Vec<u8>, u64)]) -> Option<Vec<u8>> {
+        let poly = self.crc_poly()?;
+        let width = self.len() * 8;
+        let value = |b: &[u8]| -> Option<u64> {
+            (b.len() == self.len()).then(|| b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)))
+        };
+        let times = |mat: &[u64], mut vec: u64| {
+            let mut sum = 0u64;
+            let mut i = 0;
+            while vec != 0 {
+                if vec & 1 == 1 {
+                    sum ^= mat[i];
+                }
+                vec >>= 1;
+                i += 1;
+            }
+            sum
+        };
+        let square = |out: &mut [u64], mat: &[u64]| {
+            for n in 0..width {
+                out[n] = times(mat, mat[n]);
+            }
+        };
+        let combine2 = |mut crc1: u64, crc2: u64, mut len2: u64| {
+            if len2 == 0 {
+                return crc1;
+            }
+            let mut even = vec![0u64; width];
+            let mut odd = vec![0u64; width];
+            odd[0] = poly;
+            let mut row = 1u64;
+            for slot in odd.iter_mut().skip(1) {
+                *slot = row;
+                row <<= 1;
+            }
+            square(&mut even, &odd); // two zero bits
+            square(&mut odd, &even); // four
+            loop {
+                square(&mut even, &odd); // one zero byte, then doubling
+                if len2 & 1 == 1 {
+                    crc1 = times(&even, crc1);
+                }
+                len2 >>= 1;
+                if len2 == 0 {
+                    break;
+                }
+                square(&mut odd, &even);
+                if len2 & 1 == 1 {
+                    crc1 = times(&odd, crc1);
+                }
+                len2 >>= 1;
+                if len2 == 0 {
+                    break;
+                }
+            }
+            crc1 ^ crc2
+        };
+        let mut iter = parts.iter();
+        let (first, _) = iter.next()?;
+        let mut acc = value(first)?;
+        for (crc, len) in iter {
+            acc = combine2(acc, value(crc)?, *len);
+        }
+        Some(acc.to_be_bytes()[8 - self.len()..].to_vec())
     }
 
     /// The checksum of `data`, big-endian for the CRCs — the bytes whose
@@ -205,6 +298,7 @@ impl RequestChecksums {
                 .ok()
                 .and_then(|s| B64.decode(s.trim()).ok())
                 .filter(|d| d.len() == algorithm.len())
+                // AWS's answer (Ceph RGW says BadDigest instead).
                 .ok_or_else(|| {
                     ChecksumError::InvalidRequest(format!(
                         "Value for {} header is invalid.",
@@ -422,5 +516,25 @@ mod tests {
             c.verify(b"hello world"),
             Err(ChecksumError::BadChecksum(ChecksumAlgorithm::Crc32c))
         );
+    }
+
+    /// A whole object's CRC from its parts' CRCs is the CRC of the whole.
+    #[test]
+    fn combined_crcs_are_the_crc_of_the_whole() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let (a, rest) = data.split_at(70_001);
+        let (b, c) = rest.split_at(100_000);
+        for algo in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+        ] {
+            let parts: Vec<(Vec<u8>, u64)> = [a, b, c]
+                .iter()
+                .map(|p| (algo.compute(p), p.len() as u64))
+                .collect();
+            assert_eq!(algo.combine(&parts), Some(algo.compute(&data)), "{algo:?}");
+        }
+        assert_eq!(ChecksumAlgorithm::Sha256.combine(&[(vec![0; 32], 1)]), None);
     }
 }

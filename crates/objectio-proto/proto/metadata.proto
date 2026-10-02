@@ -359,6 +359,10 @@ message ObjectMeta {
     // Object tags (S3 object tagging): at most 10, set by PutObjectTagging,
     // `x-amz-tagging` on PUT / CreateMultipartUpload, or copied by CopyObject.
     map<string, string> tags = 24;
+
+    // A multipart object's parts' checksums, in order (GetObjectAttributes
+    // lists them); `checksum` is then their composite.
+    repeated ObjectChecksum part_checksums = 25;
 }
 
 // A full-object checksum, as S3 reports it.
@@ -772,6 +776,9 @@ message RegisterPartRequest {
     string etag = 5;
     uint64 size = 6;
     repeated StripeMeta stripes = 7;  // EC stripes info for this part (multiple for large parts)
+    // The part's flexible checksum (x-amz-checksum-*), checked against its
+    // body; the object's composite checksum is made of these.
+    ObjectChecksum checksum = 8;
 }
 
 message RegisterPartResponse {
@@ -807,6 +814,7 @@ message PartMeta {
     uint64 size = 3;
     uint64 last_modified = 4;
     repeated StripeMeta stripes = 5;  // EC stripes info (multiple for large parts)
+    ObjectChecksum checksum = 6;
 }
 
 // Bucket policy operations

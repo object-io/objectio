@@ -2383,8 +2383,10 @@ dependencies = [
 name = "objectio-e2e"
 version = "0.4.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "hmac",
+ "md-5",
  "objectio-common",
  "objectio-proto",
  "reqwest",
