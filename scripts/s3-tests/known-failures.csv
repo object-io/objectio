@@ -1,0 +1,305 @@
+test_id,category,note
+test_headers::test_bucket_create_bad_authorization_empty,test-environment,botocore signs/re-adds the header after the test removes it (fails_on_rgw)
+test_headers::test_bucket_create_bad_authorization_invalid_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_authorization_none,test-environment,botocore signs/re-adds the header after the test removes it (fails_on_rgw)
+test_headers::test_bucket_create_bad_date_after_today_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_date_before_epoch_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_date_before_today_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_date_empty_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_date_invalid_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_date_none_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_ua_empty_aws2,not-implemented-by-design,SigV2
+test_headers::test_bucket_create_bad_ua_none_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_acl_create_contentlength_none,not-implemented-by-design,ACLs beyond canned private
+test_headers::test_object_create_bad_authorization_empty,test-environment,botocore signs/re-adds the header after the test removes it (fails_on_rgw)
+test_headers::test_object_create_bad_authorization_incorrect_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_authorization_invalid_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_authorization_none,test-environment,botocore signs/re-adds the header after the test removes it (fails_on_rgw)
+test_headers::test_object_create_bad_contentlength_mismatch_below_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_contentlength_none,test-environment,botocore signs/re-adds the header after the test removes it (fails_on_rgw)
+test_headers::test_object_create_bad_date_after_end_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_date_before_epoch_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_date_before_today_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_date_empty_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_date_invalid_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_date_none_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_md5_invalid_garbage_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_ua_empty_aws2,not-implemented-by-design,SigV2
+test_headers::test_object_create_bad_ua_none_aws2,not-implemented-by-design,SigV2
+test_iam::test_allow_bucket_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_allow_multipart_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_allow_object_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_allow_tagging_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_delete_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_delete_user_policy_from_multiple_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_delete_user_policy_invalid_policy_name,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_delete_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_deny_bucket_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_deny_multipart_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_deny_object_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_deny_tagging_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_get_deleted_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_get_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_get_user_policy_from_multiple_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_get_user_policy_invalid_policy_name,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_get_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_list_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_list_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_put_existing_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_put_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_put_user_policy_invalid_element,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_put_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_put_user_policy_parameter_limit,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_verify_allow_iam_actions,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_verify_conflicting_user_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_verify_conflicting_user_policy_statements,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_s3::test_100_continue,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_private_object_publicread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_private_object_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_private_objectv2_publicread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_private_objectv2_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicread_object_private,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicread_object_publicread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicread_object_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicreadwrite_object_private,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicreadwrite_object_publicread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_access_bucket_publicreadwrite_object_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_account_usage,not-implemented-by-design,RGW usage extension
+test_s3::test_block_public_object_canned_acls,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_block_public_put_bucket_acls,not-implemented-by-design,public PutBucketAcl refused as ACLs-disabled (400) rather than by BlockPublicAcls (403)
+test_s3::test_bucket_acl_canned,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_canned_authenticatedread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_canned_during_create,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_canned_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_default,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3::test_bucket_acl_grant_email,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_email_not_exist,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_nonexist_user,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_userid_fullcontrol,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_userid_read,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_userid_readacp,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_userid_write,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_grant_userid_writeacp,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_acl_revoke_all,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_concurrent_set_canned_acl,not-implemented-by-design,PutBucketAcl public-read refused (ACLs disabled)
+test_s3::test_bucket_create_delete_bucket_ownership,not-implemented-by-design,ownership controls cannot be removed (always Enforced)
+test_s3::test_bucket_get_location,aws-compatible-already,us-east-1 returns null LocationConstraint as AWS does; RGW echoes api_name
+test_s3::test_bucket_head_extended,not-implemented-by-design,RGW x-rgw-object-count header
+test_s3::test_bucket_header_acl_grants,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_list_objects_anonymous,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_list_prefix_unreadable,aws-compatible-already,ListObjects v1 with encoding-type=url percent-encodes Prefix as AWS documents; botocore does not decode v1 Prefix (RGW sends it raw)
+test_s3::test_bucket_list_return_data_versioning,gap,ListObjectVersions entries carry no Owner element
+test_s3::test_bucket_list_unordered,not-implemented-by-design,RGW allow-unordered listing extension
+test_s3::test_bucket_listv2_objects_anonymous,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_listv2_unordered,not-implemented-by-design,RGW allow-unordered listing extension
+test_s3::test_bucket_logging_bucket_acl_required,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_bucket_auth_type,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_copy_objects,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_copy_objects_bucket,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_copy_objects_bucket_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_copy_objects_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_delete_objects,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_delete_objects_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_get_objects,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_get_objects_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_head_objects,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_head_objects_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_mpu_copy,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_mpu_copy_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_mpu_s,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_mpu_versioned_s,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_mtime,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_multi_delete,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_multi_delete_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_multiple_prefixes,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_object_acl_required,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_owner,not-implemented-by-design,"bucket logging (also: policy without Resource rejected, as AWS)"
+test_s3::test_bucket_logging_partitioned_key,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_permission_change_s,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_put_concurrency,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_put_objects,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_put_objects_versioned,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_request_id,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_requester_assumed_role,not-implemented-by-design,bucket logging + IAM CreateRole
+test_s3::test_bucket_logging_simple_key,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_single_prefix,not-implemented-by-design,bucket logging
+test_s3::test_bucket_policy_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_policy_different_tenant,not-implemented-by-design,RGW tenant:bucket naming
+test_s3::test_bucket_policy_put_obj_copy_source,aws-compatible-already,"BucketOwnerEnforced: copied object belongs to bucket owner, alt has no GetObject"
+test_s3::test_bucket_policy_put_obj_copy_source_meta,aws-compatible-already,"BucketOwnerEnforced: copied object belongs to bucket owner, alt has no GetObject"
+test_s3::test_bucket_policy_put_obj_grant,not-implemented-by-design,x-amz-grant-* ACL headers
+test_s3::test_bucket_policy_put_obj_request_obj_tag,test-environment,"test adds x-amz-tagging to the main client, not alt (fails_on_rgw)"
+test_s3::test_bucket_policy_set_condition_operator_end_with_IfExists,aws-compatible-already,"requester is bucket owner, so an Allow-only policy cannot deny (fails_on_rgw)"
+test_s3::test_bucket_policy_tenanted_bucket,not-implemented-by-design,RGW tenant:bucket naming
+test_s3::test_bucket_recreate_new_acl,not-implemented-by-design,CreateBucket with ACL public-read refused (400) before the exists check (409)
+test_s3::test_bucket_recreate_overwrite_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucketv2_policy_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_header_option,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_origin_response,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_origin_wildcard,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_get_object,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_get_object_tenant,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_get_object_tenant_v2,not-implemented-by-design,SigV2 presigned URLs
+test_s3::test_cors_presigned_get_object_v2,not-implemented-by-design,SigV2 presigned URLs
+test_s3::test_cors_presigned_put_object,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_put_object_tenant,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_put_object_tenant_v2,not-implemented-by-design,SigV2 presigned URLs
+test_s3::test_cors_presigned_put_object_tenant_with_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_cors_presigned_put_object_v2,not-implemented-by-design,SigV2 presigned URLs
+test_s3::test_cors_presigned_put_object_with_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_create_bucket_bucket_owner_enforced,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3::test_create_bucket_bucket_owner_preferred,not-implemented-by-design,ACLs are off: only BucketOwnerEnforced ownership (refused at CreateBucket since #94)
+test_s3::test_create_bucket_no_ownership_controls,aws-compatible-already,"ownership is always BucketOwnerEnforced, the AWS default since 2023 (fails_on_aws)"
+test_s3::test_create_bucket_object_writer,not-implemented-by-design,ACLs are off: only BucketOwnerEnforced ownership (refused at CreateBucket since #94)
+test_s3::test_encryption_sse_c_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_expected_bucket_owner,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_get_authpublic_acl_bucket_policy_status,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_get_bucket_policy_status,aws-compatible-already,"no policy -> NoSuchBucketPolicy, as AWS"
+test_s3::test_get_nonpublicpolicy_acl_bucket_policy_status,aws-compatible-already,"first call on bucket without policy -> NoSuchBucketPolicy, as AWS"
+test_s3::test_get_object_torrent,not-implemented-by-design,torrent
+test_s3::test_get_public_acl_bucket_policy_status,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_get_publicpolicy_acl_bucket_policy_status,aws-compatible-already,"first call on bucket without policy -> NoSuchBucketPolicy, as AWS"
+test_s3::test_head_bucket_usage,not-implemented-by-design,RGW X-RGW-* usage headers
+test_s3::test_head_object_404_with_policy_prefix,aws-compatible-already,alt has no s3:GetObject; 403 as AWS; RGW maps s3:prefix ListBucket to 404
+test_s3::test_ignore_public_acls,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_lifecycle_expiration_header_head,gap,no x-amz-expiration response header
+test_s3::test_lifecycle_expiration_header_put,gap,no x-amz-expiration response header
+test_s3::test_lifecycle_expiration_header_tags_head,gap,no x-amz-expiration response header
+test_s3::test_lifecycle_expiration_noncur_tags1,aws-compatible-already,"Prefix+Tag without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_lifecycle_expiration_size_gt,aws-compatible-already,"several filter conditions without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_lifecycle_expiration_size_lt,aws-compatible-already,"several filter conditions without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_lifecycle_expiration_tags1,aws-compatible-already,"Prefix+Tag without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_lifecycle_expiration_tags2,aws-compatible-already,"Prefix+Tag without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_lifecycle_expiration_versioned_tags2,aws-compatible-already,"Prefix+Tag without <And> rejected, as AWS (fails_on_aws)"
+test_s3::test_list_buckets_anonymous,aws-compatible-already,anonymous ListBuckets is 403 as on AWS (test is fails_on_aws)
+test_s3::test_list_buckets_paginated,test-environment,assumes main user owns no buckets; a bucket (testbuck2) left by another test exists
+test_s3::test_list_multipart_upload_owner,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_multipart_resend_first_finishes_last,aws-compatible-already,completes with part 1 listed twice; AWS rejects too (InvalidPartOrder); ObjectIO says EntityTooSmall
+test_s3::test_object_acl,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3::test_object_acl_canned,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_canned_authenticatedread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_canned_bucketownerfullcontrol,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_canned_bucketownerread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_canned_during_create,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_canned_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_default,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3::test_object_acl_full_control_verify_attributes,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_full_control_verify_owner,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_read,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_readacp,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_write,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_acl_writeacp,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_anon_put_write_access,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_checksum_crc64nvme,aws-compatible-already,malformed checksum value 'bad' -> InvalidRequest as AWS; RGW says BadDigest
+test_s3::test_object_checksum_sha256,aws-compatible-already,malformed checksum value 'bad' -> InvalidRequest as AWS; RGW says BadDigest
+test_s3::test_object_copy_canned_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_copy_not_owned_object_bucket,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_delete_key_bucket_gone,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_header_acl_grants,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_authenticated,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_authenticated_bucket_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_authenticated_bucket_gone,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_authenticated_object_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_authenticated_object_gone,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_bucket_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_bucket_gone,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_object_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_object_gone,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_x_amz_expires_not_expired,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_x_amz_expires_not_expired_tenant,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_x_amz_expires_out_max_range,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_x_amz_expires_out_positive_range,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_raw_get_x_amz_expires_out_range_zero,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_object_read_unreadable,aws-compatible-already,non-ASCII key read returns 404 NoSuchKey; RGW-specific 400 expected
+test_s3::test_object_set_get_unicode_metadata,aws-compatible-already,non-ASCII metadata returned RFC 2047 encoded as S3 does (fails_on_rgw)
+test_s3::test_post_object_anonymous_request,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_authenticated_no_content_type,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_authenticated_request_bad_access_key,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_case_insensitive_condition_fields,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_escaped_field_values,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_expired_policy,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_ignored_header,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_invalid_access_key,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_invalid_request_field_value,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_invalid_signature,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_missing_policy_condition,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_request_missing_policy_specified_field,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_set_invalid_success_code,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_set_key_from_filename,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_set_success_code,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_success_redirect_action,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_tags_anonymous_request,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_post_object_tags_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_upload_checksum,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_upload_larger_than_chunk,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_upload_size_rgw_chunk_size_bug,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_user_specified_header,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_post_object_wrong_bucket,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_put_bucket_acl_grant_group_read,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_put_bucket_logging,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_account_s,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_errors,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_permissions,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_policy_wildcard,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_policy_wildcard_objects,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_tenant_s,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_ownership_bucket_owner_enforced,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_put_bucket_ownership_bucket_owner_preferred,not-implemented-by-design,only BucketOwnerEnforced (ACLs disabled)
+test_s3::test_put_bucket_ownership_object_writer,not-implemented-by-design,only BucketOwnerEnforced (ACLs disabled)
+test_s3::test_rm_bucket_logging,not-implemented-by-design,bucket logging
+test_s3::test_sse_kms_default_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_sse_kms_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_sse_s3_default_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
+test_s3::test_versioned_object_acl,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3::test_versioned_object_acl_no_version_specified,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
+test_s3control::test_account_public_access_block,test-environment,needs <account>.host virtual-host DNS; S3 Control API not implemented
+test_s3select::test_alias_cyclic_refernce,not-implemented-by-design,S3 Select
+test_s3select::test_column_sum_min_max,not-implemented-by-design,S3 Select
+test_s3select::test_count_json_operation,not-implemented-by-design,S3 Select
+test_s3select::test_count_operation,not-implemented-by-design,S3 Select
+test_s3select::test_csv_definition,not-implemented-by-design,S3 Select
+test_s3select::test_generate_projection,not-implemented-by-design,S3 Select
+test_s3select::test_generate_where_clause,not-implemented-by-design,S3 Select
+test_s3select::test_json_column_sum_min_max,not-implemented-by-design,S3 Select
+test_s3select::test_json_nullif_expressions,not-implemented-by-design,S3 Select
+test_s3select::test_lowerupper_expressions,not-implemented-by-design,S3 Select
+test_s3select::test_progress_expressions,not-implemented-by-design,S3 Select
+test_s3select::test_schema_definition,not-implemented-by-design,S3 Select
+test_sts::test_assume_role_allow,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_assume_role_allow_head_nonexistent,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_assume_role_creds_expiry,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_assume_role_deny,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_assume_role_deny_head_nonexistent,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_assume_role_with_web_identity,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_for_all_values,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_for_all_values_deny,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_resource_tag,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_resource_tag_copy_obj,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_resource_tag_deny,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_resource_tag_princ_tag,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_role_resource_tag,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_tag_keys_role_policy,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_tag_keys_trust_policy,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_with_azp,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_with_principal_tag,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_with_request_tag,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_with_sub,test-environment,no [webidentity] section / IdP configured
+test_sts::test_assume_role_with_web_identity_wrong_resource_tag_deny,test-environment,no [webidentity] section / IdP configured
+test_sts::test_get_caller_identity_after_assume_role,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_get_caller_identity_non_root_user,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_get_caller_identity_root,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_get_session_token,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sts::test_session_policy_bucket_policy_deny,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_bucket_policy_role_arn,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_bucket_policy_session_arn,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_different_op_permissions,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_on_different_buckets,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_on_same_bucket,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_put_obj_denial,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_with_deny_effect,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_check_with_deny_on_same_op,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_copy_object,test-environment,no [webidentity] section / IdP configured
+test_sts::test_session_policy_no_bucket_role_policy,test-environment,no [webidentity] section / IdP configured
+test_sts::test_swapping_role_policy_and_session_policy,test-environment,no [webidentity] section / IdP configured
