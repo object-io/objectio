@@ -12138,7 +12138,9 @@ mod multipart_reclaim_tests {
             }))
             .await;
         assert_eq!(
-            abort.map(|r| r.into_inner().stripes.len()).map_err(|e| e.code()),
+            abort
+                .map(|r| r.into_inner().stripes.len())
+                .map_err(|e| e.code()),
             Err(tonic::Code::NotFound),
             "abort of a completed upload"
         );
