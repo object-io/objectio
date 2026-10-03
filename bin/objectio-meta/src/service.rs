@@ -2615,58 +2615,17 @@ impl MetaService {
             Err(e) => error!("Failed to load multipart uploads: {}", e),
         }
 
-        // OSD nodes + topology rebuild
+        // OSD nodes, then the topology rebuilt from them
         match store.load_osd_nodes() {
             Ok(nodes) => {
-                let count = nodes.len();
-                // Dedupe by address on load: if the persistent store still
-                // holds pre-cleanup duplicates from older binaries, keep
-                // only the newest entry per address (last-wins). Also drop
-                // known-bad placeholder addresses (e.g. http://0.0.0.0:9200)
-                // that come from OSDs that never heartbeated a real
-                // address — they pollute CRUSH and cause empty-address
-                // write failures.
-                let mut by_address: std::collections::HashMap<String, OsdNode> =
-                    std::collections::HashMap::new();
-                let mut bad_placeholder = 0usize;
-                for (_hex_id, node) in nodes {
-                    if node.address.is_empty()
-                        || node.address.contains("://0.0.0.0")
-                        || node.address.contains("://[::]")
-                    {
-                        bad_placeholder += 1;
-                        continue;
-                    }
-                    by_address.insert(node.address.clone(), node);
-                }
-                let deduped: Vec<OsdNode> = by_address.into_values().collect();
-                let evicted = count - deduped.len() - bad_placeholder;
-                if evicted > 0 {
-                    warn!(
-                        "Deduped {} stale OSD entries on startup (same address, stale node_id)",
-                        evicted
-                    );
-                }
-                if bad_placeholder > 0 {
-                    warn!(
-                        "Dropped {} OSD entries with placeholder addresses on startup",
-                        bad_placeholder
-                    );
-                }
                 let mut osd_nodes = self.osd_nodes.write();
-                osd_nodes.clear();
-                for node in deduped {
-                    osd_nodes.push(node);
-                }
+                *osd_nodes = nodes.into_iter().map(|(_, node)| node).collect();
                 info!("Loaded {} OSD nodes from store", osd_nodes.len());
             }
             Err(e) => error!("Failed to load OSD nodes: {}", e),
         }
 
-        // Topology — rebuild from the post-dedup OSD list so any ghost
-        // node_ids that lingered in the stored topology (from pre-cleanup
-        // binaries) don't come back into CRUSH. The stored topology is
-        // an optimization; the authoritative source is the live OSD list.
+        // Topology — rebuilt from the OSD list, the only source.
         {
             let nodes = self.osd_nodes.read().clone();
             *self.topology.write() = Default::default();
@@ -2765,14 +2724,6 @@ impl MetaService {
                 for (key, bytes) in entries {
                     match IcebergTableEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
-                            if entry.metadata_json.is_empty() {
-                                warn!(
-                                    "Iceberg table '{}' has no inline metadata \
-                                     (created by older catalog version); \
-                                     load-table will fail until it is dropped and re-created",
-                                    key
-                                );
-                            }
                             tbl_map.insert(key, entry);
                         }
                         Err(e) => error!("Failed to decode iceberg table '{}': {}", key, e),
@@ -3398,26 +3349,17 @@ impl MetaService {
     }
 
     fn upsert_topology_node(&self, osd_node: &OsdNode, evidence: NodeEvidence) {
-        // Prefer the 5-level `topology` when present; fall back to the
-        // legacy 3-tuple for OsdNodes persisted before zone/host existed.
-        let (region, zone, dc, rack, host) = osd_node
-            .topology
-            .clone()
-            .or_else(|| {
-                osd_node
-                    .failure_domain
-                    .clone()
-                    .map(|(r, dc, rack)| (r, String::new(), dc, rack, String::new()))
-            })
-            .unwrap_or_else(|| {
-                (
-                    "default".to_string(),
-                    String::new(),
-                    "dc1".to_string(),
-                    "rack1".to_string(),
-                    String::new(),
-                )
-            });
+        // An OSD that registered without a topology is placed in a
+        // default one.
+        let (region, zone, dc, rack, host) = osd_node.topology.clone().unwrap_or_else(|| {
+            (
+                "default".to_string(),
+                String::new(),
+                "dc1".to_string(),
+                "rack1".to_string(),
+                String::new(),
+            )
+        });
 
         let node_id = NodeId::from_bytes(osd_node.node_id);
 
@@ -5410,24 +5352,26 @@ impl MetadataService for MetaService {
             disk_ids.push(id);
         }
 
-        // Capacity hint must be index-aligned with disk_ids. Tolerate the
-        // older single-field protocol (empty capacities) by treating the
-        // caller as reporting 0 bytes — under-reports, never blocks
-        // re-registration of already-known hardware.
-        let disk_capacity_bytes: Vec<u64> = if req.disk_capacity_bytes.is_empty() {
-            vec![0; disk_ids.len()]
-        } else if req.disk_capacity_bytes.len() == disk_ids.len() {
-            req.disk_capacity_bytes.clone()
-        } else {
+        // An OSD must advertise an address others can reach.
+        if req.address.is_empty()
+            || req.address.contains("://0.0.0.0")
+            || req.address.contains("://[::]")
+        {
+            return Err(Status::invalid_argument(format!(
+                "OSD address {:?} is not reachable by others; set --advertise-addr",
+                req.address
+            )));
+        }
+
+        // One capacity per disk, index-aligned with disk_ids.
+        if req.disk_capacity_bytes.len() != disk_ids.len() {
             return Err(Status::invalid_argument(
                 "disk_capacity_bytes length must match disk_ids",
             ));
-        };
+        }
+        let disk_capacity_bytes = req.disk_capacity_bytes.clone();
 
-        // Register the OSD. Pull failure-domain fields from the request
-        // and persist both the legacy 3-tuple (back-compat) and the full
-        // 5-level `topology`, so newer meta readers see zone/host and
-        // older code paths still find region/dc/rack.
+        // Register the OSD, with its 5-level topology.
         let topology_tuple = req.failure_domain.as_ref().map(|fd| {
             (
                 fd.region.clone(),
@@ -5437,10 +5381,6 @@ impl MetadataService for MetaService {
                 fd.host.clone(),
             )
         });
-        let legacy_fd = req
-            .failure_domain
-            .as_ref()
-            .map(|fd| (fd.region.clone(), fd.datacenter.clone(), fd.rack.clone()));
         let num_disks = disk_ids.len();
         // Preserve operator intent across re-registrations: if the OSD
         // was marked Out or Draining and the same node_id (or address)
@@ -5458,7 +5398,6 @@ impl MetadataService for MetaService {
             node_id,
             address: req.address.clone(),
             disk_ids,
-            failure_domain: legacy_fd,
             topology: topology_tuple,
             disk_capacity_bytes,
             admin_state: prev_admin_state,
@@ -5477,7 +5416,6 @@ impl MetadataService for MetaService {
                 existing.address = node.address.clone();
                 existing.disk_ids = node.disk_ids.clone();
                 existing.disk_capacity_bytes = node.disk_capacity_bytes.clone();
-                existing.failure_domain = node.failure_domain.clone();
                 existing.topology = node.topology.clone();
                 existing.te_segment = node.te_segment.clone();
                 info!(
@@ -13367,7 +13305,6 @@ mod placement_tests {
             node_id: [id; 16],
             address: format!("http://127.0.0.1:{}", 9200 + u16::from(id)),
             disk_ids: (0..disks).map(|d| [id * 10 + d as u8; 16]).collect(),
-            failure_domain: None,
             topology: None,
             disk_capacity_bytes: vec![1_000_000_000; disks],
             admin_state,

@@ -378,14 +378,6 @@ fn repairable(stripe: &StripeMeta) -> bool {
     ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0 && stripe.pack_id.is_empty()
 }
 
-fn shard_object_id<'a>(object: &'a ObjectMeta, stripe: &'a StripeMeta) -> &'a [u8] {
-    if stripe.object_id.is_empty() {
-        &object.object_id
-    } else {
-        &stripe.object_id
-    }
-}
-
 async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMeta]) {
     // Every listed shard of every repairable stripe, grouped by node, so
     // each node is asked once for the whole page.
@@ -482,9 +474,9 @@ async fn check_shards(
     let shards = refs
         .iter()
         .map(|&(oi, si, position)| {
-            let (o, s) = (&objects[oi], &objects[oi].stripes[si]);
+            let s = &objects[oi].stripes[si];
             ShardId {
-                object_id: shard_object_id(o, s).to_vec(),
+                object_id: s.object_id.clone(),
                 stripe_id: s.stripe_id,
                 position,
             }
@@ -529,7 +521,7 @@ async fn rebuild(
 ) -> anyhow::Result<()> {
     let k = stripe.ec_k as usize;
     let total = seen.len();
-    let id = shard_object_id(object, stripe).to_vec();
+    let id = stripe.object_id.clone();
     let located: HashMap<u32, &ShardLocation> =
         stripe.shards.iter().map(|l| (l.position, l)).collect();
 

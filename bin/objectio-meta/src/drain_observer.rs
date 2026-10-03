@@ -618,10 +618,7 @@ async fn move_shard(
 async fn stripe_of(mv: &Move) -> anyhow::Result<StripeMeta> {
     for o in &mv.objects {
         if let Ok(Some(object)) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await
-            && let Some(s) = object
-                .stripes
-                .iter()
-                .find(|s| is_shard_of(&object, s, &mv.shard))
+            && let Some(s) = object.stripes.iter().find(|s| is_shard_of(s, &mv.shard))
         {
             return Ok(s.clone());
         }
@@ -632,13 +629,8 @@ async fn stripe_of(mv: &Move) -> anyhow::Result<StripeMeta> {
 }
 
 /// Whether `shard` belongs to `stripe` of `object`.
-fn is_shard_of(object: &ObjectMeta, stripe: &StripeMeta, shard: &ShardId) -> bool {
-    let id = if stripe.object_id.is_empty() {
-        &object.object_id
-    } else {
-        &stripe.object_id
-    };
-    stripe.stripe_id == shard.stripe_id && *id == shard.object_id
+fn is_shard_of(stripe: &StripeMeta, shard: &ShardId) -> bool {
+    stripe.stripe_id == shard.stripe_id && stripe.object_id == shard.object_id
 }
 
 /// Point one ObjectMeta's copy of `shard` at `to`, on every replica,
@@ -655,14 +647,8 @@ async fn repoint_object(
         return Ok(()); // deleted since: nothing to re-point
     };
     let mut changed = false;
-    let object_id = object.object_id.clone();
     for stripe in &mut object.stripes {
-        let id = if stripe.object_id.is_empty() {
-            &object_id
-        } else {
-            &stripe.object_id
-        };
-        if stripe.stripe_id != shard.stripe_id || *id != shard.object_id {
+        if stripe.stripe_id != shard.stripe_id || stripe.object_id != shard.object_id {
             continue;
         }
         for loc in &mut stripe.shards {

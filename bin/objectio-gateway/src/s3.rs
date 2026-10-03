@@ -1476,28 +1476,18 @@ async fn read_packed_slice(
     Some(out)
 }
 
-fn overlapping_stripes(
-    stripes: &[StripeMeta],
-    object_size: u64,
-    range: &ByteRange,
-) -> Vec<(usize, u64)> {
+fn overlapping_stripes(stripes: &[StripeMeta], range: &ByteRange) -> Vec<(usize, u64)> {
     let mut offset = 0u64;
     let mut result = Vec::new();
     for (idx, stripe) in stripes.iter().enumerate() {
+        // A pack member's bytes are a slice of the pack's stripe.
         let effective_size = if stripe.slice_length > 0 {
             stripe.slice_length
-        } else if stripe.data_size > 0 {
-            stripe.data_size
-        } else if stripes.len() == 1 {
-            object_size
         } else {
-            // Multi-stripe without data_size: include conservatively
-            // (the stripe loop will error out for this case)
-            0
+            stripe.data_size
         };
         let stripe_end = offset + effective_size;
-        // Include stripe if it overlaps the range, or if we can't determine its size
-        if effective_size == 0 || (offset <= range.end && stripe_end > range.start) {
+        if offset <= range.end && stripe_end > range.start {
             result.push((idx, offset));
         }
         offset = stripe_end;
@@ -3316,10 +3306,7 @@ pub async fn list_objects(
         fetch_owner: params.fetch_owner.as_deref() == Some("true"),
     };
 
-    // Prefer Meta's serializable listing index. Fall back to the
-    // scatter-gather path only when Meta has no entries for this
-    // bucket — happens during the transition window before the
-    // OBJECT_LISTINGS table is populated for pre-migration objects.
+    // Meta's listing index is the listing.
     let mut meta_client = state.meta_client.clone();
     {
         use objectio_proto::metadata::ListObjectsRequest as MetaListReq;
@@ -3334,233 +3321,68 @@ pub async fn list_objects(
             max_keys,
             include_versions: false,
         };
-        if let Ok(resp) = meta_client.list_objects(meta_req).await {
-            let r = resp.into_inner();
-            if !r.entries.is_empty() || !r.common_prefixes.is_empty() {
-                let contents: Vec<ObjectContent> = r
-                    .entries
-                    .into_iter()
-                    .map(|e| ObjectContent {
-                        key: e.key,
-                        last_modified: timestamp_to_iso(e.modified_at),
-                        etag: e.etag,
-                        size: e.size,
-                        storage_class: if e.storage_class.is_empty() {
-                            "STANDARD".into()
-                        } else {
-                            e.storage_class
-                        },
-                        owner: None,
-                    })
-                    .collect();
-                let common_prefixes: Vec<CommonPrefix> = r
-                    .common_prefixes
-                    .into_iter()
-                    .map(|p| CommonPrefix { prefix: p })
-                    .collect();
-                let key_count = contents.len() + common_prefixes.len();
-                let mut result = ListBucketResult {
-                    name: bucket.clone(),
-                    prefix: prefix.clone(),
-                    delimiter: delimiter.clone(),
-                    marker: None,
-                    next_marker: None,
-                    start_after: None,
-                    continuation_token: None,
-                    encoding_type: params.encoding_type.clone(),
-                    max_keys,
-                    is_truncated: r.is_truncated,
-                    next_continuation_token: if r.next_continuation_token.is_empty() {
-                        None
-                    } else {
-                        Some(r.next_continuation_token)
-                    },
-                    key_count: Some(key_count as u32),
-                    common_prefixes,
-                    contents,
-                };
-                apply_listing_echo(
-                    &mut result,
-                    is_v2,
-                    params.marker.clone(),
-                    params.start_after.clone(),
-                    echo(),
-                );
-                let xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-                    to_xml(&result).unwrap_or_default()
-                );
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/xml")
-                    .body(Body::from(xml))
-                    .unwrap();
-            }
-        }
-    }
-
-    // Fallback: scatter-gather for buckets whose objects predate the
-    // ObjectListings migration.
-    match state
-        .scatter_gather
-        .list_objects(
-            &mut meta_client,
-            &bucket,
-            &prefix,
+        let r = match meta_client.list_objects(meta_req).await {
+            Ok(resp) => resp.into_inner(),
+            Err(e) => return meta_failure(&e, "listing"),
+        };
+        let contents: Vec<ObjectContent> = r
+            .entries
+            .into_iter()
+            .map(|e| ObjectContent {
+                key: e.key,
+                last_modified: timestamp_to_iso(e.modified_at),
+                etag: e.etag,
+                size: e.size,
+                storage_class: if e.storage_class.is_empty() {
+                    "STANDARD".into()
+                } else {
+                    e.storage_class
+                },
+                owner: None,
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = r
+            .common_prefixes
+            .into_iter()
+            .map(|p| CommonPrefix { prefix: p })
+            .collect();
+        let key_count = contents.len() + common_prefixes.len();
+        let mut result = ListBucketResult {
+            name: bucket.clone(),
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            marker: None,
+            next_marker: None,
+            start_after: None,
+            continuation_token: None,
+            encoding_type: params.encoding_type.clone(),
             max_keys,
-            continuation_token,
-            &start_after,
-        )
-        .await
-    {
-        Ok(list_result) => {
-            // Process delimiter to extract common prefixes
-            let (contents, common_prefixes) = if let Some(ref delim) = delimiter {
-                let mut prefixes_set = std::collections::BTreeSet::new();
-                let mut filtered_contents = Vec::new();
-
-                for obj in list_result.objects {
-                    // Get the part of the key after the prefix
-                    let key_after_prefix = if obj.key.starts_with(&prefix) {
-                        &obj.key[prefix.len()..]
-                    } else {
-                        &obj.key[..]
-                    };
-
-                    // Check if the key contains the delimiter after the prefix
-                    if let Some(delim_pos) = key_after_prefix.find(delim.as_str()) {
-                        // Extract the common prefix (prefix + everything up to and including delimiter)
-                        let common_prefix =
-                            format!("{}{}{}", prefix, &key_after_prefix[..delim_pos], delim);
-                        prefixes_set.insert(common_prefix);
-                    } else {
-                        // No delimiter found - include this object in contents
-                        filtered_contents.push(ObjectContent {
-                            key: obj.key,
-                            last_modified: timestamp_to_iso(obj.modified_at),
-                            etag: obj.etag,
-                            size: obj.size,
-                            storage_class: obj.storage_class,
-                            owner: None,
-                        });
-                    }
-                }
-
-                let common_prefixes: Vec<CommonPrefix> = prefixes_set
-                    .into_iter()
-                    .map(|p| CommonPrefix { prefix: p })
-                    .collect();
-
-                (filtered_contents, common_prefixes)
+            is_truncated: r.is_truncated,
+            next_continuation_token: if r.next_continuation_token.is_empty() {
+                None
             } else {
-                // No delimiter - return all objects
-                let contents = list_result
-                    .objects
-                    .into_iter()
-                    .map(|o| ObjectContent {
-                        key: o.key,
-                        last_modified: timestamp_to_iso(o.modified_at),
-                        etag: o.etag,
-                        size: o.size,
-                        storage_class: o.storage_class,
-                        owner: None,
-                    })
-                    .collect();
-                (contents, Vec::new())
-            };
-
-            let key_count = contents.len() + common_prefixes.len();
-            let mut result = ListBucketResult {
-                name: bucket,
-                prefix,
-                delimiter,
-                marker: None,
-                next_marker: None,
-                start_after: None,
-                continuation_token: None,
-                encoding_type: params.encoding_type.clone(),
-                max_keys,
-                is_truncated: list_result.is_truncated,
-                next_continuation_token: list_result.next_continuation_token,
-                key_count: Some(key_count as u32),
-                common_prefixes,
-                contents,
-            };
-            apply_listing_echo(
-                &mut result,
-                is_v2,
-                params.marker.clone(),
-                params.start_after.clone(),
-                echo(),
-            );
-
-            let xml = format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-                to_xml(&result).unwrap_or_default()
-            );
-
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
-        }
-        Err(e) => {
-            use crate::scatter_gather::ScatterGatherError;
-            match e {
-                ScatterGatherError::NoNodesAvailable => {
-                    warn!("No OSD nodes available for listing");
-                    // Return empty result if no nodes available (cluster might be starting up)
-                    let mut result = ListBucketResult {
-                        name: bucket,
-                        prefix,
-                        delimiter,
-                        marker: None,
-                        next_marker: None,
-                        start_after: None,
-                        continuation_token: None,
-                        encoding_type: params.encoding_type.clone(),
-                        max_keys,
-                        is_truncated: false,
-                        next_continuation_token: None,
-                        key_count: Some(0),
-                        common_prefixes: vec![],
-                        contents: vec![],
-                    };
-                    apply_listing_echo(
-                        &mut result,
-                        is_v2,
-                        params.marker.clone(),
-                        params.start_after.clone(),
-                        echo(),
-                    );
-                    let xml = format!(
-                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
-                        to_xml(&result).unwrap_or_default()
-                    );
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/xml")
-                        .body(Body::from(xml))
-                        .unwrap()
-                }
-                ScatterGatherError::InvalidToken
-                | ScatterGatherError::TokenSignatureMismatch
-                | ScatterGatherError::TopologyChanged { .. } => S3Error::xml_response(
-                    "InvalidArgument",
-                    "Invalid continuation token",
-                    StatusCode::BAD_REQUEST,
-                ),
-                _ => {
-                    error!("Scatter-gather list failed: {}", e);
-                    S3Error::xml_response(
-                        "InternalError",
-                        &e.to_string(),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    )
-                }
-            }
-        }
+                Some(r.next_continuation_token)
+            },
+            key_count: Some(key_count as u32),
+            common_prefixes,
+            contents,
+        };
+        apply_listing_echo(
+            &mut result,
+            is_v2,
+            params.marker.clone(),
+            params.start_after.clone(),
+            echo(),
+        );
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+            to_xml(&result).unwrap_or_default()
+        );
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::from(xml))
+            .unwrap()
     }
 }
 
@@ -3714,12 +3536,7 @@ async fn copy_by_reference(
     }
 
     let new_id = Uuid::now_v7().as_bytes().to_vec();
-    let mut stripes = source.stripes.clone();
-    for stripe in &mut stripes {
-        if stripe.object_id.is_empty() {
-            stripe.object_id.clone_from(&source.object_id);
-        }
-    }
+    let stripes = source.stripes.clone();
     let stripe_ids: Vec<Vec<u8>> = stripes
         .iter()
         .map(|s| s.object_id.clone())
@@ -6580,7 +6397,7 @@ async fn get_object_version_once(
 
     // Determine which stripes to fetch (skip non-overlapping stripes for range requests)
     let stripe_plan: Vec<(usize, u64)> = if let Some(ref range) = resolved_range {
-        let plan = overlapping_stripes(&object.stripes, total_size, range);
+        let plan = overlapping_stripes(&object.stripes, range);
         debug!(
             "Range request bytes={}-{} for {}/{}: fetching {} of {} stripes",
             range.start,
@@ -6624,23 +6441,15 @@ async fn get_object_version_once(
         let stripe_ec_type =
             ErasureType::try_from(stripe.ec_type).unwrap_or(ErasureType::ErasureMds);
 
-        // Use stripe's data_size if available, otherwise fall back to object size (for backwards compat)
-        let stripe_data_size = if stripe.data_size > 0 {
-            stripe.data_size as usize
-        } else if object.stripes.len() == 1 {
-            object.size as usize
-        } else {
-            // For multi-stripe without data_size, we can't properly decode
-            error!(
-                "Multi-stripe object missing data_size on stripe {}",
-                stripe_idx
-            );
+        let stripe_data_size = stripe.data_size as usize;
+        if stripe_data_size == 0 && object.size > 0 {
+            error!("Object stripe {stripe_idx} has no data_size");
             return S3Error::xml_response(
                 "InternalError",
                 "Object metadata is incomplete (missing stripe data_size)",
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
-        };
+        }
 
         // Replication mode: just read raw data from any replica
         if stripe_ec_type == ErasureType::ErasureReplication {
@@ -6668,13 +6477,7 @@ async fn get_object_version_once(
                     local_group: shard_loc.local_group,
                 };
 
-                // Use stripe's object_id if available (for multipart uploads)
-                // Fall back to object.object_id for backwards compat
-                let shard_object_id = if !stripe.object_id.is_empty() {
-                    &stripe.object_id
-                } else {
-                    &object.object_id
-                };
+                let shard_object_id = &stripe.object_id;
 
                 match read_shard_from_osd(
                     &state.osd_pool,
@@ -6811,13 +6614,7 @@ async fn get_object_version_once(
         let shard_map: HashMap<u32, &ShardLocation> =
             stripe.shards.iter().map(|s| (s.position, s)).collect();
 
-        // Use stripe's object_id if available (for multipart uploads)
-        // Fall back to object.object_id for backwards compat
-        let ec_shard_object_id = if !stripe.object_id.is_empty() {
-            &stripe.object_id
-        } else {
-            &object.object_id
-        };
+        let ec_shard_object_id = &stripe.object_id;
 
         // Rank all shard positions by topological distance to this
         // gateway so reads pull from the nearest OSDs first. Any k of the
@@ -8872,7 +8669,7 @@ async fn grep_prefix_internal(
         }
     };
 
-    let mut keys: Vec<(String, u64)> = list_resp
+    let keys: Vec<(String, u64)> = list_resp
         .entries
         .into_iter()
         .map(|e| (e.key, e.size))
@@ -8880,46 +8677,12 @@ async fn grep_prefix_internal(
 
     // Capture the pagination cursor — emitted in the End frame so the
     // client can continue on the next request.
-    let mut next_token: Option<String> =
+    let next_token: Option<String> =
         if list_resp.is_truncated && !list_resp.next_continuation_token.is_empty() {
             Some(list_resp.next_continuation_token.clone())
         } else {
             None
         };
-
-    // Meta's OBJECT_LISTINGS table may be empty for pre-migration
-    // objects. Fall back to the scatter-gather path (same as
-    // list_objects handler) so freshly-uploaded aio-backed buckets
-    // work out of the box. scatter_gather returns its own
-    // is_truncated + next_continuation_token; carry those through.
-    if keys.is_empty() {
-        let ct_opt = if caps.continuation_token.is_empty() {
-            None
-        } else {
-            Some(caps.continuation_token.as_str())
-        };
-        if let Ok(list_result) = state
-            .scatter_gather
-            .list_objects(
-                &mut meta_client,
-                &bucket,
-                &caps.prefix,
-                caps.max_keys,
-                ct_opt,
-                "",
-            )
-            .await
-        {
-            keys = list_result
-                .objects
-                .into_iter()
-                .map(|o| (o.key, o.size))
-                .collect();
-            if list_result.is_truncated {
-                next_token = list_result.next_continuation_token;
-            }
-        }
-    }
 
     tracing::info!(
         "grep-prefix: bucket={} prefix={:?} listed {} keys",
@@ -13205,7 +12968,6 @@ mod s3_tests {
         let s = stripes(&[100, 100, 100]);
         let picked = overlapping_stripes(
             &s,
-            300,
             &ByteRange {
                 start: 120,
                 end: 180,
@@ -13222,7 +12984,6 @@ mod s3_tests {
         assert_eq!(
             overlapping_stripes(
                 &s,
-                300,
                 &ByteRange {
                     start: 50,
                     end: 250
@@ -13237,14 +12998,13 @@ mod s3_tests {
         let s = stripes(&[100, 100, 100]);
         // Ends on the last byte of stripe 0.
         assert_eq!(
-            overlapping_stripes(&s, 300, &ByteRange { start: 0, end: 99 }),
+            overlapping_stripes(&s, &ByteRange { start: 0, end: 99 }),
             vec![(0, 0)]
         );
         // Starts on the first byte of stripe 1.
         assert_eq!(
             overlapping_stripes(
                 &s,
-                300,
                 &ByteRange {
                     start: 100,
                     end: 199
@@ -13258,18 +13018,8 @@ mod s3_tests {
     fn the_whole_object_fetches_every_stripe() {
         let s = stripes(&[100, 100, 100]);
         assert_eq!(
-            overlapping_stripes(&s, 300, &ByteRange { start: 0, end: 299 }),
+            overlapping_stripes(&s, &ByteRange { start: 0, end: 299 }),
             vec![(0, 0), (1, 100), (2, 200)]
-        );
-    }
-
-    #[test]
-    fn a_single_stripe_without_a_recorded_size_falls_back_to_the_object_size() {
-        // Objects written before data_size was recorded per stripe.
-        let s = stripes(&[0]);
-        assert_eq!(
-            overlapping_stripes(&s, 500, &ByteRange { start: 10, end: 20 }),
-            vec![(0, 0)]
         );
     }
 
@@ -13277,7 +13027,7 @@ mod s3_tests {
     fn stripes_of_uneven_size_still_report_their_true_offsets() {
         let s = stripes(&[10, 250, 40]);
         assert_eq!(
-            overlapping_stripes(&s, 300, &ByteRange { start: 5, end: 265 }),
+            overlapping_stripes(&s, &ByteRange { start: 5, end: 265 }),
             vec![(0, 0), (1, 10), (2, 260)]
         );
     }
