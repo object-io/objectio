@@ -57,6 +57,9 @@ row.
 
 ## Publishing a run
 
-Copy `report/` to objectio-docs under
-`operations/s3-compatibility/<date>/`, and update the latest numbers in
-that folder's README.
+Run it on Linux, x86_64 and arm64 (on a Mac, in a Linux VM or container:
+native macOS syncs are far slower, and some tests time out there). Copy
+each `report/` to objectio-docs under
+`developer-guide/s3-compatibility/<date>/<platform>/` (`linux-amd64`,
+`linux-arm64`), and update the latest numbers in
+`developer-guide/s3-compatibility/README.md`.
