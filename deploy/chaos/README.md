@@ -26,7 +26,7 @@ injects, one at a time:
 | meta-kill | SIGKILL the meta leader's process (systemd restarts it) |
 | power-off | an OSD-only VM switched off for a minute |
 | meta-power-off | a meta VM switched off for a minute |
-| partition | the meta leader's VM cut off the network for a minute (iptables) |
+| partition | the meta leader's VM cut off the network for a minute (its interface taken down) |
 | disk-pull | an OSD's disk unplugged (the Incus device removed), the OSD set `out`, a new disk plugged in as its replacement |
 
 and checks, after each:

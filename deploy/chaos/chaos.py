@@ -9,6 +9,7 @@ are injected one at a time, each held, healed and left to settle:
   power-off       an OSD-only VM switched off for a minute, then on
   meta-power-off  a meta VM switched off for a minute, then on
   partition       the meta leader's VM cut off the network for a minute
+                  (its interface taken down)
   disk-pull       an OSD's disk unplugged; the OSD set out; a new disk
                   plugged in as its replacement (a new OSD)
 
@@ -309,9 +310,12 @@ def power_off(vm, name):
 def partition():
     vm = leader_vm()
     say(f"partition: cutting {vm} (the leader) off the network for {HOLD}s")
-    vm_exec(vm, "iptables -I INPUT 1 ! -i lo -j DROP && iptables -I OUTPUT 1 ! -o lo -j DROP")
+    # The VM's interface down: no packets either way. (The image has no
+    # iptables; incus exec goes over vsock, not the network, so we can
+    # still bring it back.)
+    vm_exec(vm, "ip link set enp5s0 down")
     time.sleep(HOLD)
-    vm_exec(vm, "iptables -D INPUT 1 && iptables -D OUTPUT 1")
+    vm_exec(vm, "ip link set enp5s0 up")
     say("partition: healed")
     settle("partition")
 
