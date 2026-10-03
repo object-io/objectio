@@ -216,15 +216,14 @@ smoke_test() {
   [[ "${RESULT}" == "hello objectio" ]] || die "S3 round-trip failed"
   ok "S3: bucket create + put + get OK"
 
-  # Iceberg REST Catalog
-  HTTP=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:${PF_PORT}/iceberg/v1/config)
-  [[ "${HTTP}" == "200" ]] || die "Iceberg /config returned ${HTTP}"
-  ok "Iceberg REST Catalog: /config OK"
+  # Iceberg REST Catalog: every request names a warehouse, so one
+  # without is refused (400) by a live catalog.
+  HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PF_PORT}/iceberg/v1/config)
+  [[ "${HTTP}" == "400" ]] || die "Iceberg /config without a warehouse returned ${HTTP}, not 400"
+  ok "Iceberg REST Catalog: /config alive"
 
-  # Delta Sharing
-  HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-    http://localhost:${PF_PORT}/delta-sharing/v1/shares 2>/dev/null || echo "000")
-  # 401 or 200 both mean the endpoint is alive
+  # Delta Sharing: 200 or 401 (no bearer token) both mean it is alive.
+  HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PF_PORT}/delta-sharing/v1/shares)
   [[ "${HTTP}" == "200" || "${HTTP}" == "401" ]] || die "Delta Sharing returned ${HTTP}"
   ok "Delta Sharing: /shares endpoint alive (HTTP ${HTTP})"
 
