@@ -336,7 +336,7 @@ pub fn landing_for_tenant(tenant: &str) -> &'static str {
 /// [`ListenerKind`]; a single-port deployment distinguishes the surfaces by
 /// path instead (`/_console/admin` vs `/_console/tenant`). The path is the
 /// more specific of the two, so it wins where both are present — on the
-/// legacy listener the path is the *only* signal, since `ListenerKind::Legacy`
+/// combined listener the path is the *only* signal, since `ListenerKind::Combined`
 /// deliberately gates nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleAudience {
@@ -344,7 +344,7 @@ pub enum ConsoleAudience {
     Ops,
     /// Self-service surface: tenant sessions only.
     Tenant,
-    /// Nothing to enforce — legacy single bundle, or a non-console listener.
+    /// Nothing to enforce: the combined listener, or a non-console one.
     Unscoped,
 }
 
@@ -378,9 +378,9 @@ pub fn console_audience(path: &str, listener: Option<ListenerKind>) -> ConsoleAu
 /// split, so handlers must always treat it as `Option`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerKind {
-    /// `--listen` in legacy mode — single port carrying everything.
-    /// No login restrictions (current behavior preserved).
-    Legacy,
+    /// `--listen` in single-port mode (the default) — one port carrying
+    /// everything. No login restrictions.
+    Combined,
     /// `--listen` in split mode — S3 / Iceberg / Delta Sharing only.
     /// Console login isn't reachable here (the route isn't mounted).
     Data,
@@ -648,8 +648,7 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
     // Verify HMAC
     let expected_sig = sign_payload(payload);
     if !constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
-        // Try legacy format (colon-delimited, no tenant)
-        return validate_legacy_token(&token);
+        return None;
     }
 
     // Parse payload fields: user_id|access_key|tenant|expires_at
@@ -676,35 +675,6 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
         access_key: access_key.to_string(),
         expires_at,
         tenant: tenant.to_string(),
-        display_name: String::new(),
-        email: String::new(),
-    })
-}
-
-/// Parse legacy colon-delimited tokens (pre-tenant format)
-fn validate_legacy_token(token: &str) -> Option<SessionInfo> {
-    let (payload, sig) = token.rsplit_once(':')?;
-    let expected_sig = sign_payload(payload);
-    if !constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
-        return None;
-    }
-    let fields: Vec<&str> = payload.splitn(3, ':').collect();
-    if fields.len() != 3 {
-        return None;
-    }
-    let expires_at: u64 = fields[2].parse().ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now > expires_at {
-        return None;
-    }
-    Some(SessionInfo {
-        user: fields[0].to_string(),
-        access_key: fields[1].to_string(),
-        expires_at,
-        tenant: String::new(),
         display_name: String::new(),
         email: String::new(),
     })
@@ -859,14 +829,14 @@ pub async fn my_delete_key(
 /// - **OpsConsole** returns only providers flagged `system_admin: true`
 ///   (plus the global `--oidc-*` provider, which is implicitly
 ///   system-admin). Tenant-bound providers don't belong here.
-/// - **Legacy / AdminApi / Data** return everything (pre-split
+/// - **Combined / AdminApi / Data** return everything (as before the split
 ///   behavior preserved).
 pub async fn oidc_enabled(
     State(state): State<Arc<ConsoleOidcState>>,
     listener: Option<Extension<ListenerKind>>,
     Query(params): Query<EnabledParams>,
 ) -> Json<serde_json::Value> {
-    let kind = listener.map(|l| l.0).unwrap_or(ListenerKind::Legacy);
+    let kind = listener.map(|l| l.0).unwrap_or(ListenerKind::Combined);
 
     // `?purpose=signup` asks a different question: not "who may sign in here"
     // but "which providers can an organisation register through". Only
@@ -1624,9 +1594,9 @@ mod audience_tests {
             console_audience("/", Some(ListenerKind::AdminApi)),
             ConsoleAudience::Ops
         );
-        // Legacy deliberately gates nothing.
+        // Combined deliberately gates nothing.
         assert_eq!(
-            console_audience("/", Some(ListenerKind::Legacy)),
+            console_audience("/", Some(ListenerKind::Combined)),
             ConsoleAudience::Unscoped
         );
     }
@@ -1640,7 +1610,7 @@ mod audience_tests {
             ConsoleAudience::Tenant
         );
         assert_eq!(
-            console_audience("/_console/admin/x", Some(ListenerKind::Legacy)),
+            console_audience("/_console/admin/x", Some(ListenerKind::Combined)),
             ConsoleAudience::Ops
         );
     }

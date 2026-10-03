@@ -108,8 +108,6 @@ pub enum CasTable {
     Pools,
     Tenants,
     IamPolicies,
-    Volumes,
-    Snapshots,
     Users,
     Groups,
     AccessKeys,

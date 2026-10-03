@@ -612,7 +612,7 @@ pub struct MetaService {
     bucket_policies: RwLock<HashMap<String, String>>,
     /// In-progress multipart uploads: upload_id -> MultipartUploadState
     multipart_uploads: RwLock<HashMap<String, MultipartUploadState>>,
-    /// Registered OSD nodes (legacy)
+    /// Registered OSD nodes
     osd_nodes: RwLock<Vec<OsdNode>>,
     /// Cluster topology for CRUSH 2.0
     topology: RwLock<ClusterTopology>,
@@ -967,11 +967,6 @@ impl MetaService {
         svc.store = Some(store);
         svc.load_from_store();
         svc
-    }
-
-    /// Returns true if the store already has OSD nodes persisted.
-    pub fn has_persisted_osds(&self) -> bool {
-        !self.osd_nodes.read().is_empty()
     }
 
     /// Borrow the underlying persistent store, if the service is
@@ -1450,7 +1445,7 @@ impl MetaService {
     /// Mirror a replicated OSD record into this node's caches.
     fn apply_osd_node_event(&self, key: &str, new_value: Option<&[u8]>) {
         match new_value {
-            Some(bytes) => match OsdNode::decode(bytes) {
+            Some(bytes) => match bincode::deserialize::<OsdNode>(bytes) {
                 Ok(node) => {
                     {
                         let mut nodes = self.osd_nodes.write();
@@ -1788,21 +1783,23 @@ impl MetaService {
     fn apply_access_key_event(&self, key: &str, new_value: Option<&[u8]>) {
         let mut m = self.access_keys.write();
         match new_value {
-            Some(bytes) => match objectio_meta_store::decode_access_key(bytes) {
-                Ok(k) => {
-                    // Keep user_keys index consistent: insert the
-                    // access_key_id under the owning user if absent.
-                    let user_id = k.user_id.clone();
-                    m.insert(key.to_string(), k);
-                    drop(m);
-                    let mut idx = self.user_keys.write();
-                    let ids = idx.entry(user_id).or_default();
-                    if !ids.iter().any(|k2| k2 == key) {
-                        ids.push(key.to_string());
+            Some(bytes) => {
+                match bincode::deserialize::<objectio_meta_store::StoredAccessKey>(bytes) {
+                    Ok(k) => {
+                        // Keep user_keys index consistent: insert the
+                        // access_key_id under the owning user if absent.
+                        let user_id = k.user_id.clone();
+                        m.insert(key.to_string(), k);
+                        drop(m);
+                        let mut idx = self.user_keys.write();
+                        let ids = idx.entry(user_id).or_default();
+                        if !ids.iter().any(|k2| k2 == key) {
+                            ids.push(key.to_string());
+                        }
                     }
+                    Err(e) => warn!("apply: decode StoredAccessKey('{key}') failed: {e}"),
                 }
-                Err(e) => warn!("apply: decode StoredAccessKey('{key}') failed: {e}"),
-            },
+            }
             None => {
                 let removed = m.remove(key);
                 drop(m);
@@ -3374,25 +3371,6 @@ impl MetaService {
             .collect()
     }
 
-    /// Register an OSD node for placement (legacy method)
-    pub fn register_osd(&self, node: OsdNode) {
-        info!(
-            "Registering OSD node: {} at {}",
-            hex::encode(node.node_id),
-            node.address
-        );
-        self.osd_nodes.write().push(node.clone());
-
-        // Also update the CRUSH topology
-        self.update_topology_with_node(&node);
-
-        // Persist OSD + topology atomically
-        if let Some(store) = &self.store {
-            let topology = self.topology.read().clone();
-            store.put_osd_and_topology(&hex::encode(node.node_id), &node, &topology);
-        }
-    }
-
     /// Update CRUSH topology with a new OSD node
     /// Whether a topology update is backed by evidence the node is reachable
     /// *now*.
@@ -4888,7 +4866,6 @@ impl MetadataService for MetaService {
 
         let key_count = entries.len() as u32 + common_prefixes.len() as u32;
         Ok(Response::new(ListObjectsResponse {
-            objects: Vec::new(),
             common_prefixes,
             next_continuation_token: next_token,
             is_truncated,

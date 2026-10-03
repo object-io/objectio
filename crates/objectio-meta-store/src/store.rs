@@ -6,8 +6,7 @@
 
 use crate::tables;
 use crate::types::{
-    MultipartUploadState, OsdNode, StoredAccessKey, StoredChunkRef, StoredDataFilter, StoredGroup,
-    StoredSnapshot, StoredUser, StoredVolume,
+    MultipartUploadState, OsdNode, StoredAccessKey, StoredDataFilter, StoredGroup, StoredUser,
 };
 use objectio_proto::metadata::BucketMeta;
 use prost::Message;
@@ -83,16 +82,11 @@ impl MetaStore {
             let _t = write_txn.open_table(tables::BUCKET_POLICIES)?;
             let _t = write_txn.open_table(tables::MULTIPART_UPLOADS)?;
             let _t = write_txn.open_table(tables::OSD_NODES)?;
-            let _t = write_txn.open_table(tables::CLUSTER_TOPOLOGY)?;
             let _t = write_txn.open_table(tables::USERS)?;
             let _t = write_txn.open_table(tables::ACCESS_KEYS)?;
-            let _t = write_txn.open_table(tables::VOLUMES)?;
-            let _t = write_txn.open_table(tables::SNAPSHOTS)?;
-            let _t = write_txn.open_table(tables::VOLUME_CHUNKS)?;
             let _t = write_txn.open_table(tables::ICEBERG_NAMESPACES)?;
             let _t = write_txn.open_table(tables::ICEBERG_TABLES)?;
             let _t = write_txn.open_table(tables::GROUPS)?;
-            let _t = write_txn.open_table(tables::GROUP_MEMBERS)?;
             let _t = write_txn.open_table(tables::DATA_FILTERS)?;
             let _t = write_txn.open_table(tables::DELTA_SHARES)?;
             let _t = write_txn.open_table(tables::DELTA_TABLES)?;
@@ -210,67 +204,7 @@ impl MetaStore {
     }
 
     pub fn load_osd_nodes(&self) -> MetaStoreResult<Vec<(String, OsdNode)>> {
-        // Not `load_bincode_table`: records from earlier releases have an
-        // older layout, which only `OsdNode::decode` reads.
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(tables::OSD_NODES)?;
-        let mut result = Vec::new();
-        for entry in table.iter()? {
-            let entry = entry?;
-            let key = entry.0.value().to_string();
-            match OsdNode::decode(entry.1.value()) {
-                Ok(node) => result.push((key, node)),
-                Err(e) => error!("Failed to decode OSD node '{}': {}", key, e),
-            }
-        }
-        Ok(result)
-    }
-
-    // ---- Cluster Topology (bincode, single key) ----
-
-    pub fn put_topology(&self, topology: &objectio_placement::topology::ClusterTopology) {
-        if let Err(e) = self.put_bincode(tables::CLUSTER_TOPOLOGY, "topology", topology) {
-            error!("Failed to persist cluster topology: {}", e);
-        }
-    }
-
-    pub fn load_topology(
-        &self,
-    ) -> MetaStoreResult<Option<objectio_placement::topology::ClusterTopology>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(tables::CLUSTER_TOPOLOGY)?;
-        match table.get("topology")? {
-            Some(val) => {
-                let topo = bincode::deserialize(val.value())?;
-                Ok(Some(topo))
-            }
-            None => Ok(None),
-        }
-    }
-
-    // ---- OSD Node + Topology batch write ----
-
-    pub fn put_osd_and_topology(
-        &self,
-        node_id_hex: &str,
-        node: &OsdNode,
-        topology: &objectio_placement::topology::ClusterTopology,
-    ) {
-        if let Err(e) = (|| -> MetaStoreResult<()> {
-            let node_bytes = bincode::serialize(node)?;
-            let topo_bytes = bincode::serialize(topology)?;
-            let write_txn = self.db.begin_write()?;
-            {
-                let mut t = write_txn.open_table(tables::OSD_NODES)?;
-                t.insert(node_id_hex, node_bytes.as_slice())?;
-                let mut t2 = write_txn.open_table(tables::CLUSTER_TOPOLOGY)?;
-                t2.insert("topology", topo_bytes.as_slice())?;
-            }
-            crate::commit_metrics::commit(write_txn)?;
-            Ok(())
-        })() {
-            error!("Failed to persist OSD + topology '{}': {}", node_id_hex, e);
-        }
+        self.load_bincode_table(tables::OSD_NODES)
     }
 
     // ---- Users (bincode) ----
@@ -344,100 +278,6 @@ impl MetaStore {
             Ok(())
         })() {
             error!("Failed to persist admin user+key '{}': {}", user.user_id, e);
-        }
-    }
-
-    // ---- Volumes (bincode) ----
-
-    pub fn put_volume(&self, volume_id: &str, volume: &StoredVolume) {
-        if let Err(e) = self.put_bincode(tables::VOLUMES, volume_id, volume) {
-            error!("Failed to persist volume '{}': {}", volume_id, e);
-        }
-    }
-
-    pub fn delete_volume(&self, volume_id: &str) {
-        if let Err(e) = self.delete_key(tables::VOLUMES, volume_id) {
-            error!("Failed to delete volume '{}': {}", volume_id, e);
-        }
-    }
-
-    pub fn load_volumes(&self) -> MetaStoreResult<Vec<(String, StoredVolume)>> {
-        self.load_bincode_table(tables::VOLUMES)
-    }
-
-    // ---- Snapshots (bincode) ----
-
-    pub fn put_snapshot(&self, snapshot_id: &str, snapshot: &StoredSnapshot) {
-        if let Err(e) = self.put_bincode(tables::SNAPSHOTS, snapshot_id, snapshot) {
-            error!("Failed to persist snapshot '{}': {}", snapshot_id, e);
-        }
-    }
-
-    pub fn delete_snapshot(&self, snapshot_id: &str) {
-        if let Err(e) = self.delete_key(tables::SNAPSHOTS, snapshot_id) {
-            error!("Failed to delete snapshot '{}': {}", snapshot_id, e);
-        }
-    }
-
-    pub fn load_snapshots(&self) -> MetaStoreResult<Vec<(String, StoredSnapshot)>> {
-        self.load_bincode_table(tables::SNAPSHOTS)
-    }
-
-    // ---- Volume Chunks (bincode, composite key "vol_id:chunk_id") ----
-
-    pub fn put_chunk(&self, volume_id: &str, chunk_id: u64, chunk: &StoredChunkRef) {
-        let key = format!("{volume_id}:{chunk_id}");
-        if let Err(e) = self.put_bincode(tables::VOLUME_CHUNKS, &key, chunk) {
-            error!("Failed to persist chunk '{}': {}", key, e);
-        }
-    }
-
-    pub fn delete_chunks_for_volume(&self, volume_id: &str) {
-        if let Err(e) =
-            self.delete_keys_with_prefix(tables::VOLUME_CHUNKS, &format!("{volume_id}:"))
-        {
-            error!("Failed to delete chunks for volume '{}': {}", volume_id, e);
-        }
-    }
-
-    pub fn delete_chunk(&self, volume_id: &str, chunk_id: u64) {
-        let key = format!("{volume_id}:{chunk_id}");
-        if let Err(e) = self.delete_key(tables::VOLUME_CHUNKS, &key) {
-            error!("Failed to delete chunk '{}': {}", key, e);
-        }
-    }
-
-    pub fn load_volume_chunks(&self) -> MetaStoreResult<Vec<(String, u64, StoredChunkRef)>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(tables::VOLUME_CHUNKS)?;
-        let mut result = Vec::new();
-        for entry in table.iter()? {
-            let entry = entry?;
-            let composite_key = entry.0.value().to_string();
-            let bytes = entry.1.value();
-            // Parse "vol_id:chunk_id"
-            if let Some((vol_id, chunk_str)) = composite_key.rsplit_once(':')
-                && let Ok(chunk_id) = chunk_str.parse::<u64>()
-            {
-                match bincode::deserialize::<StoredChunkRef>(bytes) {
-                    Ok(chunk) => result.push((vol_id.to_string(), chunk_id, chunk)),
-                    Err(e) => error!("Failed to decode chunk '{}': {}", composite_key, e),
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    // ---- Delete volume data ----
-
-    pub fn delete_volume_all(&self, volume_id: &str) {
-        if let Err(e) = self.delete_key(tables::VOLUMES, volume_id) {
-            error!("Failed to delete volume '{}': {}", volume_id, e);
-        }
-        if let Err(e) =
-            self.delete_keys_with_prefix(tables::VOLUME_CHUNKS, &format!("{volume_id}:"))
-        {
-            error!("Failed to delete chunks for volume '{}': {}", volume_id, e);
         }
     }
 
@@ -1665,37 +1505,4 @@ impl MetaStore {
 /// already removed: `{key}\0{version}` → `{key}`.
 fn listing_object_key(entry: &str) -> &str {
     entry.split('\0').next().unwrap_or(entry)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A store written by v0.2.x loads its OSDs: v0.3.0 started with none.
-    #[test]
-    fn osd_nodes_written_by_v0_2_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = MetaStore::open(dir.path().join("meta.redb")).unwrap();
-        let old = crate::types::legacy_osd_node::V2 {
-            node_id: [9; 16],
-            address: "http://127.0.0.1:9200".into(),
-            disk_ids: vec![[3; 16]],
-            failure_domain: None,
-            topology: None,
-            disk_capacity_bytes: vec![1 << 30],
-            admin_state: objectio_common::OsdAdminState::Out,
-        };
-        let txn = store.db.begin_write().unwrap();
-        {
-            let mut t = txn.open_table(tables::OSD_NODES).unwrap();
-            t.insert("09", bincode::serialize(&old).unwrap().as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-
-        let nodes = store.load_osd_nodes().unwrap();
-        assert_eq!(nodes.len(), 1, "the v0.2 record was dropped");
-        assert_eq!(nodes[0].1.address, "http://127.0.0.1:9200");
-        assert_eq!(nodes[0].1.admin_state, objectio_common::OsdAdminState::Out);
-    }
 }

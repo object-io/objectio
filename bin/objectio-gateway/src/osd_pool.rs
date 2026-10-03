@@ -908,19 +908,6 @@ pub async fn get_object_version_meta_from_any(
     Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable))
 }
 
-/// Legacy single-node helper retained for the gRPC client wrappers that still
-/// target one OSD directly (same-OSD copy, server-side rename). Prefer the
-/// fan-out variants for object-level PUT/GET/DELETE.
-#[allow(dead_code)]
-pub async fn get_object_meta_from_osd(
-    pool: &OsdPool,
-    primary_placement: &NodePlacement,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
-    get_object_version_meta_from_osd(pool, primary_placement, bucket, key, "").await
-}
-
 /// One OSD's copy of one version of `key` (`""`: the current one). An
 /// error says this copy couldn't be read, not that there is none.
 pub async fn get_object_version_meta_from_osd(
@@ -1523,41 +1510,6 @@ pub async fn reclaim_shards(
     }
     crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
     failed
-}
-
-/// Legacy same-OSD meta rename. Unused now that ObjectMeta is replicated on
-/// every shard-carrying OSD (a one-node rename would leave other replicas out
-/// of sync). Kept compiling but gated so a future rebuild with proper fan-out
-/// can re-enable it.
-#[allow(dead_code)]
-pub async fn copy_object_meta_on_osd(
-    pool: &OsdPool,
-    osd_placement: &NodePlacement,
-    source_bucket: &str,
-    source_key: &str,
-    dest_bucket: &str,
-    dest_key: &str,
-) -> Result<objectio_proto::metadata::ObjectMeta, OsdPoolError> {
-    use objectio_proto::storage::CopyObjectMetaRequest;
-
-    let mut client = pool.get_client_for_placement(osd_placement).await?;
-
-    let request = CopyObjectMetaRequest {
-        source_bucket: source_bucket.to_string(),
-        source_key: source_key.to_string(),
-        dest_bucket: dest_bucket.to_string(),
-        dest_key: dest_key.to_string(),
-    };
-
-    let future = client.copy_object_meta(request);
-    let response = tokio::time::timeout(std::time::Duration::from_secs(10), future)
-        .await
-        .map_err(|_| OsdPoolError::ConnectionFailed("copy_object_meta timeout".to_string()))?
-        .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-
-    response.into_inner().object.ok_or_else(|| {
-        OsdPoolError::ConnectionFailed("missing object in CopyObjectMetaResponse".to_string())
-    })
 }
 
 #[cfg(test)]
