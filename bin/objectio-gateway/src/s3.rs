@@ -10270,9 +10270,11 @@ async fn complete_multipart_upload_internal(
                     StatusCode::NOT_FOUND,
                 )
             } else if e.code() == tonic::Code::InvalidArgument
-                && e.message().starts_with("EntityTooSmall")
+                && let Some(code) = ["EntityTooSmall", "InvalidPartOrder"]
+                    .into_iter()
+                    .find(|c| e.message().starts_with(c))
             {
-                S3Error::xml_response("EntityTooSmall", e.message(), StatusCode::BAD_REQUEST)
+                S3Error::xml_response(code, e.message(), StatusCode::BAD_REQUEST)
             } else if e.code() == tonic::Code::InvalidArgument {
                 S3Error::xml_response("InvalidPart", e.message(), StatusCode::BAD_REQUEST)
             } else {
