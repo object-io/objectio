@@ -17,6 +17,7 @@ pub mod digest;
 pub mod gateway_metrics;
 pub mod grep;
 pub mod grep_engine;
+pub mod heal;
 pub mod host_provider;
 pub mod iam_admin;
 pub mod iceberg_auth;
@@ -341,6 +342,11 @@ pub struct Args {
     #[arg(long, default_value_t = 3600)]
     pub pack_min_age_secs: u64,
 
+    /// How often this gateway works the heal queue: keys a write or delete
+    /// left behind on some metadata copies (seconds; 0 turns it off).
+    #[arg(long, default_value_t = 10)]
+    pub heal_interval_secs: u64,
+
     /// How often the replication scanner looks for versions not yet sent
     /// to their targets (seconds).
     #[arg(long, default_value_t = 30)]
@@ -582,6 +588,7 @@ pub async fn run(
 
     // Create OSD connection pool
     let osd_pool = Arc::new(OsdPool::new());
+    osd_pool.set_heal_queue(meta_client.clone());
 
     // Connect to initial OSD (more will be discovered via placement)
     // Generate a temporary node ID for the initial OSD
@@ -983,6 +990,13 @@ pub async fn run(
             scan_every: std::time::Duration::from_secs(args.replication_scan_secs.max(1)),
             fast_path: args.replication_fast_path,
         },
+    );
+
+    // Healing: every gateway works the heal queue; a claim in meta keeps two
+    // off one key.
+    heal::spawn(
+        Arc::clone(&state),
+        std::time::Duration::from_secs(args.heal_interval_secs),
     );
 
     // Packing: off unless asked for; a lease in meta lets one gateway pack.

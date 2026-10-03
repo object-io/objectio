@@ -3601,6 +3601,21 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
 
+/// Keys whose ObjectMeta copies may disagree, for gateways to heal
+/// (objectio-docs core/object-metadata-quorum.md): `CasTable::Named`,
+/// keyed by [`heal_key`], each a `HealEntry`.
+const HEAL_TABLE: &str = "heal_queue";
+
+fn heal_key(bucket: &str, key: &str, version_id: &str) -> String {
+    format!("{bucket}\u{0}{key}\u{0}{version_id}")
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Small-object packs, by pack id (hex): prost `PackRecord`.
 /// Tables written through Raft by name ([`MetaService::replicate`]); the
 /// same tables the store loads them from.
@@ -3669,6 +3684,11 @@ impl MetaService {
         } else {
             Err(Status::unavailable("no store"))
         }
+    }
+
+    /// The heal queue's entry for `key`, as stored.
+    fn heal_entry(&self, key: &str) -> Option<Vec<u8>> {
+        self.store.as_ref()?.read_named(HEAL_TABLE, key)
     }
 
     fn role(&self, name: &str) -> Option<RoleObject> {
@@ -12969,6 +12989,141 @@ impl MetadataService for MetaService {
         .await?;
         info!("Deleted role {}", old.arn);
         Ok(Response::new(DeleteRoleResponse { success: true }))
+    }
+
+    async fn heal_enqueue(
+        &self,
+        request: Request<objectio_proto::metadata::HealEnqueueRequest>,
+    ) -> Result<Response<objectio_proto::metadata::HealEnqueueResponse>, Status> {
+        let req = request.into_inner();
+        let key = heal_key(&req.bucket, &req.key, &req.version_id);
+        // Always a fresh, unclaimed entry: a heal in progress finds it
+        // changed when done, and the key is healed again.
+        let entry = objectio_proto::metadata::HealEntry {
+            bucket: req.bucket,
+            key: req.key,
+            version_id: req.version_id,
+            enqueued_at_ms: unix_ms(),
+            claimed_by: String::new(),
+            claimed_until_ms: 0,
+        };
+        for _ in 0..5 {
+            match self
+                .cas_one(
+                    objectio_meta_store::CasTable::Named(HEAL_TABLE.into()),
+                    &key,
+                    self.heal_entry(&key),
+                    Some(entry.encode_to_vec()),
+                    "heal-enqueue",
+                )
+                .await
+            {
+                Ok(()) => {
+                    return Ok(Response::new(
+                        objectio_proto::metadata::HealEnqueueResponse {},
+                    ));
+                }
+                Err(s) if s.code() == tonic::Code::Aborted => {}
+                Err(s) => return Err(s),
+            }
+        }
+        Err(Status::aborted("heal-enqueue: contended; retry"))
+    }
+
+    async fn heal_list(
+        &self,
+        request: Request<objectio_proto::metadata::HealListRequest>,
+    ) -> Result<Response<objectio_proto::metadata::HealListResponse>, Status> {
+        let limit = match request.into_inner().limit {
+            0 => 100,
+            n => n as usize,
+        };
+        let mut entries: Vec<objectio_proto::metadata::HealEntry> = self
+            .store
+            .as_ref()
+            .map(|s| s.list_named(HEAL_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, v)| objectio_proto::metadata::HealEntry::decode(v.as_slice()).ok())
+            .collect();
+        entries.sort_by_key(|e| e.enqueued_at_ms);
+        entries.truncate(limit);
+        Ok(Response::new(objectio_proto::metadata::HealListResponse {
+            entries,
+        }))
+    }
+
+    async fn heal_claim(
+        &self,
+        request: Request<objectio_proto::metadata::HealClaimRequest>,
+    ) -> Result<Response<objectio_proto::metadata::HealClaimResponse>, Status> {
+        let req = request.into_inner();
+        let listed = req
+            .entry
+            .ok_or_else(|| Status::invalid_argument("missing entry"))?;
+        let now = unix_ms();
+        if !listed.claimed_by.is_empty() && listed.claimed_until_ms > now {
+            return Ok(Response::new(objectio_proto::metadata::HealClaimResponse {
+                claimed: false,
+                entry: Some(listed),
+            }));
+        }
+        let key = heal_key(&listed.bucket, &listed.key, &listed.version_id);
+        let claimed = objectio_proto::metadata::HealEntry {
+            claimed_by: req.claimer,
+            claimed_until_ms: now.saturating_add(req.lease_ms),
+            ..listed.clone()
+        };
+        match self
+            .cas_one(
+                objectio_meta_store::CasTable::Named(HEAL_TABLE.into()),
+                &key,
+                Some(listed.encode_to_vec()),
+                Some(claimed.encode_to_vec()),
+                "heal-claim",
+            )
+            .await
+        {
+            Ok(()) => Ok(Response::new(objectio_proto::metadata::HealClaimResponse {
+                claimed: true,
+                entry: Some(claimed),
+            })),
+            Err(s) if s.code() == tonic::Code::Aborted => {
+                Ok(Response::new(objectio_proto::metadata::HealClaimResponse {
+                    claimed: false,
+                    entry: None,
+                }))
+            }
+            Err(s) => Err(s),
+        }
+    }
+
+    async fn heal_done(
+        &self,
+        request: Request<objectio_proto::metadata::HealDoneRequest>,
+    ) -> Result<Response<objectio_proto::metadata::HealDoneResponse>, Status> {
+        let entry = request
+            .into_inner()
+            .entry
+            .ok_or_else(|| Status::invalid_argument("missing entry"))?;
+        let key = heal_key(&entry.bucket, &entry.key, &entry.version_id);
+        let done = match self
+            .cas_one(
+                objectio_meta_store::CasTable::Named(HEAL_TABLE.into()),
+                &key,
+                Some(entry.encode_to_vec()),
+                None,
+                "heal-done",
+            )
+            .await
+        {
+            Ok(()) => true,
+            Err(s) if s.code() == tonic::Code::Aborted => false,
+            Err(s) => return Err(s),
+        };
+        Ok(Response::new(objectio_proto::metadata::HealDoneResponse {
+            done,
+        }))
     }
 
     async fn list_attached_policies(

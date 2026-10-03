@@ -86,6 +86,10 @@ pub struct OsdPool {
     address_map: RwLock<HashMap<String, NodeId>>,
     /// Addresses that failed at the transport level, and when.
     unreachable: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Meta, for keys a write or delete left behind on some copies.
+    heal: std::sync::OnceLock<
+        objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    >,
 }
 
 impl OsdPool {
@@ -95,6 +99,37 @@ impl OsdPool {
             nodes: RwLock::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
             unreachable: std::sync::Mutex::new(HashMap::new()),
+            heal: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Where keys go whose copies a write or delete left behind.
+    pub fn set_heal_queue(
+        &self,
+        meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    ) {
+        let _ = self.heal.set(meta);
+    }
+
+    /// A write or delete of `bucket/key` reached the quorum but not every
+    /// copy: queue the key for healing (core/object-metadata-quorum.md).
+    /// Before the caller acknowledges; if meta can't take it, the data is
+    /// still durable at quorum and only waits longer to converge.
+    pub async fn queue_heal(&self, bucket: &str, key: &str, version_id: &str) {
+        let Some(meta) = self.heal.get() else {
+            return;
+        };
+        let r = meta
+            .clone()
+            .heal_enqueue(objectio_proto::metadata::HealEnqueueRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+            })
+            .await;
+        crate::gateway_metrics::record_heal_queued(r.is_ok());
+        if let Err(e) = r {
+            warn!("{bucket}/{key}: could not queue for healing: {e}");
         }
     }
 
@@ -897,9 +932,10 @@ pub async fn put_object_meta_with(
         Some(error) => {
             warn!(
                 "{bucket}/{key}: metadata on {applied} of {} copies (quorum {quorum}); \
-                 the rest catch up on repair: {error}",
+                 the rest are healed: {error}",
                 targets.len()
             );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
             Ok(displaced)
         }
         None => Ok(displaced),
@@ -1148,6 +1184,9 @@ pub async fn delete_meta_from_all(
             }
             Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
         }
+    }
+    if out.ok >= out.quorum && out.ok < out.of {
+        pool.queue_heal(bucket, key, version_id).await;
     }
     out
 }

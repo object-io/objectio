@@ -141,3 +141,63 @@ fn a_deleted_object_does_not_come_back_with_a_stale_copy() {
         );
     }
 }
+
+/// Healing (core/object-metadata-quorum.md): an overwrite and a delete made
+/// with one OSD down can't free what they replaced (a copy still names it);
+/// once the OSD is back the healer brings its copy up to date and frees it,
+/// so with everything deleted the space is all back.
+#[test]
+fn healing_brings_a_returning_copy_up_to_date_and_frees_space() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    assert_eq!(
+        ha.clients[0].request("DELETE", "/quorum/probe", &[]).status,
+        204
+    );
+    let empty = ha.clients[0].await_total_used_bytes(0);
+    for k in ["a", "d"] {
+        let r = ha.clients[0].request("PUT", &format!("/quorum/{k}"), &payload(300_000, 1));
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+
+    ha.stop_osd(2);
+    let c = &ha.clients[0];
+    assert_eq!(
+        c.request("PUT", "/quorum/a", &payload(300_000, 2)).status,
+        200
+    );
+    assert_eq!(c.request("DELETE", "/quorum/d", &[]).status, 204);
+    ha.start_osd(2, None);
+    let c = &ha.clients[0];
+
+    // Both keys healed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while healed(c) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never healed: {}",
+            healed(c)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(c.request("GET", "/quorum/a", &[]).bytes == payload(300_000, 2));
+    assert_eq!(c.request("GET", "/quorum/d", &[]).status, 404);
+
+    assert_eq!(c.request("DELETE", "/quorum/a", &[]).status, 204);
+    let used = c.await_total_used_bytes(empty);
+    assert_eq!(
+        used, empty,
+        "space left behind after healing and deleting everything"
+    );
+}
+
+fn healed(c: &objectio_e2e::Cluster) -> u64 {
+    c.request("GET", "/metrics", &[])
+        .text()
+        .lines()
+        .filter(|l| l.starts_with("objectio_gateway_heal_total{result=\"healed\"}"))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}

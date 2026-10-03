@@ -296,6 +296,14 @@ service MetadataService {
     rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
     rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
 
+    // Keys whose ObjectMeta copies may disagree: a write or delete that
+    // reached the quorum but not every copy. Gateways heal them
+    // (objectio-docs core/object-metadata-quorum.md, healing).
+    rpc HealEnqueue(HealEnqueueRequest) returns (HealEnqueueResponse);
+    rpc HealList(HealListRequest) returns (HealListResponse);
+    rpc HealClaim(HealClaimRequest) returns (HealClaimResponse);
+    rpc HealDone(HealDoneRequest) returns (HealDoneResponse);
+
     // This node's Prometheus exposition, so the gateway can serve it from
     // its own /metrics instead of every meta node needing a scrape target.
     rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
@@ -3064,4 +3072,52 @@ message FinalizeUpgradeRequest {
 
 message FinalizeUpgradeResponse {
     uint32 active_level = 1;
+}
+
+// ============================================================
+// Heal queue (object metadata at quorum)
+// ============================================================
+
+message HealEntry {
+    string bucket = 1;
+    string key = 2;
+    // The version the write or delete was of; empty for an unversioned key.
+    string version_id = 3;
+    uint64 enqueued_at_ms = 4;
+    // Who is healing it, until when (empty/0: nobody).
+    string claimed_by = 5;
+    uint64 claimed_until_ms = 6;
+}
+
+message HealEnqueueRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;
+}
+message HealEnqueueResponse {}
+
+message HealListRequest {
+    uint32 limit = 1;
+}
+message HealListResponse {
+    repeated HealEntry entries = 1;
+}
+
+// Claim `entry` (as listed) for `lease_ms`: refused if it changed since.
+message HealClaimRequest {
+    HealEntry entry = 1;
+    string claimer = 2;
+    uint64 lease_ms = 3;
+}
+message HealClaimResponse {
+    bool claimed = 1;
+    HealEntry entry = 2;
+}
+
+// Remove `entry` (as claimed): kept if it was enqueued again meanwhile.
+message HealDoneRequest {
+    HealEntry entry = 1;
+}
+message HealDoneResponse {
+    bool done = 1;
 }
