@@ -294,22 +294,6 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_NO_REEXPORT_METRICS", default_value_t = false)]
     pub no_reexport_metrics: bool,
 
-    /// Keep buckets that have no recorded owner accessible to any
-    /// authenticated caller. Buckets created before ownership was tracked
-    /// carry no owner, so enforcing owner-only on them would lock an existing
-    /// deployment out of everything it already has.
-    ///
-    /// Backfill with `PUT /_admin/buckets/{bucket}/owner`, then set this to
-    /// false to close the gap. Buckets created from now on always record
-    /// their creator and are unaffected either way.
-    #[arg(
-        long,
-        env = "OBJECTIO_AUTHZ_LEGACY_OPEN_BUCKETS",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    pub authz_legacy_open_buckets: bool,
-
     /// Name of the `--listen` endpoint, for policies (`aws:SourceVpce`).
     /// Empty: unnamed, as a request over the internet is in AWS.
     #[arg(long, env = "OBJECTIO_ENDPOINT_NAME", default_value = "")]
@@ -970,7 +954,6 @@ pub async fn run(
         kms_local: parking_lot::RwLock::new(kms_local),
         self_topology,
         host_provider,
-        legacy_open_buckets: args.authz_legacy_open_buckets,
         prometheus_url: args.prometheus_url.clone(),
         rdma,
         inline_max_size: args.inline_max_size,

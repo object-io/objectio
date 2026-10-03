@@ -3490,162 +3490,6 @@ impl MetaService {
         let uuid = Uuid::new_v4().simple().to_string();
         format!("kms-{}", &uuid[..12])
     }
-
-    /// Legacy placement algorithm (fallback when no CRUSH topology)
-    async fn get_placement_legacy(
-        &self,
-        req: &GetPlacementRequest,
-    ) -> Result<Response<GetPlacementResponse>, Status> {
-        let nodes = self.osd_nodes.read();
-
-        // Determine number of shards and EC type based on config
-        let (total_shards, ec_type, replication_count) = match &self.default_ec {
-            EcConfig::Mds { k, m } => ((*k + *m) as usize, ErasureType::ErasureMds, 0u32),
-            EcConfig::Lrc { k, l, g } => ((*k + *l + *g) as usize, ErasureType::ErasureLrc, 0u32),
-            EcConfig::Replication { count } => (
-                *count as usize,
-                ErasureType::ErasureReplication,
-                *count as u32,
-            ),
-        };
-
-        if nodes.is_empty() {
-            return Err(Status::unavailable("no storage nodes available"));
-        }
-
-        let mut all_disks = eligible_disks(&nodes);
-
-        if all_disks.is_empty() {
-            return Err(Status::unavailable(
-                "no storage nodes are accepting writes (all are draining or out)",
-            ));
-        }
-
-        // Use object key hash for deterministic placement
-        let hash_seed = {
-            let key_bytes = format!("{}/{}", req.bucket, req.key);
-            key_bytes
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-        };
-
-        // Rotate the disk list based on hash for distribution
-        if !all_disks.is_empty() {
-            let rotation = (hash_seed as usize) % all_disks.len();
-            all_disks.rotate_left(rotation);
-        }
-
-        // Select disks for each shard position, spreading across nodes
-        let mut placements: Vec<NodePlacement> = Vec::with_capacity(total_shards);
-        let mut used_nodes: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-
-        // First pass: try to use different nodes for each shard
-        for pos in 0..total_shards {
-            if placements.len() >= total_shards {
-                break;
-            }
-
-            let disk_opt = all_disks
-                .iter()
-                .find(|(node, _)| !used_nodes.contains(&node.node_id));
-
-            if let Some((node, disk_id)) = disk_opt {
-                let pos_u32 = pos as u32;
-                placements.push(NodePlacement {
-                    position: pos_u32,
-                    node_id: node.node_id.to_vec(),
-                    node_address: node.address.clone(),
-                    te_segment: node.te_segment.clone(),
-                    disk_id: disk_id.to_vec(),
-                    shard_type: if pos_u32 < self.default_ec_k {
-                        ShardType::ShardData.into()
-                    } else {
-                        ShardType::ShardGlobalParity.into()
-                    },
-                    local_group: 0,
-                });
-                used_nodes.insert(node.node_id);
-            }
-        }
-
-        // Second pass: reuse nodes with different disks if needed
-        if placements.len() < total_shards {
-            for (node, disk_id) in all_disks.iter() {
-                if placements.len() >= total_shards {
-                    break;
-                }
-                let disk_used = placements.iter().any(|p| p.disk_id == disk_id.to_vec());
-                if !disk_used {
-                    let pos = placements.len() as u32;
-                    placements.push(NodePlacement {
-                        position: pos,
-                        node_id: node.node_id.to_vec(),
-                        node_address: node.address.clone(),
-                        te_segment: node.te_segment.clone(),
-                        disk_id: disk_id.to_vec(),
-                        shard_type: if pos < self.default_ec_k {
-                            ShardType::ShardData.into()
-                        } else {
-                            ShardType::ShardGlobalParity.into()
-                        },
-                        local_group: 0,
-                    });
-                }
-            }
-        }
-
-        // Third pass: allow disk reuse for single disk mode
-        while placements.len() < total_shards {
-            let idx = placements.len() % all_disks.len().max(1);
-            if let Some((node, disk_id)) = all_disks.get(idx) {
-                let pos = placements.len() as u32;
-                placements.push(NodePlacement {
-                    position: pos,
-                    node_id: node.node_id.to_vec(),
-                    node_address: node.address.clone(),
-                    te_segment: node.te_segment.clone(),
-                    disk_id: disk_id.to_vec(),
-                    shard_type: if pos < self.default_ec_k {
-                        ShardType::ShardData.into()
-                    } else {
-                        ShardType::ShardGlobalParity.into()
-                    },
-                    local_group: 0,
-                });
-            } else {
-                break;
-            }
-        }
-
-        debug!(
-            "Legacy placement for {}/{}: {} shards across {} nodes",
-            req.bucket,
-            req.key,
-            placements.len(),
-            used_nodes.len()
-        );
-
-        Ok(Response::new(self.with_dedup(
-            &req.bucket,
-            GetPlacementResponse {
-                storage_class: "STANDARD".to_string(),
-                ec_k: self.default_ec_k,
-                ec_m: self.default_ec_m,
-                nodes: placements,
-                ec_type: ec_type.into(),
-                ec_local_parity: 0,
-                ec_global_parity: self.default_ec_m,
-                local_group_size: 0,
-                replication_count,
-                // Legacy path: no PG, pool blank. Phase 3 fills these.
-                pg_id: 0,
-                pg_version: 0,
-                pool: String::new(),
-                dedup_mode: 0,
-                dedup_domain: String::new(),
-            },
-        )))
-    }
 }
 
 /// One page of a bucket listing, as the client sees it.
@@ -3917,8 +3761,11 @@ impl MetaService {
         };
 
         if active_node_count == 0 {
-            // Fall back to legacy placement if no CRUSH topology
-            return self.get_placement_legacy(&req).await;
+            // Not until the liveness probe has seen OSDs: placing on the
+            // bare OSD list would ignore failure domains.
+            return Err(Status::unavailable(
+                "no OSD is known to be up yet (the liveness probe runs every few seconds); retry",
+            ));
         }
 
         // Create object ID from bucket/key for deterministic placement
@@ -5560,7 +5407,7 @@ impl MetadataService for MetaService {
             .map(|n| (n.node_id, n.te_segment.clone()))
             .collect();
 
-        let mut nodes: Vec<ListingNode> = topology_iter
+        let nodes: Vec<ListingNode> = topology_iter
             .enumerate()
             .map(|(idx, node)| {
                 let id_bytes = *node.id.as_bytes();
@@ -5591,33 +5438,6 @@ impl MetadataService for MetaService {
                 }
             })
             .collect();
-
-        // Also include legacy OSD nodes if no topology nodes exist
-        if nodes.is_empty() {
-            nodes = osd_nodes
-                .iter()
-                .enumerate()
-                .map(|(idx, node)| {
-                    let fd = node.topology.as_ref().map(|t| {
-                        objectio_proto::metadata::FailureDomainInfo {
-                            region: t.0.clone(),
-                            zone: t.1.clone(),
-                            datacenter: t.2.clone(),
-                            rack: t.3.clone(),
-                            host: t.4.clone(),
-                        }
-                    });
-                    ListingNode {
-                        node_id: node.node_id.to_vec(),
-                        address: node.address.clone(),
-                        shard_id: idx as u32,
-                        failure_domain: fd,
-                        admin_state: admin_state_proto(node.admin_state),
-                        te_segment: node.te_segment.clone(),
-                    }
-                })
-                .collect();
-        }
 
         debug!(
             "GetListingNodes: returning {} nodes (topology_version={})",
@@ -13168,22 +12988,6 @@ impl MetadataService for MetaService {
     }
 }
 
-/// The (node, disk) pairs the legacy placement engine may choose from.
-///
-/// Extracted from `get_placement_legacy` so it can be tested without standing
-/// up a whole `MetaService`. The filter is the point: this path used to
-/// collect every registered node with no filter at all, so marking an OSD Out
-/// removed it from the CRUSH engine — which honours intent through
-/// `active_nodes()` — and not from this one. Which engine answered then
-/// decided whether the operator's instruction meant anything.
-fn eligible_disks(nodes: &[OsdNode]) -> Vec<(&OsdNode, &[u8; 16])> {
-    nodes
-        .iter()
-        .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
-        .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
-        .collect()
-}
-
 /// Check a completion against `upload` and build the object it makes:
 /// every part named exists with its ETag, all but the last at least 5 MiB.
 /// Returns the object and the stripes of parts left out of it.
@@ -13292,86 +13096,6 @@ fn complete_upload(
         .collect();
 
     Ok((object, unused_stripes))
-}
-
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-    use objectio_common::OsdAdminState;
-
-    fn node(id: u8, disks: usize, admin_state: OsdAdminState) -> OsdNode {
-        OsdNode {
-            node_id: [id; 16],
-            address: format!("http://127.0.0.1:{}", 9200 + u16::from(id)),
-            disk_ids: (0..disks).map(|d| [id * 10 + d as u8; 16]).collect(),
-            topology: None,
-            disk_capacity_bytes: vec![1_000_000_000; disks],
-            admin_state,
-            te_segment: String::new(),
-        }
-    }
-
-    #[test]
-    fn every_disk_of_an_in_node_is_selectable() {
-        let nodes = vec![node(1, 2, OsdAdminState::In), node(2, 3, OsdAdminState::In)];
-        assert_eq!(eligible_disks(&nodes).len(), 5);
-    }
-
-    #[test]
-    fn an_out_node_is_not_handed_writes() {
-        // The operator said no. Before this filter existed, the legacy engine
-        // ignored that entirely and kept placing on it.
-        let nodes = vec![
-            node(1, 2, OsdAdminState::In),
-            node(2, 2, OsdAdminState::Out),
-        ];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 2);
-        assert!(
-            picked.iter().all(|(n, _)| n.node_id == [1; 16]),
-            "a node marked Out was selected"
-        );
-    }
-
-    #[test]
-    fn a_draining_node_is_not_handed_writes() {
-        // Draining means "no new data, keep serving reads" — placing on it
-        // would fight the drain that is trying to empty it.
-        let nodes = vec![
-            node(1, 1, OsdAdminState::In),
-            node(2, 4, OsdAdminState::Draining),
-        ];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].0.node_id, [1; 16]);
-    }
-
-    #[test]
-    fn no_eligible_nodes_yields_nothing_rather_than_a_default() {
-        // The caller turns this into "no storage nodes are accepting writes",
-        // which is actionable. Falling back to any node would place data on a
-        // disk the operator is trying to remove.
-        let nodes = vec![
-            node(1, 2, OsdAdminState::Out),
-            node(2, 2, OsdAdminState::Draining),
-        ];
-        assert!(eligible_disks(&nodes).is_empty());
-    }
-
-    #[test]
-    fn a_node_with_no_disks_contributes_nothing() {
-        // The stale registration that broke writes on the live cluster looked
-        // exactly like this: still listed, zero disks.
-        let nodes = vec![node(1, 0, OsdAdminState::In), node(2, 2, OsdAdminState::In)];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 2);
-        assert!(picked.iter().all(|(n, _)| n.node_id == [2; 16]));
-    }
-
-    #[test]
-    fn an_empty_cluster_is_empty() {
-        assert!(eligible_disks(&[]).is_empty());
-    }
 }
 
 #[cfg(test)]

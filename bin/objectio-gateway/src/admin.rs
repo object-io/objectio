@@ -1560,9 +1560,7 @@ pub async fn admin_delete_bucket_policy(
 // ============================================================================
 /// `PUT /_admin/buckets/{bucket}/owner` — reassign a bucket's owner.
 ///
-/// Body: `{"owner": "<user_id>"}`. Also the backfill path for buckets created
-/// before the gateway recorded an owner: until those have one, authorization
-/// cannot fall back to ownership and they rely on `--authz-legacy-open-buckets`.
+/// Body: `{"owner": "<user_id>"}`.
 ///
 /// Gated per-bucket: the system admin may re-home any bucket, a tenant admin
 /// only buckets in their own tenant. Buckets with no tenant stay system-admin
