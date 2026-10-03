@@ -188,7 +188,10 @@ osd:
     datacenter: default
     rack: rack1
   storage:
-    blockSize: 4194304
+    # Allocation unit for a new disk; unset, the OSD's own (4 KiB). A
+    # shard takes whole blocks, so a larger one wastes space on every
+    # shard smaller than it (at 4 MiB, a 25 KB shard took 4 MiB).
+    # blockSize: 4096
     diskFile: disk.raw
   resources:
     requests:

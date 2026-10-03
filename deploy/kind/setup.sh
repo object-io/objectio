@@ -3,7 +3,7 @@
 #
 # Spins up a full ObjectIO cluster in Kind (Kubernetes in Docker):
 #   - 4+2 EC (4 data + 2 parity shards)
-#   - S3 API (gateway on localhost:9000 via port-forward)
+#   - S3 API (gateway on localhost:${PF_PORT} via port-forward)
 #   - Iceberg REST Catalog (/iceberg/v1/)
 #   - Delta Sharing (/delta-sharing/v1/)
 #   - Prometheus + Grafana monitoring
@@ -26,6 +26,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 CLUSTER_NAME="objectio"
 NAMESPACE="objectio"
+# Local port the gateway is forwarded to (PF_PORT=19000 if 9000 is taken).
+PF_PORT="${PF_PORT:-9000}"
 RELEASE="objectio"
 REGISTRY=""
 SKIP_BUILD=false
@@ -117,7 +119,9 @@ deploy_helm() {
         --dry-run=client -o yaml | kubectl apply -f -
     fi
   else
-    IMAGE_REGISTRY="ghcr.io/object-io"   # placeholder — actual images are local
+    # The images kind loaded: built here as objectio-<svc>:latest, which
+    # kind knows as docker.io/library/objectio-<svc>:latest.
+    IMAGE_REGISTRY="docker.io/library"
   fi
 
   info "Deploying ObjectIO Helm chart..."
@@ -156,16 +160,16 @@ wait_ready() {
 # ── Port-forward ──────────────────────────────────────────────────────────────
 start_portforward() {
   # Kill any existing port-forwards
-  pkill -f "kubectl port-forward.*${NAMESPACE}.*9000" 2>/dev/null || true
+  pkill -f "kubectl port-forward.*${NAMESPACE}.*${PF_PORT}:9000" 2>/dev/null || true
   pkill -f "kubectl port-forward.*${NAMESPACE}.*3000" 2>/dev/null || true
 
   GW_SVC=$(kubectl get svc -n "${NAMESPACE}" \
     -l app.kubernetes.io/component=gateway \
     -o jsonpath='{.items[0].metadata.name}')
 
-  info "Starting port-forward: localhost:9000 → gateway S3"
+  info "Starting port-forward: localhost:${PF_PORT} → gateway S3"
   kubectl port-forward \
-    -n "${NAMESPACE}" "svc/${GW_SVC}" 9000:9000 \
+    -n "${NAMESPACE}" "svc/${GW_SVC}" "${PF_PORT}:9000" \
     &>/tmp/objectio-pf-gateway.log &
   echo $! > /tmp/objectio-pf-gateway.pid
 
@@ -183,7 +187,7 @@ start_portforward() {
   # Wait for gateway to respond
   info "Waiting for gateway to respond..."
   for i in $(seq 1 30); do
-    if curl -sf http://localhost:9000/health &>/dev/null; then
+    if curl -sf http://localhost:${PF_PORT}/health &>/dev/null; then
       ok "Gateway is up"
       return
     fi
@@ -197,15 +201,15 @@ smoke_test() {
   info "Running smoke tests..."
 
   # S3
-  aws --endpoint-url http://localhost:9000 \
+  aws --endpoint-url http://localhost:${PF_PORT} \
       --region us-east-1 \
       --no-sign-request \
       s3 mb s3://test-bucket 2>/dev/null || true
-  echo "hello objectio" | aws --endpoint-url http://localhost:9000 \
+  echo "hello objectio" | aws --endpoint-url http://localhost:${PF_PORT} \
       --region us-east-1 \
       --no-sign-request \
       s3 cp - s3://test-bucket/hello.txt
-  RESULT=$(aws --endpoint-url http://localhost:9000 \
+  RESULT=$(aws --endpoint-url http://localhost:${PF_PORT} \
       --region us-east-1 \
       --no-sign-request \
       s3 cp s3://test-bucket/hello.txt -)
@@ -213,13 +217,13 @@ smoke_test() {
   ok "S3: bucket create + put + get OK"
 
   # Iceberg REST Catalog
-  HTTP=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:9000/iceberg/v1/config)
+  HTTP=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost:${PF_PORT}/iceberg/v1/config)
   [[ "${HTTP}" == "200" ]] || die "Iceberg /config returned ${HTTP}"
   ok "Iceberg REST Catalog: /config OK"
 
   # Delta Sharing
   HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
-    http://localhost:9000/delta-sharing/v1/shares 2>/dev/null || echo "000")
+    http://localhost:${PF_PORT}/delta-sharing/v1/shares 2>/dev/null || echo "000")
   # 401 or 200 both mean the endpoint is alive
   [[ "${HTTP}" == "200" || "${HTTP}" == "401" ]] || die "Delta Sharing returned ${HTTP}"
   ok "Delta Sharing: /shares endpoint alive (HTTP ${HTTP})"
@@ -236,29 +240,29 @@ print_summary() {
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Endpoints (via kubectl port-forward):
-  S3 / Iceberg / Delta Sharing  http://localhost:9000
+  S3 / Iceberg / Delta Sharing  http://localhost:${PF_PORT}
   Grafana                       http://localhost:3000  (admin / objectio)
 
 EC scheme: 4+2  |  Meta: 3 nodes  |  OSDs: 6 nodes
 
 Quick tests:
   # S3
-  aws --endpoint-url http://localhost:9000 --region us-east-1 --no-sign-request \\
+  aws --endpoint-url http://localhost:${PF_PORT} --region us-east-1 --no-sign-request \\
     s3 ls
 
   # Iceberg
-  curl -s http://localhost:9000/iceberg/v1/config | jq .
+  curl -s http://localhost:${PF_PORT}/iceberg/v1/config | jq .
 
   # Create Iceberg namespace + table
-  curl -s -X POST http://localhost:9000/iceberg/v1/namespaces \\
+  curl -s -X POST http://localhost:${PF_PORT}/iceberg/v1/namespaces \\
     -H 'Content-Type: application/json' \\
     -d '{"namespace":["analytics"],"properties":{}}' | jq .
-  curl -s -X POST http://localhost:9000/iceberg/v1/namespaces/analytics/tables \\
+  curl -s -X POST http://localhost:${PF_PORT}/iceberg/v1/namespaces/analytics/tables \\
     -H 'Content-Type: application/json' \\
     -d '{"name":"events","schema":{"type":"struct","fields":[{"id":1,"name":"id","type":"long","required":true}]}}' | jq .
 
   # Delta Sharing (create share + recipient via admin API)
-  curl -s -X POST http://localhost:9000/_admin/delta-sharing/shares \\
+  curl -s -X POST http://localhost:${PF_PORT}/_admin/delta-sharing/shares \\
     -d '{"name":"demo"}' | jq .
 
   # Cluster status

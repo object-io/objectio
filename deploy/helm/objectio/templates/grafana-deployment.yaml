@@ -47,11 +47,13 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
           volumeMounts:
+            # One file each from the ConfigMap, into directories grafana
+            # reads; a subPath mount must target the file, not the dir.
             - name: provisioning
-              mountPath: /etc/grafana/provisioning/datasources
+              mountPath: /etc/grafana/provisioning/datasources/datasources.yml
               subPath: datasources.yml
             - name: provisioning
-              mountPath: /etc/grafana/provisioning/dashboards
+              mountPath: /etc/grafana/provisioning/dashboards/dashboards.yml
               subPath: dashboards.yml
             - name: dashboards
               mountPath: /var/lib/grafana/dashboards

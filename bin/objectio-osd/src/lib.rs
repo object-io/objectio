@@ -365,11 +365,7 @@ pub async fn run(
     };
     info!("Config file: {}", args.config);
     info!("Disks: {:?}", disks);
-    info!(
-        "Block size: {} bytes ({} MB)",
-        block_size,
-        block_size / 1024 / 1024
-    );
+    info!("Block size: {block_size} bytes");
 
     if disks.is_empty() {
         error!(
