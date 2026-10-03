@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Roadmap first (mandatory)
+
+`../objectio-docs/ROADMAP.md` is the feature list and plan of record:
+priorities (S3 production-ready, with the shared storage engine core
+alongside; data lake next; then block, then file), every feature's status,
+and milestones with exit tests.
+
+- **Before any work on a new feature** — even when the user asks for it
+  directly — check it against that list. If it's missing, add a row (🔨,
+  plus a milestone with an exit test if it's sizeable); if it's there, mark
+  it 🔨. Then start.
+- **When it ships**, mark it ✅ in the docs PR that documents it.
+- **Bug fixes** need no row, unless they change a feature's status or its
+  notes (e.g. show a ✅ feature isn't production-ready).
+
 ## Build Commands
 
 ```bash
