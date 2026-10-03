@@ -72,8 +72,8 @@ pub struct OsdNode {
 }
 
 /// How long an OSD address that just failed at the transport level (no
-/// connection, a timeout, a dropped connection) is failed fast, without
-/// trying it. A host that vanished without resetting its connections would
+/// connection, or a connection that dropped) is failed fast, without
+/// trying it. A slow answer does not count: a busy OSD is not a dead one. A host that vanished without resetting its connections would
 /// otherwise cost every request a timeout; meanwhile writes go on with the
 /// other shards (the write quorum) and repair rebuilds the missing one.
 const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
@@ -377,7 +377,6 @@ async fn call_write_shard(
     let response = result
         .map_err(|_| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
-            pool.mark_unreachable(&placement.node_address);
             error!(
                 "Timeout writing shard {} to OSD {}",
                 position, placement.node_address
@@ -422,7 +421,6 @@ async fn call_read_shard(
     let response = result
         .map_err(|_| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
-            pool.mark_unreachable(&placement.node_address);
             error!(
                 "Timeout reading shard {} from OSD {}",
                 position, placement.node_address
@@ -973,7 +971,6 @@ pub async fn get_object_version_meta_from_any(
             }
             Err(_) => {
                 warn!("get_object_meta timeout from {}", placement.node_address);
-                pool.mark_unreachable(&placement.node_address);
                 last_err = Some(OsdPoolError::ConnectionFailed(
                     "get_object_meta timeout".to_string(),
                 ));
