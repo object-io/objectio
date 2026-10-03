@@ -2,156 +2,61 @@
 
 # ObjectIO
 
-**Unified software-defined storage in Rust.** One cluster, one binary per
-service, six protocols on a shared erasure-coded durability core:
+**Software-defined storage in Rust:** an S3-compatible object store on an
+erasure-coded, topology-aware storage core, with data-lake catalogs and
+block volumes built on the same core.
 
-- **S3** — wire-compatible with AWS S3 (SigV4, multipart, policies, SSE)
-- **Apache Iceberg REST Catalog** — embedded; warehouse creation
-  auto-provisions its backing bucket
-- **Delta Lake** — native `_delta_log/` tables + uniform Delta over
-  Iceberg; shares data via the Delta Sharing protocol
-- **Delta Sharing** — open protocol, bearer-token auth, presigned S3
-  URLs for recipients
-- **Unity Catalog** — Databricks-compatible REST surface at
-  `/api/2.1/unity-catalog/`; three-level governance (catalog.schema.table),
-  row filters, column masks, default deny-direct-S3
-- **Block** — iSCSI, NVMe-oF, NBD attachment targets with thin
-  provisioning, snapshots, clones, per-volume QoS
+ObjectIO is **pre-1.0**. What is built, what is still being proven for
+production, and what is planned is tracked feature by feature in the
+**[roadmap](https://object-io.github.io/latest/ROADMAP/)**; the full
+documentation is at **[object-io.github.io](https://object-io.github.io)**.
 
-Everything runs on top of topology-aware, failure-domain-hardened
-erasure coding (Reed-Solomon, LRC) with a Raft-consensus metadata
-service.
+## Where it stands
 
-## Features
-
-- **Wire-compatible S3** — AWS CLI, boto3, SDKs, s3cmd all just work
-- **Erasure coding** — 4+2 default, configurable up to 20+4; LRC for
-  large clusters; ISA-L on x86, pure-Rust elsewhere (identical wire
-  format)
-- **Topology-aware placement** — 5-level failure domains (region →
-  zone → dc → rack → host); hard-enforced, locality-aware reads
-- **Iceberg REST Catalog** — `/iceberg/v1/*`; works with Spark, Trino,
-  PyIceberg, Flink; IAM-style policies at namespace + table level;
-  vended credentials
-- **Delta Lake** — native `_delta_log/` tables + uniform Delta over
-  Iceberg; shares data via the Delta Sharing protocol
-- **Delta Sharing server** — open protocol, bearer-token auth,
-  presigned S3 URLs for recipients
-- **Unity Catalog** — Databricks-compatible REST surface at
-  `/api/2.1/unity-catalog/`; three-level governance (catalog.schema.table),
-  row filters, column masks, default deny-direct-S3 on backing buckets,
-  OIDC group bridging, full CRUD for catalogs/schemas/tables/volumes/models
-- **Distributed block volumes** — snapshots, writable clones, thin
-  provisioning, QoS (IOPS + bandwidth)
-- **Pluggable grep engines** — regex (default), PCRE2, Hyperscan; prefix
-  grep with pagination; stream grep across many keys
-- **io_uring** — async I/O hot path on Linux via io_uring
-- **Split control plane** — gateway can bind 4 separate listeners
-  (data plane, admin, ops console, tenant console); audience gating
-  between ops and tenant surfaces
-- **Two-bundle console** — React SPA split into ops (system admin) and
-  tenant (end-user) bundles; ops refuses tenant creds, tenant refuses
-  admin creds
-- **Slug-style BYO-OIDC** — per-tenant OIDC providers with tenant admin
-  configuration
-- **Raft metadata** — single-pod dev mode or 3+-pod HA; no external
-  service dependency
-- **Encryption at rest** — SSE-S3, SSE-C, SSE-KMS (local or external
-  Vault)
-- **Multi-tenancy** — per-tenant users, keys, quotas, buckets,
-  warehouses, shares; OIDC SSO (Keycloak, Entra, Okta, Google)
-- **Web console** — React SPA at `/_console/`; AK/SK or OIDC login;
-  topology viz, tables, monitoring
-- **Prometheus metrics** — per-operation histograms on S3, Iceberg,
-  OSD, block paths; locality metrics split by topology distance
-- **One all-in-one binary** — `objectio-aio` runs meta + OSD + gateway
-  in one process for quick tests and appliance builds
+| Area | State |
+|---|---|
+| **S3** | The most complete part, and the one being made production-ready first: core operations, multipart, versioning, Object Lock, lifecycle, policies, SSE-S3/KMS/C, CORS, presigned and POST uploads, STS, tenancy, audit, bucket replication. Checked against the [ceph s3-tests](https://object-io.github.io/latest/developer-guide/s3-compatibility/) suite on every run. |
+| **Storage core** | Erasure coding (Reed-Solomon 4+2 by default; ISA-L on x86), placement groups across failure domains, repair, drain, small-object packing, a Raft metadata service that survives losing a node. Rolling upgrades from v0.5.0 on. |
+| **Data lake** | Iceberg REST Catalog, Unity Catalog API and Delta Sharing are built, but not yet tested end to end against real engines (Spark, Trino, PyIceberg): a preview. |
+| **Block** | Volumes over NBD and gRPC with snapshots, clones and thin provisioning. QoS is not enforced, and iSCSI/NVMe-oF are not built yet: a preview. |
+| **File** | Planned. |
 
 ## Quickstart
 
-### Quick deploy — the `objectio-aio` single binary
-
-The fastest way to get a working ObjectIO cluster is the all-in-one
-binary: meta + OSD + gateway running in one process, console embedded,
-SSE master key auto-persisted, admin AK/SK printed on first start.
-Ideal for laptops, demos, smoke tests, and appliance deployments.
-
-**Linux / macOS (auto-detects platform):**
+The all-in-one binary runs meta, an OSD and the gateway in one process,
+for a laptop, a demo or a smoke test (not for production):
 
 ```sh
-VERSION=v0.1.0
-OS=$(uname | tr '[:upper:]' '[:lower:]' | sed 's/darwin/darwin/;s/linux/linux/')
-ARCH=$(uname | tr '[:upper:]' '[:lower:]' | sed 's/x86_64/amd64/;s/aarch64/arm64/;s/arm64/arm64/')
+VERSION=v0.5.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')            # linux | darwin
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 curl -L -o objectio-aio \
-    "https://github.com/object-io/objectio/releases/download/${VERSION}/objectio-aio-${VERSION}-${OS}-${ARCH}"
+  "https://github.com/object-io/objectio/releases/download/${VERSION}/objectio-aio-${VERSION}-${OS}-${ARCH}"
 chmod +x objectio-aio
-sudo mv objectio-aio /usr/local/bin/
-objectio-aio
+./objectio-aio --data ~/objectio-data
 ```
 
-Pre-built binaries ship for: `linux-amd64`, `linux-arm64`, `darwin-arm64`.
-
-The banner prints:
-
-```
-━━━ ObjectIO ready ━━━
-  S3 / Iceberg / Delta / Unity : http://localhost:9000
-  Console                         : http://localhost:9000/_console/
-  Admin access key                : AKIA...
-  Admin secret key                : ...
-  AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... \
-    aws --endpoint-url http://localhost:9000 s3 mb s3://test
-```
-
-Add `--data ~/objectio-data` to persist state across restarts
-(otherwise a tempdir is used and wiped on exit). `Ctrl-C` exits
-cleanly.
-
-### Production — helm chart on Kubernetes
+Release binaries exist for `linux-amd64`, `linux-arm64` and
+`darwin-arm64`. On start it prints the S3 endpoint
+(`http://localhost:9000`), the console (`/_console/`) and the admin
+access key. Then:
 
 ```sh
-helm install objectio oci://ghcr.io/object-io/charts/objectio \
-   --version 0.1.0 \
-   -f your-values.yaml
-```
-
-Or for a local-dev cluster that exercises the same chart against kind:
-
-```sh
-git clone https://github.com/object-io/objectio
-cd objectio && make kind-up
-```
-
-Both paths pull the universal image `ghcr.io/object-io/objectio:<tag>`
-— one multi-arch image that every service container overrides the
-entrypoint on (gateway / meta / osd / block-gateway / cli).
-
-### Using it
-
-```sh
-# S3
 aws --endpoint-url http://localhost:9000 s3 mb s3://my-bucket
 aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://my-bucket/
-
-# Management: tenants, users, keys, policies, buckets, pools, ...
-# (a SigV4 client of the gateway's admin API; see bin/objectio-cli/README.md)
-objectio-cli configure --endpoint http://localhost:9000   # prompts for the admin key
-objectio-cli tenant create acme
-objectio-cli user list -o json
-
-# Iceberg REST (PyIceberg / Spark / Trino point at)
-#   http://localhost:9000/iceberg/v1
-# Create a warehouse first:
-objectio-cli warehouse create analytics
-
-# Delta Sharing (bearer-token auth)
-#   http://localhost:9000/delta-sharing/v1/
-
-# Unity Catalog (Databricks-compatible REST)
-#   http://localhost:9000/api/2.1/unity-catalog/
 ```
 
-### Building from source
+For a cluster, use the Helm chart and the image
+`ghcr.io/object-io/objectio:<tag>`:
+
+```sh
+helm install objectio oci://ghcr.io/object-io/charts/objectio --version 0.5.0 -f values.yaml
+```
+
+Installation, administration and the APIs are covered in the
+[documentation](https://object-io.github.io).
+
+## Building from source
 
 ```sh
 # macOS
@@ -159,13 +64,11 @@ brew install nasm autoconf automake libtool llvm protobuf
 # Ubuntu / Debian
 sudo apt-get install build-essential nasm autoconf automake libtool libclang-dev protobuf-compiler
 
-cargo build --workspace --release --features isal    # omit --features on ARM
+make build            # debug build, with ISA-L (x86_64); on ARM: cargo build --workspace
+make test             # all tests (tests/e2e runs real clusters of processes)
 ```
-
 
 ## License
 
-ObjectIO is licensed under the [Apache License 2.0](./LICENSE). Every
-feature — S3, Iceberg REST Catalog, Unity Catalog, Delta Sharing,
-SSE-KMS, multi-tenancy, OIDC, LRC erasure codes, block storage — is
-fully open source, with no license keys, tiers or usage caps.
+[Apache License 2.0](./LICENSE). Everything is open source: no license
+keys, tiers or usage caps.
