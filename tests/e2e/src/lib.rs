@@ -65,6 +65,26 @@ impl Drop for Cluster {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // A failing test keeps its cluster's log (it lives in the data
+        // directory, which goes with the cluster): copied next to the
+        // target dir, and named on stderr.
+        if std::thread::panicking() {
+            let from = self.data_dir.path().join("aio.log");
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/e2e-logs");
+            let name = format!(
+                "{}-{}.log",
+                std::thread::current()
+                    .name()
+                    .unwrap_or("test")
+                    .replace("::", "-"),
+                self.port
+            );
+            if std::fs::create_dir_all(&dir).is_ok()
+                && std::fs::copy(&from, dir.join(&name)).is_ok()
+            {
+                eprintln!("cluster log: {}", dir.join(name).display());
+            }
+        }
     }
 }
 
@@ -212,8 +232,8 @@ impl Cluster {
             // here, so an unread pipe wedges the child once its 64 KiB buffer
             // fills — which presents as the cluster hanging at startup with no
             // clue why. Set OBJECTIO_E2E_LOGS=1 to watch it instead.
-            .stdout(Self::log_target())
-            .stderr(Self::log_target())
+            .stdout(Self::log_target(data_dir))
+            .stderr(Self::log_target(data_dir))
             .spawn()
             .expect("spawn objectio-aio")
     }
@@ -380,12 +400,18 @@ impl Cluster {
             .join(format!("osd-{index}/disk0/disk.raw"))
     }
 
-    fn log_target() -> Stdio {
+    /// Where the cluster's output goes: inherited with `OBJECTIO_E2E_LOGS`,
+    /// otherwise `aio.log` in its data directory (appended across restarts),
+    /// kept only if the test fails (see `Drop`).
+    fn log_target(data_dir: &std::path::Path) -> Stdio {
         if std::env::var_os("OBJECTIO_E2E_LOGS").is_some() {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
+            return Stdio::inherit();
         }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(data_dir.join("aio.log"))
+            .map_or_else(|_| Stdio::null(), Stdio::from)
     }
 
     /// Poll for `admin-creds.env` and parse the two keys out of it.
