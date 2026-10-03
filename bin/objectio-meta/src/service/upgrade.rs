@@ -36,8 +36,8 @@ pub(super) struct Plan {
 }
 
 impl MetaService {
-    /// The cluster's active format level, from config (0 when unset: a
-    /// cluster from before levels existed).
+    /// The cluster's active format level, from config (0 while a new
+    /// cluster is being set up, before its first OSD registers).
     pub(super) fn active_level(&self) -> u32 {
         self.config
             .read()
@@ -105,8 +105,8 @@ impl MetaService {
         for (kind, id) in &required {
             match fresh(kind, id) {
                 None => blockers.push(format!(
-                    "{kind} {id} has not reported in the last {}s: it is down, or runs a \
-                     release from before format levels; upgrade or remove it",
+                    "{kind} {id} has not reported in the last {}s: it is down; start it, \
+                     or remove it",
                     FRESH.as_secs()
                 )),
                 Some(r) => target = target.min(r.version.format_level),
