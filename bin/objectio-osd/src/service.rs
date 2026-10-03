@@ -944,12 +944,66 @@ impl OsdService {
             timestamp: Self::current_timestamp(),
             replaced: None,
             replaced_version_kept: false,
+            superseded: false,
         }))
     }
 
     /// Whether a `PutObjectMeta` that expects `expected` (empty: anything)
     /// may replace `current`. No current entry passes, unless
     /// `require_existing`.
+    /// The stamp of the last delete of `bucket/key` (`version_id` empty: the
+    /// current object) on this copy; 0 if none.
+    fn tombstone(&self, bucket: &str, key: &str, version_id: &str) -> u64 {
+        self.meta_store
+            .get(&MetadataKey::tombstone(bucket, key, version_id))
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes)
+    }
+
+    /// Record a delete's stamp (only ever raised).
+    #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns
+    fn put_tombstone(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        stamp: u64,
+    ) -> Result<(), Status> {
+        if self.tombstone(bucket, key, version_id) >= stamp {
+            return Ok(());
+        }
+        self.meta_store
+            .put(
+                MetadataKey::tombstone(bucket, key, version_id),
+                stamp.to_be_bytes().to_vec(),
+            )
+            .map(drop)
+            .map_err(|e| Status::internal(format!("failed to record the delete: {e}")))
+    }
+
+    /// Whether this copy saw a delete of the key (or version) newer than
+    /// `incoming`: a late write must not bring the object back.
+    fn deleted_since(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        incoming: &ObjectMeta,
+    ) -> bool {
+        incoming.stamp != 0 && self.tombstone(bucket, key, version_id) >= incoming.stamp
+    }
+
+    /// The answer to a write this copy already holds a newer one than.
+    fn superseded() -> Response<PutObjectMetaResponse> {
+        Response::new(PutObjectMetaResponse {
+            success: true,
+            timestamp: Self::current_timestamp(),
+            replaced: None,
+            replaced_version_kept: false,
+            superseded: true,
+        })
+    }
+
     fn precondition_holds(
         current: Option<&ObjectMeta>,
         expected: &[u8],
@@ -1980,6 +2034,11 @@ impl StorageService for OsdService {
                 let version_key =
                     MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
                 let prev = self.stored_meta(&version_key);
+                if supersedes(prev.as_ref(), &object)
+                    || self.deleted_since(&req.bucket, &req.key, &object.version_id, &object)
+                {
+                    return Ok(Self::superseded());
+                }
                 if req.version_only
                     && !Self::precondition_holds(
                         prev.as_ref(),
@@ -2006,9 +2065,19 @@ impl StorageService for OsdService {
                     timestamp: Self::current_timestamp(),
                     replaced: None,
                     replaced_version_kept: false,
+                    superseded: false,
                 }));
             }
 
+            // A replica from another cluster is ordered by its version's age
+            // (`keep_newer_current`, above), not by when this cluster
+            // stamped it: replicas arrive in any order.
+            if !req.keep_newer_current
+                && (supersedes(old.as_ref(), &object)
+                    || self.deleted_since(&req.bucket, &req.key, "", &object))
+            {
+                return Ok(Self::superseded());
+            }
             if !Self::precondition_holds(
                 old.as_ref(),
                 &req.expected_object_id,
@@ -2087,6 +2156,7 @@ impl StorageService for OsdService {
                 timestamp,
                 replaced: old,
                 replaced_version_kept,
+                superseded: false,
             }))
         })
     }
@@ -2117,6 +2187,7 @@ impl StorageService for OsdService {
                 Ok(Response::new(GetObjectMetaResponse {
                     object: Some(object),
                     found: true,
+                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
                 }))
             }
             None => {
@@ -2125,6 +2196,7 @@ impl StorageService for OsdService {
                 Ok(Response::new(GetObjectMetaResponse {
                     object: None,
                     found: false,
+                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
                 }))
             }
         }
@@ -2141,6 +2213,31 @@ impl StorageService for OsdService {
             let req = request.into_inner();
 
             let _guard = self.usage.lock_key(&req.bucket, &req.key);
+
+            // A copy that holds a newer write than this delete keeps it
+            // (last writer wins); the delete changes nothing here.
+            let target = if req.version_id.is_empty() {
+                MetadataKey::object_meta(&req.bucket, &req.key)
+            } else {
+                MetadataKey::object_version(&req.bucket, &req.key, &req.version_id)
+            };
+            if req.stamp != 0
+                && self
+                    .stored_meta(&target)
+                    .is_some_and(|o| o.stamp > req.stamp)
+            {
+                return Ok(Response::new(DeleteObjectMetaResponse {
+                    success: true,
+                    current: None,
+                    removed: None,
+                    superseded: true,
+                }));
+            }
+            // The tombstone goes first: a copy that crashed after it but
+            // before the removal still answers "deleted" (newer stamp).
+            if req.stamp != 0 {
+                self.put_tombstone(&req.bucket, &req.key, &req.version_id, req.stamp)?;
+            }
 
             let removed;
             if req.version_id.is_empty() {
@@ -2210,6 +2307,7 @@ impl StorageService for OsdService {
                 success: true,
                 current,
                 removed,
+                superseded: false,
             }))
         })
     }
@@ -2531,6 +2629,18 @@ const NULL_VERSION: &str = "null";
 /// UUIDv7 version id carries it; the null version has no id, so its object
 /// id (a UUIDv7 too) does; older ids fall back to the modification time,
 /// in seconds. The gateway orders versions the same way.
+/// Whether `stored` is a newer write than `incoming`, so this copy keeps it
+/// (objectio-docs core/object-metadata-quorum.md): the higher stamp wins,
+/// and of equal stamps the higher object id, so every copy picks the same.
+/// The same write again is not newer than itself. An unstamped write (0, a
+/// previous-release writer during a rolling upgrade) is applied as before.
+fn supersedes(stored: Option<&ObjectMeta>, incoming: &ObjectMeta) -> bool {
+    incoming.stamp != 0
+        && stored.is_some_and(|s| {
+            (s.stamp, s.object_id.as_slice()) > (incoming.stamp, incoming.object_id.as_slice())
+        })
+}
+
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
     let ms_of = |u: uuid::Uuid| {
         (u.get_version_num() == 7)
@@ -3130,6 +3240,183 @@ mod integrity_tests {
         .map(drop)
     }
 
+    fn stamped(object_id: u8, stamp: u64) -> ObjectMeta {
+        ObjectMeta {
+            stamp,
+            ..meta(object_id)
+        }
+    }
+
+    fn stored(osd: &OsdService) -> Option<ObjectMeta> {
+        osd.stored_meta(&MetadataKey::object_meta("b", "k"))
+    }
+
+    /// A copy keeps the newest write: an older stamp arriving late is
+    /// superseded, not applied (core/object-metadata-quorum.md).
+    #[tokio::test]
+    async fn a_copy_keeps_the_write_with_the_higher_stamp() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(2, 200), &[]).await.unwrap();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        assert_eq!(
+            stored(&osd).unwrap().object_id,
+            vec![2; 16],
+            "an older write won"
+        );
+
+        put(&osd, stamped(3, 300), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
+    }
+
+    /// Equal stamps: the higher object id wins on every copy; the same write
+    /// again is applied (idempotent); an unstamped write is applied as before.
+    #[tokio::test]
+    async fn ties_and_replays_and_unstamped_writes() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(5, 100), &[]).await.unwrap();
+        put(&osd, stamped(4, 100), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![5; 16]);
+        put(&osd, stamped(6, 100), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![6; 16]);
+
+        let again = osd
+            .put_object_meta(Request::new(PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(stamped(6, 100)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!again.superseded, "the same write again is not superseded");
+
+        put(&osd, meta(7), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![7; 16]);
+    }
+
+    async fn delete_stamped(osd: &OsdService, stamp: u64) -> DeleteObjectMetaResponse {
+        osd.delete_object_meta(Request::new(DeleteObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            stamp,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    async fn read(osd: &OsdService) -> GetObjectMetaResponse {
+        osd.get_object_meta(Request::new(GetObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    /// A stamped delete leaves a tombstone: a read reports its stamp, and a
+    /// write older than it is superseded, not applied.
+    #[tokio::test]
+    async fn a_delete_leaves_a_tombstone_that_refuses_older_writes() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        let d = delete_stamped(&osd, 200).await;
+        assert!(!d.superseded && d.removed.is_some());
+        let r = read(&osd).await;
+        assert!(!r.found);
+        assert_eq!(r.tombstone_stamp, 200);
+
+        // A write that predates the delete arrives late: refused.
+        put(&osd, stamped(2, 150), &[]).await.unwrap();
+        assert!(stored(&osd).is_none(), "a deleted object came back");
+        // A newer one is a new object.
+        put(&osd, stamped(3, 300), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
+    }
+
+    /// A copy that missed the PUT still records the delete.
+    #[tokio::test]
+    async fn a_delete_of_nothing_still_leaves_a_tombstone() {
+        let (_dir, osd) = osd();
+        delete_stamped(&osd, 500).await;
+        assert_eq!(read(&osd).await.tombstone_stamp, 500);
+        put(&osd, stamped(1, 400), &[]).await.unwrap();
+        assert!(stored(&osd).is_none());
+    }
+
+    /// Replicas from another cluster arrive in any order and are stamped
+    /// when this cluster commits them: the newer version must become
+    /// current even if it was stamped first.
+    #[tokio::test]
+    async fn a_replica_is_ordered_by_its_version_not_its_stamp() {
+        let (_dir, osd) = osd();
+        let version = |id: u8, vid: &str, stamp: u64| ObjectMeta {
+            version_id: vid.into(),
+            stamp,
+            ..meta(id)
+        };
+        let replica = |o: ObjectMeta| PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(o),
+            versioning_enabled: true,
+            keep_newer_current: true,
+            ..Default::default()
+        };
+        // v1 (older version) committed second, so with the higher stamp.
+        let v1 = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let v2 = uuid::Uuid::now_v7().to_string();
+        osd.put_object_meta(Request::new(replica(version(1, &v1, 200))))
+            .await
+            .unwrap();
+        osd.put_object_meta(Request::new(replica(version(2, &v2, 100))))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(&osd).unwrap().version_id,
+            v2,
+            "the newer version is current"
+        );
+        assert!(
+            osd.stored_meta(&MetadataKey::object_version("b", "k", &v2))
+                .is_some()
+        );
+    }
+
+    /// A delete older than what the copy holds changes nothing.
+    #[tokio::test]
+    async fn an_older_delete_is_superseded() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(1, 300), &[]).await.unwrap();
+        let d = delete_stamped(&osd, 200).await;
+        assert!(d.superseded && d.removed.is_none());
+        assert_eq!(stored(&osd).unwrap().object_id, vec![1; 16]);
+    }
+
+    /// A superseded write says so, and displaces nothing.
+    #[tokio::test]
+    async fn a_superseded_write_says_so() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(2, 200), &[]).await.unwrap();
+        let r = osd
+            .put_object_meta(Request::new(PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(stamped(1, 100)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r.superseded);
+        assert!(r.replaced.is_none());
+    }
+
     /// The repairer must not bring back an object deleted after it read it;
     /// shard migration, writing to an OSD with no copy yet, must get through.
     #[tokio::test]
@@ -3526,6 +3813,7 @@ mod object_meta_tests {
             bucket: "b".into(),
             key: "k".into(),
             version_id: String::new(),
+            stamp: 0,
         }))
         .await
         .unwrap();

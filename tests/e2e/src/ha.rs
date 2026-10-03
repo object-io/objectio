@@ -254,6 +254,20 @@ impl HaCluster {
     }
 
     /// Stop OSD `i` and start it again from `bins`, on its own data.
+    /// Stop OSD `i` (killed, as a crash); [`Self::start_osd`] brings it back.
+    pub fn stop_osd(&mut self, i: usize) {
+        if let Some(mut c) = self.osds[i].child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// Start OSD `i` again, from `bins`, on its data.
+    pub fn start_osd(&mut self, i: usize, bins: Option<&Path>) {
+        self.spawn_osd(i, bins);
+        await_listening(self.osds[i].port);
+    }
+
     pub fn restart_osd(&mut self, i: usize, bins: Option<&Path>) {
         if let Some(mut c) = self.osds[i].child.take() {
             let _ = c.kill();

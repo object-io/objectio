@@ -10,6 +10,7 @@ pub mod exposition;
 pub mod histogram;
 pub mod metrics_registry;
 pub mod process_metrics;
+pub mod stamp;
 pub mod types;
 pub mod version;
 

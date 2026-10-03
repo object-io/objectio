@@ -27,6 +27,8 @@ static RDMA_FALLBACKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static SHARD_CHECKSUM_MISMATCHES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static HEAL_QUEUED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static HEALED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_CHUNKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
@@ -207,6 +209,22 @@ pub fn record_shard_checksum_mismatch(direction: &str) {
 /// Shards deleted because nothing referenced them any more, and deletes
 /// that failed (their blocks stay allocated). `reason` is a fixed label from
 /// [`crate::osd_pool::Reclaim`].
+/// A key queued for healing (its copies may disagree), or not (meta
+/// unreachable: it waits longer to converge).
+pub fn record_heal_queued(ok: bool) {
+    HEAL_QUEUED.inc(if ok {
+        "result=\"queued\""
+    } else {
+        "result=\"failed\""
+    });
+}
+
+/// A heal queue entry handled: `healed` (copies agree now), `retry` (a copy
+/// unreachable), or `requeued` (written again meanwhile).
+pub fn record_heal(result: &str) {
+    HEALED.inc(&format!("result=\"{result}\""));
+}
+
 pub fn record_reclaim(reason: &str, reclaimed: u64, failed: u64) {
     let labels = format!("reason=\"{reason}\"");
     SHARDS_RECLAIMED.add(&labels, reclaimed);
@@ -319,6 +337,16 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_shard_checksum_mismatches_total",
         "Shards sent over gRPC that did not match their checksum, by direction",
+    );
+    HEAL_QUEUED.render(
+        &mut out,
+        "objectio_gateway_heal_queued_total",
+        "Keys a write or delete left behind on some metadata copies, queued for healing",
+    );
+    HEALED.render(
+        &mut out,
+        "objectio_gateway_heal_total",
+        "Heal queue entries handled, by result",
     );
     SHARDS_RECLAIMED.render(
         &mut out,

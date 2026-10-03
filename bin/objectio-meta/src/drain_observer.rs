@@ -85,6 +85,10 @@ async fn fanout_put_object_meta(
         addrs.push(fallback_addr.to_string());
     }
 
+    // An update of what was read: stamped above it, the same on every copy.
+    let mut object = object.clone();
+    object.stamp = objectio_common::stamp::CLOCK.next_after(object.stamp);
+    let object = &object;
     let mut futs = Vec::with_capacity(addrs.len());
     for addr in &addrs {
         let addr = addr.clone();

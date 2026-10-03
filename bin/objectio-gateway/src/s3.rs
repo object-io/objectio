@@ -4828,6 +4828,11 @@ fn settle_commit(
     what: &str,
 ) {
     match outcome {
+        // Every copy already held a newer write of the key (last writer
+        // wins): nothing references this one's shards.
+        Ok(displaced) if !displaced.is_empty() && displaced.iter().all(|d| d.superseded) => {
+            spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
+        }
         Ok(displaced) if !versioning_enabled => spawn_reclaim(
             state,
             reclaimable_after_overwrite(displaced, new_object),
@@ -5298,6 +5303,7 @@ pub async fn put_object(
             replication: HashMap::new(),
             replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
             required_level: 0,
+            stamp: 0, // stamped when stored
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -5701,6 +5707,7 @@ pub async fn put_object(
         replication: HashMap::new(),
         replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
         required_level: 0,
+        stamp: 0, // stamped when stored
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.
@@ -7465,10 +7472,10 @@ async fn delete_version(
 
     let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid).await;
     let (ok, of) = (deleted.ok, deleted.of);
-    if ok == 0 {
+    if ok < deleted.quorum {
         return S3Error::xml_response(
             "ServiceUnavailable",
-            "No replica of the object's metadata could be reached; retry",
+            &format!("The delete reached {ok} of {of} metadata copies, not a quorum; retry"),
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
@@ -8130,6 +8137,17 @@ async fn delete_object_to_the_end(
     // once every replica has let it go, and only what no replica still has
     // as current: a racing write can leave it on some.
     let deleted = delete_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await;
+    if deleted.ok < deleted.quorum {
+        sync_listing(&state, &placement.nodes, &bucket, &key).await;
+        return S3Error::xml_response(
+            "ServiceUnavailable",
+            &format!(
+                "The delete reached {} of {} metadata copies, not a quorum; retry",
+                deleted.ok, deleted.of
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
     if deleted.ok < deleted.of {
         warn!(
             "{bucket}/{key}: {} of {} replicas deleted it; its blocks stay allocated",

@@ -86,6 +86,10 @@ pub struct OsdPool {
     address_map: RwLock<HashMap<String, NodeId>>,
     /// Addresses that failed at the transport level, and when.
     unreachable: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Meta, for keys a write or delete left behind on some copies.
+    heal: std::sync::OnceLock<
+        objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    >,
 }
 
 impl OsdPool {
@@ -95,6 +99,37 @@ impl OsdPool {
             nodes: RwLock::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
             unreachable: std::sync::Mutex::new(HashMap::new()),
+            heal: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Where keys go whose copies a write or delete left behind.
+    pub fn set_heal_queue(
+        &self,
+        meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    ) {
+        let _ = self.heal.set(meta);
+    }
+
+    /// A write or delete of `bucket/key` reached the quorum but not every
+    /// copy: queue the key for healing (core/object-metadata-quorum.md).
+    /// Before the caller acknowledges; if meta can't take it, the data is
+    /// still durable at quorum and only waits longer to converge.
+    pub async fn queue_heal(&self, bucket: &str, key: &str, version_id: &str) {
+        let Some(meta) = self.heal.get() else {
+            return;
+        };
+        let r = meta
+            .clone()
+            .heal_enqueue(objectio_proto::metadata::HealEnqueueRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+            })
+            .await;
+        crate::gateway_metrics::record_heal_queued(r.is_ok());
+        if let Err(e) = r {
+            warn!("{bucket}/{key}: could not queue for healing: {e}");
         }
     }
 
@@ -804,6 +839,9 @@ pub async fn put_object_meta_with(
     // of the OSDs holding this ObjectMeta.
     let mut object_meta = object_meta;
     object_meta.usage_owner.clone_from(&targets[0].node_id);
+    // Every copy gets the same stamp, above any this one was read at: the
+    // order the copies keep (core/object-metadata-quorum.md).
+    object_meta.stamp = objectio_common::stamp::CLOCK.next_after(object_meta.stamp);
 
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
@@ -856,37 +894,77 @@ pub async fn put_object_meta_with(
             Ok::<_, (OsdPoolError, bool)>(Displaced {
                 replaced: resp.replaced,
                 version_kept: resp.replaced_version_kept,
+                superseded: resp.superseded,
+                missed: false,
             })
         });
     }
 
+    let quorum = meta_write_quorum(targets.len());
     let results = futures::future::join_all(futs).await;
     let mut displaced = Vec::with_capacity(results.len());
     let mut failure: Option<OsdPoolError> = None;
     let mut unapplied = true;
+    let mut applied = 0;
     for r in results {
         match r {
             Ok(d) => {
                 unapplied = false;
+                applied += 1;
                 displaced.push(d);
             }
             Err((e, refused)) => {
                 unapplied &= refused;
                 failure.get_or_insert(e);
+                // A copy that may hold what this write replaced: nothing
+                // it could still name is freed (repair heals it).
+                displaced.push(Displaced {
+                    replaced: None,
+                    version_kept: false,
+                    superseded: false,
+                    missed: true,
+                });
             }
         }
     }
     match failure {
-        Some(error) => Err(MetaWriteError { error, unapplied }),
+        Some(error) if applied < quorum => Err(MetaWriteError { error, unapplied }),
+        Some(error) => {
+            warn!(
+                "{bucket}/{key}: metadata on {applied} of {} copies (quorum {quorum}); \
+                 the rest are healed: {error}",
+                targets.len()
+            );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            Ok(displaced)
+        }
         None => Ok(displaced),
     }
 }
 
-/// Read ObjectMeta from any shard-carrying OSD. Tries each placement in CRUSH
-/// order (nodes[0] first) and returns the first success. Returns `Ok(None)` only
-/// when every reachable replica reports not-found — a mixed outcome (some down,
-/// some report Some) returns the Some. Returns `Err` only if every replica
-/// errored (no authoritative answer).
+/// How many copies of a key's ObjectMeta a write (or delete) needs
+/// (core/object-metadata-quorum.md): a majority. Every copy until the
+/// cluster is finalized at the level that allows it: a reader from the
+/// release before takes the first copy that answers.
+fn meta_write_quorum(copies: usize) -> usize {
+    if objectio_common::version::allows(2) {
+        copies / 2 + 1
+    } else {
+        copies
+    }
+}
+
+/// How many copies a read must hear from: enough to include one that took
+/// the last acknowledged write.
+fn meta_read_quorum(copies: usize) -> usize {
+    copies - meta_write_quorum(copies) + 1
+}
+
+/// Read ObjectMeta from the shard-carrying OSDs: every copy at once, and the
+/// newest (highest stamp) that has it. Returns `Ok(None)` only when every
+/// reachable copy reports not-found — a mixed outcome (some down, some report
+/// Some) returns the Some. Returns `Err` only if every copy errored (no
+/// authoritative answer).
 pub async fn get_object_meta_from_any(
     pool: &OsdPool,
     placements: &[NodePlacement],
@@ -912,76 +990,97 @@ pub async fn get_object_version_meta_from_any(
         return Err(OsdPoolError::NoNodesAvailable);
     }
 
-    let mut last_err: Option<OsdPoolError> = None;
-    let mut saw_not_found = false;
-    for placement in &targets {
+    // Every copy at once; the newest that has it wins
+    // (core/object-metadata-quorum.md). A copy that lacks it may just not
+    // have it yet (a new OSD during a drain), so "not found" is the answer
+    // only when no copy has it.
+    let asks = targets.iter().map(|placement| async move {
         let req = GetObjectMetaRequest {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
         };
-        let client_res = pool.get_client_for_placement(placement).await;
-        let mut client = match client_res {
-            Ok(c) => c,
-            Err(e) => {
+        let mut client = pool
+            .get_client_for_placement(placement)
+            .await
+            .map_err(|e| {
                 warn!(
                     "get_object_meta: connect failed to {}: {}",
                     placement.node_address, e
                 );
-                last_err = Some(e);
-                continue;
-            }
-        };
-        let fut = client.get_object_meta(req);
-        match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+                e
+            })?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_object_meta(req),
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
-                if inner.found {
-                    tracing::debug!(
-                        "get_object_meta: hit on {} for {}/{}",
-                        placement.node_address,
-                        bucket,
-                        key
-                    );
-                    if let Some(o) = &inner.object
-                        && o.required_level > objectio_common::version::FORMAT_LEVEL
-                    {
-                        return Err(OsdPoolError::TooOld(format!(
-                            "{bucket}/{key} needs format level {}; this gateway is at {}",
-                            o.required_level,
-                            objectio_common::version::FORMAT_LEVEL
-                        )));
-                    }
-                    return Ok(inner.object);
-                }
-                tracing::debug!(
-                    "get_object_meta: miss on {} for {}/{}",
-                    placement.node_address,
-                    bucket,
-                    key
-                );
-                saw_not_found = true;
+                Ok((
+                    if inner.found { inner.object } else { None },
+                    inner.tombstone_stamp,
+                ))
             }
             Ok(Err(e)) => {
                 warn!(
                     "get_object_meta from {} failed: {}",
                     placement.node_address, e
                 );
-                last_err = Some(OsdPoolError::ConnectionFailed(e.to_string()));
+                if is_transport_failure(&e) {
+                    pool.mark_unreachable(&placement.node_address);
+                }
+                Err(OsdPoolError::ConnectionFailed(e.to_string()))
             }
             Err(_) => {
                 warn!("get_object_meta timeout from {}", placement.node_address);
-                last_err = Some(OsdPoolError::ConnectionFailed(
+                Err(OsdPoolError::ConnectionFailed(
                     "get_object_meta timeout".to_string(),
-                ));
+                ))
             }
         }
-    }
+    });
+    let answers = futures::future::join_all(asks).await;
 
-    if saw_not_found {
-        return Ok(None);
+    let mut newest: Option<objectio_proto::metadata::ObjectMeta> = None;
+    let mut deleted_at = 0u64;
+    let mut answered = 0;
+    let mut last_err: Option<OsdPoolError> = None;
+    for answer in answers {
+        match answer {
+            Ok((found, tombstone)) => {
+                answered += 1;
+                deleted_at = deleted_at.max(tombstone);
+                if let Some(o) = found
+                    && newest
+                        .as_ref()
+                        .is_none_or(|n| (o.stamp, &o.object_id) > (n.stamp, &n.object_id))
+                {
+                    newest = Some(o);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
     }
-    Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable))
+    // Fewer answers than a read quorum could all be copies that missed the
+    // last write: no answer rather than a stale one.
+    if answered < meta_read_quorum(targets.len()) {
+        return Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable));
+    }
+    // A delete newer than every copy's object: gone, whatever a copy that
+    // missed the delete still holds.
+    if let Some(o) = newest.take_if(|o| deleted_at < o.stamp || deleted_at == 0) {
+        if o.required_level > objectio_common::version::FORMAT_LEVEL {
+            return Err(OsdPoolError::TooOld(format!(
+                "{bucket}/{key} needs format level {}; this gateway is at {}",
+                o.required_level,
+                objectio_common::version::FORMAT_LEVEL
+            )));
+        }
+        return Ok(Some(o));
+    }
+    Ok(None)
 }
 
 /// One OSD's copy of one version of `key` (`""`: the current one). An
@@ -1033,9 +1132,11 @@ pub async fn get_object_version_meta_from_osd(
 /// replicas.
 #[derive(Debug, Default)]
 pub struct MetaDeleted {
-    /// Replicas that carried it out, of how many.
+    /// Replicas that carried it out (or already held something newer), of
+    /// how many, and how many the delete needs.
     pub ok: usize,
     pub of: usize,
+    pub quorum: usize,
     /// What those replicas removed, as each had it. Replicas can disagree
     /// (a write racing the delete): each is what that copy named.
     pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
@@ -1054,12 +1155,15 @@ pub async fn delete_meta_from_all(
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
+    // Every copy records the same stamp as its tombstone.
+    let stamp = objectio_common::stamp::CLOCK.now();
     let futs = targets.iter().map(|p| async move {
         let mut client = pool.get_client_for_placement(p).await?;
         let fut = client.delete_object_meta(DeleteObjectMetaRequest {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
+            stamp,
         });
         let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -1069,6 +1173,7 @@ pub async fn delete_meta_from_all(
     });
     let mut out = MetaDeleted {
         of: targets.len(),
+        quorum: meta_write_quorum(targets.len()),
         ..MetaDeleted::default()
     };
     for r in futures::future::join_all(futs).await {
@@ -1079,6 +1184,9 @@ pub async fn delete_meta_from_all(
             }
             Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
         }
+    }
+    if out.ok >= out.quorum && out.ok < out.of {
+        pool.queue_heal(bucket, key, version_id).await;
     }
     out
 }
@@ -1279,6 +1387,10 @@ pub struct Displaced {
     pub replaced: Option<objectio_proto::metadata::ObjectMeta>,
     /// The replaced object is still held there as a version.
     pub version_kept: bool,
+    /// That copy already held a newer write; this one was not applied.
+    pub superseded: bool,
+    /// That copy did not answer: it may still hold what this write replaced.
+    pub missed: bool,
 }
 
 /// Shards of the object an overwrite displaced, if it is safe to free them.
@@ -1623,6 +1735,8 @@ mod reclaim_tests {
         Displaced {
             replaced: Some(o.clone()),
             version_kept: false,
+            superseded: false,
+            missed: false,
         }
     }
 
@@ -1693,6 +1807,8 @@ mod reclaim_tests {
         let kept = Displaced {
             replaced: Some(old.clone()),
             version_kept: true,
+            superseded: false,
+            missed: false,
         };
         assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
     }
@@ -1789,6 +1905,22 @@ mod reclaim_tests {
             crate::gateway_metrics::render()
                 .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::*;
+
+    /// A majority writes, and reads hear from enough copies to overlap it.
+    #[test]
+    fn the_metadata_quorums() {
+        objectio_common::version::set_active_level(2);
+        for (copies, write, read) in [(6, 4, 3), (12, 7, 6), (3, 2, 2), (1, 1, 1)] {
+            assert_eq!(meta_write_quorum(copies), write, "{copies} copies");
+            assert_eq!(meta_read_quorum(copies), read, "{copies} copies");
+            assert!(write + read > copies);
+        }
     }
 }
 
