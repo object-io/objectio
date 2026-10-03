@@ -5,11 +5,10 @@
 const MAX_SHARD_SIZE: usize = 4 * 1024 * 1024 - 4096; // ~4MB per shard
 
 use crate::osd_pool::{
-    Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget,
-    delete_object_meta_from_all, delete_version_from_all, get_object_meta_from_any,
-    get_object_version_meta_from_any, put_object_meta_to_all, read_shard_from_osd, reclaim_shards,
-    reclaimable_after_overwrite, referenced_object_ids, stripe_targets, stripe_targets_of,
-    write_shard_to_osd,
+    Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget, delete_meta_from_all,
+    get_object_meta_from_any, get_object_version_meta_from_any, put_object_meta_to_all,
+    read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite, referenced_object_ids,
+    stripe_targets, stripe_targets_of, unreferenced, write_shard_to_osd,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{
@@ -7075,45 +7074,6 @@ async fn resolve_node_address(
     })
 }
 
-/// The object a DELETE of `key` — version `vid`, or the current object when
-/// empty — leaves referenced by nothing, so its shards may be freed.
-///
-/// `None` when there is no such object, when it is still referenced, or when
-/// that cannot be told: a version that is also the current object loses only
-/// its version entry, and a current object that is also a version (written
-/// while versioning was on) stays as that version. This used to free the
-/// *current* object's shards whatever `vid` named, so deleting an old
-/// version destroyed the latest one's data.
-async fn unreferenced_after_delete(
-    pool: &OsdPool,
-    nodes: &[objectio_proto::metadata::NodePlacement],
-    bucket: &str,
-    key: &str,
-    vid: &str,
-) -> Option<ObjectMeta> {
-    let current = get_object_meta_from_any(pool, nodes, bucket, key)
-        .await
-        .ok()?;
-    if vid.is_empty() {
-        let current = current?;
-        if current.version_id.is_empty() {
-            return Some(current);
-        }
-        let kept = get_object_version_meta_from_any(pool, nodes, bucket, key, &current.version_id)
-            .await
-            .ok()?;
-        return kept
-            .is_none_or(|v| v.object_id != current.object_id)
-            .then_some(current);
-    }
-    let version = get_object_version_meta_from_any(pool, nodes, bucket, key, vid)
-        .await
-        .ok()??;
-    current
-        .is_none_or(|c| c.object_id != version.object_id)
-        .then_some(version)
-}
-
 /// Head object (HEAD /{bucket}/{key})
 pub async fn head_object(
     State(state): State<Arc<AppState>>,
@@ -7557,7 +7517,8 @@ async fn delete_version(
         }
     };
 
-    let (ok, of) = delete_version_from_all(pool, nodes, bucket, key, vid).await;
+    let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid).await;
+    let (ok, of) = (deleted.ok, deleted.of);
     if ok == 0 {
         return S3Error::xml_response(
             "ServiceUnavailable",
@@ -7575,18 +7536,22 @@ async fn delete_version(
             "{bucket}/{key} version {vid}: {ok} of {of} replicas let it go; \
              its blocks stay allocated"
         );
-    } else if !version.stripes.is_empty() {
-        let failed = reclaim_shards(
-            pool,
-            &mut state.meta_client.clone(),
-            stripe_targets_of(&version),
-            Reclaim::Delete,
-        )
-        .await;
-        if failed > 0 {
-            warn!(
-                "{bucket}/{key} version {vid}: {failed} shard deletes failed; those blocks stay allocated"
-            );
+    } else {
+        // What the replicas removed (a packing switch may have rewritten
+        // the version since it was read), and only what none still has.
+        for gone in unreferenced(pool, nodes, bucket, key, deleted.removed).await {
+            let failed = reclaim_shards(
+                pool,
+                &mut state.meta_client.clone(),
+                stripe_targets_of(&gone),
+                Reclaim::Delete,
+            )
+            .await;
+            if failed > 0 {
+                warn!(
+                    "{bucket}/{key} version {vid}: {failed} shard deletes failed; those blocks stay allocated"
+                );
+            }
         }
     }
     info!("Deleted version {vid} of {bucket}/{key}");
@@ -8189,35 +8154,43 @@ async fn delete_object_to_the_end(
     // Without a version: the current object goes. (With versioning on, a
     // marker was added above instead.)
 
-    // Reclaim the shards *before* dropping the metadata: the stripe layout is
-    // the only record of where they live, so destroying it first would leak
-    // every block the object occupied with no way left to find them. That is
-    // what used to happen — the shards were never deleted at all — so a
-    // cluster could show an empty bucket and a disk with no free blocks.
-    if let Some(meta) =
-        unreferenced_after_delete(&state.osd_pool, &placement.nodes, &bucket, &key, "").await
-        && !meta.stripes.is_empty()
-    {
-        let failed = reclaim_shards(
+    // Free what the delete actually removed, not what was read before it:
+    // the object can change in between (a PUT replacing it, a packing
+    // switch or a tagging update rewriting it), and freeing the stripes of
+    // the version read would leak the ones the removed copy named. Only
+    // once every replica has let it go, and only what no replica still has
+    // as current: a racing write can leave it on some.
+    let deleted = delete_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await;
+    if deleted.ok < deleted.of {
+        warn!(
+            "{bucket}/{key}: {} of {} replicas deleted it; its blocks stay allocated",
+            deleted.ok, deleted.of
+        );
+    } else {
+        for gone in unreferenced(
             &state.osd_pool,
-            &mut meta_client,
-            stripe_targets_of(&meta),
-            Reclaim::Delete,
+            &placement.nodes,
+            &bucket,
+            &key,
+            deleted.removed,
         )
-        .await;
-        if failed > 0 {
-            // Leaked blocks, not lost data — the object is gone either way.
-            warn!(
-                "{}/{}: {} shard deletes failed; those blocks stay allocated",
-                bucket, key, failed
-            );
+        .await
+        {
+            let failed = reclaim_shards(
+                &state.osd_pool,
+                &mut meta_client,
+                stripe_targets_of(&gone),
+                Reclaim::Delete,
+            )
+            .await;
+            if failed > 0 {
+                // Leaked blocks, not lost data — the object is gone either way.
+                warn!(
+                    "{}/{}: {} shard deletes failed; those blocks stay allocated",
+                    bucket, key, failed
+                );
+            }
         }
-    }
-
-    if let Err(e) =
-        delete_object_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await
-    {
-        warn!("Failed to delete object metadata from OSD: {}", e);
     }
 
     // Unregister from Meta's listing index. Non-fatal if it fails —

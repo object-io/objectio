@@ -471,11 +471,16 @@ message PackMember {
     uint64 slice_offset = 4;
     uint64 slice_length = 5;
     // The stripe it had before: released once every copy names the pack.
+    // Cleared when the member is settled.
     StripeMeta old_stripe = 6;
+    // Its switch is done or abandoned: reconciliation leaves it alone. Kept
+    // in the record (key and slice) so compaction knows what's live.
+    bool settled = 7;
 }
 
 // Settle members of a pack: their switch is finished or abandoned, so
-// reconciliation needn't look at them again. Members not in the record
+// reconciliation needn't look at them again. They stay in the record,
+// marked settled, without their old stripe. Members not in the record
 // are ignored.
 message PackSettleRequest {
     bytes pack_id = 1;
@@ -2881,6 +2886,13 @@ message ListPacksRequest {
 message ListPacksResponse {
     repeated PackRecord packs = 1;
     bool truncated = 2;
+    // Per pack, in the same order: the object ids that reference it now
+    // (the shared-stripe registry), so the caller can tell what's live.
+    repeated PackReferrers referrers = 3;
+}
+
+message PackReferrers {
+    repeated bytes object_ids = 1;
 }
 
 // A pack shard moved (drain, repair): the record's location for

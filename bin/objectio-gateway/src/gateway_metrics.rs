@@ -42,6 +42,8 @@ static PACKS_WRITTEN: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PACK_OBJECTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PACK_BYTES_SAVED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static PACK_RECONCILED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACK_COMPACTIONS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static PACK_COMPACTED_OBJECTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static LIFECYCLE_SCAN_SECONDS: LazyLock<HistogramVec> =
     LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 
@@ -64,6 +66,12 @@ pub fn record_pack(objects: u64, before: u64, after: u64) {
     PACKS_WRITTEN.inc("");
     PACK_OBJECTS.add("", objects);
     PACK_BYTES_SAVED.add("", before.saturating_sub(after));
+}
+
+/// A pack compacted: its `objects` live objects moved into a new pack.
+pub fn record_pack_compaction(objects: u64) {
+    PACK_COMPACTIONS.inc("");
+    PACK_COMPACTED_OBJECTS.add("", objects);
 }
 
 /// A reconciliation outcome: `aborted` (an unsealed pack), `released` (an
@@ -391,6 +399,16 @@ pub fn render() -> String {
         &mut out,
         "objectio_pack_reconciled_total",
         "Pack reconciliation outcomes, by action (aborted, released, finished)",
+    );
+    PACK_COMPACTIONS.render(
+        &mut out,
+        "objectio_pack_compactions_total",
+        "Packs compacted: their live objects moved into a new pack, the old one freed",
+    );
+    PACK_COMPACTED_OBJECTS.render(
+        &mut out,
+        "objectio_pack_compacted_objects_total",
+        "Objects moved by compaction",
     );
     LIFECYCLE_SCAN_SECONDS.render(
         &mut out,

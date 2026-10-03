@@ -5,7 +5,9 @@
 //! Off unless `--pack-interval-secs` is set. Every gateway runs the worker;
 //! a lease in meta lets one pack at a time, as for lifecycle. Each pass:
 //!
-//! 1. Reconciles packs older than [`RECONCILE_AFTER`]: whatever a packer
+//! 1. Reconciles packs older than [`RECONCILE_AFTER`] (twice the
+//!    [`crate::packs::SWITCH_DEADLINE`] after which a packer stops
+//!    switching objects into a pack): whatever a packer
 //!    that died left half done is finished or undone (see
 //!    [`crate::packs::reconcile`]).
 //! 2. Walks every bucket for current objects that are small (above the
@@ -19,6 +21,11 @@
 //! A batch is packed only if it saves space: two objects at least, and
 //! fewer raw bytes than their own stripes. At most [`PACKS_PER_PASS`] packs
 //! are written a pass, so the packer can't swamp a cluster.
+//!
+//! Between reconciling and packing, it compacts: a pack less than half live
+//! (most of its objects deleted or overwritten) has its live objects moved
+//! into a new pack, and is freed when the last of them lets go
+//! ([`crate::packs::compact`], [`COMPACTIONS_PER_PASS`] a pass).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,15 +46,19 @@ pub const PACK_TARGET: u64 = 1024 * 1024;
 /// Packs written in one pass at most.
 const PACKS_PER_PASS: usize = 64;
 
-/// A pack this old and still unsettled had a packer die on it: no packer
-/// takes this long over one pack.
-const RECONCILE_AFTER: Duration = Duration::from_secs(600);
+/// Packs compacted in one pass at most.
+const COMPACTIONS_PER_PASS: usize = 16;
+
+use crate::packs::RECONCILE_AFTER;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
     pub interval: Duration,
     /// Objects written more recently than this are left alone.
     pub min_age: Duration,
+    /// Between switching objects and releasing their old stripes (see
+    /// [`crate::packs::PackOptions::grace`]).
+    pub grace: Duration,
 }
 
 /// Start the packer. Every gateway runs one; the lease lets one pack at a
@@ -94,6 +105,19 @@ async fn pass(state: &Arc<AppState>, holder: &str, timing: Timing) {
         Ok(r) if r.aborted + r.released + r.finished > 0 => info!("packer: reconciled {r:?}"),
         Ok(_) => {}
         Err(e) => warn!("packer: reconciliation: {e}"),
+    }
+    match crate::packs::compact(
+        state,
+        timing.min_age,
+        COMPACTIONS_PER_PASS,
+        None,
+        timing.grace,
+    )
+    .await
+    {
+        Ok(r) if r.compacted > 0 => info!("packer: compacted {r:?}"),
+        Ok(_) => {}
+        Err(e) => warn!("packer: compaction: {e}"),
     }
     let buckets = match state
         .meta_client
@@ -171,7 +195,7 @@ async fn pack_bucket(
             }
             let fits = batch_bytes(&batch) + aligned(current.size) <= PACK_TARGET;
             if !fits {
-                written += usize::from(pack_batch(state, bucket, &mut batch).await);
+                written += usize::from(pack_batch(state, bucket, &mut batch, timing.grace).await);
                 if written >= budget {
                     return Ok(written);
                 }
@@ -183,7 +207,7 @@ async fn pack_bucket(
             _ => break,
         }
     }
-    written += usize::from(pack_batch(state, bucket, &mut batch).await);
+    written += usize::from(pack_batch(state, bucket, &mut batch, timing.grace).await);
     Ok(written)
 }
 
@@ -197,13 +221,28 @@ fn batch_bytes(batch: &[(String, u64)]) -> u64 {
 
 /// Pack `batch` and empty it, if packing it saves space. Whether a pack
 /// was written.
-async fn pack_batch(state: &Arc<AppState>, bucket: &str, batch: &mut Vec<(String, u64)>) -> bool {
+async fn pack_batch(
+    state: &Arc<AppState>,
+    bucket: &str,
+    batch: &mut Vec<(String, u64)>,
+    grace: Duration,
+) -> bool {
     let taken = std::mem::take(batch);
     if !worth_packing(&taken) {
         return false;
     }
     let keys: Vec<String> = taken.into_iter().map(|(k, _)| k).collect();
-    match crate::packs::pack_objects(state, bucket, &keys, None).await {
+    match crate::packs::pack_objects(
+        state,
+        bucket,
+        &keys,
+        &crate::packs::PackOptions {
+            grace,
+            ..Default::default()
+        },
+    )
+    .await
+    {
         Ok(r) if !r.pack_id.is_empty() => {
             debug!(
                 "packer: {bucket}: pack {} holds {} objects ({} skipped)",

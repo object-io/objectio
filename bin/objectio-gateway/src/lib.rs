@@ -354,6 +354,11 @@ pub struct Args {
     #[arg(long, default_value_t = 3600)]
     pub pack_min_age_secs: u64,
 
+    /// Seconds the packer waits between switching objects into a pack and
+    /// releasing their old stripes, for reads already under way.
+    #[arg(long, default_value_t = 30, hide = true)]
+    pub pack_grace_secs: u64,
+
     /// Name of the env var holding the base64-encoded 32-byte SSE master key.
     /// If the env var is set, SSE-S3 is enabled — PUT to buckets with
     /// ServerSideEncryptionConfiguration will encrypt at rest. If missing,
@@ -965,6 +970,7 @@ pub async fn run(
             packer::Timing {
                 interval: std::time::Duration::from_secs(args.pack_interval_secs),
                 min_age: std::time::Duration::from_secs(args.pack_min_age_secs),
+                grace: std::time::Duration::from_secs(args.pack_grace_secs),
             },
         );
     }
@@ -1225,6 +1231,8 @@ pub async fn run(
                 "/_admin/test/pack-reconcile",
                 post(packs::admin_test_reconcile),
             )
+            .route("/_admin/test/pack-compact", post(packs::admin_test_compact))
+            .route("/_admin/test/packs", get(packs::admin_test_list))
     } else {
         admin_routes
     };
