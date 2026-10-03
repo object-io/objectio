@@ -421,6 +421,10 @@ message ObjectMeta {
     // feature a lower level would misread. A reader below it refuses the
     // object instead of serving wrong bytes. 0: nothing beyond the base.
     uint32 required_level = 28;
+    // Order of writes to this object's metadata copies: a hybrid logical
+    // clock value (objectio_common::stamp). An OSD keeps the highest; a
+    // read takes the newest of a read quorum. 0 = unstamped.
+    uint64 stamp = 29;
 }
 
 // A full-object checksum, as S3 reports it.

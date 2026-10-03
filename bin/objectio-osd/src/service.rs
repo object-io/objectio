@@ -944,12 +944,24 @@ impl OsdService {
             timestamp: Self::current_timestamp(),
             replaced: None,
             replaced_version_kept: false,
+            superseded: false,
         }))
     }
 
     /// Whether a `PutObjectMeta` that expects `expected` (empty: anything)
     /// may replace `current`. No current entry passes, unless
     /// `require_existing`.
+    /// The answer to a write this copy already holds a newer one than.
+    fn superseded() -> Response<PutObjectMetaResponse> {
+        Response::new(PutObjectMetaResponse {
+            success: true,
+            timestamp: Self::current_timestamp(),
+            replaced: None,
+            replaced_version_kept: false,
+            superseded: true,
+        })
+    }
+
     fn precondition_holds(
         current: Option<&ObjectMeta>,
         expected: &[u8],
@@ -1980,6 +1992,9 @@ impl StorageService for OsdService {
                 let version_key =
                     MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
                 let prev = self.stored_meta(&version_key);
+                if supersedes(prev.as_ref(), &object) {
+                    return Ok(Self::superseded());
+                }
                 if req.version_only
                     && !Self::precondition_holds(
                         prev.as_ref(),
@@ -2006,9 +2021,13 @@ impl StorageService for OsdService {
                     timestamp: Self::current_timestamp(),
                     replaced: None,
                     replaced_version_kept: false,
+                    superseded: false,
                 }));
             }
 
+            if supersedes(old.as_ref(), &object) {
+                return Ok(Self::superseded());
+            }
             if !Self::precondition_holds(
                 old.as_ref(),
                 &req.expected_object_id,
@@ -2087,6 +2106,7 @@ impl StorageService for OsdService {
                 timestamp,
                 replaced: old,
                 replaced_version_kept,
+                superseded: false,
             }))
         })
     }
@@ -2531,6 +2551,18 @@ const NULL_VERSION: &str = "null";
 /// UUIDv7 version id carries it; the null version has no id, so its object
 /// id (a UUIDv7 too) does; older ids fall back to the modification time,
 /// in seconds. The gateway orders versions the same way.
+/// Whether `stored` is a newer write than `incoming`, so this copy keeps it
+/// (objectio-docs core/object-metadata-quorum.md): the higher stamp wins,
+/// and of equal stamps the higher object id, so every copy picks the same.
+/// The same write again is not newer than itself. An unstamped write (0, a
+/// previous-release writer during a rolling upgrade) is applied as before.
+fn supersedes(stored: Option<&ObjectMeta>, incoming: &ObjectMeta) -> bool {
+    incoming.stamp != 0
+        && stored.is_some_and(|s| {
+            (s.stamp, s.object_id.as_slice()) > (incoming.stamp, incoming.object_id.as_slice())
+        })
+}
+
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
     let ms_of = |u: uuid::Uuid| {
         (u.get_version_num() == 7)
@@ -3128,6 +3160,80 @@ mod integrity_tests {
         }))
         .await
         .map(drop)
+    }
+
+    fn stamped(object_id: u8, stamp: u64) -> ObjectMeta {
+        ObjectMeta {
+            stamp,
+            ..meta(object_id)
+        }
+    }
+
+    fn stored(osd: &OsdService) -> Option<ObjectMeta> {
+        osd.stored_meta(&MetadataKey::object_meta("b", "k"))
+    }
+
+    /// A copy keeps the newest write: an older stamp arriving late is
+    /// superseded, not applied (core/object-metadata-quorum.md).
+    #[tokio::test]
+    async fn a_copy_keeps_the_write_with_the_higher_stamp() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(2, 200), &[]).await.unwrap();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        assert_eq!(
+            stored(&osd).unwrap().object_id,
+            vec![2; 16],
+            "an older write won"
+        );
+
+        put(&osd, stamped(3, 300), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
+    }
+
+    /// Equal stamps: the higher object id wins on every copy; the same write
+    /// again is applied (idempotent); an unstamped write is applied as before.
+    #[tokio::test]
+    async fn ties_and_replays_and_unstamped_writes() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(5, 100), &[]).await.unwrap();
+        put(&osd, stamped(4, 100), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![5; 16]);
+        put(&osd, stamped(6, 100), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![6; 16]);
+
+        let again = osd
+            .put_object_meta(Request::new(PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(stamped(6, 100)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!again.superseded, "the same write again is not superseded");
+
+        put(&osd, meta(7), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![7; 16]);
+    }
+
+    /// A superseded write says so, and displaces nothing.
+    #[tokio::test]
+    async fn a_superseded_write_says_so() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(2, 200), &[]).await.unwrap();
+        let r = osd
+            .put_object_meta(Request::new(PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(stamped(1, 100)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(r.superseded);
+        assert!(r.replaced.is_none());
     }
 
     /// The repairer must not bring back an object deleted after it read it;

@@ -4828,6 +4828,11 @@ fn settle_commit(
     what: &str,
 ) {
     match outcome {
+        // Every copy already held a newer write of the key (last writer
+        // wins): nothing references this one's shards.
+        Ok(displaced) if !displaced.is_empty() && displaced.iter().all(|d| d.superseded) => {
+            spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
+        }
         Ok(displaced) if !versioning_enabled => spawn_reclaim(
             state,
             reclaimable_after_overwrite(displaced, new_object),
@@ -5298,6 +5303,7 @@ pub async fn put_object(
             replication: HashMap::new(),
             replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
             required_level: 0,
+            stamp: 0, // stamped when stored
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -5701,6 +5707,7 @@ pub async fn put_object(
         replication: HashMap::new(),
         replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
         required_level: 0,
+        stamp: 0, // stamped when stored
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.
