@@ -12,19 +12,21 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// This binary's format level. Level 0 is every release before levels
-/// existed (v0.4.0 and earlier); level 1 is the first that reports one.
+/// This binary's format level. Releases before levels existed (v0.4.0 and
+/// earlier) are not supported at all: a cluster on one is reinstalled, not
+/// upgraded, and a client that declares no level is refused.
 pub const FORMAT_LEVEL: u32 = 1;
 
 /// The lowest active level this binary can run in: it reads every format
 /// from this level up.
-pub const MIN_LEVEL: u32 = 0;
+pub const MIN_LEVEL: u32 = 1;
 
 /// The release, as tagged (`v` + the workspace version).
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 
 /// Meta config key holding the cluster's active level (decimal text).
-/// Absent means 0: a cluster from before levels existed.
+/// Absent (0) only while a new cluster is being set up, before its first
+/// OSD registers; then it is this release's level.
 pub const ACTIVE_LEVEL_KEY: &str = "cluster/active_level";
 
 /// The token in a meta client's `user-agent` that carries its level.
@@ -51,13 +53,13 @@ pub fn allows(level: u32) -> bool {
     active_level() >= level
 }
 
-/// Why this binary can't run in a cluster at `active`, if it can't.
-// `MIN_LEVEL` is 0 today, so its check can't fire yet; it rises when a
-// release drops the readers for a level's formats.
-#[allow(clippy::absurd_extreme_comparisons)]
+/// Why this binary can't run in a cluster at `active`, if it can't. An
+/// `active` of 0 is a cluster still being set up: anything may join.
 #[must_use]
 pub fn incompatibility(active: u32) -> Option<String> {
-    if FORMAT_LEVEL < active {
+    if active == 0 {
+        None
+    } else if FORMAT_LEVEL < active {
         Some(format!(
             "this binary (release {RELEASE}, format level {FORMAT_LEVEL}) is older than the \
              cluster, whose active level is {active}: run a release at level {active} or above"
@@ -79,7 +81,7 @@ pub fn user_agent() -> String {
 }
 
 /// The format level a caller's `user-agent` declares; 0 when it declares
-/// none (every release before levels existed).
+/// none, which no supported release does.
 #[must_use]
 pub fn level_of_user_agent(user_agent: &str) -> u32 {
     user_agent
@@ -100,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_from_before_levels_is_level_0() {
+    fn a_client_that_declares_no_level_is_level_0() {
         assert_eq!(level_of_user_agent("tonic/0.12.3"), 0);
         assert_eq!(level_of_user_agent(""), 0);
         assert_eq!(level_of_user_agent("objectio-level/x"), 0);
@@ -108,6 +110,7 @@ mod tests {
 
     #[test]
     fn compatibility_follows_the_levels() {
+        assert!(incompatibility(0).is_none(), "a cluster being set up");
         assert!(incompatibility(FORMAT_LEVEL).is_none());
         assert!(incompatibility(MIN_LEVEL).is_none());
         assert!(incompatibility(FORMAT_LEVEL + 1).is_some());
