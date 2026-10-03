@@ -194,7 +194,8 @@ mod tests {
         let cache = WriteCache::new(
             Arc::new(objectio_block::chunk::ChunkMapper::default()),
             objectio_block::CacheConfig::default(),
-        );
+        )
+        .unwrap();
         let out = render(&cache);
         assert!(
             out.contains("objectio_block_io_errors_total{protocol=\"nbd\",op=\"test-op\"} 1"),
