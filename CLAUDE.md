@@ -246,7 +246,7 @@ npm run lint     # eslint
 
 ## Documentation
 
-Design docs and user-facing reference live in a separate sibling repo `../objectio-docs/` (`DESIGN.md`, `FEATURES.md`, `architecture/`, `api/`, `deployment/`, `operations/`, `storage/`, `getting-started.md`). Clone it next to this repo. Check these before inventing explanations — design rationale for erasure coding, placement, and storage layout is already written down. The `examples/` directory (in this repo) has pyiceberg client scripts and sample config files.
+Design docs and user-facing reference live in a separate sibling repo `../objectio-docs/` (`DESIGN.md`, `FEATURES.md`, `architecture/`, `api/`, `deployment/`, `operations/`, `storage/`, `getting-started.md`). Clone it next to this repo. Designs live in `architecture/design/<area>/` — `core/` (storage engine, data protection, placement, meta: shared by object, block and file), `s3/`, `datalake/`, `security/`, `block/`, `file/`, `platform/` — indexed with status and roadmap rows in `architecture/design/README.md`; a new design goes in its area folder. Check these before inventing explanations — design rationale for erasure coding, placement, and storage layout is already written down. The `examples/` directory (in this repo) has pyiceberg client scripts and sample config files.
 
 ## Ports
 
@@ -269,7 +269,7 @@ setting any combination of `--admin-listen`, `--ops-console-listen`,
 bundles — an "ops" surface (full system admin) and a "tenant" surface
 (end-user self-service). See `console/vite.config.ts` for the
 multi-bundle build, `console/src/apps/{ops,tenant}/` for the per-bundle
-route maps, and `../objectio-docs/architecture/design/console-split.md`
+route maps, and `../objectio-docs/architecture/design/platform/console-split.md`
 for the rationale.
 
 The aio binary mirrors these flags as `--admin-port`,

@@ -1,6 +1,6 @@
 //! Bucket replication: every new version written to a bucket, copied to a
 //! bucket on another ObjectIO cluster (architecture/design/
-//! bucket-replication.md).
+//! s3/bucket-replication.md).
 //!
 //! - **Targets** (`/_admin/replication/targets`): the remote cluster's
 //!   endpoint and bucket, and credentials holding `s3:ReplicateObject` there.

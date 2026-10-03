@@ -36,7 +36,7 @@ default = []
 # (io_uring needs Linux 5.6+; we run on 5.15+ in practice).
 #
 # See src/io_backend.rs and docs at
-# ../../../objectio-docs/architecture/design/storage-io-levels.md
+# ../../../objectio-docs/architecture/design/core/storage-io-levels.md
 # for the measured trade-offs.
 io-uring = ["dep:tokio-uring"]
 

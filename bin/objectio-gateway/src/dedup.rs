@@ -1,6 +1,6 @@
 //! Deduplication: chunking, fingerprints, and the phase-1 dry-run.
 //!
-//! Design: objectio-docs `architecture/design/dedup.md`. Dry-run measures
+//! Design: objectio-docs `architecture/design/core/dedup.md`. Dry-run measures
 //! what dedup would save without changing how anything is stored: after a
 //! PUT or UploadPart has answered, its body is cut into content-defined
 //! chunks, each chunk fingerprinted within the bucket's dedup domain, and

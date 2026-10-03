@@ -197,7 +197,7 @@ struct ShardLocation {
 const SHARD_LOC_PREFIX: &[u8] = b"osd_loc:";
 
 /// Dedup dry-run: chunk fingerprints this OSD has been told about, each
-/// with how many times. See objectio-docs `architecture/design/dedup.md`.
+/// with how many times. See objectio-docs `architecture/design/core/dedup.md`.
 const DEDUP_NOTE_PREFIX: &[u8] = b"dedup_note:";
 
 fn dedup_note_key(fingerprint: &[u8]) -> MetadataKey {

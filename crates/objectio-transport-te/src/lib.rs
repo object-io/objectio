@@ -3,7 +3,7 @@
 //! Moves shard bytes between gateways and OSDs over RDMA — or over TCP, which
 //! is how it is developed and tested without RDMA hardware — while gRPC keeps
 //! carrying control. The design is
-//! `objectio-docs/architecture/design/rdma-data-plane.md`.
+//! `objectio-docs/architecture/design/core/rdma-data-plane.md`.
 //!
 //! Two halves:
 //!

@@ -3,7 +3,7 @@
 //! They follow from the policy set at each level. Shared by meta, which
 //! resolves it for every placement, and the gateway's admin API, which
 //! reads and writes it. Design: objectio-docs
-//! `architecture/design/dedup.md`.
+//! `architecture/design/core/dedup.md`.
 
 use crate::metadata::{DedupMode, DedupPolicy, DedupScope};
 

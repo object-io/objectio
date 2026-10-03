@@ -1,5 +1,5 @@
 //! Bucket replication between two clusters (architecture/design/
-//! bucket-replication.md): every version written to the source bucket
+//! s3/bucket-replication.md): every version written to the source bucket
 //! reaches the target bucket under the same version id, with the same
 //! bytes, metadata and tags — whatever happens to the fast path, and after
 //! the target was unreachable.

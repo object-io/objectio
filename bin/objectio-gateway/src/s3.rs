@@ -139,7 +139,7 @@ pub struct AppState {
     /// Objects of at most this many bytes are stored inline in their
     /// ObjectMeta rather than in shards (`--inline-max-size`; 0 = never).
     pub inline_max_size: usize,
-    /// Dedup dry-run queue (objectio-docs `architecture/design/dedup.md`).
+    /// Dedup dry-run queue (objectio-docs `architecture/design/core/dedup.md`).
     pub dedup: crate::dedup::DryRun,
     /// Proxies whose `X-Forwarded-For` names the client (`aws:SourceIp`).
     pub trusted_proxies: crate::origin::TrustedProxies,
