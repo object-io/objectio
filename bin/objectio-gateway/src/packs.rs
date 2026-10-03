@@ -677,10 +677,7 @@ pub async fn pack_objects(
 
 /// A pack's member, as recorded for reconciliation.
 fn member(c: &Candidate) -> PackMember {
-    let mut old_stripe = c.object.stripes.first().cloned().unwrap_or_default();
-    if old_stripe.object_id.is_empty() {
-        old_stripe.object_id.clone_from(&c.object.object_id);
-    }
+    let old_stripe = c.object.stripes.first().cloned().unwrap_or_default();
     PackMember {
         object_id: c.object.object_id.clone(),
         key: c.key.clone(),

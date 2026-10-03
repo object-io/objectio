@@ -47,8 +47,6 @@ pub struct OsdNode {
     pub node_id: [u8; 16],
     pub address: String,
     pub disk_ids: Vec<[u8; 16]>,
-    /// `(region, datacenter, rack)`, derived from `topology`.
-    pub failure_domain: Option<(String, String, String)>,
     /// Full 5-level topology `(region, zone, datacenter, rack, host)`.
     #[serde(default)]
     pub topology: Option<(String, String, String, String, String)>,

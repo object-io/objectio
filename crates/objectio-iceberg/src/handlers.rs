@@ -657,10 +657,7 @@ pub async fn load_table(
     let (metadata_location, metadata_bytes) = catalog.load_table(levels.clone(), &table).await?;
 
     if metadata_bytes.is_empty() {
-        return Err(IcebergError::internal(
-            "table metadata is empty — this table was likely created with an older catalog \
-             version that did not persist inline metadata; please drop and re-create the table",
-        ));
+        return Err(IcebergError::internal("table metadata is empty"));
     }
 
     let mut metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes)
@@ -751,10 +748,7 @@ pub async fn update_table(
     let (current_location, metadata_bytes) = catalog.load_table(levels.clone(), &table).await?;
 
     if metadata_bytes.is_empty() {
-        return Err(IcebergError::internal(
-            "table metadata is empty — this table was likely created with an older catalog \
-             version that did not persist inline metadata; please drop and re-create the table",
-        ));
+        return Err(IcebergError::internal("table metadata is empty"));
     }
 
     let mut md: serde_json::Value = serde_json::from_slice(&metadata_bytes)
