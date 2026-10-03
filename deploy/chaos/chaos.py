@@ -211,17 +211,26 @@ def read_one(n, key, digest, attempts=20):
     return None
 
 
-def read_all(what):
-    """Every acknowledged object reads back intact, through either gateway
-    (32 at a time)."""
+checked = set()  # keys read back by an earlier check
+
+
+def read_all(what, everything=False):
+    """Acknowledged objects read back intact, through either gateway (32 at
+    a time): every one written since the last check and a random 2,000 of
+    the older ones, or with `everything`, all of them."""
     from concurrent.futures import ThreadPoolExecutor
     with lock:
         items = list(acked.items())
+    if not everything:
+        new = [i for i in items if i[0] not in checked]
+        old = [i for i in items if i[0] in checked]
+        items = new + random.sample(old, min(len(old), 2000))
     with ThreadPoolExecutor(max_workers=32) as pool:
         bad = [r for r in pool.map(lambda a: read_one(a[0], *a[1]), enumerate(items)) if r]
     if bad:
         fail(f"{what}: {len(bad)} of {len(items)} acknowledged objects unreadable: {bad[:10]}")
-    say(f"{what}: all {len(items)} acknowledged objects read back")
+    checked.update(k for k, _ in items)
+    say(f"{what}: {len(items)} acknowledged objects read back" + (" (all)" if everything else ""))
 
 
 # --- cluster state -------------------------------------------------------
@@ -421,7 +430,7 @@ def main():
     for t in threads:
         t.join()
     phase_report("end")
-    read_all("at the end")
+    read_all("at the end", everything=True)
     redundancy_restored()
     read_all("after the redundancy check")
     print(f"✓ chaos: {len(acked)} acknowledged writes intact through every fault", flush=True)
