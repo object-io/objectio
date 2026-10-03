@@ -771,6 +771,20 @@ impl Cluster {
         self.request_inner(method, path, body, access_key, secret_key, extra)
     }
 
+    /// Signed request that hands back a transport failure (a node
+    /// restarting mid-request) instead of panicking on it.
+    ///
+    /// # Errors
+    /// The connection failed or was dropped before a response.
+    pub fn try_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<Response, reqwest::Error> {
+        self.send_inner(method, path, body, &self.access_key, &self.secret_key, &[])
+    }
+
     fn request_inner(
         &self,
         method: &str,
@@ -780,6 +794,19 @@ impl Cluster {
         secret_key: &str,
         extra_headers: &[(&str, &str)],
     ) -> Response {
+        self.send_inner(method, path, body, access_key, secret_key, extra_headers)
+            .expect("request")
+    }
+
+    fn send_inner(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        access_key: &str,
+        secret_key: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Response, reqwest::Error> {
         let payload_hash = hex::encode(Sha256::digest(body));
         let host = self.endpoint.trim_start_matches("http://").to_string();
         let (path_only, query) = match path.split_once('?') {
@@ -862,7 +889,7 @@ impl Cluster {
             req = req.body(body.to_vec());
         }
 
-        Response::from(req.send().expect("request"))
+        req.send().map(Response::from)
     }
 
     /// A request that signs `signed` too, each value as the raw bytes sent

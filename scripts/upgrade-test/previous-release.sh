@@ -30,7 +30,14 @@ if ! git -C "$root" cat-file -e "$tag:crates/objectio-common/src/version.rs" 2>/
     exit 1
 fi
 
-if [ ! -d "$src" ]; then
+# Reuse the checkout only if it really is the tag: a directory left behind
+# (a CI cache restores parts of target/) would otherwise build whatever
+# Cargo.toml it finds above it, i.e. the current tree.
+want=$(git -C "$root" rev-parse "$tag^{commit}")
+if [ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" != "$want" ] ||
+   [ "$(git -C "$src" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$src" 2>/dev/null && pwd -P)" ]; then
+    rm -rf "$src"
+    git -C "$root" worktree prune
     mkdir -p "$base"
     git -C "$root" worktree add --detach "$src" "$tag" >&2
 fi
@@ -41,5 +48,7 @@ fi
 )
 for b in objectio-meta objectio-osd objectio-gateway; do
     [ -x "$bins/$b" ] || { echo "missing $bins/$b" >&2; exit 1; }
+    got=$("$bins/$b" --version)
+    [ "$got" = "$b ${tag#v}" ] || { echo "$bins/$b is '$got', not $tag" >&2; exit 1; }
 done
 echo "$bins"

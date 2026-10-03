@@ -109,6 +109,30 @@ jobs:
       - name: run
         run: cargo test --package objectio-e2e -- --test-threads=1 --nocapture
 
+  upgrade:
+    name: rolling upgrade
+    runs-on: ubuntu-latest
+    # A cluster on the previous release, rolled node by node to this one
+    # under traffic (objectio-docs core/upgrade-path.md). The e2e job skips
+    # this test: it needs the previous release's binaries, built here.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the previous release is the latest tag
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: build this release
+        run: cargo build --bin objectio-meta --bin objectio-osd --bin objectio-gateway
+      - name: build the previous release
+        run: |
+          bins=$(scripts/upgrade-test/previous-release.sh)
+          echo "OBJECTIO_PREVIOUS_RELEASE_BIN=$bins" >> "$GITHUB_ENV"
+      - name: run
+        run: cargo test --package objectio-e2e --test rolling_upgrade -- --nocapture
+
   image:
     name: docker image
     runs-on: ubuntu-latest
