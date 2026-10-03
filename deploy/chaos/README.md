@@ -27,7 +27,7 @@ injects, one at a time:
 | power-off | an OSD-only VM switched off for a minute |
 | meta-power-off | a meta VM switched off for a minute |
 | partition | the meta leader's VM cut off the network for a minute (its interface taken down) |
-| disk-pull | an OSD's disk unplugged (the Incus device removed), the OSD set `out`, a new disk plugged in as its replacement |
+| disk-pull | an OSD's disk unplugged (the Incus device removed), the OSD set `out`, a new disk plugged in, the OSD back on it and set `in`; repair rebuilds what the old disk held |
 
 and checks, after each:
 

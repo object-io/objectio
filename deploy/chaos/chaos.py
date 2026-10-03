@@ -11,7 +11,8 @@ are injected one at a time, each held, healed and left to settle:
   partition       the meta leader's VM cut off the network for a minute
                   (its interface taken down)
   disk-pull       an OSD's disk unplugged; the OSD set out; a new disk
-                  plugged in as its replacement (a new OSD)
+                  plugged in; the OSD back on it and set in (repair
+                  rebuilds what the old disk held)
 
 Invariants, checked after every fault and at the end:
   - every write a gateway acknowledged reads back byte for byte;
@@ -351,15 +352,22 @@ def disk_pull(vm="chaos-5"):
     incus("storage", "volume", "create", "default", f"{vm}-osd2", "--type=block", "size=16GiB")
     incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={vm}-osd2")
     vm_exec(vm, "sleep 3; systemctl restart objectio-osd")
+    # The documented replacement: the OSD comes back on the new disk under
+    # its identity (its metadata lives in its state directory; the shards
+    # the old disk held are dropped), still out until the operator sets it
+    # in; then repair rebuilds what it held, in place.
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        new = osd_of(vm)
-        if new and new["node_id"] != old["node_id"] and new.get("online"):
+        back = osd_of(vm)
+        if back and back["node_id"] == old["node_id"] and back.get("online"):
             break
         time.sleep(3)
     else:
-        fail(f"{vm}'s replacement OSD never joined")
-    say(f"disk-pull: replacement OSD {new['node_id']} joined")
+        fail(f"{vm}'s OSD never came back on the new disk")
+    status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "in"})
+    if status != 200:
+        fail(f"set in: {status} {data[:200]}")
+    say(f"disk-pull: OSD {old['node_id']} back on the new disk, set in")
     settle("disk-pull")
 
 
