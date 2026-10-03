@@ -42,6 +42,12 @@ pub enum MetaCommand {
         key: String,
         value: Vec<u8>,
         updated_by: String,
+        /// When the leader accepted it (Unix seconds), so every replica
+        /// stores the same entry. Absent in entries from releases before
+        /// it existed; those take the applying node's clock. Older nodes
+        /// ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<u64>,
     },
     /// Delete a cluster config entry. Idempotent — deleting a missing key
     /// applies successfully and returns `existed: false`.
@@ -204,6 +210,44 @@ declare_raft_types!(
 mod tests {
     use super::*;
 
+    /// A `SetConfig` from a release before `updated_at` existed still
+    /// decodes; one without it encodes as those releases wrote it, and
+    /// one with it is read by them as before (serde ignores the field).
+    #[test]
+    fn set_config_is_compatible_both_ways() {
+        let old = r#"{"SetConfig":{"key":"k","value":[1],"updated_by":"u"}}"#;
+        match serde_json::from_str::<MetaCommand>(old).unwrap() {
+            MetaCommand::SetConfig { updated_at, .. } => assert_eq!(updated_at, None),
+            other => panic!("{other:?}"),
+        }
+        let none = MetaCommand::SetConfig {
+            key: "k".into(),
+            value: vec![1],
+            updated_by: "u".into(),
+            updated_at: None,
+        };
+        assert_eq!(serde_json::to_string(&none).unwrap(), old);
+
+        #[derive(serde::Deserialize)]
+        enum OldCommand {
+            SetConfig {
+                #[allow(dead_code)]
+                key: String,
+            },
+        }
+        let new = MetaCommand::SetConfig {
+            key: "k".into(),
+            value: vec![1],
+            updated_by: "u".into(),
+            updated_at: Some(7),
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<OldCommand>(&json).unwrap(),
+            OldCommand::SetConfig { .. }
+        ));
+    }
+
     #[test]
     fn commands_round_trip_through_serde() {
         // The log stores commands serialized; any format change breaks
@@ -213,6 +257,7 @@ mod tests {
                 key: "license/active".into(),
                 value: b"hello".to_vec(),
                 updated_by: "console".into(),
+                updated_at: None,
             },
             MetaCommand::DeleteConfig {
                 key: "license/active".into(),

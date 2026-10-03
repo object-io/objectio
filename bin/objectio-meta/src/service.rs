@@ -8267,6 +8267,7 @@ impl MetadataService for MetaService {
                     key: req.key.clone(),
                     value: req.value.clone(),
                     updated_by: req.updated_by.clone(),
+                    updated_at: Some(Self::current_timestamp()),
                 })
                 .await
             {
