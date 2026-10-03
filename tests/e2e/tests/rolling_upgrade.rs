@@ -54,16 +54,17 @@ fn assert_all_readable(c: &Cluster, stored: &Stored, when: &str) {
     for (path, bytes) in &objects {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let r = c.request("GET", path, &[]);
-            if r.status == 200 {
-                assert!(r.bytes == *bytes, "{when}: {path} came back different");
-                break;
-            }
+            let why = match c.try_request("GET", path, &[]) {
+                Ok(r) if r.status == 200 => {
+                    assert!(r.bytes == *bytes, "{when}: {path} came back different");
+                    break;
+                }
+                Ok(r) => format!("{} {}", r.status, r.text()),
+                Err(e) => e.to_string(),
+            };
             assert!(
                 Instant::now() < deadline,
-                "{when}: {path} unreadable: {} {}",
-                r.status,
-                r.text()
+                "{when}: {path} unreadable: {why}"
             );
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -78,7 +79,9 @@ fn writer(endpoint: &str, ak: &str, sk: &str, stored: &Stored, stop: &AtomicBool
     while !stop.load(Ordering::Relaxed) {
         let path = format!("/traffic/k{n}");
         let bytes = payload(1000 + usize::try_from(n % 7).unwrap() * 20_000, n);
-        if c.request("PUT", &path, &bytes).status == 200 {
+        if c.try_request("PUT", &path, &bytes)
+            .is_ok_and(|r| r.status == 200)
+        {
             stored.lock().unwrap().insert(path, bytes);
         }
         n += 1;
