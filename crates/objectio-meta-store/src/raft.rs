@@ -42,6 +42,9 @@ pub enum MetaCommand {
         key: String,
         value: Vec<u8>,
         updated_by: String,
+        /// When the leader accepted it (Unix seconds), so every replica
+        /// stores the same entry.
+        updated_at: u64,
     },
     /// Delete a cluster config entry. Idempotent — deleting a missing key
     /// applies successfully and returns `existed: false`.
@@ -213,6 +216,7 @@ mod tests {
                 key: "license/active".into(),
                 value: b"hello".to_vec(),
                 updated_by: "console".into(),
+                updated_at: 0,
             },
             MetaCommand::DeleteConfig {
                 key: "license/active".into(),

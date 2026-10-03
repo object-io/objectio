@@ -127,11 +127,7 @@ impl MetaRaftStorage {
 
     fn save_state(&self, state: &RaftPersistentState) -> Result<(), StorageError<NodeId>> {
         let txn = self.db.begin_write().map_err(write_err)?;
-        {
-            let mut t = txn.open_table(tables::RAFT_STATE).map_err(write_err)?;
-            let encoded = serde_json::to_vec(state).map_err(|e| encode_err("raft_state", e))?;
-            t.insert("state", encoded.as_slice()).map_err(write_err)?;
-        }
+        write_state(&txn, state)?;
         crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
@@ -148,6 +144,7 @@ impl MetaRaftStorage {
                 key,
                 value,
                 updated_by,
+                updated_at,
             } => {
                 state.config_version += 1;
                 let version = state.config_version;
@@ -158,19 +155,20 @@ impl MetaRaftStorage {
                 let entry = objectio_proto::metadata::ConfigEntry {
                     key: key.clone(),
                     value: value.clone(),
-                    updated_at: now_unix(),
+                    updated_at: *updated_at,
                     updated_by: updated_by.clone(),
                     version,
                 };
                 let bytes = entry.encode_to_vec();
+                state.last_applied = Some(log_id);
                 let txn = self.db.begin_write().map_err(write_err)?;
                 {
                     let mut t = txn.open_table(tables::CONFIG).map_err(write_err)?;
                     t.insert(key.as_str(), bytes.as_slice())
                         .map_err(write_err)?;
                 }
+                write_state(&txn, state)?;
                 crate::commit_metrics::commit(txn).map_err(write_err)?;
-                state.last_applied = Some(log_id);
                 // Followers refresh their config cache from this, as they
                 // do for a MultiCas on the config table. Without it a
                 // setting changed through the leader stayed stale on every
@@ -179,13 +177,14 @@ impl MetaRaftStorage {
                 Ok(MetaResponse::ConfigSet { version })
             }
             MetaCommand::DeleteConfig { key } => {
+                state.last_applied = Some(log_id);
                 let txn = self.db.begin_write().map_err(write_err)?;
                 let existed = {
                     let mut t = txn.open_table(tables::CONFIG).map_err(write_err)?;
                     t.remove(key.as_str()).map_err(write_err)?.is_some()
                 };
+                write_state(&txn, state)?;
                 crate::commit_metrics::commit(txn).map_err(write_err)?;
-                state.last_applied = Some(log_id);
                 self.notify_config(key, None);
                 Ok(MetaResponse::ConfigDeleted { existed })
             }
@@ -228,8 +227,9 @@ impl MetaRaftStorage {
                         None => (false, false),
                     }
                 };
-                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 state.last_applied = Some(log_id);
+                write_state(&txn, state)?;
+                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 Ok(MetaResponse::OsdAdminStateSet { changed, found })
             }
             MetaCommand::MultiCas {
@@ -252,6 +252,18 @@ impl MetaRaftStorage {
             });
         }
     }
+}
+
+/// Write `state` (`last_applied`, the config version, membership) into
+/// `txn`, so it commits with whatever the entry being applied wrote.
+fn write_state(
+    txn: &redb::WriteTransaction,
+    state: &RaftPersistentState,
+) -> Result<(), StorageError<NodeId>> {
+    let mut t = txn.open_table(tables::RAFT_STATE).map_err(write_err)?;
+    let encoded = serde_json::to_vec(state).map_err(|e| encode_err("raft_state", e))?;
+    t.insert("state", encoded.as_slice()).map_err(write_err)?;
+    Ok(())
 }
 
 /// Apply a [`MetaCommand::MultiCas`] inside a single redb write-txn.
@@ -307,10 +319,9 @@ fn apply_multi_cas(
         // Abort: drop the txn without commit. No partial state changes.
         // `last_applied` still advances so the log entry isn't retried.
         drop(txn);
+        state.last_applied = Some(log_id);
         let commit_txn = db.begin_write().map_err(write_err)?;
-        let mut s_state = state.clone();
-        s_state.last_applied = Some(log_id);
-        *state = s_state;
+        write_state(&commit_txn, state)?;
         crate::commit_metrics::commit(commit_txn).map_err(write_err)?;
         // Only persist `last_applied` here so follower replay sees the
         // same committed position. The failed indices go back to the
@@ -334,8 +345,11 @@ fn apply_multi_cas(
         }
     }
 
-    crate::commit_metrics::commit(txn).map_err(write_err)?;
+    // `last_applied` moves in the same transaction as the writes: a crash
+    // can't leave them applied and the entry due to be applied again.
     state.last_applied = Some(log_id);
+    write_state(&txn, state)?;
+    crate::commit_metrics::commit(txn).map_err(write_err)?;
 
     // Fan out apply events after the commit lands on disk. Send is
     // non-fatal: a dropped receiver (service crash, not yet wired up)
@@ -404,14 +418,6 @@ fn hex_encode_16(bytes: &[u8; 16]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
-}
-
-/// Current unix timestamp, used to stamp `updated_at` on config writes.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------
@@ -909,6 +915,89 @@ mod tests {
         }
     }
 
+    /// A config entry applied on two replicas is byte-identical: the
+    /// timestamp comes from the command, not from each node's clock.
+    #[tokio::test]
+    async fn a_config_entry_is_the_same_on_every_replica() {
+        let cmd = MetaCommand::SetConfig {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            updated_by: "t".into(),
+            updated_at: 1_700_000_000,
+        };
+        let mut stored = Vec::new();
+        for _ in 0..2 {
+            let (_d, mut s) = storage();
+            s.apply_to_state_machine(&[normal_entry(1, cmd.clone())])
+                .await
+                .unwrap();
+            let txn = s.db.begin_read().unwrap();
+            let t = txn.open_table(tables::CONFIG).unwrap();
+            stored.push(t.get("k").unwrap().unwrap().value().to_vec());
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+        assert_eq!(stored[0], stored[1]);
+    }
+
+    /// `last_applied` commits with the entry's writes: once an entry is
+    /// applied, a restart (which reads the stored state) doesn't apply it
+    /// again, whether or not the batch finished.
+    #[tokio::test]
+    async fn an_applied_entry_is_recorded_as_applied_in_the_same_commit() {
+        for cmd in [
+            MetaCommand::SetConfig {
+                key: "k".into(),
+                value: b"v".to_vec(),
+                updated_by: "t".into(),
+                updated_at: 0,
+            },
+            MetaCommand::DeleteConfig { key: "k".into() },
+            MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Named("t".into()),
+                    key: "k".into(),
+                    expected: None,
+                    new_value: Some(b"x".to_vec()),
+                }],
+                requested_by: "t".into(),
+            },
+            // A conflict applies nothing, but is still applied.
+            MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Named("t".into()),
+                    key: "k".into(),
+                    expected: Some(b"never".to_vec()),
+                    new_value: Some(b"y".to_vec()),
+                }],
+                requested_by: "t".into(),
+            },
+        ] {
+            let (_d, s) = storage();
+            let mut state = s.load_state().unwrap();
+            // Apply the command alone, as a crash before the batch's own
+            // save of the state would leave it.
+            s.apply_command(&mut state, &cmd, log_id(1, 5)).unwrap();
+            let stored = s.load_state().unwrap();
+            assert_eq!(stored.last_applied, Some(log_id(1, 5)), "{cmd:?}");
+        }
+    }
+
+    /// The config version moves with the entry too, so it can't be counted
+    /// twice by an entry applied again after a crash.
+    #[tokio::test]
+    async fn the_config_version_is_stored_with_the_entry() {
+        let (_d, s) = storage();
+        let mut state = s.load_state().unwrap();
+        let cmd = MetaCommand::SetConfig {
+            key: "k".into(),
+            value: b"v".to_vec(),
+            updated_by: "t".into(),
+            updated_at: 0,
+        };
+        s.apply_command(&mut state, &cmd, log_id(1, 1)).unwrap();
+        assert_eq!(s.load_state().unwrap().config_version, 1);
+    }
+
     #[tokio::test]
     async fn vote_round_trip() {
         let (_d, mut s) = storage();
@@ -929,6 +1018,7 @@ mod tests {
                     key: "a".into(),
                     value: b"1".to_vec(),
                     updated_by: "t".into(),
+                    updated_at: 0,
                 },
             ),
             normal_entry(
@@ -937,6 +1027,7 @@ mod tests {
                     key: "b".into(),
                     value: b"2".to_vec(),
                     updated_by: "t".into(),
+                    updated_at: 0,
                 },
             ),
             normal_entry(
@@ -945,6 +1036,7 @@ mod tests {
                     key: "c".into(),
                     value: b"3".to_vec(),
                     updated_by: "t".into(),
+                    updated_at: 0,
                 },
             ),
         ];
@@ -977,6 +1069,7 @@ mod tests {
                 key: "license/active".into(),
                 value: b"signed-license-bytes".to_vec(),
                 updated_by: "console".into(),
+                updated_at: 0,
             },
         );
         let del = normal_entry(
@@ -1267,6 +1360,7 @@ mod tests {
                     key: "k".into(),
                     value: b"v".to_vec(),
                     updated_by: "t".into(),
+                    updated_at: 0,
                 },
             );
             s.apply_to_state_machine(&[e]).await.unwrap();
