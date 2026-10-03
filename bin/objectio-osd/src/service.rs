@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::usage::{EntryKind, UsageTracker};
@@ -174,6 +174,19 @@ pub struct OsdStatus {
     pub total_used: u64,
     pub total_shards: u64,
     pub uptime_secs: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: make recording (or forgetting) a shard's location fail, as an
+    /// unwritable or full metadata log would. Per thread, so a test's
+    /// failures stay in that test.
+    static LOCATION_RECORDS_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn location_records_fail() -> bool {
+    LOCATION_RECORDS_FAIL.with(std::cell::Cell::get)
 }
 
 /// Shard location stored in memory. Mirrored to the persistent
@@ -485,8 +498,10 @@ impl OsdService {
         let before = persisted.len();
         persisted.retain(|key, loc| {
             let lost = formatted_now.get(loc.disk_idx).copied().unwrap_or(false);
-            if lost {
-                let _ = Self::forget_shard_location(&meta_store, key);
+            if lost && let Err(e) = Self::forget_shard_location(&meta_store, key) {
+                // Harmless if it stays: the disk was formatted, so the
+                // entry's CRC never matches and the shard reads as corrupt.
+                warn!("forgetting shard {key} on a formatted disk: {e}");
             }
             !lost
         });
@@ -1062,6 +1077,10 @@ impl OsdService {
         shard_key: &str,
         loc: &ShardLocation,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if location_records_fail() {
+            return Err("injected: the metadata log is unwritable".into());
+        }
         let key = Self::shard_loc_meta_key(shard_key);
         let value = bincode::serialize(loc).map_err(|e| e.to_string())?;
         meta_store
@@ -1075,6 +1094,10 @@ impl OsdService {
         meta_store: &MetadataStore,
         shard_key: &str,
     ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if location_records_fail() {
+            return Err("injected: the metadata log is unwritable".into());
+        }
         let key = Self::shard_loc_meta_key(shard_key);
         meta_store
             .delete(&key)
@@ -1214,8 +1237,13 @@ impl StorageService for OsdService {
         for key in keys {
             let removed = self.shard_index.write().remove(&key);
             if let Some(loc) = removed {
+                // As in DeleteShard: blocks are freed only once the removal
+                // is durable. Otherwise stop; the purge is retried.
                 if let Err(e) = Self::forget_shard_location(&self.meta_store, &key) {
-                    warn!("purge: forgetting shard {key}: {e}");
+                    self.shard_index.write().entry(key.clone()).or_insert(loc);
+                    return Err(Status::unavailable(format!(
+                        "purge: the removal of shard {key} could not be recorded ({e}); retry"
+                    )));
                 }
                 self.free_location(&loc);
                 shards += 1;
@@ -1375,15 +1403,32 @@ impl StorageService for OsdService {
         // reactor stays free during the syscall / io_uring wait. On
         // Linux + --features io-uring this is +25% throughput on
         // 4 MiB stripes vs the old sync path (see storage-io-levels.md).
+        // Nothing records this extent until the location below, so if the
+        // write or the sync fails the extent goes straight back.
+        let fail = |status: Status| {
+            self.grpc_metrics.write_shard.record(
+                false,
+                start.elapsed().as_micros() as u64,
+                bytes_in,
+                0,
+            );
+            status
+        };
         let started = Instant::now();
-        disk.write_block_async(block_num, object_id, shard_id.stripe_id, data)
+        if let Err(e) = disk
+            .write_block_async(block_num, object_id, shard_id.stripe_id, data)
             .await
-            .map_err(|e| Status::internal(format!("write failed: {}", e)))?;
+        {
+            let _ = disk.free_extent(block_num, blocks);
+            return Err(fail(Status::internal(format!("write failed: {e}"))));
+        }
         DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
 
         let started = Instant::now();
-        disk.sync()
-            .map_err(|e| Status::internal(format!("sync failed: {}", e)))?;
+        if let Err(e) = disk.sync() {
+            let _ = disk.free_extent(block_num, blocks);
+            return Err(fail(Status::internal(format!("sync failed: {e}"))));
+        }
         DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
 
         // Store location in index
@@ -1397,16 +1442,19 @@ impl StorageService for OsdService {
             crc32c,
             created_at: timestamp,
         };
-        // Persist to the WAL-backed MetadataStore before inserting into
-        // the in-memory index — if the put fails the in-memory state
-        // stays accurate to what's actually recoverable. A failure
-        // here is non-fatal (the shard bytes are on disk); log loud
-        // so we notice the drift.
+        // Durable before acknowledged: the shard's bytes are synced, and
+        // its location must be too, or a restart forgets the shard and the
+        // write we acknowledged is gone. So a failure here fails the write.
+        //
+        // The extent is not freed: the failed record may still have reached
+        // the log, and a restart that replays it must find these bytes in
+        // its blocks, not another shard's. It is reclaimed at restart if the
+        // record didn't survive (the bitmap is rebuilt from the index).
         if let Err(e) = Self::persist_shard_location(&self.meta_store, &key, &loc) {
-            warn!(
-                "Failed to persist shard_location for {key}: {e} — \
-                 in-memory only, will be lost on restart"
-            );
+            error!("Shard {key} written but its location not recorded: {e}; write refused");
+            return Err(fail(Status::unavailable(format!(
+                "the shard's location could not be recorded durably ({e}); not stored, retry"
+            ))));
         }
         let replaced = self.shard_index.write().insert(key.clone(), loc);
         // Rewriting a shard that is already here — the repairer replacing a
@@ -1572,12 +1620,22 @@ impl StorageService for OsdService {
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
 
         let removed = self.shard_index.write().remove(&key);
-        // Mirror the removal in the persistent index so a future
-        // restart doesn't resurrect the deleted shard.
-        if removed.is_some()
+        // Mirror the removal in the persistent index before the blocks are
+        // freed. If that fails, the persisted entry still points at these
+        // blocks: freeing them would let another shard's bytes sit where a
+        // restart expects this one. So the shard stays, and the delete is
+        // refused for the caller to retry.
+        if let Some(loc) = removed.as_ref()
             && let Err(e) = Self::forget_shard_location(&self.meta_store, &key)
         {
-            warn!("Failed to persist shard delete for {key}: {e}");
+            self.shard_index
+                .write()
+                .entry(key.clone())
+                .or_insert_with(|| loc.clone());
+            error!("Shard {key}: its removal could not be recorded: {e}; delete refused");
+            return Err(Status::unavailable(format!(
+                "the shard's removal could not be recorded durably ({e}); retry"
+            )));
         }
 
         // Return the block to the pool. This used to be a comment saying a
@@ -2734,6 +2792,88 @@ mod grpc_write_tests {
             free_space(&osd),
             free_before,
             "a refused shard kept its blocks"
+        );
+    }
+
+    fn reopen(dir: &tempfile::TempDir) -> OsdService {
+        OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap()
+    }
+
+    /// An acknowledgement means the shard survives a restart, so a shard
+    /// whose location can't be recorded durably is refused, not
+    /// acknowledged and then forgotten at the next restart.
+    #[tokio::test]
+    async fn a_write_whose_location_cannot_be_recorded_is_refused() {
+        let (dir, osd) = osd();
+        let data = vec![0x33; 50_000];
+        let free_before = free_space(&osd);
+
+        LOCATION_RECORDS_FAIL.with(|f| f.set(true));
+        let err = osd
+            .write_shard(Request::new(write_request(&data, None)))
+            .await
+            .unwrap_err();
+        LOCATION_RECORDS_FAIL.with(|f| f.set(false));
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert_eq!(
+            read_back(&osd).await.unwrap_err().code(),
+            tonic::Code::NotFound,
+            "a refused shard was served"
+        );
+
+        // A retry stores it, and it survives a restart; the extent the
+        // refused attempt held is reclaimed there.
+        osd.write_shard(Request::new(write_request(&data, None)))
+            .await
+            .unwrap();
+        drop(osd);
+        let osd = reopen(&dir);
+        assert_eq!(&read_back(&osd).await.unwrap().data[..], &data[..]);
+        let one_shard = osd.disks[0].blocks_for_len(data.len()) * 64 * 1024;
+        assert_eq!(
+            free_space(&osd),
+            free_before - one_shard,
+            "the refused attempt's extent was not reclaimed"
+        );
+    }
+
+    /// A delete frees blocks only once the removal is durable: otherwise a
+    /// restart would find the old entry pointing at blocks another shard
+    /// may have been given.
+    #[tokio::test]
+    async fn a_delete_whose_removal_cannot_be_recorded_keeps_the_shard() {
+        let (dir, osd) = osd();
+        let data = vec![0x44; 50_000];
+        osd.write_shard(Request::new(write_request(&data, None)))
+            .await
+            .unwrap();
+        let free_with_shard = free_space(&osd);
+        let delete = || {
+            osd.delete_shard(Request::new(DeleteShardRequest {
+                shard_id: Some(shard_id()),
+            }))
+        };
+
+        LOCATION_RECORDS_FAIL.with(|f| f.set(true));
+        let err = delete().await.unwrap_err();
+        LOCATION_RECORDS_FAIL.with(|f| f.set(false));
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{err}");
+        assert_eq!(&read_back(&osd).await.unwrap().data[..], &data[..]);
+        assert_eq!(free_space(&osd), free_with_shard, "blocks freed anyway");
+
+        // The retry deletes it, for good.
+        assert!(delete().await.unwrap().into_inner().success);
+        drop(osd);
+        let osd = reopen(&dir);
+        assert_eq!(
+            read_back(&osd).await.unwrap_err().code(),
+            tonic::Code::NotFound,
+            "the deleted shard came back after a restart"
         );
     }
 
