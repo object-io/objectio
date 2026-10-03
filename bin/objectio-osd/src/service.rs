@@ -423,6 +423,32 @@ fn resolve_node_identity(
     Ok((id, Uuid::nil(), false))
 }
 
+/// Move everything in `data_dir` into `data_dir/replaced-<unix time>/`: the
+/// state of an OSD whose disks were all replaced.
+fn retire_state(data_dir: &std::path::Path) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let to = data_dir.join(format!("replaced-{stamp}"));
+    std::fs::create_dir_all(&to).map_err(|e| format!("cannot create {}: {e}", to.display()))?;
+    let entries = std::fs::read_dir(data_dir)
+        .map_err(|e| format!("cannot read {}: {e}", data_dir.display()))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("replaced-") {
+            continue;
+        }
+        std::fs::rename(entry.path(), to.join(&name))
+            .map_err(|e| format!("cannot move {} aside: {e}", entry.path().display()))?;
+    }
+    warn!(
+        "every disk is new: this OSD's previous state (identity, metadata) moved to {}; \
+         starting as a new OSD",
+        to.display()
+    );
+    Ok(())
+}
+
 impl OsdService {
     /// Create a new OSD service with the given disks
     ///
@@ -493,9 +519,21 @@ impl OsdService {
             return Err("No disks configured".into());
         }
 
+        // Every disk blank (just formatted) while the state directory holds
+        // an identity: the disks that state describes are gone (replaced),
+        // and with them every shard its metadata names. Coming back under
+        // that identity would bring back an OSD the operator retired (set
+        // out), claiming shards it no longer has. Its state is moved aside
+        // (kept, not deleted) and the OSD starts as a new one: repair
+        // rebuilds onto it (objectio-docs operations/failure-recovery.md,
+        // replacing a disk).
+        let id_path = data_dir.join("node_id");
+        if formatted_now.iter().all(|f| *f) && id_path.exists() {
+            retire_state(&data_dir)?;
+        }
+
         // Identity resolution: prefer any disk's superblock, then
         // state-PVC fallback, then generate fresh.
-        let id_path = data_dir.join("node_id");
         let (node_id, cluster_uuid, from_disk) = resolve_node_identity(&disks, &id_path)?;
 
         // If the identity came from the state PVC (or was freshly
@@ -2857,6 +2895,33 @@ mod grpc_write_tests {
         )
         .unwrap();
         (dir, osd)
+    }
+
+    /// A disk replaced by a blank one: the OSD comes back as a new OSD (new
+    /// identity, its old state moved aside), not as the one the operator
+    /// retired, claiming shards it no longer has. The same disk again keeps
+    /// the identity.
+    #[test]
+    fn a_blank_replacement_disk_makes_a_new_osd() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disk.raw");
+        let state = dir.path().join("state");
+        let start =
+            || OsdService::new(vec![disk.display().to_string()], 64 * 1024, state.clone()).unwrap();
+        let first = start().node_id;
+        assert_eq!(start().node_id, first, "the same disk keeps its identity");
+
+        std::fs::remove_file(&disk).unwrap(); // the disk is replaced
+        let second = start().node_id;
+        assert_ne!(
+            second, first,
+            "a blank disk under old state made the old OSD again"
+        );
+        let archived = std::fs::read_dir(&state)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("replaced-"));
+        assert!(archived, "the previous state is kept aside");
     }
 
     fn shard_id() -> ShardId {
