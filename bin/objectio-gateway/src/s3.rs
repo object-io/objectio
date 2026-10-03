@@ -2081,9 +2081,11 @@ impl S3Error {
     /// leader change, a node restarting) is 503 ServiceUnavailable, which
     /// S3 clients retry; anything else is 500 InternalError. tonic reports
     /// a connection that dropped (the node it went to was killed) as
-    /// Unknown "transport error": that is unavailable too.
+    /// Unknown "transport error", and a call that ran out of time as
+    /// Cancelled "Timeout expired": those are unavailable too.
     pub fn from_status(e: &tonic::Status) -> Response {
-        let dropped = e.code() == tonic::Code::Unknown && e.message() == "transport error";
+        let dropped = (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+            || (e.code() == tonic::Code::Cancelled && e.message() == "Timeout expired");
         if dropped
             || matches!(
                 e.code(),
@@ -13405,6 +13407,7 @@ mod status_tests {
             tonic::Status::unavailable("forwarding to the raft leader failed; retry"),
             tonic::Status::deadline_exceeded("slow"),
             tonic::Status::unknown("transport error"),
+            tonic::Status::cancelled("Timeout expired"),
         ] {
             assert_eq!(
                 S3Error::from_status(&e).status(),

@@ -71,12 +71,21 @@ pub struct OsdNode {
     pub client: StorageServiceClient<Channel>,
 }
 
+/// How long an OSD address that just failed at the transport level (no
+/// connection, a timeout, a dropped connection) is failed fast, without
+/// trying it. A host that vanished without resetting its connections would
+/// otherwise cost every request a timeout; meanwhile writes go on with the
+/// other shards (the write quorum) and repair rebuilds the missing one.
+const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Pool of OSD connections for multi-node operations
 pub struct OsdPool {
     /// Connected nodes: node_id -> OsdNode
     nodes: RwLock<HashMap<NodeId, OsdNode>>,
     /// Address to node_id mapping for deduplication
     address_map: RwLock<HashMap<String, NodeId>>,
+    /// Addresses that failed at the transport level, and when.
+    unreachable: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl OsdPool {
@@ -85,6 +94,31 @@ impl OsdPool {
         Self {
             nodes: RwLock::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
+            unreachable: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `address` failed at the transport level: fail it fast for a while.
+    pub fn mark_unreachable(&self, address: &str) {
+        self.unreachable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string(), std::time::Instant::now());
+    }
+
+    /// Whether `address` failed at the transport level within `FAIL_FAST`.
+    fn is_unreachable(&self, address: &str) -> bool {
+        let mut m = self
+            .unreachable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match m.get(address) {
+            Some(at) if at.elapsed() < FAIL_FAST => true,
+            Some(_) => {
+                m.remove(address);
+                false
+            }
+            None => false,
         }
     }
 
@@ -121,11 +155,22 @@ impl OsdPool {
 
         // Connect with increased message size limit (100MB for large objects)
         let max_message_size = 100 * 1024 * 1024; // 100 MB
+        // A dead host is noticed in seconds: connecting gives up after 3 s,
+        // and an open connection that stops answering keepalives is closed
+        // after about 10 s, failing what is in flight on it.
         let channel = tonic::transport::Endpoint::new(address.to_string())
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
+            .keep_alive_timeout(std::time::Duration::from_secs(5))
+            .keep_alive_while_idle(true)
             .connect()
             .await
-            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| {
+                self.mark_unreachable(address);
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?;
 
         let client = StorageServiceClient::new(channel)
             .max_decoding_message_size(max_message_size)
@@ -180,6 +225,12 @@ impl OsdPool {
     ) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
         let id = NodeId::from_bytes(node_id)
             .ok_or_else(|| OsdPoolError::NodeNotFound("invalid node ID".to_string()))?;
+        if self.is_unreachable(address) {
+            return Err(OsdPoolError::ConnectionFailed(format!(
+                "{address} failed in the last {} s; not tried",
+                FAIL_FAST.as_secs()
+            )));
+        }
 
         // Try to get existing client first (fast path)
         if let Some(node) = self.nodes.read().await.get(&id) {
@@ -255,6 +306,14 @@ pub struct RdmaSource<'a> {
     pub addr: u64,
 }
 
+/// Whether `e` says the OSD could not be reached (as opposed to an answer
+/// from it): unavailable, or a connection that dropped, which tonic reports
+/// as Unknown "transport error".
+fn is_transport_failure(e: &tonic::Status) -> bool {
+    e.code() == tonic::Code::Unavailable
+        || (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+}
+
 /// A shard call that did not succeed.
 enum ShardCallError {
     Connect(OsdPoolError),
@@ -318,6 +377,7 @@ async fn call_write_shard(
     let response = result
         .map_err(|_| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            pool.mark_unreachable(&placement.node_address);
             error!(
                 "Timeout writing shard {} to OSD {}",
                 position, placement.node_address
@@ -326,6 +386,9 @@ async fn call_write_shard(
         })?
         .map_err(|e| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            if is_transport_failure(&e) {
+                pool.mark_unreachable(&placement.node_address);
+            }
             error!(
                 "Failed to write shard to OSD {}: {}",
                 placement.node_address, e
@@ -359,6 +422,7 @@ async fn call_read_shard(
     let response = result
         .map_err(|_| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            pool.mark_unreachable(&placement.node_address);
             error!(
                 "Timeout reading shard {} from OSD {}",
                 position, placement.node_address
@@ -367,6 +431,9 @@ async fn call_read_shard(
         })?
         .map_err(|e| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            if is_transport_failure(&e) {
+                pool.mark_unreachable(&placement.node_address);
+            }
             warn!(
                 "Failed to read shard from OSD {}: {}",
                 placement.node_address, e
@@ -906,6 +973,7 @@ pub async fn get_object_version_meta_from_any(
             }
             Err(_) => {
                 warn!("get_object_meta timeout from {}", placement.node_address);
+                pool.mark_unreachable(&placement.node_address);
                 last_err = Some(OsdPoolError::ConnectionFailed(
                     "get_object_meta timeout".to_string(),
                 ));
@@ -1724,6 +1792,28 @@ mod reclaim_tests {
             crate::gateway_metrics::render()
                 .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod fail_fast_tests {
+    use super::*;
+
+    /// An address that just failed is not tried for FAIL_FAST, then is.
+    #[tokio::test]
+    async fn an_unreachable_osd_fails_fast_for_a_while() {
+        let pool = OsdPool::new();
+        let addr = "http://10.0.0.1:9200";
+        pool.mark_unreachable(addr);
+        let r = pool.get_or_connect(&[1u8; 16], addr).await;
+        assert!(matches!(r, Err(OsdPoolError::ConnectionFailed(m)) if m.contains("not tried")));
+
+        // Once the window has passed, it is tried again.
+        pool.unreachable.lock().unwrap().insert(
+            addr.to_string(),
+            std::time::Instant::now().checked_sub(FAIL_FAST).unwrap(),
+        );
+        assert!(!pool.is_unreachable(addr));
     }
 }
 

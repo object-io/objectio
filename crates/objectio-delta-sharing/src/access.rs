@@ -50,12 +50,12 @@ pub async fn authenticate_request(
     required_share: Option<&str>,
 ) -> Result<RecipientContext, DeltaError> {
     let raw_token = extract_bearer(headers)
-        .ok_or_else(|| DeltaError::forbidden("Missing Authorization: Bearer <token> header"))?;
+        .ok_or_else(|| DeltaError::unauthorized("Missing Authorization: Bearer <token> header"))?;
 
     let recipient = catalog
         .get_recipient_by_token(&raw_token)
         .await?
-        .ok_or_else(|| DeltaError::forbidden("Invalid bearer token"))?;
+        .ok_or_else(|| DeltaError::unauthorized("Invalid bearer token"))?;
 
     let ctx = RecipientContext {
         name: recipient.name,
@@ -72,4 +72,21 @@ pub async fn authenticate_request(
     }
 
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
+
+    /// A request without a bearer token is 401, as the protocol has it.
+    #[tokio::test]
+    async fn no_bearer_token_is_unauthenticated() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let catalog = DeltaCatalog::new(MetadataServiceClient::new(channel));
+        let Err(err) = authenticate_request(&HeaderMap::new(), &catalog, None).await else {
+            panic!("a request without a token was let in");
+        };
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
 }

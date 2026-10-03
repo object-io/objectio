@@ -18,6 +18,15 @@ impl DeltaError {
         }
     }
 
+    /// No bearer token, or one that names no recipient: 401, as the Delta
+    /// Sharing protocol has it (403 is for a known recipient refused).
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg.into(),
+        }
+    }
+
     pub fn forbidden(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
