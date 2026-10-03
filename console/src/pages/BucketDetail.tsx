@@ -48,7 +48,7 @@ export default function BucketDetail() {
   const [tab, setTab] = useState<Tab>("access");
 
   // Ownership. The owner is who reaches the bucket when no policy grants
-  // access, so a bucket with none relies on --authz-legacy-open-buckets.
+  // access; a bucket with none is reachable only through a policy.
   const [owner, setOwner] = useState<string>("");
   const [ownerLoading, setOwnerLoading] = useState(true);
   const [ownerInput, setOwnerInput] = useState("");
@@ -451,10 +451,8 @@ export default function BucketDetail() {
                 This bucket has no owner
               </p>
               <p className="text-[11px] text-warn mt-0.5">
-                It was created before ownership was recorded, so authorization
-                cannot fall back to an owner. It stays reachable only while the
-                gateway runs with <code>--authz-legacy-open-buckets</code>.
-                Assign an owner below before turning that off.
+                Without one, only a policy (or the system admin) reaches it.
+                Assign an owner below.
               </p>
             </div>
           )}
