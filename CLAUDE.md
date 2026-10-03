@@ -136,7 +136,7 @@ The `objectio-block` crate provides block storage on top of the distributed obje
 - **Snapshots and clones**: share stripes through the shared-stripe registry; an overwrite or delete frees only stripes nothing else uses
 - **Repair**: the meta repairer walks block stripes from meta's tables as well as objects
 
-Not implemented yet, though the types and RPCs exist: QoS enforcement, iSCSI/NVMe-oF. Meta also hosts a separate legacy `BlockMetaService` (bincode tables) that neither the block gateway nor the CLI uses — the CLI's `volume`/`snapshot` commands talk to the block gateway (`--block-endpoint`, default `:9300`). aio runs the block gateway with `--block-port`.
+Not implemented yet, though the types and RPCs exist: QoS enforcement, iSCSI/NVMe-oF. The CLI's `volume`/`snapshot` commands talk to the block gateway (`--block-endpoint`, default `:9300`). aio runs the block gateway with `--block-port`.
 
 The block gRPC service is defined in `crates/objectio-proto/proto/block.proto` (BlockService) and runs on the Block Gateway.
 
@@ -273,5 +273,5 @@ route maps, and `../objectio-docs/architecture/design/platform/console-split.md`
 for the rationale.
 
 The aio binary mirrors these flags as `--admin-port`,
-`--ops-console-port`, `--tenant-console-port` (default `0` = legacy
+`--ops-console-port`, `--tenant-console-port` (default `0` = the
 single-port behavior).
