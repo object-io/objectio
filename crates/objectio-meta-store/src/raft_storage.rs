@@ -155,7 +155,7 @@ impl MetaRaftStorage {
                 let entry = objectio_proto::metadata::ConfigEntry {
                     key: key.clone(),
                     value: value.clone(),
-                    updated_at: updated_at.unwrap_or_else(now_unix),
+                    updated_at: *updated_at,
                     updated_by: updated_by.clone(),
                     version,
                 };
@@ -418,14 +418,6 @@ fn hex_encode_16(bytes: &[u8; 16]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
-}
-
-/// Current unix timestamp, used to stamp `updated_at` on config writes.
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------
@@ -931,7 +923,7 @@ mod tests {
             key: "k".into(),
             value: b"v".to_vec(),
             updated_by: "t".into(),
-            updated_at: Some(1_700_000_000),
+            updated_at: 1_700_000_000,
         };
         let mut stored = Vec::new();
         for _ in 0..2 {
@@ -957,7 +949,7 @@ mod tests {
                 key: "k".into(),
                 value: b"v".to_vec(),
                 updated_by: "t".into(),
-                updated_at: None,
+                updated_at: 0,
             },
             MetaCommand::DeleteConfig { key: "k".into() },
             MetaCommand::MultiCas {
@@ -1000,7 +992,7 @@ mod tests {
             key: "k".into(),
             value: b"v".to_vec(),
             updated_by: "t".into(),
-            updated_at: None,
+            updated_at: 0,
         };
         s.apply_command(&mut state, &cmd, log_id(1, 1)).unwrap();
         assert_eq!(s.load_state().unwrap().config_version, 1);
@@ -1026,7 +1018,7 @@ mod tests {
                     key: "a".into(),
                     value: b"1".to_vec(),
                     updated_by: "t".into(),
-                    updated_at: None,
+                    updated_at: 0,
                 },
             ),
             normal_entry(
@@ -1035,7 +1027,7 @@ mod tests {
                     key: "b".into(),
                     value: b"2".to_vec(),
                     updated_by: "t".into(),
-                    updated_at: None,
+                    updated_at: 0,
                 },
             ),
             normal_entry(
@@ -1044,7 +1036,7 @@ mod tests {
                     key: "c".into(),
                     value: b"3".to_vec(),
                     updated_by: "t".into(),
-                    updated_at: None,
+                    updated_at: 0,
                 },
             ),
         ];
@@ -1077,7 +1069,7 @@ mod tests {
                 key: "license/active".into(),
                 value: b"signed-license-bytes".to_vec(),
                 updated_by: "console".into(),
-                updated_at: None,
+                updated_at: 0,
             },
         );
         let del = normal_entry(
@@ -1368,7 +1360,7 @@ mod tests {
                     key: "k".into(),
                     value: b"v".to_vec(),
                     updated_by: "t".into(),
-                    updated_at: None,
+                    updated_at: 0,
                 },
             );
             s.apply_to_state_machine(&[e]).await.unwrap();
