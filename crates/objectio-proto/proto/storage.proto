@@ -347,6 +347,10 @@ message PutObjectMetaResponse {
     // `replaced` is still kept on this OSD as a version entry, so its shards
     // are still referenced and must not be freed.
     bool replaced_version_kept = 4;
+    // This copy already held a newer write (a higher stamp): this one was
+    // not applied. Last writer wins; once every copy says so, the caller
+    // frees the shards this write made, which nothing references.
+    bool superseded = 5;
 }
 
 // Get object metadata request

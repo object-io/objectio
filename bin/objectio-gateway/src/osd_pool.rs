@@ -804,6 +804,9 @@ pub async fn put_object_meta_with(
     // of the OSDs holding this ObjectMeta.
     let mut object_meta = object_meta;
     object_meta.usage_owner.clone_from(&targets[0].node_id);
+    // Every copy gets the same stamp, above any this one was read at: the
+    // order the copies keep (core/object-metadata-quorum.md).
+    object_meta.stamp = objectio_common::stamp::CLOCK.next_after(object_meta.stamp);
 
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
@@ -856,6 +859,7 @@ pub async fn put_object_meta_with(
             Ok::<_, (OsdPoolError, bool)>(Displaced {
                 replaced: resp.replaced,
                 version_kept: resp.replaced_version_kept,
+                superseded: resp.superseded,
             })
         });
     }
@@ -882,11 +886,11 @@ pub async fn put_object_meta_with(
     }
 }
 
-/// Read ObjectMeta from any shard-carrying OSD. Tries each placement in CRUSH
-/// order (nodes[0] first) and returns the first success. Returns `Ok(None)` only
-/// when every reachable replica reports not-found — a mixed outcome (some down,
-/// some report Some) returns the Some. Returns `Err` only if every replica
-/// errored (no authoritative answer).
+/// Read ObjectMeta from the shard-carrying OSDs: every copy at once, and the
+/// newest (highest stamp) that has it. Returns `Ok(None)` only when every
+/// reachable copy reports not-found — a mixed outcome (some down, some report
+/// Some) returns the Some. Returns `Err` only if every copy errored (no
+/// authoritative answer).
 pub async fn get_object_meta_from_any(
     pool: &OsdPool,
     placements: &[NodePlacement],
@@ -912,72 +916,83 @@ pub async fn get_object_version_meta_from_any(
         return Err(OsdPoolError::NoNodesAvailable);
     }
 
-    let mut last_err: Option<OsdPoolError> = None;
-    let mut saw_not_found = false;
-    for placement in &targets {
+    // Every copy at once; the newest that has it wins
+    // (core/object-metadata-quorum.md). A copy that lacks it may just not
+    // have it yet (a new OSD during a drain), so "not found" is the answer
+    // only when no copy has it.
+    let asks = targets.iter().map(|placement| async move {
         let req = GetObjectMetaRequest {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
         };
-        let client_res = pool.get_client_for_placement(placement).await;
-        let mut client = match client_res {
-            Ok(c) => c,
-            Err(e) => {
+        let mut client = pool
+            .get_client_for_placement(placement)
+            .await
+            .map_err(|e| {
                 warn!(
                     "get_object_meta: connect failed to {}: {}",
                     placement.node_address, e
                 );
-                last_err = Some(e);
-                continue;
-            }
-        };
-        let fut = client.get_object_meta(req);
-        match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+                e
+            })?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.get_object_meta(req),
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
-                if inner.found {
-                    tracing::debug!(
-                        "get_object_meta: hit on {} for {}/{}",
-                        placement.node_address,
-                        bucket,
-                        key
-                    );
-                    if let Some(o) = &inner.object
-                        && o.required_level > objectio_common::version::FORMAT_LEVEL
-                    {
-                        return Err(OsdPoolError::TooOld(format!(
-                            "{bucket}/{key} needs format level {}; this gateway is at {}",
-                            o.required_level,
-                            objectio_common::version::FORMAT_LEVEL
-                        )));
-                    }
-                    return Ok(inner.object);
-                }
-                tracing::debug!(
-                    "get_object_meta: miss on {} for {}/{}",
-                    placement.node_address,
-                    bucket,
-                    key
-                );
-                saw_not_found = true;
+                Ok(if inner.found { inner.object } else { None })
             }
             Ok(Err(e)) => {
                 warn!(
                     "get_object_meta from {} failed: {}",
                     placement.node_address, e
                 );
-                last_err = Some(OsdPoolError::ConnectionFailed(e.to_string()));
+                if is_transport_failure(&e) {
+                    pool.mark_unreachable(&placement.node_address);
+                }
+                Err(OsdPoolError::ConnectionFailed(e.to_string()))
             }
             Err(_) => {
                 warn!("get_object_meta timeout from {}", placement.node_address);
-                last_err = Some(OsdPoolError::ConnectionFailed(
+                Err(OsdPoolError::ConnectionFailed(
                     "get_object_meta timeout".to_string(),
-                ));
+                ))
             }
         }
-    }
+    });
+    let answers = futures::future::join_all(asks).await;
 
+    let mut newest: Option<objectio_proto::metadata::ObjectMeta> = None;
+    let mut saw_not_found = false;
+    let mut last_err: Option<OsdPoolError> = None;
+    for answer in answers {
+        match answer {
+            Ok(Some(o)) => {
+                if newest
+                    .as_ref()
+                    .is_none_or(|n| (o.stamp, &o.object_id) > (n.stamp, &n.object_id))
+                {
+                    newest = Some(o);
+                }
+            }
+            Ok(None) => saw_not_found = true,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(o) = newest {
+        if o.required_level > objectio_common::version::FORMAT_LEVEL {
+            return Err(OsdPoolError::TooOld(format!(
+                "{bucket}/{key} needs format level {}; this gateway is at {}",
+                o.required_level,
+                objectio_common::version::FORMAT_LEVEL
+            )));
+        }
+        return Ok(Some(o));
+    }
     if saw_not_found {
         return Ok(None);
     }
@@ -1279,6 +1294,8 @@ pub struct Displaced {
     pub replaced: Option<objectio_proto::metadata::ObjectMeta>,
     /// The replaced object is still held there as a version.
     pub version_kept: bool,
+    /// That copy already held a newer write; this one was not applied.
+    pub superseded: bool,
 }
 
 /// Shards of the object an overwrite displaced, if it is safe to free them.
@@ -1623,6 +1640,7 @@ mod reclaim_tests {
         Displaced {
             replaced: Some(o.clone()),
             version_kept: false,
+            superseded: false,
         }
     }
 
@@ -1693,6 +1711,7 @@ mod reclaim_tests {
         let kept = Displaced {
             replaced: Some(old.clone()),
             version_kept: true,
+            superseded: false,
         };
         assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
     }

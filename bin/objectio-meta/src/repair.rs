@@ -742,6 +742,8 @@ async fn record_locations(
             }
         }
     }
+    // An update of what was read: stamped above it, the same on every copy.
+    fresh.stamp = objectio_common::stamp::CLOCK.next_after(fresh.stamp);
     let mut stored_on_owner = false;
     for addr in targets {
         let req = PutObjectMetaRequest {
