@@ -35,6 +35,7 @@ pub mod replication;
 pub mod s3;
 pub mod scatter_gather;
 pub mod sts_api;
+pub mod upgrade;
 
 use anyhow::Result;
 use auth_middleware::{AuthState, auth_layer, optional_auth_layer};
@@ -582,6 +583,19 @@ pub async fn run(
     info!("Connected to metadata service");
     info!("Credentials are managed by the metadata service");
 
+    // Report this binary's release and format level (rolling upgrades).
+    // A gateway has no stable id; its host and listen address name it.
+    objectio_proto::transport::spawn_version_reporter(
+        args.meta_endpoint.clone(),
+        "gateway",
+        format!(
+            "{}/{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "gateway".into()),
+            args.listen
+        ),
+        args.listen.clone(),
+    );
+
     // Create OSD connection pool
     let osd_pool = Arc::new(OsdPool::new());
 
@@ -1070,6 +1084,8 @@ pub async fn run(
             "/_admin/replication/targets/{name}",
             delete(replication::admin_delete_target),
         )
+        .route("/_admin/upgrade", get(upgrade::status))
+        .route("/_admin/upgrade/finalize", post(upgrade::finalize))
         .route(
             "/_admin/replication/settings",
             get(replication::admin_get_settings).put(replication::admin_put_settings),

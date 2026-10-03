@@ -11,6 +11,7 @@ pub mod histogram;
 pub mod metrics_registry;
 pub mod process_metrics;
 pub mod types;
+pub mod version;
 
 pub use checksum::{Checksum, ChecksumCalculator};
 pub use config::Config;

@@ -69,9 +69,12 @@ pub async fn meta_channel(endpoints: &str) -> Result<tonic::transport::Channel, 
                 format!("http://{e}")
             };
             tonic::transport::Endpoint::from_shared(uri)
-                .map(|ep| {
+                .and_then(|ep| {
+                    // The user-agent carries this binary's format level:
+                    // meta refuses a client too old for the cluster.
                     ep.connect_timeout(std::time::Duration::from_secs(3))
                         .timeout(META_CALL_TIMEOUT)
+                        .user_agent(objectio_common::version::user_agent())
                 })
                 .map_err(|err| format!("meta endpoint {e}: {err}"))
         })
@@ -153,4 +156,64 @@ async fn probe(ep: &tonic::transport::Endpoint) -> bool {
         tokio::time::timeout(PROBE_TIMEOUT, attempt).await,
         Ok(Some(()))
     )
+}
+
+/// How often each process reports its version to meta.
+pub const VERSION_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Report this process's release and format level to meta now and every
+/// [`VERSION_REPORT_EVERY`], and learn the cluster's active level from the
+/// answer (`objectio_common::version::set_active_level`). A process too old
+/// or too new for the cluster stops here with a message that says which,
+/// rather than run and misread what the others write.
+///
+/// `endpoints` is the meta address list (as for [`meta_channel`]),
+/// connected to with retries; `kind` is "meta", "osd", "gateway" or
+/// "block-gateway"; `id` names the node within its kind.
+pub fn spawn_version_reporter(endpoints: String, kind: &'static str, id: String, address: String) {
+    use objectio_common::version;
+    tokio::spawn(async move {
+        let channel = loop {
+            match meta_channel(&endpoints).await {
+                Ok(c) => break c,
+                Err(e) => {
+                    tracing::debug!("{kind} {id}: version reporter can't reach meta yet: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        };
+        let mut client =
+            crate::metadata::metadata_service_client::MetadataServiceClient::new(channel);
+        loop {
+            let req = crate::metadata::ReportVersionRequest {
+                kind: kind.to_string(),
+                id: id.clone(),
+                release: version::RELEASE.to_string(),
+                format_level: version::FORMAT_LEVEL,
+                min_level: version::MIN_LEVEL,
+                address: address.clone(),
+            };
+            match client.report_version(req).await {
+                Ok(resp) => {
+                    let active = resp.into_inner().active_level;
+                    if let Some(why) = version::incompatibility(active) {
+                        tracing::error!("{kind} {id}: {why}; stopping");
+                        std::process::exit(78);
+                    }
+                    version::set_active_level(active);
+                }
+                Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                    tracing::error!(
+                        "{kind} {id}: meta refused this binary: {}; stopping",
+                        status.message()
+                    );
+                    std::process::exit(78);
+                }
+                Err(status) => {
+                    tracing::debug!("{kind} {id}: version report failed ({status}); will retry");
+                }
+            }
+            tokio::time::sleep(VERSION_REPORT_EVERY).await;
+        }
+    });
 }
