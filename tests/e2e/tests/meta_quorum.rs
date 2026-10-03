@@ -39,6 +39,9 @@ fn a_copy_that_missed_a_write_never_wins_a_read() {
             put.text()
         );
         ha.start_osd(usize::from(osd), None);
+        // Past the gateways' fail-fast window for the OSD that was down, so
+        // the next round has only its own OSD down.
+        std::thread::sleep(Duration::from_secs(6));
 
         for (g, c) in ha.clients.iter().enumerate() {
             let r = c.request("GET", "/quorum/k", &[]);
@@ -57,5 +60,48 @@ fn await_writable(c: &objectio_e2e::Cluster) {
     while c.request("PUT", "/quorum/probe", b"probe").status != 200 {
         assert!(std::time::Instant::now() < deadline, "writes never resumed");
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// With one OSD down, PUT and overwrite still succeed (the metadata write
+/// quorum, 5 of 6); when it is back, every read gives the newest.
+#[test]
+fn writes_go_on_with_an_osd_down() {
+    let mut ha = HaCluster::start(1, 6, 2);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+
+    ha.stop_osd(3);
+    let mut latest = Vec::new();
+    for i in 0..10u8 {
+        let body = payload(20_000 + usize::from(i) * 3_000, i);
+        let r = ha.clients[usize::from(i) % 2].request("PUT", "/quorum/w", &body);
+        assert_eq!(r.status, 200, "write {i} with an OSD down: {}", r.text());
+        let r = ha.clients[0].request("PUT", &format!("/quorum/n{i}"), &body);
+        assert_eq!(
+            r.status,
+            200,
+            "new object {i} with an OSD down: {}",
+            r.text()
+        );
+        latest = body;
+    }
+    for c in &ha.clients {
+        assert!(c.request("GET", "/quorum/w", &[]).bytes == latest);
+    }
+
+    ha.start_osd(3, None);
+    std::thread::sleep(Duration::from_secs(3));
+    for (g, c) in ha.clients.iter().enumerate() {
+        let r = c.request("GET", "/quorum/w", &[]);
+        assert!(
+            r.bytes == latest,
+            "gateway {g}: not the newest after the OSD returned"
+        );
+        for i in 0..10u8 {
+            let r = c.request("GET", &format!("/quorum/n{i}"), &[]);
+            assert_eq!(r.status, 200, "gateway {g}, n{i}: {}", r.text());
+        }
     }
 }

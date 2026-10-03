@@ -860,29 +860,68 @@ pub async fn put_object_meta_with(
                 replaced: resp.replaced,
                 version_kept: resp.replaced_version_kept,
                 superseded: resp.superseded,
+                missed: false,
             })
         });
     }
 
+    let quorum = meta_write_quorum(&object_meta, targets.len());
     let results = futures::future::join_all(futs).await;
     let mut displaced = Vec::with_capacity(results.len());
     let mut failure: Option<OsdPoolError> = None;
     let mut unapplied = true;
+    let mut applied = 0;
     for r in results {
         match r {
             Ok(d) => {
                 unapplied = false;
+                applied += 1;
                 displaced.push(d);
             }
             Err((e, refused)) => {
                 unapplied &= refused;
                 failure.get_or_insert(e);
+                // A copy that may hold what this write replaced: nothing
+                // it could still name is freed (repair heals it).
+                displaced.push(Displaced {
+                    replaced: None,
+                    version_kept: false,
+                    superseded: false,
+                    missed: true,
+                });
             }
         }
     }
     match failure {
-        Some(error) => Err(MetaWriteError { error, unapplied }),
+        Some(error) if applied < quorum => Err(MetaWriteError { error, unapplied }),
+        Some(error) => {
+            warn!(
+                "{bucket}/{key}: metadata on {applied} of {} copies (quorum {quorum}); \
+                 the rest catch up on repair: {error}",
+                targets.len()
+            );
+            Ok(displaced)
+        }
         None => Ok(displaced),
+    }
+}
+
+/// How many copies of an object's ObjectMeta a write needs
+/// (core/object-metadata-quorum.md): the shards' write quorum, N − m + 1,
+/// or a majority for an object without stripes (inline). Every copy until
+/// the cluster is finalized at the level that allows it: a reader from the
+/// release before takes the first copy that answers.
+fn meta_write_quorum(object: &objectio_proto::metadata::ObjectMeta, copies: usize) -> usize {
+    if !objectio_common::version::allows(2) {
+        return copies;
+    }
+    let parity = object
+        .stripes
+        .first()
+        .map(|s| usize::try_from(s.ec_m).unwrap_or(0));
+    match parity {
+        Some(m) if m > 0 => copies.saturating_sub(m).saturating_add(1).clamp(1, copies),
+        _ => copies / 2 + 1,
     }
 }
 
@@ -1296,6 +1335,8 @@ pub struct Displaced {
     pub version_kept: bool,
     /// That copy already held a newer write; this one was not applied.
     pub superseded: bool,
+    /// That copy did not answer: it may still hold what this write replaced.
+    pub missed: bool,
 }
 
 /// Shards of the object an overwrite displaced, if it is safe to free them.
@@ -1641,6 +1682,7 @@ mod reclaim_tests {
             replaced: Some(o.clone()),
             version_kept: false,
             superseded: false,
+            missed: false,
         }
     }
 
@@ -1712,6 +1754,7 @@ mod reclaim_tests {
             replaced: Some(old.clone()),
             version_kept: true,
             superseded: false,
+            missed: false,
         };
         assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
     }
@@ -1808,6 +1851,31 @@ mod reclaim_tests {
             crate::gateway_metrics::render()
                 .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::*;
+    use objectio_proto::metadata::{ObjectMeta, StripeMeta};
+
+    /// N − m + 1 of an erasure-coded object's copies, a majority of an
+    /// inline one's; every copy before the cluster allows level 2.
+    #[test]
+    fn the_metadata_write_quorum() {
+        let ec = |k: u32, m: u32| ObjectMeta {
+            stripes: vec![StripeMeta {
+                ec_k: k,
+                ec_m: m,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        objectio_common::version::set_active_level(2);
+        assert_eq!(meta_write_quorum(&ec(4, 2), 6), 5);
+        assert_eq!(meta_write_quorum(&ec(8, 4), 12), 9);
+        assert_eq!(meta_write_quorum(&ObjectMeta::default(), 6), 4);
+        assert_eq!(meta_write_quorum(&ObjectMeta::default(), 3), 2);
     }
 }
 
