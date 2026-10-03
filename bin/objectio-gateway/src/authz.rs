@@ -311,6 +311,9 @@ struct BucketEntry {
     /// The bucket's own public access block (its tenant's and the
     /// cluster's are added when it matters).
     public_block: crate::public_access::PublicAccessBlock,
+    /// Meta answered that the bucket doesn't exist (not: meta couldn't be
+    /// read, which leaves this false and the entry empty).
+    missing: bool,
     cached_at: Instant,
 }
 
@@ -449,6 +452,7 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         }
     };
 
+    let mut missing = false;
     let (owner, tenant, found) = match client
         .get_bucket(GetBucketRequest {
             name: bucket.to_string(),
@@ -457,10 +461,15 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
     {
         Ok(response) => match response.into_inner().bucket {
             Some(b) => (b.owner, b.tenant, true),
-            None => (String::new(), String::new(), false),
+            None => {
+                missing = true;
+                (String::new(), String::new(), false)
+            }
         },
         Err(e) => {
-            if e.code() != tonic::Code::NotFound {
+            if e.code() == tonic::Code::NotFound {
+                missing = true;
+            } else {
                 error!("Failed to fetch bucket meta for {bucket}: {e}");
             }
             (String::new(), String::new(), false)
@@ -479,6 +488,7 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
         owner,
         tenant,
         public_block,
+        missing,
         cached_at: Instant::now(),
     };
 
@@ -666,6 +676,17 @@ pub async fn authorize(
     let bucket = load_bucket(state, req.bucket).await;
     crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
 
+    // A bucket that doesn't exist is "no such bucket" to everyone, as in S3:
+    // there is nothing in it to protect. Creating it goes on to the
+    // handler. (A bucket meta couldn't read is not `missing`: denied below.)
+    if bucket.missing && !req.bucket.is_empty() && req.action != "s3:CreateBucket" {
+        return Some(S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+
     if auth.auth_mode == objectio_auth::AuthMode::Anonymous {
         return authorize_anonymous(state, auth, req, &bucket).await;
     }
@@ -747,10 +768,10 @@ pub async fn authorize(
     if !bucket.owner.is_empty() && bucket.owner == auth.user_id {
         return None;
     }
-    // Any authenticated caller may create a bucket that has no owner yet
-    // (it doesn't exist), and becomes its owner; explicit Denies and the
-    // tenant boundary were applied above. If it does exist, meta refuses.
-    if req.action == "s3:CreateBucket" && bucket.owner.is_empty() {
+    // Any authenticated caller may create a bucket (and becomes its
+    // owner); for one that exists the handler answers BucketAlreadyExists
+    // (409). Explicit Denies and the tenant boundary were applied above.
+    if req.action == "s3:CreateBucket" {
         return None;
     }
 
@@ -1220,6 +1241,7 @@ mod tests {
             owner: "u1".to_string(),
             tenant: String::new(),
             public_block: crate::public_access::PublicAccessBlock::ALL,
+            missing: false,
             cached_at: Instant::now(),
         }
     }
@@ -1260,6 +1282,7 @@ mod tests {
                 tenant: "globex".to_string(),
                 public_block: crate::public_access::PublicAccessBlock::ALL,
                 cached_at: Instant::now(),
+                missing: false,
             },
         );
         assert_eq!(cache.bucket("brand-new").unwrap().tenant, "globex");
