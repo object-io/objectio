@@ -147,6 +147,18 @@ pub async fn run(args: Args) -> Result<()> {
         .map_err(anyhow::Error::msg)
         .context("connect to meta service")?;
 
+    // Report this binary's release and format level (rolling upgrades).
+    objectio_proto::transport::spawn_version_reporter(
+        args.meta_endpoint.clone(),
+        "block-gateway",
+        format!(
+            "{}/{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "block-gateway".into()),
+            args.listen
+        ),
+        args.listen.clone(),
+    );
+
     let meta = Arc::new(MetaBlocks::new(Arc::new(Mutex::new(
         objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta_channel),
     ))));

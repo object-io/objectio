@@ -3,7 +3,7 @@
 use super::{Ctx, escape_path, format_size, key_values, parse_size, q, read_json, seg};
 use crate::cli::{
     ClusterCmd, ConfigCmd, KmsCmd, KmsKeysCmd, MetricsCmd, NodeCmd, OsdCmd, PoolCmd, PoolFields,
-    RebalanceCmd, WarehouseCmd,
+    RebalanceCmd, UpgradeCmd, WarehouseCmd,
 };
 use crate::output::{cell, key_values as kv, rows_of, table, ts};
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,6 +54,64 @@ pub fn render_topology(v: &Value) -> String {
     );
     walk(&mut out, &v["tree"], 0);
     out
+}
+
+/// The upgrade status: the levels, what blocks finalize, every node.
+pub fn render_upgrade(v: &Value) -> String {
+    let mut out = format!(
+        "active format level: {}\nfinalize would raise it to: {}\n",
+        cell(&v["active_level"]),
+        cell(&v["finalize_to"])
+    );
+    let blockers = rows_of(&v["blockers"], "blockers");
+    if blockers.is_empty() {
+        if v["can_finalize"].as_bool() == Some(true) {
+            out.push_str("every node runs the new release: ready to finalize\n");
+        } else {
+            out.push_str("nothing to finalize\n");
+        }
+    } else {
+        out.push_str("not ready to finalize:\n");
+        for b in &blockers {
+            let _ = writeln!(out, "  - {}", cell(b));
+        }
+    }
+    let nodes = rows_of(&v["nodes"], "nodes");
+    let cols = [
+        ("KIND", "kind"),
+        ("ID", "id"),
+        ("RELEASE", "release"),
+        ("LEVEL", "format_level"),
+        ("ADDRESS", "address"),
+        ("SEEN (S AGO)", "seen_secs_ago"),
+    ];
+    let _ = write!(out, "\n{}", table(&nodes, &cols));
+    out
+}
+
+pub async fn upgrade(cmd: UpgradeCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
+    match cmd {
+        UpgradeCmd::Status => {
+            let v = ctx.api.get("/_admin/upgrade", &[]).await?;
+            ctx.out.emit(&v, render_upgrade)?;
+        }
+        UpgradeCmd::Finalize => {
+            let v = ctx
+                .api
+                .call(
+                    "POST",
+                    "/_admin/upgrade/finalize",
+                    &[],
+                    crate::http::Body::Empty,
+                )
+                .await?
+                .json()?;
+            ctx.out.emit(&v, |v| {
+                format!("active format level: {}", cell(&v["active_level"]))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn cluster(cmd: ClusterCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {

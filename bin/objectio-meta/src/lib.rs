@@ -318,6 +318,15 @@ pub async fn run(
         args.admin_user.clone(),
         args.data_dir.clone(),
     );
+
+    // Report this node's release and format level (rolling upgrades),
+    // through its own address: a follower forwards it to the leader.
+    objectio_proto::transport::spawn_version_reporter(
+        self_addr.clone(),
+        "meta",
+        node_id.to_string(),
+        self_addr.clone(),
+    );
     // PG balancer — leader-only, evaluates placement-group load each
     // tick. Currently observational (Phase 4a); execution lands with
     // the Phase 5 migration path.
