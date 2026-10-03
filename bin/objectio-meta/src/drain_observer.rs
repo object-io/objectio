@@ -610,7 +610,7 @@ async fn move_shard(
     }
     if mv.pack_stripe.is_some() {
         // The pack id is the shard's object id.
-        meta.pack_move_shard(&mv.shard.object_id, mv.shard.position, *draining, &to)
+        meta.move_pack_shard(&mv.shard.object_id, mv.shard.position, *draining, &to)
             .await
             .map_err(|e| anyhow::anyhow!("pack record: {e}"))?;
     }
