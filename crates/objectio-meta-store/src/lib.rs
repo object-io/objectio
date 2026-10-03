@@ -12,6 +12,7 @@ pub use raft::{ApplyEvent, CasOp, CasTable, MetaCommand, MetaResponse, MetaTypeC
 pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
 pub use raft_storage::{MetaRaftStorage, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
+pub use types::record;
 pub use types::{
     EcConfig, MultipartUploadState, OsdNode, PartState, StoredAccessKey, StoredDataFilter,
     StoredGroup, StoredUser,

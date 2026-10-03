@@ -25,6 +25,10 @@ pub enum OsdPoolError {
 
     #[error("shard checksum mismatch: {0}")]
     ChecksumMismatch(String),
+
+    /// The object needs a newer release to read correctly.
+    #[error("{0}")]
+    TooOld(String),
 }
 
 /// Node identifier (16-byte UUID)
@@ -874,6 +878,15 @@ pub async fn get_object_version_meta_from_any(
                         bucket,
                         key
                     );
+                    if let Some(o) = &inner.object
+                        && o.required_level > objectio_common::version::FORMAT_LEVEL
+                    {
+                        return Err(OsdPoolError::TooOld(format!(
+                            "{bucket}/{key} needs format level {}; this gateway is at {}",
+                            o.required_level,
+                            objectio_common::version::FORMAT_LEVEL
+                        )));
+                    }
                     return Ok(inner.object);
                 }
                 tracing::debug!(

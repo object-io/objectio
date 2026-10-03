@@ -19,6 +19,9 @@ struct Meta {
     grpc: u16,
     admin: u16,
     dir: PathBuf,
+    /// Where its binary comes from: `None` for this build, or a directory
+    /// holding another release's (rolling-upgrade tests).
+    bins: Mutex<Option<PathBuf>>,
     /// Behind a lock so a test can kill and restart nodes while other
     /// threads use the cluster.
     child: Mutex<Option<Child>>,
@@ -30,11 +33,30 @@ impl Meta {
     }
 }
 
+/// One OSD: how to start it again, and its process when running.
+struct Osd {
+    port: u16,
+    state: PathBuf,
+    disk: PathBuf,
+    child: Option<Child>,
+}
+
+/// One gateway: how to start it again, and its process when running.
+struct Gateway {
+    port: u16,
+    child: Option<Child>,
+}
+
+/// A binary from `bins` (another release's), or from this build.
+fn bin(bins: Option<&Path>, name: &str) -> PathBuf {
+    bins.map_or_else(|| binary(name), |dir| dir.join(name))
+}
+
 pub struct HaCluster {
     dir: tempfile::TempDir,
     metas: Vec<Meta>,
-    osds: Vec<Child>,
-    gateways: Vec<Child>,
+    osds: Vec<Osd>,
+    gateways: Vec<Gateway>,
     /// A signed client of each gateway, as the admin.
     pub clients: Vec<Cluster>,
     pub access_key: String,
@@ -51,7 +73,8 @@ impl Drop for HaCluster {
         let children = self
             .gateways
             .iter_mut()
-            .chain(self.osds.iter_mut())
+            .filter_map(|g| g.child.as_mut())
+            .chain(self.osds.iter_mut().filter_map(|o| o.child.as_mut()))
             .chain(metas.iter_mut());
         for c in children {
             // A frozen process ignores SIGKILL until it runs again.
@@ -94,6 +117,13 @@ impl HaCluster {
     /// `gateways` gateways with auth on, all separate processes.
     #[must_use]
     pub fn start(metas: usize, osds: usize, gateways: usize) -> Self {
+        Self::start_from(None, metas, osds, gateways)
+    }
+
+    /// As [`Self::start`], every node from the binaries in `bins` (another
+    /// release's), or from this build when `None`.
+    #[must_use]
+    pub fn start_from(bins: Option<&Path>, metas: usize, osds: usize, gateways: usize) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
             metas: (1..=metas)
@@ -102,6 +132,7 @@ impl HaCluster {
                     grpc: free_port(),
                     admin: free_port(),
                     dir: dir.path().join(format!("meta{i}")),
+                    bins: Mutex::new(bins.map(Path::to_path_buf)),
                     child: Mutex::new(None),
                 })
                 .collect(),
@@ -117,7 +148,6 @@ impl HaCluster {
         }
         cluster.form_raft_group();
 
-        let endpoints = cluster.meta_endpoints();
         for o in 0..osds {
             let state = cluster.dir.path().join(format!("osd{o}"));
             std::fs::create_dir_all(state.join("state")).expect("osd dir");
@@ -125,27 +155,13 @@ impl HaCluster {
             std::fs::File::create(&disk)
                 .and_then(|f| f.set_len(2 << 30))
                 .expect("osd disk");
-            let port = free_port();
-            let child = Command::new(binary("objectio-osd"))
-                .args([
-                    "--listen",
-                    &format!("127.0.0.1:{port}"),
-                    "--advertise-addr",
-                    &format!("http://127.0.0.1:{port}"),
-                    "--meta-endpoint",
-                    &endpoints,
-                    "--data-dir",
-                    &state.join("state").display().to_string(),
-                    "--disks",
-                    &disk.display().to_string(),
-                    "--metrics-port",
-                    "0",
-                ])
-                .stdout(log_target())
-                .stderr(log_target())
-                .spawn()
-                .expect("spawn objectio-osd");
-            cluster.osds.push(child);
+            cluster.osds.push(Osd {
+                port: free_port(),
+                state,
+                disk,
+                child: None,
+            });
+            cluster.spawn_osd(o, bins);
         }
 
         let creds = cluster.metas[0].dir.join("admin-creds.env");
@@ -153,33 +169,7 @@ impl HaCluster {
         cluster.access_key = ak;
         cluster.secret_key = sk;
         for _ in 0..gateways {
-            let port = free_port();
-            let child = Command::new(binary("objectio-gateway"))
-                // Every gateway the same SSE master key, as in production.
-                .env(
-                    "OBJECTIO_MASTER_KEY",
-                    "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-                )
-                .args([
-                    "--listen",
-                    &format!("127.0.0.1:{port}"),
-                    "--meta-endpoint",
-                    &endpoints,
-                    "--external-endpoint",
-                    &format!("http://127.0.0.1:{port}"),
-                ])
-                .stdout(log_target())
-                .stderr(log_target())
-                .spawn()
-                .expect("spawn objectio-gateway");
-            cluster.gateways.push(child);
-            let endpoint = format!("http://127.0.0.1:{port}");
-            await_listening(port);
-            cluster.clients.push(Cluster::client(
-                &endpoint,
-                &cluster.access_key,
-                &cluster.secret_key,
-            ));
+            cluster.add_gateway(bins);
         }
         cluster.await_osds(osds);
         cluster
@@ -195,11 +185,111 @@ impl HaCluster {
             .join(",")
     }
 
+    /// Start OSD `i` from `bins` (see [`Self::start_from`]).
+    fn spawn_osd(&mut self, i: usize, bins: Option<&Path>) {
+        let endpoints = self.meta_endpoints();
+        let o = &mut self.osds[i];
+        let child = Command::new(bin(bins, "objectio-osd"))
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{}", o.port),
+                "--advertise-addr",
+                &format!("http://127.0.0.1:{}", o.port),
+                "--meta-endpoint",
+                &endpoints,
+                "--data-dir",
+                &o.state.join("state").display().to_string(),
+                "--disks",
+                &o.disk.display().to_string(),
+                "--metrics-port",
+                "0",
+            ])
+            .stdout(log_target())
+            .stderr(log_target())
+            .spawn()
+            .expect("spawn objectio-osd");
+        o.child = Some(child);
+    }
+
+    /// Start gateway `i` from `bins`, and wait until it listens.
+    fn spawn_gateway(&mut self, i: usize, bins: Option<&Path>) {
+        let endpoints = self.meta_endpoints();
+        let port = self.gateways[i].port;
+        let child = Command::new(bin(bins, "objectio-gateway"))
+            // Every gateway the same SSE master key, as in production.
+            .env(
+                "OBJECTIO_MASTER_KEY",
+                "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+            )
+            .args([
+                "--listen",
+                &format!("127.0.0.1:{port}"),
+                "--meta-endpoint",
+                &endpoints,
+                "--external-endpoint",
+                &format!("http://127.0.0.1:{port}"),
+            ])
+            .stdout(log_target())
+            .stderr(log_target())
+            .spawn()
+            .expect("spawn objectio-gateway");
+        self.gateways[i].child = Some(child);
+        await_listening(port);
+    }
+
+    /// Start one more gateway, from `bins`, with a signed client of it in
+    /// `clients`. Returns its index.
+    pub fn add_gateway(&mut self, bins: Option<&Path>) -> usize {
+        let port = free_port();
+        self.gateways.push(Gateway { port, child: None });
+        let i = self.gateways.len() - 1;
+        self.spawn_gateway(i, bins);
+        self.clients.push(Cluster::client(
+            &format!("http://127.0.0.1:{port}"),
+            &self.access_key,
+            &self.secret_key,
+        ));
+        i
+    }
+
+    /// Stop OSD `i` and start it again from `bins`, on its own data.
+    pub fn restart_osd(&mut self, i: usize, bins: Option<&Path>) {
+        if let Some(mut c) = self.osds[i].child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.spawn_osd(i, bins);
+        await_listening(self.osds[i].port);
+    }
+
+    /// Stop gateway `i` and start it again from `bins`.
+    pub fn restart_gateway(&mut self, i: usize, bins: Option<&Path>) {
+        if let Some(mut c) = self.gateways[i].child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.spawn_gateway(i, bins);
+    }
+
+    /// Stop meta node `i` and start it again from `bins`, on its own data.
+    pub fn restart_meta(&self, i: usize, bins: Option<&Path>) {
+        self.kill_meta(i);
+        *self.metas[i].bins.lock().unwrap() = bins.map(Path::to_path_buf);
+        self.start_meta(i);
+    }
+
+    /// How many OSDs and gateways the cluster has.
+    #[must_use]
+    pub const fn sizes(&self) -> (usize, usize) {
+        (self.osds.len(), self.gateways.len())
+    }
+
     /// Start meta node `i` (again), on its own data.
     pub fn start_meta(&self, i: usize) {
         let m = &self.metas[i];
         std::fs::create_dir_all(&m.dir).expect("meta dir");
-        let child = Command::new(binary("objectio-meta"))
+        let bins = m.bins.lock().unwrap().clone();
+        let child = Command::new(bin(bins.as_deref(), "objectio-meta"))
             .args([
                 "--node-id",
                 &m.id.to_string(),
@@ -384,6 +474,7 @@ impl HaCluster {
             grpc: free_port(),
             admin: free_port(),
             dir: self.dir.path().join(format!("meta{new_id}")),
+            bins: Mutex::new(None),
             child: Mutex::new(None),
         };
         self.metas.push(new);

@@ -26,7 +26,7 @@ pub const ICEBERG_NAMESPACES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("iceberg_namespaces");
 // Key: "ns1\x00ns2\x00table_name", Value: prost-encoded IcebergTableEntry
 pub const ICEBERG_TABLES: TableDefinition<&str, &[u8]> = TableDefinition::new("iceberg_tables");
-// Key: filter_id, Value: bincode-encoded StoredDataFilter
+// Key: filter_id, Value: protobuf StoredDataFilter
 pub const DATA_FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("data_filters");
 
 // Delta Sharing

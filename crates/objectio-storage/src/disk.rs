@@ -77,12 +77,7 @@ impl DiskManager {
         // Create and write superblock
         let actual_block_size = block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
         let superblock = Superblock::new(size, actual_block_size)?;
-        let sb_bytes = superblock.to_bytes();
-
-        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
-        buf.copy_from(&sb_bytes);
-        file.write_at(0, buf.as_slice())?;
-        file.sync()?;
+        write_superblock(&file, &superblock)?;
 
         // Initialize bitmap region (all zeros = all free)
         let bitmap_size = superblock.bitmap_size as usize;
@@ -109,12 +104,7 @@ impl DiskManager {
         let path_buf = path.as_ref().to_path_buf();
         let file = RawFile::open(&path, false)?;
 
-        // Read and validate superblock
-        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
-        file.read_at(0, buf.as_mut_slice())?;
-
-        let superblock = Superblock::from_bytes(buf.as_slice())?;
-        superblock.validate()?;
+        let superblock = read_superblock(&file, &path_buf)?;
 
         // Load the allocation bitmap from its reserved region. A disk
         // written before the allocator was wired up has an all-zero bitmap
@@ -175,14 +165,8 @@ impl DiskManager {
             )));
         }
         sb.set_identity(cluster_uuid, osd_node_id);
-        let sb_bytes = sb.to_bytes();
-        drop(sb);
-
-        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
-        buf.copy_from(&sb_bytes);
-        self.file.write_at(0, buf.as_slice())?;
-        self.file.sync()?;
-        Ok(())
+        let sb = sb.clone();
+        write_superblock(&self.file, &sb)
     }
 
     /// Get the disk path
@@ -285,8 +269,10 @@ impl DiskManager {
         self.allocator.is_allocated(block_num)
     }
 
-    /// Write the allocation bitmap back to its reserved region and update
-    /// `superblock.free_blocks` to match, so a restart sees the same picture.
+    /// Write the allocation bitmap back to its reserved region. The
+    /// superblock is left alone: rewriting it on every delete risked tearing
+    /// it in a power cut, and the free count is read from the bitmap anyway
+    /// (`superblock.free_blocks` is as of the superblock's last write).
     pub fn persist_allocator(&self) -> Result<()> {
         let (offset, size) = {
             let sb = self.superblock.read();
@@ -296,8 +282,6 @@ impl DiskManager {
         let mut buf = AlignedBuffer::new(size as usize);
         buf.copy_from(&bytes);
         self.file.write_at(offset, buf.as_slice())?;
-        self.superblock.write().free_blocks = self.allocator.free_count();
-        self.update_superblock()?;
         self.file.sync()?;
         Ok(())
     }
@@ -628,13 +612,49 @@ impl DiskManager {
             .as_secs();
         // Recompute checksum after modifying fields
         sb.update_checksum();
+        let sb = sb.clone();
+        write_superblock(&self.file, &sb)
+    }
+}
 
-        let sb_bytes = sb.to_bytes();
+/// Write `sb` as the primary superblock, then as the backup, syncing after
+/// each: a power cut can tear at most one of them.
+fn write_superblock(file: &RawFile, sb: &Superblock) -> Result<()> {
+    let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
+    buf.copy_from(&sb.to_bytes());
+    file.write_at(0, buf.as_slice())?;
+    file.sync()?;
+    if sb.features_compat & crate::layout::FEATURE_BACKUP_SUPERBLOCK != 0 {
+        file.write_at(crate::layout::BACKUP_SUPERBLOCK_OFFSET, buf.as_slice())?;
+        file.sync()?;
+    }
+    Ok(())
+}
+
+/// The disk's superblock: the primary, or, when it can't be read (torn by
+/// a power cut, say), the backup, which then repairs the primary.
+fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
+    let read_at = |offset: u64| -> Result<Superblock> {
         let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
-        buf.copy_from(&sb_bytes);
-
-        self.file.write_at(0, buf.as_slice())?;
-        self.file.sync()
+        file.read_at(offset, buf.as_mut_slice())?;
+        let sb = Superblock::from_bytes(buf.as_slice())?;
+        sb.validate()?;
+        Ok(sb)
+    };
+    match read_at(0) {
+        Ok(sb) => Ok(sb),
+        Err(primary) => match read_at(crate::layout::BACKUP_SUPERBLOCK_OFFSET) {
+            Ok(sb) if sb.features_compat & crate::layout::FEATURE_BACKUP_SUPERBLOCK != 0 => {
+                tracing::warn!(
+                    "{}: primary superblock unreadable ({primary}); mounted from the backup \
+                     and rewrote the primary",
+                    path.display()
+                );
+                write_superblock(file, &sb)?;
+                Ok(sb)
+            }
+            _ => Err(primary),
+        },
     }
 }
 
@@ -651,6 +671,60 @@ mod tests {
     /// `DiskManager::init` refuses anything under 1 GiB, so the tests use the
     /// floor rather than a convenient small number.
     const MIN_TEST_DISK: u64 = 1024 * 1024 * 1024;
+
+    /// A power cut that tears the primary superblock (simulated by
+    /// overwriting part of it) leaves the disk mountable from the backup,
+    /// which also repairs the primary.
+    #[test]
+    fn a_torn_primary_superblock_mounts_from_the_backup() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let id = {
+            let disk = super::DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+            disk.id()
+        };
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0xAA; 64]).unwrap();
+        }
+        let disk = super::DiskManager::open(&path).expect("mounts from the backup");
+        assert_eq!(disk.id(), id);
+        drop(disk);
+        // The primary was rewritten: it reads on its own now.
+        let mut buf = vec![0u8; 4096];
+        {
+            use std::io::Read;
+            let mut f = std::fs::File::open(&path).unwrap();
+            f.read_exact(&mut buf).unwrap();
+        }
+        assert!(crate::layout::Superblock::from_bytes(&buf).is_ok());
+    }
+
+    /// Persisting the bitmap (every delete) no longer rewrites the
+    /// superblock.
+    #[test]
+    fn persisting_the_bitmap_leaves_the_superblock_alone() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = super::DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+        let read = || {
+            let mut buf = vec![0u8; 4096];
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact(&mut buf)
+                .unwrap();
+            buf
+        };
+        let before = read();
+        let start = disk.allocate_extent(3).unwrap();
+        disk.persist_allocator().unwrap();
+        disk.free_extent(start, 3).unwrap();
+        disk.persist_allocator().unwrap();
+        assert_eq!(read(), before);
+    }
 
     #[test]
     fn allocation_and_reclaim_move_the_reported_usage() {

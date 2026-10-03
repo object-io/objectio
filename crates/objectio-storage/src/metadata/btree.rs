@@ -166,11 +166,18 @@ impl BTreeIndex {
         }
 
         // Deserialize entries
-        let entries: Vec<(MetadataKey, Vec<u8>, u64)> = bincode::deserialize(&data_buf)
-            .map_err(|e| Error::Storage(format!("failed to deserialize snapshot: {}", e)))?;
+        let entries =
+            <super::types::SnapshotEntries as prost::Message>::decode(data_buf.as_slice())
+                .map_err(|e| Error::Storage(format!("failed to decode snapshot: {e}")))?;
 
-        for (key, data, lsn) in entries {
-            tree.insert(key, StoredValue { data, lsn });
+        for e in entries.entries {
+            tree.insert(
+                MetadataKey(e.key),
+                StoredValue {
+                    data: e.value,
+                    lsn: e.lsn,
+                },
+            );
         }
 
         Ok((tree, header))
@@ -274,16 +281,20 @@ impl BTreeIndex {
         let tree = self.tree.read();
 
         // Prepare entries for serialization
-        let entries: Vec<(MetadataKey, Vec<u8>, u64)> = tree
-            .iter()
-            .map(|(k, v)| (k.clone(), v.data.clone(), v.lsn))
-            .collect();
+        let entries = super::types::SnapshotEntries {
+            entries: tree
+                .iter()
+                .map(|(k, v)| super::types::SnapshotEntry {
+                    key: k.0.clone(),
+                    value: v.data.clone(),
+                    lsn: v.lsn,
+                })
+                .collect(),
+        };
 
-        let entry_count = entries.len() as u64;
+        let entry_count = entries.entries.len() as u64;
 
-        // Serialize entries
-        let data = bincode::serialize(&entries)
-            .map_err(|e| Error::Storage(format!("failed to serialize snapshot: {}", e)))?;
+        let data = prost::Message::encode_to_vec(&entries);
 
         drop(tree);
 

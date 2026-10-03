@@ -191,13 +191,51 @@ fn location_records_fail() -> bool {
 /// in-memory index from the WAL — without this, the OSD forgets
 /// which shards it holds the moment its process restarts, and
 /// meta thinks every OSD is empty.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 struct ShardLocation {
     disk_idx: usize,
     block_num: u64,
     size: u32,
     crc32c: u32,
     created_at: u64,
+}
+
+/// How a [`ShardLocation`] is stored in the metadata log: protobuf.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct ShardLocationRecord {
+    #[prost(uint32, tag = "1")]
+    disk_idx: u32,
+    #[prost(uint64, tag = "2")]
+    block_num: u64,
+    #[prost(uint32, tag = "3")]
+    size: u32,
+    #[prost(uint32, tag = "4")]
+    crc32c: u32,
+    #[prost(uint64, tag = "5")]
+    created_at: u64,
+}
+
+impl ShardLocation {
+    fn to_bytes(&self) -> Vec<u8> {
+        prost::Message::encode_to_vec(&ShardLocationRecord {
+            disk_idx: u32::try_from(self.disk_idx).unwrap_or(u32::MAX),
+            block_num: self.block_num,
+            size: self.size,
+            crc32c: self.crc32c,
+            created_at: self.created_at,
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
+        let r = <ShardLocationRecord as prost::Message>::decode(bytes)?;
+        Ok(Self {
+            disk_idx: r.disk_idx as usize,
+            block_num: r.block_num,
+            size: r.size,
+            crc32c: r.crc32c,
+            created_at: r.created_at,
+        })
+    }
 }
 
 /// Prefix under which the OSD persists its shard-location index in
@@ -1079,7 +1117,7 @@ impl OsdService {
             return Err("injected: the metadata log is unwritable".into());
         }
         let key = Self::shard_loc_meta_key(shard_key);
-        let value = bincode::serialize(loc).map_err(|e| e.to_string())?;
+        let value = loc.to_bytes();
         meta_store
             .put(key, value)
             .map(|_| ())
@@ -1118,7 +1156,7 @@ impl OsdService {
             let Ok(shard_key) = std::str::from_utf8(stripped) else {
                 continue;
             };
-            match bincode::deserialize::<ShardLocation>(&value) {
+            match ShardLocation::from_bytes(&value) {
                 Ok(loc) => {
                     out.insert(shard_key.to_string(), loc);
                 }
@@ -2654,7 +2692,7 @@ mod shard_index_tests {
         }
         s.put(
             OsdService::shard_loc_meta_key("deadbeef:0:0"),
-            b"not bincode".to_vec(),
+            b"not a record".to_vec(),
         )
         .expect("put corrupt entry");
 

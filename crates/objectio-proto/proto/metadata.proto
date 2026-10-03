@@ -415,6 +415,12 @@ message ObjectMeta {
     // This version is a replica another cluster sent: never replicated
     // again (two-way rules can't loop). The source cluster, for audit.
     string replica_of = 27;
+
+    // The format level a reader needs to read this version correctly
+    // (objectio-docs core/upgrade-path.md): set by a writer that uses a
+    // feature a lower level would misread. A reader below it refuses the
+    // object instead of serving wrong bytes. 0: nothing beyond the base.
+    uint32 required_level = 28;
 }
 
 // A full-object checksum, as S3 reports it.

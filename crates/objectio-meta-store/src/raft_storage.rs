@@ -208,13 +208,15 @@ impl MetaRaftStorage {
                         .map(|v| v.value().to_vec());
                     match current {
                         Some(bytes) => {
-                            let mut node = bincode::deserialize::<crate::types::OsdNode>(&bytes)
+                            let mut node = <crate::types::OsdNode as crate::types::record::Record>::from_bytes(&bytes)
                                 .map_err(|e| decode_err("OsdNode", e))?;
                             let changed = node.admin_state != *new_state;
                             if changed {
                                 node.admin_state = *new_state;
-                                let new_bytes = bincode::serialize(&node)
-                                    .map_err(|e| decode_err("OsdNode", e))?;
+                                let new_bytes = Ok::<_, crate::types::record::RecordError>(
+                                    crate::types::record::Record::to_bytes(&node),
+                                )
+                                .map_err(|e| decode_err("OsdNode", e))?;
                                 t.insert(key.as_str(), new_bytes.as_slice())
                                     .map_err(write_err)?;
                             }

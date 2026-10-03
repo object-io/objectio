@@ -28,8 +28,8 @@ pub enum MetaStoreError {
     Transaction(Box<redb::TransactionError>),
     #[error("redb commit error: {0}")]
     Commit(#[from] redb::CommitError),
-    #[error("bincode error: {0}")]
-    Bincode(#[from] bincode::Error),
+    #[error("record error: {0}")]
+    Record(#[from] crate::types::record::RecordError),
     #[error("prost decode error: {0}")]
     Decode(#[from] prost::DecodeError),
     #[error("io error: {0}")]
@@ -177,10 +177,10 @@ impl MetaStore {
         Ok(result)
     }
 
-    // ---- Multipart Uploads (bincode) ----
+    // ---- Multipart Uploads ----
 
     pub fn put_multipart_upload(&self, upload_id: &str, state: &MultipartUploadState) {
-        if let Err(e) = self.put_bincode(tables::MULTIPART_UPLOADS, upload_id, state) {
+        if let Err(e) = self.put_record(tables::MULTIPART_UPLOADS, upload_id, state) {
             error!("Failed to persist multipart upload '{}': {}", upload_id, e);
         }
     }
@@ -192,25 +192,25 @@ impl MetaStore {
     }
 
     pub fn load_multipart_uploads(&self) -> MetaStoreResult<Vec<(String, MultipartUploadState)>> {
-        self.load_bincode_table(tables::MULTIPART_UPLOADS)
+        self.load_records(tables::MULTIPART_UPLOADS)
     }
 
-    // ---- OSD Nodes (bincode) ----
+    // ---- OSD Nodes ----
 
     pub fn put_osd_node(&self, node_id_hex: &str, node: &OsdNode) {
-        if let Err(e) = self.put_bincode(tables::OSD_NODES, node_id_hex, node) {
+        if let Err(e) = self.put_record(tables::OSD_NODES, node_id_hex, node) {
             error!("Failed to persist OSD node '{}': {}", node_id_hex, e);
         }
     }
 
     pub fn load_osd_nodes(&self) -> MetaStoreResult<Vec<(String, OsdNode)>> {
-        self.load_bincode_table(tables::OSD_NODES)
+        self.load_records(tables::OSD_NODES)
     }
 
-    // ---- Users (bincode) ----
+    // ---- Users ----
 
     pub fn put_user(&self, user_id: &str, user: &StoredUser) {
-        if let Err(e) = self.put_bincode(tables::USERS, user_id, user) {
+        if let Err(e) = self.put_record(tables::USERS, user_id, user) {
             error!("Failed to persist user '{}': {}", user_id, e);
         }
     }
@@ -222,13 +222,13 @@ impl MetaStore {
     }
 
     pub fn load_users(&self) -> MetaStoreResult<Vec<(String, StoredUser)>> {
-        self.load_bincode_table(tables::USERS)
+        self.load_records(tables::USERS)
     }
 
-    // ---- Access Keys (bincode) ----
+    // ---- Access Keys ----
 
     pub fn put_access_key(&self, access_key_id: &str, key: &StoredAccessKey) {
-        if let Err(e) = self.put_bincode(tables::ACCESS_KEYS, access_key_id, key) {
+        if let Err(e) = self.put_record(tables::ACCESS_KEYS, access_key_id, key) {
             error!("Failed to persist access key '{}': {}", access_key_id, e);
         }
     }
@@ -240,13 +240,13 @@ impl MetaStore {
     }
 
     pub fn load_access_keys(&self) -> MetaStoreResult<Vec<(String, StoredAccessKey)>> {
-        self.load_bincode_table(tables::ACCESS_KEYS)
+        self.load_records(tables::ACCESS_KEYS)
     }
 
-    // ---- Groups (bincode) ----
+    // ---- Groups ----
 
     pub fn put_group(&self, group_id: &str, group: &StoredGroup) {
-        if let Err(e) = self.put_bincode(tables::GROUPS, group_id, group) {
+        if let Err(e) = self.put_record(tables::GROUPS, group_id, group) {
             error!("Failed to persist group '{}': {}", group_id, e);
         }
     }
@@ -258,15 +258,15 @@ impl MetaStore {
     }
 
     pub fn load_groups(&self) -> MetaStoreResult<Vec<(String, StoredGroup)>> {
-        self.load_bincode_table(tables::GROUPS)
+        self.load_records(tables::GROUPS)
     }
 
     // ---- Ensure admin (batch user + key write) ----
 
     pub fn put_user_and_key(&self, user: &StoredUser, key: &StoredAccessKey) {
         if let Err(e) = (|| -> MetaStoreResult<()> {
-            let user_bytes = bincode::serialize(user)?;
-            let key_bytes = bincode::serialize(key)?;
+            let user_bytes = crate::types::record::Record::to_bytes(user);
+            let key_bytes = crate::types::record::Record::to_bytes(key);
             let write_txn = self.db.begin_write()?;
             {
                 let mut t = write_txn.open_table(tables::USERS)?;
@@ -645,10 +645,10 @@ impl MetaStore {
         Ok((results, is_truncated, next_token))
     }
 
-    // ---- Data Filters (bincode) ----
+    // ---- Data Filters ----
 
     pub fn put_data_filter(&self, filter_id: &str, filter: &StoredDataFilter) {
-        if let Err(e) = self.put_bincode(tables::DATA_FILTERS, filter_id, filter) {
+        if let Err(e) = self.put_record(tables::DATA_FILTERS, filter_id, filter) {
             error!("Failed to persist data filter '{}': {}", filter_id, e);
         }
     }
@@ -660,7 +660,7 @@ impl MetaStore {
     }
 
     pub fn load_data_filters(&self) -> MetaStoreResult<Vec<(String, StoredDataFilter)>> {
-        self.load_bincode_table(tables::DATA_FILTERS)
+        self.load_records(tables::DATA_FILTERS)
     }
 
     // ---- Delta Sharing (raw bytes, prost-encoded) ----
@@ -758,13 +758,13 @@ impl MetaStore {
         Ok(())
     }
 
-    fn put_bincode<T: serde::Serialize>(
+    fn put_record<T: crate::types::record::Record>(
         &self,
         table_def: redb::TableDefinition<&str, &[u8]>,
         key: &str,
         value: &T,
     ) -> MetaStoreResult<()> {
-        let bytes = bincode::serialize(value)?;
+        let bytes = value.to_bytes();
         self.put_bytes(table_def, key, &bytes)
     }
 
@@ -782,7 +782,9 @@ impl MetaStore {
         Ok(())
     }
 
-    fn load_bincode_table<T: serde::de::DeserializeOwned>(
+    /// Every record in a table. One that doesn't decode fails the load,
+    /// rather than being left out of what meta serves.
+    fn load_records<T: crate::types::record::Record>(
         &self,
         table_def: redb::TableDefinition<&str, &[u8]>,
     ) -> MetaStoreResult<Vec<(String, T)>> {
@@ -792,11 +794,13 @@ impl MetaStore {
         for entry in table.iter()? {
             let entry = entry?;
             let key = entry.0.value().to_string();
-            let bytes = entry.1.value();
-            match bincode::deserialize::<T>(bytes) {
-                Ok(val) => result.push((key, val)),
-                Err(e) => error!("Failed to decode entry '{}': {}", key, e),
-            }
+            let val = T::from_bytes(entry.1.value()).map_err(|e| {
+                crate::types::record::RecordError(format!(
+                    "{} '{key}': {e}",
+                    redb::TableHandle::name(&table_def)
+                ))
+            })?;
+            result.push((key, val));
         }
         Ok(result)
     }

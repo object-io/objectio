@@ -181,16 +181,6 @@ impl MetadataEntry {
             deleted: true,
         }
     }
-
-    /// Serialize to bytes for WAL
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
-    }
-
-    /// Deserialize from bytes
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
-    }
 }
 
 /// Metadata operation type for WAL
@@ -204,16 +194,94 @@ pub enum MetadataOp {
     Batch { ops: Vec<MetadataOp> },
 }
 
-impl MetadataOp {
-    /// Serialize to bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+/// How a [`MetadataOp`] is written to the metadata log: protobuf, so a
+/// later release can add fields that this one skips.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct OpRecord {
+    /// 1 = put, 2 = delete, 3 = batch.
+    #[prost(uint32, tag = "1")]
+    kind: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    value: Vec<u8>,
+    #[prost(message, repeated, tag = "4")]
+    ops: Vec<OpRecord>,
+}
+
+impl OpRecord {
+    fn of(op: &MetadataOp) -> Self {
+        match op {
+            MetadataOp::Put { key, value } => Self {
+                kind: 1,
+                key: key.0.clone(),
+                value: value.clone(),
+                ops: Vec::new(),
+            },
+            MetadataOp::Delete { key } => Self {
+                kind: 2,
+                key: key.0.clone(),
+                ..Self::default()
+            },
+            MetadataOp::Batch { ops } => Self {
+                kind: 3,
+                ops: ops.iter().map(Self::of).collect(),
+                ..Self::default()
+            },
+        }
     }
 
-    /// Deserialize from bytes
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
+    fn into_op(self) -> Option<MetadataOp> {
+        Some(match self.kind {
+            1 => MetadataOp::Put {
+                key: MetadataKey(self.key),
+                value: self.value,
+            },
+            2 => MetadataOp::Delete {
+                key: MetadataKey(self.key),
+            },
+            3 => MetadataOp::Batch {
+                ops: self
+                    .ops
+                    .into_iter()
+                    .map(Self::into_op)
+                    .collect::<Option<_>>()?,
+            },
+            _ => return None,
+        })
     }
+}
+
+impl MetadataOp {
+    /// The operation as the metadata log stores it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        use prost::Message;
+        OpRecord::of(self).encode_to_vec()
+    }
+
+    /// The operation in `data`; `None` if it isn't one this release knows.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        use prost::Message;
+        OpRecord::decode(data).ok()?.into_op()
+    }
+}
+
+/// One entry of a B-tree snapshot.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotEntry {
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub value: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub lsn: u64,
+}
+
+/// A B-tree snapshot's entries, after its header.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotEntries {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<SnapshotEntry>,
 }
 
 /// Snapshot header for B-tree persistence
@@ -235,7 +303,7 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     pub const MAGIC: u32 = 0x4D455441; // "META"
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2; // 2: protobuf entries
     pub const SIZE: usize = 32;
 
     pub fn new(lsn: u64, entry_count: u64) -> Self {
@@ -294,19 +362,6 @@ mod tests {
 
         assert!(k1 < k2);
         assert!(k2 < k3);
-    }
-
-    #[test]
-    fn test_metadata_entry_roundtrip() {
-        let entry = MetadataEntry::new(MetadataKey::block(1), b"test value".to_vec(), 100);
-
-        let bytes = entry.to_bytes();
-        let parsed = MetadataEntry::from_bytes(&bytes).unwrap();
-
-        assert_eq!(parsed.key, entry.key);
-        assert_eq!(parsed.value, entry.value);
-        assert_eq!(parsed.lsn, entry.lsn);
-        assert!(!parsed.deleted);
     }
 
     #[test]
