@@ -36,12 +36,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
+pub mod ha;
+
 use sha2::{Digest, Sha256};
 
 /// A running single-process cluster. Killed on drop, so a panicking test
 /// cannot leave a gateway holding a port.
 pub struct Cluster {
-    child: Child,
+    /// The aio process; `None` for a client of a cluster run some other
+    /// way ([`Cluster::client`]).
+    child: Option<Child>,
     pub endpoint: String,
     pub access_key: String,
     pub secret_key: String,
@@ -57,8 +61,10 @@ pub struct Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -121,6 +127,30 @@ fn free_port() -> u16 {
 }
 
 impl Cluster {
+    /// A client of a cluster this harness didn't start (see `ha`): signed
+    /// requests to `endpoint` as `access_key`. Restarting it is not
+    /// possible.
+    #[must_use]
+    pub fn client(endpoint: &str, access_key: &str, secret_key: &str) -> Self {
+        Self {
+            child: None,
+            endpoint: endpoint.to_string(),
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            data_dir: tempfile::tempdir().expect("tempdir"),
+            port: 0,
+            osds: 0,
+            ec: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    const fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("a client-only Cluster has no process to restart")
+    }
+
     /// Boot a cluster with auth on and wait until it serves.
     pub fn start() -> Self {
         Self::start_with_osds(1)
@@ -221,7 +251,7 @@ impl Cluster {
 
             let endpoint = format!("http://127.0.0.1:{port}");
             let mut cluster = Self {
-                child,
+                child: Some(child),
                 endpoint,
                 access_key,
                 secret_key,
@@ -260,20 +290,20 @@ impl Cluster {
     /// cluster ends up in after an OSD is replaced or its identity is reset.
     pub fn restart_with_osds(&mut self, osds: usize) {
         self.osds = osds;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
 
         // A restart keeps its port and data — that is what is being tested
         // — so on losing the port, wait for it and try the same one again.
         let mut last = String::new();
         for _ in 0..Self::START_ATTEMPTS {
-            self.child = Self::spawn(
+            self.child = Some(Self::spawn(
                 self.data_dir.path(),
                 self.port,
                 self.osds,
                 self.ec,
                 &self.extra_args,
-            );
+            ));
             match self.wait_healthy() {
                 Ok(()) => return,
                 Err(e) => last = e,
@@ -309,8 +339,8 @@ impl Cluster {
                 self.osds
             );
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
         for &index in indexes {
             let disk = self.data_dir.path().join(format!("osd-{index}/disk0"));
             std::fs::remove_dir_all(&disk)
@@ -335,8 +365,8 @@ impl Cluster {
     /// Restart with the data directory `dir` (relative to the cluster's,
     /// such as `block`) destroyed.
     pub fn restart_without(&mut self, dir: &str) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
         let path = self.data_dir.path().join(dir);
         std::fs::remove_dir_all(&path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
         self.restart_with_osds(self.osds);
@@ -410,7 +440,7 @@ impl Cluster {
         let mut last = String::from("no response");
         while Instant::now() < deadline {
             // A child that has already exited will never become healthy.
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Ok(Some(status)) = self.child_mut().try_wait() {
                 return Err(format!("objectio-aio exited during startup with {status}"));
             }
             match client.get(format!("{}/_admin/nodes", self.endpoint)).send() {
@@ -426,8 +456,8 @@ impl Cluster {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
         Err(format!("the gateway did not come up within 90s — {last}"))
     }
 
@@ -440,7 +470,7 @@ impl Cluster {
     fn wait_osds_online(&mut self, deadline: Instant) -> Result<(), String> {
         let mut last = String::from("no answer");
         while Instant::now() < deadline {
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Ok(Some(status)) = self.child_mut().try_wait() {
                 return Err(format!("objectio-aio exited during startup with {status}"));
             }
             let r = self.request("GET", "/_admin/nodes", &[]);
@@ -457,8 +487,8 @@ impl Cluster {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
         Err(format!("OSDs did not come online within 90s — {last}"))
     }
 
@@ -482,7 +512,7 @@ impl Cluster {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let mut last = String::from("no answer");
         while Instant::now() < deadline {
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Ok(Some(status)) = self.child_mut().try_wait() {
                 return Err(format!("objectio-aio exited during startup with {status}"));
             }
             let answer = rt.block_on(async {
@@ -508,8 +538,8 @@ impl Cluster {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
         Err(format!("the block gateway did not come up — {last}"))
     }
 

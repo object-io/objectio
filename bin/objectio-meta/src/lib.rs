@@ -7,6 +7,7 @@
 pub mod balancer;
 pub mod block_service;
 pub mod drain_observer;
+pub mod forward;
 pub mod liveness;
 mod op_metrics;
 pub mod raft_admin;
@@ -191,36 +192,6 @@ pub async fn run(
 
     let meta_service = MetaService::with_store(ec_config, store.clone());
 
-    // Ensure admin user exists (creates on first startup, returns existing on restarts)
-    if let Some((access_key_id, secret_access_key)) = meta_service.ensure_admin(&args.admin_user) {
-        info!("============================================");
-        info!("Admin credentials (save these!):");
-        info!("  Access Key ID:     {}", access_key_id);
-        info!("  Secret Access Key: {}", secret_access_key);
-        info!("============================================");
-
-        // Also drop them on disk next to the redb so aio (or any
-        // wrapper) can surface them in a banner without parsing logs.
-        // shell-compatible format: two KEY=VAL lines + a commented
-        // `source`-hint. Any caller that doesn't want this file can
-        // ignore it; a production deployment wouldn't mount the dir.
-        let creds_path = args.data_dir.join("admin-creds.env");
-        let body = format!(
-            "# Created by objectio-meta on first boot. Safe to delete.\n\
-             export AWS_ACCESS_KEY_ID={access_key_id}\n\
-             export AWS_SECRET_ACCESS_KEY={secret_access_key}\n"
-        );
-        match std::fs::write(&creds_path, body) {
-            Ok(()) => info!("Wrote admin creds to {}", creds_path.display()),
-            Err(e) => error!(
-                "Failed to write admin creds to {}: {e}",
-                creds_path.display()
-            ),
-        }
-    } else {
-        info!("Admin user '{}' already exists", args.admin_user);
-    }
-
     // Register OSD nodes from CLI args (skip if store already has nodes)
     if !args.osd.is_empty() && !meta_service.has_persisted_osds() {
         for osd_addr in &args.osd {
@@ -342,6 +313,11 @@ pub async fn run(
         args.drain_batch,
     );
     liveness::spawn(meta_service.clone());
+    spawn_admin_bootstrap(
+        meta_service.clone(),
+        args.admin_user.clone(),
+        args.data_dir.clone(),
+    );
     // PG balancer — leader-only, evaluates placement-group load each
     // tick. Currently observational (Phase 4a); execution lands with
     // the Phase 5 migration path.
@@ -386,6 +362,9 @@ pub async fn run(
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(
             &op_metrics::RPC_METRICS,
         ))
+        // A follower forwards every client call to the leader, so any meta
+        // node serves any client (see `forward`).
+        .layer(forward::ForwardToLeaderLayer::new(raft.clone(), node_id))
         .add_service(MetadataServiceServer::from_arc(meta_service))
         .add_service(BlockServiceServer::from_arc(block_service))
         // Raft messages are JSON, which bloats binary values 3-4x; at
@@ -405,6 +384,50 @@ pub async fn run(
     info!("Metadata Service shut down gracefully");
 
     Ok(())
+}
+
+/// The bootstrap admin: created once for the whole cluster, by the Raft
+/// leader, through Raft — every meta node used to create its own admin at
+/// startup, so a 3-node cluster had three, and the credentials in use
+/// stopped working after a failover. Every node, once the admin exists
+/// (created here or replicated to it), writes its credentials next to its
+/// store for wrappers (aio) to show, and logs them once.
+fn spawn_admin_bootstrap(
+    svc: Arc<service::MetaService>,
+    admin_name: String,
+    data_dir: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Some((access_key_id, secret_access_key)) = svc.admin_credentials(&admin_name) {
+                info!("============================================");
+                info!("Admin credentials (save these!):");
+                info!("  Access Key ID:     {}", access_key_id);
+                info!("  Secret Access Key: {}", secret_access_key);
+                info!("============================================");
+                let creds_path = data_dir.join("admin-creds.env");
+                let body = format!(
+                    "# Created by objectio-meta on first boot. Safe to delete.\n\
+                     export AWS_ACCESS_KEY_ID={access_key_id}\n\
+                     export AWS_SECRET_ACCESS_KEY={secret_access_key}\n"
+                );
+                match std::fs::write(&creds_path, body) {
+                    Ok(()) => info!("Wrote admin creds to {}", creds_path.display()),
+                    Err(e) => error!(
+                        "Failed to write admin creds to {}: {e}",
+                        creds_path.display()
+                    ),
+                }
+                return;
+            }
+            if svc.is_raft_leader()
+                && let Err(e) = svc.create_admin(&admin_name).await
+            {
+                tracing::warn!("creating the bootstrap admin: {e}; retrying");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    });
 }
 
 /// Metrics state for the Meta service

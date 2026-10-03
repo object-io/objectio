@@ -9,6 +9,9 @@ license.workspace = true
 objectio-common = { workspace = true }
 tower = { workspace = true }
 tonic = { workspace = true }
+tokio = { workspace = true }
+# tonic 0.12's balanced channel takes tower 0.4's `Change`.
+tower04 = { package = "tower", version = "0.4", default-features = false, features = ["discover"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 serde_json = { workspace = true }

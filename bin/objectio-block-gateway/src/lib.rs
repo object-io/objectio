@@ -140,10 +140,9 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     // ── Meta gRPC client ──────────────────────────────────────────────────────
-    let meta_channel = tonic::transport::Endpoint::new(args.meta_endpoint.clone())
-        .context("parse meta endpoint")?
-        .connect()
+    let meta_channel = objectio_proto::transport::meta_channel(&args.meta_endpoint)
         .await
+        .map_err(anyhow::Error::msg)
         .context("connect to meta service")?;
 
     let meta = Arc::new(MetaBlocks::new(Arc::new(Mutex::new(

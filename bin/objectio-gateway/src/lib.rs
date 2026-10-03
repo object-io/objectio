@@ -193,7 +193,8 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub tenant_console_listen: String,
 
-    /// Metadata service endpoint
+    /// Metadata service endpoint: one address, or every meta node's,
+    /// comma-separated (any of them serves; one that's down is skipped)
     #[arg(long, default_value = "http://localhost:9001")]
     pub meta_endpoint: String,
 
@@ -561,9 +562,11 @@ pub async fn run(
     cluster_poll::set_reexport(!args.no_reexport_metrics);
 
     // Connect to metadata service
-    let meta_client = MetadataServiceClient::connect(args.meta_endpoint.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to metadata service: {}", e))?;
+    let meta_client = MetadataServiceClient::new(
+        objectio_proto::transport::meta_channel(&args.meta_endpoint)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to metadata service: {e}"))?,
+    );
 
     info!("Connected to metadata service");
     info!("Credentials are managed by the metadata service");
