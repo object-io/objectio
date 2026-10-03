@@ -114,5 +114,6 @@ tail -1 "$WORK/pytest.log"
   --date "$(date -u +%Y-%m-%d)" \
   --commit "$(git -C "$REPO" rev-parse --short HEAD)" \
   --s3tests-commit "$(git -C "$WORK/s3-tests" rev-parse --short HEAD)" \
+  --platform "$(uname -s) $(uname -m)" \
   ${PREVIOUS:+--previous "$PREVIOUS"}
 echo "report: $REPORT/summary.md"

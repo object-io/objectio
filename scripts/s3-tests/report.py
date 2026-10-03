@@ -86,6 +86,7 @@ def main():
     ap.add_argument("--commit", default="?")
     ap.add_argument("--s3tests-commit", default="?")
     ap.add_argument("--date", default="")
+    ap.add_argument("--platform", default="?")
     ap.add_argument("--previous")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
@@ -124,6 +125,7 @@ def main():
         f"- Date: {a.date}",
         f"- ObjectIO commit: `{a.commit}`",
         f"- s3-tests commit: `{a.s3tests_commit}`",
+        f"- Platform: {a.platform}",
         "",
         f"**Passes {totals['passed']} of {applicable} applicable tests** "
         f"({len(rows)} in all; {not_applicable} not applicable: "
