@@ -212,6 +212,15 @@ impl MetaRaftStorage {
                                 .map_err(|e| decode_err("OsdNode", e))?;
                                 t.insert(key.as_str(), new_bytes.as_slice())
                                     .map_err(write_err)?;
+                                // Every node's cache follows, not only the
+                                // leader's: a follower that later leads would
+                                // otherwise write its stale state back when
+                                // the OSD next registers.
+                                events.push(ApplyEvent::MultiCasOp {
+                                    table: CasTable::Named("osd_nodes".into()),
+                                    key: key.clone(),
+                                    new_value: Some(new_bytes.clone()),
+                                });
                             }
                             (true, changed)
                         }
@@ -1166,6 +1175,53 @@ mod tests {
         // isn't retried on leader restart.
         let (last, _) = s.last_applied_state().await.unwrap();
         assert_eq!(last.unwrap().index, 2);
+    }
+
+    /// Setting an OSD's admin state tells every node's listener, not only
+    /// the leader: a follower that later leads must not hold the old state.
+    #[tokio::test]
+    async fn an_osd_admin_state_change_reaches_the_listener() {
+        use crate::types::record::Record;
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("meta.db")).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApplyEvent>();
+        let mut s = MetaRaftStorage::with_apply_listener(db, tx);
+        let node = crate::types::OsdNode {
+            node_id: [7; 16],
+            address: "http://osd:9200".into(),
+            disk_ids: Vec::new(),
+            topology: None,
+            disk_capacity_bytes: Vec::new(),
+            admin_state: objectio_common::OsdAdminState::In,
+            te_segment: String::new(),
+        };
+        let put = normal_entry(
+            1,
+            MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Named("osd_nodes".into()),
+                    key: hex_encode_16(&[7; 16]),
+                    expected: None,
+                    new_value: Some(node.to_bytes()),
+                }],
+                requested_by: "test".into(),
+            },
+        );
+        let out = normal_entry(
+            2,
+            MetaCommand::SetOsdAdminState {
+                node_id: [7; 16],
+                state: objectio_common::OsdAdminState::Out,
+                requested_by: "test".into(),
+            },
+        );
+        s.apply_to_state_machine(&[put, out]).await.unwrap();
+        let _registered = rx.try_recv().unwrap();
+        let ApplyEvent::MultiCasOp { new_value, .. } = rx.try_recv().unwrap() else {
+            panic!("no event for the admin state change");
+        };
+        let seen = crate::types::OsdNode::from_bytes(&new_value.unwrap()).unwrap();
+        assert_eq!(seen.admin_state, objectio_common::OsdAdminState::Out);
     }
 
     #[tokio::test]
