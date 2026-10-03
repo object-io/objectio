@@ -433,10 +433,21 @@ impl MetadataWal {
             .map_err(|e| Error::Storage(format!("failed to open WAL for replay: {}", e)))?;
 
         let mut last_lsn = from_lsn.saturating_sub(1);
+        // `Records` ends at the first damaged frame: a write torn by a
+        // crash, which was never acknowledged. A whole, checksummed record
+        // that doesn't decode is different: a newer release wrote it, or
+        // the decoder broke. Skipping it would silently drop a change this
+        // OSD acknowledged, so the replay stops instead.
         for record in Records::new(file) {
-            if record.lsn >= from_lsn
-                && let Some(op) = MetadataOp::from_bytes(&record.data)
-            {
+            if record.lsn >= from_lsn {
+                let op = MetadataOp::from_bytes(&record.data).ok_or_else(|| {
+                    Error::Storage(format!(
+                        "metadata log {}: record {} is intact but doesn't decode (written by a \
+                         newer release?); refusing to start rather than drop it",
+                        self.path.display(),
+                        record.lsn
+                    ))
+                })?;
                 callback(record.lsn, op)?;
             }
             last_lsn = record.lsn;
@@ -544,6 +555,37 @@ mod tests {
     use super::super::types::MetadataKey;
     use super::*;
     use tempfile::tempdir;
+
+    /// A torn record ends the log; a whole, checksummed one that doesn't
+    /// decode (a newer release wrote it) stops the replay instead of being
+    /// skipped, which would drop an acknowledged change.
+    #[test]
+    fn an_intact_record_that_does_not_decode_stops_the_replay() {
+        use std::io::Write as _;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            wal.append(&MetadataOp::Delete {
+                key: MetadataKey::block(1),
+            })
+            .unwrap();
+        }
+        let record = WalRecord {
+            lsn: 2,
+            data: vec![0xEE; 9],
+        };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&record.to_bytes())
+            .unwrap();
+
+        let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+        let err = wal.replay(1, |_, _| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("record 2"), "{err}");
+    }
 
     #[test]
     fn test_wal_create_and_append() {

@@ -121,9 +121,15 @@ impl JournalEntry {
 
     /// Compute CRC32 checksum
     fn compute_checksum(&self) -> u32 {
+        self.checksum_with_type(self.entry_type as u8)
+    }
+
+    /// The checksum, computed with `entry_type` as the type byte (which
+    /// may be one this release has no variant for).
+    fn checksum_with_type(&self, entry_type: u8) -> u32 {
         let mut data = Vec::new();
         data.extend_from_slice(&self.sequence.to_le_bytes());
-        data.push(self.entry_type as u8);
+        data.push(entry_type);
         data.extend_from_slice(self.volume_id.as_bytes());
         data.extend_from_slice(&self.chunk_id.to_le_bytes());
         data.extend_from_slice(&self.offset.to_le_bytes());
@@ -171,6 +177,16 @@ impl JournalEntry {
 
     /// Deserialize from reader
     pub fn deserialize<R: Read>(reader: &mut R) -> BlockResult<Self> {
+        let (entry_type, mut entry) = Self::read_raw(reader)?;
+        entry.entry_type = EntryType::try_from(entry_type)?;
+        Ok(entry)
+    }
+
+    /// Read an entry's fields whatever its type byte, which comes back
+    /// separately (the entry's own `entry_type` is a placeholder): every
+    /// type has the same layout, so an unknown one can still be read and
+    /// its checksum checked.
+    fn read_raw<R: Read>(reader: &mut R) -> BlockResult<(u8, Self)> {
         // Sequence number
         let mut seq_buf = [0u8; 8];
         reader
@@ -183,7 +199,7 @@ impl JournalEntry {
         reader
             .read_exact(&mut type_buf)
             .map_err(|e| BlockError::Journal(e.to_string()))?;
-        let entry_type = EntryType::try_from(type_buf[0])?;
+        let entry_type = type_buf[0];
 
         // Volume ID
         let mut vol_len_buf = [0u8; 2];
@@ -234,15 +250,18 @@ impl JournalEntry {
             .map_err(|e| BlockError::Journal(e.to_string()))?;
         let checksum = u32::from_le_bytes(crc_buf);
 
-        Ok(Self {
-            sequence,
+        Ok((
             entry_type,
-            volume_id,
-            chunk_id,
-            offset,
-            data,
-            checksum,
-        })
+            Self {
+                sequence,
+                entry_type: EntryType::Write,
+                volume_id,
+                chunk_id,
+                offset,
+                data,
+                checksum,
+            },
+        ))
     }
 }
 
@@ -475,7 +494,30 @@ impl WriteJournal {
         // are not compared: they restart whenever the journal is reopened,
         // so filtering on them dropped writes made since a restart.
         let mut entries = Vec::new();
-        while let Ok(entry) = JournalEntry::deserialize(&mut reader) {
+        // The journal ends at the first entry that can't be read whole or
+        // fails its checksum: a write torn by a crash, never acknowledged.
+        while let Ok((entry_type, mut entry)) = JournalEntry::read_raw(&mut reader) {
+            match EntryType::try_from(entry_type) {
+                Ok(t) => entry.entry_type = t,
+                // Whole and checksummed, with a type this release doesn't
+                // know: a newer release wrote it. Stopping here would drop
+                // it and every write after it, so refuse instead.
+                Err(_) if entry.checksum == entry.checksum_with_type(entry_type) => {
+                    return Err(BlockError::Journal(format!(
+                        "journal entry {} has type {entry_type}, which this release doesn't \
+                         know (written by a newer one?); refusing to recover rather than drop \
+                         it and the writes after it",
+                        entry.sequence
+                    )));
+                }
+                Err(_) => {
+                    warn!(
+                        "Journal entry {} is torn (unknown type, bad checksum); stopping recovery",
+                        entry.sequence
+                    );
+                    break;
+                }
+            }
             if !entry.verify() {
                 warn!(
                     "Journal entry {} failed checksum, stopping recovery",
@@ -626,6 +668,52 @@ pub fn render_metrics(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry with a type this release doesn't know, appended to a
+    /// journal holding one write: `checksum_ok` says whether it is whole.
+    fn journal_with_unknown_entry(checksum_ok: bool) -> (tempfile::TempDir, WriteJournal) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j");
+        {
+            let journal = WriteJournal::open(&path, 1 << 30).unwrap();
+            let seq = journal
+                .log_write("v", 0, 0, Bytes::from(vec![1u8; 512]))
+                .unwrap();
+            journal.sync_to(seq + 1).unwrap();
+        }
+        let mut entry = JournalEntry::write(99, "v".into(), 1, 0, Bytes::from(vec![2u8; 512]));
+        if checksum_ok {
+            entry.checksum = entry.checksum_with_type(9);
+        }
+        let mut bytes = entry.serialize();
+        bytes[8] = 9; // the type byte, after the sequence
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let journal = WriteJournal::open(&path, 1 << 30).unwrap();
+        (dir, journal)
+    }
+
+    /// A whole entry of an unknown type was written by a newer release:
+    /// recovery refuses rather than drop it and everything after it.
+    #[test]
+    fn recovery_refuses_an_entry_type_it_does_not_know() {
+        let (_dir, journal) = journal_with_unknown_entry(true);
+        let err = journal.recover().unwrap_err();
+        assert!(err.to_string().contains("type 9"), "{err}");
+    }
+
+    /// A torn entry (its checksum doesn't match) is the end of the journal,
+    /// as before.
+    #[test]
+    fn recovery_stops_at_a_torn_entry() {
+        let (_dir, journal) = journal_with_unknown_entry(false);
+        assert_eq!(journal.recover().unwrap().len(), 1);
+    }
 
     /// Group commit: writers syncing at once share fsyncs, and every one
     /// of their entries is in the journal afterwards.
