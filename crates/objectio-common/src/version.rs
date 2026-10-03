@@ -15,7 +15,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// This binary's format level. Releases before levels existed (v0.4.0 and
 /// earlier) are not supported at all: a cluster on one is reinstalled, not
 /// upgraded, and a client that declares no level is refused.
-pub const FORMAT_LEVEL: u32 = 1;
+///
+/// | Level | Adds |
+/// |---|---|
+/// | 1 | format levels (v0.5.0) |
+/// | 2 | object metadata at quorum: an ObjectMeta write succeeds at the write quorum, so a copy may lag (objectio-docs `core/object-metadata-quorum.md`); readers must take the newest copy |
+pub const FORMAT_LEVEL: u32 = 2;
 
 /// The lowest active level this binary can run in: it reads every format
 /// from this level up.
