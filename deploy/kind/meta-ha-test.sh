@@ -98,9 +98,12 @@ await_healthy "before"
 while [ "$(acked)" -lt 200 ]; do sleep 2; done
 say "traffic running: $(acked) objects acknowledged"
 
-# The term every reachable meta is in, if they agree on a leader.
+# The term every reachable meta is in, if they agree on a leader (empty
+# otherwise; never a failure, which set -e would turn into an exit).
 leader_term() {
-    [ -n "$(leader_index)" ] && statuses | awk '{print $6}' | sort -n | tail -1
+    if [ -n "$(leader_index)" ]; then
+        statuses | awk '{print $6}' | sort -n | tail -1
+    fi
 }
 
 kill_meta() {
