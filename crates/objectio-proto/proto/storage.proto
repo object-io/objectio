@@ -321,6 +321,24 @@ message PutObjectMetaRequest {
     // a writer that must not bring back an object deleted since it read it
     // — the repairer adding a rebuilt shard's location.
     bool require_existing = 6;
+    // Update only the version entry `object.version_id`, leaving the
+    // current entry alone (with `expected_object_id`: only over that
+    // object, and only if the entry exists). For a change to a version
+    // that is no longer current — its replication status, say.
+    bool version_only = 7;
+    // A replica from another cluster (bucket replication): made current only
+    // if no newer version is current (versions arrive in any order: a
+    // retried older one after a newer one); otherwise stored as a version
+    // entry alone. Requires `object.version_id`.
+    bool keep_newer_current = 8;
+    // Merge `replication_set` into the replication map of the stored
+    // entries for `object` (its version entry, and the current entry if it
+    // is the same version), under the key's lock, changing nothing else: a
+    // replicator recording a send must not undo a tag or retention change
+    // made since it read the object. Only `object.object_id` and
+    // `object.version_id` are used; refused if neither entry holds it.
+    bool replication_update = 9;
+    map<string, string> replication_set = 10;
 }
 
 message PutObjectMetaResponse {

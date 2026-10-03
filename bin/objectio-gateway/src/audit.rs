@@ -69,6 +69,8 @@ use crate::s3::AppState;
 
 const CLUSTER_KEY: &str = "audit/cluster";
 const TENANT_PREFIX: &str = "audit/tenant/";
+/// What a tenant's audit target is called in a refusal.
+const WEBHOOK: &str = "audit webhook";
 const REDACTED: &str = "********";
 /// Events waiting for the dispatcher. Past this, events are dropped and
 /// counted rather than holding up requests.
@@ -341,11 +343,13 @@ struct Config {
     tenants: HashMap<String, TenantAudit>,
 }
 
-/// Whether `url` is an https URL to a host the operator allows tenants.
-fn tenant_url_allowed(url: &str, allowed: &[String]) -> Result<(), String> {
+/// Whether `url` is an https URL to a host the operator allows tenants
+/// (`what` names the kind of target, for the refusal). Replication's
+/// tenant targets are held to the same rule.
+pub(crate) fn tenant_url_allowed(url: &str, allowed: &[String], what: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("https://")
-        .ok_or("a tenant's webhook must be https")?;
+        .ok_or_else(|| format!("a tenant's {what} must be https"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.contains('@') {
         return Err("credentials in the URL are not allowed; use auth_token".into());
@@ -364,7 +368,7 @@ fn tenant_url_allowed(url: &str, allowed: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "{host} is not among the hosts the operator allows for tenant audit targets"
+            "{host} is not among the hosts the operator allows for tenant {what}s"
         ))
     }
 }
@@ -561,7 +565,7 @@ fn reconcile(running: &mut HashMap<String, Running>, cfg: &Config) {
             for w in &ta.targets {
                 // Checked again here: the operator may have narrowed the
                 // allowed hosts since the tenant saved it.
-                if let Err(e) = tenant_url_allowed(&w.url, &c.allowed_tenant_hosts) {
+                if let Err(e) = tenant_url_allowed(&w.url, &c.allowed_tenant_hosts, WEBHOOK) {
                     debug!("audit: tenant {tenant} target {}: {e}", w.name);
                     continue;
                 }
@@ -1189,7 +1193,7 @@ pub async fn admin_put(
             .map(|c| c.allowed_tenant_hosts)
             .unwrap_or_default();
         for w in &cfg.targets {
-            if let Err(e) = tenant_url_allowed(&w.url, &allowed) {
+            if let Err(e) = tenant_url_allowed(&w.url, &allowed, WEBHOOK) {
                 return admin_error(StatusCode::BAD_REQUEST, &e);
             }
         }
@@ -1274,16 +1278,18 @@ mod tests {
             "siem.acme.example".to_string(),
             "*.logs.example".to_string(),
         ];
-        assert!(tenant_url_allowed("https://siem.acme.example/ingest", &allowed).is_ok());
-        assert!(tenant_url_allowed("https://siem.acme.example:8443/x", &allowed).is_ok());
-        assert!(tenant_url_allowed("https://a.logs.example/x", &allowed).is_ok());
+        assert!(tenant_url_allowed("https://siem.acme.example/ingest", &allowed, WEBHOOK).is_ok());
+        assert!(tenant_url_allowed("https://siem.acme.example:8443/x", &allowed, WEBHOOK).is_ok());
+        assert!(tenant_url_allowed("https://a.logs.example/x", &allowed, WEBHOOK).is_ok());
         // Not https, not allowed, a lookalike, a userinfo trick.
-        assert!(tenant_url_allowed("http://siem.acme.example/x", &allowed).is_err());
-        assert!(tenant_url_allowed("https://10.0.0.1/x", &allowed).is_err());
-        assert!(tenant_url_allowed("https://logs.example/x", &allowed).is_err());
-        assert!(tenant_url_allowed("https://evilsiem.acme.example/x", &allowed).is_err());
-        assert!(tenant_url_allowed("https://siem.acme.example@10.0.0.1/x", &allowed).is_err());
-        assert!(tenant_url_allowed("https://siem.acme.example/x", &[]).is_err());
+        assert!(tenant_url_allowed("http://siem.acme.example/x", &allowed, WEBHOOK).is_err());
+        assert!(tenant_url_allowed("https://10.0.0.1/x", &allowed, WEBHOOK).is_err());
+        assert!(tenant_url_allowed("https://logs.example/x", &allowed, WEBHOOK).is_err());
+        assert!(tenant_url_allowed("https://evilsiem.acme.example/x", &allowed, WEBHOOK).is_err());
+        assert!(
+            tenant_url_allowed("https://siem.acme.example@10.0.0.1/x", &allowed, WEBHOOK).is_err()
+        );
+        assert!(tenant_url_allowed("https://siem.acme.example/x", &[], WEBHOOK).is_err());
     }
 
     #[test]

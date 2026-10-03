@@ -678,7 +678,50 @@ pub async fn put_object_meta_to_all(
     versioning_enabled: bool,
     expected_object_id: &[u8],
 ) -> Result<Vec<Displaced>, MetaWriteError> {
+    put_object_meta_with(
+        pool,
+        placements,
+        bucket,
+        key,
+        object_meta,
+        MetaWrite {
+            versioning_enabled,
+            expected_object_id,
+            ..MetaWrite::default()
+        },
+    )
+    .await
+}
+
+/// How [`put_object_meta_with`] writes.
+#[derive(Default, Clone, Copy)]
+pub struct MetaWrite<'a> {
+    pub versioning_enabled: bool,
+    /// Only over this object (an update), which must still exist.
+    pub expected_object_id: &'a [u8],
+    /// Only the version entry `object.version_id` (an update of a version
+    /// that may not be current).
+    pub version_only: bool,
+    /// A replica: made current only if no newer version is.
+    pub keep_newer_current: bool,
+}
+
+/// As [`put_object_meta_to_all`], with every option the OSD takes.
+pub async fn put_object_meta_with(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    object_meta: objectio_proto::metadata::ObjectMeta,
+    write: MetaWrite<'_>,
+) -> Result<Vec<Displaced>, MetaWriteError> {
     use objectio_proto::storage::PutObjectMetaRequest;
+    let MetaWrite {
+        versioning_enabled,
+        expected_object_id,
+        version_only,
+        keep_newer_current,
+    } = write;
 
     let targets = unique_node_placements(placements);
     if targets.is_empty() {
@@ -704,6 +747,10 @@ pub async fn put_object_meta_to_all(
             // update's read and its write brought the object back, naming
             // shards the DELETE had freed.
             require_existing: !expected_object_id.is_empty(),
+            version_only,
+            keep_newer_current,
+            replication_update: false,
+            replication_set: std::collections::HashMap::new(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             object: Some(object_meta.clone()),
@@ -1756,5 +1803,56 @@ mod tests {
     #[test]
     fn a_response_without_a_checksum_is_taken_as_is() {
         assert!(matches_checksum(None, b"anything"));
+    }
+}
+
+/// Record `status` for replication `target` on every copy of `version`
+/// (its version entry, and the current entry if it is that version),
+/// changing nothing else: each OSD merges just the status under the key's
+/// lock, so a tag or retention change made since `version` was read stays.
+/// Succeeds if any copy took it.
+pub async fn set_replication_status(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    version: &objectio_proto::metadata::ObjectMeta,
+    target: &str,
+    status: &str,
+) -> Result<(), OsdPoolError> {
+    use objectio_proto::storage::PutObjectMetaRequest;
+    let only_ids = objectio_proto::metadata::ObjectMeta {
+        object_id: version.object_id.clone(),
+        version_id: version.version_id.clone(),
+        ..Default::default()
+    };
+    let targets = unique_node_placements(placements);
+    let futs = targets.iter().map(|p| {
+        let req = PutObjectMetaRequest {
+            bucket: version.bucket.clone(),
+            key: version.key.clone(),
+            object: Some(only_ids.clone()),
+            replication_update: true,
+            replication_set: std::iter::once((target.to_string(), status.to_string())).collect(),
+            ..Default::default()
+        };
+        async move {
+            let mut client = pool.get_client_for_placement(p).await?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.put_object_meta(req),
+            )
+            .await
+            .map_err(|_| OsdPoolError::ConnectionFailed("put_object_meta timeout".into()))?
+            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            Ok::<_, OsdPoolError>(())
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+    if results.iter().any(Result::is_ok) {
+        Ok(())
+    } else {
+        Err(results
+            .into_iter()
+            .find_map(Result::err)
+            .unwrap_or(OsdPoolError::NoNodesAvailable))
     }
 }

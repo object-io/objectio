@@ -22,7 +22,8 @@ mod config;
 mod configure;
 mod http;
 mod output;
-mod sigv4;
+/// `SigV4` signing, shared with the gateway's replicator.
+use objectio_auth::signer as sigv4;
 #[cfg(test)]
 mod stub_tests;
 

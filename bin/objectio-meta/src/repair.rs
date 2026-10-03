@@ -760,6 +760,10 @@ async fn record_locations(
             expected_object_id: fresh.object_id.clone(),
             // An object deleted since it was read must not come back.
             require_existing: true,
+            version_only: false,
+            keep_newer_current: false,
+            replication_update: false,
+            replication_set: std::collections::HashMap::new(),
         };
         let result = async {
             let mut client = StorageServiceClient::new(open_channel(&addr).await?);

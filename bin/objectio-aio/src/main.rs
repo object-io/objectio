@@ -148,6 +148,15 @@ struct Args {
     #[arg(long)]
     pack_min_age_secs: Option<u64>,
 
+    /// How often the replication scanner runs (seconds); forwarded to the
+    /// gateway.
+    #[arg(long)]
+    replication_scan_secs: Option<u64>,
+
+    /// Turn the replication fast path off (testing only).
+    #[arg(long, hide = true)]
+    no_replication_fast_path: bool,
+
     /// The packer's wait between switching and releasing (testing only).
     #[arg(long, hide = true)]
     pack_grace_secs: Option<u64>,
@@ -890,6 +899,12 @@ async fn main() -> Result<()> {
     }
     if let Some(secs) = args.pack_min_age_secs {
         gw_argv.extend(["--pack-min-age-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.replication_scan_secs {
+        gw_argv.extend(["--replication-scan-secs".to_string(), secs.to_string()]);
+    }
+    if args.no_replication_fast_path {
+        gw_argv.extend(["--replication-fast-path".to_string(), "false".to_string()]);
     }
     if let Some(secs) = args.pack_grace_secs {
         gw_argv.extend(["--pack-grace-secs".to_string(), secs.to_string()]);

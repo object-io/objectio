@@ -150,6 +150,8 @@ pub struct AppState {
     pub auditor: Arc<crate::audit::Auditor>,
     /// Pack records of packed objects, for reads.
     pub pack_cache: crate::packs::PackCache,
+    /// Bucket replication: caches, the fast-path queue, the backlog.
+    pub replication: crate::replication::Replication,
 }
 
 impl AppState {
@@ -696,7 +698,7 @@ fn admin_error_json(message: &str) -> String {
 /// ride in `user_metadata` under this prefix (a space can't be in a header
 /// name, so no `x-amz-meta-` key can collide) and are served under their own
 /// names.
-const STORED_HEADER_PREFIX: &str = "objectio header ";
+pub(crate) const STORED_HEADER_PREFIX: &str = "objectio header ";
 const STORED_HEADERS: [&str; 5] = [
     "cache-control",
     "content-disposition",
@@ -763,11 +765,10 @@ fn add_metadata_headers(
 /// S3 sub-resources this gateway doesn't implement. Without this a request
 /// naming one fell through to the plain request: `GET /b?website` answered
 /// with the bucket's listing, `PUT /b?logging` tried to create the bucket.
-const UNSUPPORTED_SUBRESOURCES: [&str; 13] = [
+const UNSUPPORTED_SUBRESOURCES: [&str; 12] = [
     "website",
     "logging",
     "notification",
-    "replication",
     "inventory",
     "analytics",
     "metrics",
@@ -815,8 +816,9 @@ pub async fn unsupported_subresource_layer(
 /// the bucket or object itself: `DELETE /b?acl`, `?versioning`,
 /// `?ownershipControls` deleted an empty bucket; `DELETE /b/k?retention`,
 /// `?legal-hold` the object.
-const BUCKET_DELETE_PARAMS: [&str; 7] = [
+const BUCKET_DELETE_PARAMS: [&str; 8] = [
     "tagging",
+    "replication",
     "policy",
     "lifecycle",
     "encryption",
@@ -1104,7 +1106,7 @@ fn tagging_header(headers: &HeaderMap) -> Result<HashMap<String, String>, Respon
 }
 
 /// `tags` as an `x-amz-tagging` value.
-fn encode_tagging(tags: &HashMap<String, String>) -> String {
+pub(crate) fn encode_tagging(tags: &HashMap<String, String>) -> String {
     let mut pairs: Vec<_> = tags.iter().collect();
     pairs.sort();
     pairs
@@ -1731,6 +1733,8 @@ pub struct ListObjectsParams {
     policy_status: Option<String>,
     /// If present, a GetBucketCors request (see `crate::cors`)
     cors: Option<String>,
+    /// If present, a bucket replication configuration request.
+    replication: Option<String>,
     /// If present (even empty), this is a policy request
     policy: Option<String>,
     /// If present, this is a list object versions request
@@ -1813,6 +1817,8 @@ pub struct PutBucketParams {
     public_access_block: Option<String>,
     /// If present, a PutBucketCors request (see `crate::cors`)
     cors: Option<String>,
+    /// If present, a bucket replication configuration request.
+    replication: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
@@ -1834,6 +1840,8 @@ pub struct DeleteBucketParams {
     public_access_block: Option<String>,
     /// If present, a DeleteBucketCors request (see `crate::cors`)
     cors: Option<String>,
+    /// If present, a bucket replication configuration request.
+    replication: Option<String>,
 }
 
 /// Query parameters for PUT object operations (handles both simple PUT and multipart)
@@ -2806,6 +2814,9 @@ pub async fn create_bucket(
     if params.cors.is_some() {
         return crate::cors::put_bucket(&state, &bucket, &headers, &body).await;
     }
+    if params.replication.is_some() {
+        return crate::replication::put_config(&state, &bucket, &body).await;
+    }
     // Ownership other than BucketOwnerEnforced can't be honoured (ACLs are
     // off): refused, as PutBucketOwnershipControls refuses it, rather than
     // a bucket created that quietly behaves otherwise.
@@ -3041,6 +3052,9 @@ pub async fn delete_bucket(
     if params.cors.is_some() {
         return crate::cors::delete_bucket(&state, &bucket).await;
     }
+    if params.replication.is_some() {
+        return crate::replication::delete_config(&state, &bucket).await;
+    }
 
     // Noncurrent versions and delete markers count as contents, as in S3;
     // they live only on the OSDs. Meta checks current objects itself.
@@ -3214,6 +3228,9 @@ pub async fn list_objects(
     }
     if params.cors.is_some() {
         return crate::cors::get_bucket(&state, &bucket).await;
+    }
+    if params.replication.is_some() {
+        return crate::replication::get_config(&state, &bucket).await;
     }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
@@ -3837,6 +3854,9 @@ async fn copy_by_reference(
         legal_hold: lock_hold,
         ..Default::default()
     };
+    let mut object_meta = object_meta;
+    crate::replication::mark(state, &mut object_meta).await;
+    let marked = (!object_meta.replication.is_empty()).then(|| object_meta.clone());
 
     let listing_req = objectio_proto::metadata::CreateObjectRequest {
         bucket: dest_bucket.to_string(),
@@ -3923,6 +3943,9 @@ async fn copy_by_reference(
         );
     }
 
+    if let Some(object) = marked {
+        crate::replication::enqueue(state, &object);
+    }
     info!(
         "CopyObject: {source_bucket}/{source_key} -> {what} ({} bytes, by reference)",
         source.size
@@ -4705,6 +4728,77 @@ fn condition_refused(code: &str) -> Response {
 async fn commit_put(
     state: &Arc<AppState>,
     placement: &objectio_proto::metadata::GetPlacementResponse,
+    mut object_meta: ObjectMeta,
+    versioning_enabled: bool,
+    sent: Vec<ShardTarget>,
+    condition: &PutCondition,
+) -> Result<(), Response> {
+    if !object_meta.replica_of.is_empty() {
+        return commit_replica(state, placement, object_meta, sent).await;
+    }
+    // Marked for replication in the same write that commits it: a version
+    // is never committed and then forgotten.
+    crate::replication::mark(state, &mut object_meta).await;
+    let marked = (!object_meta.replication.is_empty()).then(|| object_meta.clone());
+    commit_new(
+        state,
+        placement,
+        object_meta,
+        versioning_enabled,
+        sent,
+        condition,
+    )
+    .await?;
+    if let Some(object) = marked {
+        crate::replication::enqueue(state, &object);
+    }
+    Ok(())
+}
+
+/// Commit a replica another cluster sent: under its source's version id,
+/// made current only if no newer version is (versions can arrive in any
+/// order), and listed as whatever is current then. A replica displaces
+/// nothing: the bucket is versioned, so what was current stays a version.
+async fn commit_replica(
+    state: &Arc<AppState>,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+    object_meta: ObjectMeta,
+    sent: Vec<ShardTarget>,
+) -> Result<(), Response> {
+    let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
+    let written = crate::osd_pool::put_object_meta_with(
+        &state.osd_pool,
+        &placement.nodes,
+        &bucket,
+        &key,
+        object_meta,
+        crate::osd_pool::MetaWrite {
+            versioning_enabled: true,
+            keep_newer_current: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    sync_listing(state, &placement.nodes, &bucket, &key).await;
+    match written {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.unapplied {
+                spawn_reclaim(state, sent, Reclaim::FailedWrite, format!("{bucket}/{key}"));
+            }
+            Err(S3Error::xml_response(
+                "ServiceUnavailable",
+                &format!("storing the replica: {}", e.error),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ))
+        }
+    }
+}
+
+/// [`commit_put`] for a version written here.
+async fn commit_new(
+    state: &Arc<AppState>,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
     object_meta: ObjectMeta,
     versioning_enabled: bool,
     sent: Vec<ShardTarget>,
@@ -5128,6 +5222,25 @@ pub async fn put_object(
     } else {
         String::new()
     };
+    // A replica another cluster sends keeps its version id (and ETag); one
+    // this bucket holds already is a repeat, answered without storing it
+    // again.
+    let replica = match crate::replication::replica_request(
+        &state,
+        &auth,
+        &bucket,
+        &key,
+        &headers,
+        versioning_enabled,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let version_id = replica
+        .as_ref()
+        .map_or(version_id, |r| r.version_id.clone());
 
     // Get placement from metadata service
     let placement = match meta_client
@@ -5334,6 +5447,7 @@ pub async fn put_object(
             .unwrap_or_default()
             .as_secs();
 
+        let etag = replica.as_ref().map_or(etag, |r| r.etag.clone());
         let object_meta = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -5360,6 +5474,8 @@ pub async fn put_object(
             checksum: stored_checksum.clone(),
             tags: tags.clone(),
             part_checksums: Vec::new(),
+            replication: HashMap::new(),
+            replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -5733,6 +5849,7 @@ pub async fn put_object(
         .as_secs();
 
     // Build ObjectMeta for OSD storage
+    let etag = replica.as_ref().map_or(etag, |r| r.etag.clone());
     let object_meta = ObjectMeta {
         bucket: bucket.clone(),
         key: key.clone(),
@@ -5759,6 +5876,8 @@ pub async fn put_object(
         checksum: stored_checksum,
         tags,
         part_checksums: Vec::new(),
+        replication: HashMap::new(),
+        replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.
@@ -6127,6 +6246,14 @@ pub(crate) async fn get_object_version(
     {
         resp.headers_mut().insert("x-amz-expiration", v);
     }
+    if resp.status().is_success()
+        && let Some(v) = notes.replication
+    {
+        resp.headers_mut().insert(
+            "x-amz-replication-status",
+            header::HeaderValue::from_static(v),
+        );
+    }
     resp
 }
 
@@ -6137,6 +6264,8 @@ struct ReadNotes {
     cached_packs: Vec<Vec<u8>>,
     /// `x-amz-expiration` for the object read.
     expiration: Option<header::HeaderValue>,
+    /// `x-amz-replication-status` for the object read.
+    replication: Option<&'static str>,
 }
 
 /// One attempt at [`get_object_version`]. `fresh_packs` resolves packs
@@ -6272,6 +6401,7 @@ async fn get_object_version_once(
     if let Some(resp) = read_preconditions(&headers, &object) {
         return resp;
     }
+    notes.replication = crate::replication::status_header(&object);
     // The current version: when lifecycle will expire it.
     if version_id.is_none() {
         notes.expiration =
@@ -7209,6 +7339,9 @@ pub async fn head_object(
             if let Some(count) = parts {
                 builder = builder.header("x-amz-mp-parts-count", count);
             }
+            if let Some(v) = crate::replication::status_header(&obj) {
+                builder = builder.header("x-amz-replication-status", v);
+            }
             if params.version_id.is_none()
                 && let Some(v) = crate::lifecycle::expiration_header(
                     &state,
@@ -7572,7 +7705,7 @@ async fn delete_version(
 /// the OSDs: listed if it is an object, unlisted if a delete marker or
 /// nothing. Re-checked after the write, since another request may have
 /// changed the current object meanwhile. Returns the current object.
-async fn sync_listing(
+pub(crate) async fn sync_listing(
     state: &Arc<AppState>,
     nodes: &[objectio_proto::metadata::NodePlacement],
     bucket: &str,
@@ -8009,10 +8142,26 @@ async fn delete_object_to_the_end(
         return refusal;
     }
 
+    // A delete marker another cluster replicates here, under its own
+    // version id.
+    if version_id.is_none()
+        && let Some(resp) = crate::replication::replica_delete(
+            &state,
+            &_auth,
+            &bucket,
+            &key,
+            &headers,
+            versioning_enabled,
+        )
+        .await
+    {
+        return resp;
+    }
+
     if versioning_enabled && version_id.is_none() {
         // Versioned delete without version_id: create a delete marker
         let marker_version_id = new_version_id();
-        let delete_marker = ObjectMeta {
+        let mut delete_marker = ObjectMeta {
             bucket: bucket.clone(),
             key: key.clone(),
             object_id: Uuid::now_v7().as_bytes().to_vec(),
@@ -8036,6 +8185,10 @@ async fn delete_object_to_the_end(
             legal_hold: None,
             ..Default::default()
         };
+        // Replicated if a rule asks for delete markers: marked as it's
+        // committed.
+        crate::replication::mark(&state, &mut delete_marker).await;
+        let marked = (!delete_marker.replication.is_empty()).then(|| delete_marker.clone());
 
         if let Err(e) = put_object_meta_to_all(
             &state.osd_pool,
@@ -8072,6 +8225,9 @@ async fn delete_object_to_the_end(
                 .await;
         }
 
+        if let Some(marker) = marked {
+            crate::replication::enqueue(&state, &marker);
+        }
         info!(
             "Created delete marker: {}/{} (version={})",
             bucket, key, marker_version_id
@@ -8581,7 +8737,7 @@ pub async fn post_object(
 ) -> Response {
     if params.uploads.is_some() {
         // Initiate multipart upload
-        initiate_multipart_upload_internal(state, bucket, key, &headers).await
+        initiate_multipart_upload_internal(state, bucket, key, &headers, &auth).await
     } else if let Some(upload_id) = params.upload_id {
         // Complete multipart upload
         complete_multipart_upload_internal(state, bucket, key, upload_id, body, &headers).await
@@ -8902,6 +9058,7 @@ async fn initiate_multipart_upload_internal(
     bucket: String,
     key: String,
     headers: &HeaderMap,
+    auth: &Option<Extension<AuthResult>>,
 ) -> Response {
     if let Some(refused) = sse_header_conflict(headers) {
         return refused;
@@ -8927,6 +9084,24 @@ async fn initiate_multipart_upload_internal(
     let mut user_metadata = extract_user_metadata(headers);
     if !tags.is_empty() {
         user_metadata.insert(UPLOAD_TAGS_KEY.to_string(), encode_tagging(&tags));
+    }
+    // A replica sent as a multipart upload keeps its source's version id
+    // and ETag: carried with the upload to its completion.
+    let versioned = bucket_versioning(&mut client, &bucket)
+        .await
+        .is_ok_and(|v| v == VersioningState::VersioningEnabled);
+    match crate::replication::replica_request(&state, auth, &bucket, &key, headers, versioned).await
+    {
+        Ok(Some(r)) => {
+            user_metadata.insert(
+                crate::replication::UPLOAD_REPLICA_VERSION.into(),
+                r.version_id,
+            );
+            user_metadata.insert(crate::replication::UPLOAD_REPLICA_ETAG.into(), r.etag);
+            user_metadata.insert(crate::replication::UPLOAD_REPLICA_OF.into(), r.of);
+        }
+        Ok(None) => {}
+        Err(resp) => return resp,
     }
     // Object lock asked for now, checked now, applied at completion (with
     // the bucket's default retention when none is asked for).
@@ -10126,9 +10301,27 @@ async fn complete_multipart_upload_internal(
                 let versioning_enabled = bucket_versioning(&mut meta_client, &bucket)
                     .await
                     .map_or(true, |v| v == VersioningState::VersioningEnabled);
-                // A new version, as a single-part PUT makes.
+                // A new version, as a single-part PUT makes — or a replica's,
+                // which keeps its source's version id and ETag.
                 if versioning_enabled {
                     object.version_id = new_version_id();
+                }
+                if let Some(v) = object
+                    .user_metadata
+                    .remove(crate::replication::UPLOAD_REPLICA_VERSION)
+                {
+                    object.version_id = v;
+                    if let Some(etag) = object
+                        .user_metadata
+                        .remove(crate::replication::UPLOAD_REPLICA_ETAG)
+                        .filter(|e| !e.is_empty())
+                    {
+                        object.etag = etag;
+                    }
+                    object.replica_of = object
+                        .user_metadata
+                        .remove(crate::replication::UPLOAD_REPLICA_OF)
+                        .unwrap_or_else(|| "replica".to_string());
                 }
                 // The lock asked for at CreateMultipartUpload, or the
                 // bucket's default retention. Past refusing (the upload is

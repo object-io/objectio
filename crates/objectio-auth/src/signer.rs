@@ -1,7 +1,6 @@
-//! AWS `SigV4` request signing for the S3 service.
-//!
-//! `objectio-auth` only *verifies* signatures — it has no signer that builds
-//! headers for an outgoing request — so this is the small client half. It
+//! AWS `SigV4` request signing for the S3 service: the client half, for
+//! requests ObjectIO itself sends (the CLI's, and the replicator's to a
+//! target cluster). [`crate::sigv4`] verifies them. It
 //! follows the SDKs (`sdk/go/sigv4.go`, `sdk/python/objectio/_sigv4.py`)
 //! exactly and is pinned to the same test vectors, so the three cannot drift.
 //!
@@ -315,10 +314,10 @@ mod tests {
             &'a [u8],
         );
         use std::sync::Arc;
-        let store = objectio_auth::UserStore::new();
+        let store = crate::UserStore::new();
         let user = store.create_user("cli-test").unwrap();
         let key = store.create_access_key(&user.user_id).unwrap();
-        let verifier = objectio_auth::SigV4Verifier::new(Arc::new(store), "us-east-1");
+        let verifier = crate::SigV4Verifier::new(Arc::new(store), "us-east-1");
         let s = Signer {
             access_key: &key.access_key_id,
             secret_key: &key.secret_access_key,

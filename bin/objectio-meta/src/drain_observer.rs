@@ -90,6 +90,10 @@ async fn fanout_put_object_meta(
         let addr = addr.clone();
         let req = PutObjectMetaRequest {
             require_existing: false,
+            version_only: false,
+            keep_newer_current: false,
+            replication_update: false,
+            replication_set: std::collections::HashMap::new(),
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             object: Some(object.clone()),

@@ -833,6 +833,58 @@ impl OsdService {
             .and_then(|v| ObjectMeta::decode(&v[..]).ok())
     }
 
+    /// `PutObjectMeta` with `replication_update`: merge the replication
+    /// statuses into the entries holding `object` (its version entry, and
+    /// the current entry when it is that version), under the key lock the
+    /// caller holds, leaving every other field as stored.
+    #[allow(clippy::result_large_err)]
+    fn merge_replication(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        set: &std::collections::HashMap<String, String>,
+        object: &ObjectMeta,
+        current_key: MetadataKey,
+        current: Option<&ObjectMeta>,
+    ) -> Result<Response<PutObjectMetaResponse>, Status> {
+        let holds =
+            |o: &ObjectMeta| o.object_id == object.object_id && o.version_id == object.version_id;
+        let mut entries: Vec<(MetadataKey, ObjectMeta, EntryKind)> = Vec::new();
+        if let Some(c) = current.filter(|c| holds(c)) {
+            entries.push((current_key, c.clone(), EntryKind::Current));
+        }
+        if !object.version_id.is_empty() {
+            let version_key = MetadataKey::object_version(bucket, object_key, &object.version_id);
+            if let Some(v) = self.stored_meta(&version_key).filter(|v| holds(v)) {
+                entries.push((version_key, v, EntryKind::Version));
+            }
+        }
+        if entries.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "{bucket}/{object_key} version {:?} is not stored here",
+                object.version_id
+            )));
+        }
+        for (key, mut stored, kind) in entries {
+            let before = stored.clone();
+            for (target, status) in set {
+                stored.replication.insert(target.clone(), status.clone());
+            }
+            self.meta_store
+                .put(key, stored.encode_to_vec())
+                .map_err(|e| {
+                    Status::internal(format!("failed to store replication status: {e}"))
+                })?;
+            self.usage.apply(bucket, kind, Some(&before), Some(&stored));
+        }
+        Ok(Response::new(PutObjectMetaResponse {
+            success: true,
+            timestamp: Self::current_timestamp(),
+            replaced: None,
+            replaced_version_kept: false,
+        }))
+    }
+
     /// Whether a `PutObjectMeta` that expects `expected` (empty: anything)
     /// may replace `current`. No current entry passes, unless
     /// `require_existing`.
@@ -1792,6 +1844,58 @@ impl StorageService for OsdService {
         // Always store as current version at m:{bucket}\0{key}
         let key = MetadataKey::object_meta(&req.bucket, &req.key);
         let old = self.stored_meta(&key);
+
+        if req.replication_update {
+            return self.merge_replication(
+                &req.bucket,
+                &req.key,
+                &req.replication_set,
+                &object,
+                key,
+                old.as_ref(),
+            );
+        }
+
+        // Only the version entry: a change to a version that may not be
+        // current (`version_only`), or a replica older than the current
+        // version (`keep_newer_current`).
+        let older_replica = req.keep_newer_current
+            && old
+                .as_ref()
+                .is_some_and(|c| version_age(c) > version_age(&object));
+        if (req.version_only || older_replica) && !object.version_id.is_empty() {
+            let version_key =
+                MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
+            let prev = self.stored_meta(&version_key);
+            if req.version_only
+                && !Self::precondition_holds(
+                    prev.as_ref(),
+                    &req.expected_object_id,
+                    req.require_existing,
+                )
+            {
+                return Err(Status::failed_precondition(format!(
+                    "{}/{} version {} is no longer the object this write was built from",
+                    req.bucket, req.key, object.version_id
+                )));
+            }
+            self.meta_store
+                .put(version_key, value)
+                .map_err(|e| Status::internal(format!("failed to store version entry: {e}")))?;
+            self.usage.apply(
+                &req.bucket,
+                EntryKind::Version,
+                prev.as_ref(),
+                Some(&object),
+            );
+            return Ok(Response::new(PutObjectMetaResponse {
+                success: true,
+                timestamp: Self::current_timestamp(),
+                replaced: None,
+                replaced_version_kept: false,
+            }));
+        }
+
         if !Self::precondition_holds(old.as_ref(), &req.expected_object_id, req.require_existing) {
             return Err(Status::failed_precondition(format!(
                 "{}/{} is no longer the object this write was built from",
@@ -2853,6 +2957,7 @@ mod integrity_tests {
             versioning_enabled: false,
             expected_object_id: expected.to_vec(),
             require_existing,
+            ..Default::default()
         }))
         .await
         .map(drop)
@@ -3191,6 +3296,7 @@ mod object_meta_tests {
             versioning_enabled: versioning,
             expected_object_id: expected.to_vec(),
             require_existing: false,
+            ..Default::default()
         }))
         .await
         .map(Response::into_inner)
