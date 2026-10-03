@@ -128,12 +128,16 @@ const DEFAULT_MAX_JOURNAL_SIZE: u64 = 256 * 1024 * 1024;
 
 impl WriteCache {
     /// Create a new write cache
-    pub fn new(chunk_mapper: Arc<ChunkMapper>, config: CacheConfig) -> Self {
-        let journal = config.journal_path.as_ref().map(|path| {
-            Arc::new(
-                WriteJournal::open(path, DEFAULT_MAX_JOURNAL_SIZE).expect("failed to open journal"),
-            )
-        });
+    ///
+    /// # Errors
+    /// The journal can't be opened, or was written by a release this one
+    /// can't read.
+    pub fn new(chunk_mapper: Arc<ChunkMapper>, config: CacheConfig) -> BlockResult<Self> {
+        let journal = config
+            .journal_path
+            .as_ref()
+            .map(|path| WriteJournal::open(path, DEFAULT_MAX_JOURNAL_SIZE).map(Arc::new))
+            .transpose()?;
 
         if journal.is_some() {
             info!(
@@ -144,23 +148,30 @@ impl WriteCache {
             warn!("Write cache initialized WITHOUT journal - data may be lost on crash");
         }
 
-        Self {
+        Ok(Self {
             caches: RwLock::new(BTreeMap::new()),
             chunk_mapper,
             config,
             total_dirty_bytes: RwLock::new(0),
             journal,
             _shutdown_tx: None,
-        }
+        })
     }
 
     /// Create a new write cache with default configuration
     pub fn with_defaults(chunk_mapper: Arc<ChunkMapper>) -> Self {
         Self::new(chunk_mapper, CacheConfig::default())
+            .unwrap_or_else(|e| unreachable!("no journal to open, yet: {e}"))
     }
 
     /// Create a new write cache with journaling enabled
-    pub fn with_journal<P: AsRef<Path>>(chunk_mapper: Arc<ChunkMapper>, journal_path: P) -> Self {
+    ///
+    /// # Errors
+    /// As [`WriteCache::new`].
+    pub fn with_journal<P: AsRef<Path>>(
+        chunk_mapper: Arc<ChunkMapper>,
+        journal_path: P,
+    ) -> BlockResult<Self> {
         let config = CacheConfig {
             journal_path: Some(journal_path.as_ref().to_string_lossy().to_string()),
             ..CacheConfig::default()
@@ -911,11 +922,11 @@ mod tests {
         let path = dir.path().join("block.journal");
         let mapper = Arc::new(ChunkMapper::default());
         {
-            let cache = WriteCache::with_journal(Arc::clone(&mapper), &path);
+            let cache = WriteCache::with_journal(Arc::clone(&mapper), &path).unwrap();
             cache.init_volume("vol1");
             cache.write("vol1", 0, b"first").unwrap();
         }
-        let cache = WriteCache::with_journal(Arc::clone(&mapper), &path);
+        let cache = WriteCache::with_journal(Arc::clone(&mapper), &path).unwrap();
         cache.init_volume("vol1");
         cache.write("vol1", 4096, b"after a reopen").unwrap();
         settle(&cache, "vol1");
@@ -939,7 +950,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("block.journal");
         let mapper = Arc::new(ChunkMapper::default());
-        let cache = Arc::new(WriteCache::with_journal(Arc::clone(&mapper), &path));
+        let cache = Arc::new(WriteCache::with_journal(Arc::clone(&mapper), &path).unwrap());
         cache.init_volume("vol1");
         cache
             .write_durable("vol1", 8192, Bytes::from_static(b"durable"))
@@ -949,7 +960,7 @@ mod tests {
         settle(&cache, "vol1");
         assert_eq!(cache.read("vol1", 8192, 7).unwrap(), b"durable");
 
-        let reopened = WriteCache::with_journal(mapper, &path);
+        let reopened = WriteCache::with_journal(mapper, &path).unwrap();
         let recovered: Vec<_> = reopened
             .recover()
             .unwrap()

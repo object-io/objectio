@@ -144,6 +144,13 @@ impl BTreeIndex {
 
         let header = SnapshotHeader::from_bytes(&header_buf)
             .ok_or_else(|| Error::Storage("invalid snapshot header".into()))?;
+        if header.version != SnapshotHeader::VERSION {
+            return Err(Error::Storage(format!(
+                "metadata snapshot is version {}, this release reads {}; refusing to start",
+                header.version,
+                SnapshotHeader::VERSION
+            )));
+        }
 
         // Read entries
         let mut tree = BTreeMap::new();
@@ -476,6 +483,26 @@ mod tests {
         let block_prefix = MetadataKey(vec![b'b']);
         let blocks = index.scan_prefix(&block_prefix);
         assert_eq!(blocks.len(), 5);
+    }
+
+    /// A snapshot of another version is refused, not read as this one.
+    #[test]
+    fn a_snapshot_of_another_version_is_refused() {
+        let dir = tempdir().unwrap();
+        let config = BTreeConfig {
+            snapshot_dir: dir.path().to_path_buf(),
+            snapshot_threshold: 10,
+            snapshot_retention: 2,
+        };
+        let index = BTreeIndex::new(config.clone());
+        index.put(MetadataKey::block(1), b"v".to_vec(), 1);
+        let path = index.write_snapshot().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&(SnapshotHeader::VERSION + 1).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = BTreeIndex::load_snapshot(config).err().expect("refused");
+        assert!(err.to_string().contains("version"), "{err}");
     }
 
     #[test]
