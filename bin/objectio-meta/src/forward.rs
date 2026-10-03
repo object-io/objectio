@@ -41,6 +41,31 @@ const PROBE: &str = objectio_proto::transport::META_PROBE_HEADER;
 /// The gRPC path prefix of Raft's own service: never forwarded.
 const RAFT_PREFIX: &str = "/objectio.raft.";
 
+/// A client whose format level is below the cluster's active level would
+/// misread what newer nodes write (objectio-docs core/upgrade-path.md):
+/// refuse it, at the node it first reached. Raft's own calls, and calls a
+/// follower already checked and forwarded, pass.
+fn too_old(req: &http::Request<BoxBody>) -> Option<tonic::Status> {
+    if req.uri().path().starts_with(RAFT_PREFIX) || req.headers().contains_key(FORWARDED) {
+        return None;
+    }
+    let active = objectio_common::version::active_level();
+    if active == 0 {
+        return None;
+    }
+    let level = req
+        .headers()
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map_or(0, objectio_common::version::level_of_user_agent);
+    (level < active).then(|| {
+        tonic::Status::failed_precondition(format!(
+            "this client is at format level {level} and the cluster at {active}: it is older \
+             than the cluster's finalized release; upgrade it"
+        ))
+    })
+}
+
 #[derive(Clone)]
 pub struct ForwardToLeaderLayer {
     raft: Arc<openraft::Raft<MetaTypeConfig>>,
@@ -148,6 +173,9 @@ where
     fn call(&mut self, mut req: http::Request<BoxBody>) -> Self::Future {
         if req.headers().contains_key(PROBE) {
             return Box::pin(async { Ok(tonic::Status::unavailable("alive").into_http()) });
+        }
+        if let Some(refusal) = too_old(&req) {
+            return Box::pin(async move { Ok(refusal.into_http()) });
         }
         match self.layer.route(&req) {
             Route::Here => Box::pin(self.inner.call(req)),

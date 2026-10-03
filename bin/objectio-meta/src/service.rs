@@ -1,6 +1,7 @@
 //! Metadata gRPC service implementation
 
 mod block_meta;
+mod upgrade;
 
 use objectio_common::{NodeId, NodeStatus};
 use objectio_meta_store::{
@@ -648,6 +649,9 @@ pub struct MetaService {
     config: RwLock<HashMap<String, ConfigEntry>>,
     /// Config version counter (monotonically increasing)
     config_version: std::sync::atomic::AtomicU64,
+    /// Every node's last version report, kept by the leader (rolling
+    /// upgrades; see `upgrade.rs`). Keyed by (kind, id).
+    versions: RwLock<HashMap<(String, String), upgrade::Report>>,
     /// Server pools: name -> PoolConfig
     pools: RwLock<HashMap<String, PoolConfig>>,
     /// Tenants: name -> TenantConfig
@@ -928,6 +932,7 @@ impl MetaService {
             delta_token_index: RwLock::new(HashMap::new()),
             config: RwLock::new(HashMap::new()),
             config_version: std::sync::atomic::AtomicU64::new(0),
+            versions: RwLock::new(HashMap::new()),
             pools: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
             iam_policies: RwLock::new(HashMap::new()),
@@ -1096,19 +1101,24 @@ impl MetaService {
     /// on this handler to populate the cache.
     fn apply_config_event(&self, key: &str, new_value: Option<&[u8]>) {
         use prost::Message;
-        let mut map = self.config.write();
-        match new_value {
-            Some(bytes) => match ConfigEntry::decode(bytes) {
-                Ok(entry) => {
-                    map.insert(key.to_string(), entry);
+        {
+            let mut map = self.config.write();
+            match new_value {
+                Some(bytes) => match ConfigEntry::decode(bytes) {
+                    Ok(entry) => {
+                        map.insert(key.to_string(), entry);
+                    }
+                    Err(e) => {
+                        warn!("apply: decode ConfigEntry('{key}') failed: {e}");
+                    }
+                },
+                None => {
+                    map.remove(key);
                 }
-                Err(e) => {
-                    warn!("apply: decode ConfigEntry('{key}') failed: {e}");
-                }
-            },
-            None => {
-                map.remove(key);
             }
+        }
+        if key == objectio_common::version::ACTIVE_LEVEL_KEY {
+            self.note_active_level();
         }
     }
 
@@ -2291,13 +2301,34 @@ impl MetaService {
         };
 
         use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        // A cluster gets its id when its first OSD registers: it is new,
+        // so nothing older than this binary is in it, and it starts at
+        // this binary's format level. (A cluster upgraded from before
+        // levels has an id and no level: 0, until finalized.)
+        let level = ConfigEntry {
+            key: objectio_common::version::ACTIVE_LEVEL_KEY.to_string(),
+            value: objectio_common::version::FORMAT_LEVEL
+                .to_string()
+                .into_bytes(),
+            updated_at: Self::current_timestamp(),
+            updated_by: "cluster-uuid-init".into(),
+            version,
+        };
         let cmd = MetaCommand::MultiCas {
-            ops: vec![CasOp {
-                table: CasTable::Config,
-                key: KEY.to_string(),
-                expected: None,
-                new_value: Some(entry.encode_to_vec()),
-            }],
+            ops: vec![
+                CasOp {
+                    table: CasTable::Config,
+                    key: KEY.to_string(),
+                    expected: None,
+                    new_value: Some(entry.encode_to_vec()),
+                },
+                CasOp {
+                    table: CasTable::Config,
+                    key: objectio_common::version::ACTIVE_LEVEL_KEY.to_string(),
+                    expected: None,
+                    new_value: Some(level.encode_to_vec()),
+                },
+            ],
             requested_by: "cluster-uuid-init".into(),
         };
         match raft.client_write(cmd).await {
@@ -3177,6 +3208,10 @@ impl MetaService {
             }
             info!("Loaded {} policy attachments from store", map.len());
         }
+
+        // A binary too old (or too new) for the cluster's active format
+        // level stops here rather than serve.
+        self.note_active_level();
     }
 
     /// Create admin user if no users exist
@@ -8257,6 +8292,11 @@ impl MetadataService for MetaService {
         if req.key.is_empty() {
             return Err(Status::invalid_argument("config key is required"));
         }
+        if req.key == objectio_common::version::ACTIVE_LEVEL_KEY {
+            return Err(Status::permission_denied(
+                "the active format level is raised only by finalizing an upgrade",
+            ));
+        }
 
         // Consensus path: if Raft is wired, every config write has to
         // commit through the log. Non-leader nodes reject with a leader
@@ -8338,6 +8378,11 @@ impl MetadataService for MetaService {
         request: Request<DeleteConfigRequest>,
     ) -> Result<Response<DeleteConfigResponse>, Status> {
         let req = request.into_inner();
+        if req.key == objectio_common::version::ACTIVE_LEVEL_KEY {
+            return Err(Status::permission_denied(
+                "the active format level is raised only by finalizing an upgrade",
+            ));
+        }
 
         if let Some(raft) = self.raft_handle() {
             match raft
@@ -12134,6 +12179,41 @@ impl MetadataService for MetaService {
                 found: false,
             })),
         }
+    }
+
+    async fn report_version(
+        &self,
+        request: Request<objectio_proto::metadata::ReportVersionRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ReportVersionResponse>, Status> {
+        let active_level = self.record_version(request.into_inner());
+        Ok(Response::new(
+            objectio_proto::metadata::ReportVersionResponse { active_level },
+        ))
+    }
+
+    async fn get_upgrade_status(
+        &self,
+        _request: Request<objectio_proto::metadata::GetUpgradeStatusRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetUpgradeStatusResponse>, Status> {
+        let plan = self.upgrade_plan();
+        Ok(Response::new(
+            objectio_proto::metadata::GetUpgradeStatusResponse {
+                active_level: plan.active,
+                nodes: plan.nodes,
+                finalize_to: plan.target,
+                blockers: plan.blockers,
+            },
+        ))
+    }
+
+    async fn finalize_upgrade(
+        &self,
+        request: Request<objectio_proto::metadata::FinalizeUpgradeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::FinalizeUpgradeResponse>, Status> {
+        let active_level = self.finalize(&request.into_inner().requested_by).await?;
+        Ok(Response::new(
+            objectio_proto::metadata::FinalizeUpgradeResponse { active_level },
+        ))
     }
 
     async fn acquire_lease(

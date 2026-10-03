@@ -128,6 +128,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ClusterCmd,
     },
+    /// Rolling upgrades: every node's release, and finalize (system admin)
+    Upgrade {
+        #[command(subcommand)]
+        action: UpgradeCmd,
+    },
     /// Storage nodes (OSDs)
     Node {
         #[command(subcommand)]
@@ -773,6 +778,17 @@ pub enum ClusterCmd {
         #[command(subcommand)]
         action: RebalanceCmd,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UpgradeCmd {
+    /// GET /_admin/upgrade: every node's release and format level, and
+    /// whether the upgrade can be finalized
+    Status,
+    /// POST /_admin/upgrade/finalize: once every node runs the new release,
+    /// let the cluster write its new formats. There is no going back to
+    /// the previous release afterwards; back up meta first.
+    Finalize,
 }
 
 #[derive(Subcommand, Debug)]

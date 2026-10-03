@@ -596,6 +596,14 @@ pub async fn run(
         info!("Metrics available at http://0.0.0.0:{metrics_port}/metrics");
     }
 
+    // Report this binary's release and format level (rolling upgrades).
+    objectio_proto::transport::spawn_version_reporter(
+        meta_endpoint.clone(),
+        "osd",
+        node_id.clone(),
+        advertise_addr.clone(),
+    );
+
     // Start heartbeat task
     let heartbeat_meta_endpoint = meta_endpoint.clone();
     let heartbeat_node_id = node_id_bytes;

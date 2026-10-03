@@ -253,6 +253,12 @@ service MetadataService {
     // A named lease held by one caller at a time, for cluster-wide
     // background work only one gateway should do (the lifecycle scan).
     rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+    // Rolling upgrades (objectio-docs core/upgrade-path.md): every node
+    // reports its release and format level; the operator finalizes once all
+    // run the new release, raising the level the cluster may write.
+    rpc ReportVersion(ReportVersionRequest) returns (ReportVersionResponse);
+    rpc GetUpgradeStatus(GetUpgradeStatusRequest) returns (GetUpgradeStatusResponse);
+    rpc FinalizeUpgrade(FinalizeUpgradeRequest) returns (FinalizeUpgradeResponse);
     rpc PutBucketSetting(PutBucketSettingRequest) returns (PutBucketSettingResponse);
 
     // KMS key management (for SSE-KMS). Key material is wrapped by the
@@ -3012,4 +3018,46 @@ message BlockDeleteSnapshotRequest {
 message BlockCloneVolumeRequest {
     string snapshot_id = 1;
     string name = 2;
+}
+
+// ---- Rolling upgrades ----
+
+message ReportVersionRequest {
+    string kind = 1;          // "meta", "osd", "gateway", "block-gateway"
+    string id = 2;            // meta: Raft node id; osd: node id (hex); others: host:port
+    string release = 3;
+    uint32 format_level = 4;
+    uint32 min_level = 5;
+    string address = 6;
+}
+
+message ReportVersionResponse {
+    uint32 active_level = 1;  // the level the cluster may write
+}
+
+message NodeVersion {
+    string kind = 1;
+    string id = 2;
+    string release = 3;
+    uint32 format_level = 4;
+    uint32 min_level = 5;
+    string address = 6;
+    uint64 seen_secs_ago = 7;
+}
+
+message GetUpgradeStatusRequest {}
+
+message GetUpgradeStatusResponse {
+    uint32 active_level = 1;
+    repeated NodeVersion nodes = 2;   // every node heard from recently
+    uint32 finalize_to = 3;           // what finalize would raise the level to (= active_level: nothing to do)
+    repeated string blockers = 4;     // why finalize would be refused now
+}
+
+message FinalizeUpgradeRequest {
+    string requested_by = 1;
+}
+
+message FinalizeUpgradeResponse {
+    uint32 active_level = 1;
 }
