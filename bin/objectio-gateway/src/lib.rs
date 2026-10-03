@@ -31,6 +31,7 @@ pub mod post_object;
 pub mod prom;
 pub mod public_access;
 pub mod rdma;
+pub mod replication;
 pub mod s3;
 pub mod scatter_gather;
 pub mod sts_api;
@@ -354,6 +355,16 @@ pub struct Args {
     /// Objects written more recently than this many seconds aren't packed.
     #[arg(long, default_value_t = 3600)]
     pub pack_min_age_secs: u64,
+
+    /// How often the replication scanner looks for versions not yet sent
+    /// to their targets (seconds).
+    #[arg(long, default_value_t = 30)]
+    pub replication_scan_secs: u64,
+
+    /// Send replicated versions as soon as they're written (off only in
+    /// tests, standing for a gateway that died before it could).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, hide = true)]
+    pub replication_fast_path: bool,
 
     /// Seconds the packer waits between switching objects into a pack and
     /// releasing their old stripes, for reads already under way.
@@ -954,6 +965,7 @@ pub async fn run(
         auth_state: Arc::clone(&auth_state),
         auditor: Arc::clone(&auditor),
         pack_cache: crate::packs::PackCache::default(),
+        replication: crate::replication::Replication::default(),
     });
 
     // Lifecycle: every gateway runs a worker; a lease in meta lets one scan
@@ -963,6 +975,16 @@ pub async fn run(
         lifecycle::Timing {
             interval: std::time::Duration::from_secs(args.lifecycle_interval_secs.max(1)),
             day: std::time::Duration::from_secs(args.lifecycle_day_secs.max(1)),
+        },
+    );
+
+    // Bucket replication: the fast path and the scanner (a lease in meta
+    // lets one gateway scan). Idle while no bucket has rules.
+    replication::spawn(
+        Arc::clone(&state),
+        replication::Timing {
+            scan_every: std::time::Duration::from_secs(args.replication_scan_secs.max(1)),
+            fast_path: args.replication_fast_path,
         },
     );
 
@@ -1039,6 +1061,18 @@ pub async fn run(
             get(public_access::admin_get)
                 .put(public_access::admin_put)
                 .delete(public_access::admin_delete),
+        )
+        .route(
+            "/_admin/replication/targets",
+            get(replication::admin_list_targets).post(replication::admin_put_target),
+        )
+        .route(
+            "/_admin/replication/targets/{name}",
+            delete(replication::admin_delete_target),
+        )
+        .route(
+            "/_admin/replication/settings",
+            get(replication::admin_get_settings).put(replication::admin_put_settings),
         )
         .route("/_admin/roles", get(iam_admin::list_roles))
         .route("/_admin/roles", post(iam_admin::create_role))

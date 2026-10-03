@@ -102,7 +102,7 @@ fn unimplemented_sub_resources_are_refused_not_misread() {
         ("GET", "/subr?website"),
         ("PUT", "/subr?logging"),
         ("GET", "/subr?notification"),
-        ("PUT", "/subr?replication"),
+        ("PUT", "/subr?accelerate"),
         ("POST", "/subr/k?restore"),
     ] {
         let r = c.request(method, path, &[]);

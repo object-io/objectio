@@ -129,6 +129,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutBucketCORS"
             } else if has(query, "tagging") {
                 "s3:PutBucketTagging"
+            } else if has(query, "replication") {
+                "s3:PutReplicationConfiguration"
             } else {
                 "s3:CreateBucket"
             }
@@ -148,6 +150,9 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
             } else if has(query, "tagging") {
                 // S3 authorizes DeleteBucketTagging as s3:PutBucketTagging.
                 "s3:PutBucketTagging"
+            } else if has(query, "replication") {
+                // And DeleteBucketReplication as s3:PutReplicationConfiguration.
+                "s3:PutReplicationConfiguration"
             } else {
                 "s3:DeleteBucket"
             }
@@ -176,6 +181,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetBucketCORS"
             } else if has(query, "tagging") {
                 "s3:GetBucketTagging"
+            } else if has(query, "replication") {
+                "s3:GetReplicationConfiguration"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {

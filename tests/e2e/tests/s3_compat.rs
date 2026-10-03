@@ -29,16 +29,13 @@ fn code(r: &objectio_e2e::Response) -> String {
 fn a_delete_of_an_unhandled_sub_resource_deletes_nothing() {
     let c = Cluster::start_with_ec(6, 4, 2);
     bucket(&c, "keep");
-    for sub in [
-        "website",
-        "logging",
-        "replication",
-        "notification",
-        "made-up",
-    ] {
+    for sub in ["website", "logging", "notification", "made-up"] {
         let r = c.request("DELETE", &format!("/keep?{sub}"), &[]);
         assert_eq!(r.status, 405, "?{sub}: {}", r.text());
     }
+    // DeleteBucketReplication is handled: it removes the configuration
+    // (there is none here), never the bucket.
+    c.request("DELETE", "/keep?replication", &[]).expect(204);
     c.request("HEAD", "/keep", &[]).expect(200);
 
     c.request("PUT", "/keep/o", b"data").expect(200);

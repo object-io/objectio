@@ -400,6 +400,15 @@ message ObjectMeta {
     // A multipart object's parts' checksums, in order (GetObjectAttributes
     // lists them); `checksum` is then their composite.
     repeated ObjectChecksum part_checksums = 25;
+
+    // Bucket replication (architecture/design/bucket-replication.md):
+    // each target this version is to reach, and how far it got — "PENDING",
+    // "COMPLETED" or "FAILED". Written with the version itself, so a
+    // version is never committed without its mark.
+    map<string, string> replication = 26;
+    // This version is a replica another cluster sent: never replicated
+    // again (two-way rules can't loop). The source cluster, for audit.
+    string replica_of = 27;
 }
 
 // A full-object checksum, as S3 reports it.

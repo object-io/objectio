@@ -34,6 +34,7 @@ pub mod error;
 pub mod policy;
 pub mod presign;
 pub mod scope;
+pub mod signer;
 pub mod sigv4;
 pub mod store;
 pub mod sts;
