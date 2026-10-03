@@ -865,7 +865,7 @@ pub async fn put_object_meta_with(
         });
     }
 
-    let quorum = meta_write_quorum(&object_meta, targets.len());
+    let quorum = meta_write_quorum(targets.len());
     let results = futures::future::join_all(futs).await;
     let mut displaced = Vec::with_capacity(results.len());
     let mut failure: Option<OsdPoolError> = None;
@@ -906,23 +906,22 @@ pub async fn put_object_meta_with(
     }
 }
 
-/// How many copies of an object's ObjectMeta a write needs
-/// (core/object-metadata-quorum.md): the shards' write quorum, N − m + 1,
-/// or a majority for an object without stripes (inline). Every copy until
-/// the cluster is finalized at the level that allows it: a reader from the
+/// How many copies of a key's ObjectMeta a write (or delete) needs
+/// (core/object-metadata-quorum.md): a majority. Every copy until the
+/// cluster is finalized at the level that allows it: a reader from the
 /// release before takes the first copy that answers.
-fn meta_write_quorum(object: &objectio_proto::metadata::ObjectMeta, copies: usize) -> usize {
-    if !objectio_common::version::allows(2) {
-        return copies;
+fn meta_write_quorum(copies: usize) -> usize {
+    if objectio_common::version::allows(2) {
+        copies / 2 + 1
+    } else {
+        copies
     }
-    let parity = object
-        .stripes
-        .first()
-        .map(|s| usize::try_from(s.ec_m).unwrap_or(0));
-    match parity {
-        Some(m) if m > 0 => copies.saturating_sub(m).saturating_add(1).clamp(1, copies),
-        _ => copies / 2 + 1,
-    }
+}
+
+/// How many copies a read must hear from: enough to include one that took
+/// the last acknowledged write.
+fn meta_read_quorum(copies: usize) -> usize {
+    copies - meta_write_quorum(copies) + 1
 }
 
 /// Read ObjectMeta from the shard-carrying OSDs: every copy at once, and the
@@ -983,7 +982,10 @@ pub async fn get_object_version_meta_from_any(
         {
             Ok(Ok(resp)) => {
                 let inner = resp.into_inner();
-                Ok(if inner.found { inner.object } else { None })
+                Ok((
+                    if inner.found { inner.object } else { None },
+                    inner.tombstone_stamp,
+                ))
             }
             Ok(Err(e)) => {
                 warn!(
@@ -1006,23 +1008,33 @@ pub async fn get_object_version_meta_from_any(
     let answers = futures::future::join_all(asks).await;
 
     let mut newest: Option<objectio_proto::metadata::ObjectMeta> = None;
-    let mut saw_not_found = false;
+    let mut deleted_at = 0u64;
+    let mut answered = 0;
     let mut last_err: Option<OsdPoolError> = None;
     for answer in answers {
         match answer {
-            Ok(Some(o)) => {
-                if newest
-                    .as_ref()
-                    .is_none_or(|n| (o.stamp, &o.object_id) > (n.stamp, &n.object_id))
+            Ok((found, tombstone)) => {
+                answered += 1;
+                deleted_at = deleted_at.max(tombstone);
+                if let Some(o) = found
+                    && newest
+                        .as_ref()
+                        .is_none_or(|n| (o.stamp, &o.object_id) > (n.stamp, &n.object_id))
                 {
                     newest = Some(o);
                 }
             }
-            Ok(None) => saw_not_found = true,
             Err(e) => last_err = Some(e),
         }
     }
-    if let Some(o) = newest {
+    // Fewer answers than a read quorum could all be copies that missed the
+    // last write: no answer rather than a stale one.
+    if answered < meta_read_quorum(targets.len()) {
+        return Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable));
+    }
+    // A delete newer than every copy's object: gone, whatever a copy that
+    // missed the delete still holds.
+    if let Some(o) = newest.take_if(|o| deleted_at < o.stamp || deleted_at == 0) {
         if o.required_level > objectio_common::version::FORMAT_LEVEL {
             return Err(OsdPoolError::TooOld(format!(
                 "{bucket}/{key} needs format level {}; this gateway is at {}",
@@ -1032,10 +1044,7 @@ pub async fn get_object_version_meta_from_any(
         }
         return Ok(Some(o));
     }
-    if saw_not_found {
-        return Ok(None);
-    }
-    Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable))
+    Ok(None)
 }
 
 /// One OSD's copy of one version of `key` (`""`: the current one). An
@@ -1087,9 +1096,11 @@ pub async fn get_object_version_meta_from_osd(
 /// replicas.
 #[derive(Debug, Default)]
 pub struct MetaDeleted {
-    /// Replicas that carried it out, of how many.
+    /// Replicas that carried it out (or already held something newer), of
+    /// how many, and how many the delete needs.
     pub ok: usize,
     pub of: usize,
+    pub quorum: usize,
     /// What those replicas removed, as each had it. Replicas can disagree
     /// (a write racing the delete): each is what that copy named.
     pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
@@ -1108,12 +1119,15 @@ pub async fn delete_meta_from_all(
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
+    // Every copy records the same stamp as its tombstone.
+    let stamp = objectio_common::stamp::CLOCK.now();
     let futs = targets.iter().map(|p| async move {
         let mut client = pool.get_client_for_placement(p).await?;
         let fut = client.delete_object_meta(DeleteObjectMetaRequest {
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
+            stamp,
         });
         let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
@@ -1123,6 +1137,7 @@ pub async fn delete_meta_from_all(
     });
     let mut out = MetaDeleted {
         of: targets.len(),
+        quorum: meta_write_quorum(targets.len()),
         ..MetaDeleted::default()
     };
     for r in futures::future::join_all(futs).await {
@@ -1857,25 +1872,16 @@ mod reclaim_tests {
 #[cfg(test)]
 mod quorum_tests {
     use super::*;
-    use objectio_proto::metadata::{ObjectMeta, StripeMeta};
 
-    /// N − m + 1 of an erasure-coded object's copies, a majority of an
-    /// inline one's; every copy before the cluster allows level 2.
+    /// A majority writes, and reads hear from enough copies to overlap it.
     #[test]
-    fn the_metadata_write_quorum() {
-        let ec = |k: u32, m: u32| ObjectMeta {
-            stripes: vec![StripeMeta {
-                ec_k: k,
-                ec_m: m,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+    fn the_metadata_quorums() {
         objectio_common::version::set_active_level(2);
-        assert_eq!(meta_write_quorum(&ec(4, 2), 6), 5);
-        assert_eq!(meta_write_quorum(&ec(8, 4), 12), 9);
-        assert_eq!(meta_write_quorum(&ObjectMeta::default(), 6), 4);
-        assert_eq!(meta_write_quorum(&ObjectMeta::default(), 3), 2);
+        for (copies, write, read) in [(6, 4, 3), (12, 7, 6), (3, 2, 2), (1, 1, 1)] {
+            assert_eq!(meta_write_quorum(copies), write, "{copies} copies");
+            assert_eq!(meta_read_quorum(copies), read, "{copies} copies");
+            assert!(write + read > copies);
+        }
     }
 }
 

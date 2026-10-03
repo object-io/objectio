@@ -114,6 +114,21 @@ impl MetadataKey {
         Some((bucket.to_string(), key.to_string(), version_id.to_string()))
     }
 
+    /// The tombstone of a delete of `bucket/key` (`version_id` empty: the
+    /// current object), holding the delete's stamp
+    /// (objectio-docs core/object-metadata-quorum.md).
+    /// Format: `t{bucket}\0{key}\0{version_id}`
+    pub fn tombstone(bucket: &str, key: &str, version_id: &str) -> Self {
+        let mut data = Vec::with_capacity(3 + bucket.len() + key.len() + version_id.len());
+        data.push(b't');
+        data.extend_from_slice(bucket.as_bytes());
+        data.push(0);
+        data.extend_from_slice(key.as_bytes());
+        data.push(0);
+        data.extend_from_slice(version_id.as_bytes());
+        Self(data)
+    }
+
     /// Get the key type prefix
     pub fn key_type(&self) -> Option<char> {
         self.0.first().map(|&b| b as char)

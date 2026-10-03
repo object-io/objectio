@@ -363,6 +363,10 @@ message GetObjectMetaRequest {
 message GetObjectMetaResponse {
     objectio.metadata.ObjectMeta object = 1;
     bool found = 2;
+    // The stamp of the last delete of this key (or version) on this copy,
+    // 0 if none: a reader takes "not found" when it is newer than every
+    // copy's object.
+    uint64 tombstone_stamp = 3;
 }
 
 // Delete object metadata request
@@ -370,6 +374,10 @@ message DeleteObjectMetaRequest {
     string bucket = 1;
     string key = 2;
     string version_id = 3;  // Optional: delete specific version
+    // The delete's stamp (objectio_common::stamp). The copy records it as a
+    // tombstone, so a copy that missed this delete is outvoted and a late,
+    // older write is refused. 0 = unstamped (a previous-release writer).
+    uint64 stamp = 4;
 }
 
 message DeleteObjectMetaResponse {
@@ -383,6 +391,8 @@ message DeleteObjectMetaResponse {
     // What this replica removed (the current object, or the version), if
     // anything: what the caller may free, rather than what it read before.
     objectio.metadata.ObjectMeta removed = 3;
+    // This copy already held a newer write than the delete: nothing removed.
+    bool superseded = 4;
 }
 
 // List objects metadata request (for ListObjects)

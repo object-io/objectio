@@ -105,3 +105,39 @@ fn writes_go_on_with_an_osd_down() {
         }
     }
 }
+
+/// A delete with one OSD down succeeds, and when that OSD returns still
+/// holding the object, the object stays deleted: its copy is outvoted by
+/// the others' tombstones, on GET and in the listing.
+#[test]
+fn a_deleted_object_does_not_come_back_with_a_stale_copy() {
+    let mut ha = HaCluster::start(1, 6, 2);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    for i in 0..6u8 {
+        let r = ha.clients[0].request("PUT", &format!("/quorum/d{i}"), &payload(9_000, i));
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+
+    // Each object deleted with a different OSD down, so one of them is the
+    // copy a read would ask first.
+    for i in 0..6u8 {
+        ha.stop_osd(usize::from(i));
+        let r = ha.clients[usize::from(i) % 2].request("DELETE", &format!("/quorum/d{i}"), &[]);
+        assert_eq!(r.status, 204, "delete d{i} with OSD {i} down: {}", r.text());
+        ha.start_osd(usize::from(i), None);
+        std::thread::sleep(Duration::from_secs(6));
+    }
+    for (g, c) in ha.clients.iter().enumerate() {
+        for i in 0..6u8 {
+            let r = c.request("GET", &format!("/quorum/d{i}"), &[]);
+            assert_eq!(r.status, 404, "gateway {g}: d{i} came back: {}", r.text());
+        }
+        let list = c.request("GET", "/quorum?list-type=2&prefix=d", &[]).text();
+        assert!(
+            !list.contains("<Key>d"),
+            "gateway {g}: listed after delete: {list}"
+        );
+    }
+}

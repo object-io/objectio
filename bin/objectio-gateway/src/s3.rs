@@ -7472,10 +7472,10 @@ async fn delete_version(
 
     let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid).await;
     let (ok, of) = (deleted.ok, deleted.of);
-    if ok == 0 {
+    if ok < deleted.quorum {
         return S3Error::xml_response(
             "ServiceUnavailable",
-            "No replica of the object's metadata could be reached; retry",
+            &format!("The delete reached {ok} of {of} metadata copies, not a quorum; retry"),
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
@@ -8137,6 +8137,17 @@ async fn delete_object_to_the_end(
     // once every replica has let it go, and only what no replica still has
     // as current: a racing write can leave it on some.
     let deleted = delete_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await;
+    if deleted.ok < deleted.quorum {
+        sync_listing(&state, &placement.nodes, &bucket, &key).await;
+        return S3Error::xml_response(
+            "ServiceUnavailable",
+            &format!(
+                "The delete reached {} of {} metadata copies, not a quorum; retry",
+                deleted.ok, deleted.of
+            ),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
     if deleted.ok < deleted.of {
         warn!(
             "{bucket}/{key}: {} of {} replicas deleted it; its blocks stay allocated",
