@@ -196,21 +196,29 @@ def phase_report(name):
         fail(f"{name}: writes stopped for {g:.0f}s (allowed {MAX_GAP:.0f}s)")
 
 
-def read_all(what, attempts=20):
-    """Every acknowledged object reads back intact, through either gateway."""
+def read_one(n, key, digest, attempts=20):
+    """One acknowledged object, read back through either gateway: None if
+    intact, else what went wrong."""
+    for a in range(attempts):
+        status, data = http("GET", f"{GW[(n + a) % len(GW)]}/{BUCKET}/{key}", timeout=10)
+        if status == 200 or status not in (None, 503):
+            break
+        time.sleep(1)
+    if status != 200:
+        return (key, status)
+    if hashlib.sha256(data).hexdigest() != digest:
+        return (key, "different")
+    return None
+
+
+def read_all(what):
+    """Every acknowledged object reads back intact, through either gateway
+    (32 at a time)."""
+    from concurrent.futures import ThreadPoolExecutor
     with lock:
         items = list(acked.items())
-    bad = []
-    for n, (key, digest) in enumerate(items):
-        for a in range(attempts):
-            status, data = http("GET", f"{GW[(n + a) % len(GW)]}/{BUCKET}/{key}", timeout=10)
-            if status == 200 or status not in (None, 503):
-                break
-            time.sleep(1)
-        if status != 200:
-            bad.append((key, status))
-        elif hashlib.sha256(data).hexdigest() != digest:
-            bad.append((key, "different"))
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        bad = [r for r in pool.map(lambda a: read_one(a[0], *a[1]), enumerate(items)) if r]
     if bad:
         fail(f"{what}: {len(bad)} of {len(items)} acknowledged objects unreadable: {bad[:10]}")
     say(f"{what}: all {len(items)} acknowledged objects read back")

@@ -201,13 +201,14 @@ impl OsdPool {
         let max_message_size = 100 * 1024 * 1024; // 100 MB
         // A dead host is noticed in seconds: connecting gives up after 3 s,
         // and an open connection that stops answering keepalives is closed
-        // after about 10 s, failing what is in flight on it.
+        // after about 5 s, failing what is in flight on it (writes wait for
+        // every shard, so this bounds how long a vanished host holds them).
         let channel = tonic::transport::Endpoint::new(address.to_string())
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?
             .connect_timeout(std::time::Duration::from_secs(3))
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-            .keep_alive_timeout(std::time::Duration::from_secs(5))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(2))
+            .keep_alive_timeout(std::time::Duration::from_secs(3))
             .keep_alive_while_idle(true)
             .connect()
             .await
@@ -906,6 +907,9 @@ pub async fn put_object_meta_with(
                         "Failed to put object metadata to OSD {}: {}",
                         p.node_address, e
                     );
+                    if is_transport_failure(&e) {
+                        pool.mark_unreachable(&p.node_address);
+                    }
                     let refused = matches!(
                         e.code(),
                         tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
@@ -1190,7 +1194,12 @@ pub async fn delete_meta_from_all(
         let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
             .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
-            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| {
+                if is_transport_failure(&e) {
+                    pool.mark_unreachable(&p.node_address);
+                }
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?;
         Ok::<_, OsdPoolError>(resp.into_inner().removed)
     });
     let mut out = MetaDeleted {
