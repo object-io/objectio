@@ -58,7 +58,7 @@ for i in range(n):
     try:
         url = f"http://{sts}-{i}.{headless}.{ns}.svc.cluster.local:9102/status"
         s = json.load(urllib.request.urlopen(url, timeout=3))
-        print(i, s["self_id"], s["leader_id"], s["last_applied"] or 0, len(s["voters"]))
+        print(i, s["self_id"], s["leader_id"], s["last_applied"] or 0, len(s["voters"]), s["current_term"])
     except Exception:
         pass
 ' "$STS" "$HEADLESS" "$NS" "$REPLICAS" 2>/dev/null || true
@@ -98,21 +98,31 @@ await_healthy "before"
 while [ "$(acked)" -lt 200 ]; do sleep 2; done
 say "traffic running: $(acked) objects acknowledged"
 
+# The term every reachable meta is in, if they agree on a leader.
+leader_term() {
+    [ -n "$(leader_index)" ] && statuses | awk '{print $6}' | sort -n | tail -1
+}
+
 kill_meta() {
-    local i=$1 what=$2 old_leader
+    local i=$1 what=$2 old_leader old_term
     old_leader=$(leader_index)
+    old_term=$(leader_term)
     say "killing $STS-$i ($what)"
     local t0=$SECONDS
     k delete pod "$STS-$i" --grace-period=0 --force >/dev/null 2>&1
     if [ "$i" = "$old_leader" ]; then
-        local deadline=$((SECONDS + 60)) l=""
+        # A new leader is a higher term, whichever pod wins it: the killed
+        # one, back on a new IP within seconds, may.
+        local deadline=$((SECONDS + 60)) l="" t=""
         while [ $SECONDS -lt $deadline ]; do
             l=$(leader_index)
-            [ -n "$l" ] && [ "$l" != "$i" ] && break
+            t=$(leader_term)
+            [ -n "$l" ] && [ -n "$t" ] && [ "$t" -gt "$old_term" ] && break
             sleep 1
         done
-        [ -n "$l" ] && [ "$l" != "$i" ] || die "no new leader within 60s of killing the leader"
-        say "new leader $STS-$l after $((SECONDS - t0))s"
+        [ -n "$l" ] && [ -n "$t" ] && [ "$t" -gt "$old_term" ] ||
+            die "no new leader within 60s of killing the leader"
+        say "new leader $STS-$l (term $t) after $((SECONDS - t0))s"
     fi
     await_healthy "$STS-$i back after $what"
     sleep 15
