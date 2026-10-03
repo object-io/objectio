@@ -1394,7 +1394,7 @@ impl MetaService {
             let stored = store.read_named(MULTIPART_TABLE, upload_id);
             let current = match &stored {
                 Some(bytes) => Some(
-                    bincode::deserialize::<MultipartUploadState>(bytes)
+                    objectio_meta_store::record::deserialize::<MultipartUploadState>(bytes)
                         .map_err(|e| Status::internal(format!("multipart decode: {e}")))?,
                 ),
                 None => None,
@@ -1402,7 +1402,7 @@ impl MetaService {
             let (new, out) = change(current)?;
             let new_bytes = match &new {
                 Some(u) => Some(
-                    bincode::serialize(u)
+                    objectio_meta_store::record::serialize(u)
                         .map_err(|e| Status::internal(format!("multipart encode: {e}")))?,
                 ),
                 None => None,
@@ -1445,7 +1445,7 @@ impl MetaService {
     /// Mirror a replicated OSD record into this node's caches.
     fn apply_osd_node_event(&self, key: &str, new_value: Option<&[u8]>) {
         match new_value {
-            Some(bytes) => match bincode::deserialize::<OsdNode>(bytes) {
+            Some(bytes) => match objectio_meta_store::record::deserialize::<OsdNode>(bytes) {
                 Ok(node) => {
                     {
                         let mut nodes = self.osd_nodes.write();
@@ -1492,12 +1492,14 @@ impl MetaService {
     /// Mirror a replicated multipart upload into this node's cache.
     fn apply_multipart_event(&self, key: &str, new_value: Option<&[u8]>) {
         match new_value {
-            Some(bytes) => match bincode::deserialize::<MultipartUploadState>(bytes) {
-                Ok(u) => {
-                    self.multipart_uploads.write().insert(key.to_string(), u);
+            Some(bytes) => {
+                match objectio_meta_store::record::deserialize::<MultipartUploadState>(bytes) {
+                    Ok(u) => {
+                        self.multipart_uploads.write().insert(key.to_string(), u);
+                    }
+                    Err(e) => warn!("apply: decode multipart upload('{key}') failed: {e}"),
                 }
-                Err(e) => warn!("apply: decode multipart upload('{key}') failed: {e}"),
-            },
+            }
             None => {
                 self.multipart_uploads.write().remove(key);
             }
@@ -1768,7 +1770,7 @@ impl MetaService {
     fn apply_user_event(&self, key: &str, new_value: Option<&[u8]>) {
         let mut m = self.users.write();
         match new_value {
-            Some(bytes) => match bincode::deserialize::<StoredUser>(bytes) {
+            Some(bytes) => match objectio_meta_store::record::deserialize::<StoredUser>(bytes) {
                 Ok(u) => {
                     m.insert(key.to_string(), u);
                 }
@@ -1784,7 +1786,9 @@ impl MetaService {
         let mut m = self.access_keys.write();
         match new_value {
             Some(bytes) => {
-                match bincode::deserialize::<objectio_meta_store::StoredAccessKey>(bytes) {
+                match objectio_meta_store::record::deserialize::<objectio_meta_store::StoredAccessKey>(
+                    bytes,
+                ) {
                     Ok(k) => {
                         // Keep user_keys index consistent: insert the
                         // access_key_id under the owning user if absent.
@@ -5327,7 +5331,7 @@ impl MetadataService for MetaService {
             OSD_NODES_TABLE,
             hex::encode(node_id),
             Some(
-                bincode::serialize(&node)
+                objectio_meta_store::record::serialize(&node)
                     .map_err(|e| Status::internal(format!("OSD encode: {e}")))?,
             ),
         )];
@@ -5503,8 +5507,8 @@ impl MetadataService for MetaService {
         // Replicate through Raft. expected=None ensures the user_id
         // hasn't collided with a concurrent create (cryptographically
         // unlikely for UUIDs, but tested correctly by the state machine).
-        let user_bytes =
-            bincode::serialize(&user).map_err(|e| Status::internal(format!("user encode: {e}")))?;
+        let user_bytes = objectio_meta_store::record::serialize(&user)
+            .map_err(|e| Status::internal(format!("user encode: {e}")))?;
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
             let cmd = MetaCommand::MultiCas {
@@ -5645,9 +5649,9 @@ impl MetadataService for MetaService {
                 .ok_or_else(|| Status::not_found("user not found"))?;
             let mut new_user = user.clone();
             new_user.status = UserStatus::UserDeleted as i32;
-            let old_bytes = bincode::serialize(user)
+            let old_bytes = objectio_meta_store::record::serialize(user)
                 .map_err(|e| Status::internal(format!("user encode: {e}")))?;
-            let new_bytes = bincode::serialize(&new_user)
+            let new_bytes = objectio_meta_store::record::serialize(&new_user)
                 .map_err(|e| Status::internal(format!("user encode: {e}")))?;
             (old_bytes, new_bytes, new_user)
         };
@@ -5670,9 +5674,9 @@ impl MetadataService for MetaService {
                 if let Some(key) = keys.get(key_id) {
                     let mut new_key = key.clone();
                     new_key.status = KeyStatus::KeyInactive as i32;
-                    let old_b = bincode::serialize(key)
+                    let old_b = objectio_meta_store::record::serialize(key)
                         .map_err(|e| Status::internal(format!("key encode: {e}")))?;
-                    let new_b = bincode::serialize(&new_key)
+                    let new_b = objectio_meta_store::record::serialize(&new_key)
                         .map_err(|e| Status::internal(format!("key encode: {e}")))?;
                     key_transitions.push((key_id.clone(), old_b, new_b, new_key));
                 }
@@ -5771,7 +5775,7 @@ impl MetadataService for MetaService {
             operation: req.operation,
         };
 
-        let key_bytes = bincode::serialize(&key)
+        let key_bytes = objectio_meta_store::record::serialize(&key)
             .map_err(|e| Status::internal(format!("access key encode: {e}")))?;
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
@@ -5886,7 +5890,7 @@ impl MetadataService for MetaService {
             .get(&req.access_key_id)
             .cloned()
             .ok_or_else(|| Status::not_found("access key not found"))?;
-        let expected_bytes = bincode::serialize(&current)
+        let expected_bytes = objectio_meta_store::record::serialize(&current)
             .map_err(|e| Status::internal(format!("access key encode: {e}")))?;
 
         if let Some(raft) = self.raft_handle() {
@@ -7037,7 +7041,7 @@ impl MetadataService for MetaService {
             member_user_ids: Vec::new(),
             created_at: now,
         };
-        let group_bytes = bincode::serialize(&group)
+        let group_bytes = objectio_meta_store::record::serialize(&group)
             .map_err(|e| Status::internal(format!("group encode: {e}")))?;
 
         if let Some(raft) = self.raft_handle() {
@@ -7095,7 +7099,8 @@ impl MetadataService for MetaService {
             let g = groups
                 .get(&req.group_id)
                 .ok_or_else(|| Status::not_found("group not found"))?;
-            bincode::serialize(g).map_err(|e| Status::internal(format!("group encode: {e}")))?
+            objectio_meta_store::record::serialize(g)
+                .map_err(|e| Status::internal(format!("group encode: {e}")))?
         };
 
         if let Some(raft) = self.raft_handle() {
@@ -7196,13 +7201,13 @@ impl MetadataService for MetaService {
             if current.member_user_ids.contains(&req.user_id) {
                 return Err(Status::already_exists("user already in group"));
             }
-            let expected = bincode::serialize(&current)
+            let expected = objectio_meta_store::record::serialize(&current)
                 .map_err(|e| Status::internal(format!("group encode: {e}")))?;
             let mut new_group = current;
             new_group.member_user_ids.push(req.user_id.clone());
             (expected, new_group)
         };
-        let new_bytes = bincode::serialize(&new_group)
+        let new_bytes = objectio_meta_store::record::serialize(&new_group)
             .map_err(|e| Status::internal(format!("group encode: {e}")))?;
 
         if let Some(raft) = self.raft_handle() {
@@ -7256,13 +7261,13 @@ impl MetadataService for MetaService {
             if !current.member_user_ids.contains(&req.user_id) {
                 return Err(Status::not_found("user not in group"));
             }
-            let expected = bincode::serialize(&current)
+            let expected = objectio_meta_store::record::serialize(&current)
                 .map_err(|e| Status::internal(format!("group encode: {e}")))?;
             let mut new_group = current;
             new_group.member_user_ids.retain(|id| id != &req.user_id);
             (expected, new_group)
         };
-        let new_bytes = bincode::serialize(&new_group)
+        let new_bytes = objectio_meta_store::record::serialize(&new_group)
             .map_err(|e| Status::internal(format!("group encode: {e}")))?;
 
         if let Some(raft) = self.raft_handle() {
@@ -7356,7 +7361,7 @@ impl MetadataService for MetaService {
             updated_at: now,
         };
 
-        let bytes = bincode::serialize(&filter)
+        let bytes = objectio_meta_store::record::serialize(&filter)
             .map_err(|e| Status::internal(format!("data_filter encode: {e}")))?;
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
@@ -7454,7 +7459,7 @@ impl MetadataService for MetaService {
             let Some(f) = filters.get(&req.filter_id) else {
                 return Ok(Response::new(DeleteDataFilterResponse { success: false }));
             };
-            bincode::serialize(f)
+            objectio_meta_store::record::serialize(f)
                 .map_err(|e| Status::internal(format!("data_filter encode: {e}")))?
         };
 
@@ -12703,7 +12708,7 @@ impl MetadataService for MetaService {
             new.email = email;
         }
         let enc = |u: &StoredUser| -> Result<Vec<u8>, Box<Status>> {
-            bincode::serialize(u)
+            objectio_meta_store::record::serialize(u)
                 .map_err(|e| Box::new(Status::internal(format!("user encode: {e}"))))
         };
         self.cas_one(
@@ -12759,7 +12764,7 @@ impl MetadataService for MetaService {
         let mut new = old.clone();
         new.status = req.status;
         let enc = |k: &StoredAccessKey| -> Result<Vec<u8>, Box<Status>> {
-            bincode::serialize(k)
+            objectio_meta_store::record::serialize(k)
                 .map_err(|e| Box::new(Status::internal(format!("key encode: {e}"))))
         };
         self.cas_one(

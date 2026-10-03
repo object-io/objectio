@@ -29,6 +29,15 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Superblock size (4KB)
 pub const SUPERBLOCK_SIZE: u64 = 4096;
 
+/// Where the backup copy of the superblock is: the first 4 KiB of the WAL
+/// region, which nothing else uses. Fixed, so it can be found when the
+/// primary can't be read.
+pub const BACKUP_SUPERBLOCK_OFFSET: u64 = SUPERBLOCK_SIZE;
+
+/// Compatible feature: the disk keeps a backup superblock at
+/// [`BACKUP_SUPERBLOCK_OFFSET`].
+pub const FEATURE_BACKUP_SUPERBLOCK: u64 = 1;
+
 /// Default block size (64KB)
 /// Disk allocation granularity — the unit the block bitmap tracks.
 ///
@@ -186,7 +195,7 @@ impl Superblock {
             flags: 0,
             cluster_uuid: Uuid::nil(),
             osd_node_id: [0u8; 16],
-            features_compat: 0,
+            features_compat: FEATURE_BACKUP_SUPERBLOCK,
             features_incompat: 0,
             reserved: [0u8; 80],
             checksum: 0,
@@ -602,20 +611,26 @@ mod tests {
         );
     }
 
-    /// The feature words sit where reserved zeros were, inside the
-    /// checksummed range, and the checksum didn't move: every existing disk
-    /// reads as having no features.
+    /// The feature words sit at bytes 196–211, inside the checksummed range,
+    /// and a new disk carries exactly the backup-superblock feature.
     #[test]
-    fn existing_disks_read_as_having_no_features() {
+    fn a_new_disk_has_the_backup_superblock_feature_and_no_other() {
         let sb = Superblock::new(10 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE).unwrap();
         let bytes = sb.to_bytes();
-        assert!(bytes[196..212].iter().all(|b| *b == 0));
+        assert_eq!(
+            u64::from_le_bytes(bytes[196..204].try_into().unwrap()),
+            FEATURE_BACKUP_SUPERBLOCK
+        );
+        assert!(bytes[204..212].iter().all(|b| *b == 0));
         assert_eq!(
             u32::from_le_bytes(bytes[292..296].try_into().unwrap()),
             sb.checksum
         );
         let back = Superblock::from_bytes(&bytes).unwrap();
-        assert_eq!((back.features_compat, back.features_incompat), (0, 0));
+        assert_eq!(
+            (back.features_compat, back.features_incompat),
+            (FEATURE_BACKUP_SUPERBLOCK, 0)
+        );
     }
 
     /// A shard flag this release doesn't know changes what the bytes mean:

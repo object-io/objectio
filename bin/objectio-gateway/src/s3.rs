@@ -5292,6 +5292,7 @@ pub async fn put_object(
             part_checksums: Vec::new(),
             replication: HashMap::new(),
             replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
+            required_level: 0,
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -5694,6 +5695,7 @@ pub async fn put_object(
         part_checksums: Vec::new(),
         replication: HashMap::new(),
         replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
+        required_level: 0,
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.
