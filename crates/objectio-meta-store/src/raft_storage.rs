@@ -208,7 +208,7 @@ impl MetaRaftStorage {
                         .map(|v| v.value().to_vec());
                     match current {
                         Some(bytes) => {
-                            let mut node = crate::types::OsdNode::decode(&bytes)
+                            let mut node = bincode::deserialize::<crate::types::OsdNode>(&bytes)
                                 .map_err(|e| decode_err("OsdNode", e))?;
                             let changed = node.admin_state != *new_state;
                             if changed {
@@ -385,8 +385,6 @@ pub fn cas_table_name(t: &CasTable) -> &str {
         CasTable::Pools => "pools",
         CasTable::Tenants => "tenants",
         CasTable::IamPolicies => "iam_policies",
-        CasTable::Volumes => "volumes",
-        CasTable::Snapshots => "snapshots",
         CasTable::Users => "users",
         CasTable::Groups => "groups",
         CasTable::AccessKeys => "access_keys",

@@ -5,7 +5,6 @@
 //! `bin/objectio-aio` to compose meta into a single-process monolith.
 
 pub mod balancer;
-pub mod block_service;
 pub mod drain_observer;
 pub mod forward;
 pub mod liveness;
@@ -22,10 +21,8 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use block_service::BlockMetaService;
 use clap::Parser;
-use objectio_meta_store::{MetaStore, OsdNode};
-use objectio_proto::block::block_service_server::BlockServiceServer;
+use objectio_meta_store::MetaStore;
 use objectio_proto::metadata::metadata_service_server::MetadataServiceServer;
 use service::MetaService;
 use std::fmt::Write;
@@ -55,10 +52,6 @@ pub struct Args {
     /// Peer addresses for Raft cluster
     #[arg(long)]
     pub peers: Vec<String>,
-
-    /// OSD addresses to register (host:port)
-    #[arg(long)]
-    pub osd: Vec<String>,
 
     /// Erasure coding data shards (k)
     #[arg(long, default_value = "4")]
@@ -192,43 +185,14 @@ pub async fn run(
 
     let meta_service = MetaService::with_store(ec_config, store.clone());
 
-    // Register OSD nodes from CLI args (skip if store already has nodes)
-    if !args.osd.is_empty() && !meta_service.has_persisted_osds() {
-        for osd_addr in &args.osd {
-            // In a real implementation, we would connect to the OSD and get its info
-            // For now, create a placeholder with generated IDs
-            let node = OsdNode {
-                node_id: *uuid::Uuid::new_v4().as_bytes(),
-                address: osd_addr.clone(),
-                disk_ids: vec![*uuid::Uuid::new_v4().as_bytes()],
-                failure_domain: None,
-                topology: None,
-                disk_capacity_bytes: vec![0],
-                admin_state: objectio_common::OsdAdminState::default(),
-                te_segment: String::new(),
-            };
-            meta_service.register_osd(node);
-        }
-    } else if meta_service.has_persisted_osds() && !args.osd.is_empty() {
-        info!(
-            "Skipping --osd registration: {} OSD nodes already loaded from store",
-            meta_service.stats().osd_count
-        );
-    }
-
     // Parse listen address
     let addr = args
         .listen
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid listen address {}: {}", args.listen, e))?;
 
-    // Initialize block metadata service with persistent store
-    let block_service = BlockMetaService::with_store(store);
-    info!("Block storage service initialized");
-
     // Wrap services in Arc for sharing
     let meta_service = Arc::new(meta_service);
-    let block_service = Arc::new(block_service);
 
     // Create metrics state
     let metrics_state = Arc::new(MetaMetricsState {
@@ -375,7 +339,6 @@ pub async fn run(
         // node serves any client (see `forward`).
         .layer(forward::ForwardToLeaderLayer::new(raft.clone(), node_id))
         .add_service(MetadataServiceServer::from_arc(meta_service))
-        .add_service(BlockServiceServer::from_arc(block_service))
         // Raft messages are JSON, which bloats binary values 3-4x; at
         // tonic's default 4 MiB limit a batch of large entries, or a
         // snapshot chunk, would be refused and the follower never caught up.
@@ -505,8 +468,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     writeln!(output, "objectio_meta_users_total {}", stats.user_count).unwrap();
 
     // Block volumes and snapshots, and the shared-stripe registry, from
-    // the Raft tables. (This read the legacy block service's tables, which
-    // the block gateway does not use.)
+    // the Raft tables.
     state.meta_service.render_block_metrics(&mut output);
     op_metrics::render_raft(&state.meta_service, &mut output);
     objectio_erasure::metrics::render(&mut output);

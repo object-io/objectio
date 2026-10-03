@@ -6456,7 +6456,7 @@ async fn get_object_version_once(
     // Resolve SSE state up front so per-stripe decryption can be inlined.
     // For SSE-S3 we unwrap the DEK once and decrypt each stripe's contribution
     // to `all_data` below, using that stripe's IV (multipart) or the
-    // object-level IV (legacy single-stripe).
+    // object-level IV (single-part).
     let object_sse_algo =
         SseAlgorithm::try_from(object.encryption_algorithm).unwrap_or(SseAlgorithm::SseNone);
     // `sse_response_header` is the value for `x-amz-server-side-encryption`
@@ -7132,8 +7132,8 @@ fn inline_slice(
 /// Decrypt `buf` — one stripe's contribution to the GET response.
 ///
 /// Picks the right IV + counter offset so a single helper works for both
-/// the legacy single-stripe whole-body encryption scheme and the new
-/// per-stripe IV scheme used by multipart SSE.
+/// single-part objects (one IV for the whole body) and multipart ones (an
+/// IV per stripe).
 #[allow(clippy::result_large_err)]
 fn decrypt_stripe_slice(
     dek: &[u8; objectio_kms::DEK_LEN],
@@ -7143,9 +7143,9 @@ fn decrypt_stripe_slice(
     slice_start_in_stripe: u64,
     buf: &mut [u8],
 ) -> Result<(), Response> {
-    // Per-stripe IV (multipart & new single-part): decrypt from offset within
-    // the stripe. Otherwise fall back to the object-level IV (legacy whole-body
-    // CTR), using the absolute byte offset within the object.
+    // Per-stripe IV (multipart): decrypt from the offset within the
+    // stripe. Otherwise the object-level IV (single-part, whole-body CTR),
+    // with the absolute byte offset within the object.
     let (iv_bytes, effective_offset) = if !stripe.encryption_iv.is_empty() {
         (&stripe.encryption_iv[..], slice_start_in_stripe)
     } else {

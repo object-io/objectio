@@ -476,8 +476,8 @@ mod tests {
             );
         }
 
-        // Insert some object metadata
-        index.put(MetadataKey::object(&[1u8; 16]), b"object_1".to_vec(), 10);
+        // And an entry under another prefix
+        index.put(MetadataKey::object_meta("b", "k"), b"object_1".to_vec(), 10);
 
         // Scan for blocks (prefix 'b')
         let block_prefix = MetadataKey(vec![b'b']);

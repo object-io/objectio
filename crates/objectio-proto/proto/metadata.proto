@@ -443,10 +443,9 @@ message StripeMeta {
     bytes object_id = 10;
 
     // AES-CTR initialization vector used to encrypt this stripe's bytes,
-    // when the object is SSE-S3/SSE-KMS. Empty for plaintext objects and
-    // for legacy single-stripe encrypted objects that stored the IV on
-    // `ObjectMeta.encryption_iv` only (fall back to that if unset).
-    // Multipart objects populate this per stripe.
+    // when the object is SSE-S3/SSE-KMS. Multipart objects set it per
+    // stripe; a single-part object leaves it empty and uses
+    // `ObjectMeta.encryption_iv` for its whole body.
     bytes encryption_iv = 11;
 
     // This object's bytes are [slice_offset, slice_offset + slice_length)
@@ -590,8 +589,8 @@ message CreateObjectRequest {
     bytes object_id = 8;        // 16-byte UUID (provided by caller)
     // Placement context the gateway picked up from GetPlacementResponse.
     // Server trusts these for the listing entry so reads don't need a
-    // second hash+pool lookup. 0 / "" = legacy (pre-PG) write; server
-    // will leave the listing entry unpopulated on the PG axis.
+    // second hash+pool lookup. 0 / "" = placed without a placement group
+    // (per-object CRUSH); the listing entry has no PG then.
     uint32 pg_id = 9;
     string pool = 10;
     // The OSDs the gateway wrote the object's ObjectMeta to, by position
@@ -671,8 +670,8 @@ message ObjectListingEntry {
     // the CRUSH placement on miss.
     bytes primary_osd_id = 12;
 
-    // Placement-group ID the object was routed through. 0 = legacy
-    // per-object CRUSH placement (pre-PG objects). With a non-zero
+    // Placement-group ID the object was routed through. 0 = placed
+    // without a placement group (per-object CRUSH). With a non-zero
     // pg_id the gateway can look up the PG's current osd_ids in one
     // in-memory cache hit instead of recomputing CRUSH.
     uint32 pg_id = 13;
@@ -692,17 +691,12 @@ message ListObjectsRequest {
 }
 
 message ListObjectsResponse {
-    // Pre-Raft-listings field — kept so older clients that still expect
-    // full ObjectMeta entries don't break. New server-side fills
-    // `entries` instead and leaves this empty.
-    repeated ObjectMeta objects = 1;
+    reserved 1;  // was `objects`, full ObjectMeta entries; `entries` replaced it
     repeated string common_prefixes = 2;
     string next_continuation_token = 3;
     bool is_truncated = 4;
     uint32 key_count = 5;
-    // Meta-backed listing index results. When populated, this is
-    // authoritative — the gateway no longer scatter-gathers OSDs for
-    // this list.
+    // The listing, from meta's index.
     repeated ObjectListingEntry entries = 6;
 }
 
@@ -2306,8 +2300,8 @@ message PoolConfig {
     // growable pg_count is a v2 feature. tier selects the storage
     // class the balancer places this pool's PGs on ("nvme" / "ssd" /
     // "hdd" / "cold"). Empty tier = no constraint.
-    // pg_count = 0 keeps the legacy per-object CRUSH path — pre-PG
-    // pools and anyone on an upgrade still work unchanged.
+    // pg_count = 0 places each object directly (per-object CRUSH, no
+    // placement groups): the default.
     uint32 pg_count = 15;
     string tier = 16;
 }

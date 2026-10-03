@@ -9,8 +9,6 @@ use objectio_proto::storage::{
     CheckShardsRequest,
     CheckShardsResponse,
     Checksum,
-    CopyObjectMetaRequest,
-    CopyObjectMetaResponse,
     DeleteObjectMetaRequest,
     DeleteObjectMetaResponse,
     DeleteShardRequest,
@@ -104,7 +102,6 @@ pub struct GrpcMetrics {
     pub get_object_meta: GrpcMethodMetrics,
     pub delete_object_meta: GrpcMethodMetrics,
     pub list_objects_meta: GrpcMethodMetrics,
-    pub copy_object_meta: GrpcMethodMetrics,
     pub stream_list_objects_meta: GrpcMethodMetrics,
     pub health_check: GrpcMethodMetrics,
     pub get_status: GrpcMethodMetrics,
@@ -2319,57 +2316,6 @@ impl StorageService for OsdService {
         Ok(Response::new(FindObjectsReferencingNodeResponse {
             objects: out,
             truncated,
-        }))
-    }
-
-    async fn copy_object_meta(
-        &self,
-        request: Request<CopyObjectMetaRequest>,
-    ) -> Result<Response<CopyObjectMetaResponse>, Status> {
-        let req = request.into_inner();
-
-        // Read source ObjectMeta from local store
-        let src_key = MetadataKey::object_meta(&req.source_bucket, &req.source_key);
-        let value = self
-            .meta_store
-            .get(&src_key)
-            .ok_or_else(|| Status::not_found("source object not found on this OSD"))?;
-
-        let mut object = ObjectMeta::decode(&value[..]).map_err(|e| {
-            Status::internal(format!("failed to decode source object metadata: {e}"))
-        })?;
-
-        // Update metadata fields for the destination key
-        let now = Self::current_timestamp();
-        object.bucket = req.dest_bucket.clone();
-        object.key = req.dest_key.clone();
-        object.created_at = now;
-        object.modified_at = now;
-        // Generate a new ETag based on object_id + timestamp so dest has its own identity
-        object.etag = format!("{:x}", Uuid::new_v4().as_u128());
-
-        // Write dest ObjectMeta
-        let _guard = self.usage.lock_key(&req.dest_bucket, &req.dest_key);
-        let dst_key = MetadataKey::object_meta(&req.dest_bucket, &req.dest_key);
-        let old = self.stored_meta(&dst_key);
-        let dest_bytes = object.encode_to_vec();
-        self.meta_store
-            .put(dst_key, dest_bytes)
-            .map_err(|e| Status::internal(format!("failed to store dest object metadata: {e}")))?;
-        self.usage.apply(
-            &req.dest_bucket,
-            EntryKind::Current,
-            old.as_ref(),
-            Some(&object),
-        );
-
-        info!(
-            "Copied object metadata: {}/{} -> {}/{}",
-            req.source_bucket, req.source_key, req.dest_bucket, req.dest_key
-        );
-
-        Ok(Response::new(CopyObjectMetaResponse {
-            object: Some(object),
         }))
     }
 
