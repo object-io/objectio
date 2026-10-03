@@ -55,8 +55,9 @@ cargo build --bin objectio-aio --bin objectio-cli --bin objectio-meta --bin obje
   libtool, libclang-dev. It is declared on `objectio-erasure` and forwarded
   by gateway, osd and aio: use `--workspace --features isal` or
   `--bin objectio-aio --features isal`, not on other crates.
-- Clippy runs with `-D warnings` (`all`, `pedantic`, `nursery`,
-  workspace-wide).
+- Clippy runs with `-D warnings`. The `pedantic` and `nursery` groups apply
+  only where a crate opts into `[lints] workspace = true` (today 6 of the
+  15 library crates and 3 of the 10 binaries).
 - Without local Rust: `docker compose run --rm build|test|lint|fmt|dev`.
 - Local cluster: `objectio-aio` (meta + OSD + gateway in one process; see
   the README quickstart), or kind: `make kind-up | kind-up-registry |

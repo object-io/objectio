@@ -2665,22 +2665,7 @@ dependencies = [
 name = "objectio-s3"
 version = "0.4.0"
 dependencies = [
- "axum 0.8.8",
- "bytes",
- "hmac",
- "hyper",
- "objectio-client",
- "objectio-common",
- "quick-xml",
- "ring",
  "serde",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "uuid",
 ]
 
 [[package]]
