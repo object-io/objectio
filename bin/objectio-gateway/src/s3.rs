@@ -8330,7 +8330,10 @@ pub async fn delete_objects(
             async move {
                 let mut out = Vec::with_capacity(entries.len());
                 for (i, obj) in entries {
-                    out.push((i, delete_one(state, auth.as_ref(), bucket, headers, obj).await));
+                    out.push((
+                        i,
+                        delete_one(state, auth.as_ref(), bucket, headers, obj).await,
+                    ));
                 }
                 out
             }
