@@ -865,10 +865,7 @@ fn delete_refusal(path: &str, query: Option<&str>) -> Option<Response> {
 /// again) when meta couldn't be reached or answer in time — a meta node
 /// lost, an election under way — and 500 otherwise.
 pub(crate) fn meta_failure(e: &tonic::Status, what: &str) -> Response {
-    if matches!(
-        e.code(),
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
-    ) {
+    if S3Error::is_unavailable(e) {
         S3Error::xml_response(
             "ServiceUnavailable",
             &format!("{what}: the metadata service is unavailable; retry"),
@@ -2083,15 +2080,18 @@ impl S3Error {
     /// a connection that dropped (the node it went to was killed) as
     /// Unknown "transport error", and a call that ran out of time as
     /// Cancelled "Timeout expired": those are unavailable too.
+    /// Whether a failed meta or OSD call means "unavailable, retry": the
+    /// service said so, ran out of time, or the connection dropped (tonic's
+    /// Unknown "transport error", Cancelled "Timeout expired").
+    pub fn is_unavailable(e: &tonic::Status) -> bool {
+        matches!(
+            e.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+        ) || (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+    }
+
     pub fn from_status(e: &tonic::Status) -> Response {
-        let dropped = (e.code() == tonic::Code::Unknown && e.message() == "transport error")
-            || (e.code() == tonic::Code::Cancelled && e.message() == "Timeout expired");
-        if dropped
-            || matches!(
-                e.code(),
-                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-            )
-        {
+        if Self::is_unavailable(e) {
             Self::xml_response(
                 "ServiceUnavailable",
                 e.message(),
