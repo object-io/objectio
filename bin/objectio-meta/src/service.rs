@@ -2303,8 +2303,7 @@ impl MetaService {
         use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
         // A cluster gets its id when its first OSD registers: it is new,
         // so nothing older than this binary is in it, and it starts at
-        // this binary's format level. (A cluster upgraded from before
-        // levels has an id and no level: 0, until finalized.)
+        // this binary's format level.
         let level = ConfigEntry {
             key: objectio_common::version::ACTIVE_LEVEL_KEY.to_string(),
             value: objectio_common::version::FORMAT_LEVEL
