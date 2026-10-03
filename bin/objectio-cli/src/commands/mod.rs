@@ -39,6 +39,7 @@ pub async fn run(cmd: Command, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         Command::Bucket { action } => bucket::bucket(action, ctx).await,
         Command::Provision { action } => bucket::provision(action, ctx).await,
         Command::Cluster { action } => cluster::cluster(action, ctx).await,
+        Command::Upgrade { action } => cluster::upgrade(action, ctx).await,
         Command::Node { action } => cluster::node(action, ctx).await,
         Command::Osd { action } => cluster::osd(action, ctx).await,
         Command::Pool { action } => cluster::pool(action, ctx).await,
