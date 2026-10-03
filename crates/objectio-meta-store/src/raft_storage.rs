@@ -131,13 +131,15 @@ impl MetaRaftStorage {
         crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
-    /// Apply a committed [`MetaCommand`] inside the same txn that moves
-    /// `last_applied` forward. Atomic from the perspective of a restart.
+    /// Apply a committed [`MetaCommand`] into `txn`, the apply batch's
+    /// transaction, which also moves `last_applied` forward: atomic from
+    /// the perspective of a restart. Events for the listener go to
+    /// `events`, sent once the batch has committed.
     fn apply_command(
-        &self,
+        txn: &redb::WriteTransaction,
         state: &mut RaftPersistentState,
         cmd: &MetaCommand,
-        log_id: LogId<NodeId>,
+        events: &mut Vec<ApplyEvent>,
     ) -> Result<MetaResponse, StorageError<NodeId>> {
         match cmd {
             MetaCommand::SetConfig {
@@ -160,32 +162,24 @@ impl MetaRaftStorage {
                     version,
                 };
                 let bytes = entry.encode_to_vec();
-                state.last_applied = Some(log_id);
-                let txn = self.db.begin_write().map_err(write_err)?;
                 {
                     let mut t = txn.open_table(tables::CONFIG).map_err(write_err)?;
                     t.insert(key.as_str(), bytes.as_slice())
                         .map_err(write_err)?;
                 }
-                write_state(&txn, state)?;
-                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 // Followers refresh their config cache from this, as they
                 // do for a MultiCas on the config table. Without it a
                 // setting changed through the leader stayed stale on every
                 // other replica until restart.
-                self.notify_config(key, Some(bytes));
+                events.push(config_event(key, Some(bytes)));
                 Ok(MetaResponse::ConfigSet { version })
             }
             MetaCommand::DeleteConfig { key } => {
-                state.last_applied = Some(log_id);
-                let txn = self.db.begin_write().map_err(write_err)?;
                 let existed = {
                     let mut t = txn.open_table(tables::CONFIG).map_err(write_err)?;
                     t.remove(key.as_str()).map_err(write_err)?.is_some()
                 };
-                write_state(&txn, state)?;
-                crate::commit_metrics::commit(txn).map_err(write_err)?;
-                self.notify_config(key, None);
+                events.push(config_event(key, None));
                 Ok(MetaResponse::ConfigDeleted { existed })
             }
             MetaCommand::SetOsdAdminState {
@@ -196,7 +190,6 @@ impl MetaRaftStorage {
                 // Same hex encoding the rest of the meta store uses to
                 // key OsdNodes in the OSD_NODES table.
                 let key = hex_encode_16(node_id);
-                let txn = self.db.begin_write().map_err(write_err)?;
                 let (found, changed) = {
                     let mut t = txn.open_table(tables::OSD_NODES).map_err(write_err)?;
                     // Read current bytes, release the borrow, then write
@@ -223,36 +216,27 @@ impl MetaRaftStorage {
                             (true, changed)
                         }
                         // Unknown node_id — command succeeds (idempotent) but
-                        // the caller learns via `found: false`. We still
-                        // advance `last_applied` so the log entry isn't
-                        // re-applied on restart.
+                        // the caller learns via `found: false`.
                         None => (false, false),
                     }
                 };
-                state.last_applied = Some(log_id);
-                write_state(&txn, state)?;
-                crate::commit_metrics::commit(txn).map_err(write_err)?;
                 Ok(MetaResponse::OsdAdminStateSet { changed, found })
             }
             MetaCommand::MultiCas {
                 ops,
                 requested_by: _,
-            } => apply_multi_cas(&self.db, state, ops, log_id, self.listener.as_ref()),
+            } => apply_multi_cas(txn, ops, events),
         }
     }
 }
 
-impl MetaRaftStorage {
-    /// Tell the service a config key changed, as a MultiCas on the config
-    /// table would.
-    fn notify_config(&self, key: &str, new_value: Option<Vec<u8>>) {
-        if let Some(tx) = self.listener.as_ref() {
-            let _ = tx.send(ApplyEvent::MultiCasOp {
-                table: CasTable::Config,
-                key: key.to_string(),
-                new_value,
-            });
-        }
+/// The event a config key's change sends the service, as a MultiCas on the
+/// config table would.
+fn config_event(key: &str, new_value: Option<Vec<u8>>) -> ApplyEvent {
+    ApplyEvent::MultiCasOp {
+        table: CasTable::Config,
+        key: key.to_string(),
+        new_value,
     }
 }
 
@@ -268,21 +252,19 @@ fn write_state(
     Ok(())
 }
 
-/// Apply a [`MetaCommand::MultiCas`] inside a single redb write-txn.
+/// Apply a [`MetaCommand::MultiCas`] into the apply batch's `txn`.
 ///
 /// Two-pass: (1) read every op's current value and compare against its
-/// expected; collect all mismatches. If any mismatch, abort the txn —
-/// no partial writes. (2) write/delete every op's new value. Commit.
+/// expected; collect all mismatches. If any mismatch, nothing is written.
+/// (2) write/delete every op's new value.
 ///
 /// The read+write happens in the same write-txn so interleaving with
 /// other state-machine applies is impossible (openraft serializes
 /// applies, and redb's write-txn is exclusive anyway).
 fn apply_multi_cas(
-    db: &redb::Database,
-    state: &mut RaftPersistentState,
+    txn: &redb::WriteTransaction,
     ops: &[CasOp],
-    log_id: LogId<NodeId>,
-    listener: Option<&tokio::sync::mpsc::UnboundedSender<ApplyEvent>>,
+    events: &mut Vec<ApplyEvent>,
 ) -> Result<MetaResponse, StorageError<NodeId>> {
     // Guardrail: keep log-entry apply latency bounded. Callers that need
     // thousands of conditional writes should chunk and retry.
@@ -296,7 +278,6 @@ fn apply_multi_cas(
         });
     }
 
-    let txn = db.begin_write().map_err(write_err)?;
     let mut failed_indices: Vec<u32> = Vec::new();
 
     // Pass 1: verify every expected. Redb tables are scoped to the txn,
@@ -318,16 +299,9 @@ fn apply_multi_cas(
     }
 
     if !failed_indices.is_empty() {
-        // Abort: drop the txn without commit. No partial state changes.
-        // `last_applied` still advances so the log entry isn't retried.
-        drop(txn);
-        state.last_applied = Some(log_id);
-        let commit_txn = db.begin_write().map_err(write_err)?;
-        write_state(&commit_txn, state)?;
-        crate::commit_metrics::commit(commit_txn).map_err(write_err)?;
-        // Only persist `last_applied` here so follower replay sees the
-        // same committed position. The failed indices go back to the
-        // client so they can refresh and retry.
+        // Nothing written; `last_applied` still advances with the batch so
+        // the entry isn't retried. The failed indices go back to the
+        // client so it can refresh and retry.
         return Ok(MetaResponse::MultiCasConflict { failed_indices });
     }
 
@@ -347,27 +321,11 @@ fn apply_multi_cas(
         }
     }
 
-    // `last_applied` moves in the same transaction as the writes: a crash
-    // can't leave them applied and the entry due to be applied again.
-    state.last_applied = Some(log_id);
-    write_state(&txn, state)?;
-    crate::commit_metrics::commit(txn).map_err(write_err)?;
-
-    // Fan out apply events after the commit lands on disk. Send is
-    // non-fatal: a dropped receiver (service crash, not yet wired up)
-    // means the event is silently discarded. Consumers resync from redb
-    // on next load_from_store so the cache can't stay permanently stale.
-    if let Some(tx) = listener {
-        for op in ops {
-            let ev = ApplyEvent::MultiCasOp {
-                table: op.table.clone(),
-                key: op.key.clone(),
-                new_value: op.new_value.clone(),
-            };
-            let _ = tx.send(ev);
-        }
-    }
-
+    events.extend(ops.iter().map(|op| ApplyEvent::MultiCasOp {
+        table: op.table.clone(),
+        key: op.key.clone(),
+        new_value: op.new_value.clone(),
+    }));
     Ok(MetaResponse::MultiCasOk)
 }
 
@@ -830,26 +788,36 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     ) -> Result<Vec<MetaResponse>, StorageError<NodeId>> {
         let mut state = self.load_state()?;
         let mut replies = Vec::with_capacity(entries.len());
+        let mut events = Vec::new();
+        // The whole batch in one transaction, with `last_applied` and
+        // membership: one durable commit for every entry openraft hands
+        // over, and a crash leaves either all of them applied or none.
+        let txn = self.db.begin_write().map_err(write_err)?;
         for entry in entries {
             match &entry.payload {
-                EntryPayload::Blank => {
-                    state.last_applied = Some(entry.log_id);
-                    replies.push(MetaResponse::Ok);
-                }
+                EntryPayload::Blank => replies.push(MetaResponse::Ok),
                 EntryPayload::Normal(cmd) => {
-                    let reply = self.apply_command(&mut state, cmd, entry.log_id)?;
-                    replies.push(reply);
+                    replies.push(Self::apply_command(&txn, &mut state, cmd, &mut events)?);
                 }
                 EntryPayload::Membership(mem) => {
-                    state.last_applied = Some(entry.log_id);
                     state.membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     replies.push(MetaResponse::Ok);
                 }
             }
+            state.last_applied = Some(entry.log_id);
         }
-        // Persist `last_applied` + membership once per apply batch rather
-        // than per entry — one less fsync per batch.
-        self.save_state(&state)?;
+        write_state(&txn, &state)?;
+        crate::commit_metrics::commit(txn).map_err(write_err)?;
+
+        // Fan out apply events once the batch is on disk. Send is
+        // non-fatal: a dropped receiver (service crash, not yet wired up)
+        // means the event is silently discarded. Consumers resync from redb
+        // on next load_from_store so the cache can't stay permanently stale.
+        if let Some(tx) = self.listener.as_ref() {
+            for ev in events {
+                let _ = tx.send(ev);
+            }
+        }
         Ok(replies)
     }
 
@@ -941,7 +909,7 @@ mod tests {
 
     /// `last_applied` commits with the entry's writes: once an entry is
     /// applied, a restart (which reads the stored state) doesn't apply it
-    /// again, whether or not the batch finished.
+    /// again.
     #[tokio::test]
     async fn an_applied_entry_is_recorded_as_applied_in_the_same_commit() {
         for cmd in [
@@ -972,11 +940,10 @@ mod tests {
                 requested_by: "t".into(),
             },
         ] {
-            let (_d, s) = storage();
-            let mut state = s.load_state().unwrap();
-            // Apply the command alone, as a crash before the batch's own
-            // save of the state would leave it.
-            s.apply_command(&mut state, &cmd, log_id(1, 5)).unwrap();
+            let (_d, mut s) = storage();
+            s.apply_to_state_machine(&[normal_entry(5, cmd.clone())])
+                .await
+                .unwrap();
             let stored = s.load_state().unwrap();
             assert_eq!(stored.last_applied, Some(log_id(1, 5)), "{cmd:?}");
         }
@@ -986,15 +953,16 @@ mod tests {
     /// twice by an entry applied again after a crash.
     #[tokio::test]
     async fn the_config_version_is_stored_with_the_entry() {
-        let (_d, s) = storage();
-        let mut state = s.load_state().unwrap();
+        let (_d, mut s) = storage();
         let cmd = MetaCommand::SetConfig {
             key: "k".into(),
             value: b"v".to_vec(),
             updated_by: "t".into(),
             updated_at: 0,
         };
-        s.apply_command(&mut state, &cmd, log_id(1, 1)).unwrap();
+        s.apply_to_state_machine(&[normal_entry(1, cmd)])
+            .await
+            .unwrap();
         assert_eq!(s.load_state().unwrap().config_version, 1);
     }
 

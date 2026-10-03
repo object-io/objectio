@@ -173,6 +173,18 @@ pub struct OsdStatus {
     pub uptime_secs: u64,
 }
 
+/// Run `f`, which blocks (a WAL sync, a shell-out), moving off the runtime
+/// worker where the runtime allows, so other tasks keep running meanwhile.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: make recording (or forgetting) a shard's location fail, as an
@@ -1338,13 +1350,7 @@ impl StorageService for OsdService {
         let render = || self.metrics_renderer.get().map(|f| f()).unwrap_or_default();
         // SMART polling may shell out to smartctl; don't stall a runtime
         // worker on it where the runtime allows moving off.
-        let text = if tokio::runtime::Handle::current().runtime_flavor()
-            == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            tokio::task::block_in_place(render)
-        } else {
-            render()
-        };
+        let text = blocking(render);
         Ok(Response::new(
             objectio_proto::metadata::GetMetricsResponse {
                 text,
@@ -1929,149 +1935,160 @@ impl StorageService for OsdService {
     // Object Metadata Operations (stored on primary OSD)
     // ============================================================
 
+    #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns
     async fn put_object_meta(
         &self,
         request: Request<PutObjectMetaRequest>,
     ) -> Result<Response<PutObjectMetaResponse>, Status> {
-        let req = request.into_inner();
+        // The store write syncs the WAL: off the runtime worker, so a
+        // sync stalls nothing else and concurrent writes share it.
+        blocking(|| {
+            let req = request.into_inner();
 
-        let object = req
-            .object
-            .ok_or_else(|| Status::invalid_argument("missing object"))?;
+            let object = req
+                .object
+                .ok_or_else(|| Status::invalid_argument("missing object"))?;
 
-        // Serialize ObjectMeta to bytes using protobuf
-        let value = object.encode_to_vec();
+            // Serialize ObjectMeta to bytes using protobuf
+            let value = object.encode_to_vec();
 
-        let _guard = self.usage.lock_key(&req.bucket, &req.key);
+            let _guard = self.usage.lock_key(&req.bucket, &req.key);
 
-        // Always store as current version at m:{bucket}\0{key}
-        let key = MetadataKey::object_meta(&req.bucket, &req.key);
-        let old = self.stored_meta(&key);
+            // Always store as current version at m:{bucket}\0{key}
+            let key = MetadataKey::object_meta(&req.bucket, &req.key);
+            let old = self.stored_meta(&key);
 
-        if req.replication_update {
-            return self.merge_replication(
-                &req.bucket,
-                &req.key,
-                &req.replication_set,
-                &object,
-                key,
-                old.as_ref(),
-            );
-        }
+            if req.replication_update {
+                return self.merge_replication(
+                    &req.bucket,
+                    &req.key,
+                    &req.replication_set,
+                    &object,
+                    key,
+                    old.as_ref(),
+                );
+            }
 
-        // Only the version entry: a change to a version that may not be
-        // current (`version_only`), or a replica older than the current
-        // version (`keep_newer_current`).
-        let older_replica = req.keep_newer_current
-            && old
-                .as_ref()
-                .is_some_and(|c| version_age(c) > version_age(&object));
-        if (req.version_only || older_replica) && !object.version_id.is_empty() {
-            let version_key =
-                MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
-            let prev = self.stored_meta(&version_key);
-            if req.version_only
-                && !Self::precondition_holds(
+            // Only the version entry: a change to a version that may not be
+            // current (`version_only`), or a replica older than the current
+            // version (`keep_newer_current`).
+            let older_replica = req.keep_newer_current
+                && old
+                    .as_ref()
+                    .is_some_and(|c| version_age(c) > version_age(&object));
+            if (req.version_only || older_replica) && !object.version_id.is_empty() {
+                let version_key =
+                    MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
+                let prev = self.stored_meta(&version_key);
+                if req.version_only
+                    && !Self::precondition_holds(
+                        prev.as_ref(),
+                        &req.expected_object_id,
+                        req.require_existing,
+                    )
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "{}/{} version {} is no longer the object this write was built from",
+                        req.bucket, req.key, object.version_id
+                    )));
+                }
+                self.meta_store
+                    .put(version_key, value)
+                    .map_err(|e| Status::internal(format!("failed to store version entry: {e}")))?;
+                self.usage.apply(
+                    &req.bucket,
+                    EntryKind::Version,
                     prev.as_ref(),
-                    &req.expected_object_id,
-                    req.require_existing,
-                )
-            {
+                    Some(&object),
+                );
+                return Ok(Response::new(PutObjectMetaResponse {
+                    success: true,
+                    timestamp: Self::current_timestamp(),
+                    replaced: None,
+                    replaced_version_kept: false,
+                }));
+            }
+
+            if !Self::precondition_holds(
+                old.as_ref(),
+                &req.expected_object_id,
+                req.require_existing,
+            ) {
                 return Err(Status::failed_precondition(format!(
-                    "{}/{} version {} is no longer the object this write was built from",
-                    req.bucket, req.key, object.version_id
+                    "{}/{} is no longer the object this write was built from",
+                    req.bucket, req.key
                 )));
             }
             self.meta_store
-                .put(version_key, value)
-                .map_err(|e| Status::internal(format!("failed to store version entry: {e}")))?;
-            self.usage.apply(
-                &req.bucket,
-                EntryKind::Version,
-                prev.as_ref(),
-                Some(&object),
-            );
-            return Ok(Response::new(PutObjectMetaResponse {
-                success: true,
-                timestamp: Self::current_timestamp(),
-                replaced: None,
-                replaced_version_kept: false,
-            }));
-        }
-
-        if !Self::precondition_holds(old.as_ref(), &req.expected_object_id, req.require_existing) {
-            return Err(Status::failed_precondition(format!(
-                "{}/{} is no longer the object this write was built from",
-                req.bucket, req.key
-            )));
-        }
-        self.meta_store
-            .put(key, value.clone())
-            .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
-        self.usage
-            .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
-
-        // The object this write replaces was stored while versioning was
-        // off (the "null" version). With versioning on now, S3 keeps it as
-        // a noncurrent version rather than letting it go: give it a version
-        // entry. It used to be dropped, and its shards freed.
-        if req.versioning_enabled
-            && !object.version_id.is_empty()
-            && let Some(null) = old.as_ref().filter(|o| o.version_id.is_empty())
-        {
-            let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
-            let replaced = self.stored_meta(&null_key);
-            self.meta_store
-                .put(null_key, null.encode_to_vec())
-                .map_err(|e| Status::internal(format!("failed to keep the null version: {e}")))?;
-            self.usage.apply(
-                &req.bucket,
-                EntryKind::Version,
-                replaced.as_ref(),
-                Some(null),
-            );
-        }
-
-        // A versioned object's own version entry is the same object: an
-        // update in place (tags, retention, legal hold) changes both, or a
-        // read by version id sees it without them, and a delete by version
-        // id checks a lock that isn't there.
-        let updates_its_version = !req.versioning_enabled
-            && !object.version_id.is_empty()
-            && Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, &object);
-        // If versioning is enabled and version_id is set, also store version entry
-        if (req.versioning_enabled || updates_its_version) && !object.version_id.is_empty() {
-            let version_key =
-                MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
-            let old = self.stored_meta(&version_key);
-            self.meta_store
-                .put(version_key, value)
-                .map_err(|e| Status::internal(format!("failed to store version entry: {}", e)))?;
+                .put(key, value.clone())
+                .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
             self.usage
-                .apply(&req.bucket, EntryKind::Version, old.as_ref(), Some(&object));
-        }
+                .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
 
-        let timestamp = Self::current_timestamp();
+            // The object this write replaces was stored while versioning was
+            // off (the "null" version). With versioning on now, S3 keeps it as
+            // a noncurrent version rather than letting it go: give it a version
+            // entry. It used to be dropped, and its shards freed.
+            if req.versioning_enabled
+                && !object.version_id.is_empty()
+                && let Some(null) = old.as_ref().filter(|o| o.version_id.is_empty())
+            {
+                let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
+                let replaced = self.stored_meta(&null_key);
+                self.meta_store
+                    .put(null_key, null.encode_to_vec())
+                    .map_err(|e| {
+                        Status::internal(format!("failed to keep the null version: {e}"))
+                    })?;
+                self.usage.apply(
+                    &req.bucket,
+                    EntryKind::Version,
+                    replaced.as_ref(),
+                    Some(null),
+                );
+            }
 
-        info!(
-            "Stored object metadata: {}/{} ({} bytes, version={})",
-            req.bucket, req.key, object.size, object.version_id
-        );
+            // A versioned object's own version entry is the same object: an
+            // update in place (tags, retention, legal hold) changes both, or a
+            // read by version id sees it without them, and a delete by version
+            // id checks a lock that isn't there.
+            let updates_its_version = !req.versioning_enabled
+                && !object.version_id.is_empty()
+                && Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, &object);
+            // If versioning is enabled and version_id is set, also store version entry
+            if (req.versioning_enabled || updates_its_version) && !object.version_id.is_empty() {
+                let version_key =
+                    MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
+                let old = self.stored_meta(&version_key);
+                self.meta_store.put(version_key, value).map_err(|e| {
+                    Status::internal(format!("failed to store version entry: {}", e))
+                })?;
+                self.usage
+                    .apply(&req.bucket, EntryKind::Version, old.as_ref(), Some(&object));
+            }
 
-        // Hand back what this write displaced, read under the same key lock
-        // as the write, so the caller can free its shards. Whether a version
-        // entry still holds it is checked after this write's own version
-        // entry has gone in.
-        let replaced_version_kept = old
-            .as_ref()
-            .is_some_and(|o| Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, o));
+            let timestamp = Self::current_timestamp();
 
-        Ok(Response::new(PutObjectMetaResponse {
-            success: true,
-            timestamp,
-            replaced: old,
-            replaced_version_kept,
-        }))
+            info!(
+                "Stored object metadata: {}/{} ({} bytes, version={})",
+                req.bucket, req.key, object.size, object.version_id
+            );
+
+            // Hand back what this write displaced, read under the same key lock
+            // as the write, so the caller can free its shards. Whether a version
+            // entry still holds it is checked after this write's own version
+            // entry has gone in.
+            let replaced_version_kept = old.as_ref().is_some_and(|o| {
+                Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, o)
+            });
+
+            Ok(Response::new(PutObjectMetaResponse {
+                success: true,
+                timestamp,
+                replaced: old,
+                replaced_version_kept,
+            }))
+        })
     }
 
     async fn get_object_meta(
@@ -2113,82 +2130,88 @@ impl StorageService for OsdService {
         }
     }
 
+    #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns
     async fn delete_object_meta(
         &self,
         request: Request<DeleteObjectMetaRequest>,
     ) -> Result<Response<DeleteObjectMetaResponse>, Status> {
-        let req = request.into_inner();
+        // The store write syncs the WAL: off the runtime worker, so a
+        // sync stalls nothing else and concurrent writes share it.
+        blocking(|| {
+            let req = request.into_inner();
 
-        let _guard = self.usage.lock_key(&req.bucket, &req.key);
+            let _guard = self.usage.lock_key(&req.bucket, &req.key);
 
-        let removed;
-        if req.version_id.is_empty() {
-            // Delete current version entry
-            let key = MetadataKey::object_meta(&req.bucket, &req.key);
-            let old = self.stored_meta(&key);
-            removed = old.clone();
-            self.meta_store.delete(&key).map_err(|e| {
-                Status::internal(format!("failed to delete object metadata: {}", e))
-            })?;
-            self.usage
-                .apply(&req.bucket, EntryKind::Current, old.as_ref(), None);
-            info!("Deleted object metadata: {}/{}", req.bucket, req.key);
-        } else {
-            // Delete specific version entry
-            let version_key = MetadataKey::object_version(&req.bucket, &req.key, &req.version_id);
-            let old = self.stored_meta(&version_key);
-            removed = old.clone();
-            self.meta_store
-                .delete(&version_key)
-                .map_err(|e| Status::internal(format!("failed to delete version entry: {}", e)))?;
-            self.usage
-                .apply(&req.bucket, EntryKind::Version, old.as_ref(), None);
-            info!(
-                "Deleted version: {}/{} (version={})",
-                req.bucket, req.key, req.version_id
-            );
-
-            // Was it the current version? Then the newest remaining one
-            // becomes current, still under the key's lock.
-            let current_key = MetadataKey::object_meta(&req.bucket, &req.key);
-            let current = self.stored_meta(&current_key);
-            if current
-                .as_ref()
-                .is_some_and(|c| version_entry_id(&c.version_id) == req.version_id)
-            {
-                let newest = self
-                    .meta_store
-                    .scan_prefix(&MetadataKey::object_version_prefix(&req.bucket, &req.key))
-                    .into_iter()
-                    .filter_map(|(_, v)| ObjectMeta::decode(&v[..]).ok())
-                    .max_by(|a, b| version_age(a).cmp(&version_age(b)));
-                match &newest {
-                    Some(n) => self.meta_store.put(current_key, n.encode_to_vec()),
-                    None => self.meta_store.delete(&current_key),
-                }
-                .map_err(|e| {
-                    Status::internal(format!("failed to replace the current version: {e}"))
+            let removed;
+            if req.version_id.is_empty() {
+                // Delete current version entry
+                let key = MetadataKey::object_meta(&req.bucket, &req.key);
+                let old = self.stored_meta(&key);
+                removed = old.clone();
+                self.meta_store.delete(&key).map_err(|e| {
+                    Status::internal(format!("failed to delete object metadata: {}", e))
                 })?;
-                self.usage.apply(
-                    &req.bucket,
-                    EntryKind::Current,
-                    current.as_ref(),
-                    newest.as_ref(),
+                self.usage
+                    .apply(&req.bucket, EntryKind::Current, old.as_ref(), None);
+                info!("Deleted object metadata: {}/{}", req.bucket, req.key);
+            } else {
+                // Delete specific version entry
+                let version_key =
+                    MetadataKey::object_version(&req.bucket, &req.key, &req.version_id);
+                let old = self.stored_meta(&version_key);
+                removed = old.clone();
+                self.meta_store.delete(&version_key).map_err(|e| {
+                    Status::internal(format!("failed to delete version entry: {}", e))
+                })?;
+                self.usage
+                    .apply(&req.bucket, EntryKind::Version, old.as_ref(), None);
+                info!(
+                    "Deleted version: {}/{} (version={})",
+                    req.bucket, req.key, req.version_id
                 );
-            }
-        }
 
-        let current = if req.version_id.is_empty() {
-            None
-        } else {
-            self.stored_meta(&MetadataKey::object_meta(&req.bucket, &req.key))
-                .map(for_listing)
-        };
-        Ok(Response::new(DeleteObjectMetaResponse {
-            success: true,
-            current,
-            removed,
-        }))
+                // Was it the current version? Then the newest remaining one
+                // becomes current, still under the key's lock.
+                let current_key = MetadataKey::object_meta(&req.bucket, &req.key);
+                let current = self.stored_meta(&current_key);
+                if current
+                    .as_ref()
+                    .is_some_and(|c| version_entry_id(&c.version_id) == req.version_id)
+                {
+                    let newest = self
+                        .meta_store
+                        .scan_prefix(&MetadataKey::object_version_prefix(&req.bucket, &req.key))
+                        .into_iter()
+                        .filter_map(|(_, v)| ObjectMeta::decode(&v[..]).ok())
+                        .max_by(|a, b| version_age(a).cmp(&version_age(b)));
+                    match &newest {
+                        Some(n) => self.meta_store.put(current_key, n.encode_to_vec()),
+                        None => self.meta_store.delete(&current_key),
+                    }
+                    .map_err(|e| {
+                        Status::internal(format!("failed to replace the current version: {e}"))
+                    })?;
+                    self.usage.apply(
+                        &req.bucket,
+                        EntryKind::Current,
+                        current.as_ref(),
+                        newest.as_ref(),
+                    );
+                }
+            }
+
+            let current = if req.version_id.is_empty() {
+                None
+            } else {
+                self.stored_meta(&MetadataKey::object_meta(&req.bucket, &req.key))
+                    .map(for_listing)
+            };
+            Ok(Response::new(DeleteObjectMetaResponse {
+                success: true,
+                current,
+                removed,
+            }))
+        })
     }
 
     async fn list_objects_meta(
