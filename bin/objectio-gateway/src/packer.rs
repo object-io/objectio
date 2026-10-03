@@ -1,6 +1,6 @@
 //! The packer: moves small objects into packs in the background, phase 2 of
 //! small-object packing (objectio-docs
-//! architecture/design/small-object-packing.md).
+//! architecture/design/core/small-object-packing.md).
 //!
 //! Off unless `--pack-interval-secs` is set. Every gateway runs the worker;
 //! a lease in meta lets one pack at a time, as for lifecycle. Each pass:

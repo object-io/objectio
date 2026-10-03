@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Roadmap first (mandatory)
+
+`../objectio-docs/ROADMAP.md` is the feature list and plan of record:
+priorities (S3 production-ready, with the shared storage engine core
+alongside; data lake next; then block, then file), every feature's status,
+and milestones with exit tests.
+
+- **Before any work on a new feature** — even when the user asks for it
+  directly — check it against that list. If it's missing, add a row (🔨,
+  plus a milestone with an exit test if it's sizeable); if it's there, mark
+  it 🔨. Then start.
+- **When it ships**, mark it ✅ in the docs PR that documents it.
+- **Bug fixes** need no row, unless they change a feature's status or its
+  notes (e.g. show a ✅ feature isn't production-ready).
+
 ## Build Commands
 
 ```bash
@@ -231,7 +246,7 @@ npm run lint     # eslint
 
 ## Documentation
 
-Design docs and user-facing reference live in a separate sibling repo `../objectio-docs/` (`DESIGN.md`, `FEATURES.md`, `architecture/`, `api/`, `deployment/`, `operations/`, `storage/`, `getting-started.md`). Clone it next to this repo. Check these before inventing explanations — design rationale for erasure coding, placement, and storage layout is already written down. The `examples/` directory (in this repo) has pyiceberg client scripts and sample config files.
+Design docs and user-facing reference live in a separate sibling repo `../objectio-docs/` (`DESIGN.md`, `FEATURES.md`, `architecture/`, `api/`, `deployment/`, `operations/`, `storage/`, `getting-started.md`). Clone it next to this repo. Designs live in `architecture/design/<area>/` — `core/` (storage engine, data protection, placement, meta: shared by object, block and file), `s3/`, `datalake/`, `security/`, `block/`, `file/`, `platform/` — indexed with status and roadmap rows in `architecture/design/README.md`; a new design goes in its area folder. Check these before inventing explanations — design rationale for erasure coding, placement, and storage layout is already written down. The `examples/` directory (in this repo) has pyiceberg client scripts and sample config files.
 
 ## Ports
 
@@ -254,7 +269,7 @@ setting any combination of `--admin-listen`, `--ops-console-listen`,
 bundles — an "ops" surface (full system admin) and a "tenant" surface
 (end-user self-service). See `console/vite.config.ts` for the
 multi-bundle build, `console/src/apps/{ops,tenant}/` for the per-bundle
-route maps, and `../objectio-docs/architecture/design/console-split.md`
+route maps, and `../objectio-docs/architecture/design/platform/console-split.md`
 for the rationale.
 
 The aio binary mirrors these flags as `--admin-port`,

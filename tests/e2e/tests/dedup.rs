@@ -1,5 +1,5 @@
 //! Dedup policy and the phase-1 dry-run (objectio-docs
-//! `architecture/design/dedup.md`): the policy resolves bucket → tenant →
+//! `architecture/design/core/dedup.md`): the policy resolves bucket → tenant →
 //! cluster, and dry-run counts how much written data was already stored in
 //! its domain, without changing how anything is stored.
 

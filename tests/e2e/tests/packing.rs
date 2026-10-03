@@ -2,7 +2,7 @@
 //! (`/_admin/test/pack`, mounted by `--test-hooks`) read back byte-identical;
 //! each lets its own stripe go; the pack goes with its last object; and the
 //! pack survives what a stripe survives: copies, overwrites, lost disks,
-//! repair and drain (objectio-docs architecture/design/small-object-packing.md).
+//! repair and drain (objectio-docs architecture/design/core/small-object-packing.md).
 
 use std::time::{Duration, Instant};
 

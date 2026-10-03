@@ -1,6 +1,6 @@
 //! Packed objects: an object whose bytes are a slice of a pack, one stripe
 //! shared by many small objects (objectio-docs
-//! architecture/design/small-object-packing.md).
+//! architecture/design/core/small-object-packing.md).
 //!
 //! The object's `StripeMeta` names the pack (`pack_id`) and its slice; the
 //! pack's shard locations live once, in meta's pack record, so repair and

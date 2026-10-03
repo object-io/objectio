@@ -1,7 +1,7 @@
 //! The gateway's side of shard transfers over Mooncake Transfer Engine.
 //!
 //! The OSD initiates every transfer (objectio-docs
-//! `architecture/design/rdma-data-plane.md`), so the gateway never calls
+//! `architecture/design/core/rdma-data-plane.md`), so the gateway never calls
 //! Transfer Engine itself. It keeps two remote-accessible pools the OSDs
 //! reach into:
 //!

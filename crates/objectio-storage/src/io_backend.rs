@@ -23,7 +23,7 @@
 //!    switches between async and sync halves. Measurements on NVMe:
 //!    +25% throughput at 4 MiB stripes, -78% p99 at 64 KiB, -90%
 //!    p99.9 at WAL writes. See
-//!    `objectio-docs/architecture/design/storage-io-levels.md`.
+//!    `objectio-docs/architecture/design/core/storage-io-levels.md`.
 //!
 //! Backend selection:
 //!

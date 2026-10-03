@@ -5,7 +5,7 @@
 //! registered private, so peers cannot reach it — see
 //! `objectio_transport_te::Engine::register` for how each transport enforces
 //! that. The design is objectio-docs
-//! `architecture/design/rdma-data-plane.md`.
+//! `architecture/design/core/rdma-data-plane.md`.
 
 use std::sync::Arc;
 

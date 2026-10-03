@@ -2996,7 +2996,7 @@ pub async fn admin_usage(auth: Option<Extension<AuthResult>>, headers: HeaderMap
     .into_response()
 }
 
-// ---- Deduplication policy (objectio-docs architecture/design/dedup.md) ----
+// ---- Deduplication policy (objectio-docs architecture/design/core/dedup.md) ----
 
 fn status_response(e: &tonic::Status) -> Response {
     let code = match e.code() {
