@@ -170,7 +170,7 @@ test_s3::test_lifecycle_expiration_versioned_tags2,aws-compatible-already,"Prefi
 test_s3::test_list_buckets_anonymous,aws-compatible-already,anonymous ListBuckets is 403 as on AWS (test is fails_on_aws)
 test_s3::test_list_buckets_paginated,test-environment,assumes main user owns no buckets; a bucket (testbuck2) left by another test exists
 test_s3::test_list_multipart_upload_owner,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
-test_s3::test_multipart_resend_first_finishes_last,aws-compatible-already,completes with part 1 listed twice; AWS rejects too (InvalidPartOrder); ObjectIO says EntityTooSmall
+test_s3::test_multipart_resend_first_finishes_last,aws-compatible-already,completes with part 1 listed twice; AWS refuses that with InvalidPartOrder and so does ObjectIO; RGW accepts it
 test_s3::test_object_acl,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
 test_s3::test_object_acl_canned,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_object_acl_canned_authenticatedread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)

@@ -252,9 +252,48 @@ fn creating_a_bucket_someone_else_holds_is_a_conflict() {
         "{}",
         r.text()
     );
-    // A name nobody holds is still refused as forbidden when not granted.
-    let r = c.request_as("PUT", "/free-name", &[], &ak, &sk);
-    assert_ne!(r.status, 409, "{}", r.text());
+    // A name nobody holds is created, and the caller owns it.
+    c.request_as("PUT", "/free-name", &[], &ak, &sk).expect(200);
+    c.request_as("PUT", "/free-name/k", b"x", &ak, &sk)
+        .expect(200);
+}
+
+/// A bucket that doesn't exist is "no such bucket" (404) to an ordinary
+/// user, as in S3, not "forbidden": there is nothing in it to protect. The
+/// suite's other tests run as the system admin, which bypasses
+/// authorization, so this one is a user.
+#[test]
+fn a_missing_bucket_is_404_to_an_ordinary_user() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    let user = c
+        .json("POST", "/_admin/users", json!({ "display_name": "u" }))
+        .json();
+    let id = user["user_id"].as_str().expect("user id").to_string();
+    let key = c
+        .json(
+            "POST",
+            &format!("/_admin/users/{id}/access-keys"),
+            json!({}),
+        )
+        .json();
+    let ak = key["access_key_id"].as_str().expect("key id").to_string();
+    let sk = key["secret_access_key"]
+        .as_str()
+        .expect("secret")
+        .to_string();
+    for (method, path) in [
+        ("HEAD", "/nope"),
+        ("GET", "/nope"),
+        ("DELETE", "/nope"),
+        ("GET", "/nope/k"),
+        ("PUT", "/nope/k"),
+    ] {
+        let r = c.request_as(method, path, b"", &ak, &sk);
+        assert_eq!(r.status, 404, "{method} {path}: {}", r.text());
+        if method != "HEAD" {
+            assert_eq!(code(&r), "NoSuchBucket", "{method} {path}");
+        }
+    }
 }
 
 #[test]

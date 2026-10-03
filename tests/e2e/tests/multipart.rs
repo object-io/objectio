@@ -116,6 +116,38 @@ fn a_multipart_upload_reassembles_in_order() {
     );
 }
 
+/// A completion must name its parts in ascending order: a part named twice
+/// or out of order is `InvalidPartOrder`, as S3 has it, before any size check.
+#[test]
+fn parts_out_of_order_are_invalid_part_order() {
+    let c = Cluster::start();
+    c.json("POST", "/_admin/buckets", json!({"name": "mpo"}))
+        .expect_ok();
+    let upload = initiate(&c, "mpo", "k");
+    let e1 = upload_part(&c, "mpo", "k", &upload, 1, b"tiny one");
+    let e2 = upload_part(&c, "mpo", "k", &upload, 2, b"tiny two");
+    for parts in [
+        vec![(1, e1.clone()), (1, e1.clone())],
+        vec![(2, e2.clone()), (1, e1.clone())],
+    ] {
+        let r = complete(&c, "mpo", "k", &upload, &parts);
+        r.expect(400);
+        assert!(
+            r.text().contains("<Code>InvalidPartOrder</Code>"),
+            "{}",
+            r.text()
+        );
+    }
+    // In order, the small first part is what's wrong.
+    let r = complete(&c, "mpo", "k", &upload, &[(1, e1), (2, e2)]);
+    r.expect(400);
+    assert!(
+        r.text().contains("<Code>EntityTooSmall</Code>"),
+        "{}",
+        r.text()
+    );
+}
+
 /// Deleting a multipart object frees every stripe it wrote.
 ///
 /// The single-part case is covered in `lifecycle`; this one matters

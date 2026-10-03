@@ -18,7 +18,7 @@
 #
 # Results land in <work>/report/: results.csv (one row per test), summary.md,
 # junit.xml. To publish a run, copy that folder to objectio-docs under
-# operations/s3-compatibility/<date>/. Failures are labelled from
+# developer-guide/s3-compatibility/<date>/<platform>/. Failures are labelled from
 # known-failures.csv next to this script; add new ones there.
 set -euo pipefail
 
@@ -114,5 +114,6 @@ tail -1 "$WORK/pytest.log"
   --date "$(date -u +%Y-%m-%d)" \
   --commit "$(git -C "$REPO" rev-parse --short HEAD)" \
   --s3tests-commit "$(git -C "$WORK/s3-tests" rev-parse --short HEAD)" \
+  --platform "$(uname -s) $(uname -m)" \
   ${PREVIOUS:+--previous "$PREVIOUS"}
 echo "report: $REPORT/summary.md"

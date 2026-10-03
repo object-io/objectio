@@ -8179,6 +8179,97 @@ async fn delete_object_to_the_end(
         .unwrap()
 }
 
+/// How many keys of one DeleteObjects request are deleted at once.
+const DELETE_OBJECTS_CONCURRENCY: usize = 16;
+
+/// One key of a DeleteObjects request: authorized, then deleted through the
+/// single-object DELETE.
+async fn delete_one(
+    state: &Arc<AppState>,
+    auth: Option<&Extension<AuthResult>>,
+    bucket: &str,
+    headers: &HeaderMap,
+    obj: DeleteObjectIdentifier,
+) -> Result<DeletedObject, DeleteError> {
+    // Batch delete reports per-key outcomes inside a 200 response, so
+    // each key is evaluated here instead of by the middleware, which
+    // classifies this route as `DeferToHandler`.
+    if let Some(Extension(auth_result)) = auth
+        && crate::authz::authorize(
+            state,
+            auth_result,
+            &crate::authz::AuthzRequest {
+                method: &Method::DELETE,
+                action: "s3:DeleteObject",
+                bucket,
+                key: Some(&obj.key),
+                scope_key: &obj.key,
+                headers: None,
+            },
+        )
+        .await
+        .is_some()
+    {
+        return Err(DeleteError {
+            key: obj.key,
+            version_id: obj.version_id,
+            code: "AccessDenied".to_string(),
+            message: "Access Denied".to_string(),
+        });
+    }
+
+    // Each key goes through the single-object DELETE, so a batch gets
+    // the same versioning, object-lock and listing handling, and frees
+    // the shards.
+    let mut object_headers = headers.clone();
+    for (name, value) in [
+        ("if-match", &obj.etag),
+        ("x-amz-if-match-last-modified-time", &obj.last_modified_time),
+        ("x-amz-if-match-size", &obj.size),
+    ] {
+        if let Some(v) = value
+            && let Ok(v) = header::HeaderValue::from_str(v)
+        {
+            object_headers.insert(name, v);
+        }
+    }
+    let resp = delete_object(
+        State(Arc::clone(state)),
+        Path((bucket.to_string(), obj.key.clone())),
+        None,
+        obj.version_id.clone(),
+        object_headers,
+    )
+    .await;
+    if resp.status().is_success() {
+        let header_version = resp
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let delete_marker = resp.headers().contains_key("x-amz-delete-marker");
+        Ok(DeletedObject {
+            key: obj.key,
+            // A version deleted by id is named; a marker just added is
+            // named as the marker.
+            version_id: obj.version_id,
+            delete_marker,
+            delete_marker_version_id: if delete_marker { header_version } else { None },
+        })
+    } else {
+        let code = resp
+            .extensions()
+            .get::<crate::gateway_metrics::S3ErrorCode>()
+            .map_or_else(|| "InternalError".to_string(), |c| c.0.clone());
+        Err(DeleteError {
+            key: obj.key,
+            version_id: obj.version_id,
+            message: code.clone(),
+            code,
+        })
+    }
+}
+
 /// Delete multiple objects (POST /{bucket}?delete)
 pub async fn delete_objects(
     State(state): State<Arc<AppState>>,
@@ -8219,90 +8310,47 @@ pub async fn delete_objects(
         );
     }
 
+    // Keys are deleted concurrently, a bounded number at a time; one key
+    // named more than once is deleted in request order (its entries run in
+    // one task). Outcomes are reported in request order.
+    use futures::StreamExt;
+    let quiet = delete_request.quiet;
+    let mut by_key: Vec<Vec<(usize, DeleteObjectIdentifier)>> = Vec::new();
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, obj) in delete_request.objects.into_iter().enumerate() {
+        let g = *slot.entry(obj.key.clone()).or_insert_with(|| {
+            by_key.push(Vec::new());
+            by_key.len() - 1
+        });
+        by_key[g].push((i, obj));
+    }
+    let mut outcomes: Vec<(usize, Result<DeletedObject, DeleteError>)> =
+        futures::stream::iter(by_key.into_iter().map(|entries| {
+            let (state, auth, bucket, headers) = (&state, &auth, &bucket, &headers);
+            async move {
+                let mut out = Vec::with_capacity(entries.len());
+                for (i, obj) in entries {
+                    out.push((
+                        i,
+                        delete_one(state, auth.as_ref(), bucket, headers, obj).await,
+                    ));
+                }
+                out
+            }
+        }))
+        .buffer_unordered(DELETE_OBJECTS_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    outcomes.sort_unstable_by_key(|(i, _)| *i);
     let mut deleted = Vec::new();
     let mut errors = Vec::new();
-
-    // Delete each object
-    let quiet = delete_request.quiet;
-    for obj in delete_request.objects {
-        // Batch delete reports per-key outcomes inside a 200 response, so
-        // each key is evaluated here instead of by the middleware, which
-        // classifies this route as `DeferToHandler`.
-        if let Some(Extension(auth_result)) = &auth
-            && crate::authz::authorize(
-                &state,
-                auth_result,
-                &crate::authz::AuthzRequest {
-                    method: &Method::DELETE,
-                    action: "s3:DeleteObject",
-                    bucket: &bucket,
-                    key: Some(&obj.key),
-                    scope_key: &obj.key,
-                    headers: None,
-                },
-            )
-            .await
-            .is_some()
-        {
-            errors.push(DeleteError {
-                key: obj.key,
-                version_id: obj.version_id,
-                code: "AccessDenied".to_string(),
-                message: "Access Denied".to_string(),
-            });
-            continue;
-        }
-
-        // Each key goes through the single-object DELETE, so a batch gets
-        // the same versioning, object-lock and listing handling, and frees
-        // the shards. Deleting only the ObjectMeta here, as this did, left
-        // every object's shards allocated and its listing entry behind.
-        let mut object_headers = headers.clone();
-        for (name, value) in [
-            ("if-match", &obj.etag),
-            ("x-amz-if-match-last-modified-time", &obj.last_modified_time),
-            ("x-amz-if-match-size", &obj.size),
-        ] {
-            if let Some(v) = value
-                && let Ok(v) = header::HeaderValue::from_str(v)
-            {
-                object_headers.insert(name, v);
-            }
-        }
-        let resp = delete_object(
-            State(Arc::clone(&state)),
-            Path((bucket.clone(), obj.key.clone())),
-            None,
-            obj.version_id.clone(),
-            object_headers,
-        )
-        .await;
-        if resp.status().is_success() {
-            let header_version = resp
-                .headers()
-                .get("x-amz-version-id")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let delete_marker = resp.headers().contains_key("x-amz-delete-marker");
-            deleted.push(DeletedObject {
-                key: obj.key,
-                // A version deleted by id is named; a marker just added is
-                // named as the marker.
-                version_id: obj.version_id.clone(),
-                delete_marker,
-                delete_marker_version_id: if delete_marker { header_version } else { None },
-            });
-        } else {
-            let code = resp
-                .extensions()
-                .get::<crate::gateway_metrics::S3ErrorCode>()
-                .map_or_else(|| "InternalError".to_string(), |c| c.0.clone());
-            errors.push(DeleteError {
-                key: obj.key,
-                version_id: obj.version_id,
-                message: code.clone(),
-                code,
-            });
+    for (_, outcome) in outcomes {
+        match outcome {
+            Ok(d) => deleted.push(d),
+            Err(e) => errors.push(e),
         }
     }
 
@@ -10222,9 +10270,11 @@ async fn complete_multipart_upload_internal(
                     StatusCode::NOT_FOUND,
                 )
             } else if e.code() == tonic::Code::InvalidArgument
-                && e.message().starts_with("EntityTooSmall")
+                && let Some(code) = ["EntityTooSmall", "InvalidPartOrder"]
+                    .into_iter()
+                    .find(|c| e.message().starts_with(c))
             {
-                S3Error::xml_response("EntityTooSmall", e.message(), StatusCode::BAD_REQUEST)
+                S3Error::xml_response(code, e.message(), StatusCode::BAD_REQUEST)
             } else if e.code() == tonic::Code::InvalidArgument {
                 S3Error::xml_response("InvalidPart", e.message(), StatusCode::BAD_REQUEST)
             } else {

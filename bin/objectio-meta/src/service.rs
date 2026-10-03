@@ -13009,6 +13009,19 @@ fn complete_upload(
         ));
     }
 
+    // Parts are named in strictly ascending order, as S3 requires: a part
+    // named twice or out of order is refused before anything else.
+    if req
+        .parts
+        .windows(2)
+        .any(|w| w[1].part_number <= w[0].part_number)
+    {
+        return Err(Status::invalid_argument(
+            "InvalidPartOrder: the list of parts was not in ascending order; \
+             parts must be ordered by part number",
+        ));
+    }
+
     // Validate that all requested parts exist and ETags match
     let mut stripes = Vec::new();
     let mut total_size = 0u64;

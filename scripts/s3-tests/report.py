@@ -52,6 +52,9 @@ def parse(junit):
     return rows
 
 
+NOT_APPLICABLE = ("not-implemented-by-design", "test-environment", "aws-compatible-already")
+
+
 def load_known():
     path = os.path.join(HERE, "known-failures.csv")
     if not os.path.exists(path):
@@ -60,11 +63,20 @@ def load_known():
         return {r["test_id"]: r for r in csv.DictReader(f)}
 
 
+def normalize(test_id):
+    """`test_s3::name` from either spelling: this script's, or the
+    `s3tests/functional/test_s3.py::name` of earlier reports. Without it
+    an earlier report matches nothing, and nothing looks changed."""
+    path, _, name = test_id.partition("::")
+    stem = path.rsplit("/", 1)[-1].removesuffix(".py")
+    return f"{stem}::{name}"
+
+
 def load_previous(path):
     if not path or not os.path.exists(path):
         return {}
     with open(path, newline="") as f:
-        return {r["test_id"]: r["outcome"] for r in csv.DictReader(f)}
+        return {normalize(r["test_id"]): r["outcome"] for r in csv.DictReader(f)}
 
 
 def main():
@@ -74,6 +86,7 @@ def main():
     ap.add_argument("--commit", default="?")
     ap.add_argument("--s3tests-commit", default="?")
     ap.add_argument("--date", default="")
+    ap.add_argument("--platform", default="?")
     ap.add_argument("--previous")
     a = ap.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
@@ -100,6 +113,11 @@ def main():
         by_file[r["file"]][r["outcome"]] += 1
     failures = [r for r in rows if r["outcome"] in FAILED]
     by_cat = collections.Counter(r["category"] for r in failures)
+    # Applicable: what a test can fairly ask of ObjectIO. Not skipped, and
+    # not failing for a reason that isn't ObjectIO's to fix (a feature left
+    # out by design, the test environment, a test expecting RGW over AWS).
+    not_applicable = sum(by_cat[c] for c in NOT_APPLICABLE) + totals["skipped"]
+    applicable = len(rows) - not_applicable
 
     out = [
         "# ceph s3-tests results",
@@ -107,9 +125,16 @@ def main():
         f"- Date: {a.date}",
         f"- ObjectIO commit: `{a.commit}`",
         f"- s3-tests commit: `{a.s3tests_commit}`",
+        f"- Platform: {a.platform}",
         "",
-        f"**{len(rows)} tests: {totals['passed']} passed, {totals['failed']} failed, "
-        f"{totals['error']} errors, {totals['skipped']} skipped.**",
+        f"**Passes {totals['passed']} of {applicable} applicable tests** "
+        f"({len(rows)} in all; {not_applicable} not applicable: "
+        f"{totals['skipped']} skipped, "
+        + ", ".join(f"{by_cat[c]} {c}" for c in NOT_APPLICABLE)
+        + ").",
+        "",
+        f"{len(rows)} tests: {totals['passed']} passed, {totals['failed']} failed, "
+        f"{totals['error']} errors, {totals['skipped']} skipped.",
         "",
         "## By file",
         "",
