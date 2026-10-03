@@ -115,10 +115,18 @@ pub struct Superblock {
     ///
     /// Lives in bytes 16..32 of the old reserved[128] block.
     pub osd_node_id: [u8; 16],
-    /// Remaining reserved-for-future bytes (was 128; now 96 after
-    /// carving out cluster_uuid + osd_node_id). Stays zero until
-    /// a future feature claims part of it.
-    pub reserved: [u8; 96],
+    /// Features an older release may ignore and still mount the disk
+    /// (bytes 196..204 of the old reserved block). None defined yet.
+    pub features_compat: u64,
+    /// Features an older release must not mount the disk with (bytes
+    /// 204..212): a release refuses a disk with one it doesn't know.
+    /// None defined yet.
+    pub features_incompat: u64,
+    /// Remaining reserved-for-future bytes (was 128; 96 after
+    /// cluster_uuid + osd_node_id; 80 after the feature words). Zero
+    /// until a future feature claims part of it. The checksum covers
+    /// only the first 68 of them (up to byte 280).
+    pub reserved: [u8; 80],
     /// Checksum of superblock (excluding this field)
     pub checksum: u32,
 }
@@ -178,7 +186,9 @@ impl Superblock {
             flags: 0,
             cluster_uuid: Uuid::nil(),
             osd_node_id: [0u8; 16],
-            reserved: [0u8; 96],
+            features_compat: 0,
+            features_incompat: 0,
+            reserved: [0u8; 80],
             checksum: 0,
         };
 
@@ -232,6 +242,8 @@ impl Superblock {
         // nil UUID + zero node_id — treated as "unset" by has_identity().
         buf.put_slice(self.cluster_uuid.as_bytes());
         buf.put_slice(&self.osd_node_id);
+        buf.put_u64_le(self.features_compat);
+        buf.put_u64_le(self.features_incompat);
         buf.put_slice(&self.reserved);
         buf.put_u32_le(self.checksum);
 
@@ -297,7 +309,9 @@ impl Superblock {
         let mut osd_node_id = [0u8; 16];
         buf.copy_to_slice(&mut osd_node_id);
 
-        let mut reserved = [0u8; 96];
+        let features_compat = buf.get_u64_le();
+        let features_incompat = buf.get_u64_le();
+        let mut reserved = [0u8; 80];
         buf.copy_to_slice(&mut reserved);
 
         let checksum = buf.get_u32_le();
@@ -325,6 +339,8 @@ impl Superblock {
             flags,
             cluster_uuid,
             osd_node_id,
+            features_compat,
+            features_incompat,
             reserved,
             checksum,
         };
@@ -332,6 +348,13 @@ impl Superblock {
         // Verify checksum
         if sb.compute_checksum() != checksum {
             return Err(Error::Storage("superblock checksum mismatch".into()));
+        }
+        let unknown = sb.features_incompat & !Self::KNOWN_INCOMPAT;
+        if unknown != 0 {
+            return Err(Error::Storage(format!(
+                "disk uses features {unknown:#x} this release doesn't know (formatted or \
+                 changed by a newer one); not mounting it"
+            )));
         }
 
         Ok(sb)
@@ -345,6 +368,9 @@ impl Superblock {
     /// index_size(8) + data_offset(8) + data_size(8) + created_at(8) +
     /// last_mount(8) + mount_count(8) + flags(4) + reserved(128) = 280
     const CHECKSUM_OFFSET: usize = 280;
+
+    /// The incompatible features this release understands.
+    pub const KNOWN_INCOMPAT: u64 = 0;
 
     /// Compute checksum of superblock (CRC32C)
     fn compute_checksum(&self) -> u32 {
@@ -398,6 +424,11 @@ pub struct BlockHeader {
 impl BlockHeader {
     /// Block header magic
     pub const MAGIC: u32 = 0x424C4B48; // "BLKH"
+
+    /// The header flags this release understands; a shard with any other
+    /// is refused, not misread. A new flag is written only once the
+    /// cluster's active format level allows it.
+    pub const KNOWN_FLAGS: u32 = 0;
 
     /// Header size in bytes
     pub const SIZE: usize = 64;
@@ -464,6 +495,15 @@ impl BlockHeader {
 
         if header.compute_checksum() != checksum {
             return Err(Error::Storage("block header checksum mismatch".into()));
+        }
+        // A flag changes what the bytes mean (compressed, say): one this
+        // release doesn't know would have it serve them as they are.
+        let unknown = flags & !Self::KNOWN_FLAGS;
+        if unknown != 0 {
+            return Err(Error::Storage(format!(
+                "block header has flags {unknown:#x} this release doesn't know \
+                 (written by a newer one?); not serving it as plain data"
+            )));
         }
 
         Ok(header)
@@ -540,6 +580,54 @@ impl BlockFooter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A disk carrying an incompatible feature this release doesn't know
+    /// is refused; a compatible one isn't.
+    #[test]
+    fn a_disk_with_an_unknown_incompatible_feature_is_not_mounted() {
+        let mut sb = Superblock::new(10 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE).unwrap();
+        sb.features_incompat = 1;
+        sb.update_checksum();
+        let err = Superblock::from_bytes(&sb.to_bytes()).unwrap_err();
+        assert!(err.to_string().contains("features"), "{err}");
+
+        sb.features_incompat = 0;
+        sb.features_compat = 1;
+        sb.update_checksum();
+        assert_eq!(
+            Superblock::from_bytes(&sb.to_bytes())
+                .unwrap()
+                .features_compat,
+            1
+        );
+    }
+
+    /// The feature words sit where reserved zeros were, inside the
+    /// checksummed range, and the checksum didn't move: every existing disk
+    /// reads as having no features.
+    #[test]
+    fn existing_disks_read_as_having_no_features() {
+        let sb = Superblock::new(10 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE).unwrap();
+        let bytes = sb.to_bytes();
+        assert!(bytes[196..212].iter().all(|b| *b == 0));
+        assert_eq!(
+            u32::from_le_bytes(bytes[292..296].try_into().unwrap()),
+            sb.checksum
+        );
+        let back = Superblock::from_bytes(&bytes).unwrap();
+        assert_eq!((back.features_compat, back.features_incompat), (0, 0));
+    }
+
+    /// A shard flag this release doesn't know changes what the bytes mean:
+    /// refused, not served as they are.
+    #[test]
+    fn a_shard_with_an_unknown_flag_is_refused() {
+        let mut header = BlockHeader::new(1, [1u8; 16], 0, 10);
+        header.flags = 1;
+        header.checksum = header.compute_checksum();
+        let err = BlockHeader::from_bytes(&header.to_bytes()).unwrap_err();
+        assert!(err.to_string().contains("flags"), "{err}");
+    }
 
     #[test]
     fn test_superblock_roundtrip() {

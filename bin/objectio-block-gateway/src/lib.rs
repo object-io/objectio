@@ -110,7 +110,9 @@ pub async fn run(args: Args) -> Result<()> {
         ..CacheConfig::default()
     };
     let chunk_mapper = Arc::new(ChunkMapper::default());
-    let cache = Arc::new(WriteCache::new(chunk_mapper, cache_config));
+    let cache = Arc::new(
+        WriteCache::new(chunk_mapper, cache_config).context("open the block write journal")?,
+    );
     metrics::register(Arc::clone(&cache));
     if !args.metrics_listen.is_empty() {
         let addr: SocketAddr = args
