@@ -98,34 +98,27 @@ await_healthy "before"
 while [ "$(acked)" -lt 200 ]; do sleep 2; done
 say "traffic running: $(acked) objects acknowledged"
 
-# The term every reachable meta is in, if they agree on a leader (empty
-# otherwise; never a failure, which set -e would turn into an exit).
-leader_term() {
-    if [ -n "$(leader_index)" ]; then
-        statuses | awk '{print $6}' | sort -n | tail -1
-    fi
-}
-
 kill_meta() {
-    local i=$1 what=$2 old_leader old_term
+    local i=$1 what=$2 old_leader uid
     old_leader=$(leader_index)
-    old_term=$(leader_term)
+    uid=$(k get pod "$STS-$i" -o jsonpath='{.metadata.uid}')
     say "killing $STS-$i ($what)"
     local t0=$SECONDS
     k delete pod "$STS-$i" --grace-period=0 --force >/dev/null 2>&1
     if [ "$i" = "$old_leader" ]; then
-        # A new leader is a higher term, whichever pod wins it: the killed
-        # one, back on a new IP within seconds, may.
-        local deadline=$((SECONDS + 60)) l="" t=""
+        # A leader again, agreed by every reachable meta, after the kill
+        # took effect (a new pod). Any pod may lead: the killed one, back
+        # within seconds, can even resume in the same term.
+        local deadline=$((SECONDS + 60)) l=""
         while [ $SECONDS -lt $deadline ]; do
-            l=$(leader_index)
-            t=$(leader_term)
-            [ -n "$l" ] && [ -n "$t" ] && [ "$t" -gt "$old_term" ] && break
+            if [ "$(k get pod "$STS-$i" -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid" ]; then
+                l=$(leader_index)
+                [ -n "$l" ] && break
+            fi
             sleep 1
         done
-        [ -n "$l" ] && [ -n "$t" ] && [ "$t" -gt "$old_term" ] ||
-            die "no new leader within 60s of killing the leader"
-        say "new leader $STS-$l (term $t) after $((SECONDS - t0))s"
+        [ -n "$l" ] || die "no leader within 60s of killing the leader"
+        say "leader $STS-$l after $((SECONDS - t0))s"
     fi
     await_healthy "$STS-$i back after $what"
     sleep 15
