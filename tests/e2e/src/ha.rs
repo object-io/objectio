@@ -228,6 +228,7 @@ impl HaCluster {
                 &endpoints,
                 "--external-endpoint",
                 &format!("http://127.0.0.1:{port}"),
+                "--test-hooks",
             ])
             .stdout(log_target())
             .stderr(log_target())
