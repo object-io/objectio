@@ -747,6 +747,12 @@ pub async fn authorize(
     if !bucket.owner.is_empty() && bucket.owner == auth.user_id {
         return None;
     }
+    // Any authenticated caller may create a bucket that has no owner yet
+    // (it doesn't exist), and becomes its owner; explicit Denies and the
+    // tenant boundary were applied above. If it does exist, meta refuses.
+    if req.action == "s3:CreateBucket" && bucket.owner.is_empty() {
+        return None;
+    }
 
     Some(deny(&format!(
         "No policy allows {} on {resource}",
