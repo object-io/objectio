@@ -589,11 +589,7 @@ async fn check_kms_policy(
         Ok(r) => r.into_inner().policy_names,
         Err(e) => {
             tracing::error!("list_attached_policies for {}: {e}", auth_result.user_id);
-            return Some(S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Some(S3Error::from_status(&e));
         }
     };
 
@@ -852,11 +848,7 @@ pub async fn admin_create_kms_key(
         }
         Err(e) => {
             tracing::error!("create_kms_key failed: {e}");
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -905,11 +897,7 @@ pub async fn admin_list_kms_keys(
                 .body(axum::body::Body::from(body.to_string()))
                 .unwrap()
         }
-        Err(e) => S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        Err(e) => S3Error::from_status(&e),
     }
 }
 
@@ -953,11 +941,7 @@ pub async fn admin_get_kms_key(
                 .body(axum::body::Body::from(serde_json::to_string(&v).unwrap()))
                 .unwrap()
         }
-        Err(e) => S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        Err(e) => S3Error::from_status(&e),
     }
 }
 
@@ -991,11 +975,7 @@ pub async fn admin_delete_kms_key(
             .status(StatusCode::NO_CONTENT)
             .body(axum::body::Body::empty())
             .unwrap(),
-        Err(e) => S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        Err(e) => S3Error::from_status(&e),
     }
 }
 
@@ -1111,11 +1091,7 @@ pub async fn admin_kms_put_config(
         .await
     {
         tracing::error!("persist kms/config failed: {e}");
-        return S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+        return S3Error::from_status(&e);
     }
     // Rebuild providers from the new config and atomic-swap.
     let (local, provider) = build_kms_provider(

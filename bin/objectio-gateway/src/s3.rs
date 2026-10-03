@@ -253,11 +253,7 @@ async fn resolve_sse_decision(
         Ok(r) => r.into_inner(),
         Err(e) => {
             error!("Failed to fetch bucket encryption for {bucket}: {e}");
-            return Err(S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Err(S3Error::from_status(&e));
         }
     };
     let Some(rule) = bucket_enc.config.and_then(|c| c.rules.into_iter().next()) else {
@@ -869,10 +865,7 @@ fn delete_refusal(path: &str, query: Option<&str>) -> Option<Response> {
 /// again) when meta couldn't be reached or answer in time — a meta node
 /// lost, an election under way — and 500 otherwise.
 pub(crate) fn meta_failure(e: &tonic::Status, what: &str) -> Response {
-    if matches!(
-        e.code(),
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
-    ) {
+    if S3Error::is_unavailable(e) {
         S3Error::xml_response(
             "ServiceUnavailable",
             &format!("{what}: the metadata service is unavailable; retry"),
@@ -2081,6 +2074,38 @@ pub struct S3Error {
 }
 
 impl S3Error {
+    /// A failed meta or OSD call, as S3 answers it. Unavailable (a meta
+    /// leader change, a node restarting) is 503 ServiceUnavailable, which
+    /// S3 clients retry; anything else is 500 InternalError. tonic reports
+    /// a connection that dropped (the node it went to was killed) as
+    /// Unknown "transport error", and a call that ran out of time as
+    /// Cancelled "Timeout expired": those are unavailable too.
+    /// Whether a failed meta or OSD call means "unavailable, retry": the
+    /// service said so, ran out of time, or the connection dropped (tonic's
+    /// Unknown "transport error", Cancelled "Timeout expired").
+    pub fn is_unavailable(e: &tonic::Status) -> bool {
+        matches!(
+            e.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+        ) || (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+    }
+
+    pub fn from_status(e: &tonic::Status) -> Response {
+        if Self::is_unavailable(e) {
+            Self::xml_response(
+                "ServiceUnavailable",
+                e.message(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            )
+        } else {
+            Self::xml_response(
+                "InternalError",
+                &e.to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        }
+    }
+
     pub(crate) fn xml_response(code: &str, message: &str, status: StatusCode) -> Response {
         let error = S3Error {
             code: code.to_string(),
@@ -2769,11 +2794,7 @@ pub async fn list_buckets(
         }
         Err(e) => {
             error!("Failed to list buckets: {}", e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -2982,11 +3003,7 @@ pub async fn create_bucket(
                 S3Error::xml_response("TooManyBuckets", e.message(), StatusCode::BAD_REQUEST)
             } else {
                 error!("Failed to create bucket: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -3085,11 +3102,7 @@ pub async fn delete_bucket(
                 )
             } else {
                 error!("Failed to delete bucket: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -3292,11 +3305,7 @@ pub async fn list_objects(
                 );
             }
             error!("Failed to get bucket: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::from_status(&e);
         }
     };
     let echo = || ListingEcho {
@@ -4295,11 +4304,7 @@ pub(crate) async fn bucket_owner(state: &AppState, bucket: &str) -> Result<Strin
             "The specified bucket does not exist",
             StatusCode::NOT_FOUND,
         )),
-        Err(e) => Err(S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )),
+        Err(e) => Err(S3Error::from_status(&e)),
     }
 }
 
@@ -8427,11 +8432,7 @@ async fn get_bucket_policy_internal(state: Arc<AppState>, bucket: String) -> Res
                 )
             } else {
                 error!("Failed to get bucket policy: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -8516,11 +8517,7 @@ pub(crate) async fn put_bucket_policy_internal(
                 S3Error::xml_response("MalformedPolicy", e.message(), StatusCode::BAD_REQUEST)
             } else {
                 error!("Failed to set bucket policy: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -8556,11 +8553,7 @@ pub(crate) async fn delete_bucket_policy_internal(
                 )
             } else {
                 error!("Failed to delete bucket policy: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -9066,11 +9059,7 @@ async fn initiate_multipart_upload_internal(
                     );
                 }
                 error!("Failed to initiate SSE-C multipart upload: {}", e);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                return S3Error::from_status(&e);
             }
         }
     }
@@ -9220,11 +9209,7 @@ async fn initiate_multipart_upload_internal(
                 )
             } else {
                 error!("Failed to initiate multipart upload: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -9439,11 +9424,7 @@ async fn upload_part_internal(
         }
         Err(e) => {
             error!("Failed to fetch MPU state for {upload_id}: {e}");
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::from_status(&e);
         }
     };
 
@@ -9893,11 +9874,7 @@ async fn upload_part_internal(
                     StatusCode::NOT_FOUND,
                 )
             } else {
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -10278,11 +10255,7 @@ async fn complete_multipart_upload_internal(
             } else if e.code() == tonic::Code::InvalidArgument {
                 S3Error::xml_response("InvalidPart", e.message(), StatusCode::BAD_REQUEST)
             } else {
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -10611,11 +10584,7 @@ async fn list_parts_internal(
                 )
             } else {
                 error!("Failed to list parts: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -10709,11 +10678,7 @@ async fn abort_multipart_upload_internal(
         ),
         Err(e) => {
             error!("Failed to abort multipart upload: {}", e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -10804,11 +10769,7 @@ async fn list_multipart_uploads_internal(
                 )
             } else {
                 error!("Failed to list multipart uploads: {}", e);
-                S3Error::xml_response(
-                    "InternalError",
-                    &e.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
+                S3Error::from_status(&e)
             }
         }
     }
@@ -10886,11 +10847,7 @@ async fn put_bucket_versioning_internal(
         ),
         Err(e) => {
             error!("Failed to set versioning for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -10923,11 +10880,7 @@ async fn get_bucket_versioning_internal(state: Arc<AppState>, bucket: String) ->
         }
         Err(e) => {
             error!("Failed to get versioning for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11078,11 +11031,7 @@ async fn put_object_lock_config_internal(
             .unwrap(),
         Err(e) => {
             error!("Failed to set object lock config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11139,11 +11088,7 @@ async fn get_object_lock_config_internal(state: Arc<AppState>, bucket: String) -
         }
         Err(e) => {
             error!("Failed to get object lock config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11271,11 +11216,7 @@ async fn put_bucket_encryption_internal(
             .unwrap(),
         Err(e) => {
             error!("Failed to set encryption config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11335,11 +11276,7 @@ async fn get_bucket_encryption_internal(state: Arc<AppState>, bucket: String) ->
         }
         Err(e) => {
             error!("Failed to get encryption config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11358,11 +11295,7 @@ async fn delete_bucket_encryption_internal(state: Arc<AppState>, bucket: String)
             .unwrap(),
         Err(e) => {
             error!("Failed to delete encryption config for {}: {}", bucket, e);
-            S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            )
+            S3Error::from_status(&e)
         }
     }
 }
@@ -11905,11 +11838,7 @@ pub(crate) async fn gather_versions(
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
             error!("Failed to get listing nodes: {}", e);
-            return Err(S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Err(S3Error::from_status(&e));
         }
     };
 
@@ -13463,6 +13392,37 @@ mod s3_tests {
         })
         .expect("serialize");
         assert!(xml.contains("u-1") && xml.contains("yash"), "{xml}");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// A meta leader change reaches the client as 503, which S3 clients
+    /// retry, not 500.
+    #[test]
+    fn an_unavailable_meta_is_service_unavailable() {
+        for e in [
+            tonic::Status::unavailable("forwarding to the raft leader failed; retry"),
+            tonic::Status::deadline_exceeded("slow"),
+            tonic::Status::unknown("transport error"),
+            tonic::Status::cancelled("Timeout expired"),
+        ] {
+            assert_eq!(
+                S3Error::from_status(&e).status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        for e in [
+            tonic::Status::internal("bug"),
+            tonic::Status::unknown("something else"),
+        ] {
+            assert_eq!(
+                S3Error::from_status(&e).status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
     }
 }
 

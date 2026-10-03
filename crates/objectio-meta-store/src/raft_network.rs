@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openraft::BasicNode;
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -51,11 +51,27 @@ impl ChannelCache {
             return Ok(c.clone());
         }
         let uri = normalize_uri(addr);
+        // A peer that went away without closing its connections (a pod
+        // rescheduled to a new IP, a host powered off) is noticed in about
+        // two seconds, not after the kernel's retransmission timeout: on
+        // Raft's timescale (elections in under a second) a hung connection
+        // otherwise blocks votes and replication for minutes.
         let channel = Channel::from_shared(uri)
             .map_err(|e| format!("invalid meta address `{addr}`: {e}"))?
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(1))
+            .keep_alive_timeout(std::time::Duration::from_secs(2))
+            .keep_alive_while_idle(true)
             .connect_lazy();
         self.inner.lock().insert(addr.to_string(), channel.clone());
         Ok(channel)
+    }
+
+    /// Drop the channel to `addr`: the next RPC dials again, resolving the
+    /// address again (a restarted pod's new IP).
+    fn forget(&self, addr: &str) {
+        self.inner.lock().remove(addr);
     }
 }
 
@@ -123,6 +139,39 @@ impl MetaRaftNetwork {
         ))
     }
 
+    /// One RPC, bounded by openraft's deadline for it. A timeout or a
+    /// transport failure drops the cached channel.
+    async fn call<F, Fut>(
+        &self,
+        option: &RPCOption,
+        rpc: F,
+    ) -> Result<tonic::Response<objectio_proto::raft::RaftEnvelope>, RpcErr>
+    where
+        F: FnOnce(objectio_proto::raft::raft_rpc_client::RaftRpcClient<Channel>) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<tonic::Response<objectio_proto::raft::RaftEnvelope>, tonic::Status>,
+            >,
+    {
+        let client = self.client().map_err(|e| RpcErr(e.0))?;
+        match tokio::time::timeout(option.hard_ttl(), rpc(client)).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(s)) => {
+                if s.code() == tonic::Code::Unavailable || s.code() == tonic::Code::Unknown {
+                    self.channels.forget(&self.target_addr);
+                }
+                Err(RpcErr::from(s))
+            }
+            Err(_) => {
+                self.channels.forget(&self.target_addr);
+                Err(RpcErr(format!(
+                    "no answer from {} within {:?}",
+                    self.target_addr,
+                    option.hard_ttl()
+                )))
+            }
+        }
+    }
+
     fn envelope(&self, payload: Vec<u8>) -> objectio_proto::raft::RaftEnvelope {
         objectio_proto::raft::RaftEnvelope {
             from: self.self_id,
@@ -158,16 +207,16 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<MetaTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let payload = serde_json::to_vec(&rpc).expect("openraft payload must serialize");
-        let mut client = self
-            .client()
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let resp = client
-            .append_entries(tonic::Request::new(self.envelope(payload)))
+        let envelope = self.envelope(payload);
+        let resp = self
+            .call(&option, |mut c| async move {
+                c.append_entries(tonic::Request::new(envelope)).await
+            })
             .await
-            .map_err(|s| RPCError::Network(NetworkError::new(&RpcErr::from(s))))?;
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         serde_json::from_slice::<AppendEntriesResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
     }
@@ -175,19 +224,19 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<MetaTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         let payload = serde_json::to_vec(&rpc).expect("openraft payload must serialize");
-        let mut client = self
-            .client()
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let resp = client
-            .install_snapshot(tonic::Request::new(self.envelope(payload)))
+        let envelope = self.envelope(payload);
+        let resp = self
+            .call(&option, |mut c| async move {
+                c.install_snapshot(tonic::Request::new(envelope)).await
+            })
             .await
-            .map_err(|s| RPCError::Network(NetworkError::new(&RpcErr::from(s))))?;
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         serde_json::from_slice::<InstallSnapshotResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
     }
@@ -195,16 +244,16 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let payload = serde_json::to_vec(&rpc).expect("openraft payload must serialize");
-        let mut client = self
-            .client()
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let resp = client
-            .vote(tonic::Request::new(self.envelope(payload)))
+        let envelope = self.envelope(payload);
+        let resp = self
+            .call(&option, |mut c| async move {
+                c.vote(tonic::Request::new(envelope)).await
+            })
             .await
-            .map_err(|s| RPCError::Network(NetworkError::new(&RpcErr::from(s))))?;
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         serde_json::from_slice::<VoteResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
     }

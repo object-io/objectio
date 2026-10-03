@@ -31,7 +31,9 @@ data:
 
     [storage]
     disks = ["/data/disk0/{{ .Values.osd.storage.diskFile }}"]
-    block_size = {{ .Values.osd.storage.blockSize | int }}
+    {{- with .Values.osd.storage.blockSize }}
+    block_size = {{ . | int }}
+    {{- end }}
     data_dir = "/var/lib/objectio/osd"
 
     [logging]
