@@ -500,8 +500,16 @@ fn the_packer_packs_small_objects_in_the_background() {
         4,
         2,
         // Old enough a moment after the writes finish, so they're packed
-        // together, not as they arrive.
-        &["--pack-interval-secs", "1", "--pack-min-age-secs", "3"],
+        // together, not as they arrive; old stripes released a second
+        // after the switch.
+        &[
+            "--pack-interval-secs",
+            "1",
+            "--pack-min-age-secs",
+            "3",
+            "--pack-grace-secs",
+            "1",
+        ],
     );
     c.json("POST", "/_admin/buckets", json!({ "name": "bg" }))
         .expect_ok();
@@ -538,4 +546,270 @@ fn the_packer_packs_small_objects_in_the_background() {
     // Packed once: later passes leave packed objects alone.
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(metric(&c, "objectio_pack_objects_total"), 20);
+}
+
+// ── Phase 3: compaction ──────────────────────────────────────────────────
+
+fn compact(c: &Cluster, stop: Option<&str>) -> Value {
+    let r = c.json(
+        "POST",
+        "/_admin/test/pack-compact",
+        json!({ "min_age_secs": 0, "stop_after": stop }),
+    );
+    assert_eq!(r.status, 200, "compact: {}", r.text());
+    r.json()
+}
+
+/// A pack most of whose objects are gone has its survivors moved into a
+/// new pack, and its space comes back; the survivors read throughout.
+#[test]
+fn a_mostly_deleted_pack_is_compacted() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let empty = c.total_used_bytes();
+    let objects = put_small(&c, "cmp", 10);
+    pack_all(&c, "cmp", &objects);
+    // Keep the three smallest: well under half the pack.
+    delete_all(&c, "cmp", &objects[3..]);
+    let kept = &objects[..3];
+    std::thread::sleep(Duration::from_secs(1));
+    let before = c.total_used_bytes();
+
+    let report = compact(&c, None);
+    assert_eq!(
+        (count(&report, "compacted"), count(&report, "moved")),
+        (1, 3),
+        "{report}"
+    );
+    assert_readable(&c, "cmp", kept, "compacted");
+    await_used(&c, "after compaction", Duration::from_secs(15), |u| {
+        u < before
+    });
+    // Settled: nothing for reconciliation, and nothing more to compact.
+    let again = reconcile(&c);
+    assert_eq!(
+        count(&again, "released") + count(&again, "finished"),
+        0,
+        "{again}"
+    );
+    assert_eq!(count(&compact(&c, None), "compacted"), 0);
+
+    delete_all(&c, "cmp", kept);
+    await_used(&c, "all deleted", Duration::from_secs(15), |u| u <= empty);
+}
+
+/// A pack still more than half live is left as it is, and so is one a
+/// copy shares: moving the source wouldn't free it.
+#[test]
+fn live_and_shared_packs_are_not_compacted() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let objects = put_small(&c, "keep", 10);
+    pack_all(&c, "keep", &objects);
+    delete_all(&c, "keep", &objects[..1]);
+    assert_eq!(count(&compact(&c, None), "compacted"), 0, "mostly live");
+
+    let shared = put_small(&c, "shared", 10);
+    pack_all(&c, "shared", &shared);
+    c.request_with_headers(
+        "PUT",
+        "/shared/copy",
+        &[],
+        &[("x-amz-copy-source", "/shared/o1")],
+    )
+    .expect(200);
+    delete_all(&c, "shared", &shared[2..]);
+    assert_eq!(
+        count(&compact(&c, None), "compacted"),
+        0,
+        "shared by a copy"
+    );
+    assert_readable(&c, "shared", &shared[..2], "not compacted");
+    assert!(c.request("GET", "/shared/copy", &[]).bytes == shared[1].1);
+}
+
+/// A compaction that dies after switching one object is reconciled like
+/// any pack, and a later pass finishes the job; nothing is lost or leaked.
+#[test]
+fn a_compaction_that_dies_midway_is_reconciled() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let empty = c.total_used_bytes();
+    let objects = put_small(&c, "half", 10);
+    pack_all(&c, "half", &objects);
+    delete_all(&c, "half", &objects[4..]);
+    let kept = &objects[..4];
+
+    compact(&c, Some("switch-one"));
+    assert_readable(&c, "half", kept, "compaction stopped");
+    let report = reconcile(&c);
+    assert_eq!(
+        (
+            count(&report, "finished"),
+            count(&report, "released"),
+            count(&report, "unknown")
+        ),
+        (1, 3, 0),
+        "{report}"
+    );
+    assert_readable(&c, "half", kept, "reconciled");
+    // The three not moved are still in the old pack, still under half
+    // live; and the crashed pass's new pack holds one live object of four:
+    // a pass now compacts both.
+    let report = compact(&c, None);
+    assert_eq!(
+        (count(&report, "compacted"), count(&report, "moved")),
+        (2, 4),
+        "{report}"
+    );
+    assert_readable(&c, "half", kept, "compacted after the crash");
+
+    delete_all(&c, "half", kept);
+    await_used(&c, "all deleted", Duration::from_secs(15), |u| u <= empty);
+}
+
+type Model = std::collections::BTreeMap<String, Vec<u8>>;
+
+/// Every object in `model` reads back as written.
+fn verify(c: &Cluster, model: &Model, when: &str) {
+    for (key, body) in model {
+        let r = c.request("GET", &format!("/soak/{key}"), &[]);
+        assert_eq!(r.status, 200, "{when}: {key}: {}", r.text());
+        assert!(r.bytes == *body, "{when}: {key} reads back different bytes");
+    }
+}
+
+/// Random writes, overwrites, deletes and reads over 30 keys for `secs`,
+/// each read checked against what was last written. Returns what's left
+/// and how many operations ran.
+fn soak_ops(c: &Cluster, secs: u64) -> (Model, u32) {
+    let mut model = Model::new();
+    let mut x = 0x2545_F491_4F6C_DD1D_u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let started = Instant::now();
+    let mut ops = 0u32;
+    while started.elapsed() < Duration::from_secs(secs) {
+        let key = format!("k{:02}", next() % 30);
+        match next() % 10 {
+            0..=4 => {
+                let size = 4_200 + usize::try_from(next() % 56_000).unwrap();
+                let body = payload(size, u8::try_from(next() % 251).unwrap());
+                c.request("PUT", &format!("/soak/{key}"), &body).expect(200);
+                model.insert(key, body);
+            }
+            5 | 6 => {
+                c.request("DELETE", &format!("/soak/{key}"), &[])
+                    .expect(204);
+                model.remove(&key);
+            }
+            _ => {
+                let r = c.request("GET", &format!("/soak/{key}"), &[]);
+                match model.get(&key) {
+                    Some(body) => {
+                        assert_eq!(r.status, 200, "{key}: {}", r.text());
+                        assert!(r.bytes == *body, "{key} reads back different bytes");
+                    }
+                    None => assert_eq!(r.status, 404, "{key} came back"),
+                }
+            }
+        }
+        ops += 1;
+        if ops.is_multiple_of(200) {
+            verify(c, &model, "during the soak");
+        }
+    }
+    (model, ops)
+}
+
+/// Wait until the packer has stopped packing and compacting; returns the
+/// objects it packed.
+fn await_packer_quiet(c: &Cluster) -> u64 {
+    let activity = || {
+        (
+            metric(c, "objectio_pack_objects_total"),
+            metric(c, "objectio_pack_compactions_total"),
+        )
+    };
+    let mut last = activity();
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let now = activity();
+        if now == last {
+            return last.0;
+        }
+        last = now;
+    }
+}
+
+/// Reconciliation as in production: it settles only packs older than any
+/// packer could still be working on (here: past the grace and a pass).
+fn reconcile_settled(c: &Cluster) -> Value {
+    std::thread::sleep(Duration::from_secs(12));
+    let r = c.json(
+        "POST",
+        "/_admin/test/pack-reconcile",
+        json!({ "min_age_secs": 10 }),
+    );
+    assert_eq!(r.status, 200, "reconcile: {}", r.text());
+    r.json()
+}
+
+/// Soak: writes, overwrites, deletes and reads of small objects for a
+/// while, with the packer and compaction running underneath. Every read
+/// returns what was last written; at the end nothing is left for
+/// reconciliation; and deleting everything gives back every byte: nothing
+/// was freed that anything pointed at, and nothing leaked.
+#[test]
+fn a_soak_with_packing_and_compaction_loses_nothing() {
+    let c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        &[
+            "--test-hooks",
+            "--pack-interval-secs",
+            "1",
+            "--pack-min-age-secs",
+            "0",
+            "--pack-grace-secs",
+            "2",
+        ],
+    );
+    c.json("POST", "/_admin/buckets", json!({ "name": "soak" }))
+        .expect_ok();
+    let empty = c.total_used_bytes();
+
+    let (model, ops) = soak_ops(&c, 45);
+    verify(&c, &model, "at the end of the soak");
+    let packed = await_packer_quiet(&c);
+    assert!(packed > 0, "the packer packed nothing in {ops} operations");
+    verify(&c, &model, "the packer quiet");
+    let report = reconcile_settled(&c);
+    assert_eq!(count(&report, "unknown"), 0, "{report}");
+    assert_eq!(count(&report, "aborted"), 0, "{report}");
+    verify(&c, &model, "reconciled");
+
+    for key in model.keys() {
+        c.request("DELETE", &format!("/soak/{key}"), &[])
+            .expect(204);
+    }
+    // Deletes racing the packer's switches leave work for reconciliation;
+    // once it has run, every byte is back.
+    reconcile_settled(&c);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c.total_used_bytes() > empty {
+        assert!(
+            Instant::now() < deadline,
+            "all deleted: used bytes stayed at {} (empty: {empty}); packs left: {}",
+            c.total_used_bytes(),
+            c.request("GET", "/_admin/test/packs", &[]).text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!(
+        "soak: {ops} operations, {packed} objects packed, {} packs compacted",
+        metric(&c, "objectio_pack_compactions_total")
+    );
 }

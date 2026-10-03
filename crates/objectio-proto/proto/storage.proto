@@ -361,6 +361,9 @@ message DeleteObjectMetaResponse {
     // under the key's lock, so concurrent deletes of a key's versions can
     // never leave it pointing at a version that is gone.
     objectio.metadata.ObjectMeta current = 2;
+    // What this replica removed (the current object, or the version), if
+    // anything: what the caller may free, rather than what it read before.
+    objectio.metadata.ObjectMeta removed = 3;
 }
 
 // List objects metadata request (for ListObjects)

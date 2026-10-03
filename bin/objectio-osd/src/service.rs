@@ -1914,10 +1914,12 @@ impl StorageService for OsdService {
 
         let _guard = self.usage.lock_key(&req.bucket, &req.key);
 
+        let removed;
         if req.version_id.is_empty() {
             // Delete current version entry
             let key = MetadataKey::object_meta(&req.bucket, &req.key);
             let old = self.stored_meta(&key);
+            removed = old.clone();
             self.meta_store.delete(&key).map_err(|e| {
                 Status::internal(format!("failed to delete object metadata: {}", e))
             })?;
@@ -1928,6 +1930,7 @@ impl StorageService for OsdService {
             // Delete specific version entry
             let version_key = MetadataKey::object_version(&req.bucket, &req.key, &req.version_id);
             let old = self.stored_meta(&version_key);
+            removed = old.clone();
             self.meta_store
                 .delete(&version_key)
                 .map_err(|e| Status::internal(format!("failed to delete version entry: {}", e)))?;
@@ -1977,6 +1980,7 @@ impl StorageService for OsdService {
         Ok(Response::new(DeleteObjectMetaResponse {
             success: true,
             current,
+            removed,
         }))
     }
 

@@ -185,6 +185,10 @@ pub struct PackRequest {
     /// Stop just after this step, as a crash there would (tests only).
     #[serde(default)]
     pub stop_after: Option<StopAfter>,
+    /// Seconds to wait between switching and releasing (see
+    /// [`PackOptions::grace`]); 0 by default here.
+    #[serde(default)]
+    pub grace_secs: u64,
 }
 
 /// A point in [`pack_objects`] where a test stops it, standing for a
@@ -201,6 +205,35 @@ pub enum StopAfter {
     Seal,
     /// The first object switched; its old stripe not yet released.
     SwitchOne,
+}
+
+/// No object is switched into a pack once this long has passed since it
+/// was recorded. Reconciliation leaves packs alone for longer
+/// ([`RECONCILE_AFTER`] — and a switch takes at most its RPC timeout, 10 s),
+/// so it never decides "never switched" about an object a packer is about
+/// to switch: that would release the object's reference to the pack it
+/// then names. The packer measures this on its own clock; reconciliation
+/// compares the pack's recorded time with its gateway's, so the margin also
+/// covers clock skew between gateways and meta.
+pub const SWITCH_DEADLINE: Duration = Duration::from_secs(300);
+
+/// A pack this old and still unsettled had a packer die on it, or give up
+/// at [`SWITCH_DEADLINE`]: reconciliation may settle it.
+pub const RECONCILE_AFTER: Duration = Duration::from_secs(600);
+
+/// How [`pack_objects`] runs.
+#[derive(Debug, Clone, Default)]
+pub struct PackOptions {
+    /// Stop after this step (tests standing for a crash there).
+    pub stop_after: Option<StopAfter>,
+    /// Repacking this pack: slices of it are packable.
+    pub from_pack: Option<Vec<u8>>,
+    /// How long after switching to wait before releasing the objects' old
+    /// stripes, so a read that fetched an ObjectMeta just before its switch
+    /// still finds the shards it names. A packer that dies meanwhile leaves
+    /// the members unsettled, and reconciliation releases them. The packer
+    /// uses `--pack-grace-secs` (30 s by default).
+    pub grace: Duration,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -226,7 +259,12 @@ pub async fn admin_test_pack(
     if !crate::admin::is_system_admin(&caller) {
         return (StatusCode::FORBIDDEN, "system admin only").into_response();
     }
-    match pack_objects(&state, &req.bucket, &req.keys, req.stop_after).await {
+    let opts = PackOptions {
+        stop_after: req.stop_after,
+        from_pack: None,
+        grace: Duration::from_secs(req.grace_secs),
+    };
+    match pack_objects(&state, &req.bucket, &req.keys, &opts).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -238,6 +276,17 @@ pub async fn admin_test_pack(
 
 /// Why `object` can't be packed, if it can't.
 pub(crate) fn unpackable(object: &ObjectMeta, versioned_bucket: bool) -> Option<&'static str> {
+    unpackable_from(object, versioned_bucket, None)
+}
+
+/// As [`unpackable`], when repacking `from_pack`: a slice of that pack is
+/// packable too.
+fn unpackable_from(
+    object: &ObjectMeta,
+    versioned_bucket: bool,
+    from_pack: Option<&[u8]>,
+) -> Option<&'static str> {
+    let in_from_pack = |s: &StripeMeta| from_pack.is_some_and(|p| s.pack_id == p);
     let encrypted = SseAlgorithm::try_from(object.encryption_algorithm)
         .is_ok_and(|a| a != SseAlgorithm::SseNone);
     if object.is_delete_marker {
@@ -248,7 +297,9 @@ pub(crate) fn unpackable(object: &ObjectMeta, versioned_bucket: bool) -> Option<
         Some("stored inline")
     } else if encrypted {
         Some("encrypted")
-    } else if object.stripes.len() != 1 || !object.stripes[0].pack_id.is_empty() {
+    } else if object.stripes.len() != 1
+        || !(object.stripes[0].pack_id.is_empty() || in_from_pack(&object.stripes[0]))
+    {
         Some("not one stripe of its own")
     } else if object.version_id.is_empty() && versioned_bucket {
         // A null version can have a version entry of its own that a switch
@@ -285,8 +336,10 @@ pub async fn pack_objects(
     state: &Arc<AppState>,
     bucket: &str,
     keys: &[String],
-    stop_after: Option<StopAfter>,
+    opts: &PackOptions,
 ) -> Result<PackReport, String> {
+    let stop_after = opts.stop_after;
+    let from_pack = opts.from_pack.as_deref();
     let mut report = PackReport::default();
     let mut meta = state.meta_client.clone();
     let versioned = meta
@@ -317,7 +370,7 @@ pub async fn pack_objects(
                 continue;
             }
         };
-        if let Some(why) = unpackable(&object, versioned) {
+        if let Some(why) = unpackable_from(&object, versioned, from_pack) {
             skip(why);
             continue;
         }
@@ -405,6 +458,10 @@ pub async fn pack_objects(
         ..Default::default()
     };
 
+    // From here, the pack exists: past SWITCH_DEADLINE no object is
+    // switched into it, so reconciliation (which waits longer) never races
+    // a switch.
+    let intended_at = std::time::Instant::now();
     // 1. Intend: recorded before any shard exists, so a crash from here on
     // leaves a record that says where to clean up.
     meta.intend_pack(IntendPackRequest {
@@ -500,24 +557,37 @@ pub async fn pack_objects(
         .iter()
         .map(|l| hex::encode(&l.node_id))
         .collect();
-    crate::gateway_metrics::record_pack(
-        candidates.len() as u64,
-        candidates
-            .iter()
-            .map(|c| raw_size(c.object.size, k, m))
-            .sum(),
-        raw_size(data.len() as u64, k, m),
-    );
+    if from_pack.is_some() {
+        crate::gateway_metrics::record_pack_compaction(candidates.len() as u64);
+    } else {
+        crate::gateway_metrics::record_pack(
+            candidates.len() as u64,
+            candidates
+                .iter()
+                .map(|c| raw_size(c.object.size, k, m))
+                .sum(),
+            raw_size(data.len() as u64, k, m),
+        );
+    }
     if stop_after == Some(StopAfter::Seal) {
         return Ok(report);
     }
 
     // 4. Switch, and 5. release.
     let mut settled = Vec::new();
+    let mut releases = Vec::new();
     for (i, c) in candidates.into_iter().enumerate() {
         let mut packed = c.object.clone();
         packed.stripes = vec![slice_stripe(&pack_id, &sealed, c.offset, c.object.size)];
         let what = format!("{bucket}/{}", c.key);
+        if intended_at.elapsed() > SWITCH_DEADLINE {
+            // Too late to switch safely: what's left is reconciliation's.
+            warn!(
+                "pack {}: switch deadline passed; leaving the rest unswitched",
+                report.pack_id
+            );
+            break;
+        }
         if i == 1 && stop_after == Some(StopAfter::SwitchOne) {
             return Ok(report);
         }
@@ -554,9 +624,13 @@ pub async fn pack_objects(
                         .is_some_and(|r| r.object_id == c.object.object_id)
                 }) =>
             {
-                // Every copy now names the pack: its own stripe is nobody's.
-                spawn_reclaim(state, stripe_targets_of(&c.object), Reclaim::Packed, what);
-                settled.push(c.object.object_id.clone());
+                // Every copy now names the pack: its own stripe is nobody's,
+                // once reads already under way are done with it.
+                releases.push((
+                    stripe_targets_of(&c.object),
+                    what,
+                    c.object.object_id.clone(),
+                ));
                 report.packed.push(c.key);
             }
             Ok(_) => {
@@ -568,13 +642,9 @@ pub async fn pack_objects(
             Err(e) if e.unapplied => {
                 // Changed meanwhile: it keeps its stripe and lets go of
                 // the pack.
-                spawn_reclaim(
-                    state,
-                    pack_reference(&pack_id, &c.object.object_id),
-                    Reclaim::Packed,
-                    what,
-                );
-                settled.push(c.object.object_id.clone());
+                if release(state, pack_reference(&pack_id, &c.object.object_id), &what).await {
+                    settled.push(c.object.object_id.clone());
+                }
                 report
                     .skipped
                     .push((c.key, "changed while it was packed".into()));
@@ -590,8 +660,17 @@ pub async fn pack_objects(
             }
         }
     }
+    if !releases.is_empty() && !opts.grace.is_zero() {
+        tokio::time::sleep(opts.grace).await;
+    }
+    for (targets, what, object_id) in releases {
+        if release(state, targets, &what).await {
+            settled.push(object_id);
+        }
+    }
     // What's done needn't be looked at again; the rest (left partly
-    // switched, or switched over the unexpected) is reconciliation's.
+    // switched, switched over the unexpected, or not released) is
+    // reconciliation's.
     settle(state, &pack_id, settled).await;
     Ok(report)
 }
@@ -609,6 +688,7 @@ fn member(c: &Candidate) -> PackMember {
         slice_offset: c.offset,
         slice_length: c.object.size,
         old_stripe: Some(old_stripe),
+        settled: false,
     }
 }
 
@@ -709,7 +789,7 @@ pub async fn reconcile(
                 continue;
             };
             let mut settled = Vec::new();
-            for m in &pack.members {
+            for m in pack.members.iter().filter(|m| !m.settled) {
                 match reconcile_member(state, pack, stripe, m).await {
                     Some(action) => {
                         crate::gateway_metrics::record_pack_reconciled(action);
@@ -773,16 +853,12 @@ async fn reconcile_member(
         // Gone from every copy: deleted or overwritten through the S3
         // path, which released what it held. Releasing again is a no-op
         // for what's already gone, and frees what a crash left held.
-        spawn_reclaim(
-            state,
-            pack_reference(&pack.pack_id, &m.object_id),
-            Reclaim::Packed,
-            what.clone(),
-        );
-        if let Some(t) = old_stripe() {
-            spawn_reclaim(state, t, Reclaim::Packed, what);
-        }
-        return Some("released");
+        let pack_ref = release(state, pack_reference(&pack.pack_id, &m.object_id), &what).await;
+        let old = match old_stripe() {
+            Some(t) => release(state, t, &what).await,
+            None => true,
+        };
+        return (pack_ref && old).then_some("released");
     }
     if holders.len() != copies.len() {
         // Some copies have it, some don't: repair restores the missing
@@ -792,13 +868,9 @@ async fn reconcile_member(
     let at_pack = holders.iter().filter(|o| names_pack(o)).count();
     if at_pack == 0 {
         // Never switched: it keeps its stripe and lets go of the pack.
-        spawn_reclaim(
-            state,
-            pack_reference(&pack.pack_id, &m.object_id),
-            Reclaim::Packed,
-            what,
-        );
-        return Some("released");
+        return release(state, pack_reference(&pack.pack_id, &m.object_id), &what)
+            .await
+            .then_some("released");
     }
     if at_pack < holders.len() {
         // Partly switched: finish it, over the object as it stands.
@@ -827,10 +899,220 @@ async fn reconcile_member(
         }
     }
     // Every copy names the pack: the old stripe is nobody's.
-    if let Some(t) = old_stripe() {
-        spawn_reclaim(state, t, Reclaim::Packed, what);
+    let released = match old_stripe() {
+        Some(t) => release(state, t, &what).await,
+        None => true,
+    };
+    released.then_some("finished")
+}
+
+/// Release `targets` now, and say whether it all went through. A member is
+/// settled only after its release did: one that failed (meta busy, an OSD
+/// down) stays for a later pass, which releases again — harmless for what
+/// already went, since a release drops only this object's own reference.
+async fn release(state: &AppState, targets: Vec<ShardTarget>, what: &str) -> bool {
+    let failed = crate::osd_pool::reclaim_shards(
+        &state.osd_pool,
+        &mut state.meta_client.clone(),
+        targets,
+        Reclaim::Packed,
+    )
+    .await;
+    if failed > 0 {
+        warn!("pack: {what}: {failed} releases failed; left for reconciliation");
     }
-    Some("finished")
+    failed == 0
+}
+
+// ── Compaction ──────────────────────────────────────────────────────────────
+
+/// What a compaction pass did.
+#[derive(Debug, Default, Serialize)]
+pub struct CompactReport {
+    /// Packs whose live objects were moved into a new pack.
+    pub compacted: usize,
+    /// Objects moved.
+    pub moved: usize,
+    /// Hex ids of the new packs.
+    pub new_packs: Vec<String>,
+}
+
+/// A pack is repacked once less than this share of its bytes is live.
+const COMPACT_BELOW: f64 = 0.5;
+
+/// The live bytes of `pack`: its members still among its `referrers`.
+/// `None` when it can't be told: a member not settled yet (reconciliation
+/// first), or a referrer that isn't a member (a copy sharing the pack, whose
+/// slice is the source's: moving the source wouldn't free the pack).
+fn live_bytes(pack: &PackRecord, referrers: &[Vec<u8>]) -> Option<u64> {
+    if pack.members.iter().any(|m| !m.settled)
+        || referrers
+            .iter()
+            .any(|r| !pack.members.iter().any(|m| &m.object_id == r))
+    {
+        return None;
+    }
+    Some(
+        pack.members
+            .iter()
+            .filter(|m| referrers.contains(&m.object_id))
+            .map(|m| m.slice_length)
+            .sum(),
+    )
+}
+
+/// Repack packs older than `min_age` that are less than half live: their
+/// live objects go into a new pack by the same steps as packing (intend,
+/// write, seal, switch over the object read, release), and the old pack is
+/// freed when its last object lets go. At most `budget` packs.
+pub async fn compact(
+    state: &Arc<AppState>,
+    min_age: Duration,
+    budget: usize,
+    stop_after: Option<StopAfter>,
+    grace: Duration,
+) -> Result<CompactReport, String> {
+    let mut report = CompactReport::default();
+    let now = crate::lifecycle::now_ms() / 1000;
+    let mut after = Vec::new();
+    loop {
+        let page = state
+            .meta_client
+            .clone()
+            .list_packs(ListPacksRequest {
+                start_after: after.clone(),
+                limit: 500,
+            })
+            .await
+            .map_err(|e| format!("list packs: {e}"))?
+            .into_inner();
+        for (pack, refs) in page.packs.iter().zip(&page.referrers) {
+            if report.compacted >= budget {
+                return Ok(report);
+            }
+            if !pack.sealed || now.saturating_sub(pack.created_at) < min_age.as_secs() {
+                continue;
+            }
+            let Some(live) = live_bytes(pack, &refs.object_ids) else {
+                continue;
+            };
+            #[allow(clippy::cast_precision_loss)]
+            let fraction = live as f64 / pack.data_len.max(1) as f64;
+            if live == 0 || fraction >= COMPACT_BELOW {
+                continue;
+            }
+            let keys: Vec<String> = pack
+                .members
+                .iter()
+                .filter(|m| refs.object_ids.contains(&m.object_id))
+                .map(|m| m.key.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let opts = PackOptions {
+                stop_after,
+                from_pack: Some(pack.pack_id.clone()),
+                grace,
+            };
+            match pack_objects(state, &pack.bucket, &keys, &opts).await {
+                Ok(r) if !r.pack_id.is_empty() => {
+                    report.compacted += 1;
+                    report.moved += r.packed.len();
+                    report.new_packs.push(r.pack_id);
+                }
+                Ok(_) => {}
+                Err(e) => warn!("compacting pack {}: {e}", hex::encode(&pack.pack_id)),
+            }
+        }
+        match page.packs.last() {
+            Some(last) if page.truncated => after.clone_from(&last.pack_id),
+            _ => return Ok(report),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactRequest {
+    #[serde(default)]
+    pub min_age_secs: u64,
+    #[serde(default)]
+    pub stop_after: Option<StopAfter>,
+    #[serde(default)]
+    pub grace_secs: u64,
+}
+
+/// `POST /_admin/test/pack-compact {"min_age_secs", "stop_after"}`: run a
+/// compaction pass now. Mounted only with `--test-hooks`.
+pub async fn admin_test_compact(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<CompactRequest>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    match compact(
+        &state,
+        Duration::from_secs(req.min_age_secs),
+        usize::MAX,
+        req.stop_after,
+        Duration::from_secs(req.grace_secs),
+    )
+    .await
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /_admin/test/packs`: every pack, its referrers and members, for
+/// tests to see what's left. Mounted only with `--test-hooks`.
+pub async fn admin_test_list(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    let page = match state
+        .meta_client
+        .clone()
+        .list_packs(ListPacksRequest {
+            start_after: Vec::new(),
+            limit: 10_000,
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let packs: Vec<serde_json::Value> = page
+        .packs
+        .iter()
+        .zip(&page.referrers)
+        .map(|(p, r)| {
+            serde_json::json!({
+                "pack_id": hex::encode(&p.pack_id),
+                "sealed": p.sealed,
+                "data_len": p.data_len,
+                "referrers": r.object_ids.iter().map(hex::encode).collect::<Vec<_>>(),
+                "members": p.members.iter().map(|m| serde_json::json!({
+                    "key": m.key,
+                    "object_id": hex::encode(&m.object_id),
+                    "settled": m.settled,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "packs": packs })).into_response()
 }
 
 #[derive(Debug, Deserialize)]

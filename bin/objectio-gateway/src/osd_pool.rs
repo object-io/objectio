@@ -664,9 +664,9 @@ impl std::fmt::Display for MetaWriteError {
 /// retryable error to the S3 client.
 ///
 /// `expected_object_id`, when not empty, makes each replica refuse the
-/// write unless its current ObjectMeta for the key is that object (or it
-/// has none): a read-modify-write must not put back an object that a PUT
-/// replaced, and freed, after the read.
+/// write unless its current ObjectMeta for the key is that object: a
+/// read-modify-write must not put back an object that a PUT replaced, or a
+/// DELETE removed, and freed, after the read.
 ///
 /// Returns what each replica displaced, for the caller to free.
 pub async fn put_object_meta_to_all(
@@ -698,7 +698,12 @@ pub async fn put_object_meta_to_all(
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
         let req = PutObjectMetaRequest {
-            require_existing: false,
+            // A write over an object read (an expected id) is an update of
+            // it: one deleted since must not come back. Without this, a
+            // DELETE between a tagging, retention, legal-hold or packing
+            // update's read and its write brought the object back, naming
+            // shards the DELETE had freed.
+            require_existing: !expected_object_id.is_empty(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             object: Some(object_meta.clone()),
@@ -914,75 +919,28 @@ pub async fn get_object_version_meta_from_osd(
     }
 }
 
-/// Delete ObjectMeta from every shard-carrying OSD in parallel. Best-effort:
-/// succeeds if at least one replica accepts the delete. Failures on other
-/// replicas are logged but do not fail the S3 DELETE, because
-/// ObjectListingEntry is the authority on existence and any surviving stale
-/// copies will be reclaimed by subsequent sweeps.
-pub async fn delete_object_meta_from_all(
-    pool: &OsdPool,
-    placements: &[NodePlacement],
-    bucket: &str,
-    key: &str,
-    version_id: &str,
-) -> Result<(), OsdPoolError> {
-    use objectio_proto::storage::DeleteObjectMetaRequest;
-
-    let targets = unique_node_placements(placements);
-    if targets.is_empty() {
-        return Err(OsdPoolError::NoNodesAvailable);
-    }
-
-    let mut futs = Vec::with_capacity(targets.len());
-    for placement in &targets {
-        let req = DeleteObjectMetaRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: version_id.to_string(),
-        };
-        let p = placement.clone();
-        futs.push(async move {
-            let mut client = pool.get_client_for_placement(&p).await?;
-            let fut = client.delete_object_meta(req);
-            tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-                .await
-                .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
-                .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-            Ok::<_, OsdPoolError>(p.node_address.clone())
-        });
-    }
-
-    let results = futures::future::join_all(futs).await;
-    let mut ok = 0;
-    let mut last_err: Option<OsdPoolError> = None;
-    for r in results {
-        match r {
-            Ok(addr) => {
-                ok += 1;
-                tracing::debug!("delete_object_meta: ok on {addr}");
-            }
-            Err(e) => {
-                warn!("delete_object_meta replica failed: {e}");
-                last_err = Some(e);
-            }
-        }
-    }
-    if ok == 0 {
-        return Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable));
-    }
-    Ok(())
+/// What a delete of `bucket/key` (or one version of it) did on its
+/// replicas.
+#[derive(Debug, Default)]
+pub struct MetaDeleted {
+    /// Replicas that carried it out, of how many.
+    pub ok: usize,
+    pub of: usize,
+    /// What those replicas removed, as each had it. Replicas can disagree
+    /// (a write racing the delete): each is what that copy named.
+    pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
 }
 
-/// Delete one version of `bucket/key` from every replica. Each OSD, if it
-/// was the current version, makes the newest remaining one current under
-/// the key's lock. Returns how many replicas did it, of how many.
-pub async fn delete_version_from_all(
+/// Delete the current object (`version_id` empty) or one version of
+/// `bucket/key` from every replica. For a version, each OSD makes the
+/// newest remaining one current if it was, under the key's lock.
+pub async fn delete_meta_from_all(
     pool: &OsdPool,
     placements: &[NodePlacement],
     bucket: &str,
     key: &str,
     version_id: &str,
-) -> (usize, usize) {
+) -> MetaDeleted {
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
@@ -993,22 +951,80 @@ pub async fn delete_version_from_all(
             key: key.to_string(),
             version_id: version_id.to_string(),
         });
-        tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
             .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-        Ok::<_, OsdPoolError>(())
+        Ok::<_, OsdPoolError>(resp.into_inner().removed)
     });
-    let results = futures::future::join_all(futs).await;
-    let ok = results
+    let mut out = MetaDeleted {
+        of: targets.len(),
+        ..MetaDeleted::default()
+    };
+    for r in futures::future::join_all(futs).await {
+        match r {
+            Ok(removed) => {
+                out.ok += 1;
+                out.removed.extend(removed);
+            }
+            Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
+        }
+    }
+    out
+}
+
+/// Of the objects a delete removed, those no replica still has as its
+/// current object: what may be freed. A write racing the delete can leave
+/// an object current on some replicas (they saw the write after the
+/// delete); freeing it would leave them naming shards that are gone. Any
+/// replica that can't be read keeps everything: a leak, never a loss. An
+/// object gone from every replica can't come back: an update of one
+/// requires it to exist, and a PUT always writes a new one.
+pub async fn unreferenced(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    removed: Vec<objectio_proto::metadata::ObjectMeta>,
+) -> Vec<objectio_proto::metadata::ObjectMeta> {
+    let mut distinct: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
+    for o in removed {
+        if !o.object_id.is_empty() && !distinct.contains(&o) {
+            distinct.push(o);
+        }
+    }
+    if distinct.is_empty() {
+        return distinct;
+    }
+    // Every replica's current object, and the version entry of each removed
+    // object that has one (an object kept as a version too stays).
+    let versions: std::collections::BTreeSet<String> = distinct
         .iter()
-        .filter(|r| {
-            r.as_ref()
-                .inspect_err(|e| warn!("delete version {version_id} of {bucket}/{key}: {e}"))
-                .is_ok()
-        })
-        .count();
-    (ok, targets.len())
+        .map(|o| o.version_id.clone())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let mut held = std::collections::HashSet::new();
+    for p in &unique_node_placements(placements) {
+        for v in std::iter::once(String::new()).chain(versions.iter().cloned()) {
+            match get_object_version_meta_from_osd(pool, p, bucket, key, &v).await {
+                Ok(Some(o)) => {
+                    held.insert(o.object_id);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        "{bucket}/{key}: a replica can't be read after the delete ({e}); \
+                         its blocks stay allocated"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    distinct
+        .into_iter()
+        .filter(|o| !held.contains(&o.object_id))
+        .collect()
 }
 
 // ============================================================================
@@ -1220,13 +1236,22 @@ async fn freeable(
     let mut free = std::collections::HashSet::new();
     let mut packs = Vec::new();
     for (owner, ids) in by_owner {
-        let resp = meta
-            .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
-                stripe_ids: ids.into_iter().collect(),
-                referrer: owner.clone(),
-            })
-            .await?
-            .into_inner();
+        let req = objectio_proto::metadata::ReleaseStripesRequest {
+            stripe_ids: ids.into_iter().collect(),
+            referrer: owner.clone(),
+        };
+        // Meta answers Aborted when the entry kept changing under it (many
+        // releases of one pack at once): try again, a little later.
+        let mut attempt = 0u32;
+        let resp = loop {
+            match meta.release_stripes(req.clone()).await {
+                Err(e) if e.code() == tonic::Code::Aborted && attempt < 4 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                }
+                other => break other?.into_inner(),
+            }
+        };
         free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
         packs.extend(resp.freed_packs);
     }

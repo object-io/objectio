@@ -792,6 +792,20 @@ impl Default for MetaService {
     }
 }
 
+/// Tries a compare-and-set loop makes before answering "kept changing":
+/// many releases of one pack at once (an object's delete, the packer's
+/// release, compaction) all write its one registry entry.
+const CAS_ATTEMPTS: u32 = 64;
+
+/// A short, growing, randomised pause between compare-and-set attempts, so
+/// writers contending for one entry spread out instead of colliding again.
+async fn contention_backoff(attempt: u32) {
+    use rand::Rng;
+    let cap_ms = 1u64 << attempt.min(5);
+    let ms = rand::thread_rng().gen_range(0..=cap_ms);
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 impl MetaService {
     /// Create a new metadata service with default MDS 4+2 configuration
     #[allow(dead_code)]
@@ -1315,7 +1329,10 @@ impl MetaService {
         pack_id: &[u8],
         added: &[objectio_proto::metadata::ShardLocation],
     ) -> Result<(), Status> {
-        for _ in 0..8 {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
             let Some((mut record, bytes)) = self.pack_record(pack_id) else {
                 return Err(Status::not_found("pack not found"));
             };
@@ -1360,7 +1377,10 @@ impl MetaService {
         from: [u8; 16],
         to: &objectio_proto::metadata::ShardLocation,
     ) -> Result<(), Status> {
-        for _ in 0..8 {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
             let Some((mut record, bytes)) = self.pack_record(pack_id) else {
                 return Err(Status::not_found("pack not found"));
             };
@@ -10899,7 +10919,10 @@ impl MetadataService for MetaService {
         if req.owner.is_empty() || req.sharer.is_empty() {
             return Err(Status::invalid_argument("owner and sharer are required"));
         }
-        for _ in 0..8 {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
             let mut changes = Vec::new();
             {
                 let map = self.stripe_refs.read();
@@ -10946,7 +10969,10 @@ impl MetadataService for MetaService {
     ) -> Result<Response<objectio_proto::metadata::ReleaseStripesResponse>, Status> {
         use objectio_meta_store::{CasOp, CasTable};
         let req = request.into_inner();
-        for _ in 0..8 {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
             let mut changes: Vec<(String, Option<objectio_proto::metadata::StripeRefs>)> =
                 Vec::new();
             let mut freeable = Vec::new();
@@ -11205,14 +11231,25 @@ impl MetadataService for MetaService {
             .collect();
         all.sort_by(|a, b| a.0.cmp(&b.0));
         let truncated = all.len() > limit;
-        let packs = all
+        let packs: Vec<objectio_proto::metadata::PackRecord> = all
             .into_iter()
             .take(limit)
             .filter_map(|(_, v)| objectio_proto::metadata::PackRecord::decode(v.as_slice()).ok())
             .collect();
+        let refs = self.stripe_refs.read();
+        let referrers = packs
+            .iter()
+            .map(|p| objectio_proto::metadata::PackReferrers {
+                object_ids: refs
+                    .get(&hex::encode(&p.pack_id))
+                    .map(|r| r.referrers.clone())
+                    .unwrap_or_default(),
+            })
+            .collect();
         Ok(Response::new(objectio_proto::metadata::ListPacksResponse {
             packs,
             truncated,
+            referrers,
         }))
     }
 
@@ -11240,18 +11277,25 @@ impl MetadataService for MetaService {
         request: Request<objectio_proto::metadata::PackSettleRequest>,
     ) -> Result<Response<objectio_proto::metadata::PackSettleResponse>, Status> {
         let req = request.into_inner();
-        for _ in 0..8 {
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
             // A pack freed meanwhile has nothing left to settle.
             let Some((mut record, bytes)) = self.pack_record(&req.pack_id) else {
                 return Ok(Response::new(
                     objectio_proto::metadata::PackSettleResponse {},
                 ));
             };
-            let before = record.members.len();
-            record
-                .members
-                .retain(|m| !req.object_ids.contains(&m.object_id));
-            if record.members.len() == before {
+            let mut changed = false;
+            for m in &mut record.members {
+                if !m.settled && req.object_ids.contains(&m.object_id) {
+                    m.settled = true;
+                    m.old_stripe = None;
+                    changed = true;
+                }
+            }
+            if !changed {
                 return Ok(Response::new(
                     objectio_proto::metadata::PackSettleResponse {},
                 ));
@@ -13725,9 +13769,28 @@ mod pack_tests {
         let left: Vec<String> = svc.packs()[0]
             .members
             .iter()
+            .filter(|m| !m.settled)
             .map(|m| m.key.clone())
             .collect();
         assert_eq!(left, ["k2"]);
+        assert_eq!(
+            svc.packs()[0].members.len(),
+            3,
+            "settled members stay, marked"
+        );
+        let listed = svc
+            .list_packs(Request::new(
+                objectio_proto::metadata::ListPacksRequest::default(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.referrers.len(), 1);
+        assert_eq!(
+            listed.referrers[0].object_ids.len(),
+            3,
+            "the pack's referrers"
+        );
         // A pack that's gone has nothing to settle.
         svc.pack_settle(Request::new(PackSettleRequest {
             pack_id: vec![99; 16],
