@@ -9,8 +9,6 @@ use objectio_proto::storage::{
     CheckShardsRequest,
     CheckShardsResponse,
     Checksum,
-    CopyObjectMetaRequest,
-    CopyObjectMetaResponse,
     DeleteObjectMetaRequest,
     DeleteObjectMetaResponse,
     DeleteShardRequest,
@@ -104,7 +102,6 @@ pub struct GrpcMetrics {
     pub get_object_meta: GrpcMethodMetrics,
     pub delete_object_meta: GrpcMethodMetrics,
     pub list_objects_meta: GrpcMethodMetrics,
-    pub copy_object_meta: GrpcMethodMetrics,
     pub stream_list_objects_meta: GrpcMethodMetrics,
     pub health_check: GrpcMethodMetrics,
     pub get_status: GrpcMethodMetrics,
@@ -1358,19 +1355,29 @@ impl StorageService for OsdService {
         // Over rdma the staging slot has already checked this. Bytes in the
         // message are checked here, before a block is allocated, so a shard
         // damaged on the way is refused rather than stored and later served
-        // as good under a checksum computed from the damage. A writer that
-        // sends no checksum is still accepted.
+        // as good under a checksum computed from the damage. Every writer
+        // sends one.
         let crc32c = crc32c::crc32c(data);
-        if staged.is_none()
-            && let Some(expected) = req.checksum.as_ref().map(|c| c.crc32c)
-            && expected != crc32c
-        {
-            self.grpc_metrics
-                .write_shard
-                .record(false, start.elapsed().as_micros() as u64, 0, 0);
-            return Err(Status::data_loss(format!(
-                "shard has crc32c {crc32c:08x}, expected {expected:08x}"
-            )));
+        if staged.is_none() {
+            let refuse = |status: Status| {
+                self.grpc_metrics.write_shard.record(
+                    false,
+                    start.elapsed().as_micros() as u64,
+                    0,
+                    0,
+                );
+                status
+            };
+            let Some(expected) = req.checksum.as_ref().map(|c| c.crc32c) else {
+                return Err(refuse(Status::invalid_argument(
+                    "shard sent without a checksum",
+                )));
+            };
+            if expected != crc32c {
+                return Err(refuse(Status::data_loss(format!(
+                    "shard has crc32c {crc32c:08x}, expected {expected:08x}"
+                ))));
+            }
         }
 
         debug!(
@@ -2322,57 +2329,6 @@ impl StorageService for OsdService {
         }))
     }
 
-    async fn copy_object_meta(
-        &self,
-        request: Request<CopyObjectMetaRequest>,
-    ) -> Result<Response<CopyObjectMetaResponse>, Status> {
-        let req = request.into_inner();
-
-        // Read source ObjectMeta from local store
-        let src_key = MetadataKey::object_meta(&req.source_bucket, &req.source_key);
-        let value = self
-            .meta_store
-            .get(&src_key)
-            .ok_or_else(|| Status::not_found("source object not found on this OSD"))?;
-
-        let mut object = ObjectMeta::decode(&value[..]).map_err(|e| {
-            Status::internal(format!("failed to decode source object metadata: {e}"))
-        })?;
-
-        // Update metadata fields for the destination key
-        let now = Self::current_timestamp();
-        object.bucket = req.dest_bucket.clone();
-        object.key = req.dest_key.clone();
-        object.created_at = now;
-        object.modified_at = now;
-        // Generate a new ETag based on object_id + timestamp so dest has its own identity
-        object.etag = format!("{:x}", Uuid::new_v4().as_u128());
-
-        // Write dest ObjectMeta
-        let _guard = self.usage.lock_key(&req.dest_bucket, &req.dest_key);
-        let dst_key = MetadataKey::object_meta(&req.dest_bucket, &req.dest_key);
-        let old = self.stored_meta(&dst_key);
-        let dest_bytes = object.encode_to_vec();
-        self.meta_store
-            .put(dst_key, dest_bytes)
-            .map_err(|e| Status::internal(format!("failed to store dest object metadata: {e}")))?;
-        self.usage.apply(
-            &req.dest_bucket,
-            EntryKind::Current,
-            old.as_ref(),
-            Some(&object),
-        );
-
-        info!(
-            "Copied object metadata: {}/{} -> {}/{}",
-            req.source_bucket, req.source_key, req.dest_bucket, req.dest_key
-        );
-
-        Ok(Response::new(CopyObjectMetaResponse {
-            object: Some(object),
-        }))
-    }
-
     type StreamListObjectsMetaStream =
         Pin<Box<dyn Stream<Item = Result<ListObjectsMetaChunk, Status>> + Send + 'static>>;
 
@@ -2815,7 +2771,10 @@ mod grpc_write_tests {
 
         LOCATION_RECORDS_FAIL.with(|f| f.set(true));
         let err = osd
-            .write_shard(Request::new(write_request(&data, None)))
+            .write_shard(Request::new(write_request(
+                &data,
+                Some(crc32c::crc32c(&data)),
+            )))
             .await
             .unwrap_err();
         LOCATION_RECORDS_FAIL.with(|f| f.set(false));
@@ -2828,9 +2787,12 @@ mod grpc_write_tests {
 
         // A retry stores it, and it survives a restart; the extent the
         // refused attempt held is reclaimed there.
-        osd.write_shard(Request::new(write_request(&data, None)))
-            .await
-            .unwrap();
+        osd.write_shard(Request::new(write_request(
+            &data,
+            Some(crc32c::crc32c(&data)),
+        )))
+        .await
+        .unwrap();
         drop(osd);
         let osd = reopen(&dir);
         assert_eq!(&read_back(&osd).await.unwrap().data[..], &data[..]);
@@ -2849,9 +2811,12 @@ mod grpc_write_tests {
     async fn a_delete_whose_removal_cannot_be_recorded_keeps_the_shard() {
         let (dir, osd) = osd();
         let data = vec![0x44; 50_000];
-        osd.write_shard(Request::new(write_request(&data, None)))
-            .await
-            .unwrap();
+        osd.write_shard(Request::new(write_request(
+            &data,
+            Some(crc32c::crc32c(&data)),
+        )))
+        .await
+        .unwrap();
         let free_with_shard = free_space(&osd);
         let delete = || {
             osd.delete_shard(Request::new(DeleteShardRequest {
@@ -2893,19 +2858,20 @@ mod grpc_write_tests {
         assert_eq!(resp.checksum.unwrap().crc32c, crc32c::crc32c(&data));
     }
 
-    /// Older writers send no checksum; they keep working, and the OSD
-    /// records the checksum of what it got.
+    /// Every writer sends a checksum; a shard without one is refused.
     #[tokio::test]
-    async fn a_shard_without_a_checksum_is_still_stored() {
+    async fn a_shard_without_a_checksum_is_refused() {
         let (_dir, osd) = osd();
-        let data = b"no checksum from this writer".to_vec();
-        osd.write_shard(Request::new(write_request(&data, None)))
+        let data = vec![0x11; 4096];
+        let err = osd
+            .write_shard(Request::new(write_request(&data, None)))
             .await
-            .unwrap();
-
-        let resp = read_back(&osd).await.unwrap();
-        assert_eq!(&resp.data[..], &data[..]);
-        assert_eq!(resp.checksum.unwrap().crc32c, crc32c::crc32c(&data));
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+        assert_eq!(
+            read_back(&osd).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
     }
 }
 

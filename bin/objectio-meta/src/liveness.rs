@@ -94,10 +94,10 @@ async fn run(meta: Arc<MetaService>) {
     let mut sweeps: u32 = 0;
 
     loop {
-        // Only the leader mutates topology; followers get it through Raft.
-        if meta.is_raft_leader() {
-            sweep(&meta, &mut misses).await;
-        }
+        // Every meta node probes: a node's view of which OSDs are up is its
+        // own (not replicated), and a follower that becomes leader must
+        // already know, or it can place nothing until its first sweeps.
+        sweep(&meta, &mut misses).await;
         sweeps = sweeps.saturating_add(1);
         tokio::time::sleep(probe_interval(sweeps)).await;
     }

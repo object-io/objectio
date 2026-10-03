@@ -1,18 +1,12 @@
-//! ObjectIO S3 API - S3-compatible HTTP API
-//!
-//! This crate implements the S3 REST API for ObjectIO.
+//! ObjectIO S3 metrics and usage accounting, used by the gateway (the S3 API
+//! itself lives in `bin/objectio-gateway`): per-operation request metrics,
+//! merging the OSDs' and meta's metrics into the gateway's, and the usage
+//! report.
 
-pub mod auth;
-pub mod error;
-pub mod handlers;
 pub mod metrics;
 pub mod metrics_merge;
 pub mod usage;
-pub mod xml;
 
-// Re-exports
-pub use auth::SigV4Authenticator;
-pub use error::S3Error;
 pub use metrics::{
     IcebergOperation, OperationTimer, ProtectionConfig, S3Metrics, S3Operation, UnityOperation,
     observe_locality_read_bytes, s3_metrics,

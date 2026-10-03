@@ -1091,12 +1091,7 @@ impl PolicyEvaluator {
         match key {
             "aws:SourceIp" => context.source_ip.map(|ip| ip.to_string()),
             "aws:username" => Some(context.user_arn.clone()),
-            // Set as "s3:prefix" by the gateway; "prefix" is the older spelling.
-            "s3:prefix" => context
-                .variables
-                .get("s3:prefix")
-                .or_else(|| context.variables.get("prefix"))
-                .cloned(),
+            "s3:prefix" => context.variables.get("s3:prefix").cloned(),
             "obio:CurrentTime" | "aws:CurrentTime" => Some(chrono::Utc::now().to_rfc3339()),
             "aws:EpochTime" => Some(chrono::Utc::now().timestamp().to_string()),
             _ => context.variables.get(key).cloned(),

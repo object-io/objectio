@@ -163,7 +163,7 @@ pub struct Args {
     pub config: String,
 
     /// Listen address for the data plane (S3 + Iceberg + Delta Sharing).
-    /// In legacy single-port mode, also serves /_admin/* and /_console/*.
+    /// In single-port mode (the default), also serves /_admin/* and /_console/*.
     #[arg(short, long, default_value = "0.0.0.0:9000")]
     pub listen: String,
 
@@ -172,7 +172,7 @@ pub struct Args {
     /// entirely and only this address serves it. Bind to a mgmt
     /// interface (e.g. `127.0.0.1:9001` or `10.0.5.10:9001`) so the
     /// public S3 endpoint stays the only Internet-facing port. Empty =
-    /// legacy single-port (admin stays on `--listen`).
+    /// single-port mode (admin stays on `--listen`).
     #[arg(long, default_value = "")]
     pub admin_listen: String,
 
@@ -181,7 +181,7 @@ pub struct Args {
     /// SPA from `OBJECTIO_OPS_CONSOLE_DIR` plus the `/_admin/*` API
     /// (so the browser stays same-origin — no CORS). Bind to a mgmt
     /// interface in production. Empty = ops console is served on
-    /// `--listen` (legacy) or omitted entirely if `--tenant-console-listen`
+    /// `--listen` (single-port) or omitted entirely if `--tenant-console-listen`
     /// is set without this one.
     #[arg(long, default_value = "")]
     pub ops_console_listen: String,
@@ -191,7 +191,7 @@ pub struct Args {
     /// SPA from `OBJECTIO_TENANT_CONSOLE_DIR` plus the same `/_admin/*`
     /// surface (server-side tenant-scoped). Safe to expose publicly so
     /// end users can self-serve. Empty = tenant console is not served
-    /// separately (ops console covers both surfaces in legacy mode).
+    /// separately (ops console covers both surfaces in single-port mode).
     #[arg(long, default_value = "")]
     pub tenant_console_listen: String,
 
@@ -294,22 +294,6 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_NO_REEXPORT_METRICS", default_value_t = false)]
     pub no_reexport_metrics: bool,
 
-    /// Keep buckets that have no recorded owner accessible to any
-    /// authenticated caller. Buckets created before ownership was tracked
-    /// carry no owner, so enforcing owner-only on them would lock an existing
-    /// deployment out of everything it already has.
-    ///
-    /// Backfill with `PUT /_admin/buckets/{bucket}/owner`, then set this to
-    /// false to close the gap. Buckets created from now on always record
-    /// their creator and are unaffected either way.
-    #[arg(
-        long,
-        env = "OBJECTIO_AUTHZ_LEGACY_OPEN_BUCKETS",
-        default_value_t = true,
-        action = clap::ArgAction::Set
-    )]
-    pub authz_legacy_open_buckets: bool,
-
     /// Name of the `--listen` endpoint, for policies (`aws:SourceVpce`).
     /// Empty: unnamed, as a request over the internet is in AWS.
     #[arg(long, env = "OBJECTIO_ENDPOINT_NAME", default_value = "")]
@@ -403,7 +387,7 @@ pub struct Args {
     ///   • Console OIDC callback — the authorize flow needs an absolute
     ///     redirect_uri; Entra/Okta reject bare paths.
     /// Defaults to http://<listen> if unset.
-    #[arg(long, default_value = "", alias = "external-url")]
+    #[arg(long, default_value = "")]
     pub external_endpoint: String,
 
     /// Admin access key ID for Delta Sharing presigned URL generation.
@@ -970,7 +954,6 @@ pub async fn run(
         kms_local: parking_lot::RwLock::new(kms_local),
         self_topology,
         host_provider,
-        legacy_open_buckets: args.authz_legacy_open_buckets,
         prometheus_url: args.prometheus_url.clone(),
         rdma,
         inline_max_size: args.inline_max_size,
@@ -1023,7 +1006,7 @@ pub async fn run(
     let s3_routes = Router::new()
         // /health stays no-auth so a load balancer can probe the data
         // listener directly. /metrics now lives on the admin listener
-        // (or the legacy combined router) — splitting it off lets
+        // (or the combined router) — splitting it off lets
         // operators firewall metrics/admin together on a mgmt VLAN.
         .route("/health", get(s3::health_check))
         .route("/_ready", get(cluster_poll::ready_handler))
@@ -1352,8 +1335,8 @@ pub async fn run(
     //   ops     (--ops-console-listen)    : /_console/* SPA + /_console/api/* + /_admin/* + /health
     //   tenant  (--tenant-console-listen) : same shape as ops, different SPA bundle
     //
-    // Legacy single-port mode (no split flag set): everything is merged
-    // onto --listen, identical to pre-split deployments.
+    // Single-port mode (no split flag set, the default): everything is
+    // merged onto --listen.
     // ============================================================
     if !args.no_auth {
         info!("Authentication is ENABLED (credentials from metadata service)");
@@ -1365,15 +1348,15 @@ pub async fn run(
     }
 
     // SPA dirs.
-    //   OBJECTIO_CONSOLE_DIR        — legacy single-bundle (default for legacy mode)
-    //   OBJECTIO_OPS_CONSOLE_DIR    — ops bundle for --ops-console-listen
-    //   OBJECTIO_TENANT_CONSOLE_DIR — tenant bundle for --tenant-console-listen
-    let legacy_console_dir = std::env::var("OBJECTIO_CONSOLE_DIR")
+    //   OBJECTIO_CONSOLE_DIR        — where both bundles live (ops/, tenant/)
+    //   OBJECTIO_OPS_CONSOLE_DIR    — the ops bundle, if elsewhere
+    //   OBJECTIO_TENANT_CONSOLE_DIR — the tenant bundle, if elsewhere
+    let console_root = std::env::var("OBJECTIO_CONSOLE_DIR")
         .unwrap_or_else(|_| "/usr/share/objectio/console".to_string());
-    let ops_console_dir = std::env::var("OBJECTIO_OPS_CONSOLE_DIR")
-        .unwrap_or_else(|_| format!("{legacy_console_dir}/ops"));
+    let ops_console_dir =
+        std::env::var("OBJECTIO_OPS_CONSOLE_DIR").unwrap_or_else(|_| format!("{console_root}/ops"));
     let tenant_console_dir = std::env::var("OBJECTIO_TENANT_CONSOLE_DIR")
-        .unwrap_or_else(|_| format!("{legacy_console_dir}/tenant"));
+        .unwrap_or_else(|_| format!("{console_root}/tenant"));
 
     let console_service = |dir: &str| {
         tower_http::services::ServeDir::new(dir).fallback(tower_http::services::ServeFile::new(
@@ -1485,8 +1468,8 @@ pub async fn run(
     };
 
     if !split_mode {
-        // ---------- Legacy single-port: everything on --listen ----------
-        // ListenerKind::Legacy = no audience gating on console_login /
+        // ---------- Single-port: everything on --listen ----------
+        // ListenerKind::Combined = no audience gating on console_login /
         // oidc_callback (preserves pre-split behavior — any creds work
         // anywhere because there IS only one "anywhere").
         let combined = Router::new()
@@ -1502,7 +1485,7 @@ pub async fn run(
             // /_console/admin is the operator console, /_console/tenant the
             // self-service one. Each bundle is built with its own base, so the
             // same build serves correctly here and on a dedicated listener.
-            // The bare /_console mount stays for the legacy single bundle.
+            // The bare /_console mount serves the single-port console.
             .nest_service("/_console/admin", console_service(&ops_console_dir))
             .nest_service("/_console/tenant", console_service(&tenant_console_dir))
             // Self-registration entry point. A short, shareable URL that lands
@@ -1527,12 +1510,12 @@ pub async fn run(
             )
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
-            .layer(Extension(ListenerKind::Legacy))
+            .layer(Extension(ListenerKind::Combined))
             .layer(TraceLayer::new_for_http());
         listeners.push((
             data_addr,
             combined,
-            "data (legacy: + admin + console)".into(),
+            "data (+ admin + console)".into(),
             main_endpoint.clone(),
         ));
     } else {

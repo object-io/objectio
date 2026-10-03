@@ -164,7 +164,7 @@ struct Args {
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
-    /// (legacy behavior).
+    /// (single-port, the default).
     #[arg(long, default_value_t = 0)]
     admin_port: u16,
 
@@ -624,24 +624,18 @@ async fn main() -> Result<()> {
     // (multi-page Vite output). The gateway resolves
     // OBJECTIO_OPS_CONSOLE_DIR / OBJECTIO_TENANT_CONSOLE_DIR relative
     // to OBJECTIO_CONSOLE_DIR by default, so a single extraction
-    // covers both split-mode and legacy paths.
+    // covers both split mode and single-port.
     // ------------------------------------------------------------
     {
         let console_dst = data_root.join("console");
         // Embedded tree contains ops/ and tenant/ subdirs (multi-bundle
         // Vite output). Extract once; point each env var at the matching
-        // subdir so both legacy single-port and split-mode flows resolve.
+        // subdir, for single-port and split-mode alike.
         extract_embedded_console(&console_dst)?;
         let ops_dir = console_dst.join("ops");
         let tenant_dir = console_dst.join("tenant");
         // SAFETY: no tasks have been spawned yet, so no concurrent reads.
         unsafe {
-            if std::env::var("OBJECTIO_CONSOLE_DIR").is_err() {
-                // Legacy mode = serve the ops bundle from the data
-                // listener (matches pre-split behavior — system admins
-                // and tenant users land on the same SPA).
-                std::env::set_var("OBJECTIO_CONSOLE_DIR", &ops_dir);
-            }
             if std::env::var("OBJECTIO_OPS_CONSOLE_DIR").is_err() {
                 std::env::set_var("OBJECTIO_OPS_CONSOLE_DIR", &ops_dir);
             }
@@ -843,7 +837,7 @@ async fn main() -> Result<()> {
         gw_argv.push(args.prometheus_url.trim_end_matches('/').to_string());
     }
     // Forward optional split-mode listener flags. Empty / port 0 →
-    // legacy single-port behavior (current default).
+    // single-port behavior (the default).
     let split_addrs: Vec<u16> = [
         args.admin_port,
         args.ops_console_port,

@@ -411,9 +411,9 @@ impl Default for AuthzCache {
 
 /// Fetch a bucket's policy and owner, via the cache when it is warm.
 ///
-/// Meta errors yield an empty entry rather than propagating: a metadata
-/// hiccup must not start failing requests. An unreadable bucket therefore
-/// looks unowned and unpoliced, which the chain treats as legacy.
+/// Meta errors yield an empty entry rather than propagating. An unreadable
+/// bucket therefore looks unowned and unpoliced, which the chain denies to
+/// everyone but the system admin.
 async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
     if let Some(cached) = state.policy_cache.bucket(bucket) {
         return cached;
@@ -629,10 +629,8 @@ pub struct AuthzRequest<'a> {
 /// 5. the caller owns the bucket, or is the system admin
 /// 6. otherwise deny
 ///
-/// Step 5 is the change from "no policy anywhere means everyone" to "no policy
-/// anywhere means the owner". Buckets with no recorded owner are exempt while
-/// `--authz-legacy-open-buckets` is set, so an existing deployment keeps
-/// working until its owners are backfilled.
+/// Step 5: no policy anywhere means the owner, not everyone. A bucket with no
+/// recorded owner is reachable only through a policy, or by the system admin.
 ///
 /// Returns `Some(response)` when the request must be rejected.
 pub async fn authorize(
@@ -749,18 +747,11 @@ pub async fn authorize(
     if !bucket.owner.is_empty() && bucket.owner == auth.user_id {
         return None;
     }
-
-    // A bucket with no recorded owner predates ownership tracking. Denying
-    // those outright would lock an existing deployment out of every bucket it
-    // already has, so they stay open until backfilled and the flag is cleared.
-    if is_legacy_unowned(&bucket.owner) {
-        if state.legacy_open_buckets {
-            return None;
-        }
-        debug!(
-            "Denying {} {} on unowned bucket {} (legacy-open disabled)",
-            auth.user_arn, req.action, req.bucket
-        );
+    // Any authenticated caller may create a bucket that has no owner yet
+    // (it doesn't exist), and becomes its owner; explicit Denies and the
+    // tenant boundary were applied above. If it does exist, meta refuses.
+    if req.action == "s3:CreateBucket" && bucket.owner.is_empty() {
+        return None;
     }
 
     Some(deny(&format!(
@@ -880,16 +871,6 @@ fn tenant_violation(
         format!("tenant '{caller_tenant}' may not access a bucket in tenant '{bucket_tenant}'")
     })
 }
-
-/// Buckets created before the gateway recorded a real owner carry either an
-/// empty owner or the literal placeholder `create_bucket` used to write.
-fn is_legacy_unowned(owner: &str) -> bool {
-    owner.is_empty() || owner == LEGACY_BUCKET_OWNER
-}
-
-/// The placeholder `create_bucket` wrote into every bucket before ownership
-/// was tracked.
-pub const LEGACY_BUCKET_OWNER: &str = "default";
 
 fn deny(message: &str) -> Response {
     crate::gateway_metrics::record_auth_failure("policy");
@@ -1343,13 +1324,5 @@ mod tests {
         assert!(r.contains("acme") && r.contains("globex"));
         let r = tenant_violation("", "globex", AuthMode::Permanent).unwrap();
         assert!(r.contains("globex"));
-    }
-
-    #[test]
-    fn unowned_buckets_are_recognised_as_legacy() {
-        assert!(is_legacy_unowned(""));
-        // The literal placeholder create_bucket used before ownership existed.
-        assert!(is_legacy_unowned(LEGACY_BUCKET_OWNER));
-        assert!(!is_legacy_unowned("a86f2e87-0c38-47b4-9c04-9048720683e5"));
     }
 }

@@ -612,7 +612,7 @@ pub struct MetaService {
     bucket_policies: RwLock<HashMap<String, String>>,
     /// In-progress multipart uploads: upload_id -> MultipartUploadState
     multipart_uploads: RwLock<HashMap<String, MultipartUploadState>>,
-    /// Registered OSD nodes (legacy)
+    /// Registered OSD nodes
     osd_nodes: RwLock<Vec<OsdNode>>,
     /// Cluster topology for CRUSH 2.0
     topology: RwLock<ClusterTopology>,
@@ -967,11 +967,6 @@ impl MetaService {
         svc.store = Some(store);
         svc.load_from_store();
         svc
-    }
-
-    /// Returns true if the store already has OSD nodes persisted.
-    pub fn has_persisted_osds(&self) -> bool {
-        !self.osd_nodes.read().is_empty()
     }
 
     /// Borrow the underlying persistent store, if the service is
@@ -1450,7 +1445,7 @@ impl MetaService {
     /// Mirror a replicated OSD record into this node's caches.
     fn apply_osd_node_event(&self, key: &str, new_value: Option<&[u8]>) {
         match new_value {
-            Some(bytes) => match OsdNode::decode(bytes) {
+            Some(bytes) => match bincode::deserialize::<OsdNode>(bytes) {
                 Ok(node) => {
                     {
                         let mut nodes = self.osd_nodes.write();
@@ -1788,21 +1783,23 @@ impl MetaService {
     fn apply_access_key_event(&self, key: &str, new_value: Option<&[u8]>) {
         let mut m = self.access_keys.write();
         match new_value {
-            Some(bytes) => match objectio_meta_store::decode_access_key(bytes) {
-                Ok(k) => {
-                    // Keep user_keys index consistent: insert the
-                    // access_key_id under the owning user if absent.
-                    let user_id = k.user_id.clone();
-                    m.insert(key.to_string(), k);
-                    drop(m);
-                    let mut idx = self.user_keys.write();
-                    let ids = idx.entry(user_id).or_default();
-                    if !ids.iter().any(|k2| k2 == key) {
-                        ids.push(key.to_string());
+            Some(bytes) => {
+                match bincode::deserialize::<objectio_meta_store::StoredAccessKey>(bytes) {
+                    Ok(k) => {
+                        // Keep user_keys index consistent: insert the
+                        // access_key_id under the owning user if absent.
+                        let user_id = k.user_id.clone();
+                        m.insert(key.to_string(), k);
+                        drop(m);
+                        let mut idx = self.user_keys.write();
+                        let ids = idx.entry(user_id).or_default();
+                        if !ids.iter().any(|k2| k2 == key) {
+                            ids.push(key.to_string());
+                        }
                     }
+                    Err(e) => warn!("apply: decode StoredAccessKey('{key}') failed: {e}"),
                 }
-                Err(e) => warn!("apply: decode StoredAccessKey('{key}') failed: {e}"),
-            },
+            }
             None => {
                 let removed = m.remove(key);
                 drop(m);
@@ -2618,58 +2615,17 @@ impl MetaService {
             Err(e) => error!("Failed to load multipart uploads: {}", e),
         }
 
-        // OSD nodes + topology rebuild
+        // OSD nodes, then the topology rebuilt from them
         match store.load_osd_nodes() {
             Ok(nodes) => {
-                let count = nodes.len();
-                // Dedupe by address on load: if the persistent store still
-                // holds pre-cleanup duplicates from older binaries, keep
-                // only the newest entry per address (last-wins). Also drop
-                // known-bad placeholder addresses (e.g. http://0.0.0.0:9200)
-                // that come from OSDs that never heartbeated a real
-                // address — they pollute CRUSH and cause empty-address
-                // write failures.
-                let mut by_address: std::collections::HashMap<String, OsdNode> =
-                    std::collections::HashMap::new();
-                let mut bad_placeholder = 0usize;
-                for (_hex_id, node) in nodes {
-                    if node.address.is_empty()
-                        || node.address.contains("://0.0.0.0")
-                        || node.address.contains("://[::]")
-                    {
-                        bad_placeholder += 1;
-                        continue;
-                    }
-                    by_address.insert(node.address.clone(), node);
-                }
-                let deduped: Vec<OsdNode> = by_address.into_values().collect();
-                let evicted = count - deduped.len() - bad_placeholder;
-                if evicted > 0 {
-                    warn!(
-                        "Deduped {} stale OSD entries on startup (same address, stale node_id)",
-                        evicted
-                    );
-                }
-                if bad_placeholder > 0 {
-                    warn!(
-                        "Dropped {} OSD entries with placeholder addresses on startup",
-                        bad_placeholder
-                    );
-                }
                 let mut osd_nodes = self.osd_nodes.write();
-                osd_nodes.clear();
-                for node in deduped {
-                    osd_nodes.push(node);
-                }
+                *osd_nodes = nodes.into_iter().map(|(_, node)| node).collect();
                 info!("Loaded {} OSD nodes from store", osd_nodes.len());
             }
             Err(e) => error!("Failed to load OSD nodes: {}", e),
         }
 
-        // Topology — rebuild from the post-dedup OSD list so any ghost
-        // node_ids that lingered in the stored topology (from pre-cleanup
-        // binaries) don't come back into CRUSH. The stored topology is
-        // an optimization; the authoritative source is the live OSD list.
+        // Topology — rebuilt from the OSD list, the only source.
         {
             let nodes = self.osd_nodes.read().clone();
             *self.topology.write() = Default::default();
@@ -2768,14 +2724,6 @@ impl MetaService {
                 for (key, bytes) in entries {
                     match IcebergTableEntry::decode(bytes.as_slice()) {
                         Ok(entry) => {
-                            if entry.metadata_json.is_empty() {
-                                warn!(
-                                    "Iceberg table '{}' has no inline metadata \
-                                     (created by older catalog version); \
-                                     load-table will fail until it is dropped and re-created",
-                                    key
-                                );
-                            }
                             tbl_map.insert(key, entry);
                         }
                         Err(e) => error!("Failed to decode iceberg table '{}': {}", key, e),
@@ -3374,25 +3322,6 @@ impl MetaService {
             .collect()
     }
 
-    /// Register an OSD node for placement (legacy method)
-    pub fn register_osd(&self, node: OsdNode) {
-        info!(
-            "Registering OSD node: {} at {}",
-            hex::encode(node.node_id),
-            node.address
-        );
-        self.osd_nodes.write().push(node.clone());
-
-        // Also update the CRUSH topology
-        self.update_topology_with_node(&node);
-
-        // Persist OSD + topology atomically
-        if let Some(store) = &self.store {
-            let topology = self.topology.read().clone();
-            store.put_osd_and_topology(&hex::encode(node.node_id), &node, &topology);
-        }
-    }
-
     /// Update CRUSH topology with a new OSD node
     /// Whether a topology update is backed by evidence the node is reachable
     /// *now*.
@@ -3420,26 +3349,17 @@ impl MetaService {
     }
 
     fn upsert_topology_node(&self, osd_node: &OsdNode, evidence: NodeEvidence) {
-        // Prefer the 5-level `topology` when present; fall back to the
-        // legacy 3-tuple for OsdNodes persisted before zone/host existed.
-        let (region, zone, dc, rack, host) = osd_node
-            .topology
-            .clone()
-            .or_else(|| {
-                osd_node
-                    .failure_domain
-                    .clone()
-                    .map(|(r, dc, rack)| (r, String::new(), dc, rack, String::new()))
-            })
-            .unwrap_or_else(|| {
-                (
-                    "default".to_string(),
-                    String::new(),
-                    "dc1".to_string(),
-                    "rack1".to_string(),
-                    String::new(),
-                )
-            });
+        // An OSD that registered without a topology is placed in a
+        // default one.
+        let (region, zone, dc, rack, host) = osd_node.topology.clone().unwrap_or_else(|| {
+            (
+                "default".to_string(),
+                String::new(),
+                "dc1".to_string(),
+                "rack1".to_string(),
+                String::new(),
+            )
+        });
 
         let node_id = NodeId::from_bytes(osd_node.node_id);
 
@@ -3569,162 +3489,6 @@ impl MetaService {
     fn generate_kms_key_id() -> String {
         let uuid = Uuid::new_v4().simple().to_string();
         format!("kms-{}", &uuid[..12])
-    }
-
-    /// Legacy placement algorithm (fallback when no CRUSH topology)
-    async fn get_placement_legacy(
-        &self,
-        req: &GetPlacementRequest,
-    ) -> Result<Response<GetPlacementResponse>, Status> {
-        let nodes = self.osd_nodes.read();
-
-        // Determine number of shards and EC type based on config
-        let (total_shards, ec_type, replication_count) = match &self.default_ec {
-            EcConfig::Mds { k, m } => ((*k + *m) as usize, ErasureType::ErasureMds, 0u32),
-            EcConfig::Lrc { k, l, g } => ((*k + *l + *g) as usize, ErasureType::ErasureLrc, 0u32),
-            EcConfig::Replication { count } => (
-                *count as usize,
-                ErasureType::ErasureReplication,
-                *count as u32,
-            ),
-        };
-
-        if nodes.is_empty() {
-            return Err(Status::unavailable("no storage nodes available"));
-        }
-
-        let mut all_disks = eligible_disks(&nodes);
-
-        if all_disks.is_empty() {
-            return Err(Status::unavailable(
-                "no storage nodes are accepting writes (all are draining or out)",
-            ));
-        }
-
-        // Use object key hash for deterministic placement
-        let hash_seed = {
-            let key_bytes = format!("{}/{}", req.bucket, req.key);
-            key_bytes
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-        };
-
-        // Rotate the disk list based on hash for distribution
-        if !all_disks.is_empty() {
-            let rotation = (hash_seed as usize) % all_disks.len();
-            all_disks.rotate_left(rotation);
-        }
-
-        // Select disks for each shard position, spreading across nodes
-        let mut placements: Vec<NodePlacement> = Vec::with_capacity(total_shards);
-        let mut used_nodes: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-
-        // First pass: try to use different nodes for each shard
-        for pos in 0..total_shards {
-            if placements.len() >= total_shards {
-                break;
-            }
-
-            let disk_opt = all_disks
-                .iter()
-                .find(|(node, _)| !used_nodes.contains(&node.node_id));
-
-            if let Some((node, disk_id)) = disk_opt {
-                let pos_u32 = pos as u32;
-                placements.push(NodePlacement {
-                    position: pos_u32,
-                    node_id: node.node_id.to_vec(),
-                    node_address: node.address.clone(),
-                    te_segment: node.te_segment.clone(),
-                    disk_id: disk_id.to_vec(),
-                    shard_type: if pos_u32 < self.default_ec_k {
-                        ShardType::ShardData.into()
-                    } else {
-                        ShardType::ShardGlobalParity.into()
-                    },
-                    local_group: 0,
-                });
-                used_nodes.insert(node.node_id);
-            }
-        }
-
-        // Second pass: reuse nodes with different disks if needed
-        if placements.len() < total_shards {
-            for (node, disk_id) in all_disks.iter() {
-                if placements.len() >= total_shards {
-                    break;
-                }
-                let disk_used = placements.iter().any(|p| p.disk_id == disk_id.to_vec());
-                if !disk_used {
-                    let pos = placements.len() as u32;
-                    placements.push(NodePlacement {
-                        position: pos,
-                        node_id: node.node_id.to_vec(),
-                        node_address: node.address.clone(),
-                        te_segment: node.te_segment.clone(),
-                        disk_id: disk_id.to_vec(),
-                        shard_type: if pos < self.default_ec_k {
-                            ShardType::ShardData.into()
-                        } else {
-                            ShardType::ShardGlobalParity.into()
-                        },
-                        local_group: 0,
-                    });
-                }
-            }
-        }
-
-        // Third pass: allow disk reuse for single disk mode
-        while placements.len() < total_shards {
-            let idx = placements.len() % all_disks.len().max(1);
-            if let Some((node, disk_id)) = all_disks.get(idx) {
-                let pos = placements.len() as u32;
-                placements.push(NodePlacement {
-                    position: pos,
-                    node_id: node.node_id.to_vec(),
-                    node_address: node.address.clone(),
-                    te_segment: node.te_segment.clone(),
-                    disk_id: disk_id.to_vec(),
-                    shard_type: if pos < self.default_ec_k {
-                        ShardType::ShardData.into()
-                    } else {
-                        ShardType::ShardGlobalParity.into()
-                    },
-                    local_group: 0,
-                });
-            } else {
-                break;
-            }
-        }
-
-        debug!(
-            "Legacy placement for {}/{}: {} shards across {} nodes",
-            req.bucket,
-            req.key,
-            placements.len(),
-            used_nodes.len()
-        );
-
-        Ok(Response::new(self.with_dedup(
-            &req.bucket,
-            GetPlacementResponse {
-                storage_class: "STANDARD".to_string(),
-                ec_k: self.default_ec_k,
-                ec_m: self.default_ec_m,
-                nodes: placements,
-                ec_type: ec_type.into(),
-                ec_local_parity: 0,
-                ec_global_parity: self.default_ec_m,
-                local_group_size: 0,
-                replication_count,
-                // Legacy path: no PG, pool blank. Phase 3 fills these.
-                pg_id: 0,
-                pg_version: 0,
-                pool: String::new(),
-                dedup_mode: 0,
-                dedup_domain: String::new(),
-            },
-        )))
     }
 }
 
@@ -3997,8 +3761,11 @@ impl MetaService {
         };
 
         if active_node_count == 0 {
-            // Fall back to legacy placement if no CRUSH topology
-            return self.get_placement_legacy(&req).await;
+            // Not until the liveness probe has seen OSDs: placing on the
+            // bare OSD list would ignore failure domains.
+            return Err(Status::unavailable(
+                "no OSD is known to be up yet (the liveness probe runs every few seconds); retry",
+            ));
         }
 
         // Create object ID from bucket/key for deterministic placement
@@ -4888,7 +4655,6 @@ impl MetadataService for MetaService {
 
         let key_count = entries.len() as u32 + common_prefixes.len() as u32;
         Ok(Response::new(ListObjectsResponse {
-            objects: Vec::new(),
             common_prefixes,
             next_continuation_token: next_token,
             is_truncated,
@@ -5433,24 +5199,26 @@ impl MetadataService for MetaService {
             disk_ids.push(id);
         }
 
-        // Capacity hint must be index-aligned with disk_ids. Tolerate the
-        // older single-field protocol (empty capacities) by treating the
-        // caller as reporting 0 bytes — under-reports, never blocks
-        // re-registration of already-known hardware.
-        let disk_capacity_bytes: Vec<u64> = if req.disk_capacity_bytes.is_empty() {
-            vec![0; disk_ids.len()]
-        } else if req.disk_capacity_bytes.len() == disk_ids.len() {
-            req.disk_capacity_bytes.clone()
-        } else {
+        // An OSD must advertise an address others can reach.
+        if req.address.is_empty()
+            || req.address.contains("://0.0.0.0")
+            || req.address.contains("://[::]")
+        {
+            return Err(Status::invalid_argument(format!(
+                "OSD address {:?} is not reachable by others; set --advertise-addr",
+                req.address
+            )));
+        }
+
+        // One capacity per disk, index-aligned with disk_ids.
+        if req.disk_capacity_bytes.len() != disk_ids.len() {
             return Err(Status::invalid_argument(
                 "disk_capacity_bytes length must match disk_ids",
             ));
-        };
+        }
+        let disk_capacity_bytes = req.disk_capacity_bytes.clone();
 
-        // Register the OSD. Pull failure-domain fields from the request
-        // and persist both the legacy 3-tuple (back-compat) and the full
-        // 5-level `topology`, so newer meta readers see zone/host and
-        // older code paths still find region/dc/rack.
+        // Register the OSD, with its 5-level topology.
         let topology_tuple = req.failure_domain.as_ref().map(|fd| {
             (
                 fd.region.clone(),
@@ -5460,10 +5228,6 @@ impl MetadataService for MetaService {
                 fd.host.clone(),
             )
         });
-        let legacy_fd = req
-            .failure_domain
-            .as_ref()
-            .map(|fd| (fd.region.clone(), fd.datacenter.clone(), fd.rack.clone()));
         let num_disks = disk_ids.len();
         // Preserve operator intent across re-registrations: if the OSD
         // was marked Out or Draining and the same node_id (or address)
@@ -5481,7 +5245,6 @@ impl MetadataService for MetaService {
             node_id,
             address: req.address.clone(),
             disk_ids,
-            failure_domain: legacy_fd,
             topology: topology_tuple,
             disk_capacity_bytes,
             admin_state: prev_admin_state,
@@ -5500,7 +5263,6 @@ impl MetadataService for MetaService {
                 existing.address = node.address.clone();
                 existing.disk_ids = node.disk_ids.clone();
                 existing.disk_capacity_bytes = node.disk_capacity_bytes.clone();
-                existing.failure_domain = node.failure_domain.clone();
                 existing.topology = node.topology.clone();
                 existing.te_segment = node.te_segment.clone();
                 info!(
@@ -5645,7 +5407,7 @@ impl MetadataService for MetaService {
             .map(|n| (n.node_id, n.te_segment.clone()))
             .collect();
 
-        let mut nodes: Vec<ListingNode> = topology_iter
+        let nodes: Vec<ListingNode> = topology_iter
             .enumerate()
             .map(|(idx, node)| {
                 let id_bytes = *node.id.as_bytes();
@@ -5676,33 +5438,6 @@ impl MetadataService for MetaService {
                 }
             })
             .collect();
-
-        // Also include legacy OSD nodes if no topology nodes exist
-        if nodes.is_empty() {
-            nodes = osd_nodes
-                .iter()
-                .enumerate()
-                .map(|(idx, node)| {
-                    let fd = node.topology.as_ref().map(|t| {
-                        objectio_proto::metadata::FailureDomainInfo {
-                            region: t.0.clone(),
-                            zone: t.1.clone(),
-                            datacenter: t.2.clone(),
-                            rack: t.3.clone(),
-                            host: t.4.clone(),
-                        }
-                    });
-                    ListingNode {
-                        node_id: node.node_id.to_vec(),
-                        address: node.address.clone(),
-                        shard_id: idx as u32,
-                        failure_domain: fd,
-                        admin_state: admin_state_proto(node.admin_state),
-                        te_segment: node.te_segment.clone(),
-                    }
-                })
-                .collect();
-        }
 
         debug!(
             "GetListingNodes: returning {} nodes (topology_version={})",
@@ -13254,22 +12989,6 @@ impl MetadataService for MetaService {
     }
 }
 
-/// The (node, disk) pairs the legacy placement engine may choose from.
-///
-/// Extracted from `get_placement_legacy` so it can be tested without standing
-/// up a whole `MetaService`. The filter is the point: this path used to
-/// collect every registered node with no filter at all, so marking an OSD Out
-/// removed it from the CRUSH engine — which honours intent through
-/// `active_nodes()` — and not from this one. Which engine answered then
-/// decided whether the operator's instruction meant anything.
-fn eligible_disks(nodes: &[OsdNode]) -> Vec<(&OsdNode, &[u8; 16])> {
-    nodes
-        .iter()
-        .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
-        .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
-        .collect()
-}
-
 /// Check a completion against `upload` and build the object it makes:
 /// every part named exists with its ETag, all but the last at least 5 MiB.
 /// Returns the object and the stripes of parts left out of it.
@@ -13378,87 +13097,6 @@ fn complete_upload(
         .collect();
 
     Ok((object, unused_stripes))
-}
-
-#[cfg(test)]
-mod placement_tests {
-    use super::*;
-    use objectio_common::OsdAdminState;
-
-    fn node(id: u8, disks: usize, admin_state: OsdAdminState) -> OsdNode {
-        OsdNode {
-            node_id: [id; 16],
-            address: format!("http://127.0.0.1:{}", 9200 + u16::from(id)),
-            disk_ids: (0..disks).map(|d| [id * 10 + d as u8; 16]).collect(),
-            failure_domain: None,
-            topology: None,
-            disk_capacity_bytes: vec![1_000_000_000; disks],
-            admin_state,
-            te_segment: String::new(),
-        }
-    }
-
-    #[test]
-    fn every_disk_of_an_in_node_is_selectable() {
-        let nodes = vec![node(1, 2, OsdAdminState::In), node(2, 3, OsdAdminState::In)];
-        assert_eq!(eligible_disks(&nodes).len(), 5);
-    }
-
-    #[test]
-    fn an_out_node_is_not_handed_writes() {
-        // The operator said no. Before this filter existed, the legacy engine
-        // ignored that entirely and kept placing on it.
-        let nodes = vec![
-            node(1, 2, OsdAdminState::In),
-            node(2, 2, OsdAdminState::Out),
-        ];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 2);
-        assert!(
-            picked.iter().all(|(n, _)| n.node_id == [1; 16]),
-            "a node marked Out was selected"
-        );
-    }
-
-    #[test]
-    fn a_draining_node_is_not_handed_writes() {
-        // Draining means "no new data, keep serving reads" — placing on it
-        // would fight the drain that is trying to empty it.
-        let nodes = vec![
-            node(1, 1, OsdAdminState::In),
-            node(2, 4, OsdAdminState::Draining),
-        ];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].0.node_id, [1; 16]);
-    }
-
-    #[test]
-    fn no_eligible_nodes_yields_nothing_rather_than_a_default() {
-        // The caller turns this into "no storage nodes are accepting writes",
-        // which is actionable. Falling back to any node would place data on a
-        // disk the operator is trying to remove.
-        let nodes = vec![
-            node(1, 2, OsdAdminState::Out),
-            node(2, 2, OsdAdminState::Draining),
-        ];
-        assert!(eligible_disks(&nodes).is_empty());
-    }
-
-    #[test]
-    fn a_node_with_no_disks_contributes_nothing() {
-        // The stale registration that broke writes on the live cluster looked
-        // exactly like this: still listed, zero disks.
-        let nodes = vec![node(1, 0, OsdAdminState::In), node(2, 2, OsdAdminState::In)];
-        let picked = eligible_disks(&nodes);
-        assert_eq!(picked.len(), 2);
-        assert!(picked.iter().all(|(n, _)| n.node_id == [2; 16]));
-    }
-
-    #[test]
-    fn an_empty_cluster_is_empty() {
-        assert!(eligible_disks(&[]).is_empty());
-    }
 }
 
 #[cfg(test)]

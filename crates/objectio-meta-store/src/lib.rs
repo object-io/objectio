@@ -13,7 +13,6 @@ pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
 pub use raft_storage::{MetaRaftStorage, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
 pub use types::{
-    EcConfig, MultipartUploadState, OsdNode, PartState, StoredAccessKey, StoredAttachment,
-    StoredChunkRef, StoredDataFilter, StoredGroup, StoredSnapshot, StoredUser, StoredVolume,
-    decode_access_key,
+    EcConfig, MultipartUploadState, OsdNode, PartState, StoredAccessKey, StoredDataFilter,
+    StoredGroup, StoredUser,
 };

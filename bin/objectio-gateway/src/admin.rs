@@ -61,9 +61,9 @@ fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
         enabled: v["enabled"].as_bool().unwrap_or(true),
         created_at: 0,
         updated_at: 0,
-        // Placement-group sizing. 0 keeps the legacy per-object CRUSH
-        // path (backward-compat). Admins who want PG-based placement
-        // pass "pg_count": 256 (or higher) on pool creation.
+        // Placement-group sizing. 0 places each object directly (CRUSH,
+        // no placement groups), the default; for PG-based placement pass
+        // "pg_count": 256 (or higher) on pool creation.
         pg_count: v["pg_count"].as_u64().unwrap_or_default() as u32,
         tier: v["tier"].as_str().unwrap_or_default().to_string(),
     }
@@ -1560,9 +1560,7 @@ pub async fn admin_delete_bucket_policy(
 // ============================================================================
 /// `PUT /_admin/buckets/{bucket}/owner` — reassign a bucket's owner.
 ///
-/// Body: `{"owner": "<user_id>"}`. Also the backfill path for buckets created
-/// before the gateway recorded an owner: until those have one, authorization
-/// cannot fall back to ownership and they rely on `--authz-legacy-open-buckets`.
+/// Body: `{"owner": "<user_id>"}`.
 ///
 /// Gated per-bucket: the system admin may re-home any bucket, a tenant admin
 /// only buckets in their own tenant. Buckets with no tenant stay system-admin

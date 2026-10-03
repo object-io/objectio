@@ -16,7 +16,6 @@ pub mod metadata;
 pub mod raw_io;
 pub mod repair;
 pub mod smart;
-pub mod wal;
 
 // Re-exports
 pub use aligned_buf::{AlignedBuf, DEFAULT_ALIGN};
@@ -29,8 +28,6 @@ pub use layout::{
 };
 pub use metadata::{
     ArcCache, MetaCacheStats, MetadataEntry, MetadataKey, MetadataOp, MetadataStore, MetadataWal,
-    ShardMeta,
 };
 pub use raw_io::{AlignedBuffer, RawFile};
 pub use smart::{DiskSmartHealth, SmartAttribute, SmartMonitor};
-pub use wal::{RecordType, SyncMode, WalRecord, WriteAheadLog, WriteOp};

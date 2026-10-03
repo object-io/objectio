@@ -5,44 +5,18 @@ use std::cmp::Ordering;
 
 /// Key for metadata entries
 ///
-/// Keys are designed for efficient prefix scanning:
-/// - Shard keys: `s:{object_id}:{shard_pos}`
-/// - Object keys: `o:{object_id}`
-/// - Block keys: `b:{block_num}`
+/// Keys are designed for efficient prefix scanning: `m` (an object's
+/// current version), `v` (its versions), and the OSD's own prefixes
+/// (`osd_loc:` for shard locations, `dedup_note:`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MetadataKey(pub Vec<u8>);
 
 impl MetadataKey {
-    /// Create a shard metadata key
-    pub fn shard(object_id: &[u8; 16], shard_position: u8) -> Self {
-        let mut key = Vec::with_capacity(18);
-        key.push(b's');
-        key.extend_from_slice(object_id);
-        key.push(shard_position);
-        Self(key)
-    }
-
-    /// Create an object metadata key
-    pub fn object(object_id: &[u8; 16]) -> Self {
-        let mut key = Vec::with_capacity(17);
-        key.push(b'o');
-        key.extend_from_slice(object_id);
-        Self(key)
-    }
-
     /// Create a block metadata key
     pub fn block(block_num: u64) -> Self {
         let mut key = Vec::with_capacity(9);
         key.push(b'b');
         key.extend_from_slice(&block_num.to_be_bytes()); // Big-endian for sorting
-        Self(key)
-    }
-
-    /// Create a disk usage key
-    pub fn disk_usage(disk_id: &[u8; 16]) -> Self {
-        let mut key = Vec::with_capacity(17);
-        key.push(b'd');
-        key.extend_from_slice(disk_id);
         Self(key)
     }
 
@@ -171,41 +145,6 @@ impl PartialOrd for MetadataKey {
 impl AsRef<[u8]> for MetadataKey {
     fn as_ref(&self) -> &[u8] {
         &self.0
-    }
-}
-
-/// Shard metadata stored on this OSD
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ShardMeta {
-    /// Object ID this shard belongs to
-    pub object_id: [u8; 16],
-    /// Shard position in the stripe (0..k+m-1)
-    pub shard_position: u8,
-    /// Block number where shard data starts
-    pub block_num: u64,
-    /// Shard data size in bytes
-    pub size: u64,
-    /// CRC32C checksum of shard data
-    pub checksum: u32,
-    /// Creation timestamp (unix millis)
-    pub created_at: u64,
-    /// Last verified timestamp (for scrubbing)
-    pub last_verified: u64,
-    /// Shard type: 0=Data, 1=LocalParity, 2=GlobalParity
-    pub shard_type: u8,
-    /// Local group index for LRC (255 = no group / global)
-    pub local_group: u8,
-}
-
-impl ShardMeta {
-    /// Serialize to bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
-    }
-
-    /// Deserialize from bytes
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
     }
 }
 
@@ -358,34 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_meta_roundtrip() {
-        let meta = ShardMeta {
-            object_id: [1u8; 16],
-            shard_position: 0,
-            block_num: 42,
-            size: 1024,
-            checksum: 0xDEADBEEF,
-            created_at: 1234567890,
-            last_verified: 1234567890,
-            shard_type: 0,
-            local_group: 255,
-        };
-
-        let bytes = meta.to_bytes();
-        let parsed = ShardMeta::from_bytes(&bytes).unwrap();
-
-        assert_eq!(parsed.object_id, meta.object_id);
-        assert_eq!(parsed.block_num, meta.block_num);
-        assert_eq!(parsed.checksum, meta.checksum);
-    }
-
-    #[test]
     fn test_metadata_entry_roundtrip() {
-        let entry = MetadataEntry::new(
-            MetadataKey::shard(&[1u8; 16], 0),
-            b"test value".to_vec(),
-            100,
-        );
+        let entry = MetadataEntry::new(MetadataKey::block(1), b"test value".to_vec(), 100);
 
         let bytes = entry.to_bytes();
         let parsed = MetadataEntry::from_bytes(&bytes).unwrap();

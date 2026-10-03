@@ -5,7 +5,7 @@
 
 use super::btree::{BTreeConfig, BTreeIndex};
 use super::cache::ArcCache;
-use super::types::{MetadataKey, MetadataOp, ShardMeta};
+use super::types::{MetadataKey, MetadataOp};
 use super::wal::{MetadataWal, WalConfig};
 use objectio_common::{Error, Result};
 use parking_lot::{Condvar, Mutex};
@@ -202,13 +202,6 @@ impl MetadataStore {
         Ok(lsn)
     }
 
-    /// Put shard metadata
-    pub fn put_shard(&self, meta: &ShardMeta) -> Result<u64> {
-        let key = MetadataKey::shard(&meta.object_id, meta.shard_position);
-        let value = meta.to_bytes();
-        self.put(key, value)
-    }
-
     /// Delete a key
     pub fn delete(&self, key: &MetadataKey) -> Result<u64> {
         // 1. Write to WAL
@@ -240,12 +233,6 @@ impl MetadataStore {
         }
 
         None
-    }
-
-    /// Get shard metadata
-    pub fn get_shard(&self, object_id: &[u8; 16], shard_position: u8) -> Option<ShardMeta> {
-        let key = MetadataKey::shard(object_id, shard_position);
-        self.get(&key).and_then(|v| ShardMeta::from_bytes(&v))
     }
 
     /// Check if a key exists
@@ -306,20 +293,6 @@ impl MetadataStore {
     /// Scan entries with a key prefix
     pub fn scan_prefix(&self, prefix: &MetadataKey) -> Vec<(MetadataKey, Vec<u8>)> {
         self.index.scan_prefix(prefix)
-    }
-
-    /// Scan shards for an object
-    pub fn scan_object_shards(&self, object_id: &[u8; 16]) -> Vec<ShardMeta> {
-        // Prefix is 's' + object_id (17 bytes total)
-        let mut prefix_bytes = vec![b's'];
-        prefix_bytes.extend_from_slice(object_id);
-        let prefix_key = MetadataKey::from_bytes(prefix_bytes);
-
-        self.index
-            .scan_prefix(&prefix_key)
-            .iter()
-            .filter_map(|(_, v)| ShardMeta::from_bytes(v))
-            .collect()
     }
 
     /// Force a snapshot to disk
@@ -688,66 +661,6 @@ mod tests {
                 Some(b"value_125".to_vec())
             );
         }
-    }
-
-    #[test]
-    fn test_store_shard_metadata() {
-        let dir = tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let store = MetadataStore::create(config).unwrap();
-
-        let meta = ShardMeta {
-            object_id: [1u8; 16],
-            shard_position: 0,
-            block_num: 42,
-            size: 1024,
-            checksum: 0xDEADBEEF,
-            created_at: 1234567890,
-            last_verified: 1234567890,
-            shard_type: 0,
-            local_group: 255,
-        };
-
-        store.put_shard(&meta).unwrap();
-
-        let retrieved = store.get_shard(&[1u8; 16], 0).unwrap();
-        assert_eq!(retrieved.block_num, 42);
-        assert_eq!(retrieved.checksum, 0xDEADBEEF);
-    }
-
-    #[test]
-    fn test_store_scan_object_shards() {
-        let dir = tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let store = MetadataStore::create(config).unwrap();
-
-        let object_id = [1u8; 16];
-
-        // Add 6 shards for the object
-        for pos in 0..6 {
-            let meta = ShardMeta {
-                object_id,
-                shard_position: pos,
-                block_num: 100 + pos as u64,
-                size: 1024,
-                checksum: pos as u32,
-                created_at: 1234567890,
-                last_verified: 1234567890,
-                shard_type: if pos < 4 { 0 } else { 2 }, // 4 data + 2 parity
-                local_group: 255,
-            };
-            store.put_shard(&meta).unwrap();
-        }
-
-        // Scan
-        let shards = store.scan_object_shards(&object_id);
-        assert_eq!(shards.len(), 6);
-
-        // Verify positions
-        let positions: Vec<u8> = shards.iter().map(|s| s.shard_position).collect();
-        assert_eq!(positions, vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
