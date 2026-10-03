@@ -1065,6 +1065,15 @@ impl MetaService {
                         CasTable::Named(ref t) if t == "stripe_refs" => {
                             svc.apply_stripe_refs_event(&key, new_value.as_deref());
                         }
+                        CasTable::Named(ref t) if t == OSD_NODES_TABLE => {
+                            svc.apply_osd_node_event(&key, new_value.as_deref());
+                        }
+                        CasTable::Named(ref t) if t == KMS_KEYS_TABLE => {
+                            svc.apply_kms_key_event(&key, new_value.as_deref());
+                        }
+                        CasTable::Named(ref t) if t == MULTIPART_TABLE => {
+                            svc.apply_multipart_event(&key, new_value.as_deref());
+                        }
                         CasTable::Named(ref t) if block_meta::TABLES.contains(&t.as_str()) => {
                             svc.apply_block_event(t, &key, new_value.as_deref());
                         }
@@ -1295,6 +1304,198 @@ impl MetaService {
             Ok(true)
         } else {
             Err(Status::unavailable("no store"))
+        }
+    }
+
+    /// Write `writes` — `(table, key, value)`, `None` to delete — through
+    /// Raft, so every meta node holds them, not just this one. Each is
+    /// set over whatever the store holds now (last writer wins), as one
+    /// compare-and-set retried on conflict. Without Raft (in-memory tests,
+    /// store-only mode) they go to the store directly.
+    pub(crate) async fn replicate(
+        &self,
+        writes: Vec<(&'static str, String, Option<Vec<u8>>)>,
+        what: &str,
+    ) -> Result<(), Status> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        if self.raft_handle().is_none() {
+            for (table, key, value) in &writes {
+                store.write_named(table, key, value.as_deref());
+            }
+            return Ok(());
+        }
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
+            let ops = writes
+                .iter()
+                .map(|(table, key, value)| objectio_meta_store::CasOp {
+                    table: CasTable::Named((*table).into()),
+                    key: key.clone(),
+                    expected: store.read_named(table, key),
+                    new_value: value.clone(),
+                })
+                .collect();
+            if self.cas_many(ops, what).await? {
+                return Ok(());
+            }
+        }
+        Err(Status::aborted(format!("{what}: kept changing; retry")))
+    }
+
+    /// Read, change and write one multipart upload as a unit: through Raft
+    /// as a compare-and-set against the record read (retried when it
+    /// changed meanwhile), so every meta node has it and a racing
+    /// completion, abort or part upload can't be lost; without Raft, under
+    /// the in-memory lock. `change` gets the upload as it stands (`None`:
+    /// there is none) and returns what it becomes (`None`: removed) and a
+    /// result. It may run more than once.
+    async fn update_multipart<T>(
+        &self,
+        upload_id: &str,
+        what: &str,
+        change: impl Fn(
+            Option<MultipartUploadState>,
+        ) -> Result<(Option<MultipartUploadState>, T), Status>,
+    ) -> Result<T, Status> {
+        let store = self.store.as_ref().filter(|_| self.raft_handle().is_some());
+        let Some(store) = store else {
+            let mut uploads = self.multipart_uploads.write();
+            let (new, out) = change(uploads.get(upload_id).cloned())?;
+            match &new {
+                Some(u) => {
+                    uploads.insert(upload_id.to_string(), u.clone());
+                }
+                None => {
+                    uploads.remove(upload_id);
+                }
+            }
+            drop(uploads);
+            if let Some(store) = &self.store {
+                match &new {
+                    Some(u) => store.put_multipart_upload(upload_id, u),
+                    None => store.delete_multipart_upload(upload_id),
+                }
+            }
+            return Ok(out);
+        };
+        for attempt in 0..CAS_ATTEMPTS {
+            if attempt > 0 {
+                contention_backoff(attempt).await;
+            }
+            let stored = store.read_named(MULTIPART_TABLE, upload_id);
+            let current = match &stored {
+                Some(bytes) => Some(
+                    bincode::deserialize::<MultipartUploadState>(bytes)
+                        .map_err(|e| Status::internal(format!("multipart decode: {e}")))?,
+                ),
+                None => None,
+            };
+            let (new, out) = change(current)?;
+            let new_bytes = match &new {
+                Some(u) => Some(
+                    bincode::serialize(u)
+                        .map_err(|e| Status::internal(format!("multipart encode: {e}")))?,
+                ),
+                None => None,
+            };
+            if new_bytes == stored {
+                return Ok(out);
+            }
+            let ok = self
+                .cas_many(
+                    vec![objectio_meta_store::CasOp {
+                        table: CasTable::Named(MULTIPART_TABLE.into()),
+                        key: upload_id.to_string(),
+                        expected: stored,
+                        new_value: new_bytes,
+                    }],
+                    what,
+                )
+                .await?;
+            if ok {
+                // The apply listener mirrors it too; this makes it visible
+                // to the next call on this node at once.
+                match new {
+                    Some(u) => {
+                        self.multipart_uploads
+                            .write()
+                            .insert(upload_id.to_string(), u);
+                    }
+                    None => {
+                        self.multipart_uploads.write().remove(upload_id);
+                    }
+                }
+                return Ok(out);
+            }
+        }
+        Err(Status::aborted(format!(
+            "{what}: the upload kept changing; retry"
+        )))
+    }
+
+    /// Mirror a replicated OSD record into this node's caches.
+    fn apply_osd_node_event(&self, key: &str, new_value: Option<&[u8]>) {
+        match new_value {
+            Some(bytes) => match OsdNode::decode(bytes) {
+                Ok(node) => {
+                    {
+                        let mut nodes = self.osd_nodes.write();
+                        // A replacement at the same address (lost state, new
+                        // id) supersedes the old entry, as registration does.
+                        nodes.retain(|n| n.node_id == node.node_id || n.address != node.address);
+                        match nodes.iter_mut().find(|n| n.node_id == node.node_id) {
+                            Some(existing) => *existing = node.clone(),
+                            None => nodes.push(node.clone()),
+                        }
+                    }
+                    self.refresh_topology_node(&node);
+                }
+                Err(e) => warn!("apply: decode OsdNode('{key}') failed: {e}"),
+            },
+            None => {
+                let Ok(id) = hex::decode(key) else { return };
+                self.osd_nodes
+                    .write()
+                    .retain(|n| n.node_id.as_slice() != id.as_slice());
+                if let Ok(id) = <[u8; 16]>::try_from(id.as_slice()) {
+                    self.topology.write().remove_node(NodeId::from_bytes(id));
+                }
+            }
+        }
+    }
+
+    /// Mirror a replicated KMS key into this node's cache.
+    fn apply_kms_key_event(&self, key: &str, new_value: Option<&[u8]>) {
+        use prost::Message;
+        match new_value {
+            Some(bytes) => match objectio_proto::metadata::KmsKey::decode(bytes) {
+                Ok(k) => {
+                    self.kms_keys.write().insert(key.to_string(), k);
+                }
+                Err(e) => warn!("apply: decode KmsKey('{key}') failed: {e}"),
+            },
+            None => {
+                self.kms_keys.write().remove(key);
+            }
+        }
+    }
+
+    /// Mirror a replicated multipart upload into this node's cache.
+    fn apply_multipart_event(&self, key: &str, new_value: Option<&[u8]>) {
+        match new_value {
+            Some(bytes) => match bincode::deserialize::<MultipartUploadState>(bytes) {
+                Ok(u) => {
+                    self.multipart_uploads.write().insert(key.to_string(), u);
+                }
+                Err(e) => warn!("apply: decode multipart upload('{key}') failed: {e}"),
+            },
+            None => {
+                self.multipart_uploads.write().remove(key);
+            }
         }
     }
 
@@ -2979,6 +3180,65 @@ impl MetaService {
     }
 
     /// Create admin user if no users exist
+    /// The admin's first key, once the admin exists with one.
+    pub fn admin_credentials(&self, admin_name: &str) -> Option<(String, String)> {
+        let admin = self
+            .users
+            .read()
+            .values()
+            .find(|u| u.display_name == admin_name && u.tenant.is_empty())
+            .cloned()?;
+        let keys = self.user_keys.read();
+        let first = keys.get(&admin.user_id)?.first()?;
+        self.access_keys
+            .read()
+            .get(first)
+            .map(|k| (k.access_key_id.clone(), k.secret_access_key.clone()))
+    }
+
+    /// Create the bootstrap admin and its key through the ordinary,
+    /// replicated user and key calls — on the leader, when there are no
+    /// users yet (or the admin lost the race to get its key: a leader that
+    /// died between the two).
+    pub async fn create_admin(&self, admin_name: &str) -> Result<(), Status> {
+        use objectio_proto::metadata::metadata_service_server::MetadataService as _;
+        let existing = self
+            .users
+            .read()
+            .values()
+            .find(|u| u.display_name == admin_name && u.tenant.is_empty())
+            .map(|u| u.user_id.clone());
+        let user_id = match existing {
+            Some(id) => id,
+            None if self.users.read().is_empty() => self
+                .create_user(Request::new(CreateUserRequest {
+                    display_name: admin_name.to_string(),
+                    email: String::new(),
+                    tenant: String::new(),
+                }))
+                .await?
+                .into_inner()
+                .user
+                .map(|u| u.user_id)
+                .ok_or_else(|| Status::internal("created the admin, but got no user back"))?,
+            // Users exist and none is the admin: an operator's choice.
+            None => return Ok(()),
+        };
+        if self
+            .user_keys
+            .read()
+            .get(&user_id)
+            .is_none_or(Vec::is_empty)
+        {
+            self.create_access_key(Request::new(CreateAccessKeyRequest {
+                user_id,
+                ..Default::default()
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
     pub fn ensure_admin(&self, admin_name: &str) -> Option<(String, String)> {
         let users = self.users.read();
         if !users.is_empty() {
@@ -3540,6 +3800,11 @@ fn iam_key(tenant: &str, name: &str) -> String {
 const ROLES_TABLE: &str = "iam_roles";
 
 /// Small-object packs, by pack id (hex): prost `PackRecord`.
+/// Tables written through Raft by name ([`MetaService::replicate`]); the
+/// same tables the store loads them from.
+const OSD_NODES_TABLE: &str = "osd_nodes";
+const KMS_KEYS_TABLE: &str = "kms_keys";
+const MULTIPART_TABLE: &str = "multipart_uploads";
 const PACKS_TABLE: &str = "packs";
 
 /// Drained OSDs' purge state, by node id (hex): "pending" until the OSD
@@ -4610,6 +4875,7 @@ impl MetadataService for MetaService {
         Ok(response)
     }
 
+    #[allow(clippy::result_large_err)]
     async fn create_multipart_upload(
         &self,
         request: Request<CreateMultipartUploadRequest>,
@@ -4639,13 +4905,10 @@ impl MetadataService for MetaService {
             customer_key_md5: req.customer_key_md5.clone(),
             encryption_context: req.encryption_context.clone(),
         };
-        self.multipart_uploads
-            .write()
-            .insert(upload_id.clone(), state.clone());
-
-        if let Some(store) = &self.store {
-            store.put_multipart_upload(&upload_id, &state);
-        }
+        self.update_multipart(&upload_id, "create-multipart", |_| {
+            Ok((Some(state.clone()), ()))
+        })
+        .await?;
 
         info!(
             "Created multipart upload: bucket={}, key={}, upload_id={}, sse_algo={}",
@@ -4692,6 +4955,7 @@ impl MetadataService for MetaService {
         }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn register_part(
         &self,
         request: Request<RegisterPartRequest>,
@@ -4707,22 +4971,10 @@ impl MetadataService for MetaService {
 
         let now = Self::current_timestamp();
 
-        // Find and update the multipart upload
-        let mut uploads = self.multipart_uploads.write();
-        let upload = uploads.get_mut(&req.upload_id).ok_or_else(|| {
-            Status::not_found(format!("multipart upload not found: {}", req.upload_id))
-        })?;
-
-        // Verify bucket/key match
-        if upload.bucket != req.bucket || upload.key != req.key {
-            return Err(Status::invalid_argument(
-                "bucket/key mismatch for upload_id",
-            ));
-        }
-
         // Register the part (overwrites if same part_number uploaded again)
         let (checksum_algorithm, checksum) = req
             .checksum
+            .clone()
             .map(|c| (c.algorithm, c.value))
             .unwrap_or_default();
         let part_state = PartState {
@@ -4732,16 +4984,24 @@ impl MetadataService for MetaService {
             last_modified: now,
             checksum_algorithm,
             checksum,
-            stripes: req.stripes, // Multiple stripes for large parts
+            stripes: req.stripes.clone(), // Multiple stripes for large parts
         };
         // The part this replaces is referenced by nothing once the insert
         // lands; hand its stripes back so the gateway can free them.
-        let replaced = upload.parts.insert(req.part_number, part_state);
-
-        // Persist entire upload state (includes new part)
-        if let Some(store) = &self.store {
-            store.put_multipart_upload(&req.upload_id, upload);
-        }
+        let replaced = self
+            .update_multipart(&req.upload_id, "register-part", |upload| {
+                let mut upload = upload.ok_or_else(|| {
+                    Status::not_found(format!("multipart upload not found: {}", req.upload_id))
+                })?;
+                if upload.bucket != req.bucket || upload.key != req.key {
+                    return Err(Status::invalid_argument(
+                        "bucket/key mismatch for upload_id",
+                    ));
+                }
+                let replaced = upload.parts.insert(req.part_number, part_state.clone());
+                Ok((Some(upload), replaced))
+            })
+            .await?;
 
         debug!(
             "Registered part {} for upload {}: size={}, etag={}",
@@ -4818,135 +5078,33 @@ impl MetadataService for MetaService {
 
     /// Complete multipart upload
     /// Validates parts and builds final object metadata with all stripes
+    #[allow(clippy::result_large_err)]
     async fn complete_multipart_upload(
         &self,
         request: Request<CompleteMultipartUploadRequest>,
     ) -> Result<Response<CompleteMultipartUploadResponse>, Status> {
         let req = request.into_inner();
 
-        // Validate and take the upload in one step under the write lock. A
-        // read-then-remove let an abort, or a part re-upload, land in
-        // between: the abort freed parts this completion went on to use, and
-        // a re-uploaded part was dropped with the upload, unreferenced.
-        let mut uploads = self.multipart_uploads.write();
-        let upload = uploads.get(&req.upload_id).ok_or_else(|| {
-            Status::not_found(format!("multipart upload not found: {}", req.upload_id))
-        })?;
-
-        // Verify bucket/key match
-        if upload.bucket != req.bucket || upload.key != req.key {
-            return Err(Status::invalid_argument(
-                "bucket/key mismatch for upload_id",
-            ));
-        }
-
-        // Validate that all requested parts exist and ETags match
-        let mut stripes = Vec::new();
-        let mut total_size = 0u64;
-
-        for (i, part_info) in req.parts.iter().enumerate() {
-            let stored_part = upload.parts.get(&part_info.part_number).ok_or_else(|| {
-                Status::invalid_argument(format!("part {} not found", part_info.part_number))
-            })?;
-            // Every part but the last is at least 5 MiB, as S3 requires.
-            if i + 1 < req.parts.len() && stored_part.size < 5 * 1024 * 1024 {
-                return Err(Status::invalid_argument(format!(
-                    "EntityTooSmall: part {} is {} bytes; all parts but the last must be at least 5 MiB",
-                    part_info.part_number, stored_part.size
-                )));
-            }
-
-            // Verify ETag matches (normalize by removing quotes)
-            let req_etag = part_info.etag.trim_matches('"');
-            let stored_etag = stored_part.etag.trim_matches('"');
-            if req_etag != stored_etag {
-                return Err(Status::invalid_argument(format!(
-                    "ETag mismatch for part {}: expected {}, got {}",
-                    part_info.part_number, stored_etag, req_etag
-                )));
-            }
-
-            total_size += stored_part.size;
-
-            // Add all stripes for this part (large parts may have multiple stripes)
-            stripes.extend(stored_part.stripes.clone());
-        }
-
-        // Calculate multipart ETag: MD5 of concatenated part MD5s + "-" + part count
-        let final_etag = {
-            let mut concatenated_hashes = Vec::new();
-            for part_info in &req.parts {
-                if let Some(stored_part) = upload.parts.get(&part_info.part_number) {
-                    // Decode hex ETag and add to concatenated bytes
-                    let etag_clean = stored_part.etag.trim_matches('"');
-                    if let Ok(bytes) = hex::decode(etag_clean) {
-                        concatenated_hashes.extend(bytes);
-                    }
-                }
-            }
-            let hash = md5::compute(&concatenated_hashes);
-            format!("\"{:x}-{}\"", hash, req.parts.len())
-        };
-
-        let object_id = *Uuid::now_v7().as_bytes();
-        let now = Self::current_timestamp();
-
-        let object = ObjectMeta {
-            bucket: req.bucket.clone(),
-            key: req.key.clone(),
-            object_id: object_id.to_vec(),
-            size: total_size,
-            etag: final_etag,
-            content_type: upload.content_type.clone(),
-            created_at: upload.initiated,
-            modified_at: now,
-            storage_class: "STANDARD".to_string(),
-            user_metadata: upload.user_metadata.clone(),
-            version_id: String::new(),
-            is_delete_marker: false,
-            stripes,
-            retention: None,
-            legal_hold: None,
-            // Multipart SSE: each stripe carries its own IV; the object-level
-            // fields just record the algorithm + wrapped DEK so GET knows
-            // how to unwrap and which algorithm to advertise on responses.
-            encryption_algorithm: upload.encryption_algorithm,
-            kms_key_id: upload.kms_key_id.clone(),
-            encrypted_dek: upload.encrypted_dek.clone(),
-            encryption_iv: Vec::new(),
-            // SSE-KMS: the context the DEK was wrapped under, needed to
-            // unwrap it. SSE-C: what identifies the customer's key. Both
-            // used to be dropped here, so a multipart object's DEK
-            // couldn't be unwrapped under a context, and any key read it.
-            encryption_context: upload.encryption_context.clone(),
-            ..Default::default()
-        };
-
-        // Parts uploaded but not named in the completion belong to nothing
-        // once the upload is gone.
-        let used: std::collections::HashSet<u32> =
-            req.parts.iter().map(|p| p.part_number).collect();
-        let unused_stripes: Vec<_> = upload
-            .parts
-            .values()
-            .filter(|p| !used.contains(&p.part_number))
-            .flat_map(|p| p.stripes.iter().cloned())
-            .collect();
-
-        // Remove the completed upload from state
-        uploads.remove(&req.upload_id);
-        drop(uploads);
-
-        if let Some(store) = &self.store {
-            store.delete_multipart_upload(&req.upload_id);
-        }
+        // Validate and take the upload in one step (a compare-and-set
+        // through Raft, or under the lock): a read-then-remove let an
+        // abort, or a part re-upload, land in between — the abort freed
+        // parts this completion went on to use, and a re-uploaded part was
+        // dropped with the upload, unreferenced.
+        let (object, unused_stripes) = self
+            .update_multipart(&req.upload_id, "complete-multipart", |upload| {
+                let upload = upload.ok_or_else(|| {
+                    Status::not_found(format!("multipart upload not found: {}", req.upload_id))
+                })?;
+                Ok((None, complete_upload(&upload, &req)?))
+            })
+            .await?;
 
         info!(
             "Completed multipart upload: bucket={}, key={}, upload_id={}, size={}, parts={}",
             req.bucket,
             req.key,
             req.upload_id,
-            total_size,
+            object.size,
             req.parts.len()
         );
 
@@ -4956,6 +5114,7 @@ impl MetadataService for MetaService {
         }))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn abort_multipart_upload(
         &self,
         request: Request<AbortMultipartUploadRequest>,
@@ -4964,24 +5123,16 @@ impl MetadataService for MetaService {
 
         // Remove the upload from state. Only the bucket/key it was started
         // for may abort it: the caller frees every part it held.
-        let removed = {
-            let mut uploads = self.multipart_uploads.write();
-            if uploads
-                .get(&req.upload_id)
-                .is_some_and(|u| u.bucket != req.bucket || u.key != req.key)
-            {
-                return Err(Status::not_found(format!(
-                    "multipart upload not found: {}",
-                    req.upload_id
-                )));
-            }
-            uploads.remove(&req.upload_id)
-        };
+        let removed = self
+            .update_multipart(&req.upload_id, "abort-multipart", |upload| match upload {
+                Some(u) if u.bucket != req.bucket || u.key != req.key => Err(Status::not_found(
+                    format!("multipart upload not found: {}", req.upload_id),
+                )),
+                other => Ok((None, other)),
+            })
+            .await?;
 
         if removed.is_some() {
-            if let Some(store) = &self.store {
-                store.delete_multipart_upload(&req.upload_id);
-            }
             info!(
                 "Aborted multipart upload: bucket={}, key={}, upload_id={}",
                 req.bucket, req.key, req.upload_id
@@ -5308,47 +5459,49 @@ impl MetadataService for MetaService {
         // state gets a new node_id on restart, but still advertises the
         // same hostname. Treat "same address, different node_id" as a
         // replacement so the topology doesn't accumulate ghosts.
-        let mut nodes = self.osd_nodes.write();
-        let mut evicted_ids: Vec<[u8; 16]> = Vec::new();
-        if let Some(existing) = nodes.iter_mut().find(|n| n.node_id == node_id) {
-            existing.address = node.address.clone();
-            existing.disk_ids = node.disk_ids.clone();
-            existing.disk_capacity_bytes = node.disk_capacity_bytes.clone();
-            existing.failure_domain = node.failure_domain.clone();
-            existing.topology = node.topology.clone();
-            existing.te_segment = node.te_segment.clone();
-            info!(
-                "Updated OSD registration: {} at {}",
-                hex::encode(node_id),
-                req.address
-            );
-        } else {
-            // Evict any existing entry at the same address (stale node_id
-            // from a prior OSD process) so the tree shows live nodes only.
-            nodes.retain(|n| {
-                if n.address == req.address && n.node_id != node_id {
-                    evicted_ids.push(n.node_id);
-                    false
-                } else {
-                    true
-                }
-            });
-            if !evicted_ids.is_empty() {
+        let evicted_ids = {
+            let mut nodes = self.osd_nodes.write();
+            let mut evicted_ids: Vec<[u8; 16]> = Vec::new();
+            if let Some(existing) = nodes.iter_mut().find(|n| n.node_id == node_id) {
+                existing.address = node.address.clone();
+                existing.disk_ids = node.disk_ids.clone();
+                existing.disk_capacity_bytes = node.disk_capacity_bytes.clone();
+                existing.failure_domain = node.failure_domain.clone();
+                existing.topology = node.topology.clone();
+                existing.te_segment = node.te_segment.clone();
                 info!(
-                    "Evicted {} stale OSD entry/entries at address {} (node_id changed)",
-                    evicted_ids.len(),
+                    "Updated OSD registration: {} at {}",
+                    hex::encode(node_id),
                     req.address
                 );
+            } else {
+                // Evict any existing entry at the same address (stale node_id
+                // from a prior OSD process) so the tree shows live nodes only.
+                nodes.retain(|n| {
+                    if n.address == req.address && n.node_id != node_id {
+                        evicted_ids.push(n.node_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if !evicted_ids.is_empty() {
+                    info!(
+                        "Evicted {} stale OSD entry/entries at address {} (node_id changed)",
+                        evicted_ids.len(),
+                        req.address
+                    );
+                }
+                info!(
+                    "Registered new OSD: {} at {} with {} disks",
+                    hex::encode(node_id),
+                    req.address,
+                    num_disks
+                );
+                nodes.push(node.clone());
             }
-            info!(
-                "Registered new OSD: {} at {} with {} disks",
-                hex::encode(node_id),
-                req.address,
-                num_disks
-            );
-            nodes.push(node.clone());
-        }
-        drop(nodes);
+            evicted_ids
+        };
 
         // Also drop the stale node_ids from the CRUSH topology so listings
         // and placement see a clean view.
@@ -5371,11 +5524,23 @@ impl MetadataService for MetaService {
         // `update_topology_with_node`.
         self.update_topology_with_node(&node);
 
-        // Persist OSD + topology
-        if let Some(store) = &self.store {
-            let topology = self.topology.read().clone();
-            store.put_osd_and_topology(&hex::encode(node_id), &node, &topology);
-        }
+        // Persist through Raft, so a new leader knows every OSD (it used to
+        // know only those that registered with it: none, after failover).
+        // The topology is rebuilt from the OSD records on load.
+        let mut writes = vec![(
+            OSD_NODES_TABLE,
+            hex::encode(node_id),
+            Some(
+                bincode::serialize(&node)
+                    .map_err(|e| Status::internal(format!("OSD encode: {e}")))?,
+            ),
+        )];
+        writes.extend(
+            evicted_ids
+                .iter()
+                .map(|id| (OSD_NODES_TABLE, hex::encode(id), None)),
+        );
+        self.replicate(writes, "register-osd").await?;
 
         // Get current topology version
         let topology_version = self.topology.read().version;
@@ -12184,8 +12349,7 @@ impl MetadataService for MetaService {
             req.key_id.trim().to_string()
         };
         let now = Self::current_timestamp();
-        let mut map = self.kms_keys.write();
-        if map.contains_key(&key_id) {
+        if self.kms_keys.read().contains_key(&key_id) {
             return Err(Status::already_exists(format!(
                 "KMS key '{key_id}' already exists"
             )));
@@ -12200,10 +12364,30 @@ impl MetadataService for MetaService {
             updated_at: now,
             created_by: req.created_by,
         };
-        if let Some(store) = &self.store {
+        // Through Raft: a key only the old leader held would leave every
+        // object encrypted under it unreadable after a failover. Created
+        // only if no key has the id (compare-and-set against nothing).
+        if self.raft_handle().is_some() {
+            let created = self
+                .cas_many(
+                    vec![objectio_meta_store::CasOp {
+                        table: CasTable::Named(KMS_KEYS_TABLE.into()),
+                        key: key_id.clone(),
+                        expected: None,
+                        new_value: Some(key.encode_to_vec()),
+                    }],
+                    "create-kms-key",
+                )
+                .await?;
+            if !created {
+                return Err(Status::already_exists(format!(
+                    "KMS key '{key_id}' already exists"
+                )));
+            }
+        } else if let Some(store) = &self.store {
             store.put_kms_key(&key_id, &key.encode_to_vec());
         }
-        map.insert(key_id.clone(), key.clone());
+        self.kms_keys.write().insert(key_id.clone(), key.clone());
         info!("Created KMS key '{key_id}'");
         Ok(Response::new(CreateKmsKeyResponse { key: Some(key) }))
     }
@@ -12260,11 +12444,14 @@ impl MetadataService for MetaService {
         request: Request<DeleteKmsKeyRequest>,
     ) -> Result<Response<DeleteKmsKeyResponse>, Status> {
         let key_id = request.into_inner().key_id;
-        let removed = self.kms_keys.write().remove(&key_id).is_some();
+        let removed = self.kms_keys.read().contains_key(&key_id);
         if removed {
-            if let Some(store) = &self.store {
-                store.delete_kms_key(&key_id);
-            }
+            self.replicate(
+                vec![(KMS_KEYS_TABLE, key_id.clone(), None)],
+                "delete-kms-key",
+            )
+            .await?;
+            self.kms_keys.write().remove(&key_id);
             info!("Deleted KMS key '{key_id}'");
         }
         Ok(Response::new(DeleteKmsKeyResponse { success: removed }))
@@ -13001,6 +13188,116 @@ fn eligible_disks(nodes: &[OsdNode]) -> Vec<(&OsdNode, &[u8; 16])> {
         .filter(|node| node.admin_state == objectio_common::OsdAdminState::In)
         .flat_map(|node| node.disk_ids.iter().map(move |disk_id| (node, disk_id)))
         .collect()
+}
+
+/// Check a completion against `upload` and build the object it makes:
+/// every part named exists with its ETag, all but the last at least 5 MiB.
+/// Returns the object and the stripes of parts left out of it.
+#[allow(clippy::result_large_err)]
+fn complete_upload(
+    upload: &MultipartUploadState,
+    req: &CompleteMultipartUploadRequest,
+) -> Result<(ObjectMeta, Vec<objectio_proto::metadata::StripeMeta>), Status> {
+    // Verify bucket/key match
+    if upload.bucket != req.bucket || upload.key != req.key {
+        return Err(Status::invalid_argument(
+            "bucket/key mismatch for upload_id",
+        ));
+    }
+
+    // Validate that all requested parts exist and ETags match
+    let mut stripes = Vec::new();
+    let mut total_size = 0u64;
+
+    for (i, part_info) in req.parts.iter().enumerate() {
+        let stored_part = upload.parts.get(&part_info.part_number).ok_or_else(|| {
+            Status::invalid_argument(format!("part {} not found", part_info.part_number))
+        })?;
+        // Every part but the last is at least 5 MiB, as S3 requires.
+        if i + 1 < req.parts.len() && stored_part.size < 5 * 1024 * 1024 {
+            return Err(Status::invalid_argument(format!(
+                "EntityTooSmall: part {} is {} bytes; all parts but the last must be at least 5 MiB",
+                part_info.part_number, stored_part.size
+            )));
+        }
+
+        // Verify ETag matches (normalize by removing quotes)
+        let req_etag = part_info.etag.trim_matches('"');
+        let stored_etag = stored_part.etag.trim_matches('"');
+        if req_etag != stored_etag {
+            return Err(Status::invalid_argument(format!(
+                "ETag mismatch for part {}: expected {}, got {}",
+                part_info.part_number, stored_etag, req_etag
+            )));
+        }
+
+        total_size += stored_part.size;
+
+        // Add all stripes for this part (large parts may have multiple stripes)
+        stripes.extend(stored_part.stripes.clone());
+    }
+
+    // Calculate multipart ETag: MD5 of concatenated part MD5s + "-" + part count
+    let final_etag = {
+        let mut concatenated_hashes = Vec::new();
+        for part_info in &req.parts {
+            if let Some(stored_part) = upload.parts.get(&part_info.part_number) {
+                // Decode hex ETag and add to concatenated bytes
+                let etag_clean = stored_part.etag.trim_matches('"');
+                if let Ok(bytes) = hex::decode(etag_clean) {
+                    concatenated_hashes.extend(bytes);
+                }
+            }
+        }
+        let hash = md5::compute(&concatenated_hashes);
+        format!("\"{:x}-{}\"", hash, req.parts.len())
+    };
+
+    let object_id = *Uuid::now_v7().as_bytes();
+    let now = MetaService::current_timestamp();
+
+    let object = ObjectMeta {
+        bucket: req.bucket.clone(),
+        key: req.key.clone(),
+        object_id: object_id.to_vec(),
+        size: total_size,
+        etag: final_etag,
+        content_type: upload.content_type.clone(),
+        created_at: upload.initiated,
+        modified_at: now,
+        storage_class: "STANDARD".to_string(),
+        user_metadata: upload.user_metadata.clone(),
+        version_id: String::new(),
+        is_delete_marker: false,
+        stripes,
+        retention: None,
+        legal_hold: None,
+        // Multipart SSE: each stripe carries its own IV; the object-level
+        // fields just record the algorithm + wrapped DEK so GET knows
+        // how to unwrap and which algorithm to advertise on responses.
+        encryption_algorithm: upload.encryption_algorithm,
+        kms_key_id: upload.kms_key_id.clone(),
+        encrypted_dek: upload.encrypted_dek.clone(),
+        encryption_iv: Vec::new(),
+        // SSE-KMS: the context the DEK was wrapped under, needed to
+        // unwrap it. SSE-C: what identifies the customer's key. Both
+        // used to be dropped here, so a multipart object's DEK
+        // couldn't be unwrapped under a context, and any key read it.
+        encryption_context: upload.encryption_context.clone(),
+        ..Default::default()
+    };
+
+    // Parts uploaded but not named in the completion belong to nothing
+    // once the upload is gone.
+    let used: std::collections::HashSet<u32> = req.parts.iter().map(|p| p.part_number).collect();
+    let unused_stripes: Vec<_> = upload
+        .parts
+        .values()
+        .filter(|p| !used.contains(&p.part_number))
+        .flat_map(|p| p.stripes.iter().cloned())
+        .collect();
+
+    Ok((object, unused_stripes))
 }
 
 #[cfg(test)]

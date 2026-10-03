@@ -2653,8 +2653,10 @@ dependencies = [
  "prost",
  "prost-types",
  "serde_json",
+ "tokio",
  "tonic",
  "tonic-build",
+ "tower 0.4.13",
  "tower 0.5.3",
 ]
 

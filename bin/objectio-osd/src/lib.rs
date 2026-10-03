@@ -77,7 +77,8 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub init_blank_disks: bool,
 
-    /// Metadata service endpoint
+    /// Metadata service endpoint: one address, or every meta node's,
+    /// comma-separated
     #[arg(long)]
     pub meta_endpoint: Option<String>,
 
@@ -672,9 +673,11 @@ async fn register_with_meta(
     info!("Registering OSD with metadata service at {}", meta_endpoint);
 
     // Connect to metadata service
-    let mut client = MetadataServiceClient::connect(meta_endpoint.to_string())
-        .await
-        .map_err(|e| format!("Failed to connect to metadata service: {}", e))?;
+    let mut client = MetadataServiceClient::new(
+        objectio_proto::transport::meta_channel(meta_endpoint)
+            .await
+            .map_err(|e| format!("Failed to connect to metadata service: {e}"))?,
+    );
 
     // Call RegisterOsd RPC with failure domain + per-disk capacity (latter
     // feeds meta's cluster capacity accounting).

@@ -105,7 +105,7 @@ jobs:
         working-directory: console
         run: npm ci && npm run build
       - name: build the aio binary the tests drive
-        run: cargo build --bin objectio-aio --bin objectio-cli
+        run: cargo build --bin objectio-aio --bin objectio-cli --bin objectio-meta --bin objectio-osd --bin objectio-gateway
       - name: run
         run: cargo test --package objectio-e2e -- --test-threads=1 --nocapture
 

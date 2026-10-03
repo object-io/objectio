@@ -864,6 +864,28 @@ fn delete_refusal(path: &str, query: Option<&str>) -> Option<Response> {
 
 // ── Bucket tagging ───────────────────────────────────────────────────────────
 
+/// The response when a call to meta failed: 503 (retryable: S3 clients try
+/// again) when meta couldn't be reached or answer in time — a meta node
+/// lost, an election under way — and 500 otherwise.
+pub(crate) fn meta_failure(e: &tonic::Status, what: &str) -> Response {
+    if matches!(
+        e.code(),
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
+    ) {
+        S3Error::xml_response(
+            "ServiceUnavailable",
+            &format!("{what}: the metadata service is unavailable; retry"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+    } else {
+        S3Error::xml_response(
+            "InternalError",
+            &format!("{what}: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+    }
+}
+
 /// Bucket setting that holds the bucket's tags: a JSON array of
 /// `[key, value]` pairs, sorted by key.
 const BUCKET_TAGS_SETTING: &str = "tagging";
@@ -3742,11 +3764,7 @@ async fn copy_by_reference(
         Ok(r) => r.into_inner(),
         Err(e) => {
             back_out(state, format!("copy to {dest_bucket}/{dest_key}"));
-            return Some(S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to get placement: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ));
+            return Some(meta_failure(&e, "Failed to get placement"));
         }
     };
     let versioning_enabled = match bucket_versioning(&mut meta_client, dest_bucket).await {
@@ -5124,11 +5142,7 @@ pub async fn put_object(
         Ok(resp) => resp.into_inner(),
         Err(e) => {
             error!("Failed to get placement: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to get placement: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return meta_failure(&e, "Failed to get placement");
         }
     };
     phases.mark("meta_lookup");
@@ -6160,11 +6174,7 @@ async fn get_object_version_once(
         Ok(resp) => resp.into_inner(),
         Err(e) => {
             error!("Failed to get placement: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to get placement: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return meta_failure(&e, "Failed to get placement");
         }
     };
 
@@ -9482,11 +9492,7 @@ async fn upload_part_internal(
         Ok(resp) => resp.into_inner(),
         Err(e) => {
             error!("Failed to get placement for part: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to get placement: {}", e),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return meta_failure(&e, "Failed to get placement");
         }
     };
 
@@ -10108,11 +10114,7 @@ async fn complete_multipart_upload_internal(
                     Ok(resp) => resp.into_inner(),
                     Err(e) => {
                         error!("Failed to get placement for completed object: {}", e);
-                        return S3Error::xml_response(
-                            "InternalError",
-                            &e.to_string(),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
+                        return meta_failure(&e, "Failed to get placement");
                     }
                 };
 
@@ -12217,11 +12219,7 @@ pub(crate) async fn get_placement_nodes_for_object(
         }
         Err(e) => {
             error!("Failed to get placement: {}", e);
-            Err(S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
+            Err(meta_failure(&e, "Failed to get placement"))
         }
     }
 }
