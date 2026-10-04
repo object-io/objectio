@@ -73,10 +73,8 @@ impl DiskIndex {
             .map_err(storage_err("open"))?;
         let tx = db.begin_write().map_err(storage_err("open"))?;
         {
-            tx.open_table(ENTRIES)
-                .map_err(storage_err("open"))?;
-            tx.open_table(STATE)
-                .map_err(storage_err("open"))?;
+            tx.open_table(ENTRIES).map_err(storage_err("open"))?;
+            tx.open_table(STATE).map_err(storage_err("open"))?;
         }
         tx.commit().map_err(storage_err("open"))?;
         Ok(Self {
@@ -91,13 +89,8 @@ impl DiskIndex {
     /// The LSN through which the file holds every change: replay the WAL
     /// from the one after.
     pub fn checkpoint_lsn(&self) -> Result<u64> {
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(storage_err("read"))?;
-        let state = tx
-            .open_table(STATE)
-            .map_err(storage_err("read"))?;
+        let tx = self.db.begin_read().map_err(storage_err("read"))?;
+        let state = tx.open_table(STATE).map_err(storage_err("read"))?;
         Ok(state
             .get(CHECKPOINT_LSN)
             .map_err(storage_err("read"))?
@@ -142,13 +135,8 @@ impl DiskIndex {
         if let Some(v) = frozen.as_ref().and_then(|f| f.map.read().get(key).cloned()) {
             return Ok(v);
         }
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(storage_err("read"))?;
-        let entries = tx
-            .open_table(ENTRIES)
-            .map_err(storage_err("read"))?;
+        let tx = self.db.begin_read().map_err(storage_err("read"))?;
+        let entries = tx.open_table(ENTRIES).map_err(storage_err("read"))?;
         Ok(entries
             .get(key)
             .map_err(storage_err("read"))?
@@ -171,13 +159,8 @@ impl DiskIndex {
         }
         overlay.extend(active.range(prefix, after));
 
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(storage_err("scan"))?;
-        let entries = tx
-            .open_table(ENTRIES)
-            .map_err(storage_err("scan"))?;
+        let tx = self.db.begin_read().map_err(storage_err("scan"))?;
+        let entries = tx.open_table(ENTRIES).map_err(storage_err("scan"))?;
         let start = after.map_or(Bound::Included(prefix), Bound::Excluded);
         let mut file = entries
             .range::<&[u8]>((start, Bound::Unbounded))
@@ -196,7 +179,10 @@ impl DiskIndex {
             if take_mem {
                 let (k, v) = mem.next().expect("peeked");
                 // The memtable's entry replaces the file's.
-                if file.peek().is_some_and(|(fk, _)| fk.value() == k.as_slice()) {
+                if file
+                    .peek()
+                    .is_some_and(|(fk, _)| fk.value() == k.as_slice())
+                {
                     file.next();
                 }
                 if let Some(v) = v
@@ -233,16 +219,9 @@ impl DiskIndex {
                 overlay.insert(k.clone(), v.is_some());
             }
         }
-        let tx = self
-            .db
-            .begin_read()
-            .map_err(storage_err("count"))?;
-        let entries = tx
-            .open_table(ENTRIES)
-            .map_err(storage_err("count"))?;
-        let mut n = entries
-            .len()
-            .map_err(storage_err("count"))?;
+        let tx = self.db.begin_read().map_err(storage_err("count"))?;
+        let entries = tx.open_table(ENTRIES).map_err(storage_err("count"))?;
+        let mut n = entries.len().map_err(storage_err("count"))?;
         for (k, present) in overlay {
             let in_file = entries
                 .get(k.as_slice())
@@ -279,14 +258,9 @@ impl DiskIndex {
         let Some(frozen) = self.tables.read().frozen.clone() else {
             return Ok(());
         };
-        let tx = self
-            .db
-            .begin_write()
-            .map_err(storage_err("checkpoint"))?;
+        let tx = self.db.begin_write().map_err(storage_err("checkpoint"))?;
         {
-            let mut entries = tx
-                .open_table(ENTRIES)
-                .map_err(storage_err("checkpoint"))?;
+            let mut entries = tx.open_table(ENTRIES).map_err(storage_err("checkpoint"))?;
             for (k, v) in frozen.map.read().iter() {
                 match v {
                     Some(v) => entries.insert(k.as_slice(), v.as_slice()),
@@ -294,16 +268,13 @@ impl DiskIndex {
                 }
                 .map_err(storage_err("checkpoint"))?;
             }
-            let mut state = tx
-                .open_table(STATE)
-                .map_err(storage_err("checkpoint"))?;
+            let mut state = tx.open_table(STATE).map_err(storage_err("checkpoint"))?;
             state
                 .insert(CHECKPOINT_LSN, lsn)
                 .map_err(storage_err("checkpoint"))?;
         }
         // Durable (redb's default): the WAL is cut on the strength of it.
-        tx.commit()
-            .map_err(storage_err("checkpoint"))?;
+        tx.commit().map_err(storage_err("checkpoint"))?;
         self.tables.write().frozen = None;
         Ok(())
     }
@@ -383,7 +354,10 @@ mod tests {
         assert!(all.windows(2).all(|w| w[0] < w[1]));
         assert!(!all.contains(&b"k050".to_vec()));
 
-        assert_eq!(keys(&idx, b"k", Some(b"k096")), vec![b"k097".to_vec(), b"k098".to_vec(), b"k099".to_vec()]);
+        assert_eq!(
+            keys(&idx, b"k", Some(b"k096")),
+            vec![b"k097".to_vec(), b"k098".to_vec(), b"k099".to_vec()]
+        );
 
         let mut first = Vec::new();
         idx.for_each_prefix(b"k", None, |k, _| {
@@ -391,7 +365,10 @@ mod tests {
             first.len() < 3
         })
         .unwrap();
-        assert_eq!(first, vec![b"k000".to_vec(), b"k001".to_vec(), b"k002".to_vec()]);
+        assert_eq!(
+            first,
+            vec![b"k000".to_vec(), b"k001".to_vec(), b"k002".to_vec()]
+        );
     }
 
     #[test]

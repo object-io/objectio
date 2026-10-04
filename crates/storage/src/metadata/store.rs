@@ -343,9 +343,7 @@ impl MetadataStore {
                 {
                     let (lock, cv) = &*signal;
                     let mut guard = lock.lock();
-                    if !shutdown.load(Ordering::Relaxed)
-                        && !checkpoint_due(&wal, &index, &config)
-                    {
+                    if !shutdown.load(Ordering::Relaxed) && !checkpoint_due(&wal, &index, &config) {
                         cv.wait_for(&mut guard, interval);
                     }
                 }
