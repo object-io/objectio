@@ -309,6 +309,16 @@ service MetadataService {
     // This node's Prometheus exposition, so the gateway can serve it from
     // its own /metrics instead of every meta node needing a scrape target.
     rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+
+    // This node's wall clock, answered locally. Gateways compare theirs
+    // with it and refuse stamped writes while they differ by more than
+    // 500 ms (core/object-metadata-quorum.md, "Stamps").
+    rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
+}
+
+message GetTimeRequest {}
+message GetTimeResponse {
+    uint64 unix_millis = 1;
 }
 
 // Shared by MetadataService.GetMetrics and StorageService.GetMetrics.

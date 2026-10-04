@@ -11,6 +11,18 @@ impl MetadataService for MetaService {
         Self::get_metrics(self, _request).await
     }
 
+    async fn get_time(
+        &self,
+        _request: Request<objectio_proto::metadata::GetTimeRequest>,
+    ) -> Result<Response<objectio_proto::metadata::GetTimeResponse>, Status> {
+        let unix_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        Ok(Response::new(objectio_proto::metadata::GetTimeResponse {
+            unix_millis,
+        }))
+    }
+
     async fn create_bucket(
         &self,
         request: Request<CreateBucketRequest>,

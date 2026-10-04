@@ -961,6 +961,7 @@ impl OsdService {
             replaced: None,
             replaced_version_kept: false,
             superseded: false,
+            held_stamp: 0,
         }))
     }
 
@@ -1009,14 +1010,16 @@ impl OsdService {
         incoming.stamp != 0 && self.tombstone(bucket, key, version_id) >= incoming.stamp
     }
 
-    /// The answer to a write this copy already holds a newer one than.
-    fn superseded() -> Response<PutObjectMetaResponse> {
+    /// The answer to a write this copy already holds a newer one than:
+    /// `stored` (or a tombstone) at `held_stamp`.
+    fn superseded(held_stamp: u64) -> Response<PutObjectMetaResponse> {
         Response::new(PutObjectMetaResponse {
             success: true,
             timestamp: Self::current_timestamp(),
             replaced: None,
             replaced_version_kept: false,
             superseded: true,
+            held_stamp,
         })
     }
 
@@ -2087,7 +2090,12 @@ impl StorageService for OsdService {
                 if supersedes(prev.as_ref(), &object)
                     || self.deleted_since(&req.bucket, &req.key, &object.version_id, &object)
                 {
-                    return Ok(Self::superseded());
+                    let held = prev.as_ref().map_or(0, |p| p.stamp).max(self.tombstone(
+                        &req.bucket,
+                        &req.key,
+                        &object.version_id,
+                    ));
+                    return Ok(Self::superseded(held));
                 }
                 if req.version_only
                     && !Self::precondition_holds(
@@ -2116,6 +2124,7 @@ impl StorageService for OsdService {
                     replaced: None,
                     replaced_version_kept: false,
                     superseded: false,
+                    held_stamp: 0,
                 }));
             }
 
@@ -2126,7 +2135,12 @@ impl StorageService for OsdService {
                 && (supersedes(old.as_ref(), &object)
                     || self.deleted_since(&req.bucket, &req.key, "", &object))
             {
-                return Ok(Self::superseded());
+                let held = old.as_ref().map_or(0, |o| o.stamp).max(self.tombstone(
+                    &req.bucket,
+                    &req.key,
+                    "",
+                ));
+                return Ok(Self::superseded(held));
             }
             if !Self::precondition_holds(
                 old.as_ref(),
@@ -2207,6 +2221,7 @@ impl StorageService for OsdService {
                 replaced: old,
                 replaced_version_kept,
                 superseded: false,
+                held_stamp: 0,
             }))
         })
     }
@@ -2272,15 +2287,17 @@ impl StorageService for OsdService {
                 MetadataKey::object_version(&req.bucket, &req.key, &req.version_id)
             };
             if req.stamp != 0
-                && self
+                && let Some(held) = self
                     .stored_meta(&target)
-                    .is_some_and(|o| o.stamp > req.stamp)
+                    .map(|o| o.stamp)
+                    .filter(|&s| s > req.stamp)
             {
                 return Ok(Response::new(DeleteObjectMetaResponse {
                     success: true,
                     current: None,
                     removed: None,
                     superseded: true,
+                    held_stamp: held,
                 }));
             }
             // The tombstone goes first: a copy that crashed after it but
@@ -2358,6 +2375,7 @@ impl StorageService for OsdService {
                 current,
                 removed,
                 superseded: false,
+                held_stamp: 0,
             }))
         })
     }

@@ -454,10 +454,9 @@ pub(crate) async fn copy_by_reference(
         Err(e) => {
             error!("CopyObject by reference: failed to store {what}: {e}");
             back_out(state, what);
-            return Some(S3Error::xml_response(
-                "InternalError",
-                &format!("Failed to store object metadata: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
+            return Some(S3Error::for_osd_error(
+                &e.error,
+                "Failed to store object metadata",
             ));
         }
     }

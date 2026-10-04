@@ -8,6 +8,7 @@
 //! returns. Stamp 0 means unstamped.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COUNTER_BITS: u32 = 16;
@@ -71,10 +72,22 @@ impl Clock {
     }
 }
 
-fn wall_millis() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+/// Added to this process's wall clock, for tests of a gateway whose clock
+/// is wrong ([`set_test_offset_ms`]). Zero otherwise.
+static TEST_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Shift the wall clock stamps are taken from by `ms` (testing only).
+pub fn set_test_offset_ms(ms: i64) {
+    TEST_OFFSET_MS.store(ms, Ordering::Relaxed);
+}
+
+/// The wall clock stamps follow, in milliseconds since the Unix epoch.
+#[must_use]
+pub fn wall_millis() -> u64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
         u64::try_from(d.as_millis()).unwrap_or(u64::MAX >> COUNTER_BITS)
-    })
+    });
+    now.saturating_add_signed(TEST_OFFSET_MS.load(Ordering::Relaxed))
 }
 
 /// This process's clock.
