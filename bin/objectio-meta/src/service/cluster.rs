@@ -1460,10 +1460,9 @@ impl MetaService {
             _ => (false, false),
         };
 
-        // Mirror the change into the in-memory OsdNode list so this
-        // process's topology rebuild sees the new state without a redb
-        // re-read. (Followers do this via their own apply — deferred
-        // until the apply-listener lands in a later phase.)
+        // Mirror the change into the in-memory OsdNode list at once, for
+        // this call's own topology rebuild; every node (this one too) also
+        // gets it from the apply event the command emits.
         if found && changed {
             let mut nodes = self.osd_nodes.write();
             if let Some(n) = nodes.iter_mut().find(|n| n.node_id == node_id) {

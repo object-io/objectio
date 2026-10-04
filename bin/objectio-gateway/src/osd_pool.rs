@@ -86,6 +86,10 @@ pub struct OsdPool {
     address_map: RwLock<HashMap<String, NodeId>>,
     /// Addresses that failed at the transport level, and when.
     unreachable: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Addresses whose cached channel is to be dropped before next use: a
+    /// channel to a host that vanished can hang a call until its timeout
+    /// instead of failing, so after a failure the next call dials afresh.
+    stale: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Meta, for keys a write or delete left behind on some copies.
     heal: std::sync::OnceLock<
         objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
@@ -99,6 +103,7 @@ impl OsdPool {
             nodes: RwLock::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
             unreachable: std::sync::Mutex::new(HashMap::new()),
+            stale: std::sync::Mutex::new(std::collections::HashSet::new()),
             heal: std::sync::OnceLock::new(),
         }
     }
@@ -139,6 +144,10 @@ impl OsdPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(address.to_string(), std::time::Instant::now());
+        self.stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string());
     }
 
     /// Whether `address` failed at the transport level within `FAIL_FAST`.
@@ -192,13 +201,14 @@ impl OsdPool {
         let max_message_size = 100 * 1024 * 1024; // 100 MB
         // A dead host is noticed in seconds: connecting gives up after 3 s,
         // and an open connection that stops answering keepalives is closed
-        // after about 10 s, failing what is in flight on it.
+        // after about 5 s, failing what is in flight on it (writes wait for
+        // every shard, so this bounds how long a vanished host holds them).
         let channel = tonic::transport::Endpoint::new(address.to_string())
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?
             .connect_timeout(std::time::Duration::from_secs(3))
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
-            .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-            .keep_alive_timeout(std::time::Duration::from_secs(5))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(2))
+            .keep_alive_timeout(std::time::Duration::from_secs(3))
             .keep_alive_while_idle(true)
             .connect()
             .await
@@ -265,6 +275,19 @@ impl OsdPool {
                 "{address} failed in the last {} s; not tried",
                 FAIL_FAST.as_secs()
             )));
+        }
+
+        // A channel to an address that failed since it was cached: dropped,
+        // so this call dials afresh (and fails within the connect timeout
+        // if the host is still gone) rather than hanging on it.
+        let stale = self
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(address);
+        if stale {
+            self.nodes.write().await.retain(|_, n| n.address != address);
+            self.address_map.write().await.remove(address);
         }
 
         // Try to get existing client first (fast path)
@@ -884,6 +907,9 @@ pub async fn put_object_meta_with(
                         "Failed to put object metadata to OSD {}: {}",
                         p.node_address, e
                     );
+                    if is_transport_failure(&e) {
+                        pool.mark_unreachable(&p.node_address);
+                    }
                     let refused = matches!(
                         e.code(),
                         tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
@@ -1168,7 +1194,12 @@ pub async fn delete_meta_from_all(
         let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
             .await
             .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
-            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| {
+                if is_transport_failure(&e) {
+                    pool.mark_unreachable(&p.node_address);
+                }
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?;
         Ok::<_, OsdPoolError>(resp.into_inner().removed)
     });
     let mut out = MetaDeleted {
@@ -1943,6 +1974,11 @@ mod fail_fast_tests {
             std::time::Instant::now().checked_sub(FAIL_FAST).unwrap(),
         );
         assert!(!pool.is_unreachable(addr));
+        // ...and dialled afresh, not over a channel cached before the failure.
+        assert!(
+            pool.stale.lock().unwrap().contains(addr),
+            "a failed address's cached channel is dropped on next use"
+        );
     }
 }
 
