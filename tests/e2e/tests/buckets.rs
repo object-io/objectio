@@ -58,3 +58,24 @@ fn nothing_is_written_into_a_bucket_that_does_not_exist() {
     assert!(r.text().contains("NoSuchBucket"), "{}", r.text());
     assert_eq!(c.request("GET", "/nowhere/k", &[]).status, 404);
 }
+
+/// `/{bucket}/` is the bucket, for every verb: minio-go (warp, mc) creates
+/// buckets with `PUT /b/`, s3fs probes with `HEAD /b/`.
+#[test]
+fn a_trailing_slash_names_the_bucket() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    c.request("PUT", "/slash/", &[]).expect(200);
+    assert_eq!(c.request("HEAD", "/slash/", &[]).status, 200);
+    c.request("PUT", "/slash/k", b"data").expect(200);
+    let list = c.request("GET", "/slash/", &[]);
+    assert_eq!(list.status, 200, "{}", list.text());
+    assert!(list.text().contains("<Key>k</Key>"), "{}", list.text());
+
+    let batch = b"<Delete><Object><Key>k</Key></Object></Delete>";
+    let r = c.request("POST", "/slash/?delete", batch);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(c.request("GET", "/slash/k", &[]).status, 404);
+
+    assert_eq!(c.request("DELETE", "/slash/", &[]).status, 204);
+    assert_eq!(c.request("HEAD", "/slash", &[]).status, 404);
+}

@@ -127,17 +127,6 @@ pub(crate) fn apply_listing_markers(
     };
 }
 
-/// List objects with trailing slash (s3fs compatibility)
-/// Route: GET /{bucket}/
-pub async fn list_objects_trailing(
-    State(state): State<Arc<AppState>>,
-    Path(bucket): Path<String>,
-    Query(params): Query<ListObjectsParams>,
-    auth: Option<Extension<AuthResult>>,
-) -> Response {
-    list_objects(State(state), Path(bucket), Query(params), auth).await
-}
-
 /// List objects or get bucket policy (GET /{bucket} or GET /{bucket}?policy)
 pub async fn list_objects(
     State(state): State<Arc<AppState>>,
