@@ -288,6 +288,8 @@ use objectio_proto::metadata::{
     SetBucketOwnerResponse,
     SetBucketPolicyRequest,
     SetBucketPolicyResponse,
+    SetBucketQuotaRequest,
+    SetBucketQuotaResponse,
     SetConfigRequest,
     SetConfigResponse,
     SetOsdAdminStateRequest,

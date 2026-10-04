@@ -804,6 +804,61 @@ impl MetaService {
         Ok(Response::new(SetBucketOwnerResponse { success: true }))
     }
 
+    pub(crate) async fn set_bucket_quota(
+        &self,
+        request: Request<SetBucketQuotaRequest>,
+    ) -> Result<Response<SetBucketQuotaResponse>, Status> {
+        let req = request.into_inner();
+        let (expected_bytes, new_bucket, new_bytes) = {
+            let buckets = self.buckets.read();
+            let current = buckets
+                .get(&req.bucket)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("bucket '{}' not found", req.bucket)))?;
+            let expected = current.encode_to_vec();
+            let mut new_bucket = current;
+            new_bucket.quota_bytes = req.quota_bytes;
+            new_bucket.quota_objects = req.quota_objects;
+            let new_bytes = new_bucket.encode_to_vec();
+            (expected, new_bucket, new_bytes)
+        };
+
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Buckets,
+                    key: req.bucket.clone(),
+                    expected: Some(expected_bytes),
+                    new_value: Some(new_bytes),
+                }],
+                requested_by: "set-bucket-quota".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("bucket changed since read; retry"));
+                    }
+                    other => {
+                        error!("unexpected raft response for set_bucket_quota: {:?}", other);
+                        return Err(Status::internal("raft commit wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            store.put_bucket(&req.bucket, &new_bucket);
+        }
+
+        self.buckets.write().insert(req.bucket.clone(), new_bucket);
+        info!(
+            "Set quota of bucket '{}': {} bytes, {} objects (0 = unlimited)",
+            req.bucket, req.quota_bytes, req.quota_objects
+        );
+        Ok(Response::new(SetBucketQuotaResponse {}))
+    }
+
     pub(crate) async fn get_bucket_versioning(
         &self,
         request: Request<GetBucketVersioningRequest>,
