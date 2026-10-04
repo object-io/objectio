@@ -672,7 +672,7 @@ pub(crate) async fn upload_part_internal(
             let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
-                    Ok(location) => {
+                    Ok((location, crc32c)) => {
                         success += 1;
                         locs.push(ShardLocation {
                             position: pos,
@@ -681,6 +681,7 @@ pub(crate) async fn upload_part_internal(
                             offset: location.offset,
                             shard_type: placement_node.shard_type,
                             local_group: placement_node.local_group,
+                            crc32c: Some(crc32c),
                         });
                     }
                     Err(e) => {
@@ -841,7 +842,7 @@ pub(crate) async fn upload_part_internal(
             let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
-                    Ok(location) => {
+                    Ok((location, crc32c)) => {
                         success += 1;
                         locs.push(ShardLocation {
                             position: pos,
@@ -850,6 +851,7 @@ pub(crate) async fn upload_part_internal(
                             offset: location.offset,
                             shard_type: placement_node.shard_type,
                             local_group: placement_node.local_group,
+                            crc32c: Some(crc32c),
                         });
                     }
                     Err(e) => {

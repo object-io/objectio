@@ -83,13 +83,14 @@ pub async fn write_chunk(
     let mut stripe_shards: Vec<ShardLocation> = Vec::with_capacity(total_shards);
     for (position, node, result) in results {
         match result {
-            Ok(location) => stripe_shards.push(ShardLocation {
+            Ok((location, crc32c)) => stripe_shards.push(ShardLocation {
                 position,
                 node_id: node.node_id.clone(),
                 disk_id: location.disk_id,
                 offset: location.offset,
                 shard_type: node.shard_type,
                 local_group: node.local_group,
+                crc32c: Some(crc32c),
             }),
             Err(e) => error!("Failed to write shard {position} for chunk {chunk_id}: {e}"),
         }
@@ -192,6 +193,7 @@ pub async fn read_stripe(
                 &stripe.object_id,
                 stripe.stripe_id,
                 loc.position,
+                loc.crc32c,
             )
             .await
             .map_err(anyhow::Error::from)

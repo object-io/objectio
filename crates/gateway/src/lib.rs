@@ -41,6 +41,7 @@ pub mod s3;
 pub mod s3_metrics;
 pub mod scatter_gather;
 pub mod sts_api;
+pub mod test_hooks;
 pub mod upgrade;
 
 use crate::s3_metrics::{ProtectionConfig, s3_metrics};
@@ -1399,6 +1400,10 @@ pub async fn run(
             )
             .route("/_admin/test/pack-compact", post(packs::admin_test_compact))
             .route("/_admin/test/packs", get(packs::admin_test_list))
+            .route(
+                "/_admin/test/rewrite-shard",
+                post(test_hooks::rewrite_shard),
+            )
     } else {
         admin_routes
     };

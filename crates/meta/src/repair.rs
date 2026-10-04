@@ -580,13 +580,13 @@ async fn rebuild(
         if have == k {
             break;
         }
-        let Some(addr) = located
-            .get(&(p as u32))
-            .and_then(|l| node_address(meta, &l.node_id))
-        else {
+        let Some(loc) = located.get(&(p as u32)) else {
             continue;
         };
-        match read_shard(&addr, &id, stripe.stripe_id, p as u32).await {
+        let Some(addr) = node_address(meta, &loc.node_id) else {
+            continue;
+        };
+        match read_shard(&addr, &id, stripe.stripe_id, p as u32, loc.crc32c).await {
             Ok(bytes) => {
                 survivors[p] = Some(bytes);
                 have += 1;
@@ -617,6 +617,16 @@ async fn rebuild(
     let mut added = Vec::new();
     for (&p, bytes) in bad.iter().zip(rebuilt) {
         let position = p as u32;
+        // A rebuild is the shard as first written, byte for byte: one that
+        // isn't (decoded from a bad source) is not stored as if it were.
+        let crc = crc32c::crc32c(&bytes);
+        if let Some(recorded) = located.get(&position).and_then(|l| l.crc32c)
+            && recorded != crc
+        {
+            return Err(anyhow::anyhow!(
+                "position {p} rebuilt as crc32c {crc:08x}, its object records {recorded:08x}; not stored"
+            ));
+        }
         let (node_id, addr, shard_type) = match (seen[p], located.get(&position)) {
             (Seen::Lost { .. }, Some(loc)) => (
                 loc.node_id.clone(),
@@ -653,6 +663,7 @@ async fn rebuild(
                 offset: location.offset,
                 shard_type,
                 local_group: 0,
+                crc32c: Some(crc),
             });
         }
     }
@@ -719,6 +730,7 @@ async fn spread(
                 &stripe.object_id,
                 stripe.stripe_id,
                 old.position,
+                old.crc32c,
             )
             .await?;
             let at = write_shard(&to_addr, &stripe.object_id, stripe, old.position, bytes).await?;
@@ -836,11 +848,14 @@ async fn release_moved() {
     }
 }
 
+/// `expected_crc32c`: what the shard's object records (B23); the OSD
+/// refuses a shard that doesn't match it.
 async fn read_shard(
     address: &str,
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
+    expected_crc32c: Option<u32>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut client = StorageServiceClient::new(open_channel(address).await?)
         .max_decoding_message_size(100 * 1024 * 1024);
@@ -852,12 +867,21 @@ async fn read_shard(
                 stripe_id,
                 position,
             }),
+            expected_crc32c,
             ..Default::default()
         }),
     )
     .await??
     .into_inner();
-    Ok(verified_shard(resp)?.to_vec())
+    let bytes = verified_shard(resp)?.to_vec();
+    if let Some(expected) = expected_crc32c
+        && crc32c::crc32c(&bytes) != expected
+    {
+        return Err(anyhow::anyhow!(
+            "position {position}: not the shard its object records"
+        ));
+    }
+    Ok(bytes)
 }
 
 async fn write_shard(
