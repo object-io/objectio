@@ -548,8 +548,11 @@ fn is_transport_failure(e: &tonic::Status) -> bool {
 /// error: error reading a body from connection", as a meta pod's restart
 /// cut a placement answer short, which became a 500).
 pub fn connection_broke(e: &tonic::Status) -> bool {
-    (e.code() == tonic::Code::Unknown && e.message() == "transport error")
-        || (e.code() == tonic::Code::Internal && e.message().starts_with("h2 protocol error"))
+    // tonic reports a connection that dropped mid-call either way round:
+    // "transport error", or the h2 layer's own message (seen as Unknown
+    // when a meta pod restarted during a call: a 500, not a retry, before).
+    matches!(e.code(), tonic::Code::Unknown | tonic::Code::Internal)
+        && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
 }
 
 /// A shard call that did not succeed.
@@ -2027,6 +2030,29 @@ pub async fn reclaim_shards(
     }
     crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
     failed
+}
+
+#[cfg(test)]
+mod connection_broke_tests {
+    use super::connection_broke;
+
+    #[test]
+    fn a_dropped_connection_is_recognised_whatever_the_code() {
+        for code in [tonic::Code::Unknown, tonic::Code::Internal] {
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "transport error"
+            )));
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "h2 protocol error: error reading a body from connection"
+            )));
+        }
+        assert!(!connection_broke(&tonic::Status::internal("disk exploded")));
+        assert!(!connection_broke(&tonic::Status::not_found(
+            "transport error"
+        )));
+    }
 }
 
 #[cfg(test)]
