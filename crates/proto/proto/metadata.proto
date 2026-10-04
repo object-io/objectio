@@ -547,6 +547,11 @@ message ShardLocation {
     // LRC-specific fields
     ShardType shard_type = 5;   // Type of shard (data, local parity, global parity)
     uint32 local_group = 6;     // Local group index (for LRC)
+    // The shard's crc32c as its writer encoded it (B23), kept with the
+    // object rather than only by the OSD that holds it: reads and repair
+    // check against it, so a shard stored wrong (with an OSD-side checksum
+    // of its own wrong bytes) is caught.
+    optional uint32 crc32c = 7;
 }
 
 // Shard type for LRC
