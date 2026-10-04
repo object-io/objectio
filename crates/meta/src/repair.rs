@@ -1021,21 +1021,8 @@ async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<O
     Ok(resp.object.filter(|_| resp.found))
 }
 
-/// Put an object missing from Meta's listing index back, so ListObjects
-/// shows it. Checked against the owner first: an object deleted since the
-/// page was read must not come back.
-async fn restore_listing(
-    meta: &Arc<MetaService>,
-    owner_addr: &str,
-    object: &ObjectMeta,
-) -> anyhow::Result<()> {
-    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
-        return Ok(());
-    }
-    match get_object_meta(owner_addr, object).await? {
-        Some(fresh) if fresh.object_id == object.object_id => {}
-        _ => return Ok(()),
-    }
+/// Meta's listing entry for `object`.
+async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()> {
     MetadataService::create_object(
         meta.as_ref(),
         tonic::Request::new(CreateObjectRequest {
@@ -1056,6 +1043,109 @@ async fn restore_listing(
     )
     .await
     .map_err(|e| anyhow::anyhow!("create_object: {e}"))?;
+    Ok(())
+}
+
+/// The key's current object as a read quorum of its copies has it, as a
+/// GET reads it (objectio-docs core/object-metadata-quorum.md): the newest
+/// object, unless a tombstone is newer. `None`: deleted, or absent. An
+/// error when fewer than a read quorum answer.
+async fn quorum_current(
+    meta: &Arc<MetaService>,
+    object: &ObjectMeta,
+) -> anyhow::Result<Option<ObjectMeta>> {
+    let mut addrs: Vec<String> = Vec::new();
+    let mut seen_nodes: Vec<Vec<u8>> = Vec::new();
+    for n in placement_of(meta, object).await? {
+        if !seen_nodes.contains(&n.node_id) {
+            seen_nodes.push(n.node_id.clone());
+            addrs.push(n.node_address);
+        }
+    }
+    let copies = addrs.len();
+    let read_quorum = copies - (copies / 2 + 1) + 1;
+    let asks = addrs.iter().map(|addr| async move {
+        let mut client = StorageServiceClient::new(open_channel(addr).await?)
+            .max_decoding_message_size(100 * 1024 * 1024);
+        let resp = tokio::time::timeout(
+            RPC_TIMEOUT,
+            client.get_object_meta(GetObjectMetaRequest {
+                bucket: object.bucket.clone(),
+                key: object.key.clone(),
+                version_id: String::new(),
+            }),
+        )
+        .await??
+        .into_inner();
+        Ok::<_, anyhow::Error>((resp.object.filter(|_| resp.found), resp.tombstone_stamp))
+    });
+    let mut answered = 0;
+    let mut newest: Option<ObjectMeta> = None;
+    let mut deleted_at = 0u64;
+    for answer in futures::future::join_all(asks).await.into_iter().flatten() {
+        answered += 1;
+        deleted_at = deleted_at.max(answer.1);
+        if let Some(o) = answer.0
+            && newest
+                .as_ref()
+                .is_none_or(|n| o.write_order() > n.write_order())
+        {
+            newest = Some(o);
+        }
+    }
+    if answered < read_quorum {
+        return Err(anyhow::anyhow!(
+            "{answered} of {copies} copies answered, need {read_quorum}"
+        ));
+    }
+    Ok(newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp))
+}
+
+/// Put an object missing from Meta's listing index back, so ListObjects
+/// shows it: only if a read quorum of its copies has it as the current
+/// object, as a GET would. Checked against the owner alone it listed
+/// objects deleted moments before (a copy that missed or hadn't yet taken
+/// the delete; the B2 soak). And checked again after, in case a delete
+/// landed in between: then the entry goes again.
+async fn restore_listing(
+    meta: &Arc<MetaService>,
+    _owner_addr: &str,
+    object: &ObjectMeta,
+) -> anyhow::Result<()> {
+    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
+        return Ok(());
+    }
+    let is_current = |c: &Option<ObjectMeta>| {
+        c.as_ref()
+            .is_some_and(|c| c.object_id == object.object_id && !c.is_delete_marker)
+    };
+    if !is_current(&quorum_current(meta, object).await?) {
+        return Ok(());
+    }
+    list(meta, object).await?;
+    // A delete or a replacement may have landed since the check: the entry
+    // follows what is current now.
+    match quorum_current(meta, object).await? {
+        Some(c) if c.object_id == object.object_id && !c.is_delete_marker => {}
+        Some(c) if !c.is_delete_marker => {
+            list(meta, &c).await?;
+            return Ok(());
+        }
+        _ => {
+            MetadataService::delete_object(
+                meta.as_ref(),
+                tonic::Request::new(objectio_proto::metadata::DeleteObjectRequest {
+                    bucket: object.bucket.clone(),
+                    key: object.key.clone(),
+                    version_id: String::new(),
+                    forget_home: false,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("delete_object: {e}"))?;
+            return Ok(());
+        }
+    }
     STATS.listings_restored.fetch_add(1, Ordering::Relaxed);
     info!(
         "repair: restored the listing entry of {}/{}",
