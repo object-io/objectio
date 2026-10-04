@@ -50,14 +50,12 @@ impl ChannelCache {
         if let Some(c) = self.inner.lock().get(addr) {
             return Ok(c.clone());
         }
-        let uri = normalize_uri(addr);
         // A peer that went away without closing its connections (a pod
         // rescheduled to a new IP, a host powered off) is noticed in about
         // two seconds, not after the kernel's retransmission timeout: on
         // Raft's timescale (elections in under a second) a hung connection
         // otherwise blocks votes and replication for minutes.
-        let channel = Channel::from_shared(uri)
-            .map_err(|e| format!("invalid meta address `{addr}`: {e}"))?
+        let channel = objectio_proto::transport::endpoint(addr)?
             .connect_timeout(std::time::Duration::from_secs(1))
             .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(1))
@@ -72,14 +70,6 @@ impl ChannelCache {
     /// address again (a restarted pod's new IP).
     fn forget(&self, addr: &str) {
         self.inner.lock().remove(addr);
-    }
-}
-
-fn normalize_uri(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
     }
 }
 
@@ -256,20 +246,5 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         serde_json::from_slice::<VoteResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_uri_adds_http_prefix() {
-        assert_eq!(normalize_uri("127.0.0.1:9100"), "http://127.0.0.1:9100");
-        assert_eq!(normalize_uri("http://meta-0:9100"), "http://meta-0:9100");
-        assert_eq!(
-            normalize_uri("https://meta.example.com:9100"),
-            "https://meta.example.com:9100"
-        );
     }
 }

@@ -24,10 +24,10 @@ fn serve_some_traffic(c: &Cluster, block_port: u16) {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let url = format!("http://127.0.0.1:{block_port}");
+        let url = format!("127.0.0.1:{block_port}");
         let mut client = loop {
-            if let Ok(c) = BlockServiceClient::connect(url.clone()).await {
-                break c;
+            if let Ok(c) = objectio_e2e::tls::channel(&url).await {
+                break BlockServiceClient::new(c);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };

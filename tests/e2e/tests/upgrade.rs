@@ -43,7 +43,8 @@ fn meta_client_as(
     user_agent: &str,
 ) -> MetadataServiceClient<tonic::transport::Channel> {
     rt.block_on(async {
-        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+        objectio_e2e::tls::client();
+        let channel = objectio_proto::transport::endpoint(endpoint)
             .unwrap()
             .user_agent(user_agent)
             .unwrap()

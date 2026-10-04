@@ -248,6 +248,11 @@ struct Args {
     /// NBD port for the block gateway, when --block-port is set.
     #[arg(long, default_value_t = 10809)]
     nbd_port: u16,
+
+    /// mTLS between the services (A8a): with these, even the all-in-one's
+    /// own gRPC hops go over mutual TLS.
+    #[command(flatten)]
+    tls: objectio_proto::transport::TlsArgs,
 }
 
 /// Pick a free loopback port by binding to :0 and releasing.
@@ -368,10 +373,18 @@ async fn serves_block(grpc_port: u16, nbd_port: u16, max: u64) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
     const NBD_MAGIC: &[u8; 8] = b"NBDMAGIC";
-    let url = format!("http://127.0.0.1:{grpc_port}");
+    let url = format!("127.0.0.1:{grpc_port}");
     let mut last = String::new();
     for _ in 0..(max * 10) {
-        match BlockServiceClient::connect(url.clone()).await {
+        let connected = match objectio_proto::transport::endpoint(&url) {
+            Ok(ep) => ep
+                .connect()
+                .await
+                .map(BlockServiceClient::new)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        match connected {
             Ok(mut client) => match client
                 .list_volumes(ListVolumesRequest {
                     max_results: 1,
@@ -521,6 +534,8 @@ async fn bootstrap_raft(port: u16) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // Once for the process: every service run below shares it.
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
 
     // Single tracing subscriber for everyone. Default: --log-level for
     // our own crates, warn for the noisy deps (hyper, h2, tower, tonic,

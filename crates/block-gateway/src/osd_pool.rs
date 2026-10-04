@@ -102,8 +102,8 @@ impl OsdPool {
         drop(nodes);
 
         let max_message_size = 100 * 1024 * 1024;
-        let channel = tonic::transport::Endpoint::new(address.to_string())
-            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?
+        let channel = objectio_proto::transport::endpoint(address)
+            .map_err(OsdPoolError::ConnectionFailed)?
             .connect()
             .await
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
