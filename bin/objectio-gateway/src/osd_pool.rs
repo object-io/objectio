@@ -368,8 +368,16 @@ pub struct RdmaSource<'a> {
 /// from it): unavailable, or a connection that dropped, which tonic reports
 /// as Unknown "transport error".
 fn is_transport_failure(e: &tonic::Status) -> bool {
-    e.code() == tonic::Code::Unavailable
-        || (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+    e.code() == tonic::Code::Unavailable || connection_broke(e)
+}
+
+/// The connection failed under the call, whatever tonic made of it: a
+/// transport error, or an HTTP/2 stream or connection reset ("h2 protocol
+/// error: error reading a body from connection", as a meta pod's restart
+/// cut a placement answer short, which became a 500).
+pub fn connection_broke(e: &tonic::Status) -> bool {
+    (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+        || (e.code() == tonic::Code::Internal && e.message().starts_with("h2 protocol error"))
 }
 
 /// A shard call that did not succeed.
@@ -1992,6 +2000,22 @@ mod tests {
             crc32c,
             ..Default::default()
         }
+    }
+
+    /// A connection cut under a call is a failure to retry (503), not a
+    /// server error, however tonic reports it.
+    #[test]
+    fn a_broken_connection_is_unavailable() {
+        for e in [
+            tonic::Status::unknown("transport error"),
+            tonic::Status::internal("h2 protocol error: error reading a body from connection"),
+        ] {
+            assert!(super::connection_broke(&e), "{e:?}");
+            assert!(crate::s3::S3Error::is_unavailable(&e), "{e:?}");
+        }
+        assert!(!super::connection_broke(&tonic::Status::internal(
+            "disk on fire"
+        )));
     }
 
     #[test]
