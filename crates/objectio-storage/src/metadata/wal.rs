@@ -18,7 +18,7 @@ use super::types::{MetadataEntry, MetadataOp};
 use objectio_common::{Error, Result};
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -156,13 +156,42 @@ pub struct MetadataWal {
     written_lsn: AtomicU64,
     /// Highest LSN covered by a completed `fdatasync`.
     synced_lsn: AtomicU64,
-    /// Held only across the sync itself — deliberately *not* `writer`, so a
-    /// thread waiting to sync does not block one that is still writing.
-    sync_lock: Mutex<()>,
     /// Second descriptor for the same file, used to sync without taking
     /// `writer`. `fdatasync` acts on the inode, so syncing through this
-    /// durably commits everything written through the other handle.
-    sync_handle: File,
+    /// durably commits everything written through the other handle. Locked
+    /// across the sync itself — deliberately *not* `writer`, so a thread
+    /// waiting to sync does not block one that is still writing.
+    ///
+    /// Compaction replaces the file, and this with it: a descriptor left on
+    /// the old file syncs an inode nothing reads any more, and every record
+    /// "synced" through it is lost at the next power cut.
+    sync_handle: Mutex<File>,
+    /// Truncations so far: a [`WalMark`] is only good in the file it was
+    /// taken in.
+    file: AtomicU64,
+}
+
+/// Where the log ends at some moment: the last LSN written, and the byte
+/// its record ends at. [`MetadataWal::truncate_through`] drops everything
+/// up to it.
+#[derive(Clone, Copy, Debug)]
+pub struct WalMark {
+    pub lsn: u64,
+    offset: u64,
+    /// Which file the offset is in: each truncation starts a new one.
+    file: u64,
+}
+
+/// Make a rename or a new file in `path`'s directory durable: until the
+/// directory itself is synced, a power cut can bring back the old entry.
+pub(super) fn sync_parent_dir(path: &Path) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| Error::Storage(format!("failed to sync {}: {e}", dir.display())))
 }
 
 /// The whole records of a WAL file, in order. Ends at the end of the file
@@ -238,8 +267,8 @@ impl MetadataWal {
             written_lsn: AtomicU64::new(0),
             synced_lsn: AtomicU64::new(0),
             sync_stats: WalSyncStats::default(),
-            sync_lock: Mutex::new(()),
-            sync_handle,
+            sync_handle: Mutex::new(sync_handle),
+            file: AtomicU64::new(0),
         })
     }
 
@@ -286,8 +315,8 @@ impl MetadataWal {
             written_lsn: AtomicU64::new(last_lsn),
             synced_lsn: AtomicU64::new(last_lsn),
             sync_stats: WalSyncStats::default(),
-            sync_lock: Mutex::new(()),
-            sync_handle,
+            sync_handle: Mutex::new(sync_handle),
+            file: AtomicU64::new(0),
         })
     }
 
@@ -374,7 +403,7 @@ impl MetadataWal {
             return Ok(());
         }
 
-        let _guard = self.sync_lock.lock();
+        let handle = self.sync_handle.lock();
 
         // Re-check: while waiting for the lock, another thread's sync may
         // already have covered this record.
@@ -384,7 +413,7 @@ impl MetadataWal {
 
         let covered = self.written_lsn.load(Ordering::SeqCst);
         let started = std::time::Instant::now();
-        self.sync_handle
+        handle
             .sync_data()
             .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))?;
         self.sync_stats.seconds.observe_duration(started.elapsed());
@@ -489,44 +518,72 @@ impl MetadataWal {
         })
     }
 
-    /// Truncate WAL up to (but not including) the given LSN
+    /// Where the log ends now (see [`WalMark`]).
+    pub fn mark(&self) -> Result<WalMark> {
+        let mut writer = self.writer.lock();
+        writer
+            .flush()
+            .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
+        Ok(WalMark {
+            lsn: self.current_lsn(),
+            offset: self.size.load(Ordering::SeqCst),
+            file: self.file.load(Ordering::SeqCst),
+        })
+    }
+
+    /// Drop the records up to `mark`, which a durable snapshot now holds:
+    /// the records after it go to a new file, which replaces this one.
     ///
-    /// This is called after a successful snapshot to reclaim space.
-    /// Creates a new WAL file with only entries >= snapshot_lsn.
-    pub fn truncate_before(&self, snapshot_lsn: u64) -> Result<()> {
-        // Create new WAL file
+    /// Appends wait meanwhile (`writer`), and so do syncs (`sync_handle`):
+    /// a record appended to the old file after the copy would be gone with
+    /// it, and a sync of the old file covers nothing the new one holds.
+    pub fn truncate_through(&self, mark: WalMark) -> Result<()> {
+        let storage =
+            |what: &str, e: std::io::Error| Error::Storage(format!("WAL truncation: {what}: {e}"));
         let new_path = self.path.with_extension("wal.new");
 
-        {
-            let new_wal = MetadataWal::create(&new_path, self.config.clone())?;
-
-            // Copy entries >= snapshot_lsn to new file
-            self.replay(snapshot_lsn, |_lsn, op| {
-                new_wal.append(&op)?;
-                Ok(())
-            })?;
-
-            new_wal.sync()?;
+        let mut writer = self.writer.lock();
+        let mut sync_handle = self.sync_handle.lock();
+        writer.flush().map_err(|e| storage("flush", e))?;
+        let len = self.size.load(Ordering::SeqCst);
+        if mark.file != self.file.load(Ordering::SeqCst) || mark.offset > len {
+            return Err(Error::Storage(
+                "WAL truncation: the mark is from a log since replaced".into(),
+            ));
         }
 
-        // Atomic rename
-        std::fs::rename(&new_path, &self.path)
-            .map_err(|e| Error::Storage(format!("WAL rename failed: {}", e)))?;
+        let mut old = File::open(&self.path).map_err(|e| storage("open", e))?;
+        old.seek(SeekFrom::Start(mark.offset))
+            .map_err(|e| storage("seek", e))?;
+        let mut new = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&new_path)
+            .map_err(|e| storage("create", e))?;
+        let kept = std::io::copy(&mut old.take(len - mark.offset), &mut new)
+            .map_err(|e| storage("copy", e))?;
+        new.sync_all().map_err(|e| storage("sync", e))?;
+        std::fs::rename(&new_path, &self.path).map_err(|e| storage("rename", e))?;
+        sync_parent_dir(&self.path)?;
 
-        // Reopen writer to new file
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .map_err(|e| Error::Storage(format!("failed to reopen WAL: {}", e)))?;
-
-        let mut writer = self.writer.lock();
-        *writer = BufWriter::with_capacity(self.config.write_buffer_size, file);
-
-        // Update size
-        let new_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
-        self.size.store(new_size, Ordering::Relaxed);
-
+        *sync_handle = new.try_clone().map_err(|e| storage("clone", e))?;
+        *writer = BufWriter::with_capacity(self.config.write_buffer_size, new);
+        self.size.store(kept, Ordering::SeqCst);
+        self.file.fetch_add(1, Ordering::SeqCst);
+        // Everything written is in the new file, and it was synced.
+        self.synced_lsn
+            .fetch_max(self.written_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Never number a record at or below `lsn` (a snapshot's). A log that
+    /// compaction left empty would otherwise restart at LSN 1, below the
+    /// snapshot, and the next replay — which starts after it — skip them.
+    pub fn advance_past(&self, lsn: u64) {
+        self.next_lsn.fetch_max(lsn + 1, Ordering::SeqCst);
+        self.written_lsn.fetch_max(lsn, Ordering::SeqCst);
+        self.synced_lsn.fetch_max(lsn, Ordering::SeqCst);
     }
 
     /// Get current LSN (last assigned)
@@ -1010,5 +1067,62 @@ mod group_commit_tests {
                 garbage.len()
             );
         }
+    }
+
+    /// After a truncation, the syncs that acknowledge appends must reach
+    /// the file the log now is. They went to the replaced one, an inode
+    /// nothing reads: every acknowledged write after the first compaction
+    /// was durable only once the kernel wrote it back on its own, and a
+    /// power cut before that lost it (found by the A6 chaos test).
+    #[test]
+    fn syncs_after_a_truncation_reach_the_new_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let w = wal(&dir);
+        for i in 0..8 {
+            w.append(&op(i)).unwrap();
+        }
+        let mark = w.mark().unwrap();
+        w.append(&op(8)).unwrap();
+        w.truncate_through(mark).unwrap();
+        w.append(&op(9)).unwrap();
+
+        let synced = w.sync_handle.lock().metadata().unwrap().ino();
+        let current = std::fs::metadata(dir.path().join("g.wal")).unwrap().ino();
+        assert_eq!(synced, current, "syncs go to a file the log no longer is");
+
+        // And the log holds what came after the mark, then what came after
+        // the truncation.
+        let mut lsns = Vec::new();
+        w.replay(1, |lsn, _| {
+            lsns.push(lsn);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(lsns, vec![9, 10]);
+    }
+
+    /// A mark is a byte offset in one file: after another truncation it
+    /// points into a different log, and cutting there would drop records.
+    #[test]
+    fn a_mark_from_a_replaced_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = wal(&dir);
+        for i in 0..8 {
+            w.append(&op(i)).unwrap();
+        }
+        let stale = w.mark().unwrap();
+        w.truncate_through(w.mark().unwrap()).unwrap();
+        for i in 8..16 {
+            w.append(&op(i)).unwrap();
+        }
+        assert!(w.truncate_through(stale).is_err());
+        let mut n = 0;
+        w.replay(1, |_, _| {
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 8);
     }
 }
