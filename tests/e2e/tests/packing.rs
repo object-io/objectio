@@ -513,15 +513,21 @@ fn the_packer_packs_small_objects_in_the_background() {
     );
     c.json("POST", "/_admin/buckets", json!({ "name": "bg" }))
         .expect_ok();
-    // Twenty objects, all within the packing cut-off (64 KiB).
+    // Twenty objects, all within the packing cut-off (64 KiB). Written at
+    // once: one after the other they took most of a second, and a pass in
+    // that window packed all but the last, which, alone, is not worth a
+    // pack and was never packed.
     let objects: Vec<(String, Vec<u8>)> = (0..20u8)
-        .map(|i| {
-            let body = payload(5_000 + usize::from(i) * 2_500, i);
-            let key = format!("o{i}");
-            c.request("PUT", &format!("/bg/{key}"), &body).expect(200);
-            (key, body)
-        })
+        .map(|i| (format!("o{i}"), payload(5_000 + usize::from(i) * 2_500, i)))
         .collect();
+    std::thread::scope(|s| {
+        for (key, body) in &objects {
+            let c = &c;
+            s.spawn(move || {
+                c.request("PUT", &format!("/bg/{key}"), body).expect(200);
+            });
+        }
+    });
     c.request("PUT", "/bg/tiny", b"inline").expect(200);
     let large = payload(300_000, 77);
     c.request("PUT", "/bg/large", &large).expect(200);

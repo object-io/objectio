@@ -30,6 +30,17 @@ pub mod metadata {
     tonic::include_proto!("objectio.metadata");
 }
 
+impl metadata::ObjectMeta {
+    /// Where this copy stands in the order of writes to its key
+    /// (objectio-docs core/object-metadata-quorum.md): by object (its stamp,
+    /// then its id), then, between copies of one object, by update. A copy
+    /// with a higher order holds the newer write.
+    #[must_use]
+    pub fn write_order(&self) -> (u64, &[u8], u64) {
+        (self.stamp, self.object_id.as_slice(), self.update_stamp)
+    }
+}
+
 /// Cluster service (node and disk management)
 pub mod cluster {
     tonic::include_proto!("objectio.cluster");

@@ -2638,15 +2638,14 @@ const NULL_VERSION: &str = "null";
 /// id (a UUIDv7 too) does; older ids fall back to the modification time,
 /// in seconds. The gateway orders versions the same way.
 /// Whether `stored` is a newer write than `incoming`, so this copy keeps it
-/// (objectio-docs core/object-metadata-quorum.md): the higher stamp wins,
-/// and of equal stamps the higher object id, so every copy picks the same.
+/// (objectio-docs core/object-metadata-quorum.md): the newer object wins
+/// (higher stamp, then higher object id, so every copy picks the same), and
+/// between copies of one object the later update. An update keeps its
+/// object's stamp, so it never outranks a newer object written meanwhile.
 /// The same write again is not newer than itself. An unstamped write (0, a
 /// previous-release writer during a rolling upgrade) is applied as before.
 fn supersedes(stored: Option<&ObjectMeta>, incoming: &ObjectMeta) -> bool {
-    incoming.stamp != 0
-        && stored.is_some_and(|s| {
-            (s.stamp, s.object_id.as_slice()) > (incoming.stamp, incoming.object_id.as_slice())
-        })
+    incoming.stamp != 0 && stored.is_some_and(|s| s.write_order() > incoming.write_order())
 }
 
 fn version_age(object: &ObjectMeta) -> (u64, &str) {
@@ -3274,6 +3273,53 @@ mod integrity_tests {
 
         put(&osd, stamped(3, 300), &[]).await.unwrap();
         assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
+    }
+
+    /// An update of an object (tagging, packing, ...) racing a PUT of the
+    /// key, in either order on a copy: the PUT wins on both. The update was
+    /// stamped above the object it read, so where it arrived first it
+    /// superseded the PUT — acknowledged on the other copies — and the old
+    /// object, the newest by stamp, came back everywhere once healed. It
+    /// keeps the object's stamp now and is ordered among its updates.
+    #[tokio::test]
+    async fn an_update_never_outranks_a_newer_object() {
+        let fresh = osd;
+        let updated = ObjectMeta {
+            update_stamp: 300,
+            ..stamped(1, 100)
+        };
+        let put_after = stamped(2, 200);
+
+        // The update first, then the PUT.
+        let (_dir, osd) = fresh();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        put(&osd, updated.clone(), &[1; 16]).await.unwrap();
+        put(&osd, put_after.clone(), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![2; 16]);
+
+        // The PUT first: the update, of an object no longer there, is
+        // refused or superseded — not applied.
+        let (_dir, osd) = fresh();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        put(&osd, put_after, &[]).await.unwrap();
+        let _ = put(&osd, updated, &[1; 16]).await;
+        assert_eq!(stored(&osd).unwrap().object_id, vec![2; 16]);
+
+        // Updates of one object keep their order.
+        let (_dir, osd) = fresh();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        let later = ObjectMeta {
+            update_stamp: 400,
+            tags: [("v".to_string(), "2".to_string())].into(),
+            ..stamped(1, 100)
+        };
+        let earlier = ObjectMeta {
+            update_stamp: 300,
+            ..stamped(1, 100)
+        };
+        put(&osd, later, &[1; 16]).await.unwrap();
+        put(&osd, earlier, &[1; 16]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().update_stamp, 400);
     }
 
     /// Equal stamps: the higher object id wins on every copy; the same write

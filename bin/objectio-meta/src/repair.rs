@@ -742,8 +742,9 @@ async fn record_locations(
             }
         }
     }
-    // An update of what was read: stamped above it, the same on every copy.
-    fresh.stamp = objectio_common::stamp::CLOCK.next_after(fresh.stamp);
+    // An update of what was read: ordered after its other updates, the same
+    // on every copy; its stamp stays, so a newer object still wins.
+    fresh.update_stamp = objectio_common::stamp::CLOCK.next_after(fresh.update_stamp);
     let mut stored_on_owner = false;
     for addr in targets {
         let req = PutObjectMetaRequest {
