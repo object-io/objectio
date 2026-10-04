@@ -113,6 +113,19 @@ pub struct Args {
     #[arg(long, default_value_t = 10_000)]
     pub raft_keep_logs: u64,
 
+    /// Raft heartbeat interval, in ms. It also bounds how long a leader
+    /// waits for a follower to take entries before counting it lost.
+    #[arg(long, default_value_t = 500)]
+    pub raft_heartbeat_ms: u64,
+
+    /// A follower that hears nothing from its leader for a random time in
+    /// [this, 2 × this] ms stands for election. Under write load a follower
+    /// fsyncing its log, or a busy VM, delays heartbeats: at 500 ms meta
+    /// elected under the soak's load with no fault at all, and every
+    /// election is seconds of 503s.
+    #[arg(long, default_value_t = 2000)]
+    pub raft_election_ms: u64,
+
     /// Shards a drain sweep moves off each draining OSD, at most.
     #[arg(long, default_value_t = 64)]
     pub drain_batch: usize,
@@ -139,12 +152,17 @@ const RAFT_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 /// file) and purges its log up to it, keeping `keep_logs` entries behind
 /// it for followers that are only a little behind. A follower further
 /// behind is sent the snapshot.
-fn raft_config(snapshot_every: u64, keep_logs: u64) -> openraft::Config {
+fn raft_config(
+    snapshot_every: u64,
+    keep_logs: u64,
+    heartbeat_ms: u64,
+    election_ms: u64,
+) -> openraft::Config {
     openraft::Config {
         cluster_name: "objectio-meta".into(),
-        heartbeat_interval: 250,
-        election_timeout_min: 500,
-        election_timeout_max: 1000,
+        heartbeat_interval: heartbeat_ms,
+        election_timeout_min: election_ms,
+        election_timeout_max: election_ms * 2,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_every.max(1)),
         max_in_snapshot_log_to_keep: keep_logs,
         // Snapshots travel in chunks: small enough that one, JSON-encoded,
@@ -272,9 +290,14 @@ pub async fn run(
     );
     let (log_store, state_machine) = openraft::storage::Adaptor::new(raft_storage);
     let raft_config = Arc::new(
-        raft_config(args.raft_snapshot_every, args.raft_keep_logs)
-            .validate()
-            .expect("raft config valid"),
+        raft_config(
+            args.raft_snapshot_every,
+            args.raft_keep_logs,
+            args.raft_heartbeat_ms,
+            args.raft_election_ms,
+        )
+        .validate()
+        .expect("raft config valid"),
     );
     let network = objectio_meta_store::MetaRaftNetworkFactory::new(node_id);
     let raft = openraft::Raft::<objectio_meta_store::MetaTypeConfig>::new(
@@ -530,7 +553,7 @@ mod raft_config_tests {
     /// configured tail.
     #[test]
     fn the_log_is_compacted_as_configured() {
-        let c = super::raft_config(1000, 100).validate().unwrap();
+        let c = super::raft_config(1000, 100, 500, 2000).validate().unwrap();
         assert!(matches!(
             c.snapshot_policy,
             openraft::SnapshotPolicy::LogsSinceLast(1000)
