@@ -125,6 +125,10 @@ pub struct Args {
     #[cfg(feature = "rdma")]
     #[arg(long, default_value_t = 64)]
     pub rdma_staging_slots: usize,
+
+    /// mTLS between services (A8a).
+    #[command(flatten)]
+    pub tls: objectio_proto::transport::TlsArgs,
 }
 
 /// Configuration file structure
@@ -269,6 +273,7 @@ pub async fn run(
     args: Args,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     // Load config file if it exists
     let config: Config = if std::path::Path::new(&args.config).exists() {
         let config_str = std::fs::read_to_string(&args.config)?;

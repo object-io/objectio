@@ -123,13 +123,17 @@ struct OsdPoll {
     metrics: Option<GetMetricsResponse>,
 }
 
+/// A client of the OSD at `addr`, over mTLS when it is on.
+async fn connect(addr: &str) -> Result<StorageServiceClient<tonic::transport::Channel>, String> {
+    let channel = objectio_proto::transport::endpoint(addr)?
+        .connect()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(StorageServiceClient::new(channel))
+}
+
 async fn poll_osd(addr: String, node_id: Vec<u8>, up: Vec<Vec<u8>>) -> OsdPoll {
-    let endpoint = if addr.starts_with("http") {
-        addr.clone()
-    } else {
-        format!("http://{addr}")
-    };
-    let (status, metrics) = match timed(StorageServiceClient::connect(endpoint)).await {
+    let (status, metrics) = match timed(connect(&addr)).await {
         Some(mut c) => {
             let status = timed(c.get_status(GetStatusRequest { up_nodes: up }))
                 .await
@@ -550,7 +554,7 @@ async fn reachable_osds(mut meta: MetaClient) -> Option<(usize, usize)> {
         };
         let expected = n.node_id;
         let probe = async {
-            let mut c = StorageServiceClient::connect(endpoint).await.ok()?;
+            let mut c = connect(&endpoint).await.ok()?;
             c.get_status(GetStatusRequest::default()).await.ok()
         };
         tokio::time::timeout(Duration::from_secs(3), probe)

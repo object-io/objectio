@@ -86,6 +86,10 @@ pub struct Args {
     /// Log level (trace / debug / info / warn / error)
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// mTLS between services (A8a).
+    #[command(flatten)]
+    pub tls: objectio_proto::transport::TlsArgs,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -96,6 +100,7 @@ pub struct Args {
 /// If the data directory, store, meta connection or listeners cannot be
 /// set up, or the gRPC server fails.
 pub async fn run(args: Args) -> Result<()> {
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Block Gateway");
 
     // ── Data directory ────────────────────────────────────────────────────────

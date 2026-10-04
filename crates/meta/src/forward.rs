@@ -27,7 +27,7 @@ use objectio_meta_store::MetaTypeConfig;
 use parking_lot::Mutex;
 use tonic::body::BoxBody;
 use tonic::codegen::http;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tracing::debug;
 
 /// Marks a call a follower forwarded, so it is forwarded only once.
@@ -135,12 +135,7 @@ impl ForwardToLeaderLayer {
         if let Some(c) = channels.get(addr) {
             return Ok(c.clone());
         }
-        let uri = if addr.starts_with("http://") || addr.starts_with("https://") {
-            addr.to_string()
-        } else {
-            format!("http://{addr}")
-        };
-        let channel = Endpoint::from_shared(uri)
+        let channel = objectio_proto::transport::endpoint(addr)
             .map_err(|e| tonic::Status::internal(format!("leader address {addr}: {e}")))?
             .connect_timeout(std::time::Duration::from_secs(3))
             // A leader that stopped answering (frozen, cut off) must not

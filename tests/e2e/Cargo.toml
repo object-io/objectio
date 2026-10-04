@@ -22,6 +22,8 @@ tonic = { workspace = true }
 objectio-proto = { workspace = true }
 objectio-common = { workspace = true }
 ring = { workspace = true }
+# A CA and a node certificate for mTLS between the services (src/tls.rs).
+rcgen = "0.13"
 
 [lints]
 workspace = true

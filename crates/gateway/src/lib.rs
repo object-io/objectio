@@ -490,6 +490,10 @@ pub struct Args {
     /// Log level
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// mTLS between services (A8a).
+    #[command(flatten)]
+    pub tls: objectio_proto::transport::TlsArgs,
 }
 
 /// Run the gateway until `shutdown` resolves. Caller owns the tracing
@@ -498,6 +502,7 @@ pub async fn run(
     args: Args,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Gateway");
     info!("Metadata endpoint: {}", args.meta_endpoint);
     info!("OSD endpoint: {}", args.osd_endpoint);

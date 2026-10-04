@@ -1,0 +1,38 @@
+{{- /*
+mTLS between the services (A8a): one certificate for the whole cluster,
+from cert-manager, naming every address a component is dialled by (pods
+through the headless services, components through their services).
+Without an issuer, provide the Secret yourself (tls.secretName).
+*/ -}}
+{{- if and .Values.tls.enabled .Values.tls.certManager.issuerRef.name }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "objectio.fullname" . }}-tls
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "objectio.tls.secretName" . }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    {{- $ns := .Release.Namespace }}
+    {{- range (list (include "objectio.meta.fullname" .) (include "objectio.meta.headless" .) (include "objectio.osd.fullname" .) (include "objectio.osd.headless" .) (include "objectio.gateway.fullname" .) (include "objectio.blockGateway.fullname" .)) }}
+    - {{ . }}
+    - {{ . }}.{{ $ns }}.svc
+    - {{ . }}.{{ $ns }}.svc.cluster.local
+    - "*.{{ . }}"
+    - "*.{{ . }}.{{ $ns }}.svc"
+    - "*.{{ . }}.{{ $ns }}.svc.cluster.local"
+    {{- end }}
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  issuerRef:
+    {{- toYaml .Values.tls.certManager.issuerRef | nindent 4 }}
+{{- end }}
