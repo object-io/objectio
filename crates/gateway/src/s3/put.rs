@@ -247,13 +247,9 @@ pub(crate) async fn commit_new(
         if_none_match: condition.if_none_match.clone().unwrap_or_default(),
     };
     let new_object = referenced_object_ids(&object_meta);
-    let failed = |e: &dyn std::fmt::Display| {
+    let failed = |e: &crate::osd_pool::MetaWriteError| {
         error!("Failed to store object metadata on OSDs: {e}");
-        S3Error::xml_response(
-            "InternalError",
-            &format!("Failed to store object metadata: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
+        S3Error::for_osd_error(&e.error, "Failed to store object metadata")
     };
 
     if condition.is_set() {

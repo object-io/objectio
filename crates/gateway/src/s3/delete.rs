@@ -168,11 +168,7 @@ pub(crate) async fn delete_version(
         Ok(None) => return done(false),
         Err(e) => {
             error!("{bucket}/{key} version {vid}: cannot read it: {e}");
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e, "Failed to read object metadata");
         }
     };
 
@@ -495,11 +491,7 @@ pub(crate) async fn delete_object_to_the_end(
         .await
         {
             error!("Failed to create delete marker: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
         }
 
         // The key no longer has a current version, so drop it from Meta's
@@ -568,11 +560,7 @@ pub(crate) async fn delete_object_to_the_end(
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to put the null delete marker: {}", e.error);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
             }
         };
         // A null version it replaced: its shards, once every replica agrees.
