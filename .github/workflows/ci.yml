@@ -86,8 +86,9 @@ jobs:
     name: end-to-end
     runs-on: ubuntu-latest
     # Boots a real single-process cluster and drives it over HTTP, so it is
-    # slower than everything above put together.
-    timeout-minutes: 25
+    # slower than everything above put together. The suite runs one test
+    # at a time and takes about 25 minutes now.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

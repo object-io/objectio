@@ -487,15 +487,6 @@ pub async fn head_bucket(
     }
 }
 
-/// Head bucket with trailing slash (s3fs compatibility)
-/// Route: HEAD /{bucket}/
-pub async fn head_bucket_trailing(
-    State(state): State<Arc<AppState>>,
-    Path(bucket): Path<String>,
-) -> Response {
-    head_bucket(State(state), Path(bucket)).await
-}
-
 /// The bucket's versioning state, or the response to give: NoSuchBucket,
 /// or 503 when it can't be read. Never a guess: taking "unversioned" for
 /// a versioned bucket frees the version a write replaces.

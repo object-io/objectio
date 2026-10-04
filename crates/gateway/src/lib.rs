@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod audit;
+pub mod audit_spool;
 pub mod auth_middleware;
 pub mod authz;
 pub mod checksum;
@@ -320,6 +321,31 @@ pub struct Args {
     /// `/_admin/audit`.
     #[arg(long, env = "OBJECTIO_AUDIT_LOG")]
     pub audit_log: Option<String>,
+
+    /// Keep audit events in this directory before they are delivered
+    /// (A8c): a gateway killed or a receiver down loses none. A local
+    /// directory that survives restarts.
+    #[arg(long, env = "OBJECTIO_AUDIT_SPOOL")]
+    pub audit_spool: Option<std::path::PathBuf>,
+
+    /// The most the spool holds; past it, new events are dropped and
+    /// counted (`objectio_audit_dropped_total{target="spool"}`).
+    #[arg(long, env = "OBJECTIO_AUDIT_SPOOL_MAX_BYTES", default_value_t = 10 << 30)]
+    pub audit_spool_max_bytes: u64,
+
+    /// The system always audits: every event also goes to this bucket in
+    /// the cluster (created if missing), as JSON-lines objects by hour.
+    /// Needs `--audit-spool`.
+    #[arg(long, env = "OBJECTIO_AUDIT_SYSTEM_BUCKET")]
+    pub audit_system_bucket: Option<String>,
+
+    /// On shutdown, how long to wait for the audit spool to be delivered.
+    #[arg(long, env = "OBJECTIO_AUDIT_DRAIN_SECS", default_value_t = 20)]
+    pub audit_drain_secs: u64,
+
+    /// Days the system bucket keeps events (0: kept).
+    #[arg(long, env = "OBJECTIO_AUDIT_RETENTION_DAYS", default_value_t = 365)]
+    pub audit_retention_days: u32,
 
     /// How often the lifecycle worker scans buckets with lifecycle rules.
     #[arg(long, default_value_t = 3600)]
@@ -950,10 +976,18 @@ pub async fn run(
     // them here with whatever the CLI flag + env / meta config resolved to.
     let trusted_proxies = origin::TrustedProxies::parse(&args.trusted_proxies)
         .map_err(|e| anyhow::anyhow!("--trusted-proxies: {e}"))?;
+    let spool = match &args.audit_spool {
+        Some(dir) => Some(
+            audit_spool::Spool::open(dir, args.audit_spool_max_bytes)
+                .map_err(|e| anyhow::anyhow!("--audit-spool {}: {e}", dir.display()))?,
+        ),
+        None => None,
+    };
     let auditor = audit::Auditor::start(
         meta_client.clone(),
         args.audit_log.clone(),
         trusted_proxies.clone(),
+        spool,
     );
     let state = Arc::new(AppState {
         meta_client,
@@ -978,6 +1012,14 @@ pub async fn run(
         pack_cache: crate::packs::PackCache::default(),
         replication: crate::replication::Replication::default(),
     });
+
+    if let Some(bucket) = &args.audit_system_bucket {
+        auditor.start_system_bucket(
+            Arc::clone(&state),
+            bucket.clone(),
+            args.audit_retention_days,
+        );
+    }
 
     // Lifecycle: every gateway runs a worker; a lease in meta lets one scan
     // at a time.
@@ -1023,6 +1065,14 @@ pub async fn run(
     let body_limit = DefaultBodyLimit::max(100 * 1024 * 1024);
     info!("Max single-part upload size: 100 MB");
 
+    // Bucket operations (including ?policy and ?uploads query params;
+    // POST is ?delete, the batch delete)
+    let bucket_routes = put(s3::create_bucket)
+        .delete(s3::delete_bucket)
+        .head(s3::head_bucket)
+        .get(s3::list_objects)
+        .post(s3::post_bucket);
+
     // Build S3 routes (behind SigV4 auth when enabled)
     let s3_routes = Router::new()
         // /health stays no-auth so a load balancer can probe the data
@@ -1033,16 +1083,10 @@ pub async fn run(
         .route("/_ready", get(cluster_poll::ready_handler))
         // Service endpoint (list buckets)
         .route("/", get(s3::list_buckets))
-        // Bucket operations (including ?policy and ?uploads query params)
-        .route("/{bucket}", put(s3::create_bucket))
-        .route("/{bucket}", delete(s3::delete_bucket))
-        .route("/{bucket}", head(s3::head_bucket))
-        .route("/{bucket}", get(s3::list_objects))
-        // POST /{bucket}?delete - batch delete objects
-        .route("/{bucket}", post(s3::post_bucket))
-        // Bucket with trailing slash (s3fs compatibility)
-        .route("/{bucket}/", head(s3::head_bucket_trailing))
-        .route("/{bucket}/", get(s3::list_objects_trailing))
+        // `/{bucket}/` is the same request: minio-go (warp, mc) and s3fs
+        // send the slash, so every verb takes it.
+        .route("/{bucket}", bucket_routes.clone())
+        .route("/{bucket}/", bucket_routes)
         // Object operations (with multipart upload support via query params)
         .route("/{bucket}/{*key}", put(s3::put_object_with_params))
         .route("/{bucket}/{*key}", get(s3::get_object_with_params))
@@ -1712,6 +1756,11 @@ pub async fn run(
             Err(e) => warn!("Listener task join error: {}", e),
         }
     }
+
+    // What the audit spool holds goes out before the gateway does.
+    auditor
+        .drain(std::time::Duration::from_secs(args.audit_drain_secs))
+        .await;
 
     info!("Gateway shut down gracefully");
 
