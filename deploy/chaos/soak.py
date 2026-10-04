@@ -1,0 +1,389 @@
+"""Soak for a multi-host cluster (roadmap B2; deploy/chaos/README.md).
+
+    python3 deploy/chaos/soak.py             # on the lab host, after cluster.sh up
+
+Runs for SOAK_HOURS (48) on the chaos cluster: writers PUT, overwrite
+and delete objects (1 KB to 8 MB) through both gateways, filling the
+cluster past the OSDs' full ratio and deleting it back down, over and
+over, while the chaos faults (chaos.py) are injected in turn, one every
+FAULT_EVERY minutes (20).
+
+Invariants:
+  - every key holds what its last acknowledged write left: the object,
+    byte for byte, or nothing after a delete (a write or delete that
+    failed may or may not have taken effect: either is accepted);
+    checked after each fault on a sample, and on every key at the end;
+  - writes never fail with other than 503 (retry), 507 (full) or no
+    answer; something is acknowledged at least every MAX_GAP seconds;
+  - the bucket lists exactly the keys that exist;
+  - redundancy is restored after the last fault (as chaos.py);
+  - nothing leaks: once every key is deleted, the space the cluster uses
+    falls back to what it used before the run, within LEAK_SLACK bytes.
+
+Standard library only. Exits 1 on the first broken invariant. Prints a
+JSON progress line every 5 minutes.
+"""
+
+import hashlib
+import json
+import os
+import random
+import threading
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+import chaos
+from chaos import BUCKET, GW, fail, http, incus, say
+
+HOURS = float(os.environ.get("SOAK_HOURS", "48"))
+FAULT_EVERY = float(os.environ.get("FAULT_EVERY", "20")) * 60
+WRITERS = int(os.environ.get("WRITERS", "12"))
+FULL_HIGH = float(os.environ.get("FULL_HIGH", "0.97"))  # past the OSDs' 0.95
+FULL_LOW = float(os.environ.get("FULL_LOW", "0.5"))
+LEAK_SLACK = int(os.environ.get("LEAK_SLACK", str(1 << 30)))
+SAMPLE = int(os.environ.get("SAMPLE", "20000"))
+GONE = "-"  # the outcome "no object"
+
+# key -> the outcomes a read may show: a digest, or GONE. One writer owns
+# each key, so its operations on it never race.
+expect = {}
+touched = set()  # keys changed since the last check
+lock = threading.Lock()
+stop = threading.Event()
+draining = threading.Event()
+stats = {"put": 0, "overwrite": 0, "delete": 0, "failed": 0, "full": 0, "bytes": 0}
+errors = {}
+samples = {}
+last_ok = [time.monotonic()]
+gap = [0.0]
+
+
+def body_for(key, gen):
+    seed = hashlib.sha256(f"{key}#{gen}".encode()).digest()
+    r = seed[0]
+    if r < 179:  # 70%: 1-64 KB (inline, packed)
+        size = 1_000 + int.from_bytes(seed[1:3], "big")
+    elif r < 243:  # 25%: 64 KB-1 MB
+        size = 64_000 + int.from_bytes(seed[1:4], "big") % 960_000
+    else:  # 5%: 1-8 MB
+        size = 1_000_000 + int.from_bytes(seed[1:4], "big") % 7_000_000
+    return (seed * (size // 32 + 1))[:size]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()[:32]
+
+
+def record(status, reply, ok_statuses):
+    now = time.monotonic()
+    with lock:
+        if status in ok_statuses:
+            gap[0] = max(gap[0], now - last_ok[0])
+            last_ok[0] = now
+            return True
+        stats["failed"] += 1
+        stats["full"] += status == 507
+        errors[str(status)] = errors.get(str(status), 0) + 1
+        s = samples.setdefault(str(status), [])
+        if len(s) < 2:
+            s.append(reply[:200].decode(errors="replace"))
+        return False
+
+
+def writer(n):
+    rng = random.Random(n)
+    mine = []  # keys this writer made and has not seen deleted
+    gen = {}
+    i = 0
+    while not stop.is_set():
+        url = GW[i % len(GW)]
+        i += 1
+        r = rng.random()
+        delete_share = 0.65 if draining.is_set() else 0.10
+        if mine and r < delete_share:
+            key = mine.pop(rng.randrange(len(mine)))
+            with lock:  # a read from now on may see it gone
+                expect[key] = expect[key] | {GONE}
+            status, reply = http("DELETE", f"{url}/{BUCKET}/{key}", timeout=30)
+            ok = record(status, reply, (204, 200))
+            with lock:
+                if ok:
+                    expect[key] = {GONE}
+                touched.add(key)
+                stats["delete"] += ok
+            if not ok:
+                mine.append(key)  # may still be there: delete again later
+        else:
+            overwrite = mine and r < delete_share + 0.15
+            key = rng.choice(mine) if overwrite else f"w{n}/k{i}"
+            gen[key] = gen.get(key, 0) + 1
+            body = body_for(key, gen[key])
+            d = digest(body)
+            with lock:  # a read from now on may see it
+                expect[key] = expect.get(key, {GONE}) | {d}
+            status, reply = http("PUT", f"{url}/{BUCKET}/{key}", body, timeout=60)
+            ok = record(status, reply, (200,))
+            with lock:
+                if ok:
+                    expect[key] = {d}
+                touched.add(key)
+                if ok:
+                    stats["overwrite" if overwrite else "put"] += 1
+                    stats["bytes"] += len(body)
+            if not overwrite:
+                mine.append(key)
+        if status not in (200, 204):
+            time.sleep(0.2)
+
+
+def phase_report(name):
+    """Replaces chaos.phase_report, which chaos's faults call when settled."""
+    with lock:
+        g = max(gap[0], time.monotonic() - last_ok[0])
+        report = {"phase": name, "keys": len(expect), "longest_gap_s": round(g, 1),
+                  "errors": dict(errors), "samples": dict(samples)}
+        gap[0] = 0.0
+        errors.clear()
+        samples.clear()
+    print(json.dumps(report), flush=True)
+    bad = {k: v for k, v in report["errors"].items() if k not in ("503", "507", "None")}
+    if bad:
+        fail(f"{name}: operations failed with other than 503/507: {bad} {report['samples']}")
+    if g > chaos.MAX_GAP:
+        fail(f"{name}: nothing acknowledged for {g:.0f}s (allowed {chaos.MAX_GAP:.0f}s)")
+
+
+chaos.phase_report = phase_report
+
+
+def usage():
+    """(used, capacity) bytes across the OSDs, from a gateway's metrics."""
+    for url in GW:
+        status, body = http("GET", f"{url}/metrics", timeout=10)
+        if status != 200:
+            continue
+        got = {}
+        for line in body.decode(errors="replace").splitlines():
+            name = line.split(" ")[0]
+            if name in ("objectio_cluster_used_bytes", "objectio_cluster_capacity_bytes"):
+                got[name] = float(line.rsplit(" ", 1)[1])
+        if len(got) == 2:
+            return got["objectio_cluster_used_bytes"], got["objectio_cluster_capacity_bytes"]
+    return None
+
+
+def fill_control():
+    """Fill past the full ratio, then delete down to FULL_LOW, repeatedly."""
+    while not stop.is_set():
+        u = usage()
+        if u and u[1]:
+            ratio = u[0] / u[1]
+            if ratio >= FULL_HIGH or (ratio >= FULL_HIGH - 0.03 and stats_full_refusals()):
+                if not draining.is_set():
+                    say(f"fill: {ratio:.0%} used, deleting down to {FULL_LOW:.0%}")
+                draining.set()
+            elif ratio <= FULL_LOW and draining.is_set():
+                say(f"fill: {ratio:.0%} used, filling again")
+                draining.clear()
+        stop.wait(30)
+
+
+full_seen = [0]
+
+
+def stats_full_refusals():
+    """Whether PUTs were refused as full since the last look: OSDs fill
+    unevenly, so the cluster may refuse before the average reaches FULL_HIGH."""
+    with lock:
+        n = stats["full"]
+    seen, full_seen[0] = full_seen[0], n
+    return n > seen
+
+
+def progress():
+    while not stop.wait(300):
+        u = usage()
+        with lock:
+            line = {"t": time.strftime("%F %T"), **stats, "keys": len(expect),
+                    "draining": draining.is_set(),
+                    "used": None if not u else round(u[0] / max(u[1], 1), 3)}
+        print(json.dumps(line), flush=True)
+
+
+def read_outcome(key, attempts=20):
+    """What a read of `key` shows: a digest, GONE, or the failing status."""
+    for a in range(attempts):
+        status, data = http("GET", f"{GW[a % len(GW)]}/{BUCKET}/{key}", timeout=30)
+        if status == 200:
+            return digest(data)
+        if status == 404:
+            return GONE
+        if status not in (None, 503):
+            return status
+        time.sleep(1)
+    return status
+
+
+def check_one(item):
+    """None if a read of the key shows an outcome it allows. Writers go on
+    meanwhile, so a read that doesn't match is retried against what is
+    allowed by then; a wrong read three times running is wrong."""
+    key, allowed = item
+    for _ in range(3):
+        got = read_outcome(key)
+        with lock:
+            now = expect[key]
+        if got in allowed or got in now:
+            return None
+        allowed = now
+        time.sleep(2)
+    return (key, "deleted" if got == GONE else got if not isinstance(got, str) else "different")
+
+
+def check(what, everything=False):
+    with lock:
+        if everything:
+            items = list(expect.items())
+        else:
+            recent = random.sample(list(touched), min(len(touched), SAMPLE))
+            items = [(k, expect[k]) for k in recent]
+            items += random.sample(list(expect.items()), min(len(expect), 2000))
+        touched.clear()
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        bad = [r for r in pool.map(check_one, items) if r]
+    if bad:
+        fail(f"{what}: {len(bad)} of {len(items)} keys read wrong: {bad[:10]}")
+    say(f"{what}: {len(items)} keys read as expected" + (" (all)" if everything else ""))
+
+
+def listed():
+    """Every key the bucket lists."""
+    keys, token = set(), None
+    while True:
+        q = "list-type=2&max-keys=1000" + (
+            f"&continuation-token={urllib.parse.quote(token, safe='')}" if token else "")
+        for attempt in range(20):
+            status, body = http("GET", f"{GW[attempt % len(GW)]}/{BUCKET}?{q}", timeout=60)
+            if status == 200:
+                break
+            time.sleep(2)
+        else:
+            fail(f"listing failed: {status} {body[:200]}")
+        text = body.decode()
+        keys.update(part.split("</Key>")[0] for part in text.split("<Key>")[1:])
+        if "<IsTruncated>true</IsTruncated>" not in text:
+            return keys
+        token = text.split("<NextContinuationToken>")[1].split("</NextContinuationToken>")[0]
+
+
+def check_listing():
+    keys = listed()
+    with lock:
+        must = {k for k, a in expect.items() if GONE not in a}
+        may = {k for k, a in expect.items() if a - {GONE}}
+    missing, extra = must - keys, keys - may
+    if missing or extra:
+        fail(f"listing: {len(missing)} keys missing {sorted(missing)[:5]}, "
+             f"{len(extra)} listed that should be gone {sorted(extra)[:5]}")
+    say(f"listing: {len(keys)} keys, as expected")
+
+
+def delete_everything():
+    with lock:
+        keys = [k for k, a in expect.items() if a != {GONE}]
+
+    def gone(key):
+        for a in range(20):
+            status, reply = http("DELETE", f"{GW[a % len(GW)]}/{BUCKET}/{key}", timeout=30)
+            if status in (200, 204):
+                with lock:
+                    expect[key] = {GONE}
+                return None
+            time.sleep(1)
+        return (key, status)
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        bad = [r for r in pool.map(gone, keys) if r]
+    if bad:
+        fail(f"deleting everything: {len(bad)} deletes failed: {bad[:5]}")
+    say(f"deleted all {len(keys)} remaining keys")
+
+
+def await_no_leak(baseline):
+    """Space comes back: within LEAK_SLACK of the baseline, given time for
+    the deletes' tombstones and packs to be cleaned up."""
+    deadline = time.monotonic() + float(os.environ.get("LEAK_WAIT", "3600"))
+    while True:
+        u = usage()
+        if u and u[0] <= baseline + LEAK_SLACK:
+            say(f"no leak: {u[0] / 1e9:.2f} GB used, {baseline / 1e9:.2f} GB before the run")
+            return
+        if time.monotonic() > deadline:
+            fail(f"leak: {u and u[0] / 1e9:.2f} GB still used with every key deleted "
+                 f"({baseline / 1e9:.2f} GB before the run)")
+        time.sleep(60)
+
+
+def main():
+    say(f"soak: {HOURS} h, a fault every {FAULT_EVERY / 60:.0f} min, {WRITERS} writers; "
+        f"cluster {chaos.IP}")
+    while http("PUT", f"{GW[0]}/{BUCKET}")[0] not in (200, 409):
+        time.sleep(2)
+    chaos.await_metas_healthy()
+    chaos.await_osds_online(6)
+    baseline = usage()[0]
+    threads = [threading.Thread(target=writer, args=(n,), daemon=True) for n in range(WRITERS)]
+    threads += [threading.Thread(target=fill_control, daemon=True),
+                threading.Thread(target=progress, daemon=True)]
+    for t in threads:
+        t.start()
+    time.sleep(60)
+    phase_report("warm-up")
+
+    faults = os.environ.get("FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull")
+    faults = faults.split(",")
+    volume = {}  # the VM pulled from -> its OSD's current volume
+    end = time.monotonic() + HOURS * 3600
+    n = 0
+    while time.monotonic() < end:
+        stop.wait(FAULT_EVERY)
+        f = faults[n % len(faults)]
+        n += 1
+        if f == "meta-kill":
+            chaos.meta_kill()
+        elif f == "power-off":
+            chaos.power_off("chaos-6", "power-off")
+        elif f == "meta-power-off":
+            chaos.power_off("chaos-3", "meta-power-off")
+        elif f == "partition":
+            chaos.partition()
+        elif f == "disk-pull":
+            vm = "chaos-5"
+            old = volume.get(vm, f"{vm}-osd")
+            chaos.disk_pull(vm, new=f"{vm}-osd-{n}")
+            volume[vm] = f"{vm}-osd-{n}"
+            incus("storage", "volume", "delete", "default", old, check=False)
+        else:
+            fail(f"unknown fault {f}")
+        check(f"after {f} ({n})")
+
+    stop.set()
+    for t in threads[:WRITERS]:
+        t.join()
+    phase_report("end")
+    check("at the end", everything=True)
+    check_listing()
+    with lock:
+        want = {k: next(iter(a)) for k, a in expect.items() if GONE not in a and len(a) == 1}
+    chaos.redundancy_restored(list(want), lambda key, data: digest(data) == want[key])
+    delete_everything()
+    check("after deleting everything", everything=True)
+    await_no_leak(baseline)
+    print(f"✓ soak: {sum(stats[k] for k in ('put', 'overwrite', 'delete'))} acknowledged "
+          f"operations over {HOURS} h, {stats['bytes'] / 1e12:.2f} TB written; nothing lost, "
+          f"nothing leaked", flush=True)
+
+
+if __name__ == "__main__":
+    main()

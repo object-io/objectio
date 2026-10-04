@@ -48,6 +48,7 @@ WRITERS = 6
 MAX_GAP = float(os.environ.get("MAX_GAP", "60"))
 HOLD = int(os.environ.get("HOLD", "60"))
 REPAIR_WAIT = int(os.environ.get("REPAIR_WAIT", "900"))
+DISK_SIZE = os.environ.get("DISK_SIZE", "16GiB")  # as cluster.sh
 
 
 def say(msg):
@@ -338,7 +339,9 @@ def partition():
     settle("partition")
 
 
-def disk_pull(vm="chaos-5"):
+def disk_pull(vm="chaos-5", new=None):
+    """`new`: the Incus volume to plug in (default `<vm>-osd2`)."""
+    new = new or f"{vm}-osd2"
     old = osd_of(vm)
     if not old:
         fail(f"no OSD found on {vm}")
@@ -349,8 +352,8 @@ def disk_pull(vm="chaos-5"):
     status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "out"})
     if status != 200:
         fail(f"set out: {status} {data[:200]}")
-    incus("storage", "volume", "create", "default", f"{vm}-osd2", "--type=block", "size=16GiB")
-    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={vm}-osd2")
+    incus("storage", "volume", "create", "default", new, "--type=block", f"size={DISK_SIZE}")
+    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={new}")
     vm_exec(vm, "sleep 3; systemctl restart objectio-osd")
     # The documented replacement: the OSD comes back on the new disk under
     # its identity (its metadata lives in its state directory; the shards
@@ -405,9 +408,17 @@ def await_repair_quiet(deadline):
         time.sleep(10)
 
 
-def redundancy_restored():
+def redundancy_restored(keys=None, intact=None):
     """With every node up, wait for repair (meta runs it every minute
-    here) to have nothing left to do, then any two OSDs may go."""
+    here) to have nothing left to do, then any two OSDs may go. `keys`
+    (default: the acknowledged ones) are sampled; `intact(key, data)`
+    (default: its acknowledged digest) says whether a read is right."""
+    if keys is None:
+        with lock:
+            keys = list(acked)
+    if intact is None:
+        def intact(key, data):
+            return hashlib.sha256(data).hexdigest() == acked[key]
     say("redundancy: running repair until two OSDs can be stopped")
     pairs = [("chaos-1", "chaos-2"), ("chaos-3", "chaos-4"), ("chaos-5", "chaos-6")]
     deadline = time.monotonic() + REPAIR_WAIT
@@ -419,12 +430,10 @@ def redundancy_restored():
             for vm in (a, b):
                 vm_exec(vm, "systemctl stop objectio-osd")
             try:
-                with lock:
-                    items = list(acked.items())
                 unreadable = 0
-                for key, digest in random.sample(items, min(len(items), 400)):
+                for key in random.sample(keys, min(len(keys), 400)):
                     status, data = http("GET", f"{GW[0]}/{BUCKET}/{key}", timeout=10)
-                    if status != 200 or hashlib.sha256(data).hexdigest() != digest:
+                    if status != 200 or not intact(key, data):
                         unreadable += 1
             finally:
                 for vm in (a, b):
