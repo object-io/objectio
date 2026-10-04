@@ -1708,6 +1708,21 @@ impl StorageService for OsdService {
 
         let timestamp = Self::current_timestamp();
 
+        // The checksum the shard's object records (B23). The block's own
+        // checks passed above against this OSD's checksum; that one was
+        // taken of whatever bytes this OSD was sent, so a shard stored wrong
+        // (rebuilt from a bad source) passes them. It doesn't pass this.
+        if let Some(expected) = req.expected_crc32c {
+            let actual = crc32c::crc32c(&data);
+            if actual != expected {
+                self.mark_corrupt(&key, location.block_num);
+                return Err(Status::data_loss(format!(
+                    "shard is not the one its object records \
+                     (crc32c {actual:08x}, expected {expected:08x})"
+                )));
+            }
+        }
+
         // A ranged read (a packed object's slice): the whole shard is
         // checked against its stored checksum first, as the gateway checks
         // a whole shard, and only the range goes back, with a checksum of
