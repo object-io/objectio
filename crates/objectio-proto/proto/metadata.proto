@@ -433,6 +433,11 @@ message ObjectMeta {
     // clock value (objectio_common::stamp). An OSD keeps the highest; a
     // read takes the newest of a read quorum. 0 = unstamped.
     uint64 stamp = 29;
+    // Order of updates of this same object (tagging, retention, legal
+    // hold, packing, a shard moved or rebuilt), which keep `stamp`: compared
+    // only between copies of one object (same stamp and object id), so an
+    // update never outranks a newer object. 0 = never updated.
+    uint64 update_stamp = 30;
 }
 
 // A full-object checksum, as S3 reports it.

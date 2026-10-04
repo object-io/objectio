@@ -872,7 +872,18 @@ pub async fn put_object_meta_with(
     object_meta.usage_owner.clone_from(&targets[0].node_id);
     // Every copy gets the same stamp, above any this one was read at: the
     // order the copies keep (core/object-metadata-quorum.md).
-    object_meta.stamp = objectio_common::stamp::CLOCK.next_after(object_meta.stamp);
+    //
+    // An update of the object read (an expected id) keeps its stamp and is
+    // ordered among that object's updates: stamped above it, it would
+    // outrank a PUT of the key that raced it on some copies, and that PUT,
+    // acknowledged, would lose to the old object on every copy once healed.
+    if expected_object_id.is_empty() {
+        object_meta.stamp = objectio_common::stamp::CLOCK.next_after(object_meta.stamp);
+        object_meta.update_stamp = 0;
+    } else {
+        object_meta.update_stamp =
+            objectio_common::stamp::CLOCK.next_after(object_meta.update_stamp);
+    }
 
     let mut futs = Vec::with_capacity(targets.len());
     for placement in &targets {
@@ -1089,7 +1100,7 @@ pub async fn get_object_version_meta_from_any(
                 if let Some(o) = found
                     && newest
                         .as_ref()
-                        .is_none_or(|n| (o.stamp, &o.object_id) > (n.stamp, &n.object_id))
+                        .is_none_or(|n| o.write_order() > n.write_order())
                 {
                     newest = Some(o);
                 }

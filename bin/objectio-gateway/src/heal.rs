@@ -191,7 +191,7 @@ async fn converge(
     let newest = held
         .iter()
         .filter_map(|h| h.object.as_ref())
-        .max_by(|a, b| (a.stamp, &a.object_id).cmp(&(b.stamp, &b.object_id)))
+        .max_by(|a, b| a.write_order().cmp(&b.write_order()))
         .cloned();
     let deleted_at = held.iter().map(|h| h.deleted_at).max().unwrap_or(0);
 
@@ -202,7 +202,7 @@ async fn converge(
             for (c, h) in copies.iter().zip(&held) {
                 if h.object
                     .as_ref()
-                    .is_some_and(|o| o.object_id == newest.object_id && o.stamp == newest.stamp)
+                    .is_some_and(|o| o.write_order() == newest.write_order())
                 {
                     continue;
                 }
