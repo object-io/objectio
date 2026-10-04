@@ -83,6 +83,14 @@ const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
 /// an OSD that restarted accepts at once; one that is gone does not.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long an OSD call runs before the gateway checks, in the
+/// background, whether the OSD still accepts connections ([`OsdPool::watched`]).
+const SUSPECT_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a failed-fast address is kept failed fast by its probe while
+/// it stays gone.
+const PROBE_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// How often a failed-fast address is probed while its mark lasts.
 const PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -100,7 +108,7 @@ pub struct OsdPool {
     /// Addresses whose cached channel is to be dropped before next use: a
     /// channel to a host that vanished can hang a call until its timeout
     /// instead of failing, so after a failure the next call dials afresh.
-    stale: std::sync::Mutex<std::collections::HashSet<String>>,
+    stale: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Meta, for keys a write or delete left behind on some copies.
     heal: std::sync::OnceLock<
         objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
@@ -115,7 +123,7 @@ impl OsdPool {
             address_map: RwLock::new(HashMap::new()),
             unreachable: Arc::default(),
             probing: Arc::default(),
-            stale: std::sync::Mutex::new(std::collections::HashSet::new()),
+            stale: Arc::default(),
             heal: std::sync::OnceLock::new(),
         }
     }
@@ -185,6 +193,7 @@ impl OsdPool {
         // check stopped the next two OSDs inside that window, and four
         // looked down).
         runtime.spawn(async move {
+            let started = std::time::Instant::now();
             let marked = || {
                 unreachable
                     .lock()
@@ -197,15 +206,89 @@ impl OsdPool {
                     Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
                     Err(_) => false,
                 };
-                if answers {
-                    unreachable
+                {
+                    let mut marks = unreachable
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&address);
-                    debug!("{address} answers again; no longer failed fast");
-                    break;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if answers {
+                        marks.remove(&address);
+                        debug!("{address} answers again; no longer failed fast");
+                        break;
+                    }
+                    // Still gone: kept failed fast, so requests don't each
+                    // wait out a connect timeout every time the mark would
+                    // run out (every 8 s, writes stalled for 3). Until
+                    // PROBE_FOR, after which the next failure starts over.
+                    if started.elapsed() < PROBE_FOR {
+                        marks.insert(address.clone(), std::time::Instant::now());
+                    }
                 }
                 tokio::time::sleep(PROBE_EVERY).await;
+            }
+            probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&address);
+        });
+    }
+
+    /// Await `call`, an RPC to the OSD at `address`. One still running after
+    /// [`SUSPECT_AFTER`] makes the gateway check, in the background, whether
+    /// the OSD still accepts a connection, and fail it fast if not.
+    ///
+    /// A call on a connection to a host that vanished without a reset hangs
+    /// until HTTP/2 keepalive gives up (about 5 s). By then the client has
+    /// often given up too, the request is dropped, and the failure is never
+    /// seen: the next request takes the same dead connection. In the A6
+    /// chaos test that held every write through one gateway for the whole
+    /// 60 s partition. A busy OSD still accepts connections, so a slow call
+    /// alone never fails one fast.
+    pub async fn watched<F: std::future::Future>(&self, address: &str, call: F) -> F::Output {
+        let mut call = std::pin::pin!(call);
+        tokio::select! {
+            out = &mut call => return out,
+            () = tokio::time::sleep(SUSPECT_AFTER) => {}
+        }
+        self.suspect(address);
+        call.await
+    }
+
+    /// Check whether `address` accepts a fresh connection, in the
+    /// background; fail it fast if it doesn't.
+    fn suspect(&self, address: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.is_unreachable(address)
+            || !self
+                .probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(address.to_string())
+        {
+            return; // known down, or already being checked
+        }
+        let (unreachable, stale, probing) = (
+            Arc::clone(&self.unreachable),
+            Arc::clone(&self.stale),
+            Arc::clone(&self.probing),
+        );
+        let address = address.to_string();
+        runtime.spawn(async move {
+            let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
+                Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                Err(_) => false,
+            };
+            if !answers {
+                warn!("{address}: a call hangs and a new connection fails; failing it fast");
+                unreachable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(address.clone(), std::time::Instant::now());
+                stale
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(address.clone());
             }
             probing
                 .lock()
@@ -500,7 +583,7 @@ async fn call_write_shard(
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        client.write_shard(request),
+        pool.watched(&placement.node_address, client.write_shard(request)),
     )
     .await;
     crate::gateway_metrics::record_shard_io(&placement.node_address, "write", started.elapsed());
@@ -544,7 +627,7 @@ async fn call_read_shard(
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        client.read_shard(request),
+        pool.watched(&placement.node_address, client.read_shard(request)),
     )
     .await;
     crate::gateway_metrics::record_shard_io(&placement.node_address, "read", started.elapsed());
@@ -975,7 +1058,7 @@ pub async fn put_object_meta_with(
                 .get_client_for_placement(&p)
                 .await
                 .map_err(|e| (e, true))?;
-            let fut = client.put_object_meta(req);
+            let fut = pool.watched(&p.node_address, client.put_object_meta(req));
             let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
                 .await
                 .map_err(|_| {
@@ -1121,7 +1204,7 @@ pub async fn get_object_version_meta_from_any(
             })?;
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            client.get_object_meta(req),
+            pool.watched(&placement.node_address, client.get_object_meta(req)),
         )
         .await
         {
@@ -1211,7 +1294,10 @@ pub async fn get_object_version_meta_from_osd(
         version_id: version_id.to_string(),
     };
 
-    let get_future = client.get_object_meta(request);
+    let get_future = pool.watched(
+        &primary_placement.node_address,
+        client.get_object_meta(request),
+    );
     let response = tokio::time::timeout(std::time::Duration::from_secs(10), get_future)
         .await
         .map_err(|_| {
@@ -1274,15 +1360,18 @@ pub async fn delete_meta_from_all(
             version_id: version_id.to_string(),
             stamp,
         });
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-            .await
-            .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
-            .map_err(|e| {
-                if is_transport_failure(&e) {
-                    pool.mark_unreachable(&p.node_address);
-                }
-                OsdPoolError::ConnectionFailed(e.to_string())
-            })?;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pool.watched(&p.node_address, fut),
+        )
+        .await
+        .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
+        .map_err(|e| {
+            if is_transport_failure(&e) {
+                pool.mark_unreachable(&p.node_address);
+            }
+            OsdPoolError::ConnectionFailed(e.to_string())
+        })?;
         Ok::<_, OsdPoolError>(resp.into_inner().removed)
     });
     let mut out = MetaDeleted {
@@ -2124,6 +2213,48 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A call that hangs makes the gateway check the OSD: one that no
+    /// longer accepts connections is failed fast even though the call
+    /// itself never failed (its request may be long gone); a slow one that
+    /// still answers is not.
+    #[tokio::test]
+    async fn a_hanging_call_to_a_vanished_osd_fails_it_fast() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let hang =
+            || tokio::time::sleep(super::SUSPECT_AFTER + std::time::Duration::from_millis(500));
+
+        let pool = super::OsdPool::new();
+        // Dropped before it would be suspected: nothing checked.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.watched(&gone, hang()),
+        )
+        .await;
+        assert!(!pool.is_unreachable(&gone));
+
+        tokio::join!(pool.watched(&gone, hang()), pool.watched(&busy, hang()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pool.is_unreachable(&gone) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a vanished OSD not failed fast"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pool.is_unreachable(&busy),
+            "a slow OSD that answers was failed fast"
+        );
     }
 
     /// A connection cut under a call is a failure to retry (503), not a
