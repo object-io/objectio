@@ -5,6 +5,7 @@
 //! `bin/objectio-aio` to compose meta into a single-process monolith.
 
 pub mod balancer;
+mod campaign;
 pub mod drain_observer;
 pub mod forward;
 pub mod liveness;
@@ -277,6 +278,7 @@ pub async fn run(
         args.drain_batch,
     );
     liveness::spawn(meta_service.clone());
+    campaign::spawn(raft.clone(), node_id);
     spawn_admin_bootstrap(
         meta_service.clone(),
         args.admin_user.clone(),
