@@ -151,6 +151,55 @@ fn a_follower_lost_and_back_catches_up() {
     assert_all_readable(&ha.clients[1], "fo", &acked, "after both losses");
 }
 
+/// B18: the log is compacted into snapshots, so a follower down for
+/// longer than the kept log can't be caught up from it: it is sent a
+/// snapshot, under traffic, and then serves as part of the majority.
+#[test]
+fn a_follower_behind_the_compacted_log_catches_up_from_a_snapshot() {
+    let ha = HaCluster::start_with_meta_args(
+        3,
+        6,
+        2,
+        &["--raft-snapshot-every", "50", "--raft-keep-logs", "10"],
+    );
+    bucket(&ha.clients[0], "sn");
+    let acked = Acked::default();
+    let leader = ha.await_leader(Duration::from_secs(20));
+    let follower = (0..3).find(|&i| i != leader).unwrap();
+    let mut stopped_at = 0;
+    while_writing(&ha, "sn", &acked, 8, || {
+        stopped_at = ha.status(follower).map_or(0, |s| s.last_applied);
+        ha.kill_meta(follower);
+    });
+    let l = ha.status(leader).expect("leader status");
+    assert!(
+        l.purged > stopped_at,
+        "the leader's log was not compacted past the follower: {l:?}, follower at {stopped_at}"
+    );
+
+    ha.start_meta(follower);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (f, l) = (ha.status(follower), ha.status(leader));
+        if let (Some(f), Some(l)) = (&f, &l)
+            && f.last_applied >= l.last_applied
+            && f.snapshot > stopped_at
+            && f.state == "Follower"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never caught up from a snapshot: {f:?} vs {l:?}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Now the leader goes: the node caught up from the snapshot is part of
+    // the new majority, and holds everything.
+    while_writing(&ha, "sn", &acked, 6, || ha.kill_meta(leader));
+    assert_all_readable(&ha.clients[1], "sn", &acked, "after both losses");
+}
+
 /// The leader frozen (as if cut off by a partition): the others elect a
 /// new one and go on; when it thaws it steps down rather than leading a
 /// second cluster, and nothing written meanwhile is lost.
