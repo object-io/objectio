@@ -136,6 +136,22 @@ k rollout status "sts/$STS" --timeout=600s >/dev/null
 await_healthy "after the rolling restart"
 sleep 15
 
+# A8c: the system always audits. A fresh install keeps every event in its
+# system bucket (the chart's default), through the failovers above.
+audit_objects() {
+    k exec "$POD" -- python3 -c '
+import sys, urllib.request
+body = urllib.request.urlopen(sys.argv[1] + "/objectio-audit?list-type=2", timeout=10).read()
+print(body.decode().count("<Key>"))
+' "http://$GW_SVC:$GW_PORT" 2>/dev/null || echo 0
+}
+deadline=$((SECONDS + 60))
+until [ "$(audit_objects)" -gt 0 ]; do
+    [ $SECONDS -lt $deadline ] || die "no audit events in the system bucket objectio-audit"
+    sleep 3
+done
+say "system audit: $(audit_objects) objects of events in objectio-audit"
+
 say "stopping traffic; reading every acknowledged object back"
 k exec "$POD" -- touch /tmp/stop
 k wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$POD" --timeout=900s >/dev/null 2>&1 || true
