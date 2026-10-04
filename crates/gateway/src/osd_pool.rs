@@ -152,17 +152,34 @@ impl OsdPool {
         let Some(meta) = self.heal.get() else {
             return;
         };
-        let r = meta
-            .clone()
-            .heal_enqueue(objectio_proto::metadata::HealEnqueueRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: version_id.to_string(),
-            })
-            .await;
+        let request = objectio_proto::metadata::HealEnqueueRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+        };
+        let r = meta.clone().heal_enqueue(request.clone()).await;
         crate::gateway_metrics::record_heal_queued(r.is_ok());
         if let Err(e) = r {
-            warn!("{bucket}/{key}: could not queue for healing: {e}");
+            // Meta down or electing: keep trying for a while rather than
+            // leave the key unhealed (and, after a delete, still listed).
+            warn!("{bucket}/{key}: could not queue for healing yet: {e}");
+            let meta = meta.clone();
+            tokio::spawn(async move {
+                let mut wait = std::time::Duration::from_secs(1);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+                while std::time::Instant::now() < deadline {
+                    tokio::time::sleep(wait).await;
+                    if meta.clone().heal_enqueue(request.clone()).await.is_ok() {
+                        crate::gateway_metrics::record_heal_queued(true);
+                        return;
+                    }
+                    wait = (wait * 2).min(std::time::Duration::from_secs(30));
+                }
+                warn!(
+                    "{}/{}: could not queue for healing in 10 minutes; given up",
+                    request.bucket, request.key
+                );
+            });
         }
     }
 
