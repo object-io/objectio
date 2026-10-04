@@ -265,8 +265,15 @@ fn dedup_note_key(fingerprint: &[u8]) -> MetadataKey {
 }
 
 /// OSD service state
+/// The default share of a disk client writes may fill: the rest is kept for
+/// repair, drain and backfill (as Ceph's `full_ratio`).
+pub const DEFAULT_FULL_RATIO: f64 = 0.95;
+
 pub struct OsdService {
     node_id: [u8; 16],
+    /// The share of a disk client writes may fill (B3); the rest is kept
+    /// for writes that restore redundancy.
+    full_ratio: f64,
     disks: Vec<DiskManager>,
     disk_ids: Vec<[u8; 16]>,
     /// Shard index: object_id:stripe_id:position -> location (in-memory cache)
@@ -629,6 +636,7 @@ impl OsdService {
             disks,
             disk_ids,
             shard_index: RwLock::new(persisted),
+            full_ratio: DEFAULT_FULL_RATIO,
             meta_store: Arc::new(meta_store),
             start_time: Instant::now(),
             next_disk: RwLock::new(0),
@@ -1240,6 +1248,37 @@ impl OsdService {
         out
     }
 
+    /// The share of each disk client writes may fill (B3).
+    #[must_use]
+    pub fn with_full_ratio(mut self, ratio: f64) -> Self {
+        self.full_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Whether a client write of `blocks` fits on disk `disk_idx` without
+    /// going into the space kept for writes that restore redundancy. A full
+    /// disk refused client writes only when it had no block left, so repair
+    /// had nowhere to rebuild a lost shard on a full cluster.
+    #[allow(clippy::result_large_err)]
+    fn check_room(&self, disk_idx: usize, blocks: u64) -> Result<(), Status> {
+        let disk = &self.disks[disk_idx];
+        let need = blocks * u64::from(disk.block_size());
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let reserve = (disk.capacity() as f64 * (1.0 - self.full_ratio)) as u64;
+        if disk.free_space() < need + reserve {
+            return Err(Status::resource_exhausted(format!(
+                "disk {disk_idx} is full: {} of {} bytes used, the rest kept for repair",
+                disk.used_space(),
+                disk.capacity()
+            )));
+        }
+        Ok(())
+    }
+
     /// Allocate a block for writing.
     ///
     /// Was `next_block.fetch_add(1)` — a counter that never checked itself
@@ -1503,6 +1542,9 @@ impl StorageService for OsdService {
         // an object count, not a byte count, and nothing reported it.
         let disk_idx = self.select_disk_for_write();
         let blocks = self.disks[disk_idx].blocks_for_len(data.len());
+        if !req.use_reserve {
+            self.check_room(disk_idx, blocks)?;
+        }
         let block_num = self.allocate_extent(disk_idx, blocks)?;
 
         let disk = &self.disks[disk_idx];
@@ -2885,6 +2927,7 @@ mod grpc_write_tests {
                 ..Default::default()
             }),
             rdma: None,
+            use_reserve: false,
         }
     }
 
