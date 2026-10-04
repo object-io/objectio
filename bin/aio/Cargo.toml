@@ -1,0 +1,54 @@
+[package]
+name = "objectio-aio"
+description = "ObjectIO all-in-one — single-command supervisor for meta + OSD + gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Creates console/dist when missing so a fresh clone can build; see build.rs.
+build = "build.rs"
+
+[[bin]]
+name = "objectio-aio"
+path = "src/main.rs"
+
+[dependencies]
+# aio links directly against each service crate's lib — they run as
+# tokio tasks in the same process, not as child processes. One
+# tracing subscriber, one Ctrl-C handler, one memory space.
+objectio-meta = { workspace = true }
+objectio-osd = { workspace = true }
+objectio-gateway = { workspace = true }
+objectio-block-gateway = { workspace = true }
+objectio-proto = { workspace = true }
+
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+which = "6"
+tempfile = "3"
+include_dir = "0.7"
+
+[features]
+default = []
+# ISA-L erasure coding on x86_64. The release builds aio by package
+# (`--bin objectio-aio --features isal`), which cannot reach a feature
+# declared only on objectio-erasure — so forward it through the two
+# binaries that do the encoding.
+isal = ["objectio-gateway/isal", "objectio-osd/isal"]
+# Propagates to objectio-osd → objectio-storage. Linux-only win; safe
+# no-op elsewhere. Enable on Linux release builds to get +25%
+# throughput + -43% p99.9 on 4 MiB object stripes.
+io-uring = ["objectio-osd/io-uring"]
+# Shard transfers over Mooncake Transfer Engine between the embedded gateway
+# and OSDs, turned on with `--rdma`. Linux only; needs a Mooncake build.
+rdma = ["objectio-gateway/rdma", "objectio-osd/rdma"]
+# Pluggable grep engines — propagate into the embedded gateway.
+# pcre2 needs libpcre2-dev at build time; hyperscan needs
+# libhyperscan-dev (Linux x86_64 primary). Off by default so
+# macOS / Windows builds stay pure-Rust.
+grep-pcre2 = ["objectio-gateway/pcre2"]
+grep-hyperscan = ["objectio-gateway/hyperscan"]

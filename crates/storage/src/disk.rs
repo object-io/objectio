@@ -1,0 +1,1005 @@
+//! Disk management and raw I/O
+//!
+//! Provides high-level disk operations including:
+//! - Disk initialization with superblock
+//! - Block read/write with checksums
+//! - Background scrubbing
+
+use crate::aligned_buf::AlignedBuf;
+use crate::block::{BlockBitmap, Extent};
+use crate::io_backend::{IoBackend, best_available};
+use crate::layout::{BlockFooter, BlockHeader, DEFAULT_BLOCK_SIZE, SUPERBLOCK_SIZE, Superblock};
+use crate::raw_io::{AlignedBuffer, RawFile};
+use objectio_common::{DiskId, Error, Result};
+use parking_lot::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Disk manager for a single raw disk
+pub struct DiskManager {
+    /// Sync raw file handle. Used by every non-hot-path call site
+    /// (superblock update, bitmap I/O, fsync). Kept for backward
+    /// compatibility — the sync `read_block` / `write_block` methods
+    /// below still go through this handle.
+    file: RawFile,
+    /// Async I/O backend for the shard hot path. Opened at
+    /// construction; selects `UringBackend` on Linux + `--features
+    /// io-uring`, else `PreadBackend` wrapping `spawn_blocking`.
+    /// Either way, the tokio reactor is not blocked.
+    disk_io: Arc<dyn IoBackend>,
+    /// Keep the path around so error messages can identify the disk
+    /// without unwrapping the file handle. Unused today but tiny, and
+    /// gives us an asserts-friendly identity if we need it.
+    #[allow(dead_code)]
+    path: PathBuf,
+    /// Superblock (cached)
+    superblock: RwLock<Superblock>,
+    /// Next block sequence number
+    sequence: AtomicU64,
+    /// Which data blocks are in use.
+    ///
+    /// The on-disk format has always reserved a region for this (see
+    /// `Superblock::bitmap_offset`), and `BlockBitmap` has always known how
+    /// to allocate and free against it — the two were simply never
+    /// connected. Until they were, the OSD allocated with a bare
+    /// incrementing counter: it never bounded itself against
+    /// `total_blocks`, so a full disk surfaced as a write past the end of
+    /// the device, and it could never reuse a block, so deleting an object
+    /// freed nothing.
+    allocator: BlockBitmap,
+    /// Statistics
+    stats: DiskStats,
+}
+
+/// Disk statistics
+#[derive(Debug, Default)]
+pub struct DiskStats {
+    pub reads: AtomicU64,
+    pub writes: AtomicU64,
+    pub bytes_read: AtomicU64,
+    pub bytes_written: AtomicU64,
+    pub read_errors: AtomicU64,
+    pub write_errors: AtomicU64,
+    pub checksum_errors: AtomicU64,
+}
+
+impl DiskManager {
+    /// Initialize a new disk with ObjectIO format
+    ///
+    /// The block_size parameter determines the storage block size.
+    /// Use None to use the default (64KB), or specify a custom size.
+    /// Larger block sizes support larger erasure-coded shards without chunking.
+    pub fn init(path: impl AsRef<Path>, size: u64, block_size: Option<u32>) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
+        let file = RawFile::create(&path, size)?;
+
+        // Create and write superblock
+        let actual_block_size = block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
+        let superblock = Superblock::new(size, actual_block_size)?;
+        write_superblock(&file, &superblock)?;
+
+        // Initialize bitmap region (all zeros = all free)
+        let bitmap_size = superblock.bitmap_size as usize;
+        let bitmap_buf = AlignedBuffer::new(bitmap_size);
+        file.write_at(superblock.bitmap_offset, bitmap_buf.as_slice())?;
+
+        file.sync()?;
+
+        let disk_io = best_available(&path_buf, false, true)?;
+        let allocator = BlockBitmap::new(superblock.total_blocks);
+        Ok(Self {
+            file,
+            disk_io,
+            path: path_buf,
+            superblock: RwLock::new(superblock),
+            sequence: AtomicU64::new(1),
+            allocator,
+            stats: DiskStats::default(),
+        })
+    }
+
+    /// Open an existing disk
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path_buf = path.as_ref().to_path_buf();
+        let file = RawFile::open(&path, false)?;
+
+        let superblock = read_superblock(&file, &path_buf)?;
+
+        // Load the allocation bitmap from its reserved region. A disk
+        // written before the allocator was wired up has an all-zero bitmap
+        // even though its blocks are occupied; the OSD repairs that on
+        // startup by replaying its shard index through `mark_block_used`.
+        let mut bitmap_buf = AlignedBuffer::new(superblock.bitmap_size as usize);
+        file.read_at(superblock.bitmap_offset, bitmap_buf.as_mut_slice())?;
+        let allocator = BlockBitmap::from_bytes(bitmap_buf.as_slice(), superblock.total_blocks);
+
+        let disk_io = best_available(&path_buf, false, true)?;
+        Ok(Self {
+            file,
+            disk_io,
+            path: path_buf,
+            superblock: RwLock::new(superblock),
+            sequence: AtomicU64::new(1),
+            allocator,
+            stats: DiskStats::default(),
+        })
+    }
+
+    /// Get the disk ID
+    pub fn id(&self) -> DiskId {
+        self.superblock.read().disk_id
+    }
+
+    /// Cluster UUID this disk belongs to, or `Uuid::nil()` if the disk
+    /// predates the identity fields / hasn't been claimed yet.
+    pub fn cluster_uuid(&self) -> uuid::Uuid {
+        self.superblock.read().cluster_uuid
+    }
+
+    /// Stable OSD node_id this disk is owned by, or all-zero if the
+    /// disk hasn't been claimed by an OSD yet. The OSD uses this on
+    /// boot to recover its identity across pod restarts.
+    pub fn osd_node_id(&self) -> [u8; 16] {
+        self.superblock.read().osd_node_id
+    }
+
+    /// Does this disk's superblock contain a persisted OSD identity?
+    /// `false` for pre-upgrade disks (both fields all-zero) — the OSD
+    /// will write one on the next mount.
+    pub fn has_identity(&self) -> bool {
+        self.superblock.read().has_identity()
+    }
+
+    /// Write cluster_uuid + osd_node_id into the superblock's reserved
+    /// region and persist. Idempotent — safe to call even if the disk
+    /// already has a matching identity; errors out if the existing
+    /// cluster_uuid disagrees (cross-cluster guard).
+    pub fn set_identity(&self, cluster_uuid: uuid::Uuid, osd_node_id: [u8; 16]) -> Result<()> {
+        let mut sb = self.superblock.write();
+        if sb.has_identity() && sb.cluster_uuid != cluster_uuid && !cluster_uuid.is_nil() {
+            return Err(Error::Storage(format!(
+                "refusing to rewrite disk identity: on-disk cluster_uuid={} \
+                 does not match caller's {}",
+                sb.cluster_uuid, cluster_uuid
+            )));
+        }
+        sb.set_identity(cluster_uuid, osd_node_id);
+        let sb = sb.clone();
+        write_superblock(&self.file, &sb)
+    }
+
+    /// Get the disk path
+    pub fn path(&self) -> &str {
+        self.file.path()
+    }
+
+    /// Get total capacity in bytes
+    pub fn capacity(&self) -> u64 {
+        let sb = self.superblock.read();
+        sb.total_blocks * u64::from(sb.block_size)
+    }
+
+    /// Get free space in bytes.
+    ///
+    /// Read from the live bitmap, not `superblock.free_blocks` — that field
+    /// was written once at format time and never again, which is why every
+    /// capacity reading in the cluster was the disk's full size and why a
+    /// disk could fill with nothing warning about it.
+    pub fn free_space(&self) -> u64 {
+        self.allocator.free_count() * u64::from(self.block_size())
+    }
+
+    /// Get used space in bytes.
+    pub fn used_space(&self) -> u64 {
+        let sb = self.superblock.read();
+        let used_blocks = sb.total_blocks.saturating_sub(self.allocator.free_count());
+        used_blocks * u64::from(sb.block_size)
+    }
+
+    /// How many contiguous blocks a payload of `data_len` needs.
+    ///
+    /// One shard used to occupy exactly one block, and the block was sized for
+    /// the largest shard any scheme could produce — 4 MB. So a 4 KB object and
+    /// a 4 MB object cost the same 24 MB across a 4+2 stripe, measured at
+    /// 6144x and 6x amplification, and the real capacity limit was an object
+    /// count (~12,500 on a 294 GiB cluster) that nothing reported. Sizing the
+    /// allocation to the payload is what fixes that.
+    ///
+    /// An extent is laid out exactly as a single block was — header at the
+    /// very start, footer at the very end — so `data_len` in the header tells
+    /// a reader how far the extent runs. That is why nothing had to be added
+    /// to the persisted shard index.
+    #[must_use]
+    pub fn blocks_for(data_len: usize, block_size: usize) -> u64 {
+        let total = BlockHeader::SIZE + data_len + BlockFooter::SIZE;
+        total.div_ceil(block_size) as u64
+    }
+
+    /// Blocks a shard of `data_len` bytes occupies on this disk.
+    #[must_use]
+    pub fn blocks_for_len(&self, data_len: usize) -> u64 {
+        Self::blocks_for(data_len, self.superblock.read().block_size as usize)
+    }
+
+    /// Claim `count` contiguous free blocks, returning the first.
+    pub fn allocate_extent(&self, count: u64) -> Result<u64> {
+        self.allocator
+            .allocate_extent(count)
+            .map(|e| e.start)
+            .ok_or(Error::DiskFull)
+    }
+
+    /// Release `count` blocks starting at `start`.
+    pub fn free_extent(&self, start: u64, count: u64) -> Result<()> {
+        self.allocator.free_extent(&Extent::new(start, count))
+    }
+
+    /// Mark `count` blocks starting at `start` used, for startup
+    /// reconciliation. Idempotent, like [`Self::mark_block_used`].
+    pub fn mark_extent_used(&self, start: u64, count: u64) -> Result<()> {
+        for i in 0..count {
+            self.allocator.mark_used(start + i)?;
+        }
+        Ok(())
+    }
+
+    /// Claim a free data block. `Error::DiskFull` when there are none.
+    pub fn allocate_block(&self) -> Result<u64> {
+        self.allocator.allocate().ok_or(Error::DiskFull)
+    }
+
+    /// Release a block back to the pool.
+    pub fn free_block(&self, block_num: u64) -> Result<()> {
+        self.allocator.free(block_num)
+    }
+
+    /// Mark a block used without allocating it.
+    ///
+    /// Only for startup reconciliation: a disk written before the allocator
+    /// existed has occupied blocks and an empty bitmap, so the OSD replays
+    /// its shard index through this to make the two agree. Idempotent — a
+    /// block already marked is left alone rather than double-counted.
+    pub fn mark_block_used(&self, block_num: u64) -> Result<()> {
+        self.allocator.mark_used(block_num)
+    }
+
+    /// Whether a block is currently allocated.
+    pub fn is_block_allocated(&self, block_num: u64) -> bool {
+        self.allocator.is_allocated(block_num)
+    }
+
+    /// Write the allocation bitmap back to its reserved region. The
+    /// superblock is left alone: rewriting it on every delete risked tearing
+    /// it in a power cut, and the free count is read from the bitmap anyway
+    /// (`superblock.free_blocks` is as of the superblock's last write).
+    pub fn persist_allocator(&self) -> Result<()> {
+        let (offset, size) = {
+            let sb = self.superblock.read();
+            (sb.bitmap_offset, sb.bitmap_size)
+        };
+        let bytes = self.allocator.to_bytes();
+        let mut buf = AlignedBuffer::new(size as usize);
+        buf.copy_from(&bytes);
+        self.file.write_at(offset, buf.as_slice())?;
+        self.file.sync()?;
+        Ok(())
+    }
+
+    /// Get block size
+    pub fn block_size(&self) -> u32 {
+        self.superblock.read().block_size
+    }
+
+    /// Byte offset of `block_num` in the device or file.
+    #[must_use]
+    pub fn block_offset(&self, block_num: u64) -> u64 {
+        let sb = self.superblock.read();
+        sb.data_offset + block_num * u64::from(sb.block_size)
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> &DiskStats {
+        &self.stats
+    }
+
+    /// Write a block to the disk
+    ///
+    /// Returns the block number where data was written
+    pub fn write_block(
+        &self,
+        block_num: u64,
+        object_id: [u8; 16],
+        object_offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let sb = self.superblock.read();
+        let block_size = sb.block_size as usize;
+        let blocks = Self::blocks_for(data.len(), block_size);
+
+        if block_num + blocks > sb.total_blocks {
+            return Err(Error::Storage(format!(
+                "extent {}..{} exceeds total blocks {}",
+                block_num,
+                block_num + blocks,
+                sb.total_blocks
+            )));
+        }
+        let extent_bytes = blocks as usize * block_size;
+
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+
+        // Build block: header + data + padding + footer
+        let mut buf = AlignedBuffer::new(extent_bytes);
+        let block_buf = buf.as_mut_slice();
+
+        // Write header
+        let header = BlockHeader::new(sequence, object_id, object_offset, data.len() as u32);
+        block_buf[..BlockHeader::SIZE].copy_from_slice(&header.to_bytes());
+
+        // Write data
+        let data_start = BlockHeader::SIZE;
+        let data_end = data_start + data.len();
+        block_buf[data_start..data_end].copy_from_slice(data);
+
+        // Calculate data checksum
+        let data_checksum = crc32c::crc32c(data);
+
+        // Write footer at the end of the extent
+        let footer = BlockFooter::new(data_checksum, sequence);
+        let footer_start = extent_bytes - BlockFooter::SIZE;
+        block_buf[footer_start..].copy_from_slice(&footer.to_bytes());
+
+        // Calculate disk offset
+        let offset = sb.data_offset + block_num * block_size as u64;
+        drop(sb); // Release read lock
+
+        // Write to disk
+        self.file.write_at(offset, block_buf)?;
+
+        self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_written
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Read a block from the disk
+    ///
+    /// Returns the data portion of the block (without header/footer)
+    pub fn read_block(&self, block_num: u64) -> Result<(BlockHeader, Vec<u8>)> {
+        let sb = self.superblock.read();
+        let block_size = sb.block_size as usize;
+
+        if block_num >= sb.total_blocks {
+            return Err(Error::Storage(format!(
+                "block {} exceeds total blocks {}",
+                block_num, sb.total_blocks
+            )));
+        }
+
+        let offset = sb.data_offset + block_num * block_size as u64;
+        drop(sb);
+
+        // Read the first block to learn the payload length, then the whole
+        // extent if it runs further.
+        let mut probe = AlignedBuffer::new(block_size);
+        self.file.read_at(offset, probe.as_mut_slice())?;
+        let header = BlockHeader::from_bytes(&probe.as_slice()[..BlockHeader::SIZE])?;
+
+        let extent_bytes =
+            Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
+
+        let mut whole;
+        let block_buf: &[u8] = if extent_bytes > block_size {
+            whole = AlignedBuffer::new(extent_bytes);
+            self.file.read_at(offset, whole.as_mut_slice())?;
+            whole.as_slice()
+        } else {
+            probe.as_slice()
+        };
+
+        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_read
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
+
+        // Parse footer from the end of the extent
+        let footer_start = extent_bytes - BlockFooter::SIZE;
+        let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
+
+        // Verify sequence numbers match
+        if header.sequence != footer.sequence {
+            self.stats.checksum_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Storage(format!(
+                "block {} sequence mismatch: header={}, footer={}",
+                block_num, header.sequence, footer.sequence
+            )));
+        }
+
+        // Extract and verify data
+        let data_start = BlockHeader::SIZE;
+        let data_end = data_start + header.data_size as usize;
+        let data = &block_buf[data_start..data_end];
+
+        let computed_checksum = crc32c::crc32c(data);
+        if computed_checksum != footer.data_checksum {
+            self.stats.checksum_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Storage(format!(
+                "block {} data checksum mismatch: computed={:08x}, stored={:08x}",
+                block_num, computed_checksum, footer.data_checksum
+            )));
+        }
+
+        Ok((header, data.to_vec()))
+    }
+
+    // ------------------------------------------------------------
+    // Async hot-path variants. Same semantics as write_block /
+    // read_block above, but the disk I/O goes through IoBackend so
+    // the tokio reactor is free during the syscall / io_uring wait.
+    //
+    // On Linux + --features io-uring, these paths use io_uring
+    // directly — measured +25% throughput and -43% p99.9 on 4 MiB
+    // stripes vs the sync path (bin/io-bench).
+    //
+    // Buffer alignment: relies on glibc malloc returning page-aligned
+    // memory for allocations >= 128 KiB (which block_size always is —
+    // default 4 MiB). For smaller allocations the allocator doesn't
+    // guarantee alignment and we'd need an AlignedBuf variant. Not
+    // an issue at current config.
+    // ------------------------------------------------------------
+
+    /// Async version of `write_block`.
+    pub async fn write_block_async(
+        &self,
+        block_num: u64,
+        object_id: [u8; 16],
+        object_offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        // Scope the parking_lot guard — it's !Send, so holding it
+        // across `.await` below makes the whole future !Send (tonic
+        // requires Send). Extract plain fields, then drop.
+        let (block_size, offset) = {
+            let sb = self.superblock.read();
+            let block_size = sb.block_size as usize;
+            // The payload spans as many blocks as it needs. It used to have to
+            // fit in one, which is why the block was sized for the largest
+            // shard any EC scheme could produce and every shard paid for that
+            // worst case whatever its actual size.
+            let blocks = Self::blocks_for(data.len(), block_size);
+            if block_num + blocks > sb.total_blocks {
+                return Err(Error::Storage(format!(
+                    "extent {}..{} exceeds total blocks {}",
+                    block_num,
+                    block_num + blocks,
+                    sb.total_blocks
+                )));
+            }
+            let offset = sb.data_offset + block_num * block_size as u64;
+            (block_size, offset)
+        };
+
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+
+        // Build header+data+padding+footer into an aligned owned buf
+        // so ownership can transfer through the io_uring submission
+        // and the buffer's address satisfies O_DIRECT alignment.
+        //
+        // The buffer covers the whole extent, not one block: header at the
+        // very start, footer at the very end of the last block, data in
+        // between. A single-block extent is byte-for-byte the old layout.
+        let extent_bytes = Self::blocks_for(data.len(), block_size) as usize * block_size;
+        let mut buf = AlignedBuf::new(extent_bytes);
+        let block_buf = buf.as_mut_slice();
+        let header = BlockHeader::new(sequence, object_id, object_offset, data.len() as u32);
+        block_buf[..BlockHeader::SIZE].copy_from_slice(&header.to_bytes());
+        let data_start = BlockHeader::SIZE;
+        let data_end = data_start + data.len();
+        block_buf[data_start..data_end].copy_from_slice(data);
+
+        let data_checksum = crc32c::crc32c(data);
+        let footer = BlockFooter::new(data_checksum, sequence);
+        let footer_start = extent_bytes - BlockFooter::SIZE;
+        block_buf[footer_start..].copy_from_slice(&footer.to_bytes());
+
+        // Transfer to disk via IoBackend — frees the reactor and,
+        // when uring is compiled in, skips spawn_blocking entirely.
+        let _ = self.disk_io.write_at_owned(buf, offset).await?;
+
+        self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_written
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Async version of `read_block`.
+    pub async fn read_block_async(&self, block_num: u64) -> Result<(BlockHeader, Vec<u8>)> {
+        // Same Send-across-await constraint as write_block_async —
+        // scope the guard tightly.
+        let (block_size, offset) = {
+            let sb = self.superblock.read();
+            if block_num >= sb.total_blocks {
+                return Err(Error::Storage(format!(
+                    "block {} exceeds total blocks {}",
+                    block_num, sb.total_blocks
+                )));
+            }
+            (
+                sb.block_size as usize,
+                sb.data_offset + block_num * sb.block_size as u64,
+            )
+        };
+
+        // Read the first block to learn how long the payload is, then the rest
+        // of the extent if it spans further. The header carries `data_size`,
+        // which is what makes the extent self-describing — no block count had
+        // to be added to the persisted shard index.
+        let first = AlignedBuf::new(block_size);
+        let first_owned = self.disk_io.read_at_owned(first, offset).await?;
+        let header = BlockHeader::from_bytes(&first_owned.as_slice()[..BlockHeader::SIZE])?;
+
+        let extent_bytes =
+            Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
+
+        let owned;
+        let block_buf: &[u8] = if extent_bytes > block_size {
+            let whole = AlignedBuf::new(extent_bytes);
+            owned = self.disk_io.read_at_owned(whole, offset).await?;
+            owned.as_slice()
+        } else {
+            first_owned.as_slice()
+        };
+
+        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_read
+            .fetch_add(extent_bytes as u64, Ordering::Relaxed);
+
+        // Parse footer from the end of the extent
+        let footer_start = extent_bytes - BlockFooter::SIZE;
+        let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
+
+        if header.sequence != footer.sequence {
+            self.stats.checksum_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Storage(format!(
+                "block {} sequence mismatch: header={}, footer={}",
+                block_num, header.sequence, footer.sequence
+            )));
+        }
+
+        let data_start = BlockHeader::SIZE;
+        let data_end = data_start + header.data_size as usize;
+        let data = &block_buf[data_start..data_end];
+
+        let computed_checksum = crc32c::crc32c(data);
+        if computed_checksum != footer.data_checksum {
+            self.stats.checksum_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::Storage(format!(
+                "block {} data checksum mismatch: computed={:08x}, stored={:08x}",
+                block_num, computed_checksum, footer.data_checksum
+            )));
+        }
+
+        Ok((header, data.to_vec()))
+    }
+
+    /// Verify a block's integrity without returning data
+    pub fn verify_block(&self, block_num: u64) -> Result<bool> {
+        match self.read_block(block_num) {
+            Ok(_) => Ok(true),
+            Err(Error::Storage(msg)) if msg.contains("checksum") || msg.contains("mismatch") => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sync all pending writes to disk
+    pub fn sync(&self) -> Result<()> {
+        self.file.sync()
+    }
+
+    /// Update superblock on disk
+    pub fn update_superblock(&self) -> Result<()> {
+        let mut sb = self.superblock.write();
+        sb.last_mount = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Recompute checksum after modifying fields
+        sb.update_checksum();
+        let sb = sb.clone();
+        write_superblock(&self.file, &sb)
+    }
+}
+
+/// Write `sb` as the primary superblock, then as the backup, syncing after
+/// each: a power cut can tear at most one of them.
+fn write_superblock(file: &RawFile, sb: &Superblock) -> Result<()> {
+    let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
+    buf.copy_from(&sb.to_bytes());
+    file.write_at(0, buf.as_slice())?;
+    file.sync()?;
+    if sb.features_compat & crate::layout::FEATURE_BACKUP_SUPERBLOCK != 0 {
+        file.write_at(crate::layout::BACKUP_SUPERBLOCK_OFFSET, buf.as_slice())?;
+        file.sync()?;
+    }
+    Ok(())
+}
+
+/// The disk's superblock: the primary, or, when it can't be read (torn by
+/// a power cut, say), the backup, which then repairs the primary.
+fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
+    let read_at = |offset: u64| -> Result<Superblock> {
+        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
+        file.read_at(offset, buf.as_mut_slice())?;
+        let sb = Superblock::from_bytes(buf.as_slice())?;
+        sb.validate()?;
+        Ok(sb)
+    };
+    match read_at(0) {
+        Ok(sb) => Ok(sb),
+        Err(primary) => match read_at(crate::layout::BACKUP_SUPERBLOCK_OFFSET) {
+            Ok(sb) if sb.features_compat & crate::layout::FEATURE_BACKUP_SUPERBLOCK != 0 => {
+                tracing::warn!(
+                    "{}: primary superblock unreadable ({primary}); mounted from the backup \
+                     and rewrote the primary",
+                    path.display()
+                );
+                write_superblock(file, &sb)?;
+                Ok(sb)
+            }
+            _ => Err(primary),
+        },
+    }
+}
+
+impl Drop for DiskManager {
+    fn drop(&mut self) {
+        // Try to sync and update superblock on close
+        let _ = self.update_superblock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// `DiskManager::init` refuses anything under 1 GiB, so the tests use the
+    /// floor rather than a convenient small number.
+    const MIN_TEST_DISK: u64 = 1024 * 1024 * 1024;
+
+    /// A power cut that tears the primary superblock (simulated by
+    /// overwriting part of it) leaves the disk mountable from the backup,
+    /// which also repairs the primary.
+    #[test]
+    fn a_torn_primary_superblock_mounts_from_the_backup() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let id = {
+            let disk = super::DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+            disk.id()
+        };
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0xAA; 64]).unwrap();
+        }
+        let disk = super::DiskManager::open(&path).expect("mounts from the backup");
+        assert_eq!(disk.id(), id);
+        drop(disk);
+        // The primary was rewritten: it reads on its own now.
+        let mut buf = vec![0u8; 4096];
+        {
+            use std::io::Read;
+            let mut f = std::fs::File::open(&path).unwrap();
+            f.read_exact(&mut buf).unwrap();
+        }
+        assert!(crate::layout::Superblock::from_bytes(&buf).is_ok());
+    }
+
+    /// Persisting the bitmap (every delete) no longer rewrites the
+    /// superblock.
+    #[test]
+    fn persisting_the_bitmap_leaves_the_superblock_alone() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = super::DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+        let read = || {
+            let mut buf = vec![0u8; 4096];
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact(&mut buf)
+                .unwrap();
+            buf
+        };
+        let before = read();
+        let start = disk.allocate_extent(3).unwrap();
+        disk.persist_allocator().unwrap();
+        disk.free_extent(start, 3).unwrap();
+        disk.persist_allocator().unwrap();
+        assert_eq!(read(), before);
+    }
+
+    #[test]
+    fn allocation_and_reclaim_move_the_reported_usage() {
+        // The whole point. Before this, used_space was derived from a
+        // superblock field written once at format time, so a disk reported
+        // itself empty right up until every write failed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        let capacity = disk.capacity();
+        assert_eq!(disk.used_space(), 0);
+        assert_eq!(disk.free_space(), capacity);
+
+        let a = disk.allocate_block().unwrap();
+        let b = disk.allocate_block().unwrap();
+        assert_ne!(a, b, "the allocator handed out the same block twice");
+        let block = u64::from(disk.block_size());
+        assert_eq!(disk.used_space(), 2 * block);
+
+        disk.free_block(a).unwrap();
+        assert_eq!(disk.used_space(), block);
+        // Freed space is usable again, not merely accounted for.
+        assert_eq!(disk.allocate_block().unwrap(), a);
+    }
+
+    #[test]
+    fn the_bitmap_survives_a_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+
+        let taken = {
+            let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+            let blocks: Vec<u64> = (0..5).map(|_| disk.allocate_block().unwrap()).collect();
+            disk.free_block(blocks[1]).unwrap();
+            disk.persist_allocator().unwrap();
+            blocks
+        };
+
+        let disk = DiskManager::open(&path).unwrap();
+        assert!(disk.is_block_allocated(taken[0]));
+        assert!(
+            !disk.is_block_allocated(taken[1]),
+            "a freed block came back allocated"
+        );
+        assert!(disk.is_block_allocated(taken[4]));
+        assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
+    }
+
+    #[test]
+    fn a_full_disk_says_so_instead_of_writing_past_the_end() {
+        // `block N exceeds total blocks M` as a 500 was the symptom that
+        // started this: a full disk has to be a distinguishable condition,
+        // because a caller can act on it and cannot act on an internal error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        let total = disk.capacity() / u64::from(disk.block_size());
+        for _ in 0..total {
+            disk.allocate_block()
+                .expect("should allocate up to capacity");
+        }
+        assert_eq!(disk.free_space(), 0);
+        assert!(
+            matches!(disk.allocate_block(), Err(Error::DiskFull)),
+            "a full disk must report DiskFull"
+        );
+    }
+
+    #[test]
+    fn mark_block_used_reconciles_a_disk_whose_bitmap_predates_the_allocator() {
+        // A disk formatted before the allocator was wired up has occupied
+        // blocks and an all-zero bitmap. Without this replay the OSD would
+        // hand out block 0 on restart and overwrite a live shard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+
+        for block in [0u64, 1, 2, 9] {
+            disk.mark_block_used(block).unwrap();
+        }
+        assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
+        // The next allocation avoids every reconciled block.
+        let next = disk.allocate_block().unwrap();
+        assert!(
+            ![0, 1, 2, 9].contains(&next),
+            "allocator reused a live block {next}"
+        );
+    }
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_disk_init_and_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.disk");
+
+        // Initialize disk
+        {
+            let disk = DiskManager::init(&path, 2 * 1024 * 1024 * 1024, None).unwrap();
+            assert!(disk.capacity() > 0);
+            assert_eq!(disk.free_space(), disk.capacity());
+        }
+
+        // Reopen disk
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            assert!(disk.capacity() > 0);
+        }
+    }
+
+    #[test]
+    fn test_block_write_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.disk");
+
+        let disk = DiskManager::init(&path, 2 * 1024 * 1024 * 1024, None).unwrap();
+
+        let object_id = [1u8; 16];
+        let data = b"Hello, ObjectIO!";
+
+        // Write block
+        disk.write_block(0, object_id, 0, data).unwrap();
+        disk.sync().unwrap();
+
+        // Read block back
+        let (header, read_data) = disk.read_block(0).unwrap();
+        assert_eq!(header.object_id, object_id);
+        assert_eq!(read_data, data);
+    }
+
+    #[test]
+    fn test_block_verify() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.disk");
+
+        let disk = DiskManager::init(&path, 2 * 1024 * 1024 * 1024, None).unwrap();
+
+        let object_id = [2u8; 16];
+        let data = b"Test block verification";
+
+        disk.write_block(5, object_id, 1024, data).unwrap();
+
+        assert!(disk.verify_block(5).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::*;
+
+    const DISK: u64 = 1024 * 1024 * 1024;
+
+    fn disk(dir: &tempfile::TempDir, block_size: u32) -> DiskManager {
+        DiskManager::init(dir.path().join("d.raw"), DISK, Some(block_size)).expect("init")
+    }
+
+    /// The allocation is sized to the payload, not to the largest shard any
+    /// scheme could produce.
+    #[test]
+    fn a_payload_occupies_only_the_blocks_it_needs() {
+        let bs = 4096;
+        // header + footer is 96 bytes, so a block holds 4000 of payload.
+        assert_eq!(DiskManager::blocks_for(1, bs), 1);
+        assert_eq!(DiskManager::blocks_for(4000, bs), 1);
+        assert_eq!(DiskManager::blocks_for(4001, bs), 2);
+        assert_eq!(DiskManager::blocks_for(8000, bs), 2);
+        // A 1 MiB shard — what 4+2 produces from a 4 MiB stripe.
+        assert_eq!(DiskManager::blocks_for(1024 * 1024, bs), 257);
+    }
+
+    /// Zero-length payloads still need somewhere for the header and footer.
+    #[test]
+    fn an_empty_payload_still_takes_one_block() {
+        assert_eq!(DiskManager::blocks_for(0, 4096), 1);
+    }
+
+    /// Data larger than one block round-trips — the case that could not exist
+    /// before, because a shard had to fit in a single block.
+    #[test]
+    fn a_multi_block_payload_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        for len in [1usize, 4000, 4001, 65536, 1024 * 1024] {
+            let payload: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let blocks = d.blocks_for_len(len);
+            let start = d.allocate_extent(blocks).expect("allocate");
+
+            d.write_block(start, [7u8; 16], 0, &payload).expect("write");
+            let (header, got) = d.read_block(start).expect("read");
+
+            assert_eq!(header.data_size as usize, len, "length lost for {len}");
+            assert_eq!(got, payload, "bytes changed for a {len}-byte payload");
+        }
+    }
+
+    /// Freeing an extent returns every block, not just the first.
+    ///
+    /// Releasing only the head would leak the rest permanently — and at 4 KiB
+    /// granularity a 1 MiB shard is 257 blocks, so it would leak 256 of them.
+    #[test]
+    fn freeing_an_extent_returns_all_of_its_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let before = d.free_space();
+        let len = 1024 * 1024;
+        let blocks = d.blocks_for_len(len);
+        assert!(blocks > 1, "this test needs a multi-block extent");
+
+        let start = d.allocate_extent(blocks).expect("allocate");
+        assert!(d.free_space() < before, "allocation did not consume space");
+
+        d.free_extent(start, blocks).expect("free");
+        assert_eq!(
+            d.free_space(),
+            before,
+            "freeing the extent left {} bytes behind",
+            before.saturating_sub(d.free_space())
+        );
+    }
+
+    /// Startup reconciliation has to claim the whole extent too, or the
+    /// allocator will hand out blocks that already hold a shard.
+    #[test]
+    fn reconciliation_marks_every_block_of_an_extent() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let blocks = d.blocks_for_len(1024 * 1024);
+        d.mark_extent_used(100, blocks).expect("mark");
+
+        for b in 100..100 + blocks {
+            assert!(d.is_block_allocated(b), "block {b} of the extent is free");
+        }
+        assert!(!d.is_block_allocated(100 + blocks), "marked one too many");
+    }
+
+    /// Two shards must never be handed overlapping blocks.
+    #[test]
+    fn extents_do_not_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+
+        let n = d.blocks_for_len(64 * 1024);
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for _ in 0..50 {
+            let start = d.allocate_extent(n).expect("allocate");
+            spans.push((start, start + n));
+        }
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "extents {:?} and {:?} overlap",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// A single-block extent is byte-for-byte the old layout, so the change is
+    /// a generalisation rather than a new format.
+    #[test]
+    fn a_single_block_extent_is_the_old_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = disk(&dir, 4096);
+        let payload = b"small".to_vec();
+        assert_eq!(d.blocks_for_len(payload.len()), 1);
+
+        let start = d.allocate_extent(1).expect("allocate");
+        d.write_block(start, [1u8; 16], 0, &payload).unwrap();
+        let (_, got) = d.read_block(start).unwrap();
+        assert_eq!(got, payload);
+    }
+}

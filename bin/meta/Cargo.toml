@@ -1,0 +1,18 @@
+[package]
+name = "objectio-meta-bin"
+description = "The objectio-meta binary: the metadata service (the code is in crates/meta)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "objectio-meta"
+path = "src/main.rs"
+
+[dependencies]
+objectio-meta = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

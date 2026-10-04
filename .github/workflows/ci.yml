@@ -183,7 +183,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: crates/objectio-transport-te/test.Dockerfile
+          file: crates/transport-te/test.Dockerfile
           load: true
           tags: objectio-te-test
           cache-from: type=gha,scope=te-test

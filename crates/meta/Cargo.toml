@@ -1,0 +1,46 @@
+[package]
+name = "objectio-meta"
+description = "Metadata Service for ObjectIO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+
+[dependencies]
+objectio-common = { workspace = true }
+objectio-meta-store = { workspace = true }
+objectio-placement = { workspace = true }
+objectio-proto = { workspace = true }
+# EC reconstruction path (Phase 4c): when an ObjectMeta references an
+# unregistered OSD, read surviving shards and regenerate the missing
+# one instead of failing the whole object.
+objectio-erasure = { workspace = true }
+futures = { workspace = true }
+# Shards the drain migrator moves are checked on read and on write.
+crc32c = { workspace = true }
+openraft = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+md5 = "0.7"
+prost = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

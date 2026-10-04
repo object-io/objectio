@@ -2,7 +2,7 @@
 
 Each test checks what goes on the wire — method, path, query, body — for a
 method, and how the answer is read back. The shapes are taken from the
-gateway's handlers (bin/objectio-gateway/src/{admin,iam_admin,public_access,
+gateway's handlers (crates/gateway/src/{admin,iam_admin,public_access,
 sts_api,kms,prom}.rs); tests/test_integration.py runs the same calls against
 a real gateway.
 """

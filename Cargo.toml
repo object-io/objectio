@@ -2,37 +2,13 @@
 resolver = "2"
 
 members = [
-    # Library crates
-    "crates/objectio-common",
-    "crates/objectio-proto",
-    "crates/objectio-erasure",
-    "crates/objectio-placement",
-    "crates/objectio-storage",
-    "crates/objectio-meta-store",
-    "crates/objectio-s3",
-    "crates/objectio-client",
-    "crates/objectio-auth",
-    "crates/objectio-block",
-    "crates/objectio-kms",
-    "crates/objectio-iceberg",
-    "crates/objectio-delta-sharing",
-    "crates/objectio-unity-catalog",
-
-    # Binary crates
-    "bin/objectio-gateway",
-    "bin/objectio-meta",
-    "bin/objectio-osd",
-    "bin/objectio-cli",
-    "bin/objectio-install",
-
-    # End-to-end tests: boots a real cluster and drives it over HTTP.
+    # Libraries, the services' code among them.
+    "crates/*",
+    # Binaries: the services' thin entry points, the all-in-one, the CLI
+    # and tools.
+    "bin/*",
+    # End-to-end tests: boot a real cluster and drive it over HTTP.
     "tests/e2e",
-    "bin/objectio-block-gateway",
-    "bin/objectio-aio",
-    "bin/objectio-io-bench",
-    "bin/objectio-s3-bench",
-    "bin/objectio-dedup-estimate",
-    "crates/objectio-transport-te",
 ]
 
 [workspace.package]
@@ -122,21 +98,23 @@ tempfile = "3.14"
 rand = "0.8"
 
 # Internal crates
-objectio-common = { path = "crates/objectio-common" }
-objectio-proto = { path = "crates/objectio-proto" }
-objectio-erasure = { path = "crates/objectio-erasure" }
-objectio-placement = { path = "crates/objectio-placement" }
-objectio-storage = { path = "crates/objectio-storage" }
-objectio-meta-store = { path = "crates/objectio-meta-store" }
-objectio-s3 = { path = "crates/objectio-s3" }
-objectio-client = { path = "crates/objectio-client" }
-objectio-auth = { path = "crates/objectio-auth" }
-objectio-block = { path = "crates/objectio-block" }
-objectio-iceberg = { path = "crates/objectio-iceberg" }
-objectio-delta-sharing = { path = "crates/objectio-delta-sharing" }
-objectio-unity-catalog = { path = "crates/objectio-unity-catalog" }
-objectio-kms = { path = "crates/objectio-kms" }
-objectio-transport-te = { path = "crates/objectio-transport-te" }
+objectio-common = { path = "crates/common" }
+objectio-proto = { path = "crates/proto" }
+objectio-erasure = { path = "crates/erasure" }
+objectio-placement = { path = "crates/placement" }
+objectio-storage = { path = "crates/storage" }
+objectio-meta-store = { path = "crates/meta-store" }
+objectio-auth = { path = "crates/auth" }
+objectio-block = { path = "crates/block" }
+objectio-iceberg = { path = "crates/iceberg" }
+objectio-delta-sharing = { path = "crates/delta-sharing" }
+objectio-unity-catalog = { path = "crates/unity-catalog" }
+objectio-kms = { path = "crates/kms" }
+objectio-transport-te = { path = "crates/transport-te" }
+objectio-gateway = { path = "crates/gateway" }
+objectio-meta = { path = "crates/meta" }
+objectio-osd = { path = "crates/osd" }
+objectio-block-gateway = { path = "crates/block-gateway" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

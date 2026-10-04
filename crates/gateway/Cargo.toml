@@ -1,0 +1,111 @@
+[package]
+name = "objectio-gateway"
+description = "S3 API Gateway for ObjectIO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+
+[dependencies]
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+objectio-common = { workspace = true }
+objectio-erasure = { workspace = true }
+objectio-transport-te = { workspace = true }
+objectio-proto = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+quick-xml = { workspace = true }
+bytes = { workspace = true }
+http-body = "1"
+http-body-util = "0.1"
+md-5 = { workspace = true }
+crc32c = { workspace = true }
+# Upload checksums (x-amz-checksum-crc32 / -crc64nvme); see src/checksum.rs.
+crc32fast = "1.4"
+crc = "3.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+objectio-auth = { workspace = true, features = ["oidc"] }
+objectio-iceberg = { workspace = true }
+objectio-unity-catalog = { workspace = true }
+objectio-delta-sharing = { workspace = true }
+objectio-kms = { workspace = true }
+objectio-placement = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+http = "1.2"
+chrono = "0.4"
+ring = { workspace = true }
+base64 = { workspace = true }
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+regex = "1"
+urlencoding = "2"
+# Boundary search in browser form uploads (src/post_object.rs).
+memchr = "2"
+tokio-stream = "0.1"
+# `io` feature = StreamReader — turn an axum body stream back into
+# an AsyncRead so the grep scanner can walk large objects without
+# buffering the full body in memory.
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Optional grep regex engines — off by default (pure-Rust `regex`
+# remains the default engine). Opt-in at build time to unlock the
+# corresponding `engine: "pcre2"` / `engine: "hyperscan"` in the
+# grep JSON body.
+#
+# * `pcre2` — Perl-compatible regex (backrefs, lookaround). Pulls
+#   in a C library; needs `libpcre2-dev` installed when compiling.
+# * `hyperscan` — Intel Hyperscan SIMD matcher. Linux-primary;
+#   needs the Hyperscan / Vectorscan system library.
+pcre2 = { version = "0.2", optional = true }
+hyperscan = { version = "0.3", optional = true }
+
+# Kubernetes client for the K8sHostProvider (Phase 2 host actions).
+# `rustls-tls` avoids linking OpenSSL — keeps the Alpine-ish runtime
+# image small. `client` pulls in the minimal set we need (no CRDs,
+# no watchers). k8s-openapi is pinned to v1_29 to match the cluster
+# API surface we ship against; newer minors add typedefs we don't
+# use yet.
+kube = { version = "0.97", default-features = false, features = ["client", "rustls-tls"] }
+k8s-openapi = { version = "0.23", default-features = false, features = ["v1_29"] }
+
+[features]
+default = []
+# Forwards ISA-L erasure coding (x86_64) to objectio-erasure, so the
+# feature is addressable from a package-scoped build.
+isal = ["objectio-erasure/isal"]
+# Move shards over Mooncake Transfer Engine (RDMA, or TCP in development) to
+# OSDs that offer it. Linux only, and needs a Mooncake build — see
+# crates/transport-te. Enabled at run time with `--rdma`.
+rdma = ["objectio-transport-te/te"]
+# Compile in the PCRE2 pattern backend so requests can select
+# `engine: "pcre2"`. Requires libpcre2-dev at build time.
+pcre2 = ["dep:pcre2"]
+# Compile in the Hyperscan / Vectorscan pattern backend for
+# `engine: "hyperscan"`. Requires the Hyperscan system library
+# (`libhs-dev` on Debian) at build time. Linux-primary.
+hyperscan = ["dep:hyperscan"]
+
+# MD5 (ETags): the assembly implementation where there is one.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+md-5 = { workspace = true, features = ["asm"] }

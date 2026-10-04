@@ -145,7 +145,7 @@ jobs:
   # aarch64-unknown-linux-gnu is correct but confusing.
   #
   # Windows is not built: objectio-aio transitively depends on
-  # crates/objectio-storage (raw-disk I/O engine) which uses
+  # crates/storage (raw-disk I/O engine) which uses
   # unix-only APIs — ioctl BLKGETSIZE64, O_DIRECT,
   # std::os::unix::fs::FileTypeExt. A windows port would be real
   # work, not a cfg-gate.

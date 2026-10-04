@@ -1,0 +1,18 @@
+[package]
+name = "objectio-block-gateway-bin"
+description = "The objectio-block-gateway binary: the block gateway (the code is in crates/block-gateway)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "objectio-block-gateway"
+path = "src/main.rs"
+
+[dependencies]
+objectio-block-gateway = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
