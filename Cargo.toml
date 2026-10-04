@@ -20,6 +20,9 @@ repository = "https://github.com/objectio/objectio"
 authors = ["ObjectIO Contributors"]
 
 [workspace.dependencies]
+# The services' allocator: returns freed memory to the OS, where glibc's
+# kept an OSD's snapshot peaks as resident memory (B22).
+tikv-jemallocator = "0.6"
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 async-trait = "0.1"

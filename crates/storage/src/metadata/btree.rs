@@ -20,8 +20,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct BTreeConfig {
     /// Snapshot directory
     pub snapshot_dir: PathBuf,
-    /// Minimum entries between snapshots
-    pub snapshot_threshold: u64,
     /// Keep this many old snapshots
     pub snapshot_retention: usize,
 }
@@ -30,7 +28,6 @@ impl Default for BTreeConfig {
     fn default() -> Self {
         Self {
             snapshot_dir: PathBuf::from("."),
-            snapshot_threshold: 10000,
             snapshot_retention: 2,
         }
     }
@@ -44,8 +41,9 @@ pub struct BTreeIndex {
     lsn: AtomicU64,
     /// Entry count
     entry_count: AtomicU64,
-    /// Mutations since last snapshot
-    mutations_since_snapshot: AtomicU64,
+    /// Size of the last snapshot written or loaded, in bytes: the store
+    /// takes the next one when the WAL has grown to a share of it.
+    last_snapshot_bytes: AtomicU64,
     /// Configuration
     config: BTreeConfig,
     /// Last snapshot LSN
@@ -68,7 +66,7 @@ impl BTreeIndex {
             tree: RwLock::new(BTreeMap::new()),
             lsn: AtomicU64::new(0),
             entry_count: AtomicU64::new(0),
-            mutations_since_snapshot: AtomicU64::new(0),
+            last_snapshot_bytes: AtomicU64::new(0),
             config,
             last_snapshot_lsn: AtomicU64::new(0),
         }
@@ -81,11 +79,12 @@ impl BTreeIndex {
         match snapshot_path {
             Some(path) => {
                 let (tree, header) = Self::read_snapshot(&path)?;
+                let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
                 Ok(Self {
                     entry_count: AtomicU64::new(tree.len() as u64),
                     tree: RwLock::new(tree),
                     lsn: AtomicU64::new(header.lsn),
-                    mutations_since_snapshot: AtomicU64::new(0),
+                    last_snapshot_bytes: AtomicU64::new(bytes),
                     last_snapshot_lsn: AtomicU64::new(header.lsn),
                     config,
                 })
@@ -193,8 +192,6 @@ impl BTreeIndex {
             self.entry_count.fetch_add(1, Ordering::Relaxed);
         }
         self.update_lsn(lsn);
-        self.mutations_since_snapshot
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Delete a key
@@ -206,8 +203,6 @@ impl BTreeIndex {
             self.entry_count.fetch_sub(1, Ordering::Relaxed);
         }
         self.update_lsn(lsn);
-        self.mutations_since_snapshot
-            .fetch_add(1, Ordering::Relaxed);
 
         removed
     }
@@ -310,6 +305,7 @@ impl BTreeIndex {
 
         let data = prost::Message::encode_to_vec(&entries);
         drop(entries);
+        let bytes = data.len() as u64;
 
         // Compute checksum
         let checksum = crc32c::crc32c(&data);
@@ -368,7 +364,7 @@ impl BTreeIndex {
 
         // Update tracking
         self.last_snapshot_lsn.store(lsn, Ordering::SeqCst);
-        self.mutations_since_snapshot.store(0, Ordering::Relaxed);
+        self.last_snapshot_bytes.store(bytes, Ordering::Relaxed);
 
         // Cleanup old snapshots
         self.cleanup_old_snapshots()?;
@@ -413,9 +409,9 @@ impl BTreeIndex {
         Ok(())
     }
 
-    /// Check if snapshot is needed
-    pub fn needs_snapshot(&self) -> bool {
-        self.mutations_since_snapshot.load(Ordering::Relaxed) >= self.config.snapshot_threshold
+    /// Size of the last snapshot written or loaded, in bytes.
+    pub fn last_snapshot_bytes(&self) -> u64 {
+        self.last_snapshot_bytes.load(Ordering::Relaxed)
     }
 
     /// Get current LSN
@@ -517,7 +513,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = BTreeConfig {
             snapshot_dir: dir.path().to_path_buf(),
-            snapshot_threshold: 10,
             snapshot_retention: 2,
         };
         let index = BTreeIndex::new(config.clone());
@@ -536,7 +531,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = BTreeConfig {
             snapshot_dir: dir.path().to_path_buf(),
-            snapshot_threshold: 10,
             snapshot_retention: 2,
         };
 

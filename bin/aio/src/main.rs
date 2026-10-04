@@ -20,6 +20,10 @@
 //!   - replication = 1 (no redundancy)
 //!   - tempdir data (wiped on exit) unless --data is passed
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::io::Read;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};

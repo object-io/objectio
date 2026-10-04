@@ -328,7 +328,7 @@ impl MetadataStore {
 
     /// Check if compaction is needed
     pub fn needs_compaction(&self) -> bool {
-        self.index.needs_snapshot() || self.wal.needs_compaction()
+        snapshot_due(&self.wal, &self.index)
     }
 
     /// Start background compaction thread
@@ -365,7 +365,7 @@ impl MetadataStore {
                 }
 
                 // Check if compaction needed
-                if index.needs_snapshot() || wal.needs_compaction() {
+                if snapshot_due(&wal, &index) {
                     debug!("Starting background compaction");
 
                     let _one = compaction_lock.lock();
@@ -464,6 +464,16 @@ impl MetadataStore {
 ///
 /// The log is cut only once the snapshot is durable; a failure in between
 /// leaves both, and the next restart replays what the snapshot already has.
+/// Whether to snapshot now: the WAL has outgrown its limit and a quarter of
+/// the last snapshot. A snapshot writes the whole index, so it is taken
+/// after writes amounting to a share of it: its cost per write stays
+/// constant as the index grows. (Every 10,000 writes, it grew with the
+/// index, and so did the memory a snapshot's copy took.) Recovery replays
+/// at most that quarter.
+fn snapshot_due(wal: &MetadataWal, index: &BTreeIndex) -> bool {
+    wal.needs_compaction() && wal.size() >= index.last_snapshot_bytes() / 4
+}
+
 fn compact(wal: &MetadataWal, index: &BTreeIndex, gate: &RwLock<()>) -> Result<PathBuf> {
     let (mark, entries) = {
         let _nothing_in_flight = gate.write();
@@ -523,7 +533,6 @@ mod tests {
             },
             btree: BTreeConfig {
                 snapshot_dir: dir.join("snapshots"),
-                snapshot_threshold: 100,
                 snapshot_retention: 2,
             },
             cache_size: 100,
