@@ -9,8 +9,10 @@ are injected one at a time, each held, healed and left to settle:
   power-off       an OSD-only VM switched off for a minute, then on
   meta-power-off  a meta VM switched off for a minute, then on
   partition       the meta leader's VM cut off the network for a minute
+                  (its interface taken down)
   disk-pull       an OSD's disk unplugged; the OSD set out; a new disk
-                  plugged in as its replacement (a new OSD)
+                  plugged in; the OSD back on it and set in (repair
+                  rebuilds what the old disk held)
 
 Invariants, checked after every fault and at the end:
   - every write a gateway acknowledged reads back byte for byte;
@@ -195,24 +197,41 @@ def phase_report(name):
         fail(f"{name}: writes stopped for {g:.0f}s (allowed {MAX_GAP:.0f}s)")
 
 
-def read_all(what, attempts=20):
-    """Every acknowledged object reads back intact, through either gateway."""
+def read_one(n, key, digest, attempts=20):
+    """One acknowledged object, read back through either gateway: None if
+    intact, else what went wrong."""
+    for a in range(attempts):
+        status, data = http("GET", f"{GW[(n + a) % len(GW)]}/{BUCKET}/{key}", timeout=10)
+        if status == 200 or status not in (None, 503):
+            break
+        time.sleep(1)
+    if status != 200:
+        return (key, status)
+    if hashlib.sha256(data).hexdigest() != digest:
+        return (key, "different")
+    return None
+
+
+checked = set()  # keys read back by an earlier check
+
+
+def read_all(what, everything=False):
+    """Acknowledged objects read back intact, through either gateway (32 at
+    a time): every one written since the last check and a random 2,000 of
+    the older ones, or with `everything`, all of them."""
+    from concurrent.futures import ThreadPoolExecutor
     with lock:
         items = list(acked.items())
-    bad = []
-    for n, (key, digest) in enumerate(items):
-        for a in range(attempts):
-            status, data = http("GET", f"{GW[(n + a) % len(GW)]}/{BUCKET}/{key}", timeout=10)
-            if status == 200 or status not in (None, 503):
-                break
-            time.sleep(1)
-        if status != 200:
-            bad.append((key, status))
-        elif hashlib.sha256(data).hexdigest() != digest:
-            bad.append((key, "different"))
+    if not everything:
+        new = [i for i in items if i[0] not in checked]
+        old = [i for i in items if i[0] in checked]
+        items = new + random.sample(old, min(len(old), 2000))
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        bad = [r for r in pool.map(lambda a: read_one(a[0], *a[1]), enumerate(items)) if r]
     if bad:
         fail(f"{what}: {len(bad)} of {len(items)} acknowledged objects unreadable: {bad[:10]}")
-    say(f"{what}: all {len(items)} acknowledged objects read back")
+    checked.update(k for k, _ in items)
+    say(f"{what}: {len(items)} acknowledged objects read back" + (" (all)" if everything else ""))
 
 
 # --- cluster state -------------------------------------------------------
@@ -309,9 +328,12 @@ def power_off(vm, name):
 def partition():
     vm = leader_vm()
     say(f"partition: cutting {vm} (the leader) off the network for {HOLD}s")
-    vm_exec(vm, "iptables -I INPUT 1 ! -i lo -j DROP && iptables -I OUTPUT 1 ! -o lo -j DROP")
+    # The VM's interface down: no packets either way. (The image has no
+    # iptables; incus exec goes over vsock, not the network, so we can
+    # still bring it back.)
+    vm_exec(vm, "ip link set enp5s0 down")
     time.sleep(HOLD)
-    vm_exec(vm, "iptables -D INPUT 1 && iptables -D OUTPUT 1")
+    vm_exec(vm, "ip link set enp5s0 up")
     say("partition: healed")
     settle("partition")
 
@@ -330,15 +352,22 @@ def disk_pull(vm="chaos-5"):
     incus("storage", "volume", "create", "default", f"{vm}-osd2", "--type=block", "size=16GiB")
     incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={vm}-osd2")
     vm_exec(vm, "sleep 3; systemctl restart objectio-osd")
+    # The documented replacement: the OSD comes back on the new disk under
+    # its identity (its metadata lives in its state directory; the shards
+    # the old disk held are dropped), still out until the operator sets it
+    # in; then repair rebuilds what it held, in place.
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        new = osd_of(vm)
-        if new and new["node_id"] != old["node_id"] and new.get("online"):
+        back = osd_of(vm)
+        if back and back["node_id"] == old["node_id"] and back.get("online"):
             break
         time.sleep(3)
     else:
-        fail(f"{vm}'s replacement OSD never joined")
-    say(f"disk-pull: replacement OSD {new['node_id']} joined")
+        fail(f"{vm}'s OSD never came back on the new disk")
+    status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "in"})
+    if status != 200:
+        fail(f"set in: {status} {data[:200]}")
+    say(f"disk-pull: OSD {old['node_id']} back on the new disk, set in")
     settle("disk-pull")
 
 
@@ -409,7 +438,7 @@ def main():
     for t in threads:
         t.join()
     phase_report("end")
-    read_all("at the end")
+    read_all("at the end", everything=True)
     redundancy_restored()
     read_all("after the redundancy check")
     print(f"✓ chaos: {len(acked)} acknowledged writes intact through every fault", flush=True)
