@@ -14,7 +14,7 @@
 //! 4. **Optional Scoring**: For hot data, consider network distance and load
 
 use crate::topology::{ClusterTopology, NodeInfo};
-use objectio_common::{FailureDomain, NodeId, ObjectId};
+use objectio_common::{FailureDomain, NodeId, NodeStatus, ObjectId};
 use std::collections::HashMap;
 
 /// Shard type for placement
@@ -300,6 +300,20 @@ impl Crush2 {
         // Group nodes by domain
         let domain_nodes = self.group_nodes_by_domain(FailureDomain::Rack);
         let all_nodes: Vec<&NodeInfo> = self.topology.active_nodes().collect();
+        // OSDs that are in but not answering: still the stripe's, for now.
+        let down_nodes: Vec<&NodeInfo> = self
+            .topology
+            .all_nodes()
+            .filter(|n| n.status == NodeStatus::Down)
+            .collect();
+        // How many positions may go to them: their shards aren't written
+        // until they answer again, so a write must still reach its quorum,
+        // k + 1, without them. Erasure-coded (MDS) stripes only.
+        let mut down_allowed = if template.local_parity == 0 {
+            usize::from(template.global_parity.saturating_sub(1))
+        } else {
+            0
+        };
 
         // Step 2 & 3: Apply template with HRW hashing per domain
         let mut placements = Vec::with_capacity(template.total_shards() as usize);
@@ -325,11 +339,23 @@ impl Crush2 {
 
             // Prefer an unused node in the shard's own domain, then an
             // unused node anywhere (relaxing the domain beats doubling up on
-            // a disk), and only when every node already holds a shard —
-            // fewer OSDs than shards — reuse the least-loaded one.
+            // a disk). Then an unused node that is down: the write goes on
+            // without its shard (within `down_allowed`), and the repairer
+            // writes it there once it is back. Doubling up instead is for
+            // good — the object's home keeps the layout — and leaves the
+            // object one failure short of its protection. Only when every
+            // node already holds a shard — fewer OSDs than shards — reuse
+            // the least-loaded one.
             let (node_id, score) = self
                 .hrw_pick(object_id, &nodes, &used)
                 .or_else(|| self.hrw_pick(object_id, &all_nodes, &used))
+                .or_else(|| {
+                    let pick = (down_allowed > 0)
+                        .then(|| self.hrw_pick(object_id, &down_nodes, &used))
+                        .flatten();
+                    down_allowed -= usize::from(pick.is_some());
+                    pick
+                })
                 .or_else(|| self.least_used(object_id, &all_nodes, &used))
                 .unwrap_or_else(|| self.placeholder(object_id));
 
@@ -626,6 +652,41 @@ mod tests {
             }
             assert_eq!(counts.len(), 3, "{p:?}");
             assert!(counts.values().all(|c| *c == 2), "{counts:?}");
+        }
+    }
+
+    /// One OSD of six down: its position stays on it rather than doubling
+    /// up on a live one, so the repairer can fill it when it is back. Two
+    /// down: only one position may wait (a write needs k + 1 = 5 shards),
+    /// so the other doubles up.
+    #[test]
+    fn a_down_osd_keeps_its_position_within_the_write_quorum() {
+        fn mark_down(topology: &mut ClusterTopology, id: NodeId) {
+            let mut n = topology.get_node(id).unwrap().clone();
+            n.status = NodeStatus::Down;
+            topology.upsert_node(n);
+        }
+        let mut topology = single_rack_topology(6);
+        let ids: Vec<NodeId> = topology.all_nodes().map(|n| n.id).collect();
+        let template = PlacementTemplate::mds(4, 2);
+
+        mark_down(&mut topology, ids[0]);
+        let crush = Crush2::new(topology.clone(), 16);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template);
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
+        }
+
+        mark_down(&mut topology, ids[1]);
+        let crush = Crush2::new(topology, 16);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template);
+            let on_down = p
+                .iter()
+                .filter(|x| x.node_id == ids[0] || x.node_id == ids[1])
+                .count();
+            assert_eq!(on_down, 1, "{p:?}");
+            assert_eq!(distinct_nodes(&p), 5, "{p:?}");
         }
     }
 

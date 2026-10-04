@@ -167,19 +167,17 @@ async fn sweep(meta: &Arc<MetaService>, misses: &mut HashMap<[u8; 16], u32>) {
 /// `None` means "not enough evidence yet, leave it alone" — the grace period
 /// before a node is taken out of placement.
 fn decide(reachable: bool, consecutive_misses: u32, admin: OsdAdminState) -> Option<NodeStatus> {
-    if reachable {
-        // Observed liveness never overrides operator intent: an OSD the
-        // operator marked Out stays out even though it is answering.
-        return Some(match admin {
-            OsdAdminState::In => NodeStatus::Active,
-            OsdAdminState::Draining => NodeStatus::Draining,
-            OsdAdminState::Out => NodeStatus::Decommissioning,
-        });
-    }
-    if consecutive_misses >= FAILURES_BEFORE_DOWN {
-        Some(NodeStatus::Down)
-    } else {
-        None
+    // Observed liveness never overrides operator intent: an OSD the
+    // operator marked Out stays out even though it is answering, and one
+    // drained or out that stops answering is still that, not Down. Down is
+    // "in, but not answering": placement keeps such an OSD's positions for
+    // it (crush2), which an OSD on its way out must not get.
+    match admin {
+        OsdAdminState::In if reachable => Some(NodeStatus::Active),
+        OsdAdminState::In if consecutive_misses >= FAILURES_BEFORE_DOWN => Some(NodeStatus::Down),
+        OsdAdminState::In => None,
+        OsdAdminState::Draining => Some(NodeStatus::Draining),
+        OsdAdminState::Out => Some(NodeStatus::Decommissioning),
     }
 }
 
@@ -261,6 +259,20 @@ mod tests {
         assert_eq!(
             decide(true, 0, OsdAdminState::Out),
             Some(NodeStatus::Decommissioning)
+        );
+    }
+
+    /// Down means in but silent: a drained or out OSD that stops
+    /// answering keeps its operator-given status.
+    #[test]
+    fn a_silent_osd_on_its_way_out_is_not_down() {
+        assert_eq!(
+            decide(false, FAILURES_BEFORE_DOWN, OsdAdminState::Out),
+            Some(NodeStatus::Decommissioning)
+        );
+        assert_eq!(
+            decide(false, FAILURES_BEFORE_DOWN, OsdAdminState::Draining),
+            Some(NodeStatus::Draining)
         );
     }
 
