@@ -2704,6 +2704,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "crossbeam-channel",
+ "hashlink",
  "libc",
  "nix",
  "objectio-common",
