@@ -6,9 +6,10 @@ use bytes::Bytes;
 use objectio_proto::metadata::NodePlacement;
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Error type for OSD pool operations
 #[derive(Debug, thiserror::Error)]
@@ -78,14 +79,21 @@ pub struct OsdNode {
 /// other shards (the write quorum) and repair rebuilds the missing one.
 const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the probe after a transport failure waits for a connection:
+/// an OSD that restarted accepts at once; one that is gone does not.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Pool of OSD connections for multi-node operations
 pub struct OsdPool {
     /// Connected nodes: node_id -> OsdNode
     nodes: RwLock<HashMap<NodeId, OsdNode>>,
     /// Address to node_id mapping for deduplication
     address_map: RwLock<HashMap<String, NodeId>>,
-    /// Addresses that failed at the transport level, and when.
-    unreachable: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Addresses that failed at the transport level, and when. Shared
+    /// with the probe that lifts a mark as soon as the OSD answers again.
+    unreachable: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Addresses being probed now, so one failure burst starts one probe.
+    probing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Addresses whose cached channel is to be dropped before next use: a
     /// channel to a host that vanished can hang a call until its timeout
     /// instead of failing, so after a failure the next call dials afresh.
@@ -102,7 +110,8 @@ impl OsdPool {
         Self {
             nodes: RwLock::new(HashMap::new()),
             address_map: RwLock::new(HashMap::new()),
-            unreachable: std::sync::Mutex::new(HashMap::new()),
+            unreachable: Arc::default(),
+            probing: Arc::default(),
             stale: std::sync::Mutex::new(std::collections::HashSet::new()),
             heal: std::sync::OnceLock::new(),
         }
@@ -138,7 +147,12 @@ impl OsdPool {
         }
     }
 
-    /// `address` failed at the transport level: fail it fast for a while.
+    /// `address` failed at the transport level: fail it fast for a while,
+    /// unless it answers a fresh connection at once. An OSD that restarted
+    /// closes every connection to it, so the next call on each fails though
+    /// it is back; held off for the whole `FAIL_FAST`, it cost every read
+    /// that needed it (the A6 chaos test: two OSDs stopped looked like four,
+    /// with the two just restarted, and nothing was readable).
     pub fn mark_unreachable(&self, address: &str) {
         self.unreachable
             .lock()
@@ -148,6 +162,37 @@ impl OsdPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(address.to_string());
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if !self
+            .probing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string())
+        {
+            return; // already being probed
+        }
+        let (unreachable, probing) = (Arc::clone(&self.unreachable), Arc::clone(&self.probing));
+        let address = address.to_string();
+        runtime.spawn(async move {
+            let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
+                Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                Err(_) => false,
+            };
+            if answers {
+                unreachable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&address);
+                debug!("{address} answers again; no longer failed fast");
+            }
+            probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&address);
+        });
     }
 
     /// Whether `address` failed at the transport level within `FAIL_FAST`.
@@ -2011,6 +2056,32 @@ mod tests {
             crc32c,
             ..Default::default()
         }
+    }
+
+    /// An address marked after a transport failure is tried again as soon
+    /// as it accepts a connection (an OSD that restarted), and stays failed
+    /// fast while it doesn't.
+    #[tokio::test]
+    async fn a_restarted_osd_is_not_failed_fast() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+
+        let pool = super::OsdPool::new();
+        pool.mark_unreachable(&up);
+        pool.mark_unreachable(&gone);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pool.is_unreachable(&up) {
+            assert!(std::time::Instant::now() < deadline, "still failed fast");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pool.is_unreachable(&gone));
     }
 
     /// A connection cut under a call is a failure to retry (503), not a
