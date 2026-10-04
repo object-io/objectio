@@ -255,6 +255,13 @@ ec:
 monitoring:
   enabled: false
 
+  # The alert rules (alerts/objectio-rules.yaml) as a PrometheusRule, for
+  # a prometheus-operator in the cluster. The chart's own Prometheus
+  # (enabled above) loads them either way.
+  prometheusRule:
+    enabled: false
+    labels: {}
+
   prometheus:
     image:
       repository: prom/prometheus
