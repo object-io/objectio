@@ -161,3 +161,71 @@ fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
     got.expect(200);
     assert_eq!(got.bytes, body);
 }
+
+/// OSD `index`'s node id, as `/_admin/nodes` lists it.
+fn osd_id(c: &Cluster, index: usize) -> String {
+    let addr = c.osd_address(index);
+    c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["address"].as_str() == Some(addr.as_str()))
+        .and_then(|n| n["node_id"].as_str())
+        .unwrap_or_else(|| panic!("no OSD at {addr}"))
+        .to_string()
+}
+
+/// OSD `index`'s shard count, from `/_admin/nodes`.
+fn shard_count(c: &Cluster, index: usize) -> u64 {
+    let id = osd_id(c, index);
+    c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node_id"].as_str() == Some(id.as_str()))
+        .and_then(|n| n["shard_count"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Backfill (B20): objects written while an OSD is out have two shards on
+/// one of the other five; once it is back in, the repairer moves one of
+/// them to it, so every OSD holds one shard of each object again and the
+/// objects survive any two losses.
+#[test]
+fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
+    let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--repair-interval-secs", "1"]);
+    let out = osd_id(&c, 0);
+    let set = |state: &str| {
+        c.json(
+            "PUT",
+            &format!("/_admin/osds/{out}/admin-state"),
+            json!({ "state": state }),
+        )
+        .expect_ok();
+    };
+    set("out");
+    let bodies = put_objects(&c, "spread");
+    let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
+    let hot = counts
+        .iter()
+        .position(|n| *n > OBJECTS as u64)
+        .unwrap_or_else(|| panic!("nothing doubled up with an OSD out: {counts:?}"));
+
+    set("in");
+    // Moved, and the old copies deleted after their grace.
+    let deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
+        if counts.iter().all(|n| *n == OBJECTS as u64) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "shards never spread: {counts:?}");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(metric(&c, "objectio_meta_repair_shards_moved_total", &[]) >= OBJECTS as u64);
+    assert_readable(&c, "spread", &bodies, "after the shards were spread");
+
+    // The OSD that held two of each, and one more.
+    c.restart_with_lost_disks(&[hot, (hot + 1) % 6]);
+    assert_readable(&c, "spread", &bodies, "with two disks lost");
+}

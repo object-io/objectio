@@ -714,6 +714,91 @@ impl MetaService {
         }
     }
 
+    /// Where to move a shard of a stripe whose shards are on `holders`
+    /// (B20, backfill): an active OSD holding none of them, picked by the
+    /// highest hash of the object and the OSD, so moves spread over the
+    /// cluster. `None` when every active OSD already holds one.
+    pub(crate) fn spread_target(
+        &self,
+        object_id: &[u8],
+        holders: &std::collections::HashSet<Vec<u8>>,
+    ) -> Option<([u8; 16], String)> {
+        let topology = self.topology.read();
+        let osd_nodes = self.osd_nodes.read();
+        topology
+            .active_nodes()
+            .map(|n| *n.id.as_bytes())
+            .filter(|id| !holders.contains(id.as_slice()))
+            .filter_map(|id| {
+                let node = osd_nodes.iter().find(|n| n.node_id == id)?;
+                (node.admin_state == objectio_common::OsdAdminState::In)
+                    .then(|| (id, node.address.clone()))
+            })
+            .max_by_key(|(id, _)| {
+                let mut seed = object_id.to_vec();
+                seed.extend_from_slice(id);
+                xxhash_rust::xxh64::xxh64(&seed, 0)
+            })
+    }
+
+    /// Move positions of `bucket/key`'s home from one OSD to another (B20):
+    /// `(position, from, to)`, each only if the home still has `from`
+    /// there. A later write of the key is then placed where its shards now
+    /// are, not doubled up again.
+    pub(crate) async fn move_object_home(
+        &self,
+        bucket: &str,
+        key: &str,
+        moves: &[(u32, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), String> {
+        let home_key = format!("{bucket}/{key}");
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        let Some(current) = store.read_object_home(&home_key) else {
+            return Ok(()); // never written with a home: nothing pins it
+        };
+        let mut home = ObjectHome::decode(current.as_slice()).map_err(|e| e.to_string())?;
+        let mut changed = false;
+        for (position, from, to) in moves {
+            if let Some(slot) = home.osd_ids.get_mut(*position as usize)
+                && slot == from
+            {
+                slot.clone_from(to);
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let new = home.encode_to_vec();
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Named("object_homes".into()),
+                    key: home_key,
+                    expected: Some(current),
+                    new_value: Some(new),
+                }],
+                requested_by: "backfill".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(r) => match r.data {
+                    MetaResponse::MultiCasOk => Ok(()),
+                    MetaResponse::MultiCasConflict { .. } => {
+                        Err("the key's home changed meanwhile".into())
+                    }
+                    other => Err(format!("unexpected raft response: {other:?}")),
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            store.put_object_home(&home_key, &new);
+            Ok(())
+        }
+    }
+
     /// Placement computed from the topology (or the bucket's pool's
     /// placement groups), whatever the key's home.
     pub(super) async fn computed_placement(
