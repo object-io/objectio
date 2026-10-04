@@ -63,6 +63,11 @@ pub struct HaCluster {
     pub secret_key: String,
     /// Flags every meta node gets besides the harness's own.
     meta_args: Vec<String>,
+    /// Whether the cluster runs mTLS between its nodes: decided when it
+    /// starts, for its whole life. One started from another release (a
+    /// rolling upgrade) runs plain, also once its nodes run this build: a
+    /// cluster can't run half on TLS.
+    tls: bool,
 }
 
 impl Drop for HaCluster {
@@ -170,6 +175,7 @@ impl HaCluster {
             access_key: String::new(),
             secret_key: String::new(),
             meta_args: meta_args.iter().map(ToString::to_string).collect(),
+            tls: bins.is_none(),
         };
         for i in 0..metas {
             // A port it lost to another process: new ones, before any peer
@@ -227,7 +233,7 @@ impl HaCluster {
         let endpoints = self.meta_endpoints();
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
-        if bins.is_none() {
+        if self.tls {
             crate::tls::apply(&mut cmd);
         }
         let child = cmd
@@ -258,7 +264,7 @@ impl HaCluster {
         let endpoints = self.meta_endpoints();
         let port = self.gateways[i].port;
         let mut cmd = Command::new(bin(bins, "objectio-gateway"));
-        if bins.is_none() {
+        if self.tls {
             crate::tls::apply(&mut cmd);
         }
         let child = cmd
@@ -374,7 +380,7 @@ impl HaCluster {
         std::fs::create_dir_all(&m.dir).expect("meta dir");
         let bins = m.bins.lock().unwrap().clone();
         let mut cmd = Command::new(bin(bins.as_deref(), "objectio-meta"));
-        if bins.is_none() {
+        if self.tls {
             crate::tls::apply(&mut cmd);
         }
         let child = cmd
