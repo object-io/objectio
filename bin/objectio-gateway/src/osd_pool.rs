@@ -83,6 +83,9 @@ const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
 /// an OSD that restarted accepts at once; one that is gone does not.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How often a failed-fast address is probed while its mark lasts.
+const PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Pool of OSD connections for multi-node operations
 pub struct OsdPool {
     /// Connected nodes: node_id -> OsdNode
@@ -176,17 +179,33 @@ impl OsdPool {
         }
         let (unreachable, probing) = (Arc::clone(&self.unreachable), Arc::clone(&self.probing));
         let address = address.to_string();
+        // Probed until it answers or the mark runs out: an OSD that was
+        // stopped when it failed and restarted within the window is used
+        // again as soon as it is up, not when the mark expires (the A6
+        // check stopped the next two OSDs inside that window, and four
+        // looked down).
         runtime.spawn(async move {
-            let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
-                Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
-                Err(_) => false,
-            };
-            if answers {
+            let marked = || {
                 unreachable
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&address);
-                debug!("{address} answers again; no longer failed fast");
+                    .get(&address)
+                    .is_some_and(|at| at.elapsed() < FAIL_FAST)
+            };
+            while marked() {
+                let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
+                    Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                    Err(_) => false,
+                };
+                if answers {
+                    unreachable
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&address);
+                    debug!("{address} answers again; no longer failed fast");
+                    break;
+                }
+                tokio::time::sleep(PROBE_EVERY).await;
             }
             probing
                 .lock()
@@ -2082,6 +2101,29 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(pool.is_unreachable(&gone));
+
+        // Down when it failed, up a moment later: used again then, not
+        // when the mark runs out.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let back = format!("http://{addr}");
+        pool.mark_unreachable(&back);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(pool.is_unreachable(&back));
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pool.is_unreachable(&back) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not used again once back"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// A connection cut under a call is a failure to retry (503), not a
