@@ -144,7 +144,12 @@ impl HaCluster {
             secret_key: String::new(),
         };
         for i in 0..metas {
-            cluster.start_meta(i);
+            // A port it lost to another process: new ones, before any peer
+            // knows them.
+            while !cluster.spawn_meta(i) {
+                cluster.metas[i].grpc = free_port();
+                cluster.metas[i].admin = free_port();
+            }
         }
         cluster.form_raft_group();
 
@@ -162,6 +167,10 @@ impl HaCluster {
                 child: None,
             });
             cluster.spawn_osd(o, bins);
+            while !cluster.osd_listening(o) {
+                cluster.osds[o].port = free_port();
+                cluster.spawn_osd(o, bins);
+            }
         }
 
         let creds = cluster.metas[0].dir.join("admin-creds.env");
@@ -211,8 +220,9 @@ impl HaCluster {
         o.child = Some(child);
     }
 
-    /// Start gateway `i` from `bins`, and wait until it listens.
-    fn spawn_gateway(&mut self, i: usize, bins: Option<&Path>) {
+    /// Start gateway `i` from `bins`, and wait until it listens. False if
+    /// it exited instead (see [`await_child_listening`]).
+    fn spawn_gateway(&mut self, i: usize, bins: Option<&Path>) -> bool {
         let endpoints = self.meta_endpoints();
         let port = self.gateways[i].port;
         let child = Command::new(bin(bins, "objectio-gateway"))
@@ -234,17 +244,23 @@ impl HaCluster {
             .stderr(log_target())
             .spawn()
             .expect("spawn objectio-gateway");
-        self.gateways[i].child = Some(child);
-        await_listening(port);
+        let gateway = &mut self.gateways[i];
+        gateway.child = Some(child);
+        await_child_listening(gateway.child.as_mut().unwrap(), &[port])
     }
 
     /// Start one more gateway, from `bins`, with a signed client of it in
     /// `clients`. Returns its index.
     pub fn add_gateway(&mut self, bins: Option<&Path>) -> usize {
-        let port = free_port();
-        self.gateways.push(Gateway { port, child: None });
+        self.gateways.push(Gateway {
+            port: free_port(),
+            child: None,
+        });
         let i = self.gateways.len() - 1;
-        self.spawn_gateway(i, bins);
+        while !self.spawn_gateway(i, bins) {
+            self.gateways[i].port = free_port();
+        }
+        let port = self.gateways[i].port;
         self.clients.push(Cluster::client(
             &format!("http://127.0.0.1:{port}"),
             &self.access_key,
@@ -264,8 +280,19 @@ impl HaCluster {
 
     /// Start OSD `i` again, from `bins`, on its data.
     pub fn start_osd(&mut self, i: usize, bins: Option<&Path>) {
-        self.spawn_osd(i, bins);
-        await_listening(self.osds[i].port);
+        retry(
+            || {
+                self.spawn_osd(i, bins);
+                self.osd_listening(i)
+            },
+            "OSD",
+        );
+    }
+
+    /// Wait until OSD `i` listens; false if it exited instead.
+    fn osd_listening(&mut self, i: usize) -> bool {
+        let o = &mut self.osds[i];
+        await_child_listening(o.child.as_mut().expect("OSD started"), &[o.port])
     }
 
     pub fn restart_osd(&mut self, i: usize, bins: Option<&Path>) {
@@ -273,8 +300,7 @@ impl HaCluster {
             let _ = c.kill();
             let _ = c.wait();
         }
-        self.spawn_osd(i, bins);
-        await_listening(self.osds[i].port);
+        self.start_osd(i, bins);
     }
 
     /// Stop gateway `i` and start it again from `bins`.
@@ -283,7 +309,7 @@ impl HaCluster {
             let _ = c.kill();
             let _ = c.wait();
         }
-        self.spawn_gateway(i, bins);
+        retry(|| self.spawn_gateway(i, bins), "gateway");
     }
 
     /// Stop meta node `i` and start it again from `bins`, on its own data.
@@ -299,8 +325,15 @@ impl HaCluster {
         (self.osds.len(), self.gateways.len())
     }
 
-    /// Start meta node `i` (again), on its own data.
+    /// Start meta node `i` (again), on its own data. Its ports are known to
+    /// its peers, so one it lost is retried, not changed.
     pub fn start_meta(&self, i: usize) {
+        retry(|| self.spawn_meta(i), "meta");
+    }
+
+    /// Start meta node `i` and wait until it listens; false if it exited
+    /// instead (see [`await_child_listening`]).
+    fn spawn_meta(&self, i: usize) -> bool {
         let m = &self.metas[i];
         std::fs::create_dir_all(&m.dir).expect("meta dir");
         let bins = m.bins.lock().unwrap().clone();
@@ -329,8 +362,9 @@ impl HaCluster {
             .stderr(log_target())
             .spawn()
             .expect("spawn objectio-meta");
-        *m.child.lock().unwrap() = Some(child);
-        await_listening(m.admin);
+        let mut slot = m.child.lock().unwrap();
+        *slot = Some(child);
+        await_child_listening(slot.as_mut().unwrap(), &[m.grpc, m.admin])
     }
 
     /// Kill meta node `i` outright.
@@ -540,12 +574,48 @@ impl HaCluster {
     }
 }
 
-fn await_listening(port: u16) {
+/// Wait until every one of `ports` accepts connections, or `child` exits.
+/// False if it exited: it most likely lost a port, bound by another
+/// process (another test's) between the harness picking it, free, and the
+/// child binding it. That made CI fail now and then ("nothing listening").
+fn await_child_listening(child: &mut Child, ports: &[u16]) -> bool {
     let deadline = Instant::now() + Duration::from_secs(60);
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "nothing listening on {port}");
+    let exited = |child: &mut Child| match child.try_wait() {
+        Ok(Some(status)) => {
+            eprintln!(
+                "a process for ports {ports:?} exited before listening ({status}); starting it again"
+            );
+            true
+        }
+        _ => false,
+    };
+    loop {
+        if exited(child) {
+            return false;
+        }
+        let up = ports
+            .iter()
+            .all(|p| std::net::TcpStream::connect(("127.0.0.1", *p)).is_ok());
+        if up {
+            // Not someone else's listener on a port it lost.
+            std::thread::sleep(Duration::from_millis(50));
+            return !exited(child);
+        }
+        assert!(Instant::now() < deadline, "nothing listening on {ports:?}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Start something on ports its peers already know, retrying while it
+/// can't get them (held for a moment by another process).
+fn retry(mut start: impl FnMut() -> bool, what: &str) {
+    for _ in 0..40 {
+        if start() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("{what} never started");
 }
 
 fn await_credentials(path: &Path) -> (String, String) {
