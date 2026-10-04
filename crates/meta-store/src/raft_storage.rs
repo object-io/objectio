@@ -29,14 +29,14 @@
 //!   [`MetaCommand::DeleteConfig`] into the existing `CONFIG` redb table.
 //!   All other meta mutations still write directly to redb and are not
 //!   quorum-safe yet — they get migrated variant-by-variant in R2+.
-//! - Snapshots: **stubbed**. `get_current_snapshot` returns `None`,
-//!   `build_snapshot` returns an empty snapshot, `install_snapshot` is a
-//!   no-op. Good enough for small clusters that don't need log
-//!   compaction; a real implementation follows in a later phase.
+//! - Snapshots: the whole state machine, streamed through a file in the
+//!   snapshot directory (never held in memory: meta has a listing entry
+//!   per object), so the log can be compacted (B18).
 
 use std::fmt::Debug;
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::RangeBounds;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::{
@@ -80,14 +80,21 @@ pub struct MetaRaftStorage {
     /// in-memory caches live — so reads on a just-promoted follower
     /// aren't stuck on the pre-promote snapshot.
     listener: Option<tokio::sync::mpsc::UnboundedSender<ApplyEvent>>,
+    /// Where snapshots are written while they are built or received.
+    snapshot_dir: PathBuf,
 }
 
 impl MetaRaftStorage {
     /// Build a storage from a shared redb database. All Raft tables are
     /// opened on first write — no upfront migration needed.
+    /// Snapshots go through files in `snapshot_dir` (created if missing).
     #[must_use]
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db, listener: None }
+    pub fn new(db: Arc<Database>, snapshot_dir: PathBuf) -> Self {
+        Self {
+            db,
+            listener: None,
+            snapshot_dir,
+        }
     }
 
     /// Attach an apply-event listener. The state machine will send one
@@ -96,11 +103,13 @@ impl MetaRaftStorage {
     #[must_use]
     pub fn with_apply_listener(
         db: Arc<Database>,
+        snapshot_dir: PathBuf,
         listener: tokio::sync::mpsc::UnboundedSender<ApplyEvent>,
     ) -> Self {
         Self {
             db,
             listener: Some(listener),
+            snapshot_dir,
         }
     }
 
@@ -123,12 +132,6 @@ impl MetaRaftStorage {
             Some(v) => serde_json::from_slice(v.value()).map_err(|e| decode_err("raft_state", e)),
             None => Ok(RaftPersistentState::default()),
         }
-    }
-
-    fn save_state(&self, state: &RaftPersistentState) -> Result<(), StorageError<NodeId>> {
-        let txn = self.db.begin_write().map_err(write_err)?;
-        write_state(&txn, state)?;
-        crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
     /// Apply a committed [`MetaCommand`] into `txn`, the apply batch's
@@ -476,14 +479,20 @@ const RAFT_TABLES: [&str; 3] = ["raft_logs", "raft_vote", "raft_state"];
 
 const SNAPSHOT_MAGIC: &[u8] = b"OBIO-META-SNAPSHOT-1\n";
 
-/// One table's rows, as a snapshot carries them.
-type TableRows = (String, Vec<(String, Vec<u8>)>);
+/// A key or value larger than this in a snapshot is damage, not data.
+const SNAPSHOT_FIELD_LIMIT: u64 = 1 << 30;
 
 impl MetaRaftStorage {
-    /// The state machine's tables and the Raft state they correspond to,
-    /// read in one transaction so they agree.
-    fn dump_state_machine(&self) -> Result<(Vec<u8>, RaftPersistentState), StorageError<NodeId>> {
-        let txn = self.db.begin_read().map_err(read_err)?;
+    /// Write every state-machine table to `out`, and return the Raft state
+    /// they correspond to: one read transaction, so the two agree, while
+    /// writes go on (redb readers see a fixed version).
+    fn write_state_machine(
+        db: &Database,
+        out: &mut impl Write,
+    ) -> Result<RaftPersistentState, StorageError<NodeId>> {
+        use redb::ReadableTableMetadata as _;
+        let io = |e: std::io::Error| encode_err("snapshot", e);
+        let txn = db.begin_read().map_err(read_err)?;
         let state = match txn.open_table(tables::RAFT_STATE) {
             Ok(t) => match t.get("state").map_err(read_err)? {
                 Some(v) => {
@@ -502,37 +511,35 @@ impl MetaRaftStorage {
             .collect();
         names.sort();
 
-        let mut out = SNAPSHOT_MAGIC.to_vec();
-        put_u64(&mut out, names.len() as u64);
+        out.write_all(SNAPSHOT_MAGIC).map_err(io)?;
+        put_u64(out, names.len() as u64).map_err(io)?;
         for name in &names {
             let table = txn
                 .open_table(redb::TableDefinition::<&str, &[u8]>::new(name))
                 .map_err(read_err)?;
-            put_bytes(&mut out, name.as_bytes());
-            let rows: Vec<(String, Vec<u8>)> = table
-                .iter()
-                .map_err(read_err)?
-                .map(|r| r.map(|(k, v)| (k.value().to_string(), v.value().to_vec())))
-                .collect::<Result<_, _>>()
-                .map_err(read_err)?;
-            put_u64(&mut out, rows.len() as u64);
-            for (k, v) in rows {
-                put_bytes(&mut out, k.as_bytes());
-                put_bytes(&mut out, &v);
+            put_bytes(out, name.as_bytes()).map_err(io)?;
+            put_u64(out, table.len().map_err(read_err)?).map_err(io)?;
+            for row in table.iter().map_err(read_err)? {
+                let (k, v) = row.map_err(read_err)?;
+                put_bytes(out, k.value().as_bytes()).map_err(io)?;
+                put_bytes(out, v.value()).map_err(io)?;
             }
         }
-        Ok((out, state))
+        out.flush().map_err(io)?;
+        Ok(state)
     }
 
-    /// Replace every state-machine table with the snapshot's, and record
-    /// the position it was taken at, in one transaction: a crash leaves
-    /// either the old state or the new, never a mix.
+    /// Replace every state-machine table with the snapshot read from `src`,
+    /// and record the position it was taken at, in one transaction: a crash,
+    /// or a snapshot that turns out damaged part way, leaves the old state
+    /// whole; nothing is committed until the last row has been read.
     fn install_state_machine(
-        &self,
-        tables_in: &[TableRows],
+        db: &Database,
+        src: &mut impl BufRead,
         meta: &SnapshotMeta<NodeId, Node>,
     ) -> Result<(), StorageError<NodeId>> {
-        let txn = self.db.begin_write().map_err(write_err)?;
+        let bad = |e: String| decode_err("snapshot", std::io::Error::other(e));
+        let txn = db.begin_write().map_err(write_err)?;
         {
             let existing: Vec<String> = txn
                 .list_tables()
@@ -544,14 +551,31 @@ impl MetaRaftStorage {
                 txn.delete_table(redb::TableDefinition::<&str, &[u8]>::new(name))
                     .map_err(write_err)?;
             }
-            for (name, rows) in tables_in {
+
+            let mut magic = vec![0u8; SNAPSHOT_MAGIC.len()];
+            src.read_exact(&mut magic)
+                .map_err(|e| bad(format!("snapshot is truncated: {e}")))?;
+            if magic != SNAPSHOT_MAGIC {
+                return Err(bad("not a meta snapshot".into()));
+            }
+            for _ in 0..get_u64(src).map_err(bad)? {
+                let name = get_string(src).map_err(bad)?;
+                if RAFT_TABLES.contains(&name.as_str()) {
+                    return Err(bad(format!("snapshot carries Raft's own table {name}")));
+                }
                 let mut t = txn
-                    .open_table(redb::TableDefinition::<&str, &[u8]>::new(name))
+                    .open_table(redb::TableDefinition::<&str, &[u8]>::new(&name))
                     .map_err(write_err)?;
-                for (k, v) in rows {
+                for _ in 0..get_u64(src).map_err(bad)? {
+                    let k = get_string(src).map_err(bad)?;
+                    let v = get_bytes(src).map_err(bad)?;
                     t.insert(k.as_str(), v.as_slice()).map_err(write_err)?;
                 }
             }
+            if !src.fill_buf().map_err(|e| bad(e.to_string()))?.is_empty() {
+                return Err(bad("trailing bytes after the last table".into()));
+            }
+
             let mut state = match txn.open_table(tables::RAFT_STATE) {
                 Ok(t) => match t.get("state").map_err(write_err)? {
                     Some(v) => serde_json::from_slice(v.value())
@@ -569,10 +593,33 @@ impl MetaRaftStorage {
         crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
-    fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
-        let started = std::time::Instant::now();
-        let (data, state) = self.dump_state_machine()?;
-        crate::commit_metrics::snapshot_built(data.len(), started.elapsed());
+    /// The state machine as it is now, as a snapshot: written to a file in
+    /// the snapshot directory, which is unlinked once open, so nothing is
+    /// left behind however the snapshot's life ends.
+    async fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
+        let (db, dir) = (Arc::clone(&self.db), self.snapshot_dir.clone());
+        let (file, state, len) = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let (file, path) = snapshot_file(&dir, "build")?;
+            let mut out = BufWriter::with_capacity(1 << 20, &file);
+            let state = Self::write_state_machine(&db, &mut out)?;
+            drop(out);
+            let len = file.metadata().map_or(0, |m| m.len());
+            let _ = std::fs::remove_file(&path);
+            crate::commit_metrics::snapshot_built(
+                usize::try_from(len).unwrap_or(usize::MAX),
+                started.elapsed(),
+            );
+            Ok::<_, StorageError<NodeId>>((file, state, len))
+        })
+        .await
+        .map_err(|e| encode_err("snapshot", std::io::Error::other(e)))??;
+        let mut file = tokio::fs::File::from_std(file);
+        use tokio::io::AsyncSeekExt as _;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| encode_err("snapshot", e))?;
+        tracing::debug!("meta snapshot built: {len} bytes");
         let snapshot_id = format!(
             "meta-snap-{}-{}",
             state.last_applied.map_or(0, |id| id.leader_id.term),
@@ -584,70 +631,64 @@ impl MetaRaftStorage {
                 last_membership: state.membership,
                 snapshot_id,
             },
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(file),
         })
     }
 }
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+/// A new file in `dir` for a snapshot, open for reading and writing, and
+/// its path (to unlink once it no longer needs a name).
+fn snapshot_file(dir: &Path, what: &str) -> Result<(std::fs::File, PathBuf), StorageError<NodeId>> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(dir).map_err(|e| encode_err("snapshot dir", e))?;
+    let path = dir.join(format!(
+        "{what}-{}-{}.snap",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| encode_err("snapshot file", e))?;
+    Ok((file, path))
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u64(out, b.len() as u64);
-    out.extend_from_slice(b);
+fn put_u64(out: &mut impl Write, v: u64) -> std::io::Result<()> {
+    out.write_all(&v.to_le_bytes())
 }
 
-/// Parse a whole snapshot before anything is installed from it: a
-/// truncated or corrupt one is refused, never half-applied.
-fn parse_snapshot(data: &[u8]) -> Result<Vec<TableRows>, String> {
-    struct Reader<'a>(&'a [u8]);
-    impl Reader<'_> {
-        fn take(&mut self, n: usize) -> Result<&[u8], String> {
-            if self.0.len() < n {
-                return Err("snapshot is truncated".into());
-            }
-            let (a, b) = self.0.split_at(n);
-            self.0 = b;
-            Ok(a)
-        }
-        fn u64(&mut self) -> Result<u64, String> {
-            Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-        }
-        fn bytes(&mut self) -> Result<&[u8], String> {
-            let n = usize::try_from(self.u64()?).map_err(|e| e.to_string())?;
-            self.take(n)
-        }
-        fn string(&mut self) -> Result<String, String> {
-            String::from_utf8(self.bytes()?.to_vec()).map_err(|e| e.to_string())
-        }
+fn put_bytes(out: &mut impl Write, b: &[u8]) -> std::io::Result<()> {
+    put_u64(out, b.len() as u64)?;
+    out.write_all(b)
+}
+
+fn get_u64(src: &mut impl Read) -> Result<u64, String> {
+    let mut b = [0u8; 8];
+    src.read_exact(&mut b)
+        .map_err(|e| format!("snapshot is truncated: {e}"))?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn get_bytes(src: &mut impl Read) -> Result<Vec<u8>, String> {
+    let n = get_u64(src)?;
+    if n > SNAPSHOT_FIELD_LIMIT {
+        return Err(format!("snapshot field of {n} bytes: damaged"));
     }
-    let mut r = Reader(data);
-    if r.take(SNAPSHOT_MAGIC.len())? != SNAPSHOT_MAGIC {
-        return Err("not a meta snapshot".into());
-    }
-    let mut tables_out = Vec::new();
-    for _ in 0..r.u64()? {
-        let name = r.string()?;
-        if RAFT_TABLES.contains(&name.as_str()) {
-            return Err(format!("snapshot carries Raft's own table {name}"));
-        }
-        let mut rows = Vec::new();
-        for _ in 0..r.u64()? {
-            let k = r.string()?;
-            rows.push((k, r.bytes()?.to_vec()));
-        }
-        tables_out.push((name, rows));
-    }
-    if !r.0.is_empty() {
-        return Err("trailing bytes after the last table".into());
-    }
-    Ok(tables_out)
+    let mut b = vec![0u8; usize::try_from(n).map_err(|e| e.to_string())?];
+    src.read_exact(&mut b)
+        .map_err(|e| format!("snapshot is truncated: {e}"))?;
+    Ok(b)
+}
+
+fn get_string(src: &mut impl Read) -> Result<String, String> {
+    String::from_utf8(get_bytes(src)?).map_err(|e| e.to_string())
 }
 
 impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
-        self.snapshot_of()
+        self.snapshot_of().await
     }
 }
 
@@ -778,10 +819,12 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                 t.remove(idx).map_err(write_err)?;
             }
         }
-        crate::commit_metrics::commit(txn).map_err(write_err)?;
+        // With the entries, in the same transaction: purged entries that a
+        // crash left recorded as still there would be asked for, and missed.
         let mut state = self.load_state()?;
         state.last_purged = Some(log_id);
-        self.save_state(&state)
+        write_state(&txn, &state)?;
+        crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
     async fn last_applied_state(
@@ -836,22 +879,35 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Box<tokio::fs::File>, StorageError<NodeId>> {
+        // A file with no name: it lives as long as the receive does.
+        let (file, path) = snapshot_file(&self.snapshot_dir, "recv")?;
+        let _ = std::fs::remove_file(&path);
+        Ok(Box::new(tokio::fs::File::from_std(file)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, Node>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<NodeId>> {
         // The whole state machine, replaced. (This used to only move
         // last_applied forward with no data, so a replica caught up from a
         // snapshot believed it was current while missing everything.)
+        use tokio::io::AsyncSeekExt as _;
         let started = std::time::Instant::now();
-        let tables_in = parse_snapshot(snapshot.get_ref())
-            .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))?;
-        self.install_state_machine(&tables_in, meta)?;
+        let mut file = *snapshot;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| decode_err("snapshot", e))?;
+        let file = file.into_std().await;
+        let (db, meta_owned) = (Arc::clone(&self.db), meta.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut src = BufReader::with_capacity(1 << 20, file);
+            Self::install_state_machine(&db, &mut src, &meta_owned)
+        })
+        .await
+        .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))??;
         crate::commit_metrics::snapshot_installed(started.elapsed());
         if let Some(tx) = self.listener.as_ref() {
             let _ = tx.send(ApplyEvent::SnapshotInstalled);
@@ -864,8 +920,14 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     ) -> Result<Option<Snapshot<MetaTypeConfig>>, StorageError<NodeId>> {
         // Built fresh from the tables: always the current state, so there
         // is no stored snapshot to fall out of date.
-        self.snapshot_of().map(Some)
+        self.snapshot_of().await.map(Some)
     }
+}
+
+/// Snapshot files of the tests: unique names, so one directory is shared.
+#[cfg(test)]
+fn test_snapshot_dir() -> PathBuf {
+    std::env::temp_dir().join("objectio-meta-store-test-snapshots")
 }
 
 #[cfg(test)]
@@ -878,7 +940,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("meta.db");
         let db = Database::create(&path).unwrap();
-        (dir, MetaRaftStorage::new(Arc::new(db)))
+        (dir, MetaRaftStorage::new(Arc::new(db), test_snapshot_dir()))
     }
 
     fn log_id(term: u64, index: u64) -> LogId<NodeId> {
@@ -1185,7 +1247,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Database::create(dir.path().join("meta.db")).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApplyEvent>();
-        let mut s = MetaRaftStorage::with_apply_listener(db, tx);
+        let mut s = MetaRaftStorage::with_apply_listener(db, test_snapshot_dir(), tx);
         let node = crate::types::OsdNode {
             node_id: [7; 16],
             address: "http://osd:9200".into(),
@@ -1230,7 +1292,7 @@ mod tests {
         let path = dir.path().join("meta.db");
         let db = Arc::new(Database::create(&path).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApplyEvent>();
-        let mut s = MetaRaftStorage::with_apply_listener(db, tx);
+        let mut s = MetaRaftStorage::with_apply_listener(db, test_snapshot_dir(), tx);
 
         let e = normal_entry(
             1,
@@ -1303,7 +1365,7 @@ mod tests {
         let path = dir.path().join("meta.db");
         let db = Arc::new(Database::create(&path).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApplyEvent>();
-        let mut s = MetaRaftStorage::with_apply_listener(db, tx);
+        let mut s = MetaRaftStorage::with_apply_listener(db, test_snapshot_dir(), tx);
 
         // Seed b1=v1.
         let seed = normal_entry(
@@ -1377,7 +1439,7 @@ mod tests {
         let path = dir.path().join("meta.db");
         {
             let db = Database::create(&path).unwrap();
-            let mut s = MetaRaftStorage::new(Arc::new(db));
+            let mut s = MetaRaftStorage::new(Arc::new(db), test_snapshot_dir());
             let e = normal_entry(
                 1,
                 MetaCommand::SetConfig {
@@ -1391,7 +1453,7 @@ mod tests {
         }
         {
             let db = Database::create(&path).unwrap();
-            let mut s = MetaRaftStorage::new(Arc::new(db));
+            let mut s = MetaRaftStorage::new(Arc::new(db), test_snapshot_dir());
             let (last, _) = s.last_applied_state().await.unwrap();
             assert_eq!(last.unwrap().index, 1);
         }
@@ -1411,7 +1473,7 @@ mod snapshot_tests {
     fn storage() -> (TempDir, MetaRaftStorage) {
         let dir = TempDir::new().unwrap();
         let db = Database::create(dir.path().join("meta.db")).unwrap();
-        (dir, MetaRaftStorage::new(Arc::new(db)))
+        (dir, MetaRaftStorage::new(Arc::new(db), test_snapshot_dir()))
     }
 
     fn put(s: &MetaRaftStorage, table: &str, key: &str, value: &[u8]) {
@@ -1497,14 +1559,23 @@ mod snapshot_tests {
     async fn a_truncated_snapshot_changes_nothing() {
         let (_a, mut leader) = storage();
         put(&leader, "buckets", "b", b"v");
-        let mut data = leader.build_snapshot().await.unwrap().snapshot.into_inner();
+        let mut data = Vec::new();
+        {
+            use tokio::io::AsyncReadExt as _;
+            let mut built = *leader.build_snapshot().await.unwrap().snapshot;
+            built.read_to_end(&mut data).await.unwrap();
+        }
         data.truncate(data.len() - 3);
 
         let (_b, mut replica) = storage();
         put(&replica, "buckets", "mine", b"x");
-        let err = replica
-            .install_snapshot(&at(9), Box::new(Cursor::new(data)))
-            .await;
+        let mut received = replica.begin_receiving_snapshot().await.unwrap();
+        {
+            use tokio::io::AsyncWriteExt as _;
+            received.write_all(&data).await.unwrap();
+            received.flush().await.unwrap();
+        }
+        let err = replica.install_snapshot(&at(9), received).await;
         assert!(err.is_err());
         assert_eq!(
             rows(&replica, "buckets"),
@@ -1524,7 +1595,7 @@ mod snapshot_tests {
         let dir = TempDir::new().unwrap();
         let db = Arc::new(Database::create(dir.path().join("meta.db")).unwrap());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut replica = MetaRaftStorage::with_apply_listener(db, tx);
+        let mut replica = MetaRaftStorage::with_apply_listener(db, test_snapshot_dir(), tx);
         replica
             .install_snapshot(&at(1), snap.snapshot)
             .await
