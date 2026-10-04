@@ -398,11 +398,7 @@ pub(crate) async fn put_object_retention_internal(
         }
         Err(e) => {
             error!("Failed to get object metadata: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e, "Failed to read object metadata");
         }
     };
 
@@ -453,11 +449,7 @@ pub(crate) async fn put_object_retention_internal(
     .await
     {
         error!("Failed to update object retention: {}", e);
-        return S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+        return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
     }
 
     Response::builder()
@@ -577,11 +569,7 @@ pub(crate) async fn put_object_legal_hold_internal(
         }
         Err(e) => {
             error!("Failed to get object metadata: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e, "Failed to read object metadata");
         }
     };
 
@@ -602,11 +590,7 @@ pub(crate) async fn put_object_legal_hold_internal(
     .await
     {
         error!("Failed to update legal hold: {}", e);
-        return S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+        return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
     }
 
     Response::builder()

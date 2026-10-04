@@ -343,11 +343,7 @@ pub(crate) async fn set_object_tagging(
     .await
     {
         error!("Failed to update tags of {bucket}/{key}: {e}");
-        return S3Error::xml_response(
-            "InternalError",
-            &e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
+        return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
     }
     let mut builder = Response::builder().status(status);
     if !version_id.is_empty() {

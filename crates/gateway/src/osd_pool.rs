@@ -34,6 +34,10 @@ pub enum OsdPoolError {
     /// The object needs a newer release to read correctly.
     #[error("{0}")]
     TooOld(String),
+
+    /// This gateway's clock is too far from meta's to stamp a write.
+    #[error("{0}")]
+    ClockSkew(String),
 }
 
 /// Node identifier (16-byte UUID)
@@ -1027,6 +1031,12 @@ pub async fn put_object_meta_with(
             unapplied: true,
         });
     }
+    if let Some(why) = crate::clock_skew::refusal() {
+        return Err(MetaWriteError {
+            error: OsdPoolError::ClockSkew(why),
+            unapplied: true,
+        });
+    }
 
     // Exactly one replica counts the object in usage. Chosen from the
     // key's placement rather than the stripes: a multipart object's
@@ -1367,6 +1377,14 @@ pub async fn delete_meta_from_all(
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
+    if let Some(why) = crate::clock_skew::refusal() {
+        warn!("delete {bucket}/{key}: {why}");
+        return MetaDeleted {
+            of: targets.len(),
+            quorum: meta_write_quorum(targets.len()),
+            ..MetaDeleted::default()
+        };
+    }
     // Every copy records the same stamp as its tombstone.
     let stamp = objectio_common::stamp::CLOCK.now();
     let futs = targets.iter().map(|p| async move {

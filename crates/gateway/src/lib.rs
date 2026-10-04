@@ -10,6 +10,7 @@ pub mod auth_middleware;
 pub mod authz;
 pub mod checksum;
 pub mod chunked_decode;
+pub mod clock_skew;
 pub mod cluster_poll;
 pub mod console_auth;
 pub mod cors;
@@ -361,6 +362,11 @@ pub struct Args {
     #[arg(long, hide = true)]
     pub test_hooks: bool,
 
+    /// Run this gateway's stamp clock this many milliseconds off the
+    /// system's: a gateway whose clock is wrong. For testing only.
+    #[arg(long, default_value_t = 0, hide = true, allow_negative_numbers = true)]
+    pub test_clock_offset_ms: i64,
+
     /// How often the packer moves small objects into packs (seconds). 0,
     /// the default, leaves packing off.
     #[arg(long, default_value_t = 0)]
@@ -529,6 +535,9 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
+    if args.test_clock_offset_ms != 0 {
+        objectio_common::stamp::set_test_offset_ms(args.test_clock_offset_ms);
+    }
     info!("Starting ObjectIO Gateway");
     info!("Metadata endpoint: {}", args.meta_endpoint);
     info!("OSD endpoint: {}", args.osd_endpoint);
@@ -1697,6 +1706,7 @@ pub async fn run(
     // must not fail because one node is slow to answer.
     cluster_poll::spawn(state.meta_client.clone());
     cluster_poll::spawn_readiness(state.meta_client.clone());
+    clock_skew::spawn(state.meta_client.clone());
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
     let mut tasks = Vec::with_capacity(listeners.len());
