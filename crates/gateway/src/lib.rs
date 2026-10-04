@@ -31,6 +31,7 @@ pub mod packs;
 pub mod post_object;
 pub mod prom;
 pub mod public_access;
+pub mod quota;
 pub mod rdma;
 pub mod replication;
 pub mod s3;
@@ -1175,6 +1176,10 @@ pub async fn run(
         .route(
             "/_admin/buckets/{bucket}/owner",
             put(admin::admin_set_bucket_owner),
+        )
+        .route(
+            "/_admin/buckets/{bucket}/quota",
+            put(admin::admin_set_bucket_quota),
         )
         .route("/_admin/policies/attach", post(iam_admin::attach_policy))
         .route("/_admin/policies/detach", post(iam_admin::detach_policy))

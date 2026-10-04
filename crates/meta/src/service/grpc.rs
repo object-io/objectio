@@ -1079,6 +1079,13 @@ impl MetadataService for MetaService {
         Self::locate_chunks(self, request).await
     }
 
+    async fn set_bucket_quota(
+        &self,
+        request: Request<SetBucketQuotaRequest>,
+    ) -> Result<Response<SetBucketQuotaResponse>, Status> {
+        Self::set_bucket_quota(self, request).await
+    }
+
     async fn set_bucket_owner(
         &self,
         request: Request<SetBucketOwnerRequest>,

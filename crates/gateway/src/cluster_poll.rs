@@ -34,6 +34,9 @@ use tonic::transport::Channel;
 /// of writes, and each poll costs a few RPCs per OSD.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The poll interval while any bucket or tenant has a quota.
+pub const QUOTA_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Budget for one OSD or meta call. A node slower than this is reported
 /// as down for the poll rather than holding up every other node.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,8 +69,6 @@ static SNAPSHOT: LazyLock<RwLock<Snapshot>> = LazyLock::new(|| RwLock::new(Snaps
 /// Start the poll loop.
 pub fn spawn(meta: MetaClient) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Last usage each OSD reported. An OSD that misses a poll keeps its
         // previous numbers: its objects are counted by nobody else, so
         // dropping them would make every bucket it serves look like it lost
@@ -76,8 +77,19 @@ pub fn spawn(meta: MetaClient) {
         // Nodes that answered the previous poll; sent to OSDs as the "up"
         // set for the safety check.
         let mut up: Vec<Vec<u8>> = Vec::new();
+        let mut first = true;
         loop {
-            ticker.tick().await;
+            // While any quota is set, usage is gathered more often: it is
+            // what writes are admitted against (crate::quota).
+            if !first {
+                tokio::time::sleep(if crate::quota::any_quota() {
+                    QUOTA_POLL_INTERVAL
+                } else {
+                    POLL_INTERVAL
+                })
+                .await;
+            }
+            first = false;
             let started = Instant::now();
             let ok = poll_once(meta.clone(), &mut last_usage, &mut up).await;
             let elapsed = started.elapsed();
@@ -152,6 +164,8 @@ async fn poll_once(
     last_usage: &mut HashMap<String, Vec<OsdBucketUsage>>,
     up: &mut Vec<Vec<u8>>,
 ) -> bool {
+    // Usage gathered from here on: writes admitted before it are in it.
+    let gathered_at = Instant::now();
     let Some(resp) = timed(meta.get_listing_nodes(GetListingNodesRequest {
         bucket: String::new(),
         include_all_states: true,
@@ -217,6 +231,7 @@ async fn poll_once(
     last_usage.retain(|id, _| nodes.iter().any(|n| &n.node_id == id));
 
     if let Some(report) = crate::build_usage_report(meta.clone(), &nodes, last_usage).await {
+        crate::quota::on_report(&report, gathered_at);
         s3_metrics().set_usage(report);
     }
     s3_metrics().set_capacity(nodes);

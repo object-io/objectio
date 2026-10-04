@@ -654,6 +654,17 @@ pub enum BucketCmd {
     Delete { name: String },
     /// PUT /_admin/buckets/{name}/owner
     SetOwner { name: String, owner: String },
+    /// PUT /_admin/buckets/{name}/quota: byte and object quotas; a write
+    /// that would pass one is refused (403 QuotaExceeded)
+    SetQuota {
+        name: String,
+        /// Byte quota, e.g. 500G or 2T (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        bytes: String,
+        /// Object count quota (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        objects: u64,
+    },
     /// Bucket policy
     Policy {
         #[command(subcommand)]

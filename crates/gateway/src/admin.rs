@@ -1626,6 +1626,53 @@ pub async fn admin_set_bucket_owner(
     }
 }
 
+/// `PUT /_admin/buckets/{bucket}/quota` with `{"quota_bytes": N,
+/// "quota_objects": N}` (0 or absent = unlimited): the bucket's quotas
+/// (A8b, objectio-docs `s3/quotas.md`). A system admin, or the admin of
+/// the bucket's tenant.
+pub async fn admin_set_bucket_quota(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(deny) = require_bucket_tenant_admin(&state, &auth, &headers, &bucket).await {
+        return deny;
+    }
+    let field = |name: &str| match &body[name] {
+        serde_json::Value::Null => Ok(0),
+        v => v
+            .as_u64()
+            .ok_or_else(|| format!("{name} must be a whole number of bytes or objects")),
+    };
+    let (quota_bytes, quota_objects) = match (field("quota_bytes"), field("quota_objects")) {
+        (Ok(b), Ok(o)) => (b, o),
+        (Err(e), _) | (_, Err(e)) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match state
+        .meta_client
+        .clone()
+        .set_bucket_quota(objectio_proto::metadata::SetBucketQuotaRequest {
+            bucket: bucket.clone(),
+            quota_bytes,
+            quota_objects,
+        })
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                "Set quota of bucket '{bucket}': {quota_bytes} bytes, {quota_objects} objects"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, e.message().to_string()).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+    }
+}
+
 /// Query params for admin object listing
 #[derive(Debug, serde::Deserialize)]
 pub struct AdminListObjectsParams {

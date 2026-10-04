@@ -236,6 +236,12 @@ pub(crate) async fn copy_by_reference(
         return None;
     }
 
+    // Quotas (A8b): a copy by reference stores no new shards, but the
+    // destination object counts as the source's size, as usage does.
+    if let Some(refused) = crate::quota::check(dest_bucket, source.size, 1) {
+        return Some(refused);
+    }
+
     let new_id = Uuid::now_v7().as_bytes().to_vec();
     let stripes = source.stripes.clone();
     let stripe_ids: Vec<Vec<u8>> = stripes
