@@ -145,6 +145,9 @@ async fn heal_key(state: &Arc<AppState>, entry: &HealEntry) -> bool {
         )
         .await;
     }
+    // The listing too: a write or delete queued here may have reached its
+    // copies while meta couldn't take the listing update.
+    crate::s3::sync_listing(state, &copies, bucket, key).await;
     info!("healed {bucket}/{key} (version {:?})", entry.version_id);
     true
 }

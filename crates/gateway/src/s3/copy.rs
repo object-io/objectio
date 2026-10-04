@@ -461,9 +461,8 @@ pub(crate) async fn copy_by_reference(
         }
     }
     if let Ok((_, Committed::Unlisted(e))) = &committed {
-        warn!(
-            "create_object on meta failed for {what} ({e}); readable by key, not listed until repair"
-        );
+        warn!("create_object on meta failed for {what} ({e}); listing it again");
+        crate::s3::sync_listing(state, &dest_placement.nodes, dest_bucket, dest_key).await;
     }
 
     if let Some(object) = marked {
