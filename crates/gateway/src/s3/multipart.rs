@@ -425,6 +425,11 @@ pub(crate) async fn upload_part_internal(
         verified_md5.map_or_else(|| crate::digest::md5_hex(&body), hex::encode)
     );
     let part_size = body.len() as u64;
+    // Quotas (A8b): a part's bytes count when it is uploaded; the object,
+    // when the upload completes.
+    if let Some(refused) = crate::quota::check(&bucket, part_size, 0) {
+        return refused;
+    }
 
     let mut meta_client = state.meta_client.clone();
 
@@ -1029,6 +1034,11 @@ pub(crate) async fn complete_multipart_upload_internal(
                 return S3Error::xml_response("InvalidRequest", msg, StatusCode::BAD_REQUEST);
             }
         }
+    }
+
+    // Quotas (A8b): the object (its parts' bytes were counted as they came).
+    if let Some(refused) = crate::quota::check(&bucket, 0, 1) {
+        return refused;
     }
 
     // If-Match / If-None-Match: refused now, while the upload still exists

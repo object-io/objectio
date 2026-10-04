@@ -34,7 +34,7 @@
 //!   per object), so the log can be compacted (B18).
 
 use std::fmt::Debug;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -593,47 +593,137 @@ impl MetaRaftStorage {
         crate::commit_metrics::commit(txn).map_err(write_err)
     }
 
-    /// The state machine as it is now, as a snapshot: written to a file in
-    /// the snapshot directory, which is unlinked once open, so nothing is
-    /// left behind however the snapshot's life ends.
+    /// Build a snapshot of the state machine as it is now, and make it the
+    /// current one (see [`Self::current_snapshot`]).
     async fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
         let (db, dir) = (Arc::clone(&self.db), self.snapshot_dir.clone());
-        let (file, state, len) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
             let (file, path) = snapshot_file(&dir, "build")?;
             let mut out = BufWriter::with_capacity(1 << 20, &file);
             let state = Self::write_state_machine(&db, &mut out)?;
             drop(out);
             let len = file.metadata().map_or(0, |m| m.len());
-            let _ = std::fs::remove_file(&path);
             crate::commit_metrics::snapshot_built(
                 usize::try_from(len).unwrap_or(usize::MAX),
                 started.elapsed(),
             );
-            Ok::<_, StorageError<NodeId>>((file, state, len))
-        })
-        .await
-        .map_err(|e| encode_err("snapshot", std::io::Error::other(e)))??;
-        let mut file = tokio::fs::File::from_std(file);
-        use tokio::io::AsyncSeekExt as _;
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|e| encode_err("snapshot", e))?;
-        tracing::debug!("meta snapshot built: {len} bytes");
-        let snapshot_id = format!(
-            "meta-snap-{}-{}",
-            state.last_applied.map_or(0, |id| id.leader_id.term),
-            state.last_applied.map_or(0, |id| id.index)
-        );
-        Ok(Snapshot {
-            meta: SnapshotMeta {
+            let snapshot_id = format!(
+                "meta-snap-{}-{}",
+                state.last_applied.map_or(0, |id| id.leader_id.term),
+                state.last_applied.map_or(0, |id| id.index)
+            );
+            let meta = SnapshotMeta {
                 last_log_id: state.last_applied,
                 last_membership: state.membership,
                 snapshot_id,
-            },
-            snapshot: Box::new(file),
+            };
+            keep_snapshot(&dir, &file, &path, &meta)?;
+            Ok::<_, StorageError<NodeId>>(())
         })
+        .await
+        .map_err(|e| encode_err("snapshot", std::io::Error::other(e)))??;
+        self.current_snapshot()
+            .await?
+            .ok_or_else(|| encode_err("snapshot", std::io::Error::other("just built, now gone")))
     }
+
+    /// The current snapshot: the last one built or installed, exactly as it
+    /// was. openraft sends a follower the snapshot it last recorded, and
+    /// checks the follower's answer against that snapshot's position: one
+    /// built afresh at a later position made the leader's check fail (a
+    /// panic that stopped its Raft core).
+    async fn current_snapshot(
+        &self,
+    ) -> Result<Option<Snapshot<MetaTypeConfig>>, StorageError<NodeId>> {
+        let dir = self.snapshot_dir.clone();
+        let found = tokio::task::spawn_blocking(move || current_snapshot_files(&dir))
+            .await
+            .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))??;
+        let Some((data, meta)) = found else {
+            return Ok(None);
+        };
+        let file = tokio::fs::File::open(&data)
+            .await
+            .map_err(|e| decode_err("snapshot", e))?;
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(file),
+        }))
+    }
+}
+
+/// Keep the snapshot written to `file` (at `tmp`) as the current one, as
+/// `meta` describes it: `<id>.data`, then `<id>.meta`, whose presence says
+/// the pair is whole. Older snapshots are deleted.
+fn keep_snapshot(
+    dir: &Path,
+    file: &std::fs::File,
+    tmp: &Path,
+    meta: &SnapshotMeta<NodeId, Node>,
+) -> Result<(), StorageError<NodeId>> {
+    let io = |e: std::io::Error| encode_err("snapshot", e);
+    file.sync_all().map_err(io)?;
+    let data = dir.join(format!("{}.data", meta.snapshot_id));
+    std::fs::rename(tmp, &data).map_err(io)?;
+    let meta_tmp = dir.join(format!("{}.meta.tmp", meta.snapshot_id));
+    {
+        let mut f = std::fs::File::create(&meta_tmp).map_err(io)?;
+        f.write_all(&serde_json::to_vec(meta).map_err(|e| encode_err("snapshot meta", e))?)
+            .map_err(io)?;
+        f.sync_all().map_err(io)?;
+    }
+    std::fs::rename(&meta_tmp, dir.join(format!("{}.meta", meta.snapshot_id))).map_err(io)?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io)?;
+    // Everything else: older snapshots, and what a crash left half-written.
+    for e in std::fs::read_dir(dir).map_err(io)?.filter_map(Result::ok) {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ours = name == format!("{}.data", meta.snapshot_id)
+            || name == format!("{}.meta", meta.snapshot_id);
+        if !ours {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    Ok(())
+}
+
+/// A kept snapshot: its data file and its description.
+type KeptSnapshot = (PathBuf, SnapshotMeta<NodeId, Node>);
+
+/// The current snapshot's data file and description, if there is one.
+fn current_snapshot_files(dir: &Path) -> Result<Option<KeptSnapshot>, StorageError<NodeId>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(decode_err("snapshot dir", e)),
+    };
+    let mut best: Option<KeptSnapshot> = None;
+    for e in entries.filter_map(Result::ok) {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("meta") {
+            continue;
+        }
+        let Some(meta) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SnapshotMeta<NodeId, Node>>(&b).ok())
+        else {
+            continue;
+        };
+        let data = path.with_extension("data");
+        if !data.exists() {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(_, b)| meta.last_log_id > b.last_log_id)
+        {
+            best = Some((data, meta));
+        }
+    }
+    Ok(best)
 }
 
 /// A new file in `dir` for a snapshot, open for reading and writing, and
@@ -901,10 +991,23 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
             .await
             .map_err(|e| decode_err("snapshot", e))?;
         let file = file.into_std().await;
-        let (db, meta_owned) = (Arc::clone(&self.db), meta.clone());
+        let (db, meta_owned, dir) = (
+            Arc::clone(&self.db),
+            meta.clone(),
+            self.snapshot_dir.clone(),
+        );
         tokio::task::spawn_blocking(move || {
-            let mut src = BufReader::with_capacity(1 << 20, file);
-            Self::install_state_machine(&db, &mut src, &meta_owned)
+            let mut src = BufReader::with_capacity(1 << 20, &file);
+            Self::install_state_machine(&db, &mut src, &meta_owned)?;
+            // And kept as this node's current snapshot, as the leader
+            // described it: what it sends on if it leads.
+            let mut received = &file;
+            received
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| decode_err("snapshot", e))?;
+            let (copy, tmp) = snapshot_file(&dir, "recv")?;
+            std::io::copy(&mut received, &mut &copy).map_err(|e| encode_err("snapshot", e))?;
+            keep_snapshot(&dir, &copy, &tmp, &meta_owned)
         })
         .await
         .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))??;
@@ -918,16 +1021,22 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<MetaTypeConfig>>, StorageError<NodeId>> {
-        // Built fresh from the tables: always the current state, so there
-        // is no stored snapshot to fall out of date.
-        self.snapshot_of().await.map(Some)
+        // The last one built or installed, exactly: openraft checks what a
+        // follower answers against it.
+        self.current_snapshot().await
     }
 }
 
-/// Snapshot files of the tests: unique names, so one directory is shared.
+/// A snapshot directory of its own for each test storage: a node keeps
+/// one current snapshot in its directory and clears out the rest.
 #[cfg(test)]
 fn test_snapshot_dir() -> PathBuf {
-    std::env::temp_dir().join("objectio-meta-store-test-snapshots")
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "objectio-meta-store-test-snapshots/{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 #[cfg(test)]
@@ -1585,6 +1694,46 @@ mod snapshot_tests {
             replica.load_state().unwrap().last_applied.map(|l| l.index),
             Some(9)
         );
+    }
+
+    /// The current snapshot is the one last built or installed, exactly:
+    /// none before the first, the installed one (as the leader described
+    /// it) after an install, and the same one after a restart. Built afresh
+    /// whenever asked, it could be at a later position than the one the
+    /// leader recorded sending, and the leader's check of the follower's
+    /// answer panicked.
+    #[tokio::test]
+    async fn the_current_snapshot_is_the_last_built_or_installed() {
+        let (_a, mut leader) = storage();
+        put(&leader, "buckets", "b", b"v");
+        assert!(leader.get_current_snapshot().await.unwrap().is_none());
+        let built = leader.build_snapshot().await.unwrap();
+        let current = leader.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, built.meta);
+
+        let dir = TempDir::new().unwrap();
+        let snaps = dir.path().join("snapshots");
+        {
+            let db = Database::create(dir.path().join("meta.db")).unwrap();
+            let mut replica = MetaRaftStorage::new(Arc::new(db), snaps.clone());
+            replica
+                .install_snapshot(&at(42), built.snapshot)
+                .await
+                .unwrap();
+            let kept = replica.get_current_snapshot().await.unwrap().unwrap();
+            assert_eq!(kept.meta, at(42));
+        }
+        // After a restart, the same one: and it still carries the data.
+        let db = Database::open(dir.path().join("meta.db")).unwrap();
+        let mut replica = MetaRaftStorage::new(Arc::new(db), snaps);
+        let kept = replica.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(kept.meta, at(42));
+        let (_c, mut third) = storage();
+        third
+            .install_snapshot(&at(42), kept.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(rows(&third, "buckets"), rows(&leader, "buckets"));
     }
 
     /// The service hears about it, to rebuild its caches.
