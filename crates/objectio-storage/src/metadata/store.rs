@@ -8,7 +8,7 @@ use super::cache::ArcCache;
 use super::types::{MetadataKey, MetadataOp};
 use super::wal::{MetadataWal, WalConfig};
 use objectio_common::{Error, Result};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,8 +71,12 @@ pub struct MetadataStore {
     cache: Arc<ArcCache>,
     /// Configuration
     config: MetadataStoreConfig,
-    /// Compaction lock
-    compaction_lock: Mutex<()>,
+    /// One compaction at a time: explicit or background.
+    compaction_lock: Arc<Mutex<()>>,
+    /// Held shared by every write from its log append to its index update,
+    /// and exclusively by a snapshot to see the index with nothing in
+    /// between ([`compact`]).
+    gate: Arc<RwLock<()>>,
     /// Shutdown flag for background thread
     shutdown: Arc<AtomicBool>,
     /// Wakes the compaction thread out of its sleep so shutdown does not have
@@ -106,7 +110,8 @@ impl MetadataStore {
             index,
             cache,
             config,
-            compaction_lock: Mutex::new(()),
+            compaction_lock: Arc::new(Mutex::new(())),
+            gate: Arc::new(RwLock::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
@@ -134,6 +139,7 @@ impl MetadataStore {
         // Load B-tree from snapshot
         let index = Arc::new(BTreeIndex::load_snapshot(config.btree.clone())?);
         let snapshot_lsn = index.last_snapshot_lsn();
+        wal.advance_past(snapshot_lsn);
 
         // Replay WAL entries after snapshot
         info!("Replaying WAL from LSN {}", snapshot_lsn + 1);
@@ -155,7 +161,8 @@ impl MetadataStore {
             index,
             cache,
             config,
-            compaction_lock: Mutex::new(()),
+            compaction_lock: Arc::new(Mutex::new(())),
+            gate: Arc::new(RwLock::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
@@ -190,6 +197,7 @@ impl MetadataStore {
             key: key.clone(),
             value: value.clone(),
         };
+        let _applying = self.gate.read();
         let lsn = self.wal.append(&op)?;
 
         // 2. Update index
@@ -206,6 +214,7 @@ impl MetadataStore {
     pub fn delete(&self, key: &MetadataKey) -> Result<u64> {
         // 1. Write to WAL
         let op = MetadataOp::Delete { key: key.clone() };
+        let _applying = self.gate.read();
         let lsn = self.wal.append(&op)?;
 
         // 2. Update index
@@ -256,6 +265,7 @@ impl MetadataStore {
             .collect();
 
         // 1. Write to WAL atomically
+        let _applying = self.gate.read();
         let lsn = self.wal.append_batch(&ops)?;
 
         // 2. Update index
@@ -281,6 +291,7 @@ impl MetadataStore {
             .iter()
             .map(|k| MetadataOp::Delete { key: k.clone() })
             .collect();
+        let _applying = self.gate.read();
         let lsn = self.wal.append_batch(&ops)?;
         for key in keys {
             self.index.delete(key, lsn);
@@ -303,22 +314,7 @@ impl MetadataStore {
 
     /// Internal snapshot implementation
     fn do_snapshot(&self) -> Result<PathBuf> {
-        // Write snapshot
-        let path = self.index.write_snapshot()?;
-        let snapshot_lsn = self.index.last_snapshot_lsn();
-
-        info!("Wrote snapshot at LSN {}", snapshot_lsn);
-
-        // Truncate WAL
-        if snapshot_lsn > 0 {
-            if let Err(e) = self.wal.truncate_before(snapshot_lsn) {
-                warn!("Failed to truncate WAL: {}", e);
-            } else {
-                debug!("Truncated WAL before LSN {}", snapshot_lsn);
-            }
-        }
-
-        Ok(path)
+        compact(&self.wal, &self.index, &self.gate)
     }
 
     /// Trigger compaction if needed
@@ -342,8 +338,8 @@ impl MetadataStore {
         let shutdown = Arc::clone(&self.shutdown);
         let signal = Arc::clone(&self.shutdown_signal);
         let interval = self.config.compaction_interval;
-        let compaction_lock = self.compaction_lock.lock();
-        drop(compaction_lock); // Just checking it exists
+        let gate = Arc::clone(&self.gate);
+        let compaction_lock = Arc::clone(&self.compaction_lock);
 
         let handle = thread::spawn(move || {
             info!("Background compaction thread started");
@@ -372,20 +368,10 @@ impl MetadataStore {
                 if index.needs_snapshot() || wal.needs_compaction() {
                     debug!("Starting background compaction");
 
-                    match index.write_snapshot() {
-                        Ok(path) => {
-                            info!("Background snapshot completed: {:?}", path);
-
-                            let snapshot_lsn = index.last_snapshot_lsn();
-                            if snapshot_lsn > 0
-                                && let Err(e) = wal.truncate_before(snapshot_lsn)
-                            {
-                                warn!("Failed to truncate WAL: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Background snapshot failed: {}", e);
-                        }
+                    let _one = compaction_lock.lock();
+                    match compact(&wal, &index, &gate) {
+                        Ok(path) => info!("Background snapshot completed: {:?}", path),
+                        Err(e) => error!("Background snapshot failed: {}", e),
                     }
                 }
             }
@@ -464,6 +450,33 @@ impl MetadataStore {
             cache_misses: self.cache.stats().misses.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Snapshot the index and drop the log records the snapshot holds.
+///
+/// The snapshot must hold every record up to the LSN it is labelled with,
+/// or the log is cut past one it lacks and that write — acknowledged — is
+/// gone at the next restart. A write appends (and waits for its sync) and
+/// only then updates the index, so the index can hold a later record while
+/// an earlier one is still on its way; its highest LSN is no such label.
+/// `gate` is: writers hold it shared from append to update, so with it held
+/// exclusively every record in the log is in the index.
+///
+/// The log is cut only once the snapshot is durable; a failure in between
+/// leaves both, and the next restart replays what the snapshot already has.
+fn compact(wal: &MetadataWal, index: &BTreeIndex, gate: &RwLock<()>) -> Result<PathBuf> {
+    let (mark, entries) = {
+        let _nothing_in_flight = gate.write();
+        (wal.mark()?, index.entries_for_snapshot())
+    };
+    let path = index.write_snapshot_at(mark.lsn, entries)?;
+    info!("Wrote snapshot at LSN {}", mark.lsn);
+    if let Err(e) = wal.truncate_through(mark) {
+        warn!("Failed to truncate WAL: {}", e);
+    } else {
+        debug!("Truncated WAL through LSN {}", mark.lsn);
+    }
+    Ok(path)
 }
 
 impl Drop for MetadataStore {
@@ -683,6 +696,71 @@ mod tests {
         let stats_after = store.cache.stats().hits.load(Ordering::Relaxed);
 
         assert!(stats_after > stats_before);
+    }
+
+    /// Writes that land while a snapshot is taken and the log cut must all
+    /// be there after a restart. The cut copied the log's tail to a new
+    /// file without stopping appends, so a record appended between the copy
+    /// and the rename went into the file the rename then dropped.
+    #[test]
+    fn writes_during_compaction_survive_a_restart() {
+        use std::sync::atomic::AtomicU64;
+        let dir = tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.wal.sync_on_write = true;
+        let written = Arc::new(AtomicU64::new(0));
+        {
+            let store = Arc::new(MetadataStore::create(config.clone()).unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let writers: Vec<_> = (0..4u64)
+                .map(|w| {
+                    let (store, stop, written) =
+                        (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&written));
+                    thread::spawn(move || {
+                        let mut i = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            store
+                                .put(MetadataKey::block(w << 32 | i), vec![1; 64])
+                                .unwrap();
+                            written.fetch_add(1, Ordering::Relaxed);
+                            i += 1;
+                        }
+                    })
+                })
+                .collect();
+            for _ in 0..30 {
+                store.snapshot().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            for w in writers {
+                w.join().unwrap();
+            }
+        }
+        let store = MetadataStore::open(config).unwrap();
+        assert_eq!(store.len(), written.load(Ordering::Relaxed));
+    }
+
+    /// A compaction can leave the log empty. Reopened, it must go on from
+    /// past the snapshot's LSN: numbered from 1 again, the next records
+    /// sat below the snapshot and the replay after it skipped them.
+    #[test]
+    fn writes_after_an_emptying_compaction_survive_restarts() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        {
+            let store = MetadataStore::create(config.clone()).unwrap();
+            for i in 0..10 {
+                store.put(MetadataKey::block(i), vec![1]).unwrap();
+            }
+            store.snapshot().unwrap();
+        }
+        {
+            let store = MetadataStore::open(config.clone()).unwrap();
+            store.put(MetadataKey::block(100), vec![2]).unwrap();
+        }
+        let store = MetadataStore::open(config).unwrap();
+        assert_eq!(store.get(&MetadataKey::block(100)), Some(vec![2]));
+        assert_eq!(store.len(), 11);
     }
 }
 
