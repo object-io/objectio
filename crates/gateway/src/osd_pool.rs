@@ -34,6 +34,10 @@ pub enum OsdPoolError {
     /// The object needs a newer release to read correctly.
     #[error("{0}")]
     TooOld(String),
+
+    /// This gateway's clock is too far from meta's to stamp a write.
+    #[error("{0}")]
+    ClockSkew(String),
 }
 
 /// Node identifier (16-byte UUID)
@@ -990,6 +994,9 @@ pub async fn put_object_meta_to_all(
     .await
 }
 
+/// How many times a write superseded by a newer stamp is stamped again.
+const MAX_RESTAMPS: usize = 5;
+
 /// How [`put_object_meta_with`] writes.
 #[derive(Default, Clone, Copy)]
 pub struct MetaWrite<'a> {
@@ -1027,6 +1034,12 @@ pub async fn put_object_meta_with(
             unapplied: true,
         });
     }
+    if let Some(why) = crate::clock_skew::refusal() {
+        return Err(MetaWriteError {
+            error: OsdPoolError::ClockSkew(why),
+            unapplied: true,
+        });
+    }
 
     // Exactly one replica counts the object in usage. Chosen from the
     // key's placement rather than the stripes: a multipart object's
@@ -1049,68 +1062,111 @@ pub async fn put_object_meta_with(
             objectio_common::stamp::CLOCK.next_after(object_meta.update_stamp);
     }
 
-    let mut futs = Vec::with_capacity(targets.len());
-    for placement in &targets {
-        let req = PutObjectMetaRequest {
-            // A write over an object read (an expected id) is an update of
-            // it: one deleted since must not come back. Without this, a
-            // DELETE between a tagging, retention, legal-hold or packing
-            // update's read and its write brought the object back, naming
-            // shards the DELETE had freed.
-            require_existing: !expected_object_id.is_empty(),
-            version_only,
-            keep_newer_current,
-            replication_update: false,
-            replication_set: std::collections::HashMap::new(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            object: Some(object_meta.clone()),
-            versioning_enabled,
-            expected_object_id: expected_object_id.to_vec(),
-        };
-        let p = placement.clone();
-        // The bool on an error: this replica certainly did not apply it.
-        futs.push(async move {
-            let mut client = pool
-                .get_client_for_placement(&p)
-                .await
-                .map_err(|e| (e, true))?;
-            let fut = pool.watched(&p.node_address, client.put_object_meta(req));
-            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
-                .await
-                .map_err(|_| {
-                    error!("Timeout putting object metadata to OSD {}", p.node_address);
-                    (
-                        OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
-                        false,
-                    )
-                })?
-                .map_err(|e| {
-                    error!(
-                        "Failed to put object metadata to OSD {}: {}",
-                        p.node_address, e
-                    );
-                    if is_transport_failure(&e) {
-                        pool.mark_unreachable(&p.node_address);
-                    }
-                    let refused = matches!(
-                        e.code(),
-                        tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
-                    );
-                    (OsdPoolError::ConnectionFailed(e.to_string()), refused)
-                })?
-                .into_inner();
-            Ok::<_, (OsdPoolError, bool)>(Displaced {
-                replaced: resp.replaced,
-                version_kept: resp.replaced_version_kept,
-                superseded: resp.superseded,
-                missed: false,
-            })
-        });
-    }
+    // A copy holding a newer stamp supersedes the write. When that is a
+    // write this one follows (acknowledged before it began, through a
+    // gateway whose clock is ahead of this one's), losing would lose an
+    // acknowledged overwrite: so stamp above what the copies hold and
+    // write again. Concurrent writes may land either way, as S3 allows.
+    // Updates are ordered by the object they read instead, and replicas
+    // by their versions' age.
+    let restamp = expected_object_id.is_empty() && !version_only && !keep_newer_current;
+    // What each copy displaced in the round it took the write: a later
+    // round would only report this write's own earlier stamp.
+    let mut took: Vec<Option<Displaced>> = vec![None; targets.len()];
+    let mut round = 0;
+    let results = loop {
+        let mut futs = Vec::with_capacity(targets.len());
+        for placement in &targets {
+            let req = PutObjectMetaRequest {
+                // A write over an object read (an expected id) is an update of
+                // it: one deleted since must not come back. Without this, a
+                // DELETE between a tagging, retention, legal-hold or packing
+                // update's read and its write brought the object back, naming
+                // shards the DELETE had freed.
+                require_existing: !expected_object_id.is_empty(),
+                version_only,
+                keep_newer_current,
+                replication_update: false,
+                replication_set: std::collections::HashMap::new(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                object: Some(object_meta.clone()),
+                versioning_enabled,
+                expected_object_id: expected_object_id.to_vec(),
+            };
+            let p = placement.clone();
+            // The bool on an error: this replica certainly did not apply it.
+            futs.push(async move {
+                let mut client = pool
+                    .get_client_for_placement(&p)
+                    .await
+                    .map_err(|e| (e, true))?;
+                let fut = pool.watched(&p.node_address, client.put_object_meta(req));
+                let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+                    .await
+                    .map_err(|_| {
+                        error!("Timeout putting object metadata to OSD {}", p.node_address);
+                        (
+                            OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
+                            false,
+                        )
+                    })?
+                    .map_err(|e| {
+                        error!(
+                            "Failed to put object metadata to OSD {}: {}",
+                            p.node_address, e
+                        );
+                        if is_transport_failure(&e) {
+                            pool.mark_unreachable(&p.node_address);
+                        }
+                        let refused = matches!(
+                            e.code(),
+                            tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                        );
+                        (OsdPoolError::ConnectionFailed(e.to_string()), refused)
+                    })?
+                    .into_inner();
+                Ok::<_, (OsdPoolError, bool)>((
+                    Displaced {
+                        replaced: resp.replaced,
+                        version_kept: resp.replaced_version_kept,
+                        superseded: resp.superseded,
+                        missed: false,
+                    },
+                    resp.held_stamp,
+                ))
+            });
+        }
+        let answers = futures::future::join_all(futs).await;
+        round += 1;
+        let held = answers
+            .iter()
+            .filter_map(|a| a.as_ref().ok())
+            .filter(|(d, _)| d.superseded)
+            .map(|&(_, h)| h)
+            .max()
+            .unwrap_or(0);
+        for (slot, answer) in took.iter_mut().zip(&answers) {
+            if let Ok((d, _)) = answer
+                && !d.superseded
+                && slot.is_none()
+            {
+                *slot = Some(d.clone());
+            }
+        }
+        if restamp && held != 0 && round < MAX_RESTAMPS {
+            debug!("{bucket}/{key}: a copy holds stamp {held}; writing again above it");
+            object_meta.stamp = objectio_common::stamp::CLOCK.next_after(held);
+            continue;
+        }
+        break answers
+            .into_iter()
+            .zip(&took)
+            .map(|(a, first)| a.map(|(d, _)| first.clone().unwrap_or(d)))
+            .collect::<Vec<_>>();
+    };
 
     let quorum = meta_write_quorum(targets.len());
-    let results = futures::future::join_all(futs).await;
     let mut displaced = Vec::with_capacity(results.len());
     let mut failure: Option<OsdPoolError> = None;
     let mut unapplied = true;
@@ -1367,41 +1423,77 @@ pub async fn delete_meta_from_all(
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
-    // Every copy records the same stamp as its tombstone.
-    let stamp = objectio_common::stamp::CLOCK.now();
-    let futs = targets.iter().map(|p| async move {
-        let mut client = pool.get_client_for_placement(p).await?;
-        let fut = client.delete_object_meta(DeleteObjectMetaRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: version_id.to_string(),
-            stamp,
+    if let Some(why) = crate::clock_skew::refusal() {
+        warn!("delete {bucket}/{key}: {why}");
+        return MetaDeleted {
+            of: targets.len(),
+            quorum: meta_write_quorum(targets.len()),
+            ..MetaDeleted::default()
+        };
+    }
+    // Every copy records the same stamp as its tombstone. A copy holding a
+    // newer write keeps it; when that is a write this delete follows
+    // (through a gateway whose clock is ahead), the delete is stamped
+    // above it and sent again, as a superseded PUT is.
+    let mut stamp = objectio_common::stamp::CLOCK.now();
+    let mut removed = Vec::new();
+    let mut round = 0;
+    let answers = loop {
+        let futs = targets.iter().map(|p| async move {
+            let mut client = pool.get_client_for_placement(p).await?;
+            let fut = client.delete_object_meta(DeleteObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+                stamp,
+            });
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                pool.watched(&p.node_address, fut),
+            )
+            .await
+            .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
+            .map_err(|e| {
+                if is_transport_failure(&e) {
+                    pool.mark_unreachable(&p.node_address);
+                }
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?
+            .into_inner();
+            Ok::<_, OsdPoolError>(resp)
         });
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            pool.watched(&p.node_address, fut),
-        )
-        .await
-        .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
-        .map_err(|e| {
-            if is_transport_failure(&e) {
-                pool.mark_unreachable(&p.node_address);
-            }
-            OsdPoolError::ConnectionFailed(e.to_string())
-        })?;
-        Ok::<_, OsdPoolError>(resp.into_inner().removed)
-    });
+        let answers = futures::future::join_all(futs).await;
+        round += 1;
+        // What a round removed stays removed whatever the next one does.
+        removed.extend(
+            answers
+                .iter()
+                .filter_map(|a| a.as_ref().ok())
+                .filter_map(|r| r.removed.clone()),
+        );
+        let held = answers
+            .iter()
+            .filter_map(|a| a.as_ref().ok())
+            .filter(|r| r.superseded)
+            .map(|r| r.held_stamp)
+            .max()
+            .unwrap_or(0);
+        if held != 0 && round < MAX_RESTAMPS {
+            debug!("delete {bucket}/{key}: a copy holds stamp {held}; deleting again above it");
+            stamp = objectio_common::stamp::CLOCK.next_after(held);
+            continue;
+        }
+        break answers;
+    };
     let mut out = MetaDeleted {
         of: targets.len(),
         quorum: meta_write_quorum(targets.len()),
+        removed,
         ..MetaDeleted::default()
     };
-    for r in futures::future::join_all(futs).await {
+    for r in answers {
         match r {
-            Ok(removed) => {
-                out.ok += 1;
-                out.removed.extend(removed);
-            }
+            Ok(_) => out.ok += 1,
             Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
         }
     }

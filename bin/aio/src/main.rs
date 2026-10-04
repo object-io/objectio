@@ -20,6 +20,10 @@
 //!   - replication = 1 (no redundancy)
 //!   - tempdir data (wiped on exit) unless --data is passed
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::io::Read;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
@@ -153,6 +157,11 @@ struct Args {
     /// Mount the gateway's `/_admin/test/*` hooks (testing only).
     #[arg(long, hide = true)]
     test_hooks: bool,
+
+    /// Run the gateway's stamp clock this many milliseconds off (testing
+    /// only; forwarded).
+    #[arg(long, default_value_t = 0, hide = true, allow_negative_numbers = true)]
+    test_clock_offset_ms: i64,
 
     /// How often the packer moves small objects into packs (seconds);
     /// forwarded to the gateway. 0 leaves packing off.
@@ -920,6 +929,12 @@ async fn main() -> Result<()> {
     }
     if args.test_hooks {
         gw_argv.push("--test-hooks".to_string());
+    }
+    if args.test_clock_offset_ms != 0 {
+        gw_argv.push(format!(
+            "--test-clock-offset-ms={}",
+            args.test_clock_offset_ms
+        ));
     }
     if let Some(secs) = args.pack_interval_secs {
         gw_argv.extend(["--pack-interval-secs".to_string(), secs.to_string()]);

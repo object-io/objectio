@@ -4,6 +4,10 @@
 //! into the library crate. The heavy lifting lives in `lib.rs` so
 //! `bin/aio` can re-use it in-process.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

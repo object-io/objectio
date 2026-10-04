@@ -406,6 +406,12 @@ impl DiskManager {
             .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
         // Parse footer from the end of the extent
+        if block_buf.len() != extent_bytes {
+            return Err(Error::Storage(format!(
+                "block {block_num}: read {} of {extent_bytes} bytes",
+                block_buf.len()
+            )));
+        }
         let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 
@@ -540,7 +546,14 @@ impl DiskManager {
         // to be added to the persisted shard index.
         let first = AlignedBuf::new(block_size);
         let first_owned = self.disk_io.read_at_owned(first, offset).await?;
-        let header = BlockHeader::from_bytes(&first_owned.as_slice()[..BlockHeader::SIZE])?;
+        // Whatever a backend hands back, never slice past it: an error, so
+        // the shard is marked corrupt, not a panic that leaves it "present".
+        let header = BlockHeader::from_bytes(
+            first_owned
+                .as_slice()
+                .get(..BlockHeader::SIZE)
+                .ok_or_else(|| Error::Storage(format!("block {block_num}: short read")))?,
+        )?;
 
         let extent_bytes =
             Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
@@ -560,6 +573,12 @@ impl DiskManager {
             .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
         // Parse footer from the end of the extent
+        if block_buf.len() != extent_bytes {
+            return Err(Error::Storage(format!(
+                "block {block_num}: read {} of {extent_bytes} bytes",
+                block_buf.len()
+            )));
+        }
         let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 

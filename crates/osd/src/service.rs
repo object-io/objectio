@@ -256,6 +256,113 @@ impl ShardLocation {
 /// layer writes under its own 's'-prefixed keys.
 const SHARD_LOC_PREFIX: &[u8] = b"osd_loc:";
 
+/// Where each shard on this OSD is: its persisted `SHARD_LOC` entry, read
+/// from the metadata store when asked. Only counts are kept in memory; the
+/// in-memory map of every shard this held made an OSD's memory grow with
+/// its shard count (B22).
+struct ShardIndex {
+    store: Arc<MetadataStore>,
+    /// Shards per disk.
+    per_disk: Vec<AtomicU64>,
+    /// A key's read-modify-write (replace, remove) runs under its stripe.
+    stripes: Vec<parking_lot::Mutex<()>>,
+}
+
+impl ShardIndex {
+    const STRIPES: usize = 256;
+
+    fn new(store: Arc<MetadataStore>, num_disks: usize) -> Self {
+        Self {
+            store,
+            per_disk: (0..num_disks).map(|_| AtomicU64::new(0)).collect(),
+            stripes: (0..Self::STRIPES)
+                .map(|_| parking_lot::Mutex::new(()))
+                .collect(),
+        }
+    }
+
+    fn lock(&self, key: &str) -> parking_lot::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        key.hash(&mut h);
+        let i = (h.finish() % Self::STRIPES as u64) as usize;
+        self.stripes[i].lock()
+    }
+
+    fn get(&self, key: &str) -> Option<ShardLocation> {
+        let v = self.store.get(&OsdService::shard_loc_meta_key(key))?;
+        ShardLocation::from_bytes(&v)
+            .inspect_err(|e| warn!("corrupt ShardLocation entry {key}: {e}"))
+            .ok()
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn counted(&self, gone: Option<&ShardLocation>, new: Option<&ShardLocation>) {
+        if let Some(c) = gone.and_then(|l| self.per_disk.get(l.disk_idx)) {
+            c.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(c) = new.and_then(|l| self.per_disk.get(l.disk_idx)) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record `loc` for `key` durably; what it replaced, if anything.
+    fn record(&self, key: &str, loc: &ShardLocation) -> Result<Option<ShardLocation>, String> {
+        let _key = self.lock(key);
+        let old = self.get(key);
+        OsdService::persist_shard_location(&self.store, key, loc)?;
+        self.counted(old.as_ref(), Some(loc));
+        Ok(old)
+    }
+
+    /// Forget `key` durably; where the shard was, if it was here. Its
+    /// blocks may be freed only after this returns.
+    fn forget(&self, key: &str) -> Result<Option<ShardLocation>, String> {
+        let _key = self.lock(key);
+        let Some(old) = self.get(key) else {
+            return Ok(None);
+        };
+        OsdService::forget_shard_location(&self.store, key)?;
+        self.counted(Some(&old), None);
+        Ok(Some(old))
+    }
+
+    /// Up to `n` shards in key order, after `after`: a page, so walking
+    /// every shard (scrub, purge) holds one page at a time.
+    fn page(&self, after: Option<&str>, n: usize) -> Vec<(String, ShardLocation)> {
+        let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
+        let after = after.map(OsdService::shard_loc_meta_key);
+        let mut out = Vec::with_capacity(n.min(4096));
+        self.store.for_each_prefix(&prefix, after.as_ref(), |k, v| {
+            if let (Some(key), Ok(loc)) = (
+                k.strip_prefix(SHARD_LOC_PREFIX)
+                    .and_then(|k| std::str::from_utf8(k).ok()),
+                ShardLocation::from_bytes(v),
+            ) {
+                out.push((key.to_string(), loc));
+            }
+            out.len() < n
+        });
+        out
+    }
+
+    fn count(&self) -> u64 {
+        self.per_disk
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn count_on(&self, disk_idx: usize) -> u64 {
+        self.per_disk
+            .get(disk_idx)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
+    }
+}
+
 /// Dedup dry-run: chunk fingerprints this OSD has been told about, each
 /// with how many times. See objectio-docs `architecture/design/core/dedup.md`.
 const DEDUP_NOTE_PREFIX: &[u8] = b"dedup_note:";
@@ -277,7 +384,7 @@ pub struct OsdService {
     disks: Vec<DiskManager>,
     disk_ids: Vec<[u8; 16]>,
     /// Shard index: object_id:stripe_id:position -> location (in-memory cache)
-    shard_index: RwLock<HashMap<String, ShardLocation>>,
+    shard_index: ShardIndex,
     /// Persistent metadata store (WAL + B-tree + ARC cache)
     meta_store: Arc<MetadataStore>,
     start_time: Instant,
@@ -441,6 +548,21 @@ impl OsdService {
         block_size: u32,
         data_dir: PathBuf,
     ) -> Result<Self, String> {
+        Self::new_with_cache(
+            disk_paths,
+            block_size,
+            data_dir,
+            MetadataStoreConfig::default().cache_bytes,
+        )
+    }
+
+    /// [`Self::new`], the metadata index's page cache at most `cache_bytes`.
+    pub fn new_with_cache(
+        disk_paths: Vec<String>,
+        block_size: u32,
+        data_dir: PathBuf,
+        cache_bytes: usize,
+    ) -> Result<Self, String> {
         // Node identity: Ceph/Rook pattern — the disk is the source of
         // truth. Three-level cascade:
         //   1. Existing disk's superblock with a non-nil osd_node_id.
@@ -529,7 +651,10 @@ impl OsdService {
         }
 
         // Initialize metadata store for persistent object metadata
-        let meta_config = MetadataStoreConfig::with_data_dir(&data_dir);
+        let meta_config = MetadataStoreConfig {
+            cache_bytes,
+            ..MetadataStoreConfig::with_data_dir(&data_dir)
+        };
         let meta_store = MetadataStore::open_or_create(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
 
@@ -544,19 +669,53 @@ impl OsdService {
         // (replayed from the WAL as part of `MetadataStore::open_or_create`
         // above). Before this step the OSD used to report 0 shards on
         // every restart even though disk.raw was full.
-        let mut persisted = Self::load_persisted_shard_index(&meta_store);
-        // A disk that had to be formatted — replaced, or wiped — holds none
-        // of the shards the index remembers on it. Forget them, so they are
-        // reported missing and rebuilt rather than reported present and
-        // failing every read.
-        let before = persisted.len();
+        let meta_store = Arc::new(meta_store);
+        let shard_index = ShardIndex::new(Arc::clone(&meta_store), num_disks);
+        // One pass over the persisted shard locations (replayed from the
+        // WAL as part of `MetadataStore::open_or_create` above), streamed:
+        //
+        // - A disk that had to be formatted (replaced, or wiped) holds none
+        //   of the shards the index remembers on it. They are forgotten, so
+        //   they are reported missing and rebuilt rather than reported
+        //   present and failing every read.
+        // - Each disk's allocation bitmap is reconciled against the index,
+        //   the source of truth for what is on the platter: a disk formatted
+        //   before the allocator was wired up has an all-zero bitmap under a
+        //   full data region, and would hand out block 0 over live shards.
         let mut lost = Vec::new();
-        persisted.retain(|key, loc| {
-            let gone = formatted_now.get(loc.disk_idx).copied().unwrap_or(false);
-            if gone {
-                lost.push(Self::shard_loc_meta_key(key));
+        let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
+        let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
+        meta_store.for_each_prefix(&prefix, None, |k, v| {
+            let loc = match ShardLocation::from_bytes(v) {
+                Ok(loc) => loc,
+                Err(e) => {
+                    warn!("skipping corrupt ShardLocation entry: {e}");
+                    return true;
+                }
+            };
+            if formatted_now.get(loc.disk_idx).copied().unwrap_or(false) {
+                lost.push(MetadataKey::from_bytes(k.to_vec()));
+                return true;
             }
-            !gone
+            if loc.disk_idx >= disks.len() {
+                warn!(
+                    "Shard index references disk {} but only {} are attached; skipping",
+                    loc.disk_idx,
+                    disks.len()
+                );
+                return true;
+            }
+            shard_index.counted(None, Some(&loc));
+            let blocks = disks[loc.disk_idx].blocks_for_len(loc.size as usize);
+            if let Err(e) = disks[loc.disk_idx].mark_extent_used(loc.block_num, blocks) {
+                warn!(
+                    "Could not mark block {} on disk {} as used: {e}",
+                    loc.block_num, loc.disk_idx
+                );
+            } else {
+                reclaimed_check[loc.disk_idx] += 1;
+            }
+            true
         });
         // In batches, one log record (and fsync) each: one per shard took
         // over five minutes for a disk of 24,000 shards.
@@ -567,45 +726,14 @@ impl OsdService {
                 warn!("forgetting {} shards on a formatted disk: {e}", chunk.len());
             }
         }
-        if persisted.len() < before {
+        if !lost.is_empty() {
             warn!(
                 "{} shards were on a disk formatted at startup; they are lost \
                  and will be rebuilt by Meta's repairer",
-                before - persisted.len()
+                lost.len()
             );
         }
-        info!(
-            "Rebuilt shard index from persistent store: {} entries",
-            persisted.len()
-        );
-        // Reconcile each disk's allocation bitmap against the shard index.
-        //
-        // The index is the source of truth for what is actually on the
-        // platter. A disk formatted before the allocator was wired up has an
-        // all-zero bitmap under a full data region, so without this the OSD
-        // would hand out block 0 on restart and overwrite live shards. It is
-        // also what makes the fix work on an existing disk rather than only
-        // on a freshly formatted one.
-        let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
-        for loc in persisted.values() {
-            if loc.disk_idx >= disks.len() {
-                warn!(
-                    "Shard index references disk {} but only {} are attached; skipping",
-                    loc.disk_idx,
-                    disks.len()
-                );
-                continue;
-            }
-            let blocks = disks[loc.disk_idx].blocks_for_len(loc.size as usize);
-            if let Err(e) = disks[loc.disk_idx].mark_extent_used(loc.block_num, blocks) {
-                warn!(
-                    "Could not mark block {} on disk {} as used: {e}",
-                    loc.block_num, loc.disk_idx
-                );
-            } else {
-                reclaimed_check[loc.disk_idx] += 1;
-            }
-        }
+        info!("Shard index: {} shards", shard_index.count());
         for (idx, disk) in disks.iter().enumerate() {
             if let Err(e) = disk.persist_allocator() {
                 warn!("Could not persist allocation bitmap for disk {idx}: {e}");
@@ -621,9 +749,8 @@ impl OsdService {
         let started = Instant::now();
         usage.rebuild(
             meta_store
-                .scan_prefix(&MetadataKey::all_object_meta_prefix())
-                .into_iter()
-                .chain(meta_store.scan_prefix(&MetadataKey::from_bytes(vec![b'v']))),
+                .iter_prefix(&MetadataKey::all_object_meta_prefix())
+                .chain(meta_store.iter_prefix(&MetadataKey::from_bytes(vec![b'v']))),
         );
         info!(
             "Rebuilt usage for {} buckets in {:?}",
@@ -635,9 +762,9 @@ impl OsdService {
             node_id,
             disks,
             disk_ids,
-            shard_index: RwLock::new(persisted),
+            shard_index,
             full_ratio: DEFAULT_FULL_RATIO,
-            meta_store: Arc::new(meta_store),
+            meta_store,
             start_time: Instant::now(),
             next_disk: RwLock::new(0),
             grpc_metrics: Arc::new(GrpcMetrics::default()),
@@ -779,7 +906,6 @@ impl OsdService {
     fn mark_corrupt(&self, key: &str, block_num: u64) {
         let still_there = self
             .shard_index
-            .read()
             .get(key)
             .is_some_and(|l| l.block_num == block_num);
         if still_there && self.corrupt.write().insert(key.to_string()) {
@@ -793,39 +919,41 @@ impl OsdService {
     /// disk is found even if nobody reads it. Corrupt shards are recorded
     /// for the repairer.
     pub async fn scrub_pass(&self, bytes_per_sec: u64) {
-        let shards: Vec<(String, ShardLocation)> = self
-            .shard_index
-            .read()
-            .iter()
-            .map(|(k, l)| (k.clone(), l.clone()))
-            .collect();
         let started = Instant::now();
         let mut bytes = 0u64;
-        for (key, loc) in shards {
-            if loc.disk_idx >= self.disks.len() {
-                continue;
-            }
-            // Any failure counts, not only a checksum: a block whose header
-            // no longer parses, or that the disk cannot return, cannot be
-            // served either. `mark_corrupt` ignores a shard rewritten or
-            // deleted since the snapshot.
-            if let Err(e) = self.disks[loc.disk_idx]
-                .read_block_async(loc.block_num)
-                .await
-            {
-                debug!("scrub: {key} is unreadable: {e}");
-                self.mark_corrupt(&key, loc.block_num);
-            }
-            bytes += u64::from(loc.size);
-            self.scrub.shards.fetch_add(1, Ordering::Relaxed);
-            self.scrub
-                .bytes
-                .fetch_add(u64::from(loc.size), Ordering::Relaxed);
-            // Pace to the rate: wait until this many bytes are due.
-            if bytes_per_sec > 0 {
-                let due = std::time::Duration::from_secs_f64(bytes as f64 / bytes_per_sec as f64);
-                if let Some(wait) = due.checked_sub(started.elapsed()) {
-                    tokio::time::sleep(wait).await;
+        // A page of shards at a time, in key order.
+        let mut after: Option<String> = None;
+        loop {
+            let page = self.shard_index.page(after.as_deref(), 1024);
+            let Some((last, _)) = page.last() else { break };
+            after = Some(last.clone());
+            for (key, loc) in page {
+                if loc.disk_idx >= self.disks.len() {
+                    continue;
+                }
+                // Any failure counts, not only a checksum: a block whose header
+                // no longer parses, or that the disk cannot return, cannot be
+                // served either. `mark_corrupt` ignores a shard rewritten or
+                // deleted since the snapshot.
+                if let Err(e) = self.disks[loc.disk_idx]
+                    .read_block_async(loc.block_num)
+                    .await
+                {
+                    debug!("scrub: {key} is unreadable: {e}");
+                    self.mark_corrupt(&key, loc.block_num);
+                }
+                bytes += u64::from(loc.size);
+                self.scrub.shards.fetch_add(1, Ordering::Relaxed);
+                self.scrub
+                    .bytes
+                    .fetch_add(u64::from(loc.size), Ordering::Relaxed);
+                // Pace to the rate: wait until this many bytes are due.
+                if bytes_per_sec > 0 {
+                    let due =
+                        std::time::Duration::from_secs_f64(bytes as f64 / bytes_per_sec as f64);
+                    if let Some(wait) = due.checked_sub(started.elapsed()) {
+                        tokio::time::sleep(wait).await;
+                    }
                 }
             }
         }
@@ -961,6 +1089,7 @@ impl OsdService {
             replaced: None,
             replaced_version_kept: false,
             superseded: false,
+            held_stamp: 0,
         }))
     }
 
@@ -1009,14 +1138,16 @@ impl OsdService {
         incoming.stamp != 0 && self.tombstone(bucket, key, version_id) >= incoming.stamp
     }
 
-    /// The answer to a write this copy already holds a newer one than.
-    fn superseded() -> Response<PutObjectMetaResponse> {
+    /// The answer to a write this copy already holds a newer one than:
+    /// `stored` (or a tombstone) at `held_stamp`.
+    fn superseded(held_stamp: u64) -> Response<PutObjectMetaResponse> {
         Response::new(PutObjectMetaResponse {
             success: true,
             timestamp: Self::current_timestamp(),
             replaced: None,
             replaced_version_kept: false,
             superseded: true,
+            held_stamp,
         })
     }
 
@@ -1119,12 +1250,7 @@ impl OsdService {
             let capacity = disk.capacity();
             let free = disk.free_space();
             let used = capacity.saturating_sub(free);
-            let shard_count = self
-                .shard_index
-                .read()
-                .values()
-                .filter(|loc| loc.disk_idx == i)
-                .count() as u64;
+            let shard_count = self.shard_index.count_on(i);
 
             total_capacity += capacity;
             total_used += used;
@@ -1227,6 +1353,7 @@ impl OsdService {
     /// before this, `shard_index` started empty after every restart
     /// and the OSD reported 0 shards to meta even when disk.raw was
     /// full of real data.
+    #[cfg(test)]
     fn load_persisted_shard_index(meta_store: &MetadataStore) -> HashMap<String, ShardLocation> {
         let prefix_key = objectio_storage::MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
         let mut out = HashMap::new();
@@ -1319,7 +1446,7 @@ impl StorageService for OsdService {
         request: Request<CheckShardsRequest>,
     ) -> Result<Response<CheckShardsResponse>, Status> {
         let req = request.into_inner();
-        let index = self.shard_index.read();
+        let index = &self.shard_index;
         let corrupt = self.corrupt.read();
         let states = req
             .shards
@@ -1328,7 +1455,7 @@ impl StorageService for OsdService {
                 let key = Self::shard_key(&id.object_id, id.stripe_id, id.position);
                 let state = if corrupt.contains(&key) {
                     ShardState::Corrupt
-                } else if index.contains_key(&key) {
+                } else if index.contains(&key) {
                     ShardState::Ok
                 } else {
                     ShardState::Missing
@@ -1380,23 +1507,30 @@ impl StorageService for OsdService {
         // Shards: the index entry, its persisted copy, then the block — the
         // same order as DeleteShard, so a crash leaks a block rather than
         // handing a live shard's block out.
-        let keys: Vec<String> = self.shard_index.read().keys().cloned().collect();
         let mut shards = 0u64;
-        for key in keys {
-            let removed = self.shard_index.write().remove(&key);
-            if let Some(loc) = removed {
+        loop {
+            // Forgotten as it goes, so each page starts at the next.
+            let page = self.shard_index.page(None, 1024);
+            if page.is_empty() {
+                break;
+            }
+            for (key, _) in page {
                 // As in DeleteShard: blocks are freed only once the removal
                 // is durable. Otherwise stop; the purge is retried.
-                if let Err(e) = Self::forget_shard_location(&self.meta_store, &key) {
-                    self.shard_index.write().entry(key.clone()).or_insert(loc);
-                    return Err(Status::unavailable(format!(
-                        "purge: the removal of shard {key} could not be recorded ({e}); retry"
-                    )));
+                match self.shard_index.forget(&key) {
+                    Ok(Some(loc)) => {
+                        self.free_location(&loc);
+                        shards += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(Status::unavailable(format!(
+                            "purge: the removal of shard {key} could not be recorded ({e}); retry"
+                        )));
+                    }
                 }
-                self.free_location(&loc);
-                shards += 1;
+                self.corrupt.write().remove(&key);
             }
-            self.corrupt.write().remove(&key);
         }
         // Object and version metadata: stale once drained, and harmful if
         // the OSD came back with it (deleted objects would reappear).
@@ -1405,7 +1539,7 @@ impl StorageService for OsdService {
             MetadataKey::all_object_meta_prefix(),
             MetadataKey::from_bytes(vec![b'v']),
         ] {
-            for (key, _) in self.meta_store.scan_prefix(&prefix) {
+            for (key, _) in self.meta_store.iter_prefix(&prefix) {
                 match self.meta_store.delete(&key) {
                     Ok(_) => entries += 1,
                     Err(e) => {
@@ -1427,21 +1561,25 @@ impl StorageService for OsdService {
         _request: Request<ResetChunkNotesRequest>,
     ) -> Result<Response<ResetChunkNotesResponse>, Status> {
         let prefix = MetadataKey::from_bytes(DEDUP_NOTE_PREFIX.to_vec());
-        let keys: Vec<MetadataKey> = self
-            .meta_store
-            .scan_prefix(&prefix)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
-        for batch in keys.chunks(4096) {
+        // A batch at a time, each deleted before the next is read.
+        let mut forgotten = 0u64;
+        loop {
+            let batch: Vec<MetadataKey> = self
+                .meta_store
+                .iter_prefix(&prefix)
+                .take(4096)
+                .map(|(k, _)| k)
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
             self.meta_store
-                .batch_delete(batch)
+                .batch_delete(&batch)
                 .map_err(|e| Status::internal(format!("forgetting chunk notes: {e}")))?;
+            forgotten += batch.len() as u64;
         }
-        info!("dedup dry-run: forgot {} chunk notes", keys.len());
-        Ok(Response::new(ResetChunkNotesResponse {
-            forgotten: keys.len() as u64,
-        }))
+        info!("dedup dry-run: forgot {forgotten} chunk notes");
+        Ok(Response::new(ResetChunkNotesResponse { forgotten }))
     }
 
     async fn get_metrics(
@@ -1605,13 +1743,15 @@ impl StorageService for OsdService {
         // the log, and a restart that replays it must find these bytes in
         // its blocks, not another shard's. It is reclaimed at restart if the
         // record didn't survive (the bitmap is rebuilt from the index).
-        if let Err(e) = Self::persist_shard_location(&self.meta_store, &key, &loc) {
-            error!("Shard {key} written but its location not recorded: {e}; write refused");
-            return Err(fail(Status::unavailable(format!(
-                "the shard's location could not be recorded durably ({e}); not stored, retry"
-            ))));
-        }
-        let replaced = self.shard_index.write().insert(key.clone(), loc);
+        let replaced = match self.shard_index.record(&key, &loc) {
+            Ok(replaced) => replaced,
+            Err(e) => {
+                error!("Shard {key} written but its location not recorded: {e}; write refused");
+                return Err(fail(Status::unavailable(format!(
+                    "the shard's location could not be recorded durably ({e}); not stored, retry"
+                ))));
+            }
+        };
         // Rewriting a shard that is already here — the repairer replacing a
         // corrupt copy — gets new blocks; the old ones go back to the pool
         // now that the index no longer points at them.
@@ -1667,7 +1807,7 @@ impl StorageService for OsdService {
 
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
 
-        let location = self.shard_index.read().get(&key).cloned().ok_or_else(|| {
+        let location = self.shard_index.get(&key).ok_or_else(|| {
             self.grpc_metrics.read_shard.record(
                 false,
                 start.elapsed().as_micros() as u64,
@@ -1774,24 +1914,20 @@ impl StorageService for OsdService {
 
         let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
 
-        let removed = self.shard_index.write().remove(&key);
-        // Mirror the removal in the persistent index before the blocks are
-        // freed. If that fails, the persisted entry still points at these
-        // blocks: freeing them would let another shard's bytes sit where a
-        // restart expects this one. So the shard stays, and the delete is
-        // refused for the caller to retry.
-        if let Some(loc) = removed.as_ref()
-            && let Err(e) = Self::forget_shard_location(&self.meta_store, &key)
-        {
-            self.shard_index
-                .write()
-                .entry(key.clone())
-                .or_insert_with(|| loc.clone());
-            error!("Shard {key}: its removal could not be recorded: {e}; delete refused");
-            return Err(Status::unavailable(format!(
-                "the shard's removal could not be recorded durably ({e}); retry"
-            )));
-        }
+        // The removal is durable before the blocks are freed. If it fails,
+        // the persisted entry still points at these blocks: freeing them
+        // would let another shard's bytes sit where a restart expects this
+        // one. So the shard stays, and the delete is refused for the caller
+        // to retry.
+        let removed = match self.shard_index.forget(&key) {
+            Ok(removed) => removed,
+            Err(e) => {
+                error!("Shard {key}: its removal could not be recorded: {e}; delete refused");
+                return Err(Status::unavailable(format!(
+                    "the shard's removal could not be recorded durably ({e}); retry"
+                )));
+            }
+        };
 
         // Return the block to the pool. This used to be a comment saying a
         // real implementation would do it, which meant storage was write-once
@@ -1825,9 +1961,7 @@ impl StorageService for OsdService {
 
         let location = self
             .shard_index
-            .read()
             .get(&key)
-            .cloned()
             .ok_or_else(|| Status::not_found("shard not found"))?;
 
         let disk = &self.disks[location.disk_idx];
@@ -1861,10 +1995,9 @@ impl StorageService for OsdService {
             req.limit as usize
         };
 
-        let index = self.shard_index.read();
         let mut shards: Vec<GetShardMetaResponse> = Vec::new();
 
-        for (key, location) in index.iter().take(limit) {
+        for (key, location) in self.shard_index.page(None, limit) {
             // Parse key back to shard_id
             let parts: Vec<&str> = key.split(':').collect();
             if parts.len() != 3 {
@@ -1943,11 +2076,10 @@ impl StorageService for OsdService {
             let scan = || {
                 self.usage.safety(
                     self.meta_store
-                        .scan_prefix(&MetadataKey::all_object_meta_prefix())
-                        .into_iter()
+                        .iter_prefix(&MetadataKey::all_object_meta_prefix())
                         .chain(
                             self.meta_store
-                                .scan_prefix(&MetadataKey::from_bytes(vec![b'v'])),
+                                .iter_prefix(&MetadataKey::from_bytes(vec![b'v'])),
                         ),
                     &up,
                 )
@@ -1974,12 +2106,7 @@ impl StorageService for OsdService {
             total_capacity += cap;
             used_capacity += used;
 
-            let shard_count = self
-                .shard_index
-                .read()
-                .values()
-                .filter(|loc| loc.disk_idx == idx)
-                .count() as u64;
+            let shard_count = self.shard_index.count_on(idx);
 
             disk_statuses.push(DiskStatus {
                 disk_id: self.disk_ids[idx].to_vec(),
@@ -1991,7 +2118,7 @@ impl StorageService for OsdService {
             });
         }
 
-        let shard_count = self.shard_index.read().len() as u64;
+        let shard_count = self.shard_index.count();
         let uptime = self.start_time.elapsed().as_secs();
 
         // Gather host/environment info
@@ -2087,7 +2214,12 @@ impl StorageService for OsdService {
                 if supersedes(prev.as_ref(), &object)
                     || self.deleted_since(&req.bucket, &req.key, &object.version_id, &object)
                 {
-                    return Ok(Self::superseded());
+                    let held = prev.as_ref().map_or(0, |p| p.stamp).max(self.tombstone(
+                        &req.bucket,
+                        &req.key,
+                        &object.version_id,
+                    ));
+                    return Ok(Self::superseded(held));
                 }
                 if req.version_only
                     && !Self::precondition_holds(
@@ -2116,6 +2248,7 @@ impl StorageService for OsdService {
                     replaced: None,
                     replaced_version_kept: false,
                     superseded: false,
+                    held_stamp: 0,
                 }));
             }
 
@@ -2126,7 +2259,12 @@ impl StorageService for OsdService {
                 && (supersedes(old.as_ref(), &object)
                     || self.deleted_since(&req.bucket, &req.key, "", &object))
             {
-                return Ok(Self::superseded());
+                let held = old.as_ref().map_or(0, |o| o.stamp).max(self.tombstone(
+                    &req.bucket,
+                    &req.key,
+                    "",
+                ));
+                return Ok(Self::superseded(held));
             }
             if !Self::precondition_holds(
                 old.as_ref(),
@@ -2207,6 +2345,7 @@ impl StorageService for OsdService {
                 replaced: old,
                 replaced_version_kept,
                 superseded: false,
+                held_stamp: 0,
             }))
         })
     }
@@ -2272,15 +2411,17 @@ impl StorageService for OsdService {
                 MetadataKey::object_version(&req.bucket, &req.key, &req.version_id)
             };
             if req.stamp != 0
-                && self
+                && let Some(held) = self
                     .stored_meta(&target)
-                    .is_some_and(|o| o.stamp > req.stamp)
+                    .map(|o| o.stamp)
+                    .filter(|&s| s > req.stamp)
             {
                 return Ok(Response::new(DeleteObjectMetaResponse {
                     success: true,
                     current: None,
                     removed: None,
                     superseded: true,
+                    held_stamp: held,
                 }));
             }
             // The tombstone goes first: a copy that crashed after it but
@@ -2358,6 +2499,7 @@ impl StorageService for OsdService {
                 current,
                 removed,
                 superseded: false,
+                held_stamp: 0,
             }))
         })
     }
@@ -2380,11 +2522,28 @@ impl StorageService for OsdService {
         let prefix = if req.bucket.is_empty() {
             MetadataKey::all_object_meta_prefix()
         } else {
-            MetadataKey::object_meta_prefix(&req.bucket)
+            // Within a bucket, only the keys under the listing's prefix.
+            MetadataKey::from_bytes(
+                [
+                    MetadataKey::object_meta_prefix(&req.bucket).0,
+                    req.prefix.as_bytes().to_vec(),
+                ]
+                .concat(),
+            )
         };
-
-        // Scan all objects in bucket (or cluster-wide when bucket="")
-        let entries = self.meta_store.scan_prefix(&prefix);
+        // Start past the cursor rather than read the bucket up to it: a
+        // page costs its own size, not the bucket's.
+        let cursor = std::cmp::max(&req.start_after, &req.continuation_token);
+        let after = (!cursor.is_empty())
+            .then(|| {
+                if req.bucket.is_empty() {
+                    MetadataKey::from_bytes([b"m".as_slice(), cursor.as_bytes()].concat())
+                } else {
+                    MetadataKey::object_meta(&req.bucket, cursor)
+                }
+            })
+            .filter(|a| a.0 > prefix.0);
+        let entries = self.meta_store.iter_prefix_after(&prefix, after);
 
         let mut objects = Vec::new();
         let mut count = 0;
@@ -2479,7 +2638,7 @@ impl StorageService for OsdService {
         // an operator-triggered drain is actively sweeping, so the
         // linear scan is acceptable.
         let prefix = MetadataKey::all_object_meta_prefix();
-        let entries = self.meta_store.scan_prefix(&prefix);
+        let entries = self.meta_store.iter_prefix(&prefix);
         let mut out: Vec<AffectedObject> = Vec::new();
         let mut truncated = false;
 
@@ -2548,49 +2707,45 @@ impl StorageService for OsdService {
         const CHUNK_SIZE: usize = 500;
 
         let req = request.into_inner();
-        let prefix = MetadataKey::object_meta_prefix(&req.bucket);
-        let entries = self.meta_store.scan_prefix(&prefix);
+        // The keys under the listing's prefix, past the cursor, read as the
+        // stream is consumed: a chunk in memory at a time, not the bucket.
+        let prefix = MetadataKey::from_bytes(
+            [
+                MetadataKey::object_meta_prefix(&req.bucket).0,
+                req.prefix.as_bytes().to_vec(),
+            ]
+            .concat(),
+        );
+        let cursor = std::cmp::max(&req.start_after, &req.continuation_token);
+        let after = (!cursor.is_empty())
+            .then(|| MetadataKey::object_meta(&req.bucket, cursor))
+            .filter(|a| a.0 > prefix.0);
+        let entries = self.meta_store.iter_prefix_owned(prefix, after);
 
-        let mut chunks: Vec<ListObjectsMetaChunk> = Vec::new();
-        let mut batch: Vec<ObjectMeta> = Vec::with_capacity(CHUNK_SIZE);
-
-        for (meta_key, value) in entries {
-            if let Some((_bucket, key)) = meta_key.parse_object_meta() {
-                // Apply start_after / continuation_token cursor
-                if !req.start_after.is_empty() && key <= req.start_after {
+        let stream = futures::stream::unfold(Some(entries), |state| async move {
+            let mut entries = state?;
+            let mut batch: Vec<ObjectMeta> = Vec::with_capacity(CHUNK_SIZE);
+            let mut last = String::new();
+            for (meta_key, value) in entries.by_ref() {
+                let Some((_bucket, key)) = meta_key.parse_object_meta() else {
                     continue;
-                }
-                if !req.continuation_token.is_empty() && key <= req.continuation_token {
-                    continue;
-                }
-                // Apply prefix filter
-                if !req.prefix.is_empty() && !key.starts_with(&req.prefix) {
-                    continue;
-                }
-
+                };
                 if let Ok(object) = ObjectMeta::decode(&value[..]) {
                     batch.push(for_listing(object));
-
+                    last = key;
                     if batch.len() >= CHUNK_SIZE {
-                        let cursor = key.clone();
-                        chunks.push(ListObjectsMetaChunk {
-                            objects: std::mem::take(&mut batch),
-                            next_start_after: cursor,
-                            is_last: false,
-                        });
+                        break;
                     }
                 }
             }
-        }
-
-        // Emit the final (possibly partial) batch
-        chunks.push(ListObjectsMetaChunk {
-            objects: batch,
-            next_start_after: String::new(),
-            is_last: true,
+            let is_last = batch.len() < CHUNK_SIZE;
+            let chunk = ListObjectsMetaChunk {
+                objects: batch,
+                next_start_after: if is_last { String::new() } else { last },
+                is_last,
+            };
+            Some((Ok(chunk), (!is_last).then_some(entries)))
         });
-
-        let stream = futures::stream::iter(chunks.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -2617,26 +2772,85 @@ impl StorageService for OsdService {
                     || (key == req.key_marker && !req.version_id_marker.is_empty()))
         };
 
+        // Two sources in key order, version entries and current objects,
+        // each read from past `key_marker` and only as far as `max_keys` + 1
+        // keys: every key listed has a version, so that is enough to fill
+        // the page and to know whether more follow. Whichever stops first
+        // bounds the page; past it, the other may have keys not yet read.
+        let limit_keys = max_keys + 1;
+        let under = |base: MetadataKey| {
+            MetadataKey::from_bytes([base.0, req.prefix.as_bytes().to_vec()].concat())
+        };
+        let past_marker = |base: MetadataKey, prefix: &MetadataKey| {
+            (!req.key_marker.is_empty())
+                .then(|| {
+                    MetadataKey::from_bytes([base.0, req.key_marker.as_bytes().to_vec()].concat())
+                })
+                .filter(|a| a.0 > prefix.0)
+        };
         let mut by_key: std::collections::BTreeMap<String, Vec<ObjectMeta>> =
             std::collections::BTreeMap::new();
-        for (meta_key, value) in self
-            .meta_store
-            .scan_prefix(&MetadataKey::object_version_bucket_prefix(&req.bucket))
-        {
-            if let Some((_, key, _)) = meta_key.parse_object_version()
-                && wanted(&key)
-                && let Ok(object) = ObjectMeta::decode(&value[..])
-            {
+        let mut bound: Option<String> = None;
+
+        let v_prefix = under(MetadataKey::object_version_bucket_prefix(&req.bucket));
+        let v_after = past_marker(
+            MetadataKey::object_version_bucket_prefix(&req.bucket),
+            &v_prefix,
+        );
+        let mut v_keys = 0usize;
+        let mut v_last = String::new();
+        for (meta_key, value) in self.meta_store.iter_prefix_after(&v_prefix, v_after) {
+            let Some((_, key, _)) = meta_key.parse_object_version() else {
+                continue;
+            };
+            if !wanted(&key) {
+                continue;
+            }
+            if key != v_last {
+                if v_keys == limit_keys {
+                    bound = Some(v_last.clone());
+                    break;
+                }
+                v_keys += 1;
+                v_last.clone_from(&key);
+            }
+            if let Ok(object) = ObjectMeta::decode(&value[..]) {
                 by_key.entry(key).or_default().push(for_listing(object));
             }
         }
-        for (meta_key, value) in self
-            .meta_store
-            .scan_prefix(&MetadataKey::object_meta_prefix(&req.bucket))
+
+        let m_prefix = under(MetadataKey::object_meta_prefix(&req.bucket));
+        let m_after = past_marker(MetadataKey::object_meta_prefix(&req.bucket), &m_prefix);
+        // The marker key's own current object is at the seek point, not
+        // past it: read it on its own when its versions are wanted.
+        let marker_current = (!req.key_marker.is_empty() && !req.version_id_marker.is_empty())
+            .then(|| {
+                let k = MetadataKey::object_meta(&req.bucket, &req.key_marker);
+                self.meta_store.get(&k).map(|v| (k, v))
+            })
+            .flatten();
+        let mut m_keys = 0usize;
+        for (meta_key, value) in marker_current
+            .into_iter()
+            .chain(self.meta_store.iter_prefix_after(&m_prefix, m_after))
         {
-            if let Some((_, key)) = meta_key.parse_object_meta()
-                && wanted(&key)
-                && let Ok(object) = ObjectMeta::decode(&value[..])
+            let Some((_, key)) = meta_key.parse_object_meta() else {
+                continue;
+            };
+            if !wanted(&key) {
+                continue;
+            }
+            if m_keys == limit_keys {
+                if bound.as_ref().is_none_or(|b| &key < b) {
+                    bound = by_key
+                        .range(..key.clone())
+                        .next_back()
+                        .map(|(k, _)| k.clone());
+                }
+                break;
+            }
+            m_keys += 1;
+            if let Ok(object) = ObjectMeta::decode(&value[..])
                 && object.version_id.is_empty()
             {
                 // The current null version supersedes a null version
@@ -2645,6 +2859,11 @@ impl StorageService for OsdService {
                 versions.retain(|v| !v.version_id.is_empty());
                 versions.push(for_listing(object));
             }
+        }
+        // Past the bound, one source may be missing keys: leave them to the
+        // next page.
+        if let Some(bound) = bound {
+            by_key.retain(|k, _| *k <= bound);
         }
 
         let mut versions = Vec::new();
@@ -3157,7 +3376,10 @@ mod integrity_tests {
     /// file, the way a bad sector would.
     fn rot(dir: &tempfile::TempDir, osd: &OsdService, position: u32, needle: &[u8]) {
         use std::io::{Read, Seek, SeekFrom, Write};
-        let loc = osd.shard_index.read()[&OsdService::shard_key(&[7; 16], 0, position)].clone();
+        let loc = osd
+            .shard_index
+            .get(&OsdService::shard_key(&[7; 16], 0, position))
+            .unwrap();
         let block = u64::from(osd.disks[0].block_size());
         let start = osd.disks[0].block_offset(loc.block_num);
         let mut f = std::fs::OpenOptions::new()

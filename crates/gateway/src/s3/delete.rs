@@ -168,11 +168,7 @@ pub(crate) async fn delete_version(
         Ok(None) => return done(false),
         Err(e) => {
             error!("{bucket}/{key} version {vid}: cannot read it: {e}");
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e, "Failed to read object metadata");
         }
     };
 
@@ -363,19 +359,16 @@ pub(crate) async fn delete_object_to_the_end(
         .await
     {
         Ok(resp) => resp.into_inner(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .unwrap();
-        }
+        // Not "deleted": nothing was. (A 204 here told clients the object
+        // was gone while meta elected a leader; the B2 soak found it.)
+        Err(e) => return S3Error::from_status(&e),
     };
 
     if placement.nodes.is_empty() {
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .unwrap();
+        return S3Error::for_osd_error(
+            &crate::osd_pool::OsdPoolError::NoNodesAvailable,
+            "No OSDs to delete from",
+        );
     }
 
     // Check versioning state
@@ -395,17 +388,18 @@ pub(crate) async fn delete_object_to_the_end(
     if DeleteCondition::from_headers(&headers).is_set() {
         let pool = &state.osd_pool;
         let nodes = &placement.nodes;
+        // A condition that can't be checked is not met.
         let target = match &version_id {
-            Some(vid) => find_version(pool, nodes, &bucket, &key, vid)
-                .await
-                .ok()
-                .flatten(),
+            Some(vid) => match find_version(pool, nodes, &bucket, &key, vid).await {
+                Ok(v) => v,
+                Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
+            },
             None => match get_object_meta_from_any(pool, nodes, &bucket, &key).await {
                 Ok(Some(c)) if c.is_delete_marker => {
                     newest_object(pool, nodes, &bucket, &key).await
                 }
                 Ok(current) => current,
-                Err(_) => None,
+                Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
             },
         };
         if target.is_some_and(|t| !DeleteCondition::from_headers(&headers).holds(&t)) {
@@ -416,18 +410,17 @@ pub(crate) async fn delete_object_to_the_end(
     // Lock enforcement: retention and legal hold protect the version a
     // delete would destroy. A versioned delete without a version destroys
     // nothing (it adds a marker), so S3 allows it.
-    let protected = if let Some(vid) = &version_id {
-        find_version(&state.osd_pool, &placement.nodes, &bucket, &key, vid)
-            .await
-            .ok()
-            .flatten()
+    // A lock that can't be read protects what it may cover: no delete.
+    let read = if let Some(vid) = &version_id {
+        find_version(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
     } else if versioning_enabled {
-        None
+        Ok(None)
     } else {
-        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
-            .await
-            .ok()
-            .flatten()
+        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
+    };
+    let protected = match read {
+        Ok(p) => p,
+        Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
     };
     if let Some(meta) = protected
         && let Some(refusal) = lock_refusal(&meta, &headers)
@@ -495,11 +488,7 @@ pub(crate) async fn delete_object_to_the_end(
         .await
         {
             error!("Failed to create delete marker: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
         }
 
         // The key no longer has a current version, so drop it from Meta's
@@ -568,11 +557,7 @@ pub(crate) async fn delete_object_to_the_end(
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to put the null delete marker: {}", e.error);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
             }
         };
         // A null version it replaced: its shards, once every replica agrees.

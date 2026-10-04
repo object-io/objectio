@@ -45,6 +45,8 @@ struct Osd {
 struct Gateway {
     port: u16,
     child: Option<Child>,
+    /// Its own flags, after the cluster's.
+    args: Vec<String>,
 }
 
 /// A binary from `bins` (another release's), or from this build.
@@ -282,6 +284,7 @@ impl HaCluster {
                 &format!("http://127.0.0.1:{port}"),
                 "--test-hooks",
             ])
+            .args(&self.gateways[i].args)
             .stdout(log_target())
             .stderr(log_target())
             .spawn()
@@ -294,9 +297,15 @@ impl HaCluster {
     /// Start one more gateway, from `bins`, with a signed client of it in
     /// `clients`. Returns its index.
     pub fn add_gateway(&mut self, bins: Option<&Path>) -> usize {
+        self.add_gateway_with_args(bins, &[])
+    }
+
+    /// [`Self::add_gateway`], the gateway started with `args` too.
+    pub fn add_gateway_with_args(&mut self, bins: Option<&Path>, args: &[&str]) -> usize {
         self.gateways.push(Gateway {
             port: free_port(),
             child: None,
+            args: args.iter().map(ToString::to_string).collect(),
         });
         let i = self.gateways.len() - 1;
         while !self.spawn_gateway(i, bins) {
