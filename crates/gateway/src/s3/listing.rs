@@ -169,6 +169,9 @@ pub async fn list_objects(
     if params.replication.is_some() {
         return crate::replication::get_config(&state, &bucket).await;
     }
+    if params.logging.is_some() {
+        return crate::bucket_logging::get_config(&state, &bucket).await;
+    }
     if params.is_policy_request() {
         return get_bucket_policy_internal(state, bucket).await;
     }

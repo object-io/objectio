@@ -19,6 +19,9 @@ cluster's data; and the results.
 
 - A 6-OSD, 4+2 aio with SigV4 auth on, and lifecycle "days" of 10 seconds,
   so the lifecycle tests finish (`lc_debug_interval = 10` in the config).
+- Bucket-logging objects rolled every 3 seconds (`--bucket-log-roll-secs`):
+  the logging tests wait 5.5 seconds for one. pytest runs with `TZ=UTC`, as
+  they compare a log object's name (UTC) with the local clock.
 - Users through the admin API (`setup_users.py`):
   - `main` and `alt` in tenant `s3t`;
   - `tenant` in tenant `testx`;
@@ -45,7 +48,7 @@ Each failure's category and note come from `known-failures.csv`:
 
 | Category | Meaning |
 |---|---|
-| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, the IAM API, bucket logging, S3 Select, torrents, RGW extensions |
+| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, the IAM API, S3 Select, torrents, RGW extensions |
 | `aws-compatible-already` | ObjectIO does what AWS does; the test expects RGW's behaviour |
 | `test-environment` | can't pass on this setup |
 | `gap` | a feature we lack and could add |

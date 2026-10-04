@@ -299,10 +299,9 @@ fn add_metadata_headers(
 
 /// S3 sub-resources this gateway doesn't implement. Without this a request
 /// naming one fell through to the plain request: `GET /b?website` answered
-/// with the bucket's listing, `PUT /b?logging` tried to create the bucket.
-const UNSUPPORTED_SUBRESOURCES: [&str; 12] = [
+/// with the bucket's listing, `PUT /b?notification` tried to create the bucket.
+const UNSUPPORTED_SUBRESOURCES: [&str; 11] = [
     "website",
-    "logging",
     "notification",
     "inventory",
     "analytics",
@@ -329,9 +328,15 @@ pub async fn unsupported_subresource_layer(
     let named = request.uri().query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let name = pair.split('=').next().unwrap_or_default();
-            UNSUPPORTED_SUBRESOURCES
-                .contains(&name)
-                .then(|| name.to_string())
+            // Logging is a bucket's (`crate::bucket_logging`), not an object's.
+            let object_logging = name == "logging"
+                && request
+                    .uri()
+                    .path()
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .is_some_and(|(_, key)| !key.is_empty());
+            (UNSUPPORTED_SUBRESOURCES.contains(&name) || object_logging).then(|| name.to_string())
         })
     });
     match named {
