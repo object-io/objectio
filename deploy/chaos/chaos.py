@@ -371,13 +371,49 @@ def disk_pull(vm="chaos-5"):
     settle("disk-pull")
 
 
+def repair_counters():
+    """Meta's repair counters, as a gateway exports them: passes, and
+    shards rebuilt or moved."""
+    status, body = http("GET", f"{GW[0]}/metrics", timeout=10)
+    if status != 200:
+        return None
+    passes = work = 0
+    for line in body.decode(errors="replace").splitlines():
+        name = line.split("{")[0].split(" ")[0]
+        if name == "objectio_meta_repair_passes_total":
+            passes += int(float(line.rsplit(" ", 1)[1]))
+        elif name in ("objectio_meta_repair_shards_rebuilt_total",
+                      "objectio_meta_repair_shards_moved_total"):
+            work += int(float(line.rsplit(" ", 1)[1]))
+    return passes, work
+
+
+def await_repair_quiet(deadline):
+    """Wait for a whole repair pass that rebuilt and moved nothing. Stopping
+    OSDs while repair still works would only slow it: a shard can't be
+    rebuilt from stopped OSDs."""
+    start = None
+    while time.monotonic() < deadline:
+        now = repair_counters()
+        if now is None:
+            time.sleep(10)
+            continue
+        if start is None or now[1] != start[1]:
+            start = now  # still working: count passes from here
+        elif now[0] >= start[0] + 2:
+            return  # a whole pass began and ended with nothing to do
+        time.sleep(10)
+
+
 def redundancy_restored():
     """With every node up, wait for repair (meta runs it every minute
-    here), then any two OSDs may go."""
+    here) to have nothing left to do, then any two OSDs may go."""
     say("redundancy: running repair until two OSDs can be stopped")
     pairs = [("chaos-1", "chaos-2"), ("chaos-3", "chaos-4"), ("chaos-5", "chaos-6")]
     deadline = time.monotonic() + REPAIR_WAIT
     while True:
+        await_repair_quiet(deadline)
+        say("redundancy: repair is quiet; stopping OSDs in pairs")
         ok = True
         for a, b in pairs:
             for vm in (a, b):
