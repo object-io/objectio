@@ -85,9 +85,10 @@ async fn fanout_put_object_meta(
         addrs.push(fallback_addr.to_string());
     }
 
-    // An update of what was read: stamped above it, the same on every copy.
+    // An update of what was read: ordered after its other updates, the same
+    // on every copy; its stamp stays, so a newer object still wins.
     let mut object = object.clone();
-    object.stamp = objectio_common::stamp::CLOCK.next_after(object.stamp);
+    object.update_stamp = objectio_common::stamp::CLOCK.next_after(object.update_stamp);
     let object = &object;
     let mut futs = Vec::with_capacity(addrs.len());
     for addr in &addrs {
