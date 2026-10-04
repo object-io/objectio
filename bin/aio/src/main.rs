@@ -146,6 +146,11 @@ struct Args {
     #[arg(long)]
     audit_system_bucket: Option<String>,
 
+    /// Seconds a bucket-logging object collects records before it is
+    /// written (the gateway's default when not given).
+    #[arg(long)]
+    bucket_log_roll_secs: Option<u64>,
+
     /// How often the lifecycle worker scans (seconds).
     #[arg(long)]
     lifecycle_interval_secs: Option<u64>,
@@ -961,6 +966,14 @@ async fn main() -> Result<()> {
     }
     if let Some(bucket) = &args.audit_system_bucket {
         gw_argv.extend(["--audit-system-bucket".to_string(), bucket.clone()]);
+    }
+    // Bucket logging's records wait in the data directory: always on.
+    gw_argv.extend([
+        "--bucket-log-spool".to_string(),
+        data_root.join("bucket-log-spool").display().to_string(),
+    ]);
+    if let Some(secs) = args.bucket_log_roll_secs {
+        gw_argv.extend(["--bucket-log-roll-secs".to_string(), secs.to_string()]);
     }
     if let Some(path) = &args.audit_log {
         gw_argv.extend(["--audit-log".to_string(), path.clone()]);
