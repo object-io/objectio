@@ -251,3 +251,91 @@ fn the_command_line_log_gets_every_event() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// Every event in the system bucket's objects.
+fn system_bucket_events(c: &Cluster, bucket: &str) -> Vec<Value> {
+    let list = c
+        .request("GET", &format!("/{bucket}?list-type=2"), &[])
+        .text();
+    list.split("<Key>")
+        .skip(1)
+        .filter_map(|s| s.split("</Key>").next())
+        .flat_map(|key| {
+            let body = c.request("GET", &format!("/{bucket}/{key}"), &[]).text();
+            body.lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A8c: events are spooled on the gateway's disk before delivery. With
+/// the receiver down and the gateway killed, every request's event still
+/// arrives once both are back, and every one is also in the system
+/// bucket, the copy the system always keeps.
+#[test]
+fn spooled_events_survive_a_killed_gateway_and_a_receiver_down() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut c =
+        Cluster::start_with_ec_and_args(6, 4, 2, &["--audit-system-bucket", "objectio-audit"]);
+    c.json("PUT", "/_admin/audit", webhook(port)).expect_ok();
+    c.request("PUT", "/spool", &[]).expect(200);
+    let mut ids = Vec::new();
+    let mut put = |c: &Cluster, i: usize| {
+        let r = c.request("PUT", &format!("/spool/k{i}"), b"x");
+        assert_eq!(r.status, 200, "{}", r.text());
+        ids.push(r.header("x-amz-request-id").unwrap());
+    };
+    for i in 0..50 {
+        put(&c, i);
+    }
+    // Killed with events undelivered: they are on its disk.
+    std::thread::sleep(Duration::from_millis(100));
+    c.restart();
+    for i in 50..60 {
+        put(&c, i);
+    }
+
+    let events = receiver(TcpListener::bind(("127.0.0.1", port)).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let got: std::collections::HashSet<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(str::to_string))
+            .collect();
+        let missing: Vec<&String> = ids.iter().filter(|id| !got.contains(*id)).collect();
+        if missing.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {} events never reached the receiver: {missing:?}",
+            missing.len(),
+            ids.len()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let kept: std::collections::HashSet<String> = system_bucket_events(&c, "objectio-audit")
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(str::to_string))
+            .collect();
+        let missing = ids.iter().filter(|id| !kept.contains(*id)).count();
+        if missing == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{missing} of {} events not in the system bucket",
+            ids.len()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

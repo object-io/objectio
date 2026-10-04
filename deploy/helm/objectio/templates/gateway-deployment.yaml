@@ -159,6 +159,20 @@ spec:
             {{- with (include "objectio.tls.env" .) }}
             {{- . | nindent 12 }}
             {{- end }}
+            {{- if .Values.gateway.audit.spool.enabled }}
+            - name: OBJECTIO_AUDIT_SPOOL
+              value: /var/lib/objectio/audit-spool
+            - name: OBJECTIO_AUDIT_DRAIN_SECS
+              value: {{ .Values.gateway.audit.spool.drainSeconds | quote }}
+            - name: OBJECTIO_AUDIT_SPOOL_MAX_BYTES
+              value: {{ .Values.gateway.audit.spool.maxBytes | int64 | quote }}
+            {{- if .Values.gateway.audit.systemBucket }}
+            - name: OBJECTIO_AUDIT_SYSTEM_BUCKET
+              value: {{ .Values.gateway.audit.systemBucket | quote }}
+            - name: OBJECTIO_AUDIT_RETENTION_DAYS
+              value: {{ .Values.gateway.audit.retentionDays | quote }}
+            {{- end }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.service.port }}
@@ -186,13 +200,30 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
-          {{- with (include "objectio.tls.volumeMount" .) }}
+          {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
           volumeMounts:
+            {{- with (include "objectio.tls.volumeMount" .) }}
             {{- . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.gateway.audit.spool.enabled }}
+            - name: audit-spool
+              mountPath: /var/lib/objectio/audit-spool
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
-      {{- with (include "objectio.tls.volume" .) }}
+      {{- if .Values.gateway.audit.spool.enabled }}
+      # Room to deliver the audit spool on the way out.
+      terminationGracePeriodSeconds: {{ add .Values.gateway.audit.spool.drainSeconds 30 }}
+      {{- end }}
+      {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
       volumes:
+        {{- with (include "objectio.tls.volume" .) }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.gateway.audit.spool.enabled }}
+        - name: audit-spool
+          emptyDir:
+            sizeLimit: {{ .Values.gateway.audit.spool.sizeLimit }}
+        {{- end }}
       {{- end }}

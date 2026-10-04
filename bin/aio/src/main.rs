@@ -127,6 +127,15 @@ struct Args {
     #[arg(long)]
     audit_log: Option<String>,
 
+    /// Keep audit events here before delivery (A8c). Default: `audit-spool`
+    /// in the data directory when `--audit-system-bucket` is given.
+    #[arg(long)]
+    audit_spool: Option<PathBuf>,
+
+    /// The system always audits: every event also into this bucket.
+    #[arg(long)]
+    audit_system_bucket: Option<String>,
+
     /// How often the lifecycle worker scans (seconds).
     #[arg(long)]
     lifecycle_interval_secs: Option<u64>,
@@ -917,6 +926,17 @@ async fn main() -> Result<()> {
     }
     if let Some(secs) = args.pack_grace_secs {
         gw_argv.extend(["--pack-grace-secs".to_string(), secs.to_string()]);
+    }
+    let spool = args.audit_spool.clone().or_else(|| {
+        args.audit_system_bucket
+            .as_ref()
+            .map(|_| data_root.join("audit-spool"))
+    });
+    if let Some(dir) = spool {
+        gw_argv.extend(["--audit-spool".to_string(), dir.display().to_string()]);
+    }
+    if let Some(bucket) = &args.audit_system_bucket {
+        gw_argv.extend(["--audit-system-bucket".to_string(), bucket.clone()]);
     }
     if let Some(path) = &args.audit_log {
         gw_argv.extend(["--audit-log".to_string(), path.clone()]);
