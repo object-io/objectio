@@ -79,6 +79,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- with (include "objectio.tls.env" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.osd.service.port }}
@@ -105,6 +108,9 @@ spec:
               mountPath: /data/disk0
             - name: state
               mountPath: /var/lib/objectio
+            {{- with (include "objectio.tls.volumeMount" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.osd.resources | nindent 12 }}
       volumes:
@@ -113,6 +119,9 @@ spec:
             name: {{ include "objectio.osd.fullname" . }}-config
         - name: config
           emptyDir: {}
+        {{- with (include "objectio.tls.volume" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

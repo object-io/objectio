@@ -273,3 +273,27 @@ monitoring:
       limits:
         cpu: 500m
         memory: 512Mi
+
+# mTLS between the services (A8a): gRPC between gateway, meta, OSDs and the
+# block gateway (Raft included) accepts only peers presenting a certificate
+# this cluster's CA signed. Client-facing TLS (S3, console) is the
+# ingress's. Enable it at install: turning it on (or off) later restarts
+# every component at once, as a cluster can't speak both.
+tls:
+  enabled: false
+  # A Secret with tls.crt, tls.key and ca.crt (cert-manager's format).
+  # Default: <release>-objectio-tls. Made by cert-manager when an issuer
+  # is named below; otherwise create it yourself.
+  secretName: ""
+  certManager:
+    # e.g. {name: objectio-ca, kind: Issuer}: a CA issuer, so ca.crt is
+    # the CA that signs every component's certificate.
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    # Components read their certificate when they start: after a renewal,
+    # roll them (kubectl rollout restart) to pick it up, well before the
+    # old one expires. Long-lived, so that is a yearly task.
+    duration: 8760h      # 1 year
+    renewBefore: 720h    # 30 days

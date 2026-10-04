@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 pub mod ha;
+pub mod tls;
 
 use sha2::{Digest, Sha256};
 
@@ -208,8 +209,9 @@ impl Cluster {
         ec: Option<(u8, u8)>,
         extra_args: &[String],
     ) -> Child {
-        Command::new(aio_binary())
-            .arg("--data")
+        let mut cmd = Command::new(aio_binary());
+        tls::apply(&mut cmd);
+        cmd.arg("--data")
             .arg(data_dir)
             .arg("--port")
             .arg(port.to_string())
@@ -542,9 +544,11 @@ impl Cluster {
                 return Err(format!("objectio-aio exited during startup with {status}"));
             }
             let answer = rt.block_on(async {
-                let mut client = BlockServiceClient::connect(format!("http://127.0.0.1:{port}"))
-                    .await
-                    .map_err(|e| (false, e.to_string()))?;
+                let mut client = BlockServiceClient::new(
+                    tls::channel(&format!("127.0.0.1:{port}"))
+                        .await
+                        .map_err(|e| (false, e))?,
+                );
                 client
                     .list_volumes(ListVolumesRequest::default())
                     .await
