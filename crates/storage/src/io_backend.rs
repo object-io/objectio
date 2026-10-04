@@ -401,22 +401,36 @@ mod uring_backend {
                 };
 
                 match op {
+                    // A transfer of fewer bytes than asked is an error, as
+                    // pread's read_exact_at makes it: a removed device reads
+                    // 0 bytes (EOF), which became an empty buffer that the
+                    // caller then sliced, and a short write was taken as done.
                     Op::Read { buf, offset, reply } => {
+                        let want = buf.capacity();
                         let (res, buf) = file.read_at(buf, offset).await;
-                        let r = res
-                            .map_err(|e| {
-                                Error::Storage(format!("uring read {path} @ {offset}: {e}"))
-                            })
-                            .map(|_| buf);
+                        let r = match res {
+                            Ok(n) if n == want => Ok(buf),
+                            Ok(n) => Err(Error::Storage(format!(
+                                "uring read {path} @ {offset}: {n} of {want} bytes"
+                            ))),
+                            Err(e) => {
+                                Err(Error::Storage(format!("uring read {path} @ {offset}: {e}")))
+                            }
+                        };
                         let _ = reply.send(r);
                     }
                     Op::Write { buf, offset, reply } => {
+                        let want = buf.len();
                         let (res, buf) = file.write_at(buf, offset).submit().await;
-                        let r = res
-                            .map_err(|e| {
-                                Error::Storage(format!("uring write {path} @ {offset}: {e}"))
-                            })
-                            .map(|_| buf);
+                        let r = match res {
+                            Ok(n) if n == want => Ok(buf),
+                            Ok(n) => Err(Error::Storage(format!(
+                                "uring write {path} @ {offset}: {n} of {want} bytes"
+                            ))),
+                            Err(e) => Err(Error::Storage(format!(
+                                "uring write {path} @ {offset}: {e}"
+                            ))),
+                        };
                         let _ = reply.send(r);
                     }
                     Op::Sync { reply } => {
@@ -554,13 +568,8 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     #[test]
     fn uring_roundtrip() {
-        if std::env::var("OBJECTIO_TEST_URING").is_err() {
-            eprintln!(
-                "skipping uring_roundtrip (set OBJECTIO_TEST_URING=1 to run — \
-                 requires io_uring capability)"
-            );
-            return;
-        }
+        // The best backend here: io_uring where the kernel allows it, else
+        // pread. Either must read whole buffers or fail.
         let dir = tempdir().unwrap();
         let path = make_test_file(dir.path(), 64 * 1024);
 
@@ -575,11 +584,20 @@ mod tests {
                 BackendKind::Uring | BackendKind::Pread
             ));
 
-            let buf = vec![0u8; 4096];
-            let got = backend.read_at_owned(buf, 4096).await.unwrap();
-            for (i, b) in got.iter().enumerate() {
+            let got = backend
+                .read_at_owned(crate::aligned_buf::AlignedBuf::new(4096), 4096)
+                .await
+                .unwrap();
+            for (i, b) in got.as_slice().iter().enumerate() {
                 assert_eq!(*b, ((4096 + i) & 0xff) as u8, "byte {i} mismatched");
             }
+
+            // Past the end, as a removed device reads: an error, not a
+            // short buffer (which a caller then sliced, and panicked).
+            let short = backend
+                .read_at_owned(crate::aligned_buf::AlignedBuf::new(4096), 62 * 1024)
+                .await;
+            assert!(short.is_err(), "a short read came back as data");
         });
     }
 }
