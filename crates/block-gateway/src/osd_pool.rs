@@ -202,6 +202,7 @@ pub async fn write_shard_to_osd(
         }),
         data,
         rdma: None,
+        use_reserve: false,
     };
 
     let write_future = client.write_shard(request);

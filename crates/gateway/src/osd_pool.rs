@@ -27,6 +27,10 @@ pub enum OsdPoolError {
     #[error("shard checksum mismatch: {0}")]
     ChecksumMismatch(String),
 
+    /// The OSD has no room for a client write (B3): past its full ratio.
+    #[error("OSD full: {0}")]
+    Full(String),
+
     /// The object needs a newer release to read correctly.
     #[error("{0}")]
     TooOld(String),
@@ -534,11 +538,22 @@ enum ShardCallError {
     Status(tonic::Status),
 }
 
+impl OsdPoolError {
+    /// Whether this is an OSD refusing a write for lack of room.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+}
+
 impl From<ShardCallError> for OsdPoolError {
     fn from(e: ShardCallError) -> Self {
         match e {
             ShardCallError::Connect(e) => e,
             ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
+            ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
+                Self::Full(s.message().to_string())
+            }
             ShardCallError::Status(s) => Self::ConnectionFailed(s.to_string()),
         }
     }
@@ -699,6 +714,7 @@ pub async fn write_shard_to_osd(
                         addr: src.addr,
                         len: data.len() as u64,
                     }),
+                    use_reserve: false,
                 };
                 match call_write_shard(pool, placement, request).await {
                     Ok(location) => {
@@ -732,6 +748,7 @@ pub async fn write_shard_to_osd(
         checksum: Some(checksum),
         data,
         rdma: None,
+        use_reserve: false,
     };
     let location = call_write_shard(pool, placement, request)
         .await

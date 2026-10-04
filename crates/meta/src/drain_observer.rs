@@ -731,6 +731,8 @@ async fn write_shard(
             data: bytes,
             ec_k: 0,
             ec_m: 0,
+            // Restores redundancy: may use the space kept from client writes.
+            use_reserve: true,
         }),
     )
     .await

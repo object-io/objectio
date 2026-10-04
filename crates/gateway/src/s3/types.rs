@@ -417,6 +417,16 @@ impl S3Error {
         ) || crate::osd_pool::connection_broke(e)
     }
 
+    /// A write refused because the OSDs it needs are full (B3): 507, which
+    /// clients don't retry blindly, as MinIO answers (`XMinioStorageFull`).
+    pub fn storage_full() -> Response {
+        Self::xml_response(
+            "StorageFull",
+            "The cluster has no room for this write: its disks are full",
+            StatusCode::INSUFFICIENT_STORAGE,
+        )
+    }
+
     pub fn from_status(e: &tonic::Status) -> Response {
         if Self::is_unavailable(e) {
             Self::xml_response(
