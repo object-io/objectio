@@ -404,8 +404,9 @@ def await_repair_quiet(deadline):
         if start is None or now[1] != start[1]:
             start = now  # still working: count passes from here
         elif now[0] >= start[0] + 2:
-            return  # a whole pass began and ended with nothing to do
+            return True  # a whole pass began and ended with nothing to do
         time.sleep(10)
+    return False
 
 
 def redundancy_restored(keys=None, intact=None):
@@ -423,8 +424,10 @@ def redundancy_restored(keys=None, intact=None):
     pairs = [("chaos-1", "chaos-2"), ("chaos-3", "chaos-4"), ("chaos-5", "chaos-6")]
     deadline = time.monotonic() + REPAIR_WAIT
     while True:
-        await_repair_quiet(deadline)
-        say("redundancy: repair is quiet; stopping OSDs in pairs")
+        if await_repair_quiet(deadline):
+            say("redundancy: repair is quiet; stopping OSDs in pairs")
+        else:
+            say(f"redundancy: repair still working after {REPAIR_WAIT}s; stopping OSDs in pairs anyway")
         ok = True
         for a, b in pairs:
             for vm in (a, b):
