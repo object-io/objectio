@@ -7,7 +7,9 @@ use objectio_e2e::Cluster;
 use serde_json::json;
 
 fn body(len: usize) -> Vec<u8> {
-    (0..len).map(|i| u8::try_from(i * 31 % 251).unwrap()).collect()
+    (0..len)
+        .map(|i| u8::try_from(i * 31 % 251).unwrap())
+        .collect()
 }
 
 #[test]
