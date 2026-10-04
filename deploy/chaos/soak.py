@@ -34,7 +34,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 import chaos
-from chaos import BUCKET, GW, fail, http, incus, say
+from chaos import GW, fail, http, incus, say
 
 HOURS = float(os.environ.get("SOAK_HOURS", "48"))
 FAULT_EVERY = float(os.environ.get("FAULT_EVERY", "20")) * 60
@@ -44,6 +44,14 @@ FULL_LOW = float(os.environ.get("FULL_LOW", "0.5"))
 LEAK_SLACK = int(os.environ.get("LEAK_SLACK", str(1 << 30)))
 SAMPLE = int(os.environ.get("SAMPLE", "20000"))
 GONE = "-"  # the outcome "no object"
+# A bucket of its own: keys left by an earlier run would read as wrong.
+BUCKET = os.environ.get("SOAK_BUCKET", f"soak-{int(time.time())}")
+chaos.BUCKET = BUCKET  # for chaos's redundancy check
+OPLOG = open(os.environ.get("OPLOG", "soak-ops.log"), "a", buffering=1)  # noqa: SIM115
+
+
+def oplog(*fields):
+    OPLOG.write(" ".join([f"{time.time():.3f}", *map(str, fields)]) + "\n")
 
 # key -> the outcomes a read may show: a digest, or GONE. One writer owns
 # each key, so its operations on it never race.
@@ -105,7 +113,9 @@ def writer(n):
             key = mine.pop(rng.randrange(len(mine)))
             with lock:  # a read from now on may see it gone
                 expect[key] = expect[key] | {GONE}
+            t0 = time.time()
             status, reply = http("DELETE", f"{url}/{BUCKET}/{key}", timeout=30)
+            oplog(key, "DELETE", url.split("//")[1], f"{t0:.3f}", status)
             ok = record(status, reply, (204, 200))
             with lock:
                 if ok:
@@ -122,7 +132,9 @@ def writer(n):
             d = digest(body)
             with lock:  # a read from now on may see it
                 expect[key] = expect.get(key, {GONE}) | {d}
+            t0 = time.time()
             status, reply = http("PUT", f"{url}/{BUCKET}/{key}", body, timeout=60)
+            oplog(key, "PUT", url.split("//")[1], f"{t0:.3f}", status, f"gen={gen[key]}", d)
             ok = record(status, reply, (200,))
             with lock:
                 if ok:
@@ -253,6 +265,14 @@ def check(what, everything=False):
     with ThreadPoolExecutor(max_workers=32) as pool:
         bad = [r for r in pool.map(check_one, items) if r]
     if bad:
+        OPLOG.flush()
+        for key, _ in bad[:5]:
+            say(f"history of {key}:")
+            with open(OPLOG.name) as f:
+                for line in f:
+                    if line.split(" ", 2)[1] == key:
+                        print("   ", line.rstrip(), flush=True)
+            say(f"  reads now: {read_outcome(key)}; allowed: {expect[key]}")
         fail(f"{what}: {len(bad)} of {len(items)} keys read wrong: {bad[:10]}")
     say(f"{what}: {len(items)} keys read as expected" + (" (all)" if everything else ""))
 
