@@ -1497,11 +1497,12 @@ pub async fn head_object(
         .await
     {
         Ok(resp) => resp.into_inner(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .unwrap();
+        // Unknown, not missing: a 404 here told clients an object was gone
+        // while meta elected a leader.
+        Err(e) => {
+            let mut resp = S3Error::from_status(&e);
+            *resp.body_mut() = Body::empty();
+            return resp;
         }
     };
 
