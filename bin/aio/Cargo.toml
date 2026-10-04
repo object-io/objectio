@@ -32,6 +32,9 @@ which = "6"
 tempfile = "3"
 include_dir = "0.7"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [features]
 default = []
 # ISA-L erasure coding on x86_64. The release builds aio by package
