@@ -160,7 +160,7 @@ async fn cli(argv: &[&str], replies: Vec<Canned>) -> Run {
 async fn cli_env(argv: &[&str], replies: Vec<Canned>, environment: &[(&str, &str)]) -> Run {
     let s = stub(replies).await;
     let mut full = vec![
-        "objectio-cli",
+        "obioctl",
         "--endpoint",
         &s.url,
         "--access-key",
@@ -532,7 +532,7 @@ async fn sts_is_unsigned_and_needs_no_key() {
     .await;
     // No --access-key at all.
     let args = Args::try_parse_from([
-        "objectio-cli",
+        "obioctl",
         "--endpoint",
         &s.url,
         "--output",

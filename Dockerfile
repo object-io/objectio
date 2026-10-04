@@ -287,11 +287,11 @@ LABEL org.opencontainers.image.title="ObjectIO CLI"
 LABEL org.opencontainers.image.description="Admin CLI for ObjectIO cluster management"
 LABEL org.opencontainers.image.architecture="${TARGETARCH}"
 
-COPY --from=builder /build/target/release/objectio-cli /usr/local/bin/
+COPY --from=builder /build/target/release/obioctl /usr/local/bin/
 
 USER objectio
 
-ENTRYPOINT ["objectio-cli"]
+ENTRYPOINT ["obioctl"]
 CMD ["--help"]
 
 # =============================================================================
@@ -335,7 +335,7 @@ LABEL org.opencontainers.image.architecture="${TARGETARCH}"
 COPY --from=builder /build/target/release/objectio-gateway /usr/local/bin/
 COPY --from=builder /build/target/release/objectio-meta /usr/local/bin/
 COPY --from=builder /build/target/release/objectio-osd /usr/local/bin/
-COPY --from=builder /build/target/release/objectio-cli /usr/local/bin/
+COPY --from=builder /build/target/release/obioctl /usr/local/bin/
 COPY --from=builder /build/target/release/objectio-install /usr/local/bin/
 COPY --from=builder /build/target/release/objectio-block-gateway /usr/local/bin/
 
@@ -349,4 +349,4 @@ EXPOSE 9000 9100 9101 9200 9201 9300 10809
 VOLUME ["/var/lib/objectio"]
 
 # Default shows available commands
-CMD ["sh", "-c", "echo 'ObjectIO - Available commands:' && echo '  objectio-gateway  - S3 API gateway' && echo '  objectio-meta     - Metadata service' && echo '  objectio-osd      - Storage daemon' && echo '  objectio-cli      - Admin CLI' && echo '  objectio-install  - Installation tool'"]
+CMD ["sh", "-c", "echo 'ObjectIO - Available commands:' && echo '  objectio-gateway  - S3 API gateway' && echo '  objectio-meta     - Metadata service' && echo '  objectio-osd      - Storage daemon' && echo '  obioctl           - Admin CLI' && echo '  objectio-install  - Installation tool'"]

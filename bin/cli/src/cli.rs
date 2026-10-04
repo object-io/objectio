@@ -10,11 +10,11 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "objectio-cli", version, about = "ObjectIO management CLI")]
+#[command(name = "obioctl", version, about = "ObjectIO management CLI")]
 #[command(
     after_help = "Credentials: --access-key/--secret-key, OBJECTIO_ACCESS_KEY(_FILE)/\
 OBJECTIO_SECRET_KEY(_FILE) (AWS_* accepted), or a profile in ~/.objectio/config \
-written by `objectio-cli configure`."
+written by `obioctl configure`."
 )]
 pub struct Args {
     /// Gateway URL, e.g. https://s3.example.com [env: OBJECTIO_ENDPOINT, OBJECTIO_URL]
@@ -535,7 +535,7 @@ pub enum StsCmd {
         /// A file holding the token (e.g. a projected service-account token)
         #[arg(long)]
         token_file: Option<PathBuf>,
-        #[arg(long, default_value = "objectio-cli")]
+        #[arg(long, default_value = "obioctl")]
         session_name: String,
         #[arg(long)]
         duration_seconds: Option<u32>,

@@ -48,7 +48,7 @@ explanation; if they're wrong, fix them in the same PR.
 make build | build-release | test | lint | fmt | fmt-fix | ci | coverage
 cargo test -p objectio-erasure --features isal          # one crate
 cargo test -p objectio-e2e --test <file>                # e2e: spawns target/debug binaries; build them first
-cargo build --bin objectio-aio --bin objectio-cli --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
 ```
 
 - Needs `protoc`. `isal` (x86_64 only) needs NASM, autoconf, automake,
@@ -83,7 +83,7 @@ prefix; packages and binaries keep it: `crates/gateway` is the package
 | `crates/block-gateway` | 9300 gRPC, 10809 NBD | Block volumes |
 | `bin/{gateway,meta,osd,block-gateway}` | | Their binaries |
 | `bin/aio` | | All of the above in one process |
-| `bin/cli` | | Admin CLI: a SigV4 client of the gateway only (`bin/cli/README.md`) |
+| `bin/cli` | | `obioctl`, the admin CLI: a SigV4 client of the gateway's admin API only (`bin/cli/README.md`) |
 | `bin/{install,io-bench,s3-bench,dedup-estimate}` | | Tools |
 | `crates/common` | | `Error`/`Result`, shared types, metrics, format levels (`version`) |
 | `crates/proto` | | gRPC definitions (`proto/*.proto`, built by its `build.rs`); meta channel (`transport`) |

@@ -1,4 +1,4 @@
-# objectio-cli
+# obioctl
 
 The ObjectIO management CLI. It is a client of the gateway's admin HTTP API
 (`/_admin/*`), signed with SigV4 exactly like the SDKs in `sdk/go` and
@@ -19,10 +19,10 @@ The exceptions:
 ## Configure
 
 ```sh
-objectio-cli configure                      # prompts; writes profile "default"
-objectio-cli --profile acme configure \
+obioctl configure                      # prompts; writes profile "default"
+obioctl --profile acme configure \
   --endpoint https://s3.example.com --access-key AKIA... --secret-key ... --non-interactive
-objectio-cli configure --list               # secrets masked
+obioctl configure --list               # secrets masked
 ```
 
 Profiles are stored in `~/.objectio/config` (or `$OBJECTIO_CONFIG_FILE`) with
@@ -72,7 +72,7 @@ json`), the CLI prints the API's own JSON document, pretty-printed, so
 scripts read the same shapes the SDKs do:
 
 ```sh
-objectio-cli -o json user create alice | jq -r .user_id
+obioctl -o json user create alice | jq -r .user_id
 ```
 
 Commands that get no response body (HTTP 204), such as deletes, print
@@ -152,27 +152,27 @@ For `provision`, `--user` defaults to `$OBJECTIO_PROVISIONER_USER_ID`.
 Onboard a tenant as the system admin:
 
 ```sh
-objectio-cli tenant create acme --display-name "Acme Corp" --quota-bytes 2T
-ADMIN=$(objectio-cli -o json user create acme-admin --tenant acme | jq -r .user_id)
-objectio-cli tenant admin add acme "$ADMIN"
-objectio-cli key create "$ADMIN"            # hand this key to the tenant admin
+obioctl tenant create acme --display-name "Acme Corp" --quota-bytes 2T
+ADMIN=$(obioctl -o json user create acme-admin --tenant acme | jq -r .user_id)
+obioctl tenant admin add acme "$ADMIN"
+obioctl key create "$ADMIN"            # hand this key to the tenant admin
 ```
 
 Then, as the tenant admin (no `--tenant` needed):
 
 ```sh
-objectio-cli user create alice
-objectio-cli policy create read-logs --file read-logs.json
-objectio-cli policy attach read-logs --user <alice-id>
-objectio-cli public-access-block put --all
-objectio-cli bucket create logs
-objectio-cli bucket lifecycle put logs --file lifecycle.xml
-objectio-cli provision bucket ws-1 --user "$ADMIN"   # bucket + key scoped to it
+obioctl user create alice
+obioctl policy create read-logs --file read-logs.json
+obioctl policy attach read-logs --user <alice-id>
+obioctl public-access-block put --all
+obioctl bucket create logs
+obioctl bucket lifecycle put logs --file lifecycle.xml
+obioctl provision bucket ws-1 --user "$ADMIN"   # bucket + key scoped to it
 ```
 
 Get temporary credentials from an OIDC token (no key needed):
 
 ```sh
-eval "$(objectio-cli sts assume-role-with-web-identity \
+eval "$(obioctl sts assume-role-with-web-identity \
   --role-arn arn:obio:iam::acme:role/etl --token-file /var/run/secrets/token --env)"
 ```

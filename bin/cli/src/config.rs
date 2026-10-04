@@ -256,7 +256,7 @@ pub fn resolve(
         .find_map(|s| s.endpoint.clone())
         .ok_or_else(|| {
             anyhow!(
-                "no endpoint: pass --endpoint, set OBJECTIO_ENDPOINT, or run `objectio-cli configure`"
+                "no endpoint: pass --endpoint, set OBJECTIO_ENDPOINT, or run `obioctl configure`"
             )
         })?;
     let region = sources
@@ -282,7 +282,7 @@ pub fn resolve(
         bail!(
             "no credentials: pass --access-key/--secret-key, set OBJECTIO_ACCESS_KEY and \
              OBJECTIO_SECRET_KEY (or their _FILE forms, or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY), \
-             or run `objectio-cli configure`"
+             or run `obioctl configure`"
         );
     }
 
