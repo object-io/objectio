@@ -505,8 +505,23 @@ async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
     entry
 }
 
-/// Load and parse every policy attached to one principal (user or group).
-async fn load_identity_policies(
+/// How meta names a principal's attachments and inline policies:
+/// "user:<id>", "group:<id>" or "role:<tenant/name>" (a role session's
+/// `user_id` is already "role:<key>").
+pub(crate) fn principal_key(principal_id: &str, is_group: bool) -> String {
+    if principal_id.starts_with("role:") {
+        principal_id.to_string()
+    } else if is_group {
+        format!("group:{principal_id}")
+    } else {
+        format!("user:{principal_id}")
+    }
+}
+
+/// Load and parse every policy of one principal (user, group or role
+/// session): the named ones attached to it, the AWS managed ones attached
+/// to it, and its inline ones.
+pub(crate) async fn load_identity_policies(
     state: &AppState,
     principal_id: &str,
     is_group: bool,
@@ -553,20 +568,46 @@ async fn load_identity_policies(
 
     let mut policies = Vec::with_capacity(names.len());
     for name in names {
-        let Ok(resp) = client
-            .get_policy(GetPolicyRequest { name: name.clone() })
-            .await
-        else {
-            continue;
+        let json = if let Some(doc) = objectio_auth::managed::attached(&name) {
+            doc.to_string()
+        } else {
+            let Ok(resp) = client
+                .get_policy(GetPolicyRequest { name: name.clone() })
+                .await
+            else {
+                continue;
+            };
+            let inner = resp.into_inner();
+            let Some(obj) = inner.policy.filter(|_| inner.found) else {
+                continue;
+            };
+            obj.policy_json
         };
-        let inner = resp.into_inner();
-        let Some(obj) = inner.policy.filter(|_| inner.found) else {
-            continue;
-        };
-        match BucketPolicy::from_json(&obj.policy_json) {
+        match BucketPolicy::from_json(&json) {
             Ok(policy) => policies.push((name, Arc::new(policy))),
             Err(e) => warn!("attached policy '{name}' for {principal_id} failed to parse: {e}"),
         }
+    }
+    // Inline policies. An unreadable list is treated as none, which fails
+    // closed for an Allow but could miss a Deny: logged, as attachments are.
+    match client
+        .list_inline_policies(objectio_proto::metadata::ListInlinePoliciesRequest {
+            principal: principal_key(principal_id, is_group),
+        })
+        .await
+    {
+        Ok(r) => {
+            for p in r.into_inner().policies {
+                match BucketPolicy::from_json(&p.policy_json) {
+                    Ok(policy) => policies.push((format!("inline:{}", p.name), Arc::new(policy))),
+                    Err(e) => warn!(
+                        "inline policy '{}' of {principal_id} failed to parse: {e}",
+                        p.name
+                    ),
+                }
+            }
+        }
+        Err(e) => error!("list_inline_policies for {principal_id} failed: {e}"),
     }
 
     let policies = Arc::new(policies);
@@ -781,6 +822,69 @@ pub async fn authorize(
     )))
 }
 
+/// What a caller's own policies say of `context`: those of the caller
+/// itself (a user, or a role's session) and of every group it is in. An
+/// explicit Deny anywhere wins, then any Allow; else nothing granted it.
+pub(crate) async fn identity_decision(
+    state: &AppState,
+    auth: &AuthResult,
+    context: &RequestContext,
+) -> PolicyDecision {
+    let mut principals: Vec<(&str, bool)> = vec![(auth.user_id.as_str(), false)];
+    principals.extend(auth.group_ids.iter().map(|g| (g.as_str(), true)));
+    let mut allowed = false;
+    for (principal, is_group) in principals {
+        for (_, policy) in load_identity_policies(state, principal, is_group)
+            .await
+            .iter()
+        {
+            match state.policy_evaluator.evaluate(policy, context) {
+                PolicyDecision::Deny => return PolicyDecision::Deny,
+                PolicyDecision::Allow => allowed = true,
+                PolicyDecision::ImplicitDeny => {}
+            }
+        }
+    }
+    if allowed {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::ImplicitDeny
+    }
+}
+
+/// Whether the caller's own policies explicitly deny listing its buckets
+/// (`GET /`). ListAllMyBuckets has no bucket to authorize against, and
+/// lists what the caller owns; a Deny of it still holds.
+async fn list_buckets_denied(state: &AppState, auth: &AuthResult) -> bool {
+    if auth.user_arn == crate::admin::SYSTEM_ADMIN_USER_ARN || auth.user_id.is_empty() {
+        return false;
+    }
+    let mut context = RequestContext::new(&auth.user_arn, "s3:ListAllMyBuckets", "arn:obio:s3:::*");
+    if let Some(ip) = auth.source_ip {
+        context = context.with_source_ip(ip);
+    }
+    context = with_credential_vars(context, auth);
+    identity_decision(state, auth, &context).await == PolicyDecision::Deny
+}
+
+/// The condition keys that say how the caller authenticated:
+/// `obio:CredentialType`, and `sts:authentication` ("true") for temporary
+/// credentials.
+fn with_credential_vars(mut context: RequestContext, auth: &AuthResult) -> RequestContext {
+    use objectio_auth::AuthMode;
+    context = context.with_variable(
+        "obio:CredentialType".to_string(),
+        auth.auth_mode.as_str().to_string(),
+    );
+    if matches!(
+        auth.auth_mode,
+        AuthMode::Sts | AuthMode::AssumedRole | AuthMode::SessionToken
+    ) {
+        context = context.with_variable("sts:authentication".to_string(), "true".to_string());
+    }
+    context
+}
+
 /// The policy-evaluation context of a request by `principal`.
 async fn request_context(
     state: &AppState,
@@ -814,11 +918,7 @@ async fn request_context(
     }
     // Surface credential-type so policies can deny permanent-key direct
     // access while still allowing STS-vended sessions through.
-    context = context.with_variable(
-        "obio:CredentialType".to_string(),
-        auth.auth_mode.as_str().to_string(),
-    );
-    context
+    with_credential_vars(context, auth)
 }
 
 /// An unsigned request: only a bucket policy's grants to everyone can let
@@ -968,6 +1068,16 @@ pub async fn authz_layer(
         && !matches!(classification, Authz::Check { .. } | Authz::DeferToHandler)
     {
         return deny("Anonymous access is not allowed");
+    }
+
+    // ListAllMyBuckets: nothing to check but the caller's own Denies.
+    if uri.path() == "/"
+        && request.method() == Method::GET
+        && auth.auth_mode != objectio_auth::AuthMode::Anonymous
+        && list_buckets_denied(&state, &auth).await
+    {
+        crate::audit::note_action("s3:ListAllMyBuckets");
+        return deny("Action s3:ListAllMyBuckets denied by an identity policy");
     }
 
     let Authz::Check {

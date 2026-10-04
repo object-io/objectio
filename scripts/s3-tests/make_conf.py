@@ -44,14 +44,11 @@ conf += section(
 conf += section("s3 alt", users["alt"])
 conf += section("s3 tenant", users["tenant"], "tenant = testx\n")
 conf += section("iam", users["iam"])
-conf += section(
-    "iam root", users["iamroot"], f"account_id = {users['iamroot']['user_id']}\n"
-)
-conf += section(
-    "iam alt root",
-    users["iamaltroot"],
-    f"account_id = {users['iamaltroot']['user_id']}\n",
-)
+# An IAM account is a tenant, its id the tenant's name, and its root (a
+# tenant admin) is known by that id too (GetCallerIdentity's UserId).
+for name, key in [("iam root", "iamroot"), ("iam alt root", "iamaltroot")]:
+    root = dict(users[key], user_id=users[key]["tenant"])
+    conf += section(name, root, f"account_id = {root['tenant']}\n")
 with open(out_path, "w") as f:
     f.write(conf)
 print(f"config written to {out_path}")

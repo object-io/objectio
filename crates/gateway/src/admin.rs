@@ -584,39 +584,51 @@ pub async fn require_tenant_admin_access(
         );
     }
     // Consult TenantConfig.admin_users
-    let mut client = state.meta_client.clone();
-    let tenant = match client
-        .get_tenant(GetTenantRequest {
-            name: target_tenant.to_string(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let r = resp.into_inner();
-            if !r.found {
-                return Some((StatusCode::FORBIDDEN, "Tenant not found").into_response());
-            }
-            match r.tenant {
-                Some(t) => t,
-                None => {
-                    return Some((StatusCode::FORBIDDEN, "Tenant not found").into_response());
-                }
-            }
+    match tenant_admin(state, target_tenant, &caller.user_id, &caller.user_arn).await {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(TenantAdminError::NoTenant) => {
+            return Some((StatusCode::FORBIDDEN, "Tenant not found").into_response());
         }
-        Err(_) => {
+        Err(TenantAdminError::Unavailable) => {
             return Some(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load tenant").into_response(),
             );
         }
-    };
-    let is_tenant_admin = tenant
-        .admin_users
-        .iter()
-        .any(|entry| entry == &caller.user_id || entry == &caller.user_arn);
-    if is_tenant_admin {
-        return None;
     }
     Some((StatusCode::FORBIDDEN, "Not a tenant admin").into_response())
+}
+
+/// Why [`tenant_admin`] couldn't say.
+pub(crate) enum TenantAdminError {
+    NoTenant,
+    Unavailable,
+}
+
+/// Whether the user `user_id` (ARN `user_arn`) is one of `tenant`'s
+/// admins: listed, by id or ARN, in its `admin_users`.
+pub(crate) async fn tenant_admin(
+    state: &AppState,
+    tenant: &str,
+    user_id: &str,
+    user_arn: &str,
+) -> Result<bool, TenantAdminError> {
+    let r = state
+        .meta_client
+        .clone()
+        .get_tenant(GetTenantRequest {
+            name: tenant.to_string(),
+        })
+        .await
+        .map_err(|_| TenantAdminError::Unavailable)?
+        .into_inner();
+    let t = r
+        .tenant
+        .filter(|_| r.found)
+        .ok_or(TenantAdminError::NoTenant)?;
+    Ok(t.admin_users
+        .iter()
+        .any(|entry| entry == user_id || entry == user_arn))
 }
 
 /// Validate admin access from either SigV4 auth or console session cookie.
@@ -3350,6 +3362,7 @@ pub async fn admin_update_user(
             status,
             display_name: body["display_name"].as_str().map(str::to_string),
             email: body["email"].as_str().map(str::to_string),
+            path: None,
         })
         .await
     {

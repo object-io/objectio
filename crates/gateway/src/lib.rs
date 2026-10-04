@@ -22,6 +22,7 @@ pub mod grep_engine;
 pub mod heal;
 pub mod host_provider;
 pub mod iam_admin;
+pub mod iam_api;
 pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
@@ -718,7 +719,7 @@ pub async fn run(
         None
     };
 
-    // STS (AssumeRoleWithWebIdentity) on the S3 endpoint.
+    // STS (AssumeRoleWithWebIdentity, unsigned) on the S3 endpoint.
     let sts_state = Arc::new(sts_api::StsState {
         meta_client: meta_client.clone(),
         system_oidc: oidc_provider.clone(),
@@ -1442,6 +1443,13 @@ pub async fn run(
         ))
     };
 
+    // The IAM and STS query APIs (POST / with a form body) on the S3
+    // endpoint.
+    let query_api_state = Arc::new(iam_api::QueryApiState {
+        app: Arc::clone(&state),
+        sts: Arc::clone(&sts_state),
+    });
+
     let post_object_state = Arc::new(post_object::PostObjectState {
         app: Arc::clone(&state),
         auth_enabled: !args.no_auth,
@@ -1471,8 +1479,8 @@ pub async fn run(
             ))
         };
         r.layer(middleware::from_fn_with_state(
-            Arc::clone(&sts_state),
-            sts_api::sts_layer,
+            Arc::clone(&query_api_state),
+            iam_api::query_api_layer,
         ))
         // Browser form uploads carry their credentials in the form, not an
         // Authorization header: taken ahead of SigV4, like STS.
