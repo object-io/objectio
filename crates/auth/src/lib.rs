@@ -31,6 +31,7 @@
 
 // Core modules (always available)
 pub mod error;
+pub mod managed;
 pub mod policy;
 pub mod presign;
 pub mod scope;

@@ -171,6 +171,9 @@ pub enum AuthMode {
     /// carrying the role's tenant and its attached policies, inside the
     /// tenant boundary like any of the tenant's users.
     AssumedRole,
+    /// A user's own session (`GetSessionToken`): temporary keys that act as
+    /// the user who asked for them (its policies, groups and tenant).
+    SessionToken,
 }
 
 impl AuthMode {
@@ -183,6 +186,7 @@ impl AuthMode {
             Self::Sts => "STS",
             Self::Anonymous => "Anonymous",
             Self::AssumedRole => "AssumedRole",
+            Self::SessionToken => "SessionToken",
         }
     }
 }

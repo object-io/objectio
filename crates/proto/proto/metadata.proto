@@ -297,6 +297,14 @@ service MetadataService {
     rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
     rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
     rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+    // Rename a group or change its path.
+    rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse);
+    // Inline policies of users, groups and roles. Put replaces one of the
+    // same name; Delete of one that isn't there is NOT_FOUND.
+    rpc PutInlinePolicy(PutInlinePolicyRequest) returns (PutInlinePolicyResponse);
+    rpc GetInlinePolicy(GetInlinePolicyRequest) returns (GetInlinePolicyResponse);
+    rpc ListInlinePolicies(ListInlinePoliciesRequest) returns (ListInlinePoliciesResponse);
+    rpc DeleteInlinePolicy(DeleteInlinePolicyRequest) returns (DeleteInlinePolicyResponse);
 
     // Keys whose ObjectMeta copies may disagree: a write or delete that
     // reached the quorum but not every copy. Gateways heal them
@@ -1144,6 +1152,9 @@ message UserMeta {
     uint64 created_at = 5;
     string email = 6;
     string tenant = 7;              // Owning tenant (empty = system tenant)
+    // IAM path, "/" or "/a/b/": in the ARN between "user" and the name.
+    // Empty means "/". Written from format level 3.
+    string path = 8;
 }
 
 // Access key metadata
@@ -1166,6 +1177,7 @@ message CreateUserRequest {
     string display_name = 1;
     string email = 2;
     string tenant = 3;              // Assign user to tenant (empty = system tenant)
+    string path = 4;                // IAM path (empty = "/"); level 3
 }
 
 message CreateUserResponse {
@@ -1475,12 +1487,23 @@ message GroupMeta {
     // The tenant that owns it (empty = system scope), as in its ARN's
     // account segment: arn:obio:iam::<tenant|objectio>:group/<name>.
     string tenant = 6;
+    string path = 7;        // IAM path (empty = "/"); level 3
 }
 
 message CreateGroupRequest {
     string group_name = 1;
     string tenant = 2;      // empty = system scope; names are unique per tenant
+    string path = 3;        // IAM path (empty = "/"); level 3
 }
+
+// Rename a group or move it to another path (level 3). Its id, members
+// and attachments stay.
+message UpdateGroupRequest {
+    string group_id = 1;
+    optional string group_name = 2;
+    optional string path = 3;
+}
+message UpdateGroupResponse { GroupMeta group = 1; }
 
 message CreateGroupResponse {
     GroupMeta group = 1;
@@ -2601,13 +2624,18 @@ message PolicyObject {
     // A system policy tenant admins may attach to their own users and
     // groups (but not change): the operator's catalogue.
     bool shared = 6;
+    string path = 7;          // IAM path (empty = "/"); level 3
+    string policy_id = 8;     // set at creation from level 3
+    string description = 9;
 }
 
 message CreatePolicyRequest {
-    string name = 1;          // no "/"
+    string name = 1;          // letters, digits and +=,.@_- (no "/" or ":")
     string policy_json = 2;
     string tenant = 3;        // empty = system scope
     bool shared = 4;          // system scope only
+    string path = 5;          // IAM path (empty = "/"); level 3
+    string description = 6;
 }
 message CreatePolicyResponse { PolicyObject policy = 1; }
 
@@ -2650,8 +2678,9 @@ message UpdateUserRequest {
     string user_id = 1;
     // Each field: unset leaves it as it is.
     optional UserStatus status = 2;   // ACTIVE or SUSPENDED only
-    optional string display_name = 3;
+    optional string display_name = 3;   // renames: the ARN follows
     optional string email = 4;
+    optional string path = 5;           // the ARN follows; level 3
 }
 message UpdateUserResponse { UserMeta user = 1; }
 
@@ -2675,6 +2704,8 @@ message RoleObject {
     uint32 max_session_seconds = 6;       // 0 = default (3600)
     uint64 created_at = 7;
     uint64 updated_at = 8;
+    string path = 9;                      // IAM path (empty = "/"); level 3
+    string role_id = 10;                  // set at creation from level 3
 }
 message CreateRoleRequest { RoleObject role = 1; }
 message CreateRoleResponse { RoleObject role = 1; }
@@ -2692,6 +2723,30 @@ message UpdateRoleResponse { RoleObject role = 1; }
 message DeleteRoleRequest { string name = 1; }
 message DeleteRoleResponse { bool success = 1; }
 message ListAttachedPoliciesResponse { repeated string policy_names = 1; }
+
+// An inline policy: a document embedded in one user, group or role, by
+// name, that goes when its principal goes (level 3). The principal is
+// named as attachments name it: "user:<user_id>", "group:<group_id>" or
+// "role:<role key>".
+message InlinePolicy {
+    string principal = 1;
+    string name = 2;
+    string policy_json = 3;
+    uint64 created_at = 4;
+    uint64 updated_at = 5;
+}
+message PutInlinePolicyRequest {
+    string principal = 1;
+    string name = 2;
+    string policy_json = 3;
+}
+message PutInlinePolicyResponse { InlinePolicy policy = 1; }
+message GetInlinePolicyRequest { string principal = 1; string name = 2; }
+message GetInlinePolicyResponse { InlinePolicy policy = 1; bool found = 2; }
+message ListInlinePoliciesRequest { string principal = 1; }
+message ListInlinePoliciesResponse { repeated InlinePolicy policies = 1; }
+message DeleteInlinePolicyRequest { string principal = 1; string name = 2; }
+message DeleteInlinePolicyResponse { bool success = 1; }
 
 // ============================================================
 // Server-Side Encryption

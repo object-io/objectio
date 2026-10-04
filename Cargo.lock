@@ -2558,6 +2558,7 @@ dependencies = [
  "futures",
  "hex",
  "md5",
+ "objectio-auth",
  "objectio-common",
  "objectio-erasure",
  "objectio-meta-store",
