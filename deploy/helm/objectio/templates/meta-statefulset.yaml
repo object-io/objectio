@@ -40,6 +40,10 @@ spec:
                 --ec-k "{{ .Values.ec.k }}" \
                 --ec-m "{{ .Values.ec.m }}" \
                 --log-level "{{ .Values.meta.logLevel }}"
+          {{- with (include "objectio.tls.env" .) }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.meta.service.port }}
@@ -65,8 +69,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/objectio
+            {{- with (include "objectio.tls.volumeMount" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.meta.resources | nindent 12 }}
+      {{- with (include "objectio.tls.volume" .) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

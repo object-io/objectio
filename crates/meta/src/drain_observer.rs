@@ -299,11 +299,12 @@ async fn purge_pending(meta: &Arc<MetaService>) {
 
 /// Wipe a drained OSD and record it done.
 async fn purge_one(meta: &Arc<MetaService>, node_id: [u8; 16], address: &str) {
-    let uri = canonical_uri(address);
     let result = async {
         let channel = tokio::time::timeout(
             PER_OSD_TIMEOUT,
-            Channel::from_shared(uri.clone())?.connect(),
+            objectio_proto::transport::endpoint(address)
+                .map_err(anyhow::Error::msg)?
+                .connect(),
         )
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
@@ -340,10 +341,11 @@ async fn purge_one(meta: &Arc<MetaService>, node_id: [u8; 16], address: &str) {
 /// channel per call — drain polling is low-frequency and it avoids
 /// stale-connection issues after an OSD reboot.
 async fn query_shard_count(address: &str) -> anyhow::Result<u64> {
-    let uri = canonical_uri(address);
     let channel = tokio::time::timeout(
         PER_OSD_TIMEOUT,
-        Channel::from_shared(uri.clone())?.connect(),
+        objectio_proto::transport::endpoint(address)
+            .map_err(anyhow::Error::msg)?
+            .connect(),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout"))??;
@@ -818,8 +820,8 @@ async fn find_affected_objects(
 }
 
 pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
-    let uri = canonical_uri(address);
-    let channel = tokio::time::timeout(PER_OSD_TIMEOUT, Channel::from_shared(uri)?.connect())
+    let endpoint = objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?;
+    let channel = tokio::time::timeout(PER_OSD_TIMEOUT, endpoint.connect())
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
     Ok(channel)
@@ -846,20 +848,6 @@ pub(crate) fn checksum_of(data: &[u8]) -> Checksum {
         crc32c: crc32c::crc32c(data),
         xxhash64: 0,
         sha256: vec![],
-    }
-}
-
-/// Turn a registered OSD address into something `Channel::from_shared` takes.
-///
-/// The check was `starts_with("http")`, which also matches a host called
-/// `httpd:9200` or `http-osd-1` — those would be passed through without a
-/// scheme and fail to parse, taking the whole sweep for that OSD with them.
-/// Match the scheme, not the prefix.
-fn canonical_uri(address: &str) -> String {
-    if address.starts_with("http://") || address.starts_with("https://") {
-        address.to_string()
-    } else {
-        format!("http://{address}")
     }
 }
 
@@ -905,7 +893,7 @@ fn now_unix() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrainStep, Scan, canonical_uri, checksum_of, drain_step, verified_shard};
+    use super::{DrainStep, Scan, checksum_of, drain_step, verified_shard};
     use objectio_proto::storage::ReadShardResponse;
 
     fn response(data: &[u8], crc32c: Option<u32>) -> ReadShardResponse {
@@ -951,29 +939,5 @@ mod tests {
         assert_eq!(drain_step(scan(false, 0)), DrainStep::Migrate);
         assert_eq!(drain_step(scan(true, 3)), DrainStep::Migrate);
         assert_eq!(drain_step(None), DrainStep::Wait);
-    }
-
-    #[test]
-    fn an_address_without_a_scheme_gets_one() {
-        assert_eq!(canonical_uri("10.0.0.4:9200"), "http://10.0.0.4:9200");
-        assert_eq!(canonical_uri("osd-1:9200"), "http://osd-1:9200");
-    }
-
-    #[test]
-    fn an_address_that_already_has_a_scheme_is_left_alone() {
-        assert_eq!(canonical_uri("http://osd-1:9200"), "http://osd-1:9200");
-        assert_eq!(canonical_uri("https://osd-1:9200"), "https://osd-1:9200");
-    }
-
-    /// A hostname that merely begins with "http" is not a URL.
-    ///
-    /// The check used to be `starts_with("http")`, so a host called `httpd` or
-    /// `http-osd-1` was passed through with no scheme, failed to parse, and
-    /// took that OSD's whole sweep down with it.
-    #[test]
-    fn a_hostname_beginning_with_http_still_gets_a_scheme() {
-        assert_eq!(canonical_uri("httpd:9200"), "http://httpd:9200");
-        assert_eq!(canonical_uri("http-osd-1:9200"), "http://http-osd-1:9200");
-        assert_eq!(canonical_uri("https-gw:9200"), "http://https-gw:9200");
     }
 }

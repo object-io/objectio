@@ -123,3 +123,39 @@ Format: meta-0.HEADLESS:9100,meta-1.HEADLESS:9100,...
 {{- end }}
 {{- join "," $peers }}
 {{- end }}
+
+{{/*
+mTLS between the services (A8a): the Secret holding this cluster's
+certificate (tls.crt, tls.key, ca.crt, as cert-manager writes them), and
+what each gRPC component mounts and sets from it.
+*/}}
+{{- define "objectio.tls.secretName" -}}
+{{- .Values.tls.secretName | default (printf "%s-tls" (include "objectio.fullname" .)) -}}
+{{- end }}
+
+{{- define "objectio.tls.env" -}}
+{{- if .Values.tls.enabled }}
+- name: OBJECTIO_TLS_CERT
+  value: /etc/objectio-tls/tls.crt
+- name: OBJECTIO_TLS_KEY
+  value: /etc/objectio-tls/tls.key
+- name: OBJECTIO_TLS_CA
+  value: /etc/objectio-tls/ca.crt
+{{- end }}
+{{- end }}
+
+{{- define "objectio.tls.volumeMount" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  mountPath: /etc/objectio-tls
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- define "objectio.tls.volume" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  secret:
+    secretName: {{ include "objectio.tls.secretName" . }}
+{{- end }}
+{{- end }}

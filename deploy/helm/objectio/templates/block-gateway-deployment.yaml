@@ -63,9 +63,16 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
+          {{- with (include "objectio.tls.env" .) }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/objectio
+            {{- with (include "objectio.tls.volumeMount" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.blockGateway.resources | nindent 12 }}
       volumes:
@@ -76,4 +83,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- with (include "objectio.tls.volume" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
 {{- end }}

@@ -55,6 +55,11 @@ pub struct Args {
     #[arg(long, global = true, default_value = "warn")]
     pub log_level: String,
 
+    /// mTLS to the block gateway, for `volume` and `snapshot`, when the
+    /// cluster runs it between services (A8a).
+    #[command(flatten)]
+    pub tls: objectio_proto::transport::TlsArgs,
+
     #[command(subcommand)]
     pub command: Command,
 }

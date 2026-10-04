@@ -91,9 +91,12 @@ const SNAPSHOT_COLUMNS: &[(&str, &str)] = &[
 ];
 
 async fn connect(endpoint: &str) -> Result<BlockServiceClient<tonic::transport::Channel>> {
-    BlockServiceClient::connect(endpoint.to_string())
+    let channel = objectio_proto::transport::endpoint(endpoint)
+        .map_err(anyhow::Error::msg)?
+        .connect()
         .await
-        .with_context(|| format!("connecting to the block gateway at {endpoint}"))
+        .with_context(|| format!("connecting to the block gateway at {endpoint}"))?;
+    Ok(BlockServiceClient::new(channel))
 }
 
 #[allow(clippy::needless_pass_by_value)] // shaped for map_err
