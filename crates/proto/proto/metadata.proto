@@ -11,6 +11,8 @@ service MetadataService {
     // Reassign a bucket's owner. Also the backfill path for buckets created
     // before the gateway recorded a real owner.
     rpc SetBucketOwner(SetBucketOwnerRequest) returns (SetBucketOwnerResponse);
+    // A bucket's byte and object quotas (0 = unlimited).
+    rpc SetBucketQuota(SetBucketQuotaRequest) returns (SetBucketQuotaResponse);
     rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
     rpc GetBucket(GetBucketRequest) returns (GetBucketResponse);
     rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
@@ -567,6 +569,14 @@ message SetBucketOwnerRequest {
 message SetBucketOwnerResponse {
     bool success = 1;
 }
+
+message SetBucketQuotaRequest {
+    string bucket = 1;
+    uint64 quota_bytes = 2;      // 0 = unlimited
+    uint64 quota_objects = 3;    // 0 = unlimited
+}
+
+message SetBucketQuotaResponse {}
 
 message CreateBucketResponse {
     BucketMeta bucket = 1;

@@ -29,6 +29,7 @@ static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::ne
 static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static HEAL_QUEUED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static HEALED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static QUOTA_REFUSALS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_CHUNKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
@@ -225,6 +226,11 @@ pub fn record_heal(result: &str) {
     HEALED.inc(&format!("result=\"{result}\""));
 }
 
+/// A write refused for passing a quota: `scope` is `bucket` or `tenant`.
+pub fn record_quota_refusal(scope: &str) {
+    QUOTA_REFUSALS.inc(&format!("scope=\"{scope}\""));
+}
+
 pub fn record_reclaim(reason: &str, reclaimed: u64, failed: u64) {
     let labels = format!("reason=\"{reason}\"");
     SHARDS_RECLAIMED.add(&labels, reclaimed);
@@ -347,6 +353,11 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_heal_total",
         "Heal queue entries handled, by result",
+    );
+    QUOTA_REFUSALS.render(
+        &mut out,
+        "objectio_s3_quota_refusals_total",
+        "Writes refused for passing a bucket's or tenant's quota",
     );
     SHARDS_RECLAIMED.render(
         &mut out,

@@ -617,6 +617,10 @@ pub async fn put_object(
         value: f.value_b64(),
     });
     let original_size = body.len() as u64;
+    // Quotas (A8b): admitted before any of it is stored.
+    if let Some(refused) = crate::quota::check(&bucket, original_size, 1) {
+        return refused;
+    }
 
     // SSE: if the request header or bucket default asks for encryption,
     // encrypt the body before it enters the erasure-coding path. Shards

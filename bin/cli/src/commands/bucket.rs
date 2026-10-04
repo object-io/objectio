@@ -78,6 +78,24 @@ pub async fn bucket(cmd: BucketCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
             ctx.out
                 .done(&format!("Bucket {name} is now owned by {owner}"))?;
         }
+        BucketCmd::SetQuota {
+            name,
+            bytes,
+            objects,
+        } => {
+            let bytes = super::parse_size(&bytes)?;
+            ctx.api
+                .send_json(
+                    "PUT",
+                    &format!("/_admin/buckets/{}/quota", seg(&name)),
+                    &[],
+                    json!({ "quota_bytes": bytes, "quota_objects": objects }),
+                )
+                .await?;
+            ctx.out.done(&format!(
+                "Bucket {name}: quota {bytes} bytes, {objects} objects (0 = unlimited)"
+            ))?;
+        }
         BucketCmd::Policy { action } => bucket_policy(action, ctx).await?,
         BucketCmd::Dedup { action } => bucket_dedup(action, ctx).await?,
         BucketCmd::Lifecycle { action } => xml_subresource(ctx, "lifecycle", action).await?,
