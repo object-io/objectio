@@ -1,7 +1,7 @@
-//! `objectio-cli` against a real gateway: the built binary, signing with
+//! `obioctl` against a real gateway: the built binary, signing with
 //! `SigV4` through the admin API, as an operator would run it.
 //!
-//! Needs `cargo build --bin objectio-cli --bin objectio-aio` first.
+//! Needs `cargo build --bin obioctl --bin objectio-aio` first.
 
 use objectio_e2e::{Cluster, binary};
 use serde_json::Value;
@@ -24,7 +24,7 @@ impl<'a> Cli<'a> {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(binary("objectio-cli"));
+        let mut cmd = Command::new(binary("obioctl"));
         cmd.env_clear()
             .env("HOME", self.home.path())
             .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -39,7 +39,7 @@ impl<'a> Cli<'a> {
             .env("OBJECTIO_SECRET_KEY", &self.c.secret_key)
             .args(args)
             .output()
-            .expect("run objectio-cli")
+            .expect("run obioctl")
     }
 
     /// With the credentials of a profile in the profile file.
@@ -49,14 +49,14 @@ impl<'a> Cli<'a> {
             .arg(profile)
             .args(args)
             .output()
-            .expect("run objectio-cli")
+            .expect("run obioctl")
     }
 }
 
 fn ok(o: &Output) -> String {
     assert!(
         o.status.success(),
-        "objectio-cli failed ({}):\nstdout: {}\nstderr: {}",
+        "obioctl failed ({}):\nstdout: {}\nstderr: {}",
         o.status,
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)

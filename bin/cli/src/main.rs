@@ -1,4 +1,4 @@
-//! `objectio-cli` — the `ObjectIO` management CLI.
+//! `obioctl` — the `ObjectIO` management CLI.
 //!
 //! A client of the gateway's admin HTTP API, signed with `SigV4` like the
 //! SDKs: every call goes through the gateway's authentication, tenant
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn an_empty_tenant_is_refused_at_parse_time() {
-        let r = Args::try_parse_from(["objectio-cli", "user", "list", "--tenant", ""]);
+        let r = Args::try_parse_from(["obioctl", "user", "list", "--tenant", ""]);
         assert!(r.is_err());
     }
 
@@ -136,20 +136,11 @@ mod tests {
     fn a_policy_principal_is_exactly_one() {
         assert!(
             Args::try_parse_from([
-                "objectio-cli",
-                "policy",
-                "attach",
-                "p",
-                "--user",
-                "u",
-                "--group",
-                "g"
+                "obioctl", "policy", "attach", "p", "--user", "u", "--group", "g"
             ])
             .is_err()
         );
-        assert!(Args::try_parse_from(["objectio-cli", "policy", "attach", "p"]).is_err());
-        assert!(
-            Args::try_parse_from(["objectio-cli", "policy", "attach", "p", "--role", "r"]).is_ok()
-        );
+        assert!(Args::try_parse_from(["obioctl", "policy", "attach", "p"]).is_err());
+        assert!(Args::try_parse_from(["obioctl", "policy", "attach", "p", "--role", "r"]).is_ok());
     }
 }

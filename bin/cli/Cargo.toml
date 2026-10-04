@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "objectio-cli"
+name = "obioctl"
 path = "src/main.rs"
 
 [dependencies]

@@ -202,7 +202,7 @@ impl ApiClient {
         }
         if sign {
             let (ak, sk) = self.settings.credentials.as_ref().ok_or_else(|| {
-                anyhow!("this command needs credentials; see `objectio-cli configure`")
+                anyhow!("this command needs credentials; see `obioctl configure`")
             })?;
             let signer = Signer {
                 access_key: ak,
