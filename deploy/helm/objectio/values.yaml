@@ -17,6 +17,23 @@ global:
     tag: latest
 
 gateway:
+  # The system always audits (A8c): every request is an event, kept in the
+  # gateway's spool before it is delivered and in the system bucket.
+  audit:
+    # Spooled events wait in an emptyDir: they survive the gateway being
+    # killed (the container restarts), and on a normal shutdown the gateway
+    # delivers what is left before it exits (drainSeconds). A pod deleted
+    # without a shutdown loses what it had not delivered.
+    spool:
+      enabled: true
+      sizeLimit: 10Gi
+      # The gateway's own cap, below sizeLimit (an emptyDir past its limit
+      # gets the pod evicted): past it new events are dropped and counted.
+      maxBytes: 9663676416   # 9 GiB
+      drainSeconds: 20
+    # Every event also goes here (created on first start), kept retentionDays.
+    systemBucket: objectio-audit
+    retentionDays: 365
   image:
     repository: objectio-gateway
     tag: latest
