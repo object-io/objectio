@@ -427,6 +427,29 @@ impl S3Error {
         )
     }
 
+    /// A failed ObjectMeta read or write, as S3 answers it: 507 when the
+    /// OSDs are full, 503 (retry) when copies were unreachable or this
+    /// gateway's clock may not stamp writes, otherwise 500. `what`
+    /// prefixes the message.
+    pub fn for_osd_error(e: &crate::osd_pool::OsdPoolError, what: &str) -> Response {
+        use crate::osd_pool::OsdPoolError as E;
+        match e {
+            E::Full(_) => Self::storage_full(),
+            E::ConnectionFailed(_) | E::NoNodesAvailable | E::NodeNotFound(_) | E::ClockSkew(_) => {
+                Self::xml_response(
+                    "ServiceUnavailable",
+                    &format!("{what}: {e}"),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+            }
+            E::ChecksumMismatch(_) | E::TooOld(_) => Self::xml_response(
+                "InternalError",
+                &format!("{what}: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        }
+    }
+
     pub fn from_status(e: &tonic::Status) -> Response {
         if Self::is_unavailable(e) {
             Self::xml_response(
