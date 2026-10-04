@@ -403,7 +403,9 @@ fn classify(path: &Path) -> DiskState {
                 reason: "LUKS-encrypted volume".into(),
             };
         }
-        if head.is_empty() || head.iter().all(|b| *b == 0) {
+        // Blank only if the backup copy is empty too: a disk whose primary
+        // superblock was zeroed still holds shards.
+        if objectio_storage::is_blank(path).unwrap_or(false) {
             return DiskState::Blank;
         }
         return DiskState::Foreign {
