@@ -27,7 +27,7 @@ pub use layout::{
     SUPERBLOCK_SIZE, Superblock,
 };
 pub use metadata::{
-    ArcCache, MetaCacheStats, MetadataEntry, MetadataKey, MetadataOp, MetadataStore, MetadataWal,
+    MetadataEntry, MetadataKey, MetadataOp, MetadataStore, MetadataWal,
 };
 pub use raw_io::{AlignedBuffer, RawFile};
 pub use smart::{DiskSmartHealth, SmartAttribute, SmartMonitor};

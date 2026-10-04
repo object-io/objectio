@@ -2717,6 +2717,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "rand 0.8.5",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",
