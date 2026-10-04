@@ -15,8 +15,9 @@ on:
     paths:
       - deploy/helm/**
       - deploy/kind/**
-      - bin/objectio-meta/**
-      - crates/objectio-meta-store/**
+      - crates/meta/**
+      - bin/meta/**
+      - crates/meta-store/**
       - .github/workflows/kind.yml
 
 concurrency:

@@ -56,8 +56,8 @@ cargo build --bin objectio-aio --bin objectio-cli --bin objectio-meta --bin obje
   by gateway, osd and aio: use `--workspace --features isal` or
   `--bin objectio-aio --features isal`, not on other crates.
 - Clippy runs with `-D warnings`. The `pedantic` and `nursery` groups apply
-  only where a crate opts into `[lints] workspace = true` (today 6 of the
-  15 library crates and 3 of the 10 binaries).
+  only where a crate opts into `[lints] workspace = true` (today 5 of the
+  17 library crates and 3 of the 10 binaries).
 - Without local Rust: `docker compose run --rm build|test|lint|fmt|dev`.
 - Local cluster: `objectio-aio` (meta + OSD + gateway in one process; see
   the README quickstart), or kind: `make kind-up | kind-up-registry |
@@ -68,29 +68,34 @@ cargo build --bin objectio-aio --bin objectio-cli --bin objectio-meta --bin obje
 
 ## Map
 
-Binaries live in `bin/`, libraries in `crates/`.
+Every library is in `crates/`, the services' code included; `bin/` holds
+the binaries: a service's is a thin `main.rs` around its crate's `run()`,
+so `objectio-aio` can run them all in one process. Directories drop the
+prefix; packages and binaries keep it: `crates/gateway` is the package
+`objectio-gateway` (`use objectio_gateway`), `bin/gateway` is the package
+`objectio-gateway-bin` that builds the binary `objectio-gateway`.
 
 | | Port | What |
 |---|---|---|
-| `bin/objectio-gateway` | 9000 | S3 API (`s3.rs`), admin API, Iceberg REST, Unity Catalog, Delta Sharing, console; SigV4/OIDC/STS auth (`authz.rs`) |
-| `bin/objectio-meta` | 9100 (metrics 9101, admin 9102) | Metadata on Raft (openraft + redb); placement, IAM, tenants, listings |
-| `bin/objectio-osd` | 9200 (metrics 9201) | Shards on raw disks |
-| `bin/objectio-block-gateway` | 9300 gRPC, 10809 NBD | Block volumes |
-| `bin/objectio-aio` | | All of the above in one process |
-| `bin/objectio-cli` | | Admin CLI: a SigV4 client of the gateway only (`bin/objectio-cli/README.md`) |
-| `bin/objectio-{install,io-bench,s3-bench,dedup-estimate}` | | Tools |
-| `crates/objectio-common` | | `Error`/`Result`, shared types, metrics, format levels (`version`) |
-| `crates/objectio-proto` | | gRPC definitions (`proto/*.proto`, the only `build.rs`); meta channel (`transport`) |
-| `crates/objectio-storage` | | The OSD's disk engine and metadata store |
-| `crates/objectio-erasure` | | Erasure coding (rust-simd, ISA-L) |
-| `crates/objectio-placement` | | CRUSH placement, topology |
-| `crates/objectio-meta-store` | | Meta's redb tables, Raft storage and network |
-| `crates/objectio-block` | | Block engine: volumes, write cache, journal |
-| `crates/objectio-auth` | | SigV4 (signer too), policies, STS |
-| `crates/objectio-kms` | | SSE key handling |
-| `crates/objectio-iceberg`, `-unity-catalog`, `-delta-sharing` | | Data lake APIs |
-| `crates/objectio-s3` | | S3 metrics and usage accounting |
-| `crates/objectio-transport-te` | | RDMA shard transport (Mooncake TE) |
+| `crates/gateway` | 9000 | S3 API (`s3.rs`, `s3/`), admin API, Iceberg REST, Unity Catalog, Delta Sharing, console; SigV4/OIDC/STS auth (`authz.rs`); S3 metrics and usage (`s3_metrics/`) |
+| `crates/meta` | 9100 (metrics 9101, admin 9102) | Metadata on Raft (openraft + redb); placement, IAM, tenants, listings, repair |
+| `crates/osd` | 9200 (metrics 9201) | Shards on raw disks |
+| `crates/block-gateway` | 9300 gRPC, 10809 NBD | Block volumes |
+| `bin/{gateway,meta,osd,block-gateway}` | | Their binaries |
+| `bin/aio` | | All of the above in one process |
+| `bin/cli` | | Admin CLI: a SigV4 client of the gateway only (`bin/cli/README.md`) |
+| `bin/{install,io-bench,s3-bench,dedup-estimate}` | | Tools |
+| `crates/common` | | `Error`/`Result`, shared types, metrics, format levels (`version`) |
+| `crates/proto` | | gRPC definitions (`proto/*.proto`, built by its `build.rs`); meta channel (`transport`) |
+| `crates/storage` | | The OSD's disk engine and metadata store |
+| `crates/erasure` | | Erasure coding (rust-simd, ISA-L) |
+| `crates/placement` | | CRUSH placement, topology |
+| `crates/meta-store` | | Meta's redb tables, Raft storage and network |
+| `crates/block` | | Block engine: volumes, write cache, journal |
+| `crates/auth` | | SigV4 (signer too), policies, STS |
+| `crates/kms` | | SSE key handling |
+| `crates/{iceberg,unity-catalog,delta-sharing}` | | Data lake APIs |
+| `crates/transport-te` | | RDMA shard transport (Mooncake TE) |
 | `tests/e2e` | | End-to-end tests against real processes (`src/ha.rs`: multi-process clusters) |
 
 ## Code conventions

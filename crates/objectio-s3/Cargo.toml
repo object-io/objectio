@@ -1,9 +1,0 @@
-[package]
-name = "objectio-s3"
-description = "S3 metrics and usage accounting for the ObjectIO gateway"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-serde = { workspace = true }

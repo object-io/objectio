@@ -24,7 +24,9 @@ bins="$base/target/debug"
 
 # Only releases with format levels can be rolled from: nothing carries
 # over from the ones before (objectio-docs core/upgrade-path.md).
-if ! git -C "$root" cat-file -e "$tag:crates/objectio-common/src/version.rs" 2>/dev/null; then
+# (crates/common since the layout change; crates/objectio-common before.)
+if ! git -C "$root" cat-file -e "$tag:crates/common/src/version.rs" 2>/dev/null &&
+   ! git -C "$root" cat-file -e "$tag:crates/objectio-common/src/version.rs" 2>/dev/null; then
     echo "$tag has no format levels; the first release with them is the earliest" \
          "a rolling upgrade starts from" >&2
     exit 1

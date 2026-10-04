@@ -2253,7 +2253,6 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32c",
- "objectio-client",
  "objectio-common",
  "objectio-proto",
  "parking_lot",
@@ -2294,6 +2293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-block-gateway-bin"
+version = "0.6.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "objectio-block-gateway",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "objectio-cli"
 version = "0.6.0-dev"
 dependencies = [
@@ -2315,18 +2325,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "objectio-client"
-version = "0.6.0-dev"
-dependencies = [
- "objectio-common",
- "objectio-proto",
- "thiserror 2.0.18",
- "tokio",
- "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -2436,7 +2434,6 @@ dependencies = [
  "md-5",
  "memchr",
  "objectio-auth",
- "objectio-client",
  "objectio-common",
  "objectio-delta-sharing",
  "objectio-erasure",
@@ -2444,7 +2441,6 @@ dependencies = [
  "objectio-kms",
  "objectio-placement",
  "objectio-proto",
- "objectio-s3",
  "objectio-transport-te",
  "objectio-unity-catalog",
  "parking_lot",
@@ -2469,6 +2465,17 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "objectio-gateway-bin"
+version = "0.6.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "objectio-gateway",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2569,6 +2576,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-meta-bin"
+version = "0.6.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "objectio-meta",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "objectio-meta-store"
 version = "0.6.0-dev"
 dependencies = [
@@ -2621,6 +2639,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objectio-osd-bin"
+version = "0.6.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "objectio-osd",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "objectio-placement"
 version = "0.6.0-dev"
 dependencies = [
@@ -2647,13 +2676,6 @@ dependencies = [
  "tower 0.4.13",
  "tower 0.5.3",
  "tracing",
-]
-
-[[package]]
-name = "objectio-s3"
-version = "0.6.0-dev"
-dependencies = [
- "serde",
 ]
 
 [[package]]

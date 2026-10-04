@@ -1,0 +1,29 @@
+[package]
+name = "objectio-gateway-bin"
+description = "The objectio-gateway binary: the S3 API gateway (the code is in crates/gateway)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "objectio-gateway"
+path = "src/main.rs"
+
+[dependencies]
+objectio-gateway = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+# ISA-L erasure coding (x86_64).
+isal = ["objectio-gateway/isal"]
+# Shard transfers over Mooncake Transfer Engine.
+rdma = ["objectio-gateway/rdma"]
+# The PCRE2 grep engine.
+pcre2 = ["objectio-gateway/pcre2"]
+# The Hyperscan grep engine.
+hyperscan = ["objectio-gateway/hyperscan"]

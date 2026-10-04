@@ -1,0 +1,27 @@
+[package]
+name = "objectio-osd-bin"
+description = "The objectio-osd binary: the storage daemon (OSD) (the code is in crates/osd)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "objectio-osd"
+path = "src/main.rs"
+
+[dependencies]
+objectio-osd = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+# ISA-L erasure coding (x86_64).
+isal = ["objectio-osd/isal"]
+# Shard I/O through io_uring (Linux).
+io-uring = ["objectio-osd/io-uring"]
+# Shard transfers over Mooncake Transfer Engine.
+rdma = ["objectio-osd/rdma"]
