@@ -428,11 +428,16 @@ async fn audit(
         }
     }
     let mut states: HashMap<(usize, usize, u32), Seen> = HashMap::new();
-    for (node, refs) in asks {
+    // Every node at once: one slow or gone node no longer holds up the rest.
+    let answers = futures::future::join_all(asks.into_iter().map(|(node, refs)| async move {
         let answer = match node_address(meta, &node) {
             Some(addr) => check_shards(&addr, objects, &refs).await,
             None => Err(anyhow::anyhow!("node not registered")),
         };
+        (node, refs, answer)
+    }))
+    .await;
+    for (node, refs, answer) in answers {
         match answer {
             Ok(got) => {
                 for (r, st) in refs.into_iter().zip(got) {
@@ -448,46 +453,68 @@ async fn audit(
         }
     }
 
-    for (oi, object) in objects.iter().enumerate() {
-        STATS.objects.fetch_add(1, Ordering::Relaxed);
-        let mut healthy = true;
-        for (si, stripe) in object.stripes.iter().enumerate() {
-            if !repairable(stripe) {
-                continue;
-            }
-            let total = (stripe.ec_k + stripe.ec_m) as usize;
-            let mut seen = vec![Seen::Unplaced; total];
-            for loc in &stripe.shards {
-                if let Some(slot) = seen.get_mut(loc.position as usize) {
-                    *slot = states
-                        .get(&(oi, si, loc.position))
-                        .copied()
-                        .unwrap_or(Seen::Unknown);
-                }
-            }
-            let v = verdict(&seen, stripe.ec_k as usize);
-            healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
-            match v {
-                Verdict::Healthy => {}
-                Verdict::Unrecoverable { good } => {
-                    STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "repair: {}/{} stripe {} has {good} good shards, needs {}",
-                        object.bucket, object.key, stripe.stripe_id, stripe.ec_k
-                    );
-                }
-                Verdict::Rebuild { bad, good } => {
-                    if let Err(e) = rebuild(meta, source, object, stripe, &seen, &bad, &good).await
-                    {
-                        STATS.errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "repair: {}/{} stripe {}: {e}",
-                            object.bucket, object.key, stripe.stripe_id
-                        );
+    // Rebuilds, REBUILDS_AT_ONCE objects at a time (each one's reads are
+    // parallel too): one at a time, a replaced disk took hours (B24).
+    use futures::FutureExt;
+    let states = &states;
+    let rebuilds: Vec<futures::future::BoxFuture<'_, bool>> = objects
+        .iter()
+        .enumerate()
+        .map(|(oi, object)| {
+            async move {
+                STATS.objects.fetch_add(1, Ordering::Relaxed);
+                let mut healthy = true;
+                for (si, stripe) in object.stripes.iter().enumerate() {
+                    if !repairable(stripe) {
+                        continue;
+                    }
+                    let total = (stripe.ec_k + stripe.ec_m) as usize;
+                    let mut seen = vec![Seen::Unplaced; total];
+                    for loc in &stripe.shards {
+                        if let Some(slot) = seen.get_mut(loc.position as usize) {
+                            *slot = states
+                                .get(&(oi, si, loc.position))
+                                .copied()
+                                .unwrap_or(Seen::Unknown);
+                        }
+                    }
+                    let v = verdict(&seen, stripe.ec_k as usize);
+                    healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
+                    match v {
+                        Verdict::Healthy => {}
+                        Verdict::Unrecoverable { good } => {
+                            STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "repair: {}/{} stripe {} has {good} good shards, needs {}",
+                                object.bucket, object.key, stripe.stripe_id, stripe.ec_k
+                            );
+                        }
+                        Verdict::Rebuild { bad, good } => {
+                            if let Err(e) =
+                                rebuild(meta, source, object, stripe, &seen, &bad, &good).await
+                            {
+                                STATS.errors.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    "repair: {}/{} stripe {}: {e}",
+                                    object.bucket, object.key, stripe.stripe_id
+                                );
+                            }
+                        }
                     }
                 }
+                healthy
             }
-        }
+            .boxed()
+        })
+        .collect();
+    use futures::StreamExt;
+    let healthy: Vec<bool> = futures::stream::iter(rebuilds)
+        .buffered(REBUILDS_AT_ONCE)
+        .collect()
+        .await;
+
+    // Then, in order: backfill (bounded by `moves`) and listings.
+    for (object, healthy) in objects.iter().zip(healthy) {
         let Source::Osd(owner_addr) = source else {
             continue;
         };
@@ -508,6 +535,9 @@ async fn audit(
         }
     }
 }
+
+/// Objects one repair pass rebuilds at once.
+const REBUILDS_AT_ONCE: usize = 16;
 
 fn node_address(meta: &MetaService, node_id: &[u8]) -> Option<String> {
     let id = <[u8; 16]>::try_from(node_id).ok()?;
@@ -576,22 +606,36 @@ async fn rebuild(
     // k good shards, verified against their checksums.
     let mut survivors: Vec<Option<Vec<u8>>> = vec![None; total];
     let mut have = 0;
-    for &p in good {
-        if have == k {
-            break;
-        }
-        let Some(addr) = located
-            .get(&(p as u32))
-            .and_then(|l| node_address(meta, &l.node_id))
-        else {
-            continue;
-        };
-        match read_shard(&addr, &id, stripe.stripe_id, p as u32).await {
-            Ok(bytes) => {
-                survivors[p] = Some(bytes);
-                have += 1;
+    // As many reads at once as shards still needed; a failed one is made
+    // up from the next good positions.
+    let mut candidates: std::collections::VecDeque<usize> = good.iter().copied().collect();
+    while have < k && !candidates.is_empty() {
+        let batch: Vec<usize> = (0..(k - have).min(candidates.len()))
+            .filter_map(|_| candidates.pop_front())
+            .collect();
+        let reads = batch.into_iter().map(|p| {
+            let addr = located
+                .get(&(p as u32))
+                .and_then(|l| node_address(meta, &l.node_id));
+            let id = &id;
+            async move {
+                let Some(addr) = addr else {
+                    return (
+                        p,
+                        Err(anyhow::anyhow!("position {p} has no reachable holder")),
+                    );
+                };
+                (p, read_shard(&addr, id, stripe.stripe_id, p as u32).await)
             }
-            Err(e) => debug!("repair: read of position {p} from {addr}: {e}"),
+        });
+        for (p, r) in futures::future::join_all(reads).await {
+            match r {
+                Ok(bytes) => {
+                    survivors[p] = Some(bytes);
+                    have += 1;
+                }
+                Err(e) => debug!("repair: read of position {p}: {e}"),
+            }
         }
     }
     if have < k {

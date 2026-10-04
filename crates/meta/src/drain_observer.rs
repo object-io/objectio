@@ -821,11 +821,29 @@ async fn find_affected_objects(
     Ok(resp.into_inner().objects)
 }
 
+/// One channel per OSD address, kept: repair and drain made a connection
+/// (with mTLS, a handshake) for every call, which bounded a rebuild at
+/// about 50 shards a second (B24). A tonic channel reconnects by itself
+/// after its OSD restarts; every call has its own timeout.
+static CHANNELS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Channel>>> =
+    std::sync::LazyLock::new(Default::default);
+
 pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
+    if let Some(ch) = CHANNELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(address)
+    {
+        return Ok(ch.clone());
+    }
     let endpoint = objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?;
     let channel = tokio::time::timeout(PER_OSD_TIMEOUT, endpoint.connect())
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+    CHANNELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(address.to_string(), channel.clone());
     Ok(channel)
 }
 
