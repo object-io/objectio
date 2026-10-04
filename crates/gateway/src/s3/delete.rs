@@ -686,19 +686,24 @@ pub(crate) async fn delete_object_to_the_end(
         }
     }
 
-    // Unregister from Meta's listing index. Non-fatal if it fails —
-    // the next ListObjects sweep will re-check the OSDs and prune.
+    // Unregister from Meta's listing index. If meta can't take it now (an
+    // election), sync_listing retries and then queues the key for healing:
+    // the error was dropped here, and the key stayed listed for good.
     {
         use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
         let mut meta_client = state.meta_client.clone();
-        let _ = meta_client
+        if let Err(e) = meta_client
             .delete_object(MetaDelReq {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: String::new(),
                 forget_home: never_versioned,
             })
-            .await;
+            .await
+        {
+            warn!("{bucket}/{key}: listing not removed ({e}); retrying");
+            sync_listing(&state, &placement.nodes, &bucket, &key).await;
+        }
     }
 
     info!("Deleted object: {}/{}", bucket, key);
