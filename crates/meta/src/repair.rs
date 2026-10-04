@@ -883,6 +883,8 @@ async fn write_shard(
             ec_m: stripe.ec_m,
             checksum,
             rdma: None,
+            // Restores redundancy: may use the space kept from client writes.
+            use_reserve: true,
         }),
     )
     .await??

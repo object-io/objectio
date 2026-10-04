@@ -89,6 +89,9 @@ hyperscan = { version = "0.3", optional = true }
 kube = { version = "0.97", default-features = false, features = ["client", "rustls-tls"] }
 k8s-openapi = { version = "0.23", default-features = false, features = ["v1_29"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default = []
 # Forwards ISA-L erasure coding (x86_64) to objectio-erasure, so the

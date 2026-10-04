@@ -107,6 +107,12 @@ pub struct Args {
     #[arg(long, default_value_t = 50)]
     pub scrub_rate_mib: u64,
 
+    /// The share of each disk client writes may fill; past it they are
+    /// refused (the gateway answers 507), and the rest is kept for repair,
+    /// drain and backfill.
+    #[arg(long, env = "OBJECTIO_OSD_FULL_RATIO", default_value_t = crate::service::DEFAULT_FULL_RATIO)]
+    pub full_ratio: f64,
+
     /// Accept shard transfers over Mooncake Transfer Engine: `rdma`, or
     /// `tcp` to develop without RDMA hardware. Unset: gRPC bytes only.
     #[cfg(feature = "rdma")]
@@ -385,7 +391,7 @@ pub async fn run(
     info!("Data directory: {}", data_dir);
     let disk_paths = disks.clone();
     let osd_service = match OsdService::new(disk_paths, block_size as u32, data_path) {
-        Ok(s) => s,
+        Ok(s) => s.with_full_ratio(args.full_ratio),
         Err(e) => {
             error!("Failed to initialize OSD: {}", e);
             std::process::exit(1);

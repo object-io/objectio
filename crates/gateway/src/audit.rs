@@ -29,7 +29,15 @@
 //!
 //! ## Delivery
 //!
-//! Events are queued in memory and delivered at least once: a webhook batch
+//! With a spool (`--audit-spool`, A8c), every event is on the gateway's disk
+//! before it is delivered (`crate::audit_spool`), and each target is fed
+//! from there by a shipper with a durable cursor: a gateway killed or a
+//! receiver down loses nothing; it is caught up when it is back. With
+//! `--audit-system-bucket`, the system always audits: every event also goes
+//! to that internal bucket, as JSON-lines objects by hour.
+//!
+//! Without a spool (development), events are queued in memory and delivered
+//! at least once: a webhook batch
 //! is retried with backoff until it is taken, so a receiver may see an event
 //! twice (dedupe on `id`). Each target has a bounded queue; when it is full
 //! — the receiver has been down a long time — new events for it are dropped
@@ -378,6 +386,8 @@ pub(crate) fn tenant_url_allowed(url: &str, allowed: &[String], what: &str) -> R
 /// Collects events from requests and hands them to the dispatcher.
 pub struct Auditor {
     tx: mpsc::Sender<AuditEvent>,
+    /// Where events go first when spooling (A8c).
+    spool: Option<Arc<crate::audit_spool::Spool>>,
     /// Whether any target is listening. When none is, requests still get
     /// an ID but no event is built.
     active: Arc<AtomicBool>,
@@ -393,22 +403,83 @@ impl Auditor {
         meta: MetadataServiceClient<Channel>,
         log: Option<String>,
         trusted_proxies: crate::origin::TrustedProxies,
+        spool: Option<Arc<crate::audit_spool::Spool>>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(INGEST_QUEUE);
-        let active = Arc::new(AtomicBool::new(log.is_some()));
+        // Spooling, every event is kept: the system bucket takes them all.
+        let active = Arc::new(AtomicBool::new(log.is_some() || spool.is_some()));
         let auditor = Arc::new(Self {
             tx,
+            spool: spool.clone(),
             active: Arc::clone(&active),
             reload: tokio::sync::Notify::new(),
             trusted_proxies,
         });
         let (cfg_tx, cfg_rx) = watch::channel(Config::default());
         tokio::spawn(reload_loop(Arc::clone(&auditor), meta, cfg_tx));
-        tokio::spawn(dispatch(rx, cfg_rx, log, active));
+        match spool {
+            Some(spool) => {
+                tokio::spawn(dispatch_spooled(spool, cfg_rx, log));
+            }
+            None => {
+                tokio::spawn(dispatch(rx, cfg_rx, log, active));
+            }
+        }
         auditor
     }
 
+    /// The system always audits (A8c): every event also goes to `bucket`
+    /// in this cluster, created if missing with `retention_days` (0: kept).
+    /// Needs the spool.
+    pub fn start_system_bucket(&self, state: Arc<AppState>, bucket: String, retention_days: u32) {
+        let Some(spool) = self.spool.clone() else {
+            warn!("audit: --audit-system-bucket needs --audit-spool; not started");
+            return;
+        };
+        let (_stop_tx, stop) = watch::channel(false);
+        tokio::spawn(async move {
+            ensure_system_bucket(&state, &bucket, retention_days).await;
+            let sink = Sink::Bucket {
+                state,
+                bucket,
+                gateway: spool.id.clone(),
+            };
+            // Held for the gateway's life: the system bucket never stops.
+            let _keep = _stop_tx;
+            ship(spool, "system".into(), Filter::All, sink, stop).await;
+        });
+    }
+
+    /// On the way out: give the shippers up to `within` to deliver what is
+    /// in the spool, so a gateway that is replaced rather than restarted
+    /// (a pod deleted, with its spool) leaves nothing behind.
+    pub async fn drain(&self, within: Duration) {
+        let Some(spool) = &self.spool else {
+            return;
+        };
+        spool.sync();
+        let end = *spool.durable().borrow();
+        let deadline = Instant::now() + within;
+        while !spool.caught_up(end) {
+            if Instant::now() > deadline {
+                warn!(
+                    "audit: shutting down with {} bytes not yet delivered (kept in the spool)",
+                    spool.bytes()
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     fn submit(&self, event: AuditEvent) {
+        if let Some(spool) = &self.spool {
+            let ok = serde_json::to_vec(&event).is_ok_and(|line| spool.append(&line));
+            if !ok {
+                DROPPED.inc(&label("spool"));
+            }
+            return;
+        }
         if self.tx.try_send(event).is_err() {
             DROPPED.inc(&label("ingest"));
         }
@@ -772,6 +843,397 @@ async fn run_webhook(name: String, w: Webhook, mut rx: mpsc::Receiver<AuditEvent
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
+// ── Spooled delivery (A8c) ──────────────────────────────────────────────
+
+use crate::audit_spool::{Pos, Spool};
+
+/// Which events a spooled target delivers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Filter {
+    /// Every event (the system bucket, the command-line file).
+    All,
+    /// The operator's targets.
+    Cluster { include_reads: bool },
+    /// A tenant's: events on its buckets or by its principals.
+    Tenant { tenant: String, include_reads: bool },
+}
+
+/// What a filter needs of a spooled event.
+#[derive(Deserialize)]
+struct Routed {
+    method: String,
+    #[serde(default)]
+    bucket_tenant: Option<String>,
+    #[serde(default)]
+    principal: RoutedPrincipal,
+}
+
+#[derive(Deserialize, Default)]
+struct RoutedPrincipal {
+    #[serde(default)]
+    tenant: String,
+}
+
+impl Filter {
+    fn wants(&self, line: &[u8]) -> bool {
+        let reads =
+            |include: bool, r: &Routed| include || !matches!(r.method.as_str(), "GET" | "HEAD");
+        match self {
+            Self::All => true,
+            Self::Cluster { include_reads } => {
+                serde_json::from_slice::<Routed>(line).is_ok_and(|r| reads(*include_reads, &r))
+            }
+            Self::Tenant {
+                tenant,
+                include_reads,
+            } => serde_json::from_slice::<Routed>(line).is_ok_and(|r| {
+                reads(*include_reads, &r)
+                    && (r.bucket_tenant.as_deref() == Some(tenant.as_str())
+                        || r.principal.tenant == *tenant)
+            }),
+        }
+    }
+}
+
+/// Where a spooled target sends a batch.
+enum Sink {
+    Stdout,
+    File(String),
+    Webhook(Webhook, reqwest::Client),
+    /// An internal bucket: one object per batch, named after the batch's
+    /// place in the spool, so a batch sent again replaces itself.
+    Bucket {
+        state: Arc<AppState>,
+        bucket: String,
+        gateway: String,
+    },
+}
+
+impl Sink {
+    fn of(spec: &Target) -> Self {
+        match spec {
+            Target::Stdout { .. } => Self::Stdout,
+            Target::Webhook(w) => Self::Webhook(
+                w.clone(),
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    // Never follow a redirect: a tenant's allowed host could
+                    // otherwise bounce events anywhere.
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Deliver `body` (JSON lines; the batch starts at `at` in the spool and
+    /// its first event is `first`). True once the target took it.
+    async fn send(&self, name: &str, body: Vec<u8>, at: Pos, first: &[u8]) -> bool {
+        match self {
+            Self::Stdout => {
+                let mut out = tokio::io::stdout();
+                out.write_all(&body).await.is_ok() && out.flush().await.is_ok()
+            }
+            Self::File(path) => {
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await;
+                match file {
+                    Ok(mut f) => f.write_all(&body).await.is_ok() && f.flush().await.is_ok(),
+                    Err(e) => {
+                        warn!("audit log {path}: {e}");
+                        false
+                    }
+                }
+            }
+            Self::Webhook(w, client) => {
+                let mut req = client
+                    .post(&w.url)
+                    .header("Content-Type", "application/x-ndjson")
+                    .body(body);
+                if !w.auth_token.is_empty() {
+                    req = req.bearer_auth(&w.auth_token);
+                }
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => true,
+                    Ok(r) => {
+                        warn!("audit target {name}: {} from {}", r.status(), w.url);
+                        false
+                    }
+                    Err(e) => {
+                        warn!("audit target {name}: {e}");
+                        false
+                    }
+                }
+            }
+            Self::Bucket {
+                state,
+                bucket,
+                gateway,
+            } => {
+                // By the hour of the batch's first event: "2026-10-04T12:…".
+                let time = serde_json::from_slice::<serde_json::Value>(first)
+                    .ok()
+                    .and_then(|v| v["time"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let hour = if time.len() >= 13 {
+                    format!(
+                        "{}/{}/{}/{}",
+                        &time[0..4],
+                        &time[5..7],
+                        &time[8..10],
+                        &time[11..13]
+                    )
+                } else {
+                    "undated".to_string()
+                };
+                let key = format!("{hour}/{gateway}-{:020}-{:020}.ndjson", at.seg, at.off);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-ndjson"),
+                );
+                let put = crate::s3::put_object(
+                    State(Arc::clone(state)),
+                    axum::extract::Path((bucket.clone(), key)),
+                    None,
+                    headers,
+                    Bytes::from(body),
+                )
+                .await;
+                let ok = put.status() == StatusCode::OK;
+                if !ok {
+                    warn!("audit: system bucket {bucket}: {}", put.status());
+                }
+                ok
+            }
+        }
+    }
+}
+
+/// Batch size and how long a shipper waits for more events to fill one.
+const SPOOL_BATCH: usize = DEFAULT_BATCH;
+const SPOOL_FILL: Duration = Duration::from_millis(500);
+
+/// Feed one target from the spool until `stop`: a batch of what it wants
+/// from its cursor, sent until taken, then the cursor moved past it.
+async fn ship(
+    spool: Arc<Spool>,
+    key: String,
+    filter: Filter,
+    sink: Sink,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut cursor = spool.cursor(&key);
+    let mut durable = spool.durable();
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let read = {
+            let spool = Arc::clone(&spool);
+            tokio::task::spawn_blocking(move || spool.read(cursor, SPOOL_BATCH))
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|r| r)
+        };
+        let lines = match read {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("audit spool {key}: {e}");
+                FAILURES.inc(&label(&key));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        if lines.len() < SPOOL_BATCH {
+            // Wait for more (or a stop), then send what there is.
+            tokio::select! {
+                _ = stop.changed() => {}
+                () = tokio::time::sleep(SPOOL_FILL) => {}
+                _ = durable.changed(), if lines.is_empty() => {}
+            }
+            if lines.is_empty() {
+                continue;
+            }
+        }
+        let start = cursor;
+        let end = lines.last().map_or(cursor, |(p, _)| *p);
+        let picked: Vec<&Vec<u8>> = lines
+            .iter()
+            .map(|(_, l)| l)
+            .filter(|l| filter.wants(l))
+            .collect();
+        if let Some(first) = picked.first() {
+            let mut body = Vec::with_capacity(picked.iter().map(|l| l.len() + 1).sum());
+            for l in &picked {
+                body.extend_from_slice(l);
+                body.push(b'\n');
+            }
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                if sink.send(&key, body.clone(), start, first).await {
+                    EVENTS.add(&label(&key), picked.len() as u64);
+                    break;
+                }
+                FAILURES.inc(&label(&key));
+                if *stop.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = stop.changed() => return,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+        if let Err(e) = spool.advance(&key, end) {
+            warn!("audit spool {key}: cannot save the cursor: {e}");
+        }
+        cursor = end;
+    }
+}
+
+/// A running spooled target.
+struct Shipper {
+    stop: watch::Sender<bool>,
+    spec: (Target, Filter),
+}
+
+/// Spooled: start, restart and stop shippers so they match the config.
+async fn dispatch_spooled(
+    spool: Arc<Spool>,
+    mut cfg_rx: watch::Receiver<Config>,
+    log: Option<String>,
+) {
+    // The command-line file takes every event, whatever the config.
+    let _log_stop = log.map(|path| {
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(ship(
+            Arc::clone(&spool),
+            "file".into(),
+            Filter::All,
+            Sink::File(path),
+            rx,
+        ));
+        tx
+    });
+    let mut running: HashMap<String, Shipper> = HashMap::new();
+    while cfg_rx.changed().await.is_ok() {
+        let cfg = cfg_rx.borrow_and_update().clone();
+        let mut wanted: HashMap<String, (Target, Filter)> = HashMap::new();
+        if let Some(c) = cfg.cluster.as_ref().filter(|c| c.enabled) {
+            for t in &c.targets {
+                wanted.insert(
+                    format!("c/{}", t.name()),
+                    (
+                        t.clone(),
+                        Filter::Cluster {
+                            include_reads: c.include_reads,
+                        },
+                    ),
+                );
+            }
+            for (tenant, ta) in &cfg.tenants {
+                if !ta.enabled {
+                    continue;
+                }
+                for w in &ta.targets {
+                    if let Err(e) = tenant_url_allowed(&w.url, &c.allowed_tenant_hosts, WEBHOOK) {
+                        debug!("audit: tenant {tenant} target {}: {e}", w.name);
+                        continue;
+                    }
+                    wanted.insert(
+                        format!("t/{tenant}/{}", w.name),
+                        (
+                            Target::Webhook(w.clone()),
+                            Filter::Tenant {
+                                tenant: tenant.clone(),
+                                include_reads: ta.include_reads,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+        // Gone: stopped, and its cursor no longer holds the spool.
+        // Changed: restarted from where it was.
+        running.retain(|key, shipper| match wanted.get(key) {
+            Some(spec) if *spec == shipper.spec => true,
+            Some(_) => {
+                let _ = shipper.stop.send(true);
+                false
+            }
+            None => {
+                let _ = shipper.stop.send(true);
+                spool.forget(key);
+                false
+            }
+        });
+        for (key, spec) in wanted {
+            if running.contains_key(&key) {
+                continue;
+            }
+            let (stop, rx) = watch::channel(false);
+            tokio::spawn(ship(
+                Arc::clone(&spool),
+                key.clone(),
+                spec.1.clone(),
+                Sink::of(&spec.0),
+                rx,
+            ));
+            running.insert(key, Shipper { stop, spec });
+        }
+    }
+}
+
+/// The system bucket: created (in the system scope) if missing, with a
+/// rule expiring events after `retention_days` (0: kept).
+async fn ensure_system_bucket(state: &AppState, bucket: &str, retention_days: u32) {
+    use objectio_proto::metadata::{
+        CreateBucketRequest, LifecycleConfiguration, LifecycleRule, PutBucketLifecycleRequest,
+    };
+    let mut meta = state.meta_client.clone();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match meta
+            .create_bucket(CreateBucketRequest {
+                name: bucket.to_string(),
+                owner: "system".into(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => break,
+            Err(e) if e.code() == tonic::Code::AlreadyExists => break,
+            Err(e) => {
+                warn!("audit: cannot create the system bucket {bucket}: {e}; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+    if retention_days > 0 {
+        let rule = LifecycleRule {
+            id: "audit-retention".into(),
+            enabled: true,
+            expiration_days: retention_days,
+            ..Default::default()
+        };
+        if let Err(e) = meta
+            .put_bucket_lifecycle(PutBucketLifecycleRequest {
+                bucket: bucket.to_string(),
+                config: Some(LifecycleConfiguration { rules: vec![rule] }),
+            })
+            .await
+        {
+            warn!("audit: cannot set retention on {bucket}: {e}");
         }
     }
 }
