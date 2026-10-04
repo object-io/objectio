@@ -28,6 +28,13 @@
 //! place, and one never written is rebuilt on its placement OSD and its
 //! location added to every chunk record holding the stripe.
 //!
+//! A stripe whose shards are all good but two of them on one OSD (written
+//! while an OSD was out, so placement doubled up) is spread (B20,
+//! backfill): the extra shard is copied to an active OSD holding none of
+//! the stripe, every ObjectMeta copy and the key's home are moved to it,
+//! and the old copy is deleted once reads that may still use it are done.
+//! A few moves per pass, so a returning OSD is filled without a storm.
+//!
 //! Out of scope here: replicated and LRC stripes, shards on OSDs that do
 //! not answer (they may be rebooting; drain handles OSDs that are gone),
 //! and version entries other than the current one.
@@ -44,8 +51,8 @@ use objectio_proto::metadata::{
     ShardLocation, StripeMeta,
 };
 use objectio_proto::storage::{
-    CheckShardsRequest, GetObjectMetaRequest, ListObjectsMetaRequest, PutObjectMetaRequest,
-    ReadShardRequest, ShardId, ShardState, WriteShardRequest,
+    CheckShardsRequest, DeleteShardRequest, GetObjectMetaRequest, ListObjectsMetaRequest,
+    PutObjectMetaRequest, ReadShardRequest, ShardId, ShardState, WriteShardRequest,
     storage_service_client::StorageServiceClient,
 };
 use tracing::{debug, info, warn};
@@ -59,6 +66,17 @@ const PAGE: u32 = 200;
 /// Per-RPC timeout. Shard reads and writes move up to 4 MiB.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shards moved per pass at most (backfill).
+const MOVES_PER_PASS: usize = 64;
+
+/// How long a moved shard's old copy is kept: a read that fetched the
+/// ObjectMeta before the move may still be reading it.
+const MOVED_GRACE: Duration = Duration::from_secs(2 * 30);
+
+/// Old copies of moved shards, deleted once due: (due, OSD address, shard).
+static MOVED: std::sync::Mutex<Vec<(std::time::Instant, String, ShardId)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// What the repairer has done since this node started.
 #[derive(Default)]
 struct Stats {
@@ -68,6 +86,7 @@ struct Stats {
     rebuilt_corrupt: AtomicU64,
     unrecoverable: AtomicU64,
     listings_restored: AtomicU64,
+    moved: AtomicU64,
     errors: AtomicU64,
     block_stripes: AtomicU64,
     last_pass_ms: AtomicU64,
@@ -81,6 +100,7 @@ static STATS: Stats = Stats {
     rebuilt_corrupt: AtomicU64::new(0),
     unrecoverable: AtomicU64::new(0),
     listings_restored: AtomicU64::new(0),
+    moved: AtomicU64::new(0),
     errors: AtomicU64::new(0),
     block_stripes: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
@@ -144,6 +164,11 @@ pub fn render_metrics(out: &mut String) {
             &s.listings_restored,
         ),
         (
+            "objectio_meta_repair_shards_moved_total",
+            "Shards moved off an OSD holding two of their stripe (backfill)",
+            &s.moved,
+        ),
+        (
             "objectio_meta_repair_errors_total",
             "Repairs that failed and will be retried next pass",
             &s.errors,
@@ -179,6 +204,8 @@ pub fn render_metrics(out: &mut String) {
 /// One full pass over every object on every OSD that is not Out.
 pub async fn pass(meta: &Arc<MetaService>) {
     let started = std::time::Instant::now();
+    release_moved().await;
+    let mut moves = MOVES_PER_PASS;
     let osds: Vec<([u8; 16], String)> = meta
         .osd_nodes_snapshot()
         .into_iter()
@@ -202,7 +229,7 @@ pub async fn pass(meta: &Arc<MetaService>) {
                 .into_iter()
                 .filter(|o| owner(o) == Some(node_id.as_slice()))
                 .collect();
-            audit(meta, Source::Osd(&address), &owned).await;
+            audit(meta, Source::Osd(&address), &owned, &mut moves).await;
             if next.is_empty() {
                 break;
             }
@@ -217,7 +244,7 @@ pub async fn pass(meta: &Arc<MetaService>) {
         STATS
             .block_stripes
             .fetch_add(objects.len() as u64, Ordering::Relaxed);
-        audit(meta, Source::Block, &objects).await;
+        audit(meta, Source::Block, &objects, &mut 0).await;
     }
     // Packs: their shards are recorded once, in meta's pack table; the
     // objects in them name the pack and hold no shards of their own.
@@ -231,7 +258,7 @@ pub async fn pass(meta: &Arc<MetaService>) {
         if !meta.is_raft_leader() {
             return;
         }
-        audit(meta, Source::Pack, page).await;
+        audit(meta, Source::Pack, page, &mut 0).await;
     }
     STATS.passes.fetch_add(1, Ordering::Relaxed);
     STATS.last_pass_ms.store(
@@ -378,7 +405,14 @@ fn repairable(stripe: &StripeMeta) -> bool {
     ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0 && stripe.pack_id.is_empty()
 }
 
-async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMeta]) {
+/// Check `objects`' stripes and repair them; spread doubled-up ones (an
+/// object's own, from an OSD listing) while `moves` lasts.
+async fn audit(
+    meta: &Arc<MetaService>,
+    source: Source<'_>,
+    objects: &[ObjectMeta],
+    moves: &mut usize,
+) {
     // Every listed shard of every repairable stripe, grouped by node, so
     // each node is asked once for the whole page.
     let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
@@ -416,6 +450,7 @@ async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMet
 
     for (oi, object) in objects.iter().enumerate() {
         STATS.objects.fetch_add(1, Ordering::Relaxed);
+        let mut healthy = true;
         for (si, stripe) in object.stripes.iter().enumerate() {
             if !repairable(stripe) {
                 continue;
@@ -430,7 +465,9 @@ async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMet
                         .unwrap_or(Seen::Unknown);
                 }
             }
-            match verdict(&seen, stripe.ec_k as usize) {
+            let v = verdict(&seen, stripe.ec_k as usize);
+            healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
+            match v {
                 Verdict::Healthy => {}
                 Verdict::Unrecoverable { good } => {
                     STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
@@ -454,6 +491,17 @@ async fn audit(meta: &Arc<MetaService>, source: Source<'_>, objects: &[ObjectMet
         let Source::Osd(owner_addr) = source else {
             continue;
         };
+        if healthy && *moves > 0 && doubled_up(object) {
+            match spread(meta, owner_addr, object, moves).await {
+                Ok(n) => {
+                    STATS.moved.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    STATS.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!("backfill: {}/{}: {e}", object.bucket, object.key);
+                }
+            }
+        }
         if let Err(e) = restore_listing(meta, owner_addr, object).await {
             STATS.errors.fetch_add(1, Ordering::Relaxed);
             warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
@@ -629,6 +677,165 @@ async fn rebuild(
     Ok(())
 }
 
+/// Whether any of the object's stripes has two shards on one OSD.
+fn doubled_up(object: &ObjectMeta) -> bool {
+    object.stripes.iter().filter(|s| repairable(s)).any(|s| {
+        let mut nodes = std::collections::HashSet::new();
+        s.shards.iter().any(|l| !nodes.insert(l.node_id.as_slice()))
+    })
+}
+
+/// Move the extra shards off OSDs holding two of a stripe to active OSDs
+/// holding none (B20). The object's stripes are all good (checked by the
+/// caller). Each shard is copied first; then every ObjectMeta copy and the
+/// key's home follow; the old copies are deleted after [`MOVED_GRACE`].
+/// Returns the shards moved.
+async fn spread(
+    meta: &Arc<MetaService>,
+    owner_addr: &str,
+    object: &ObjectMeta,
+    budget: &mut usize,
+) -> anyhow::Result<usize> {
+    // (stripe id, the shard's old location, its new one, old OSD's address)
+    let mut moved: Vec<(u64, ShardLocation, ShardLocation, String)> = Vec::new();
+    for stripe in object.stripes.iter().filter(|s| repairable(s)) {
+        let mut holders: std::collections::HashSet<Vec<u8>> =
+            stripe.shards.iter().map(|l| l.node_id.clone()).collect();
+        let mut kept = std::collections::HashSet::new();
+        let mut shards = stripe.shards.clone();
+        shards.sort_by_key(|l| l.position);
+        for old in shards {
+            if kept.insert(old.node_id.clone()) || *budget == 0 {
+                continue;
+            }
+            let Some((to, to_addr)) = meta.spread_target(&object.object_id, &holders) else {
+                break; // every active OSD holds a shard of it already
+            };
+            let from_addr = node_address(meta, &old.node_id).ok_or_else(|| {
+                anyhow::anyhow!("holder of position {} not registered", old.position)
+            })?;
+            let bytes = read_shard(
+                &from_addr,
+                &stripe.object_id,
+                stripe.stripe_id,
+                old.position,
+            )
+            .await?;
+            let at = write_shard(&to_addr, &stripe.object_id, stripe, old.position, bytes).await?;
+            holders.insert(to.to_vec());
+            *budget -= 1;
+            info!(
+                "backfill: {}/{} stripe {} position {} from {from_addr} to {to_addr}",
+                object.bucket, object.key, stripe.stripe_id, old.position
+            );
+            let new = ShardLocation {
+                node_id: to.to_vec(),
+                disk_id: at.disk_id,
+                offset: at.offset,
+                ..old.clone()
+            };
+            moved.push((stripe.stripe_id, old, new, from_addr));
+        }
+    }
+    if moved.is_empty() {
+        return Ok(0);
+    }
+
+    let changes: Vec<(u64, ShardLocation, ShardLocation)> = moved
+        .iter()
+        .map(|(id, old, new, _)| (*id, old.clone(), new.clone()))
+        .collect();
+    // On failure the new copies are left: some ObjectMeta copies may name
+    // them already. A leak, never a loss.
+    update_locations(meta, owner_addr, object, |fresh| {
+        for (stripe_id, old, new) in changes {
+            let loc = fresh
+                .stripes
+                .iter_mut()
+                .find(|s| s.stripe_id == stripe_id)
+                .and_then(|s| s.shards.iter_mut().find(|l| l.position == old.position))
+                .filter(|l| l.node_id == old.node_id)
+                .ok_or_else(|| anyhow::anyhow!("position {} moved meanwhile", old.position))?;
+            *loc = new;
+        }
+        Ok(())
+    })
+    .await?;
+
+    // The key's home: by position, as stripe 0 is placed.
+    let home_moves: Vec<(u32, Vec<u8>, Vec<u8>)> = moved
+        .iter()
+        .filter(|(id, ..)| Some(*id) == object.stripes.first().map(|s| s.stripe_id))
+        .map(|(_, old, new, _)| (old.position, old.node_id.clone(), new.node_id.clone()))
+        .collect();
+    if let Err(e) = meta
+        .move_object_home(&object.bucket, &object.key, &home_moves)
+        .await
+    {
+        // The shards moved; a later write of the key may double up again.
+        warn!(
+            "backfill: {}/{}: home not moved: {e}",
+            object.bucket, object.key
+        );
+    }
+
+    let due = std::time::Instant::now() + MOVED_GRACE;
+    let mut queue = MOVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let stripes: HashMap<u64, &StripeMeta> =
+        object.stripes.iter().map(|s| (s.stripe_id, s)).collect();
+    for (stripe_id, old, _, from_addr) in &moved {
+        if let Some(stripe) = stripes.get(stripe_id) {
+            queue.push((
+                due,
+                from_addr.clone(),
+                ShardId {
+                    object_id: stripe.object_id.clone(),
+                    stripe_id: *stripe_id,
+                    position: old.position,
+                },
+            ));
+        }
+    }
+    Ok(moved.len())
+}
+
+/// Delete moved shards' old copies that are due. One that can't be deleted
+/// now is tried again next pass.
+async fn release_moved() {
+    let now = std::time::Instant::now();
+    let due: Vec<(std::time::Instant, String, ShardId)> = {
+        let mut queue = MOVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (due, later) = queue.drain(..).partition(|(at, ..)| *at <= now);
+        *queue = later;
+        due
+    };
+    for (at, addr, shard) in due {
+        let deleted = async {
+            let mut client = StorageServiceClient::new(open_channel(&addr).await?);
+            tokio::time::timeout(
+                RPC_TIMEOUT,
+                client.delete_shard(DeleteShardRequest {
+                    shard_id: Some(shard.clone()),
+                }),
+            )
+            .await??;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = deleted {
+            debug!("backfill: old copy on {addr} not deleted yet: {e}");
+            MOVED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((at, addr, shard));
+        }
+    }
+}
+
 async fn read_shard(
     address: &str,
     object_id: &[u8],
@@ -711,23 +918,39 @@ async fn record_locations(
     stripe_id: u64,
     added: Vec<ShardLocation>,
 ) -> anyhow::Result<()> {
+    update_locations(meta, owner_addr, object, |fresh| {
+        let stripe = fresh
+            .stripes
+            .iter_mut()
+            .find(|s| s.stripe_id == stripe_id)
+            .ok_or_else(|| anyhow::anyhow!("stripe {stripe_id} is gone"))?;
+        for loc in added {
+            if stripe.shards.iter().all(|l| l.position != loc.position) {
+                stripe.shards.push(loc);
+            }
+        }
+        stripe.shards.sort_by_key(|l| l.position);
+        Ok(())
+    })
+    .await
+}
+
+/// Change where the object's shards are, with `edit`, in its ObjectMeta on
+/// every node that holds a copy (and every node that holds a shard after
+/// the change) — only if the key still holds this object.
+async fn update_locations(
+    meta: &Arc<MetaService>,
+    owner_addr: &str,
+    object: &ObjectMeta,
+    edit: impl FnOnce(&mut ObjectMeta) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let Some(mut fresh) = get_object_meta(owner_addr, object).await? else {
         return Err(anyhow::anyhow!("object is gone"));
     };
     if fresh.object_id != object.object_id {
         return Err(anyhow::anyhow!("object was replaced meanwhile"));
     }
-    let stripe = fresh
-        .stripes
-        .iter_mut()
-        .find(|s| s.stripe_id == stripe_id)
-        .ok_or_else(|| anyhow::anyhow!("stripe {stripe_id} is gone"))?;
-    for loc in added {
-        if stripe.shards.iter().all(|l| l.position != loc.position) {
-            stripe.shards.push(loc);
-        }
-    }
-    stripe.shards.sort_by_key(|l| l.position);
+    edit(&mut fresh)?;
 
     // Every copy: the key's placement, plus anyone holding a shard.
     let mut targets: BTreeSet<String> = placement_of(meta, object)
