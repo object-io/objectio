@@ -113,6 +113,11 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_OSD_FULL_RATIO", default_value_t = crate::service::DEFAULT_FULL_RATIO)]
     pub full_ratio: f64,
 
+    /// The metadata index's page cache, in MiB: with the memtables, all
+    /// the memory the OSD's metadata takes, whatever its object count.
+    #[arg(long, env = "OBJECTIO_OSD_META_CACHE_MIB", default_value_t = 1024)]
+    pub meta_cache_mib: usize,
+
     /// Accept shard transfers over Mooncake Transfer Engine: `rdma`, or
     /// `tcp` to develop without RDMA hardware. Unset: gRPC bytes only.
     #[cfg(feature = "rdma")]
@@ -390,7 +395,12 @@ pub async fn run(
     let data_path = PathBuf::from(&data_dir);
     info!("Data directory: {}", data_dir);
     let disk_paths = disks.clone();
-    let osd_service = match OsdService::new(disk_paths, block_size as u32, data_path) {
+    let osd_service = match OsdService::new_with_cache(
+        disk_paths,
+        block_size as u32,
+        data_path,
+        args.meta_cache_mib << 20,
+    ) {
         Ok(s) => s.with_full_ratio(args.full_ratio),
         Err(e) => {
             error!("Failed to initialize OSD: {}", e);
