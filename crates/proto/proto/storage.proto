@@ -141,6 +141,10 @@ message ReadShardRequest {
     // ReadShardResponse.data is empty. Only sent to OSDs that advertised a
     // `te_segment`.
     RdmaBuffer rdma_dest = 4;
+    // The shard's crc32c as its object records it (B23). The OSD checks the
+    // whole shard against it, as well as against its own, and answers
+    // DATA_LOSS (marking the shard corrupt) when they differ.
+    optional uint32 expected_crc32c = 5;
 }
 
 message ReadShardResponse {
