@@ -58,7 +58,14 @@ fn assert_all_readable(c: &Cluster, bucket: &str, acked: &Acked, when: &str) {
     let acked = acked.lock().unwrap();
     assert!(!acked.is_empty(), "{when}: nothing was written");
     for (key, (body, _)) in acked.iter() {
-        let r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        // Retried while it says "retry", as a client would: right after a
+        // node is lost, meta may still be electing a leader.
+        let mut r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        let until = Instant::now() + Duration::from_secs(30);
+        while r.status == 503 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(200));
+            r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        }
         assert_eq!(
             r.status,
             200,
