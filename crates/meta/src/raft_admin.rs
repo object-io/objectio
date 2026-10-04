@@ -198,6 +198,10 @@ struct StatusResponse {
     current_term: u64,
     last_log_index: Option<u64>,
     last_applied: Option<u64>,
+    /// Index the last snapshot covers: the log is compacted up to it.
+    snapshot: Option<u64>,
+    /// Index the log is purged up to.
+    purged: Option<u64>,
     state: String,
     voters: Vec<u64>,
     learners: Vec<u64>,
@@ -216,6 +220,8 @@ async fn status(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
         current_term: m.current_term,
         last_log_index: m.last_log_index,
         last_applied: m.last_applied.map(|l| l.index),
+        snapshot: m.snapshot.map(|l| l.index),
+        purged: m.purged.map(|l| l.index),
         state: format!("{:?}", m.state),
         voters,
         learners,

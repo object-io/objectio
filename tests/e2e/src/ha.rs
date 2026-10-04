@@ -61,6 +61,8 @@ pub struct HaCluster {
     pub clients: Vec<Cluster>,
     pub access_key: String,
     pub secret_key: String,
+    /// Flags every meta node gets besides the harness's own.
+    meta_args: Vec<String>,
 }
 
 impl Drop for HaCluster {
@@ -109,6 +111,10 @@ pub struct RaftStatus {
     pub leader: Option<u64>,
     pub term: u64,
     pub last_applied: u64,
+    /// Index the last snapshot covers (0: none yet).
+    pub snapshot: u64,
+    /// Index the log is purged up to (0: nothing purged).
+    pub purged: u64,
     pub voters: Vec<u64>,
 }
 
@@ -124,6 +130,27 @@ impl HaCluster {
     /// release's), or from this build when `None`.
     #[must_use]
     pub fn start_from(bins: Option<&Path>, metas: usize, osds: usize, gateways: usize) -> Self {
+        Self::start_with(bins, metas, osds, gateways, &[])
+    }
+
+    /// As [`Self::start`], every meta node also given `meta_args`.
+    #[must_use]
+    pub fn start_with_meta_args(
+        metas: usize,
+        osds: usize,
+        gateways: usize,
+        meta_args: &[&str],
+    ) -> Self {
+        Self::start_with(None, metas, osds, gateways, meta_args)
+    }
+
+    fn start_with(
+        bins: Option<&Path>,
+        metas: usize,
+        osds: usize,
+        gateways: usize,
+        meta_args: &[&str],
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
             metas: (1..=metas)
@@ -142,6 +169,7 @@ impl HaCluster {
             clients: Vec::new(),
             access_key: String::new(),
             secret_key: String::new(),
+            meta_args: meta_args.iter().map(ToString::to_string).collect(),
         };
         for i in 0..metas {
             // A port it lost to another process: new ones, before any peer
@@ -370,6 +398,7 @@ impl HaCluster {
                 "--repair-interval-secs",
                 "0",
             ])
+            .args(&self.meta_args)
             .stdout(log_target())
             .stderr(log_target())
             .spawn()
@@ -427,6 +456,8 @@ impl HaCluster {
             leader: v["leader_id"].as_u64(),
             term: v["current_term"].as_u64().unwrap_or(0),
             last_applied: v["last_applied"].as_u64().unwrap_or(0),
+            snapshot: v["snapshot"].as_u64().unwrap_or(0),
+            purged: v["purged"].as_u64().unwrap_or(0),
             voters: v["voters"]
                 .as_array()
                 .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())

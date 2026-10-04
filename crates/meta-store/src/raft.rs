@@ -197,7 +197,7 @@ declare_raft_types!(
         NodeId       = u64,
         Node         = BasicNode,
         Entry        = openraft::Entry<MetaTypeConfig>,
-        SnapshotData = std::io::Cursor<Vec<u8>>,
+        SnapshotData = tokio::fs::File,
         AsyncRuntime = openraft::TokioRuntime,
 );
 

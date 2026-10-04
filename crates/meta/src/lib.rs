@@ -102,6 +102,17 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub drain_interval_secs: u64,
 
+    /// Snapshot the state machine, and compact the Raft log into it, every
+    /// this many log entries (B18). A snapshot is the whole metadata
+    /// database (a listing entry per object), so not too often.
+    #[arg(long, default_value_t = 500_000)]
+    pub raft_snapshot_every: u64,
+
+    /// Log entries kept behind the last snapshot: a follower behind by
+    /// fewer catches up from the log; one further behind gets a snapshot.
+    #[arg(long, default_value_t = 10_000)]
+    pub raft_keep_logs: u64,
+
     /// Shards a drain sweep moves off each draining OSD, at most.
     #[arg(long, default_value_t = 64)]
     pub drain_batch: usize,
@@ -123,21 +134,19 @@ const RAFT_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
 
 /// Raft settings for the meta cluster.
 ///
-/// Snapshots are never built on a schedule, so the log is never purged:
-/// it grows, but every replica can always be caught up from it. Snapshots
-/// themselves now carry the whole state machine (they used to be empty,
-/// and openraft's default policy purged the log into them, so a replica
-/// caught up from one silently missed everything before it). They are
-/// what a node gets when the log it needs was purged by an earlier
-/// version. Scheduled compaction comes back once a multi-node test covers
-/// catching a replica up from one.
-fn raft_config() -> openraft::Config {
+/// The log is compacted (B18): every `snapshot_every` entries each node
+/// snapshots its state machine (the whole database, streamed through a
+/// file) and purges its log up to it, keeping `keep_logs` entries behind
+/// it for followers that are only a little behind. A follower further
+/// behind is sent the snapshot.
+fn raft_config(snapshot_every: u64, keep_logs: u64) -> openraft::Config {
     openraft::Config {
         cluster_name: "objectio-meta".into(),
         heartbeat_interval: 250,
         election_timeout_min: 500,
         election_timeout_max: 1000,
-        snapshot_policy: openraft::SnapshotPolicy::Never,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_every.max(1)),
+        max_in_snapshot_log_to_keep: keep_logs,
         // Snapshots travel in chunks: small enough that one, JSON-encoded,
         // is far under the Raft RPC limit.
         snapshot_max_chunk_size: 512 * 1024,
@@ -256,9 +265,17 @@ pub async fn run(
     let (apply_tx, apply_rx) =
         tokio::sync::mpsc::unbounded_channel::<objectio_meta_store::ApplyEvent>();
     meta_service.spawn_apply_listener(apply_rx);
-    let raft_storage = objectio_meta_store::MetaRaftStorage::with_apply_listener(raft_db, apply_tx);
+    let raft_storage = objectio_meta_store::MetaRaftStorage::with_apply_listener(
+        raft_db,
+        args.data_dir.join("raft-snapshots"),
+        apply_tx,
+    );
     let (log_store, state_machine) = openraft::storage::Adaptor::new(raft_storage);
-    let raft_config = Arc::new(raft_config().validate().expect("raft config valid"));
+    let raft_config = Arc::new(
+        raft_config(args.raft_snapshot_every, args.raft_keep_logs)
+            .validate()
+            .expect("raft config valid"),
+    );
     let network = objectio_meta_store::MetaRaftNetworkFactory::new(node_id);
     let raft = openraft::Raft::<objectio_meta_store::MetaTypeConfig>::new(
         node_id,
@@ -509,10 +526,15 @@ async fn start_metrics_server(port: u16, state: Arc<MetaMetricsState>) -> Result
 
 #[cfg(test)]
 mod raft_config_tests {
-    /// Purging the log is only safe once snapshots carry the state.
+    /// The log is compacted at the configured interval, keeping the
+    /// configured tail.
     #[test]
-    fn the_log_is_never_compacted_into_an_empty_snapshot() {
-        let c = super::raft_config().validate().unwrap();
-        assert!(matches!(c.snapshot_policy, openraft::SnapshotPolicy::Never));
+    fn the_log_is_compacted_as_configured() {
+        let c = super::raft_config(1000, 100).validate().unwrap();
+        assert!(matches!(
+            c.snapshot_policy,
+            openraft::SnapshotPolicy::LogsSinceLast(1000)
+        ));
+        assert_eq!(c.max_in_snapshot_log_to_keep, 100);
     }
 }
