@@ -30,6 +30,10 @@ gateway:
       # The gateway's own cap, below sizeLimit (an emptyDir past its limit
       # gets the pod evicted): past it new events are dropped and counted.
       maxBytes: 9663676416   # 9 GiB
+      # Bucket logging's records (A12) wait in the same volume until they
+      # are written into their target buckets; with maxBytes, below
+      # sizeLimit.
+      bucketLogMaxBytes: 536870912   # 512 MiB
       drainSeconds: 20
     # Every event also goes here (created on first start), kept retentionDays.
     systemBucket: objectio-audit

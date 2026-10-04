@@ -166,6 +166,10 @@ spec:
               value: {{ .Values.gateway.audit.spool.drainSeconds | quote }}
             - name: OBJECTIO_AUDIT_SPOOL_MAX_BYTES
               value: {{ .Values.gateway.audit.spool.maxBytes | int64 | quote }}
+            # Bucket logging's records wait in the same volume
+            # (audit-spool/bucket-logging).
+            - name: OBJECTIO_BUCKET_LOG_SPOOL_MAX_BYTES
+              value: {{ .Values.gateway.audit.spool.bucketLogMaxBytes | int64 | quote }}
             {{- if .Values.gateway.audit.systemBucket }}
             - name: OBJECTIO_AUDIT_SYSTEM_BUCKET
               value: {{ .Values.gateway.audit.systemBucket | quote }}

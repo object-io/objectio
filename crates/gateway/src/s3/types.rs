@@ -46,6 +46,8 @@ pub struct ListObjectsParams {
     pub(crate) cors: Option<String>,
     /// If present, a bucket replication configuration request.
     pub(crate) replication: Option<String>,
+    /// If present, a GetBucketLogging request (see `crate::bucket_logging`).
+    pub(crate) logging: Option<String>,
     /// If present (even empty), this is a policy request
     pub(crate) policy: Option<String>,
     /// If present, this is a list object versions request
@@ -130,6 +132,8 @@ pub struct PutBucketParams {
     pub(crate) cors: Option<String>,
     /// If present, a bucket replication configuration request.
     pub(crate) replication: Option<String>,
+    /// If present, a PutBucketLogging request (see `crate::bucket_logging`).
+    pub(crate) logging: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
