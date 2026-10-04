@@ -1,5 +1,9 @@
 //! ObjectIO Block Gateway binary: parse arguments, set up logging, run.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use objectio_block_gateway::Args;

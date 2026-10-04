@@ -281,90 +281,6 @@ impl MetadataOp {
     }
 }
 
-/// One entry of a B-tree snapshot.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SnapshotEntry {
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub value: Vec<u8>,
-    #[prost(uint64, tag = "3")]
-    pub lsn: u64,
-}
-
-/// A B-tree snapshot's entries, after its header.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SnapshotEntries {
-    #[prost(message, repeated, tag = "1")]
-    pub entries: Vec<SnapshotEntry>,
-}
-
-/// Snapshot header for B-tree persistence
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SnapshotHeader {
-    /// Magic number for validation
-    pub magic: u32,
-    /// Snapshot version
-    pub version: u32,
-    /// LSN at snapshot time
-    pub lsn: u64,
-    /// Number of entries in snapshot
-    pub entry_count: u64,
-    /// CRC32C of snapshot data (excluding header)
-    pub checksum: u32,
-    /// Timestamp of snapshot creation
-    pub created_at: u64,
-}
-
-impl SnapshotHeader {
-    pub const MAGIC: u32 = 0x4D455441; // "META"
-    pub const VERSION: u32 = 2; // 2: protobuf entries
-    pub const SIZE: usize = 32;
-
-    pub fn new(lsn: u64, entry_count: u64) -> Self {
-        Self {
-            magic: Self::MAGIC,
-            version: Self::VERSION,
-            lsn,
-            entry_count,
-            checksum: 0,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        }
-    }
-
-    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.version.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.entry_count.to_le_bytes());
-        buf[24..28].copy_from_slice(&self.checksum.to_le_bytes());
-        buf[28..32].copy_from_slice(&(self.created_at as u32).to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::SIZE {
-            return None;
-        }
-        let magic = u32::from_le_bytes(data[0..4].try_into().ok()?);
-        if magic != Self::MAGIC {
-            return None;
-        }
-        Some(Self {
-            magic,
-            version: u32::from_le_bytes(data[4..8].try_into().ok()?),
-            lsn: u64::from_le_bytes(data[8..16].try_into().ok()?),
-            entry_count: u64::from_le_bytes(data[16..24].try_into().ok()?),
-            checksum: u32::from_le_bytes(data[24..28].try_into().ok()?),
-            created_at: u32::from_le_bytes(data[28..32].try_into().ok()?) as u64,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,16 +293,5 @@ mod tests {
 
         assert!(k1 < k2);
         assert!(k2 < k3);
-    }
-
-    #[test]
-    fn test_snapshot_header_roundtrip() {
-        let header = SnapshotHeader::new(1000, 500);
-        let bytes = header.to_bytes();
-        let parsed = SnapshotHeader::from_bytes(&bytes).unwrap();
-
-        assert_eq!(parsed.magic, SnapshotHeader::MAGIC);
-        assert_eq!(parsed.lsn, 1000);
-        assert_eq!(parsed.entry_count, 500);
     }
 }

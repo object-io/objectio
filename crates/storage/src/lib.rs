@@ -26,8 +26,6 @@ pub use layout::{
     ALIGNMENT, BlockFooter, BlockHeader, DEFAULT_BLOCK_SIZE, DEFAULT_WAL_SIZE, MIN_DISK_SIZE,
     SUPERBLOCK_SIZE, Superblock,
 };
-pub use metadata::{
-    ArcCache, MetaCacheStats, MetadataEntry, MetadataKey, MetadataOp, MetadataStore, MetadataWal,
-};
+pub use metadata::{MetadataEntry, MetadataKey, MetadataOp, MetadataStore, MetadataWal};
 pub use raw_io::{AlignedBuffer, RawFile};
 pub use smart::{DiskSmartHealth, SmartAttribute, SmartMonitor};

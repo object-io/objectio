@@ -17,6 +17,9 @@ clap = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
+
 [features]
 default = []
 # ISA-L erasure coding (x86_64).

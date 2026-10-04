@@ -1,10 +1,9 @@
-//! Unified Metadata Store
-//!
-//! Combines WAL, B-tree index, and ARC cache into a single interface
-//! with background compaction.
+//! The OSD's metadata store (objectio-docs `core/storage-engine.md`): a
+//! WAL, the durability boundary, in front of an index whose recent changes
+//! are in memory and the rest on disk ([`DiskIndex`]). Checkpoints write
+//! the memtable to the index file and cut the WAL.
 
-use super::btree::{BTreeConfig, BTreeIndex};
-use super::cache::ArcCache;
+use super::disk_index::DiskIndex;
 use super::types::{MetadataKey, MetadataOp};
 use super::wal::{MetadataWal, WalConfig};
 use objectio_common::{Error, Result};
@@ -23,13 +22,13 @@ pub struct MetadataStoreConfig {
     pub data_dir: PathBuf,
     /// WAL configuration
     pub wal: WalConfig,
-    /// B-tree configuration
-    pub btree: BTreeConfig,
-    /// Cache size (number of entries)
-    pub cache_size: usize,
+    /// The index file's page cache, in bytes.
+    pub cache_bytes: usize,
+    /// A checkpoint is taken when the memtable reaches this many bytes.
+    pub memtable_bytes: usize,
     /// Enable background compaction
     pub background_compaction: bool,
-    /// Compaction check interval
+    /// How often the checkpoint thread looks, when no write wakes it.
     pub compaction_interval: Duration,
 }
 
@@ -38,8 +37,8 @@ impl Default for MetadataStoreConfig {
         Self {
             data_dir: PathBuf::from("./metadata"),
             wal: WalConfig::default(),
-            btree: BTreeConfig::default(),
-            cache_size: 10000,
+            cache_bytes: 1 << 30,
+            memtable_bytes: 64 << 20,
             background_compaction: true,
             compaction_interval: Duration::from_secs(60),
         }
@@ -49,204 +48,161 @@ impl Default for MetadataStoreConfig {
 impl MetadataStoreConfig {
     /// Create config with data directory
     pub fn with_data_dir(data_dir: impl AsRef<Path>) -> Self {
-        let data_dir = data_dir.as_ref().to_path_buf();
         Self {
-            btree: BTreeConfig {
-                snapshot_dir: data_dir.join("snapshots"),
-                ..Default::default()
-            },
-            data_dir,
+            data_dir: data_dir.as_ref().to_path_buf(),
             ..Default::default()
         }
     }
 }
 
+/// An index that can't be read: the OSD stops rather than answer "not
+/// there" for what may be there. Its copies are outvoted and repaired.
+fn fatal(e: &Error) -> ! {
+    error!("metadata index unreadable, stopping: {e}");
+    std::process::abort()
+}
+
 /// Unified metadata store for OSD
 pub struct MetadataStore {
-    /// Write-ahead log
     wal: Arc<MetadataWal>,
-    /// B-tree index
-    index: Arc<BTreeIndex>,
-    /// ARC cache
-    cache: Arc<ArcCache>,
-    /// Configuration
+    index: Arc<DiskIndex>,
     config: MetadataStoreConfig,
-    /// One compaction at a time: explicit or background.
+    /// One checkpoint at a time: explicit or background.
     compaction_lock: Arc<Mutex<()>>,
     /// Held shared by every write from its log append to its index update,
-    /// and exclusively by a snapshot to see the index with nothing in
-    /// between ([`compact`]).
+    /// and exclusively by a checkpoint to freeze the memtable with nothing
+    /// in between ([`checkpoint`]).
     gate: Arc<RwLock<()>>,
-    /// Shutdown flag for background thread
     shutdown: Arc<AtomicBool>,
-    /// Wakes the compaction thread out of its sleep so shutdown does not have
-    /// to wait for the interval to elapse.
-    shutdown_signal: Arc<(Mutex<()>, Condvar)>,
-    /// Background compaction handle
+    /// Wakes the checkpoint thread: for shutdown, and when a write fills
+    /// the memtable or the WAL.
+    signal: Arc<(Mutex<()>, Condvar)>,
     compaction_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl MetadataStore {
     /// Create a new metadata store
     pub fn create(config: MetadataStoreConfig) -> Result<Self> {
-        // Ensure directories exist
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| Error::Storage(format!("failed to create data dir: {}", e)))?;
-        std::fs::create_dir_all(&config.btree.snapshot_dir)
-            .map_err(|e| Error::Storage(format!("failed to create snapshot dir: {}", e)))?;
-
-        // Create WAL
         let wal_path = config.data_dir.join("metadata.wal");
         let wal = Arc::new(MetadataWal::create(&wal_path, config.wal.clone())?);
-
-        // Create B-tree index
-        let index = Arc::new(BTreeIndex::new(config.btree.clone()));
-
-        // Create cache
-        let cache = Arc::new(ArcCache::new(config.cache_size));
-
-        let store = Self {
-            wal,
-            index,
-            cache,
-            config,
-            compaction_lock: Arc::new(Mutex::new(())),
-            gate: Arc::new(RwLock::new(())),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
-            compaction_handle: Mutex::new(None),
-        };
-
-        // Start background compaction if enabled
-        if store.config.background_compaction {
-            store.start_background_compaction();
-        }
-
+        let index = Arc::new(DiskIndex::open(
+            &config.data_dir.join("index.redb"),
+            config.cache_bytes,
+        )?);
+        let store = Self::with(wal, index, config);
         info!("Created new metadata store at {:?}", store.config.data_dir);
         Ok(store)
     }
 
     /// Open an existing metadata store
     pub fn open(config: MetadataStoreConfig) -> Result<Self> {
-        // Open or create WAL
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| Error::Storage(format!("failed to create data dir: {}", e)))?;
         let wal_path = config.data_dir.join("metadata.wal");
         let wal = Arc::new(if wal_path.exists() {
             MetadataWal::open(&wal_path, config.wal.clone())?
         } else {
             MetadataWal::create(&wal_path, config.wal.clone())?
         });
+        let index = Arc::new(DiskIndex::open(
+            &config.data_dir.join("index.redb"),
+            config.cache_bytes,
+        )?);
+        let checkpoint_lsn = index.checkpoint_lsn()?;
+        wal.advance_past(checkpoint_lsn);
 
-        // Load B-tree from snapshot
-        let index = Arc::new(BTreeIndex::load_snapshot(config.btree.clone())?);
-        let snapshot_lsn = index.last_snapshot_lsn();
-        wal.advance_past(snapshot_lsn);
-
-        // Replay WAL entries after snapshot
-        info!("Replaying WAL from LSN {}", snapshot_lsn + 1);
-        let mut replay_count = 0u64;
-
-        wal.iter_entries(snapshot_lsn + 1, |entry| {
+        info!("Replaying WAL from LSN {}", checkpoint_lsn + 1);
+        let mut replayed = 0u64;
+        wal.iter_entries(checkpoint_lsn + 1, |entry| {
             index.apply_entry(entry);
-            replay_count += 1;
+            replayed += 1;
             Ok(())
         })?;
+        info!("Replayed {replayed} WAL entries");
 
-        info!("Replayed {} WAL entries", replay_count);
+        let store = Self::with(wal, index, config);
+        info!("Opened metadata store at {:?}", store.config.data_dir);
+        Ok(store)
+    }
 
-        // Create cache
-        let cache = Arc::new(ArcCache::new(config.cache_size));
-
+    fn with(wal: Arc<MetadataWal>, index: Arc<DiskIndex>, config: MetadataStoreConfig) -> Self {
         let store = Self {
             wal,
             index,
-            cache,
             config,
             compaction_lock: Arc::new(Mutex::new(())),
             gate: Arc::new(RwLock::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_signal: Arc::new((Mutex::new(()), Condvar::new())),
+            signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
         };
-
-        // Start background compaction if enabled
         if store.config.background_compaction {
             store.start_background_compaction();
         }
-
-        info!(
-            "Opened metadata store at {:?} ({} entries)",
-            store.config.data_dir,
-            store.index.len()
-        );
-        Ok(store)
+        store
     }
 
     /// Open or create a metadata store
     pub fn open_or_create(config: MetadataStoreConfig) -> Result<Self> {
-        if config.data_dir.join("metadata.wal").exists() || config.btree.snapshot_dir.exists() {
+        if config.data_dir.join("metadata.wal").exists()
+            || config.data_dir.join("index.redb").exists()
+        {
             Self::open(config)
         } else {
             Self::create(config)
         }
     }
 
+    /// Wake the checkpoint thread if this write filled the memtable or WAL.
+    fn after_write(&self) {
+        if checkpoint_due(&self.wal, &self.index, &self.config) {
+            let (lock, cv) = &*self.signal;
+            let _g = lock.lock();
+            cv.notify_all();
+        }
+    }
+
     /// Put a key-value pair
     pub fn put(&self, key: MetadataKey, value: Vec<u8>) -> Result<u64> {
-        // 1. Write to WAL
         let op = MetadataOp::Put {
             key: key.clone(),
             value: value.clone(),
         };
-        let _applying = self.gate.read();
-        let lsn = self.wal.append(&op)?;
-
-        // 2. Update index
-        self.index.put(key.clone(), value.clone(), lsn);
-
-        // 3. Update cache
-        self.cache.put(key, value);
-
+        let lsn = {
+            let _applying = self.gate.read();
+            let lsn = self.wal.append(&op)?;
+            self.index.put(key.0, value);
+            lsn
+        };
+        self.after_write();
         debug!("put: lsn={}", lsn);
         Ok(lsn)
     }
 
     /// Delete a key
     pub fn delete(&self, key: &MetadataKey) -> Result<u64> {
-        // 1. Write to WAL
         let op = MetadataOp::Delete { key: key.clone() };
-        let _applying = self.gate.read();
-        let lsn = self.wal.append(&op)?;
-
-        // 2. Update index
-        self.index.delete(key, lsn);
-
-        // 3. Remove from cache
-        self.cache.remove(key);
-
+        let lsn = {
+            let _applying = self.gate.read();
+            let lsn = self.wal.append(&op)?;
+            self.index.delete(key.0.clone());
+            lsn
+        };
+        self.after_write();
         debug!("delete: lsn={}", lsn);
         Ok(lsn)
     }
 
     /// Get a value by key
     pub fn get(&self, key: &MetadataKey) -> Option<Vec<u8>> {
-        // 1. Check cache
-        if let Some(value) = self.cache.get(key) {
-            return Some(value);
-        }
-
-        // 2. Check index
-        if let Some(value) = self.index.get(key) {
-            // Populate cache
-            self.cache.put(key.clone(), value.clone());
-            return Some(value);
-        }
-
-        None
+        self.index.get(&key.0).unwrap_or_else(|e| fatal(&e))
     }
 
     /// Check if a key exists
     pub fn contains(&self, key: &MetadataKey) -> bool {
-        self.cache.contains(key) || self.index.contains(key)
+        self.get(key).is_some()
     }
 
     /// Batch write operations
@@ -254,8 +210,6 @@ impl MetadataStore {
         if entries.is_empty() {
             return Ok(self.wal.current_lsn());
         }
-
-        // Build batch operation
         let ops: Vec<MetadataOp> = entries
             .iter()
             .map(|(k, v)| MetadataOp::Put {
@@ -263,21 +217,15 @@ impl MetadataStore {
                 value: v.clone(),
             })
             .collect();
-
-        // 1. Write to WAL atomically
-        let _applying = self.gate.read();
-        let lsn = self.wal.append_batch(&ops)?;
-
-        // 2. Update index
-        for (key, value) in &entries {
-            self.index.put(key.clone(), value.clone(), lsn);
-        }
-
-        // 3. Update cache
-        for (key, value) in entries {
-            self.cache.put(key, value);
-        }
-
+        let lsn = {
+            let _applying = self.gate.read();
+            let lsn = self.wal.append_batch(&ops)?;
+            for (key, value) in entries {
+                self.index.put(key.0, value);
+            }
+            lsn
+        };
+        self.after_write();
         debug!("batch_put: {} entries, lsn={}", ops.len(), lsn);
         Ok(lsn)
     }
@@ -291,44 +239,88 @@ impl MetadataStore {
             .iter()
             .map(|k| MetadataOp::Delete { key: k.clone() })
             .collect();
-        let _applying = self.gate.read();
-        let lsn = self.wal.append_batch(&ops)?;
-        for key in keys {
-            self.index.delete(key, lsn);
-            self.cache.remove(key);
-        }
+        let lsn = {
+            let _applying = self.gate.read();
+            let lsn = self.wal.append_batch(&ops)?;
+            for key in keys {
+                self.index.delete(key.0.clone());
+            }
+            lsn
+        };
+        self.after_write();
         debug!("batch_delete: {} entries, lsn={}", keys.len(), lsn);
         Ok(lsn)
     }
 
-    /// Scan entries with a key prefix
+    /// Every entry with a key prefix, collected: for prefixes known to be
+    /// small (one key's versions). Large ones go through
+    /// [`Self::for_each_prefix`].
     pub fn scan_prefix(&self, prefix: &MetadataKey) -> Vec<(MetadataKey, Vec<u8>)> {
-        self.index.scan_prefix(prefix)
+        self.index
+            .scan_prefix(&prefix.0)
+            .unwrap_or_else(|e| fatal(&e))
     }
 
-    /// Force a snapshot to disk
-    pub fn snapshot(&self) -> Result<PathBuf> {
-        let _lock = self.compaction_lock.lock();
-        self.do_snapshot()
+    /// Call `f` on each entry under `prefix` in key order, from after
+    /// `after` (or the start), until it returns false; memory stays flat
+    /// however many entries the prefix has.
+    pub fn for_each_prefix(
+        &self,
+        prefix: &MetadataKey,
+        after: Option<&MetadataKey>,
+        f: impl FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        self.index
+            .for_each_prefix(&prefix.0, after.map(|a| a.0.as_slice()), f)
+            .unwrap_or_else(|e| fatal(&e));
     }
 
-    /// Internal snapshot implementation
-    fn do_snapshot(&self) -> Result<PathBuf> {
-        compact(&self.wal, &self.index, &self.gate)
+    /// The entries under `prefix` in key order, read a page at a time: for
+    /// prefixes of any size. Not a snapshot: changes made while it runs may
+    /// or may not be seen.
+    pub fn iter_prefix(&self, prefix: &MetadataKey) -> PrefixIter<&Self> {
+        PrefixIter::new(self, prefix.clone(), None)
     }
 
-    /// Trigger compaction if needed
-    pub fn maybe_compact(&self) -> Result<Option<PathBuf>> {
+    /// [`Self::iter_prefix`] from after `after` (which must sort at or
+    /// after `prefix`, or nothing is found).
+    pub fn iter_prefix_after(
+        &self,
+        prefix: &MetadataKey,
+        after: Option<MetadataKey>,
+    ) -> PrefixIter<&Self> {
+        PrefixIter::new(self, prefix.clone(), after)
+    }
+
+    /// [`Self::iter_prefix_after`], owning its handle on the store: for a
+    /// stream that outlives the call that made it.
+    pub fn iter_prefix_owned(
+        self: &Arc<Self>,
+        prefix: MetadataKey,
+        after: Option<MetadataKey>,
+    ) -> PrefixIter<Arc<Self>> {
+        PrefixIter::new(Arc::clone(self), prefix, after)
+    }
+
+    /// Take a checkpoint now: the memtable into the index file, the WAL cut.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _one = self.compaction_lock.lock();
+        checkpoint(&self.wal, &self.index, &self.gate)
+    }
+
+    /// Take a checkpoint if one is due.
+    pub fn maybe_compact(&self) -> Result<bool> {
         if self.needs_compaction() {
-            Ok(Some(self.snapshot()?))
+            self.checkpoint()?;
+            Ok(true)
         } else {
-            Ok(None)
+            Ok(false)
         }
     }
 
-    /// Check if compaction is needed
+    /// Whether a checkpoint is due.
     pub fn needs_compaction(&self) -> bool {
-        self.index.needs_snapshot() || self.wal.needs_compaction()
+        checkpoint_due(&self.wal, &self.index, &self.config)
     }
 
     /// Start background compaction thread
@@ -336,47 +328,40 @@ impl MetadataStore {
         let wal = Arc::clone(&self.wal);
         let index = Arc::clone(&self.index);
         let shutdown = Arc::clone(&self.shutdown);
-        let signal = Arc::clone(&self.shutdown_signal);
+        let signal = Arc::clone(&self.signal);
         let interval = self.config.compaction_interval;
         let gate = Arc::clone(&self.gate);
         let compaction_lock = Arc::clone(&self.compaction_lock);
+        let config = self.config.clone();
 
         let handle = thread::spawn(move || {
-            info!("Background compaction thread started");
-
+            info!("Background checkpoint thread started");
             while !shutdown.load(Ordering::Relaxed) {
-                // Sleep on a condvar rather than `thread::sleep`, so shutdown
-                // can wake this thread instead of waiting out the interval.
-                // With the plain sleep, `shutdown()` set the flag and then
-                // joined a thread that was not going to look at it for up to
-                // `compaction_interval` — 60 seconds by default. Under
-                // Kubernetes' 30-second default grace period that meant SIGKILL
-                // arrived first, and the WAL sync that shutdown performs *after*
-                // the join never ran.
-                let (lock, cv) = &*signal;
-                let mut guard = lock.lock();
-                if !shutdown.load(Ordering::Relaxed) {
-                    cv.wait_for(&mut guard, interval);
+                // A condvar, not a sleep: shutdown and full memtables wake
+                // it (a sleep made shutdown wait out the interval, past
+                // Kubernetes' grace period).
+                {
+                    let (lock, cv) = &*signal;
+                    let mut guard = lock.lock();
+                    if !shutdown.load(Ordering::Relaxed) && !checkpoint_due(&wal, &index, &config) {
+                        cv.wait_for(&mut guard, interval);
+                    }
                 }
-                drop(guard);
-
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-
-                // Check if compaction needed
-                if index.needs_snapshot() || wal.needs_compaction() {
-                    debug!("Starting background compaction");
-
+                if checkpoint_due(&wal, &index, &config) {
                     let _one = compaction_lock.lock();
-                    match compact(&wal, &index, &gate) {
-                        Ok(path) => info!("Background snapshot completed: {:?}", path),
-                        Err(e) => error!("Background snapshot failed: {}", e),
+                    match checkpoint(&wal, &index, &gate) {
+                        Ok(()) => debug!("checkpoint done"),
+                        Err(e) => {
+                            error!("checkpoint failed: {}", e);
+                            thread::sleep(Duration::from_secs(1));
+                        }
                     }
                 }
             }
-
-            info!("Background compaction thread stopped");
+            info!("Background checkpoint thread stopped");
         });
 
         *self.compaction_handle.lock() = Some(handle);
@@ -385,22 +370,15 @@ impl MetadataStore {
     /// Stop background compaction and shutdown
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-
-        // Wake the compaction thread now. Taking the lock first means the flag
-        // is visible to a thread that is about to start waiting, so shutdown
-        // cannot be missed in the window between the check and the wait.
         {
-            let (lock, cv) = &*self.shutdown_signal;
+            let (lock, cv) = &*self.signal;
             let guard = lock.lock();
             cv.notify_all();
             drop(guard);
         }
-
         if let Some(handle) = self.compaction_handle.lock().take() {
             let _ = handle.join();
         }
-
-        // Final sync
         if let Err(e) = self.wal.sync() {
             error!("Failed to sync WAL on shutdown: {}", e);
         }
@@ -416,9 +394,9 @@ impl MetadataStore {
         self.wal.current_lsn()
     }
 
-    /// Get entry count
+    /// The number of entries (counts the index file: not for hot paths).
     pub fn len(&self) -> u64 {
-        self.index.len()
+        self.index.len().unwrap_or_else(|e| fatal(&e))
     }
 
     /// Check if empty
@@ -426,12 +404,6 @@ impl MetadataStore {
         self.len() == 0
     }
 
-    /// Get cache hit ratio
-    pub fn cache_hit_ratio(&self) -> f64 {
-        self.cache.stats().hit_ratio()
-    }
-
-    /// Get statistics
     /// WAL fsync statistics for metrics.
     pub fn wal_sync_stats(&self) -> &super::wal::WalSyncStats {
         self.wal.sync_stats()
@@ -439,44 +411,93 @@ impl MetadataStore {
 
     pub fn stats(&self) -> MetadataStoreStats {
         MetadataStoreStats {
-            entry_count: self.index.len(),
             wal_size: self.wal.size(),
             wal_lsn: self.wal.current_lsn(),
-            index_lsn: self.index.current_lsn(),
-            last_snapshot_lsn: self.index.last_snapshot_lsn(),
-            cache_size: self.cache.len(),
-            cache_hit_ratio: self.cache.stats().hit_ratio(),
-            cache_hits: self.cache.stats().hits.load(Ordering::Relaxed),
-            cache_misses: self.cache.stats().misses.load(Ordering::Relaxed),
+            memtable_bytes: self.index.memtable_bytes() as u64,
         }
     }
 }
 
-/// Snapshot the index and drop the log records the snapshot holds.
+/// [`MetadataStore::iter_prefix`].
+pub struct PrefixIter<S: std::ops::Deref<Target = MetadataStore>> {
+    store: S,
+    prefix: MetadataKey,
+    after: Option<MetadataKey>,
+    page: std::vec::IntoIter<(MetadataKey, Vec<u8>)>,
+    done: bool,
+}
+
+impl<S: std::ops::Deref<Target = MetadataStore>> PrefixIter<S> {
+    const PAGE: usize = 1024;
+
+    fn new(store: S, prefix: MetadataKey, after: Option<MetadataKey>) -> Self {
+        Self {
+            store,
+            prefix,
+            after,
+            page: Vec::new().into_iter(),
+            done: false,
+        }
+    }
+}
+
+impl<S: std::ops::Deref<Target = MetadataStore>> Iterator for PrefixIter<S> {
+    type Item = (MetadataKey, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.page.next() {
+            return Some(e);
+        }
+        if self.done {
+            return None;
+        }
+        let mut page = Vec::with_capacity(Self::PAGE);
+        self.store
+            .for_each_prefix(&self.prefix, self.after.as_ref(), |k, v| {
+                page.push((MetadataKey::from_bytes(k.to_vec()), v.to_vec()));
+                page.len() < Self::PAGE
+            });
+        self.done = page.len() < Self::PAGE;
+        self.after = page.last().map(|(k, _)| k.clone());
+        self.page = page.into_iter();
+        self.page.next()
+    }
+}
+
+/// Whether to checkpoint now: the memtable is full, or the WAL past its
+/// limit, or a frozen memtable failed to go in and waits.
+fn checkpoint_due(wal: &MetadataWal, index: &DiskIndex, config: &MetadataStoreConfig) -> bool {
+    index.memtable_bytes() >= config.memtable_bytes || wal.needs_compaction() || index.has_frozen()
+}
+
+/// Write the memtable to the index file and drop the WAL records it holds.
 ///
-/// The snapshot must hold every record up to the LSN it is labelled with,
-/// or the log is cut past one it lacks and that write — acknowledged — is
-/// gone at the next restart. A write appends (and waits for its sync) and
-/// only then updates the index, so the index can hold a later record while
-/// an earlier one is still on its way; its highest LSN is no such label.
-/// `gate` is: writers hold it shared from append to update, so with it held
-/// exclusively every record in the log is in the index.
-///
-/// The log is cut only once the snapshot is durable; a failure in between
-/// leaves both, and the next restart replays what the snapshot already has.
-fn compact(wal: &MetadataWal, index: &BTreeIndex, gate: &RwLock<()>) -> Result<PathBuf> {
-    let (mark, entries) = {
+/// The file must hold every record up to the LSN it is labelled with, or
+/// the WAL is cut past one it lacks and that write, acknowledged, is gone
+/// at the next restart. Writers hold `gate` shared from append to apply, so
+/// with it held exclusively the memtable holds every record through the
+/// WAL's mark. The WAL is cut only once the file is durable; a failure in
+/// between leaves both, and the next restart replays what the file already
+/// has (replaying a record twice is harmless: puts and deletes by key).
+fn checkpoint(wal: &MetadataWal, index: &DiskIndex, gate: &RwLock<()>) -> Result<()> {
+    // A frozen memtable left by a failed checkpoint goes first, with the
+    // WAL left whole (its mark is gone): the next freeze's mark is later
+    // and covers it.
+    if index.has_frozen() {
+        index.flush_frozen(index.checkpoint_lsn()?)?;
+    }
+    let mark = {
         let _nothing_in_flight = gate.write();
-        (wal.mark()?, index.entries_for_snapshot())
+        let mark = wal.mark()?;
+        index.freeze();
+        mark
     };
-    let path = index.write_snapshot_at(mark.lsn, entries)?;
-    info!("Wrote snapshot at LSN {}", mark.lsn);
+    index.flush_frozen(mark.lsn)?;
+    debug!("checkpoint at LSN {}", mark.lsn);
     if let Err(e) = wal.truncate_through(mark) {
         warn!("Failed to truncate WAL: {}", e);
-    } else {
-        debug!("Truncated WAL through LSN {}", mark.lsn);
     }
-    Ok(path)
+    Ok(())
 }
 
 impl Drop for MetadataStore {
@@ -488,24 +509,12 @@ impl Drop for MetadataStore {
 /// Metadata store statistics
 #[derive(Debug, Clone)]
 pub struct MetadataStoreStats {
-    /// Number of entries in the index
-    pub entry_count: u64,
     /// WAL size in bytes
     pub wal_size: u64,
     /// Current WAL LSN
     pub wal_lsn: u64,
-    /// Current index LSN
-    pub index_lsn: u64,
-    /// Last snapshot LSN
-    pub last_snapshot_lsn: u64,
-    /// Number of cached entries
-    pub cache_size: usize,
-    /// Cache hit ratio
-    pub cache_hit_ratio: f64,
-    /// Total cache hits
-    pub cache_hits: u64,
-    /// Total cache misses
-    pub cache_misses: u64,
+    /// Bytes in the memtable not yet checkpointed
+    pub memtable_bytes: u64,
 }
 
 #[cfg(test)]
@@ -521,12 +530,8 @@ mod tests {
                 max_size_bytes: 1024 * 1024,
                 write_buffer_size: 4096,
             },
-            btree: BTreeConfig {
-                snapshot_dir: dir.join("snapshots"),
-                snapshot_threshold: 100,
-                snapshot_retention: 2,
-            },
-            cache_size: 100,
+            cache_bytes: 1 << 20,
+            memtable_bytes: 4096,
             background_compaction: false, // Manual for tests
             compaction_interval: Duration::from_secs(1),
         }
@@ -644,7 +649,7 @@ mod tests {
             }
 
             // Force snapshot
-            store.snapshot().unwrap();
+            store.checkpoint().unwrap();
 
             // Add more entries after snapshot
             for i in 101..=150 {
@@ -674,28 +679,6 @@ mod tests {
                 Some(b"value_125".to_vec())
             );
         }
-    }
-
-    #[test]
-    fn test_store_cache_population() {
-        let dir = tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let store = MetadataStore::create(config).unwrap();
-
-        let key = MetadataKey::block(42);
-        store.put(key.clone(), b"test value".to_vec()).unwrap();
-
-        // First get - from index, populates cache
-        store.cache.clear(); // Clear cache to test population
-        let _ = store.get(&key);
-
-        // Second get - should be from cache
-        let stats_before = store.cache.stats().hits.load(Ordering::Relaxed);
-        let _ = store.get(&key);
-        let stats_after = store.cache.stats().hits.load(Ordering::Relaxed);
-
-        assert!(stats_after > stats_before);
     }
 
     /// Writes that land while a snapshot is taken and the log cut must all
@@ -729,7 +712,7 @@ mod tests {
                 })
                 .collect();
             for _ in 0..30 {
-                store.snapshot().unwrap();
+                store.checkpoint().unwrap();
             }
             stop.store(true, Ordering::Relaxed);
             for w in writers {
@@ -752,7 +735,7 @@ mod tests {
             for i in 0..10 {
                 store.put(MetadataKey::block(i), vec![1]).unwrap();
             }
-            store.snapshot().unwrap();
+            store.checkpoint().unwrap();
         }
         {
             let store = MetadataStore::open(config.clone()).unwrap();
