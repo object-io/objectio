@@ -210,6 +210,8 @@ struct Noted {
     bucket: Option<String>,
     key: Option<String>,
     bucket_tenant: Option<String>,
+    /// A batch delete's deleted keys (and versions), for bucket logging.
+    deleted: Vec<(String, Option<String>)>,
 }
 
 struct Current {
@@ -270,6 +272,12 @@ pub fn note_bucket_tenant(bucket: &str, tenant: &str) {
             n.bucket_tenant = Some(tenant.to_string());
         }
     });
+}
+
+/// Record the keys a batch delete removed (bucket logging gives each a
+/// record, as S3 does).
+pub fn note_deleted(deleted: Vec<(String, Option<String>)>) {
+    note(|n| n.deleted = deleted);
 }
 
 /// Record just the action (STS, which has no bucket).
@@ -393,6 +401,8 @@ pub struct Auditor {
     active: Arc<AtomicBool>,
     reload: tokio::sync::Notify,
     trusted_proxies: crate::origin::TrustedProxies,
+    /// Bucket logging (A12), which this layer feeds: it sees every request.
+    bucket_logging: std::sync::OnceLock<Arc<crate::bucket_logging::Logger>>,
 }
 
 impl Auditor {
@@ -414,6 +424,7 @@ impl Auditor {
             active: Arc::clone(&active),
             reload: tokio::sync::Notify::new(),
             trusted_proxies,
+            bucket_logging: std::sync::OnceLock::new(),
         });
         let (cfg_tx, cfg_rx) = watch::channel(Config::default());
         tokio::spawn(reload_loop(Arc::clone(&auditor), meta, cfg_tx));
@@ -519,6 +530,16 @@ impl Auditor {
             duration_ms: 0,
             complete: true,
         });
+    }
+
+    /// Feed `logger` every request on a bucket.
+    pub fn set_bucket_logging(&self, logger: Arc<crate::bucket_logging::Logger>) {
+        let _ = self.bucket_logging.set(logger);
+    }
+
+    /// The gateway's bucket logging, once set.
+    pub fn bucket_logging(&self) -> Option<&Arc<crate::bucket_logging::Logger>> {
+        self.bucket_logging.get()
     }
 
     /// Re-read the configuration now (after this gateway changed it).
@@ -1357,12 +1378,18 @@ pub async fn audit_layer(
         user_agent,
     };
     let query = redact_query(request.uri().query().unwrap_or_default());
+    let logged = if api == "s3" && auditor.bucket_logging().is_some() {
+        crate::bucket_logging::Captured::of(&request, &query, source.ip)
+    } else {
+        None
+    };
 
     let current = Arc::new(Current {
         id: id.clone(),
         noted: Mutex::new(Noted::default()),
     });
     let mut response = CURRENT.scope(Arc::clone(&current), next.run(request)).await;
+    let turnaround = started.elapsed();
 
     if let Ok(v) = HeaderValue::from_str(&id) {
         response
@@ -1370,8 +1397,48 @@ pub async fn audit_layer(
             .entry("x-amz-request-id")
             .or_insert(v);
     }
+    let mut noted = std::mem::take(&mut *current.noted.lock());
+    let log = match (logged, auditor.bucket_logging()) {
+        (Some(captured), Some(logger)) => {
+            // The ID the client was given (a handler may have set its own).
+            let sent_id = response
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(&id)
+                .to_string();
+            let p = &noted.principal;
+            let requester = if p.arn.is_empty() { &p.user_id } else { &p.arn };
+            captured
+                .resolve(
+                    logger,
+                    requester,
+                    p.auth == "Anonymous",
+                    noted.bucket_tenant.as_deref(),
+                    std::mem::take(&mut noted.deleted),
+                    crate::bucket_logging::Answer::of(&response),
+                    &sent_id,
+                    turnaround,
+                )
+                .await
+        }
+        _ => None,
+    };
     if !auditor.active.load(Ordering::Relaxed) {
-        return response;
+        if log.is_none() {
+            return response;
+        }
+        let (parts, body) = response.into_parts();
+        return Response::from_parts(
+            parts,
+            Body::new(Counted {
+                inner: body,
+                bytes: AtomicU64::new(0),
+                done: AtomicBool::new(false),
+                pending: None,
+                log: log.map(|l| (l, started)),
+            }),
+        );
     }
     let status = response.status().as_u16();
     let error_code = response
@@ -1379,7 +1446,6 @@ pub async fn audit_layer(
         .get::<crate::gateway_metrics::S3ErrorCode>()
         .map(|c| c.0.clone());
 
-    let noted = std::mem::take(&mut *current.noted.lock());
     let mut principal = noted.principal;
     if principal.auth.is_empty()
         && let Some(s) = session
@@ -1421,6 +1487,7 @@ pub async fn audit_layer(
             bytes: AtomicU64::new(0),
             done: AtomicBool::new(false),
             pending: Some((event, auditor, started)),
+            log: log.map(|l| (l, started)),
         }),
     )
 }
@@ -1432,6 +1499,8 @@ struct Counted {
     bytes: AtomicU64,
     done: AtomicBool,
     pending: Option<(AuditEvent, Arc<Auditor>, Instant)>,
+    /// The bucket's access-log record, when it is logged.
+    log: Option<(crate::bucket_logging::Pending, Instant)>,
 }
 
 impl Counted {
@@ -1441,6 +1510,9 @@ impl Counted {
             event.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             event.complete = complete;
             auditor.submit(event);
+        }
+        if let Some((log, started)) = self.log.take() {
+            log.finish(self.bytes.load(Ordering::Relaxed), started.elapsed());
         }
     }
 }

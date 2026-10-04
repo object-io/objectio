@@ -131,6 +131,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:PutBucketTagging"
             } else if has(query, "replication") {
                 "s3:PutReplicationConfiguration"
+            } else if has(query, "logging") {
+                "s3:PutBucketLogging"
             } else {
                 "s3:CreateBucket"
             }
@@ -183,6 +185,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetBucketTagging"
             } else if has(query, "replication") {
                 "s3:GetReplicationConfiguration"
+            } else if has(query, "logging") {
+                "s3:GetBucketLogging"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -1073,6 +1077,14 @@ mod tests {
     fn cors_configuration_has_its_own_permissions() {
         assert_eq!(check_of(Method::GET, "/b", "cors").0, "s3:GetBucketCORS");
         assert_eq!(check_of(Method::PUT, "/b", "cors").0, "s3:PutBucketCORS");
+        assert_eq!(
+            check_of(Method::PUT, "/b", "logging").0,
+            "s3:PutBucketLogging"
+        );
+        assert_eq!(
+            check_of(Method::GET, "/b", "logging").0,
+            "s3:GetBucketLogging"
+        );
         // As in S3, deleting the configuration is putting it.
         assert_eq!(check_of(Method::DELETE, "/b", "cors").0, "s3:PutBucketCORS");
     }

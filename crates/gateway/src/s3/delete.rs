@@ -895,6 +895,19 @@ pub async fn delete_objects(
         errors.len()
     );
 
+    // Bucket logging gives each deleted key its own record, as S3 does.
+    crate::audit::note_deleted(
+        deleted
+            .iter()
+            .map(|d| {
+                (
+                    d.key.clone(),
+                    d.version_id.clone().or(d.delete_marker_version_id.clone()),
+                )
+            })
+            .collect(),
+    );
+
     // Build response: in quiet mode, only what could not be deleted.
     if quiet {
         deleted.clear();

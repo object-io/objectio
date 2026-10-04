@@ -100,7 +100,7 @@ fn unimplemented_sub_resources_are_refused_not_misread() {
     c.request("PUT", "/subr/k", b"x").expect(200);
     for (method, path) in [
         ("GET", "/subr?website"),
-        ("PUT", "/subr?logging"),
+        ("PUT", "/subr/k?logging"),
         ("GET", "/subr?notification"),
         ("PUT", "/subr?accelerate"),
         ("POST", "/subr/k?restore"),
