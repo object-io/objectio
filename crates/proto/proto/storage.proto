@@ -111,6 +111,9 @@ message WriteShardRequest {
     // Where the OSD reads the shard from over Transfer Engine, instead of
     // `data`. Only sent to OSDs that advertised a `te_segment`.
     RdmaBuffer rdma = 6;
+    // A write that restores redundancy (repair, drain, backfill): it may
+    // use the space an OSD keeps back from client writes (`--full-ratio`).
+    bool use_reserve = 7;
 }
 
 // Memory in another process that a shard moves through over Mooncake

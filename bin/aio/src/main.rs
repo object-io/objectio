@@ -127,6 +127,12 @@ struct Args {
     #[arg(long)]
     audit_log: Option<String>,
 
+    /// Size of each OSD's disk file, in bytes, when it is created (0: the
+    /// OSD's default, 10 GiB, sparse). Small disks fill quickly, for tests
+    /// of what a full cluster does.
+    #[arg(long, default_value_t = 0)]
+    disk_size: u64,
+
     /// How often the lifecycle worker scans (seconds).
     #[arg(long)]
     lifecycle_interval_secs: Option<u64>,
@@ -741,6 +747,9 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(osd_dir.join("disk0"))?;
         std::fs::create_dir_all(osd_dir.join("state"))?;
         let disk = osd_dir.join("disk0/disk.raw");
+        if args.disk_size > 0 && !disk.exists() {
+            std::fs::File::create(&disk)?.set_len(args.disk_size)?;
+        }
         let state = osd_dir.join("state");
         // The OSD binds port 0 and writes the address it got here; a stale
         // one from the last run must not be mistaken for it.

@@ -664,6 +664,7 @@ pub(crate) async fn upload_part_internal(
             let mut success = 0;
             let mut locs = Vec::with_capacity(total_replicas);
 
+            let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
                     Ok(location) => {
@@ -678,6 +679,7 @@ pub(crate) async fn upload_part_internal(
                         });
                     }
                     Err(e) => {
+                        full |= e.is_full();
                         warn!(
                             "Failed to write stripe {} replica {} for part: {}",
                             stripe_idx, pos, e
@@ -691,6 +693,9 @@ pub(crate) async fn upload_part_internal(
                     "Replication failed for part stripe {}: no successful writes",
                     stripe_idx
                 );
+                if full {
+                    return S3Error::storage_full();
+                }
                 return S3Error::xml_response(
                     "InternalError",
                     &format!(
@@ -828,6 +833,7 @@ pub(crate) async fn upload_part_internal(
             let mut success = 0;
             let mut locs = Vec::with_capacity(total_shards_per_stripe);
 
+            let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
                     Ok(location) => {
@@ -842,6 +848,7 @@ pub(crate) async fn upload_part_internal(
                         });
                     }
                     Err(e) => {
+                        full |= e.is_full();
                         warn!(
                             "Failed to write shard {} for part stripe {}: {}",
                             pos, stripe_idx, e
@@ -856,6 +863,9 @@ pub(crate) async fn upload_part_internal(
                     "Write quorum not met for part stripe {}: {} successful, need {} (ec_k={}, ec_m={})",
                     stripe_idx, success, quorum, ec_k, ec_m
                 );
+                if full {
+                    return S3Error::storage_full();
+                }
                 return S3Error::xml_response(
                     "ServiceUnavailable",
                     &format!(
