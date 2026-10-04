@@ -414,7 +414,7 @@ impl S3Error {
         matches!(
             e.code(),
             tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled
-        ) || (e.code() == tonic::Code::Unknown && e.message() == "transport error")
+        ) || crate::osd_pool::connection_broke(e)
     }
 
     pub fn from_status(e: &tonic::Status) -> Response {

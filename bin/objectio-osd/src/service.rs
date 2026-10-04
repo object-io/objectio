@@ -543,15 +543,23 @@ impl OsdService {
         // reported missing and rebuilt rather than reported present and
         // failing every read.
         let before = persisted.len();
+        let mut lost = Vec::new();
         persisted.retain(|key, loc| {
-            let lost = formatted_now.get(loc.disk_idx).copied().unwrap_or(false);
-            if lost && let Err(e) = Self::forget_shard_location(&meta_store, key) {
-                // Harmless if it stays: the disk was formatted, so the
-                // entry's CRC never matches and the shard reads as corrupt.
-                warn!("forgetting shard {key} on a formatted disk: {e}");
+            let gone = formatted_now.get(loc.disk_idx).copied().unwrap_or(false);
+            if gone {
+                lost.push(Self::shard_loc_meta_key(key));
             }
-            !lost
+            !gone
         });
+        // In batches, one log record (and fsync) each: one per shard took
+        // over five minutes for a disk of 24,000 shards.
+        for chunk in lost.chunks(1000) {
+            if let Err(e) = meta_store.batch_delete(chunk) {
+                // Harmless if they stay: the disk was formatted, so the
+                // entries' CRCs never match and the shards read as corrupt.
+                warn!("forgetting {} shards on a formatted disk: {e}", chunk.len());
+            }
+        }
         if persisted.len() < before {
             warn!(
                 "{} shards were on a disk formatted at startup; they are lost \
