@@ -198,7 +198,11 @@ impl HaCluster {
     fn spawn_osd(&mut self, i: usize, bins: Option<&Path>) {
         let endpoints = self.meta_endpoints();
         let o = &mut self.osds[i];
-        let child = Command::new(bin(bins, "objectio-osd"))
+        let mut cmd = Command::new(bin(bins, "objectio-osd"));
+        if bins.is_none() {
+            crate::tls::apply(&mut cmd);
+        }
+        let child = cmd
             .args([
                 "--listen",
                 &format!("127.0.0.1:{}", o.port),
@@ -225,7 +229,11 @@ impl HaCluster {
     fn spawn_gateway(&mut self, i: usize, bins: Option<&Path>) -> bool {
         let endpoints = self.meta_endpoints();
         let port = self.gateways[i].port;
-        let child = Command::new(bin(bins, "objectio-gateway"))
+        let mut cmd = Command::new(bin(bins, "objectio-gateway"));
+        if bins.is_none() {
+            crate::tls::apply(&mut cmd);
+        }
+        let child = cmd
             // Every gateway the same SSE master key, as in production.
             .env(
                 "OBJECTIO_MASTER_KEY",
@@ -337,7 +345,11 @@ impl HaCluster {
         let m = &self.metas[i];
         std::fs::create_dir_all(&m.dir).expect("meta dir");
         let bins = m.bins.lock().unwrap().clone();
-        let child = Command::new(bin(bins.as_deref(), "objectio-meta"))
+        let mut cmd = Command::new(bin(bins.as_deref(), "objectio-meta"));
+        if bins.is_none() {
+            crate::tls::apply(&mut cmd);
+        }
+        let child = cmd
             .args([
                 "--node-id",
                 &m.id.to_string(),

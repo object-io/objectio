@@ -91,8 +91,8 @@ fn admin_state(c: &Cluster, id: &str) -> String {
 
 async fn block_client(port: u16) -> BlockServiceClient<tonic::transport::Channel> {
     loop {
-        if let Ok(c) = BlockServiceClient::connect(format!("http://127.0.0.1:{port}")).await {
-            return c.max_decoding_message_size(64 << 20);
+        if let Ok(c) = objectio_e2e::tls::channel(&format!("127.0.0.1:{port}")).await {
+            return BlockServiceClient::new(c).max_decoding_message_size(64 << 20);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -220,14 +220,11 @@ fn a_drained_osd_can_be_pulled_with_two_more_lost() {
 async fn osd_shards(address: String) -> u64 {
     use objectio_proto::storage::GetStatusRequest;
     use objectio_proto::storage::storage_service_client::StorageServiceClient;
-    let uri = if address.starts_with("http") {
-        address
-    } else {
-        format!("http://{address}")
-    };
-    let mut client = StorageServiceClient::connect(uri)
-        .await
-        .expect("connect OSD");
+    let mut client = StorageServiceClient::new(
+        objectio_e2e::tls::channel(&address)
+            .await
+            .expect("connect OSD"),
+    );
     client
         .get_status(GetStatusRequest::default())
         .await

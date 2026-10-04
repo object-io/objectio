@@ -112,6 +112,10 @@ pub struct Args {
     /// pod-reachable, not `0.0.0.0`, in production.
     #[arg(long, default_value = "")]
     pub raft_advertise: String,
+
+    /// mTLS between services (A8a).
+    #[command(flatten)]
+    pub tls: objectio_proto::transport::TlsArgs,
 }
 
 /// Largest Raft RPC message meta accepts.
@@ -152,6 +156,7 @@ pub async fn run(
     args: Args,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Metadata Service");
 
     // Initialize metadata service with EC config

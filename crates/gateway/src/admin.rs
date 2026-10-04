@@ -2091,6 +2091,17 @@ pub async fn admin_list_recipients_tenant(
 // Nodes / Drives
 // ============================================================================
 
+/// A client of the OSD at `addr`, over mTLS when it is on.
+async fn connect_osd(
+    addr: &str,
+) -> Result<StorageServiceClient<tonic::transport::Channel>, String> {
+    let channel = objectio_proto::transport::endpoint(addr)?
+        .connect()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(StorageServiceClient::new(channel))
+}
+
 pub async fn admin_list_nodes(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -2129,12 +2140,7 @@ pub async fn admin_list_nodes(
 
     for (addr, node_id, admin_state_i32) in &unique_addrs {
         let admin_state_str = admin_state_label(*admin_state_i32);
-        let osd_addr = if addr.starts_with("http") {
-            addr.clone()
-        } else {
-            format!("http://{addr}")
-        };
-        let status = match StorageServiceClient::connect(osd_addr).await {
+        let status = match connect_osd(addr).await {
             Ok(mut client) => {
                 match client
                     .get_status(objectio_proto::storage::GetStatusRequest::default())
@@ -2407,12 +2413,8 @@ pub async fn admin_reboot_osd(
             return (StatusCode::NOT_FOUND, format!("no OSD {node_id_hex}")).into_response();
         }
     };
-    let osd_addr = if addr.starts_with("http") {
-        addr
-    } else {
-        format!("http://{addr}")
-    };
-    let pod_name = match StorageServiceClient::connect(osd_addr.clone()).await {
+    let osd_addr = addr;
+    let pod_name = match connect_osd(&osd_addr).await {
         Ok(mut client) => match client
             .get_status(objectio_proto::storage::GetStatusRequest::default())
             .await

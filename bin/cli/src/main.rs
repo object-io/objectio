@@ -101,6 +101,10 @@ async fn main() -> ExitCode {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    if let Err(e) = objectio_proto::transport::configure_tls(&args.tls) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
     let env = |k: &str| std::env::var(k).ok();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

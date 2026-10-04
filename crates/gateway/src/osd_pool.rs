@@ -202,7 +202,7 @@ impl OsdPool {
                     .is_some_and(|at| at.elapsed() < FAIL_FAST)
             };
             while marked() {
-                let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
+                let answers = match objectio_proto::transport::endpoint(&address) {
                     Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
                     Err(_) => false,
                 };
@@ -275,7 +275,7 @@ impl OsdPool {
         );
         let address = address.to_string();
         runtime.spawn(async move {
-            let answers = match tonic::transport::Endpoint::from_shared(address.clone()) {
+            let answers = match objectio_proto::transport::endpoint(&address) {
                 Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
                 Err(_) => false,
             };
@@ -350,8 +350,8 @@ impl OsdPool {
         // and an open connection that stops answering keepalives is closed
         // after about 5 s, failing what is in flight on it (writes wait for
         // every shard, so this bounds how long a vanished host holds them).
-        let channel = tonic::transport::Endpoint::new(address.to_string())
-            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?
+        let channel = objectio_proto::transport::endpoint(address)
+            .map_err(OsdPoolError::ConnectionFailed)?
             .connect_timeout(std::time::Duration::from_secs(3))
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(2))

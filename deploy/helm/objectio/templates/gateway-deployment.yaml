@@ -156,6 +156,9 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- with (include "objectio.tls.env" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.service.port }}
@@ -183,5 +186,13 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
+          {{- with (include "objectio.tls.volumeMount" .) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
+      {{- with (include "objectio.tls.volume" .) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}

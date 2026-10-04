@@ -23,12 +23,104 @@ pub const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// Per-connection window: room for many shards in flight from one gateway.
 pub const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
 
-/// A server builder whose connections accept shards at full window.
+/// mTLS between the services (A8a), every gRPC hop: gateway, meta, OSD
+/// and block gateway, and the CLI's block commands. With these set, a
+/// server accepts only clients presenting a certificate the CA signed, and
+/// a client accepts only servers that do; without them, gRPC is plain
+/// (development, tests that say so).
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct TlsArgs {
+    /// This node's certificate (PEM), presented to peers both as a server
+    /// and as a client. It must name every address peers dial it by.
+    #[arg(long, env = "OBJECTIO_TLS_CERT", requires_all = ["tls_key", "tls_ca"])]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// The certificate's private key (PEM).
+    #[arg(long, env = "OBJECTIO_TLS_KEY", requires_all = ["tls_cert", "tls_ca"])]
+    pub tls_key: Option<std::path::PathBuf>,
+    /// The CA (PEM) that signs every node's certificate: the only one
+    /// trusted, for servers and clients alike.
+    #[arg(long, env = "OBJECTIO_TLS_CA", requires_all = ["tls_cert", "tls_key"])]
+    pub tls_ca: Option<std::path::PathBuf>,
+}
+
+struct Tls {
+    client: tonic::transport::ClientTlsConfig,
+    server: tonic::transport::ServerTlsConfig,
+}
+
+static TLS: std::sync::OnceLock<Tls> = std::sync::OnceLock::new();
+
+/// Turn mTLS on for this process, from `args`; nothing to do when they
+/// name no certificate. Once per process: in the all-in-one, every service
+/// shares it.
+///
+/// # Errors
+/// A file that can't be read.
+pub fn configure_tls(args: &TlsArgs) -> Result<(), String> {
+    let (Some(cert), Some(key), Some(ca)) = (&args.tls_cert, &args.tls_key, &args.tls_ca) else {
+        return Ok(());
+    };
+    let read = |p: &std::path::Path| {
+        std::fs::read(p).map_err(|e| format!("TLS: cannot read {}: {e}", p.display()))
+    };
+    let identity = tonic::transport::Identity::from_pem(read(cert)?, read(key)?);
+    let ca = tonic::transport::Certificate::from_pem(read(ca)?);
+    let _ = TLS.set(Tls {
+        client: tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(ca.clone())
+            .identity(identity.clone()),
+        server: tonic::transport::ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(ca),
+    });
+    tracing::info!("gRPC between services: mutual TLS");
+    Ok(())
+}
+
+/// Whether gRPC in this process uses mTLS.
+#[must_use]
+pub fn tls_enabled() -> bool {
+    TLS.get().is_some()
+}
+
+/// An endpoint for the gRPC address `addr` (`host:port`, or a URL): over
+/// mTLS when it is on (whatever scheme the address was registered with),
+/// plain otherwise. Every client connection between services is made
+/// from one of these.
+///
+/// # Errors
+/// An address that doesn't parse.
+pub fn endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
+    let rest = addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let invalid = |e: tonic::transport::Error| format!("invalid gRPC address `{addr}`: {e}");
+    match TLS.get() {
+        Some(tls) => tonic::transport::Endpoint::from_shared(format!("https://{rest}"))
+            .map_err(invalid)?
+            .tls_config(tls.client.clone())
+            .map_err(invalid),
+        None => tonic::transport::Endpoint::from_shared(format!("http://{rest}")).map_err(invalid),
+    }
+}
+
+/// A server builder whose connections accept shards at full window, over
+/// mTLS when it is on.
+///
+/// # Panics
+/// If the TLS configuration doesn't apply (it was read and parsed when
+/// configured).
 #[must_use]
 pub fn server() -> Server {
-    Server::builder()
+    let builder = Server::builder()
         .initial_stream_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONNECTION_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW);
+    match TLS.get() {
+        Some(tls) => builder
+            .tls_config(tls.server.clone())
+            .expect("gRPC server TLS configuration"),
+        None => builder,
+    }
 }
 
 /// Header marking a meta liveness probe (see [`meta_channel`]).
@@ -63,18 +155,14 @@ pub async fn meta_channel(endpoints: &str) -> Result<tonic::transport::Channel, 
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(|e| {
-            let uri = if e.contains("://") {
-                e.to_string()
-            } else {
-                format!("http://{e}")
-            };
-            tonic::transport::Endpoint::from_shared(uri)
+            endpoint(e)
                 .and_then(|ep| {
                     // The user-agent carries this binary's format level:
                     // meta refuses a client too old for the cluster.
                     ep.connect_timeout(std::time::Duration::from_secs(3))
                         .timeout(META_CALL_TIMEOUT)
                         .user_agent(objectio_common::version::user_agent())
+                        .map_err(|err| err.to_string())
                 })
                 .map_err(|err| format!("meta endpoint {e}: {err}"))
         })
@@ -216,4 +304,27 @@ pub fn spawn_version_reporter(endpoints: String, kind: &'static str, id: String,
             tokio::time::sleep(VERSION_REPORT_EVERY).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint;
+
+    /// Plain gRPC: an address gets the scheme, whatever it was registered
+    /// with. A host that merely begins with "http" is not a URL (a check
+    /// on `starts_with("http")` once passed `httpd:9200` through without a
+    /// scheme, and a whole drain sweep failed on it).
+    #[test]
+    fn an_address_gets_the_scheme_of_the_transport() {
+        for (addr, want) in [
+            ("10.0.0.4:9200", "http://10.0.0.4:9200/"),
+            ("osd-1:9200", "http://osd-1:9200/"),
+            ("http://osd-1:9200", "http://osd-1:9200/"),
+            ("https://osd-1:9200", "http://osd-1:9200/"),
+            ("httpd:9200", "http://httpd:9200/"),
+            ("https-gw:9200", "http://https-gw:9200/"),
+        ] {
+            assert_eq!(endpoint(addr).unwrap().uri().to_string(), want, "{addr}");
+        }
+    }
 }

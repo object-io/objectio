@@ -47,11 +47,11 @@ impl Block {
     }
 
     fn client(&self) -> BlockServiceClient<Channel> {
-        let url = format!("http://127.0.0.1:{}", self.port);
+        let url = format!("127.0.0.1:{}", self.port);
         self.rt.block_on(async {
             for _ in 0..100 {
-                if let Ok(c) = BlockServiceClient::connect(url.clone()).await {
-                    return c.max_decoding_message_size(64 << 20);
+                if let Ok(c) = objectio_e2e::tls::channel(&url).await {
+                    return BlockServiceClient::new(c).max_decoding_message_size(64 << 20);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }

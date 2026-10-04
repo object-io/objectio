@@ -184,7 +184,7 @@ fn decide(reachable: bool, consecutive_misses: u32, admin: OsdAdminState) -> Opt
 /// One status call. Any error — connect, timeout, or an error response — is a
 /// miss; this only asks "would a write to you have worked".
 async fn probe(address: &str) -> bool {
-    let endpoint = match tonic::transport::Endpoint::from_shared(address.to_string()) {
+    let endpoint = match objectio_proto::transport::endpoint(address) {
         Ok(e) => e.connect_timeout(PROBE_TIMEOUT).timeout(PROBE_TIMEOUT),
         Err(_) => return false,
     };
