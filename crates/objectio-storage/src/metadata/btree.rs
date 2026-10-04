@@ -275,13 +275,19 @@ impl BTreeIndex {
         }
     }
 
-    /// Write a snapshot to disk
+    /// Write a snapshot of the index as it is, labelled with its highest
+    /// LSN: only where nothing is being applied concurrently (tests).
+    #[cfg(test)]
     pub fn write_snapshot(&self) -> Result<PathBuf> {
         let lsn = self.lsn.load(Ordering::SeqCst);
-        let tree = self.tree.read();
+        self.write_snapshot_at(lsn, self.entries_for_snapshot())
+    }
 
-        // Prepare entries for serialization
-        let entries = super::types::SnapshotEntries {
+    /// Every entry, for a snapshot. Its LSN is the caller's to know: the
+    /// index's highest can be ahead of a record still being applied.
+    pub fn entries_for_snapshot(&self) -> super::types::SnapshotEntries {
+        let tree = self.tree.read();
+        super::types::SnapshotEntries {
             entries: tree
                 .iter()
                 .map(|(k, v)| super::types::SnapshotEntry {
@@ -290,13 +296,20 @@ impl BTreeIndex {
                     lsn: v.lsn,
                 })
                 .collect(),
-        };
+        }
+    }
 
+    /// Write `entries` to disk as the snapshot at `lsn`: durable (file and
+    /// directory synced) when this returns.
+    pub fn write_snapshot_at(
+        &self,
+        lsn: u64,
+        entries: super::types::SnapshotEntries,
+    ) -> Result<PathBuf> {
         let entry_count = entries.entries.len() as u64;
 
         let data = prost::Message::encode_to_vec(&entries);
-
-        drop(tree);
+        drop(entries);
 
         // Compute checksum
         let checksum = crc32c::crc32c(&data);
@@ -350,6 +363,8 @@ impl BTreeIndex {
         // Atomic rename
         std::fs::rename(&temp_path, &snapshot_path)
             .map_err(|e| Error::Storage(format!("failed to rename snapshot: {}", e)))?;
+        // The WAL is cut next, on the strength of this file being there.
+        super::wal::sync_parent_dir(&snapshot_path)?;
 
         // Update tracking
         self.last_snapshot_lsn.store(lsn, Ordering::SeqCst);
