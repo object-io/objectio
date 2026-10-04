@@ -9,10 +9,16 @@
 //! - B2: Ghost entries recently evicted from T2
 //!
 //! The algorithm adapts the target size of T1 vs T2 based on hit patterns.
+//!
+//! Each list is a linked hash set: membership, removal and moving a key to
+//! the back are O(1). They were `VecDeque`s scanned on every get and put,
+//! up to 2 × capacity keys under the one lock, which made a hit cost more
+//! CPU than the request it served.
 
 use super::types::MetadataKey;
+use hashlink::LinkedHashSet;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cache statistics
@@ -53,13 +59,13 @@ struct CacheEntry {
 /// ARC cache internal state
 struct ArcState {
     /// Recently accessed (seen once)
-    t1: VecDeque<MetadataKey>,
+    t1: LinkedHashSet<MetadataKey>,
     /// Frequently accessed (seen multiple times)
-    t2: VecDeque<MetadataKey>,
+    t2: LinkedHashSet<MetadataKey>,
     /// Ghost entries from T1
-    b1: VecDeque<MetadataKey>,
+    b1: LinkedHashSet<MetadataKey>,
     /// Ghost entries from T2
-    b2: VecDeque<MetadataKey>,
+    b2: LinkedHashSet<MetadataKey>,
     /// Actual cached values
     cache: HashMap<MetadataKey, CacheEntry>,
     /// Target size for T1 (adaptive parameter)
@@ -71,10 +77,10 @@ struct ArcState {
 impl ArcState {
     fn new(capacity: usize) -> Self {
         Self {
-            t1: VecDeque::new(),
-            t2: VecDeque::new(),
-            b1: VecDeque::new(),
-            b2: VecDeque::new(),
+            t1: LinkedHashSet::new(),
+            t2: LinkedHashSet::new(),
+            b1: LinkedHashSet::new(),
+            b2: LinkedHashSet::new(),
             cache: HashMap::with_capacity(capacity),
             p: 0,
             capacity,
@@ -99,10 +105,18 @@ impl ArcState {
     /// Remove key from a specific list
     fn remove_from_list(&mut self, key: &MetadataKey, list: ListLocation) {
         match list {
-            ListLocation::T1 => self.t1.retain(|k| k != key),
-            ListLocation::T2 => self.t2.retain(|k| k != key),
-            ListLocation::B1 => self.b1.retain(|k| k != key),
-            ListLocation::B2 => self.b2.retain(|k| k != key),
+            ListLocation::T1 => {
+                self.t1.remove(key);
+            }
+            ListLocation::T2 => {
+                self.t2.remove(key);
+            }
+            ListLocation::B1 => {
+                self.b1.remove(key);
+            }
+            ListLocation::B2 => {
+                self.b2.remove(key);
+            }
         }
     }
 
@@ -148,8 +162,8 @@ impl ArcCache {
         // Check T1
         if state.t1.contains(key) {
             // Move from T1 to T2 (now frequently accessed)
-            state.t1.retain(|k| k != key);
-            state.t2.push_back(key.clone());
+            state.t1.remove(key);
+            state.t2.insert(key.clone());
 
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             self.stats.t1_hits.fetch_add(1, Ordering::Relaxed);
@@ -160,8 +174,7 @@ impl ArcCache {
         // Check T2
         if state.t2.contains(key) {
             // Move to back of T2 (most recently used)
-            state.t2.retain(|k| k != key);
-            state.t2.push_back(key.clone());
+            state.t2.to_back(key);
 
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             self.stats.t2_hits.fetch_add(1, Ordering::Relaxed);
@@ -184,7 +197,7 @@ impl ArcCache {
             match location {
                 ListLocation::T1 | ListLocation::T2 => {
                     state.remove_from_list(&key, location);
-                    state.t2.push_back(key.clone());
+                    state.t2.insert(key.clone());
                     state.cache.insert(key, CacheEntry { value });
                     return;
                 }
@@ -199,13 +212,13 @@ impl ArcCache {
             state.p = std::cmp::min(capacity, state.p + delta);
 
             // Remove from B1
-            state.b1.retain(|k| k != &key);
+            state.b1.remove(&key);
 
             // Make room if needed
             self.replace(&mut state, false);
 
             // Add to T2
-            state.t2.push_back(key.clone());
+            state.t2.insert(key.clone());
             state.cache.insert(key, CacheEntry { value });
             return;
         }
@@ -217,13 +230,13 @@ impl ArcCache {
             state.p = state.p.saturating_sub(delta);
 
             // Remove from B2
-            state.b2.retain(|k| k != &key);
+            state.b2.remove(&key);
 
             // Make room if needed
             self.replace(&mut state, true);
 
             // Add to T2
-            state.t2.push_back(key.clone());
+            state.t2.insert(key.clone());
             state.cache.insert(key, CacheEntry { value });
             return;
         }
@@ -241,7 +254,7 @@ impl ArcCache {
                 // T1 is full (and B1 is empty), remove from T1 and add to B1
                 if let Some(evicted) = state.t1.pop_front() {
                     state.cache.remove(&evicted);
-                    state.b1.push_back(evicted);
+                    state.b1.insert(evicted);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -255,7 +268,7 @@ impl ArcCache {
         }
 
         // Add new entry to T1
-        state.t1.push_back(key.clone());
+        state.t1.insert(key.clone());
         state.cache.insert(key, CacheEntry { value });
     }
 
@@ -300,14 +313,14 @@ impl ArcCache {
             // Evict from T1 -> B1
             if let Some(evicted) = state.t1.pop_front() {
                 state.cache.remove(&evicted);
-                state.b1.push_back(evicted);
+                state.b1.insert(evicted);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         } else {
             // Evict from T2 -> B2
             if let Some(evicted) = state.t2.pop_front() {
                 state.cache.remove(&evicted);
-                state.b2.push_back(evicted);
+                state.b2.insert(evicted);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
