@@ -1309,6 +1309,7 @@ pub(crate) async fn get_object_version_once(
     );
 
     // Verify data integrity for full (non-range) reads
+    // Never sent: bytes that don't add up to the object are not the object.
     if resolved_range.is_none() && all_data.len() as u64 != total_size {
         error!(
             "Data size mismatch for {}/{}: reassembled {} bytes but object.size={}",
@@ -1316,6 +1317,11 @@ pub(crate) async fn get_object_version_once(
             key,
             all_data.len(),
             total_size
+        );
+        return S3Error::xml_response(
+            "InternalError",
+            "The object's data did not reassemble to its size",
+            StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
 
