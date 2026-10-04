@@ -192,8 +192,14 @@ impl ErasureBackend for IsalBackend {
             }
         }
 
-        // Build erasure list (indices of missing shards in the combined array)
-        let erasures: Vec<usize> = missing_indices.to_vec();
+        // Every shard that is absent is an erasure, whether or not the
+        // caller listed it: ISA-L decodes from the first k positions not
+        // erased, and an absent one among them is the zeros put in its place
+        // above. Repair listed only the positions it lost, not a source read
+        // that failed, and stored shards rebuilt from zeros (the B2 soak).
+        let erasures: Vec<usize> = (0..shards.len())
+            .filter(|&i| shards[i].is_none() || missing_indices.contains(&i))
+            .collect();
 
         // Decode
         self.encoder

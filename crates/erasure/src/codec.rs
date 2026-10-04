@@ -673,6 +673,30 @@ mod tests {
         }
     }
 
+    /// A source that couldn't be read is not a shard of zeros. Repair asks
+    /// for the positions it lost, and its survivors can hold more gaps than
+    /// that: a source read that failed. Taken as zeros, the rebuilt shard
+    /// was wrong and stored with a checksum of its own wrong bytes; the B2
+    /// soak read objects back with a shard of zeros, HTTP 200.
+    #[test]
+    fn an_unread_source_is_not_taken_as_zeros() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data: Vec<u8> = (0..50_051u32).map(|i| (i * 13 % 251) as u8).collect();
+        let stripe = codec.encode(&data).unwrap();
+        for lost in 0..6 {
+            for unread in (0..6).filter(|&u| u != lost) {
+                let survivors: Vec<Option<Vec<u8>>> = (0..6)
+                    .map(|i| (i != lost && i != unread).then(|| stripe[i].clone()))
+                    .collect();
+                let rebuilt = codec.reconstruct_shards(&survivors, &[lost]).unwrap();
+                assert_eq!(
+                    rebuilt[0], stripe[lost],
+                    "shard {lost} rebuilt wrong with shard {unread} unread"
+                );
+            }
+        }
+    }
+
     #[test]
     fn decode_accepts_bytes_and_recovers_from_parity() {
         let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();

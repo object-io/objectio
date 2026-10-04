@@ -81,6 +81,14 @@ jobs:
       # Excluding the e2e package: it boots a cluster and belongs in its own
       # job so its runtime and its failures stay legible.
       - run: cargo test --workspace --exclude objectio-e2e
+      # The release erasure-codes with ISA-L and does disk I/O through
+      # io_uring; without these the tests above run the pure-Rust code and
+      # pread only. An ISA-L decode bug that rebuilt shards from zeros
+      # passed here for that reason (the B2 soak found it).
+      - name: ISA-L and io_uring deps
+        run: sudo apt-get install -y nasm autoconf automake libtool libclang-dev
+      - run: cargo test -p objectio-erasure --features isal
+      - run: cargo test -p objectio-storage --features io-uring
 
   e2e:
     name: end-to-end
