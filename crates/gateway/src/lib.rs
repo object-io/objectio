@@ -1023,6 +1023,14 @@ pub async fn run(
     let body_limit = DefaultBodyLimit::max(100 * 1024 * 1024);
     info!("Max single-part upload size: 100 MB");
 
+    // Bucket operations (including ?policy and ?uploads query params;
+    // POST is ?delete, the batch delete)
+    let bucket_routes = put(s3::create_bucket)
+        .delete(s3::delete_bucket)
+        .head(s3::head_bucket)
+        .get(s3::list_objects)
+        .post(s3::post_bucket);
+
     // Build S3 routes (behind SigV4 auth when enabled)
     let s3_routes = Router::new()
         // /health stays no-auth so a load balancer can probe the data
@@ -1033,16 +1041,10 @@ pub async fn run(
         .route("/_ready", get(cluster_poll::ready_handler))
         // Service endpoint (list buckets)
         .route("/", get(s3::list_buckets))
-        // Bucket operations (including ?policy and ?uploads query params)
-        .route("/{bucket}", put(s3::create_bucket))
-        .route("/{bucket}", delete(s3::delete_bucket))
-        .route("/{bucket}", head(s3::head_bucket))
-        .route("/{bucket}", get(s3::list_objects))
-        // POST /{bucket}?delete - batch delete objects
-        .route("/{bucket}", post(s3::post_bucket))
-        // Bucket with trailing slash (s3fs compatibility)
-        .route("/{bucket}/", head(s3::head_bucket_trailing))
-        .route("/{bucket}/", get(s3::list_objects_trailing))
+        // `/{bucket}/` is the same request: minio-go (warp, mc) and s3fs
+        // send the slash, so every verb takes it.
+        .route("/{bucket}", bucket_routes.clone())
+        .route("/{bucket}/", bucket_routes)
         // Object operations (with multipart upload support via query params)
         .route("/{bucket}/{*key}", put(s3::put_object_with_params))
         .route("/{bucket}/{*key}", get(s3::get_object_with_params))
