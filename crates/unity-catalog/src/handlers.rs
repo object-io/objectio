@@ -152,7 +152,7 @@ async fn check_iam_policies(
     // IAM policies attached would still be allowed (because empty set is
     // implicit-allow), but a Deny statement attached to "*" would block
     // them by accident. The admin short-circuit avoids that footgun.
-    if auth_result.user_arn.ends_with("user/admin") {
+    if auth_result.is_system_admin() {
         return Ok(());
     }
     let mut client = state.catalog.meta_client();
@@ -363,7 +363,7 @@ fn arn_short_name(arn: &str) -> &str {
 }
 
 fn is_admin(auth: &AuthResult, state: &UnityState) -> bool {
-    if auth.user_arn.ends_with("user/admin") {
+    if auth.is_system_admin() {
         return true;
     }
     if state.admin_principals.iter().any(|p| p == &auth.user_arn) {
@@ -429,7 +429,7 @@ fn require_admin(auth: Option<&Extension<AuthResult>>, state: &UnityState) -> Re
     let Some(Extension(auth_result)) = auth else {
         return Ok(());
     };
-    if auth_result.user_arn.ends_with("user/admin") {
+    if auth_result.is_system_admin() {
         return Ok(());
     }
     let arns = std::iter::once(auth_result.user_arn.as_str())
