@@ -652,6 +652,23 @@ fn write_superblock(file: &RawFile, sb: &Superblock) -> Result<()> {
 
 /// The disk's superblock: the primary, or, when it can't be read (torn by
 /// a power cut, say), the backup, which then repairs the primary.
+/// Whether `path` is blank: both superblock copies all zeros, as a new or
+/// wiped device or file reads. Only a blank disk may be formatted; one
+/// with anything there, even an ObjectIO superblock that won't parse, is
+/// data until an operator says otherwise. A read error is an error, not
+/// "blank".
+pub fn is_blank(path: impl AsRef<Path>) -> Result<bool> {
+    let file = RawFile::open(path.as_ref(), true)?;
+    for offset in [0, crate::layout::BACKUP_SUPERBLOCK_OFFSET] {
+        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
+        file.read_at(offset, buf.as_mut_slice())?;
+        if buf.as_slice().iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
     let read_at = |offset: u64| -> Result<Superblock> {
         let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);

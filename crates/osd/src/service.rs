@@ -592,7 +592,30 @@ impl OsdService {
                     formatted_now.push(false);
                     d
                 }
-                Err(_) => {
+                Err(open_error) => {
+                    // Formatted only when blank: a disk that fails to open
+                    // for any other reason (an I/O error, a superblock torn
+                    // in both copies) holds shards, and formatting it was
+                    // the OSD destroying them. It stays as it is and the
+                    // OSD doesn't start, saying why.
+                    if std::path::Path::new(path).exists() {
+                        match objectio_storage::is_blank(path) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return Err(format!(
+                                    "disk {path} has data but cannot be opened ({open_error}); \
+                                     not formatting it. Check the device, or wipe it to \
+                                     replace it."
+                                ));
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "disk {path} cannot be opened ({open_error}) or read ({e}); \
+                                     not formatting it"
+                                ));
+                            }
+                        }
+                    }
                     // Get device/file size - for block devices we need to check
                     let size = if std::path::Path::new(path).exists() {
                         // Use raw_io to get size
@@ -1844,6 +1867,21 @@ impl StorageService for OsdService {
         );
 
         let timestamp = Self::current_timestamp();
+
+        // The checksum the shard's object records (B23). The block's own
+        // checks passed above against this OSD's checksum; that one was
+        // taken of whatever bytes this OSD was sent, so a shard stored wrong
+        // (rebuilt from a bad source) passes them. It doesn't pass this.
+        if let Some(expected) = req.expected_crc32c {
+            let actual = crc32c::crc32c(&data);
+            if actual != expected {
+                self.mark_corrupt(&key, location.block_num);
+                return Err(Status::data_loss(format!(
+                    "shard is not the one its object records \
+                     (crc32c {actual:08x}, expected {expected:08x})"
+                )));
+            }
+        }
 
         // A ranged read (a packed object's slice): the whole shard is
         // checked against its stored checksum first, as the gateway checks
@@ -3133,6 +3171,46 @@ mod grpc_write_tests {
             stripe_id: 0,
             position: 1,
         }
+    }
+
+    /// A disk the OSD can't open is not formatted unless it is blank: with
+    /// both superblock copies damaged it holds shards still, and the OSD
+    /// formatting it on start destroyed them. It refuses to start instead.
+    #[tokio::test]
+    async fn a_disk_that_wont_open_is_not_formatted() {
+        use std::os::unix::fs::FileExt;
+        let (dir, osd) = osd();
+        osd.write_shard(Request::new(write_request(
+            &[7; 5000],
+            Some(crc32c::crc32c(&[7; 5000])),
+        )))
+        .await
+        .unwrap();
+        drop(osd);
+        let path = dir.path().join("disk.raw");
+        let damage = [0xAB; 4096];
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&damage, 0).unwrap();
+            f.write_all_at(&damage, objectio_storage::layout::BACKUP_SUPERBLOCK_OFFSET)
+                .unwrap();
+            f.sync_all().unwrap();
+        }
+        let reopened = OsdService::new(
+            vec![path.display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        );
+        let Err(why) = reopened else {
+            panic!("an unopenable disk with data was taken (formatted)");
+        };
+        assert!(why.contains("not formatting"), "{why}");
+        let mut head = [0u8; 4096];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut head, 0)
+            .unwrap();
+        assert_eq!(head, damage, "the disk was written to");
     }
 
     fn write_request(data: &[u8], crc: Option<u32>) -> WriteShardRequest {

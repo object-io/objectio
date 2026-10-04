@@ -87,6 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n--- Read Shard ---");
     let read_response = client
         .read_shard(ReadShardRequest {
+            expected_crc32c: None,
             rdma_dest: None,
             shard_id: Some(ShardId {
                 object_id: object_id.to_vec(),

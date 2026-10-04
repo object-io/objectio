@@ -182,10 +182,11 @@ pub async fn write_shard_to_osd(
     data: Bytes,
     ec_k: u32,
     ec_m: u32,
-) -> Result<objectio_proto::storage::BlockLocation, OsdPoolError> {
+) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
     use objectio_proto::storage::{Checksum, ShardId, WriteShardRequest};
 
     let mut client = pool.get_client_for_placement(placement).await?;
+    let crc = crc32c::crc32c(&data);
 
     let request = WriteShardRequest {
         shard_id: Some(ShardId {
@@ -196,7 +197,7 @@ pub async fn write_shard_to_osd(
         ec_k,
         ec_m,
         checksum: Some(Checksum {
-            crc32c: crc32c::crc32c(&data),
+            crc32c: crc,
             xxhash64: 0,
             sha256: vec![],
         }),
@@ -223,10 +224,12 @@ pub async fn write_shard_to_osd(
             OsdPoolError::ConnectionFailed(e.to_string())
         })?;
 
-    response
+    let location = response
         .into_inner()
         .location
-        .ok_or_else(|| OsdPoolError::ConnectionFailed("no location returned".to_string()))
+        .ok_or_else(|| OsdPoolError::ConnectionFailed("no location returned".to_string()))?;
+    // The crc32c goes into the chunk's stripe, for reads to check (B23).
+    Ok((location, crc))
 }
 
 /// Read a shard from the appropriate OSD
@@ -236,6 +239,7 @@ pub async fn read_shard_from_osd(
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
+    expected_crc32c: Option<u32>,
 ) -> Result<Vec<u8>, OsdPoolError> {
     use objectio_proto::storage::{ReadShardRequest, ShardId};
 
@@ -250,6 +254,7 @@ pub async fn read_shard_from_osd(
         offset: 0,
         length: 0,
         rdma_dest: None,
+        expected_crc32c,
     };
 
     let read_future = client.read_shard(request);
@@ -273,7 +278,9 @@ pub async fn read_shard_from_osd(
     // A shard damaged on the way is a failed read, so the chunk is decoded
     // from the others instead of from the damage.
     let response = response.into_inner();
-    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+    if !matches_checksum(response.checksum.as_ref(), &response.data)
+        || expected_crc32c.is_some_and(|c| c != crc32c::crc32c(&response.data))
+    {
         warn!(
             "shard {position} from OSD {} does not match its checksum; not using it",
             placement.node_address

@@ -179,6 +179,7 @@ pub(crate) async fn read_packed_slice(
             loc.position,
             in_shard,
             u32::try_from(len).ok()?,
+            loc.crc32c,
         )
         .await
         .ok()?;
@@ -985,6 +986,7 @@ pub(crate) async fn get_object_version_once(
                     shard_object_id,
                     stripe.stripe_id,
                     shard_loc.position,
+                    shard_loc.crc32c,
                     None, // Replicated stripes go over gRPC.
                 )
                 .await
@@ -1174,6 +1176,7 @@ pub(crate) async fn get_object_version_once(
                 let pool = &state.osd_pool;
                 let rdma = state.rdma.as_deref();
                 let stripe_id = stripe.stripe_id;
+                let expected_crc32c = shard_loc.crc32c;
                 in_flight.push(async move {
                     let result = read_shard_from_osd(
                         pool,
@@ -1181,6 +1184,7 @@ pub(crate) async fn get_object_version_once(
                         ec_shard_object_id,
                         stripe_id,
                         pos,
+                        expected_crc32c,
                         rdma,
                     )
                     .await;
