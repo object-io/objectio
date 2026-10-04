@@ -790,7 +790,7 @@ pub async fn put_object(
             let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
-                    Ok(location) => {
+                    Ok((location, crc32c)) => {
                         success_count += 1;
                         shard_locs.push(ShardLocation {
                             position: pos,
@@ -799,6 +799,7 @@ pub async fn put_object(
                             offset: location.offset,
                             shard_type: placement_node.shard_type,
                             local_group: placement_node.local_group,
+                            crc32c: Some(crc32c),
                         });
                         debug!(
                             "Wrote stripe {} replica {} to {}",
@@ -1193,7 +1194,7 @@ pub async fn put_object(
         let mut full = false;
         for (pos, result, placement_node) in results {
             match result {
-                Ok(location) => {
+                Ok((location, crc32c)) => {
                     success_count += 1;
                     shard_locs.push(ShardLocation {
                         position: pos,
@@ -1203,6 +1204,7 @@ pub async fn put_object(
                         // Use shard type from placement, or default to data/parity based on position
                         shard_type: placement_node.shard_type,
                         local_group: placement_node.local_group,
+                        crc32c: Some(crc32c),
                     });
                     debug!(
                         "Wrote stripe {} shard {} to {}",
