@@ -1,0 +1,153 @@
+# ObjectIO alert rules. Each alert has a runbook in the operations guide
+# (operations/production.md, "Runbooks"), under the alert's name.
+# Loaded by the chart's Prometheus (monitoring.enabled) and, with
+# monitoring.prometheusRule.enabled, published as a PrometheusRule.
+groups:
+  - name: objectio-data-safety
+    rules:
+      - alert: ObjectIOObjectsUnreadable
+        expr: max(objectio_objects_unreadable) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Objects have fewer than k readable shards
+      - alert: ObjectIOUnrecoverableStripes
+        expr: increase(objectio_meta_repair_unrecoverable_stripes_total[1h]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Repair found stripes it cannot rebuild
+      - alert: ObjectIOObjectsAtRisk
+        expr: max(objectio_objects_at_risk) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: Objects are one failure from unreadable and not yet repaired
+      - alert: ObjectIORepairNotRunning
+        # Three default repair intervals (--repair-interval-secs 3600).
+        expr: time() - max(objectio_meta_repair_last_pass_timestamp_seconds) > 3 * 3600
+        labels: {severity: warning}
+        annotations:
+          summary: No repair pass has completed in three hours
+      - alert: ObjectIOScrubStale
+        # One day past the scrub cycle (7 days).
+        expr: time() - min(objectio_osd_scrub_last_pass_timestamp_seconds) > 8 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: An OSD has not finished a scrub pass in eight days
+      - alert: ObjectIOCorruptShards
+        expr: sum(objectio_osd_corrupt_shards) > 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: Corrupt shards found and not rebuilt within an hour
+
+  - name: objectio-metadata
+    rules:
+      - alert: ObjectIOMetaNoLeader
+        expr: max(objectio_meta_raft_has_leader) == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Meta has no Raft leader; no metadata write can commit
+      - alert: ObjectIOMetaElectionsChurn
+        expr: increase(max(objectio_meta_raft_term)[15m:]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: More than three meta leader elections in 15 minutes
+      - alert: ObjectIOMetaFollowerLagging
+        expr: max(objectio_meta_raft_replication_lag_entries) > 1000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: A meta follower is more than 1000 log entries behind
+      - alert: ObjectIOHealQueueFailing
+        expr: increase(objectio_gateway_heal_queued_total{result="failed"}[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Writes that reached only a quorum of metadata copies could not be queued for healing
+      - alert: ObjectIOGatewayClockSkewed
+        expr: max(objectio_gateway_clock_skewed) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: A gateway's clock is more than 500 ms from meta's; it refuses writes
+
+  - name: objectio-capacity
+    rules:
+      - alert: ObjectIOOsdDown
+        expr: max(objectio_cluster_osds_total) - max(objectio_cluster_osds_up) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: An OSD is down; writes go on degraded until it returns or is set out
+      - alert: ObjectIODiskNearFull
+        expr: max by (osd_id, disk) (objectio_disk_used_bytes / objectio_disk_capacity_bytes) > 0.85
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: A disk is over 85% used; at 95% its OSD refuses client writes
+      - alert: ObjectIODiskFull
+        expr: max by (osd_id, disk) (objectio_disk_used_bytes / objectio_disk_capacity_bytes) > 0.95
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: A disk is past the full ratio; writes placed on it are refused (507)
+      - alert: ObjectIOClusterFilling
+        expr: max(objectio_cluster_used_bytes) / max(objectio_cluster_capacity_bytes) > 0.8
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: The cluster is over 80% used
+
+  - name: objectio-latency-and-errors
+    rules:
+      - alert: ObjectIOSlowShardSync
+        expr: histogram_quantile(0.99, sum by (le) (rate(objectio_osd_disk_seconds_bucket{op="sync"}[5m]))) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: p99 shard fsync over 100 ms; every write waits for it
+      - alert: ObjectIOS3ServerErrors
+        expr: sum(rate(objectio_s3_requests_total{status="server_error"}[5m])) / sum(rate(objectio_s3_requests_total[5m])) > 0.01
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Over 1% of S3 requests fail with 5xx
+      - alert: ObjectIOSpaceLeaking
+        expr: increase(objectio_gateway_shard_reclaim_failures_total[1h]) + increase(objectio_block_shard_delete_failures_total[1h]) > 100
+        labels: {severity: info}
+        annotations:
+          summary: Shard deletes failing; space stays allocated
+
+  - name: objectio-delivery
+    rules:
+      - alert: ObjectIOAuditEventsDropped
+        expr: increase(objectio_audit_dropped_total[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Audit events were dropped (spool full, or not accepted)
+      - alert: ObjectIOReplicationLagging
+        expr: max by (target) (objectio_replication_lag_seconds) > 3600
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: The oldest unreplicated version is over an hour old (the RPO)
+
+  - name: objectio-block
+    rules:
+      - alert: ObjectIOSlowBlockJournal
+        expr: histogram_quantile(0.99, sum by (le) (rate(objectio_block_journal_fsync_seconds_bucket[5m]))) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: p99 block journal fsync over 50 ms; every block write waits for it
+      - alert: ObjectIOBlockFlushFailing
+        expr: rate(objectio_block_chunks_flushed_total{result="failed"}[10m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Block chunks are not being stored; writes stay journaled and the cache fills
+      - alert: ObjectIOBlockReadErrors
+        expr: rate(objectio_block_io_errors_total{op="read"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Block reads are failing
