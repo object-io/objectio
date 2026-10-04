@@ -325,10 +325,10 @@ pub(crate) async fn commit_new(
     match committed {
         Ok((_, Committed::Both)) => Ok(()),
         Ok((_, Committed::Unlisted(e))) => {
-            warn!(
-                "create_object on meta failed ({e}); {what} is readable by key \
-                 but will not appear in ListObjects until repair",
-            );
+            // Stored and acknowledged; the listing follows (retried, then
+            // healed), not left to an hourly repair pass.
+            warn!("create_object on meta failed ({e}); listing {what} again");
+            sync_listing(state, nodes, &bucket, &key).await;
             Ok(())
         }
         Err(e) => Err(failed(&e)),
