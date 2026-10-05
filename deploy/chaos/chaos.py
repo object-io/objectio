@@ -131,16 +131,24 @@ def sigv4(method, url, body):
     return headers
 
 
-def admin(method, path, payload=None):
+def admin(method, path, payload=None, retry_for=120):
+    """An admin call through the first gateway that answers. 503 means
+    "retry" (meta electing a leader, a node coming back), as for S3 calls:
+    it is retried for up to `retry_for` seconds; anything else is final."""
     body = None if payload is None else json.dumps(payload).encode()
-    for url in GW:
-        headers = sigv4(method, url + path, body)
-        if body is not None:
-            headers["content-type"] = "application/json"
-        status, data = http(method, url + path, body, 10, headers)
-        if status is not None:
+    deadline = time.monotonic() + retry_for
+    while True:
+        status, data = None, b"no gateway answered"
+        for url in GW:
+            headers = sigv4(method, url + path, body)
+            if body is not None:
+                headers["content-type"] = "application/json"
+            status, data = http(method, url + path, body, 10, headers)
+            if status is not None:
+                break
+        if status != 503 or time.monotonic() > deadline:
             return status, data
-    return None, b"no gateway answered"
+        time.sleep(2)
 
 
 # --- traffic ---------------------------------------------------------------
