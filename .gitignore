@@ -38,3 +38,6 @@ __pycache__/
 node_modules/
 console/dist/
 .claude/
+
+# warp benchmark output (scripts/bench/baseline.sh writes it under $BENCH/results)
+warp-*.json.zst
