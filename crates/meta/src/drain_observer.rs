@@ -171,11 +171,21 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
     // or this is a new leader): try again.
     purge_pending(meta).await;
 
-    let draining: Vec<([u8; 16], String)> = {
+    // Evacuated: Draining OSDs, and Out ones not emptied yet (an OSD set
+    // Out directly is gone for good: what it held is rebuilt from the
+    // others, B26). An Out OSD that a drain emptied has a purge record.
+    let draining: Vec<([u8; 16], String, bool)> = {
         let osds = meta.osd_nodes_read().clone();
         osds.into_iter()
-            .filter(|n| n.admin_state == objectio_common::OsdAdminState::Draining)
-            .map(|n| (n.node_id, n.address))
+            .filter(|n| {
+                n.admin_state == objectio_common::OsdAdminState::Draining
+                    || (n.admin_state == objectio_common::OsdAdminState::Out
+                        && meta.purge_state(n.node_id).is_none())
+            })
+            .map(|n| {
+                let out = n.admin_state == objectio_common::OsdAdminState::Out;
+                (n.node_id, n.address, out)
+            })
             .collect()
     };
 
@@ -184,7 +194,7 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
     // honest.
     {
         let draining_ids: std::collections::HashSet<[u8; 16]> =
-            draining.iter().map(|(id, _)| *id).collect();
+            draining.iter().map(|(id, _, _)| *id).collect();
         let existing: Vec<[u8; 16]> = meta.drain_statuses_snapshot().keys().copied().collect();
         for id in existing {
             if !draining_ids.contains(&id) {
@@ -199,7 +209,7 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
 
     debug!("drain observer: sweeping {} draining OSDs", draining.len());
 
-    for (node_id, address) in draining {
+    for (node_id, address, out) in draining {
         // Always update shard_count first — the auto-finalize check
         // depends on it. Progress mirrors the observed count so the
         // console shows "X of Y migrated" even when migration stalls.
@@ -216,10 +226,10 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
                 Some(s)
             }
             Err(e) => {
-                // OSD offline → can't sweep. Record but don't abort
-                // other OSDs in this pass.
+                // It doesn't answer: what it held is rebuilt from the rest
+                // of each stripe instead of copied (B26).
                 meta.update_drain_progress(node_id, |p| {
-                    p.last_error = format!("osd unreachable: {e}");
+                    p.last_error = format!("osd unreachable ({e}): rebuilding from the others");
                     p.updated_at = now_unix();
                 });
                 None
@@ -227,23 +237,23 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
         };
 
         // Move what refers to it; finalise once nothing does.
-        let scan = match observed {
-            Some(_) => Some(migrate_batch(meta, node_id, &address, batch).await),
-            None => None,
-        };
-        if drain_step(scan) == DrainStep::Finalise {
+        let scan = migrate_batch(meta, node_id, &address, observed.is_some(), batch).await;
+        if drain_step(Some(scan)) == DrainStep::Finalise {
             info!(
                 "drain observer: nothing refers to OSD {} any more; finalising → Out",
                 hex::encode(node_id)
             );
-            match meta
-                .internal_set_osd_admin_state(
+            let flipped = if out {
+                Ok(())
+            } else {
+                meta.internal_set_osd_admin_state(
                     node_id,
                     objectio_common::OsdAdminState::Out,
                     "drain-observer".into(),
                 )
                 .await
-            {
+            };
+            match flipped {
                 Ok(()) => {
                     meta.clear_drain_progress(&node_id);
                     // Nothing refers to anything on it now: its shards and
@@ -408,6 +418,7 @@ async fn migrate_batch(
     meta: &Arc<MetaService>,
     draining: [u8; 16],
     draining_addr: &str,
+    source_alive: bool,
     batch: usize,
 ) -> Scan {
     let mut scan = Scan {
@@ -430,9 +441,24 @@ async fn migrate_batch(
         })
     };
 
-    // ObjectMetas, from every OSD (each holds copies of its placement's).
+    // ObjectMetas, from every OSD (each holds copies of its placement's):
+    // not from Out ones (emptied, or being evacuated themselves), nor from
+    // the evacuated one if it doesn't answer. Any other OSD that doesn't
+    // answer may hold the only reference left: the scan is incomplete.
     let limit = u32::try_from(batch.saturating_mul(4)).unwrap_or(u32::MAX);
-    for (addr, _id) in meta.all_osd_addresses() {
+    let scanned: Vec<String> = meta
+        .osd_nodes_read()
+        .iter()
+        .filter(|n| {
+            if n.node_id == draining {
+                source_alive
+            } else {
+                n.admin_state != objectio_common::OsdAdminState::Out
+            }
+        })
+        .map(|n| n.address.clone())
+        .collect();
+    for addr in scanned {
         match find_affected_objects(&addr, &draining, limit).await {
             Ok(objects) => {
                 for o in objects {
@@ -507,7 +533,11 @@ async fn migrate_batch(
             moves[i].pack_stripe = Some(stripe.clone());
         }
     }
-    scan.found = moves.len() + unsealed;
+    // Keys whose home has it, inline objects too (they have no shards for
+    // the scan above to find): each gets its metadata copy on the OSD
+    // that takes its place, and the home moves there (B26).
+    let (homes, homes_left) = meta.homes_holding(&draining, batch);
+    scan.found = moves.len() + unsealed + homes_left;
 
     // A few at a time: each reads and writes a shard.
     use futures::StreamExt;
@@ -519,14 +549,28 @@ async fn migrate_batch(
                 mv.shard.stripe_id,
                 mv.shard.position
             );
-            move_shard(meta, &draining, draining_addr, &mv)
+            move_shard(meta, &draining, draining_addr, source_alive, &mv)
                 .await
                 .map_err(|e| anyhow::anyhow!("{what}: {e}"))
         })
         .buffer_unordered(MOVES_AT_ONCE)
         .collect()
         .await;
-    for r in results {
+    let homes_moved: Vec<anyhow::Result<()>> = futures::stream::iter(homes)
+        .map(|(bucket, key, ids)| async move {
+            move_home(meta, &draining, &bucket, &key, &ids)
+                .await
+                .map_err(|e| anyhow::anyhow!("{bucket}/{key}: {e}"))
+        })
+        .buffer_unordered(MOVES_AT_ONCE)
+        .collect::<Vec<anyhow::Result<bool>>>()
+        .await
+        .into_iter()
+        // A key whose shard there moves first (then its home with it).
+        .filter(|r| !matches!(r, Ok(false)))
+        .map(|r| r.map(|_| ()))
+        .collect();
+    for r in results.into_iter().chain(homes_moved) {
         match r {
             Ok(()) => {
                 scan.moved += 1;
@@ -552,6 +596,7 @@ async fn move_shard(
     meta: &Arc<MetaService>,
     draining: &[u8; 16],
     draining_addr: &str,
+    source_alive: bool,
     mv: &Move,
 ) -> anyhow::Result<()> {
     let id: [u8; 16] = mv
@@ -593,7 +638,12 @@ async fn move_shard(
         .iter()
         .find(|l| l.position == mv.shard.position)
         .and_then(|l| l.crc32c);
-    let bytes = match read_shard(draining_addr, &mv.shard, expected).await {
+    let read = if source_alive {
+        read_shard(draining_addr, &mv.shard, expected).await
+    } else {
+        Err(anyhow::anyhow!("it doesn't answer"))
+    };
+    let bytes = match read {
         Ok(b) => b,
         Err(e) => {
             debug!("drain: reading from the draining OSD failed ({e}); rebuilding");
@@ -687,10 +737,160 @@ async fn repoint_object(
             }
         }
     }
-    if changed {
-        fanout_put_object_meta(meta, &object, &o.owner_addr, &[draining_addr]).await?;
+    if !changed {
+        return Ok(());
+    }
+    // The OSD that took the shard counts the object in usage, and repair
+    // visits the object from there, if the evacuated one did (B26).
+    if object.usage_owner == draining.as_slice() {
+        object.usage_owner.clone_from(&to.node_id);
+    }
+    fanout_put_object_meta(meta, &object, &o.owner_addr, &[draining_addr]).await?;
+    // The key's home follows its first stripe, as it is placed.
+    if object
+        .stripes
+        .first()
+        .is_some_and(|s| s.stripe_id == shard.stripe_id && s.object_id == shard.object_id)
+        && let Err(e) = meta
+            .move_object_home(
+                &o.bucket,
+                &o.key,
+                &[(shard.position, draining.to_vec(), to.node_id.clone())],
+            )
+            .await
+    {
+        warn!("drain: {}/{}: home not moved: {e}", o.bucket, o.key);
     }
     Ok(())
+}
+
+/// The newest copy of `bucket/key`'s ObjectMeta among `addrs`, as a read
+/// takes it: at least a read quorum of `copies` must answer, and a delete
+/// newer than every copy means none. `Ok(None)`: no current object.
+async fn newest_copy(
+    addrs: &[String],
+    copies: usize,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Option<ObjectMeta>> {
+    let asks = addrs.iter().map(|addr| async move {
+        let mut client = StorageServiceClient::new(open_channel(addr).await?)
+            .max_decoding_message_size(100 * 1024 * 1024);
+        let r = tokio::time::timeout(
+            PER_OSD_TIMEOUT,
+            client.get_object_meta(GetObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: String::new(),
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("get_object_meta timeout on {addr}"))??
+        .into_inner();
+        anyhow::Ok((r.object.filter(|_| r.found), r.tombstone_stamp))
+    });
+    let mut newest: Option<ObjectMeta> = None;
+    let mut deleted_at = 0u64;
+    let mut answered = 0;
+    for answer in futures::future::join_all(asks).await {
+        let Ok((found, tombstone)) = answer else {
+            continue;
+        };
+        answered += 1;
+        deleted_at = deleted_at.max(tombstone);
+        if let Some(o) = found
+            && newest
+                .as_ref()
+                .is_none_or(|n| o.write_order() > n.write_order())
+        {
+            newest = Some(o);
+        }
+    }
+    // As a GET: W = a majority of the copies, R = copies - W + 1.
+    let read_quorum = copies - (copies / 2 + 1) + 1;
+    if answered < read_quorum {
+        return Err(anyhow::anyhow!(
+            "{answered} copies answered, a read needs {read_quorum}"
+        ));
+    }
+    Ok(newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp))
+}
+
+/// Give `bucket/key`'s positions on the evacuated OSD to OSDs in service
+/// (B26): the newest metadata copy, read from the rest of its home, is
+/// written to each, and the home moves to them. For an object with no
+/// shard there (inline ones, above all), this is the only thing that
+/// puts its copy back. `Ok(false)`: its shard there moves first, and the
+/// home with it.
+async fn move_home(
+    meta: &Arc<MetaService>,
+    draining: &[u8; 16],
+    bucket: &str,
+    key: &str,
+    home: &[Vec<u8>],
+) -> anyhow::Result<bool> {
+    let others: Vec<String> = home
+        .iter()
+        .filter(|id| id.as_slice() != draining.as_slice())
+        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+        .filter_map(|id| meta.osd_address_by_id(&id))
+        .collect();
+    let object = newest_copy(&others, home.len(), bucket, key).await?;
+    let positions: Vec<u32> = home
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| id.as_slice() == draining.as_slice())
+        .filter_map(|(p, _)| u32::try_from(p).ok())
+        .collect();
+    if let Some(o) = &object
+        && o.stripes.first().is_some_and(|s| {
+            s.shards
+                .iter()
+                .any(|l| l.node_id == draining.as_slice() && positions.contains(&l.position))
+        })
+    {
+        return Ok(false);
+    }
+    let seed: [u8; 16] = object
+        .as_ref()
+        .and_then(|o| <[u8; 16]>::try_from(o.object_id.as_slice()).ok())
+        .unwrap_or_else(|| {
+            let h = xxhash_rust::xxh64::xxh64(format!("{bucket}/{key}").as_bytes(), 0);
+            let mut s = [0u8; 16];
+            s[..8].copy_from_slice(&h.to_le_bytes());
+            s[8..].copy_from_slice(&h.rotate_left(32).to_le_bytes());
+            s
+        });
+    let mut taken: Vec<[u8; 16]> = home
+        .iter()
+        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+        .collect();
+    let mut moves = Vec::new();
+    for position in positions {
+        let target = meta
+            .pick_drain_target(&seed, position, &taken)
+            .ok_or_else(|| anyhow::anyhow!("no OSD in service outside its home to move it to"))?;
+        taken.push(target);
+        moves.push((position, draining.to_vec(), target.to_vec()));
+    }
+    if let Some(mut o) = object {
+        let targets: Vec<String> = moves
+            .iter()
+            .filter_map(|(_, _, t)| <[u8; 16]>::try_from(t.as_slice()).ok())
+            .filter_map(|t| meta.osd_address_by_id(&t))
+            .collect();
+        let mut extra: Vec<&str> = targets.iter().map(String::as_str).collect();
+        if o.usage_owner == draining.as_slice() {
+            o.usage_owner.clone_from(&moves[0].2);
+            // Every copy changes: they all record the owner.
+            extra.extend(others.iter().map(String::as_str));
+        }
+        fanout_put_object_meta(meta, &o, &targets[0], &extra).await?;
+    }
+    meta.move_object_home(bucket, key, &moves)
+        .await
+        .map_err(|e| anyhow::anyhow!("home: {e}"))?;
+    Ok(true)
 }
 
 async fn get_object_meta(

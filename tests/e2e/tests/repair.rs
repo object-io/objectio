@@ -97,6 +97,96 @@ fn a_lost_disk_is_rebuilt_so_objects_survive_two_more_losses() {
     assert_readable(&c, "lost", &bodies, "with two more disks lost");
 }
 
+/// Whether the OSD at `address` holds a metadata copy of `bucket/key`.
+fn osd_has_meta(address: &str, bucket: &str, key: &str) -> bool {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut client = StorageServiceClient::new(
+            objectio_e2e::tls::channel(address)
+                .await
+                .expect("connect OSD"),
+        );
+        client
+            .get_object_meta(GetObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: String::new(),
+            })
+            .await
+            .expect("GetObjectMeta")
+            .into_inner()
+            .found
+    })
+}
+
+/// Every object keeps a metadata copy on each of its k + m OSDs: reads take
+/// the newest of a read quorum, which only holds while every copy is kept.
+/// A drive lost whole (its shards and the metadata on it) is replaced by a
+/// blank one; repair must give it back a copy of every object it should
+/// hold, erasure-coded and inline alike, not only the shards.
+#[test]
+fn a_replaced_drive_gets_back_every_metadata_copy() {
+    let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--repair-interval-secs", "1"]);
+    let bodies = put_objects(&c, "copies");
+    let inline: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| {
+            let body = payload(1000, 100 + u8::try_from(i).unwrap());
+            c.request("PUT", &format!("/copies/small-{i}"), &body)
+                .expect(200);
+            body
+        })
+        .collect();
+
+    // The drive is gone for good: its OSD is set out, as the runbook says,
+    // and the blank drive comes back as a new OSD.
+    let dead = osd_id(&c, 0);
+    c.restart_with_lost_drive(0);
+    c.json(
+        "PUT",
+        &format!("/_admin/osds/{dead}/admin-state"),
+        json!({ "state": "out" }),
+    )
+    .expect_ok();
+
+    // The blank drive's OSD gets back a shard of every stripe and a
+    // metadata copy of every object, inline ones too.
+    let address = c.osd_address(0);
+    let keys: Vec<String> = (0..OBJECTS)
+        .map(|i| format!("o-{i}"))
+        .chain((0..OBJECTS).map(|i| format!("small-{i}")))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    for key in &keys {
+        while !osd_has_meta(&address, "copies", key) {
+            assert!(
+                Instant::now() < deadline,
+                "the replaced drive never got {key}'s metadata copy back"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    while shard_count(&c, 0) < OBJECTS as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "the replaced drive holds {} shards, wanted {OBJECTS}",
+            shard_count(&c, 0)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Two more drives lost whole: every object still reads, from four
+    // shards and the metadata copies left.
+    c.restart_with_lost_drive(1);
+    c.restart_with_lost_drive(2);
+    assert_readable(&c, "copies", &bodies, "with two more drives lost");
+    for (i, body) in inline.iter().enumerate() {
+        let got = c.request("GET", &format!("/copies/small-{i}"), &[]);
+        assert_eq!(got.status, 200, "small-{i} unreadable: {}", got.text());
+        assert_eq!(&got.bytes, body, "small-{i}");
+    }
+}
+
 /// Flip one byte of `needle` in `path`, the way a bad sector would. Shards
 /// sit at the front of a fresh disk's data region, which begins after the
 /// 1 GiB metadata area.
