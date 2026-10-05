@@ -531,7 +531,7 @@ fn deny_scoped_credential(auth: &Option<Extension<AuthResult>>) -> Option<Respon
     None
 }
 
-pub(crate) const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
+pub(crate) use objectio_auth::SYSTEM_ADMIN_USER_ARN;
 
 /// True iff the caller is a system-scope admin. Tenant users (tenant != "")
 /// never satisfy this.
@@ -633,7 +633,7 @@ pub fn require_admin_or_session(
     }
     // If SigV4 auth is present, use it
     if let Some(Extension(auth_result)) = auth {
-        if auth_result.user_arn.ends_with("user/admin") {
+        if auth_result.is_system_admin() {
             return None; // allowed
         }
         return Some((StatusCode::FORBIDDEN, "Admin access required").into_response());
