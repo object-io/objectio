@@ -17,9 +17,26 @@ pub struct BucketPolicy {
     /// Policy ID (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Policy statements
-    #[serde(rename = "Statement")]
+    /// Policy statements. IAM takes one statement on its own as well as a
+    /// list of them.
+    #[serde(rename = "Statement", deserialize_with = "one_or_many")]
     pub statements: Vec<PolicyStatement>,
+}
+
+/// One statement, or a list of them.
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<PolicyStatement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_object() {
+        serde_json::from_value(value)
+            .map(|s| vec![s])
+            .map_err(D::Error::custom)
+    } else {
+        serde_json::from_value(value).map_err(D::Error::custom)
+    }
 }
 
 fn default_version() -> String {
@@ -353,15 +370,53 @@ impl Serialize for Principal {
     }
 }
 
-/// An ARN in ObjectIO's partition. Policies are written for S3 with
-/// `arn:aws:` ARNs (every tool, tutorial and generated policy does); they
-/// name the same buckets, keys and users as `arn:obio:` ones. Matching only
-/// `arn:obio:` made a correct S3 policy grant (and deny) nothing.
-fn obio_partition(arn: &str) -> std::borrow::Cow<'_, str> {
-    arn.strip_prefix("arn:aws:")
-        .map_or(std::borrow::Cow::Borrowed(arn), |rest| {
-            std::borrow::Cow::Owned(format!("arn:obio:{rest}"))
-        })
+/// The system scope's account, in ARNs: `arn:obio:iam::objectio:role/ops`.
+pub const SYSTEM_ACCOUNT: &str = "objectio";
+
+/// An ARN in its one canonical spelling, for matching.
+///
+/// The same identity or resource has several spellings, and a policy may
+/// use any of them:
+///
+/// - the partition: policies are written for S3 with `arn:aws:` ARNs
+///   (every tool, tutorial and generated policy does), ObjectIO's own are
+///   `arn:obio:`, and users carry `arn:objectio:` ones. All name the same
+///   buckets, keys and users;
+/// - a system-scope user: `arn:objectio:iam::user/<name>` has no account
+///   segment at all;
+/// - the system scope's account in IAM and STS ARNs: `objectio`, or empty
+///   (`arn:aws:iam:::role/ops`, as the IAM API shows it).
+///
+/// Each becomes `arn:obio:<service>:<region>:<account>:<resource>`, with
+/// the system account spelled `objectio`. Anything that isn't an ARN is
+/// returned as it is.
+#[must_use]
+pub fn canonical_arn(arn: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let Some(rest) = arn
+        .strip_prefix("arn:aws:")
+        .or_else(|| arn.strip_prefix("arn:obio:"))
+        .or_else(|| arn.strip_prefix("arn:objectio:"))
+    else {
+        return Cow::Borrowed(arn);
+    };
+    // A system user: "iam::user/<name>" (service, region, then the
+    // resource where the account should be).
+    if let Some(user) = rest.strip_prefix("iam::user/") {
+        return Cow::Owned(format!("arn:obio:iam::{SYSTEM_ACCOUNT}:user/{user}"));
+    }
+    let mut parts = rest.splitn(4, ':');
+    let (Some(service), Some(region), Some(account), Some(resource)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Cow::Owned(format!("arn:obio:{rest}"));
+    };
+    let system = account.is_empty() && matches!(service, "iam" | "sts");
+    if arn.starts_with("arn:obio:") && !system {
+        return Cow::Borrowed(arn);
+    }
+    let account = if system { SYSTEM_ACCOUNT } else { account };
+    Cow::Owned(format!("arn:obio:{service}:{region}:{account}:{resource}"))
 }
 
 impl<'de> Deserialize<'de> for Principal {
@@ -945,7 +1000,7 @@ impl PolicyEvaluator {
                 if arn == "*" {
                     true
                 } else {
-                    self.matches_pattern(&obio_partition(arn), user_arn)
+                    self.matches_pattern(&canonical_arn(arn), &canonical_arn(user_arn))
                 }
             }),
         }
@@ -953,21 +1008,20 @@ impl PolicyEvaluator {
 
     /// Check if action matches
     fn matches_action(&self, actions: &ActionList, request_action: &str) -> bool {
+        // Action names are case-insensitive, as in IAM. "s3:*" is a
+        // service's wildcard, not everything: it used to short-circuit to
+        // true, which made an S3 grant also grant every IAM and STS action.
+        let request_action = request_action.to_ascii_lowercase();
         actions.0.iter().any(|action| {
-            if action == "*" || action == "s3:*" || action == "iceberg:*" {
-                true
-            } else {
-                self.matches_pattern(action, request_action)
-            }
+            action == "*" || self.matches_pattern(&action.to_ascii_lowercase(), &request_action)
         })
     }
 
     /// Check if resource matches
     fn matches_resource(&self, resources: &ResourceList, request_resource: &str) -> bool {
-        resources
-            .0
-            .iter()
-            .any(|resource| self.matches_pattern(&obio_partition(resource), request_resource))
+        resources.0.iter().any(|resource| {
+            self.matches_pattern(&canonical_arn(resource), &canonical_arn(request_resource))
+        })
     }
 
     /// Whether a statement's conditions hold for the request: every
@@ -2139,6 +2193,105 @@ mod principal_spelling_tests {
         assert_eq!(
             get("203.0.113.1", Some("internal")),
             PolicyDecision::ImplicitDeny
+        );
+    }
+}
+
+#[cfg(test)]
+mod arn_spelling_tests {
+    use super::*;
+
+    #[test]
+    fn every_spelling_of_an_arn_is_one_arn() {
+        for (spelled, canonical) in [
+            ("arn:aws:s3:::bucket/key", "arn:obio:s3:::bucket/key"),
+            ("arn:obio:s3:::bucket", "arn:obio:s3:::bucket"),
+            (
+                "arn:objectio:iam::acme:user/app",
+                "arn:obio:iam::acme:user/app",
+            ),
+            (
+                "arn:objectio:iam::user/admin",
+                "arn:obio:iam::objectio:user/admin",
+            ),
+            ("arn:aws:iam:::role/ops", "arn:obio:iam::objectio:role/ops"),
+            (
+                "arn:aws:iam::acme:user/team/alice",
+                "arn:obio:iam::acme:user/team/alice",
+            ),
+            (
+                "arn:aws:sts:::assumed-role/ops/s",
+                "arn:obio:sts::objectio:assumed-role/ops/s",
+            ),
+            ("*", "*"),
+        ] {
+            assert_eq!(canonical_arn(spelled), canonical, "{spelled}");
+        }
+    }
+
+    fn decide(policy: &str, user: &str, action: &str, resource: &str) -> PolicyDecision {
+        let policy = BucketPolicy::from_json(policy).unwrap();
+        PolicyEvaluator::new().evaluate(&policy, &RequestContext::new(user, action, resource))
+    }
+
+    #[test]
+    fn a_user_named_in_any_spelling_is_the_user() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Principal":{"AWS":"arn:aws:iam::acme:user/app"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::b/*"}]}"#;
+        let resource = "arn:obio:s3:::b/k";
+        assert_eq!(
+            decide(
+                policy,
+                "arn:objectio:iam::acme:user/app",
+                "s3:GetObject",
+                resource
+            ),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            decide(
+                policy,
+                "arn:objectio:iam::other:user/app",
+                "s3:GetObject",
+                resource
+            ),
+            PolicyDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn a_service_wildcard_grants_only_that_service() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Action":"s3:*","Resource":"*"}]}"#;
+        let user = "arn:objectio:iam::acme:user/app";
+        assert_eq!(
+            decide(policy, user, "s3:PutObject", "*"),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            decide(policy, user, "iam:CreateUser", "*"),
+            PolicyDecision::ImplicitDeny
+        );
+    }
+
+    #[test]
+    fn a_single_statement_needs_no_list() {
+        let policy = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow",
+            "Action":"s3:GetObject","Resource":"*"}}"#;
+        assert_eq!(
+            decide(policy, "arn:obio:iam::a:user/u", "s3:GetObject", "*"),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn action_names_are_case_insensitive() {
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+            "Action":"iam:get*","Resource":"*"}]}"#;
+        assert_eq!(
+            decide(policy, "arn:obio:iam::a:user/u", "iam:GetUser", "*"),
+            PolicyDecision::Allow
         );
     }
 }

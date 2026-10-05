@@ -1017,6 +1017,80 @@ impl Cluster {
         Response::from(req.send().expect("request"))
     }
 
+    /// A call to the IAM or STS query API: `POST /` with `params` as a form
+    /// body, signed as aws-cli and boto3 sign it: for `service` (`iam` or
+    /// `sts`), over the body's hash, which they don't send. `creds` is
+    /// `(access key, secret key, session token)`.
+    pub fn query_api(
+        &self,
+        service: &str,
+        params: &[(&str, &str)],
+        creds: (&str, &str, Option<&str>),
+    ) -> Response {
+        let (access_key, secret_key, token) = creds;
+        let body = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", escape(k), escape(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
+        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let (amz_date, date_stamp) = time_now();
+        let mut headers: Vec<(&str, String)> = vec![
+            (
+                "content-type",
+                "application/x-www-form-urlencoded; charset=utf-8".into(),
+            ),
+            ("host", host),
+            ("x-amz-date", amz_date.clone()),
+        ];
+        if let Some(t) = token {
+            headers.push(("x-amz-security-token", t.to_string()));
+        }
+        headers.sort_by(|a, b| a.0.cmp(b.0));
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+            .collect();
+        let signed_headers = headers
+            .iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_request =
+            format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        let scope = format!("{date_stamp}/us-east-1/{service}/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let mut key = hmac(format!("AWS4{secret_key}").as_bytes(), &date_stamp);
+        key = hmac(&key, "us-east-1");
+        key = hmac(&key, service);
+        key = hmac(&key, "aws4_request");
+        let signature = hex::encode(hmac(&key, &string_to_sign));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let mut req = client
+            .post(format!("{}/", self.endpoint))
+            .header(
+                "Authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, \
+                     SignedHeaders={signed_headers}, Signature={signature}"
+                ),
+            )
+            .body(body);
+        for (k, v) in &headers {
+            if *k != "host" {
+                req = req.header(*k, v.as_str());
+            }
+        }
+        Response::from(req.send().expect("request"))
+    }
+
     /// Convenience: signed request whose body is JSON.
     pub fn json(&self, method: &str, path: &str, body: serde_json::Value) -> Response {
         self.request(method, path, body.to_string().as_bytes())

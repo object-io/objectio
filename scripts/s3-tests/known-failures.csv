@@ -26,33 +26,37 @@ test_headers::test_object_create_bad_date_none_aws2,not-implemented-by-design,Si
 test_headers::test_object_create_bad_md5_invalid_garbage_aws2,not-implemented-by-design,SigV2
 test_headers::test_object_create_bad_ua_empty_aws2,not-implemented-by-design,SigV2
 test_headers::test_object_create_bad_ua_none_aws2,not-implemented-by-design,SigV2
-test_iam::test_allow_bucket_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_allow_multipart_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_allow_object_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_allow_tagging_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_delete_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_delete_user_policy_from_multiple_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_delete_user_policy_invalid_policy_name,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_delete_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_deny_bucket_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_deny_multipart_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_deny_object_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_deny_tagging_actions_in_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_get_deleted_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_get_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_get_user_policy_from_multiple_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_get_user_policy_invalid_policy_name,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_get_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_list_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_list_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_put_existing_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_put_user_policy,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_put_user_policy_invalid_element,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_put_user_policy_invalid_user,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_put_user_policy_parameter_limit,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_verify_allow_iam_actions,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_verify_conflicting_user_policies,not-implemented-by-design,IAM API (PutUserPolicy etc.)
-test_iam::test_verify_conflicting_user_policy_statements,not-implemented-by-design,IAM API (PutUserPolicy etc.)
+test_iam::test_account_inline_group_policy_allow,not-implemented-by-design,ListBuckets lists what the caller owns; only an explicit Deny refuses it (AWS refuses a user no policy allows)
+test_iam::test_account_managed_group_policy_allow,not-implemented-by-design,ListBuckets lists what the caller owns; only an explicit Deny refuses it (AWS refuses a user no policy allows)
+test_iam::test_account_oidc_provider,gap,IAM OIDC provider management; providers are configured through the admin API (ListOpenIDConnectProviders lists them)
+test_iam::test_account_role_policy_allow,not-implemented-by-design,ListBuckets lists what the caller owns; only an explicit Deny refuses it (AWS refuses a user no policy allows)
+test_iam::test_account_role_policy_allow_create_bucket,not-implemented-by-design,a user of another tenant assumes a role only if its own policies allow sts:AssumeRole too (IAM's cross-account rule; RGW doesn't ask)
+test_iam::test_account_role_policy_allow_get_role,not-implemented-by-design,a user of another tenant assumes a role only if its own policies allow sts:AssumeRole too (IAM's cross-account rule; RGW doesn't ask)
+test_iam::test_account_user_policy_allow,not-implemented-by-design,ListBuckets lists what the caller owns; only an explicit Deny refuses it (AWS refuses a user no policy allows)
+test_iam::test_allow_tagging_actions_in_user_policy,aws-compatible-already,PutBucketTagging answers 204 as S3 does; the test expects RGW's 200
+test_iam::test_cross_account_bucket_acl_user_policy_grant_account_email,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_bucket_acl_user_policy_grant_canonical_id,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_bucket_acl_user_policy_grant_user_id,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_bucket_user_policy_allow_account_arn,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_bucket_user_policy_allow_account_id,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_bucket_user_policy_allow_user_arn,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_role_policy_allow,not-implemented-by-design,a user of another tenant assumes a role only if its own policies allow sts:AssumeRole too (IAM's cross-account rule; RGW doesn't ask)
+test_iam::test_cross_account_root_bucket_acl_grant_account_email,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_root_bucket_acl_grant_canonical_id,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_root_bucket_policy_allow_account_arn,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_root_bucket_policy_allow_account_id,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_user_bucket_policy_allow_account_arn,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_user_bucket_policy_allow_account_id,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_user_bucket_policy_allow_user_arn,not-implemented-by-design,tenant boundary: no policy grants access across tenants
+test_iam::test_cross_account_user_policy_bucket_acl_grant_account_email,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_user_policy_bucket_acl_grant_canonical_id,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_cross_account_user_policy_bucket_acl_grant_user_id,not-implemented-by-design,ACL grants (BucketOwnerEnforced)
+test_iam::test_same_account_role_policy_allow,not-implemented-by-design,a user of another tenant assumes a role only if its own policies allow sts:AssumeRole too (IAM's cross-account rule; RGW doesn't ask)
+test_iam::test_verify_add_existing_client_id_to_oidc,gap,IAM OIDC provider management; providers are configured through the admin API (ListOpenIDConnectProviders lists them)
+test_iam::test_verify_add_new_client_id_to_oidc,gap,IAM OIDC provider management; providers are configured through the admin API (ListOpenIDConnectProviders lists them)
+test_iam::test_verify_allow_iam_actions,test-environment,"names the user arn:aws:iam:::user/<user id>, RGW's tenant-less form; the s3-tests users are in tenant s3t"
+test_iam::test_verify_remove_client_id_from_oidc,gap,IAM OIDC provider management; providers are configured through the admin API (ListOpenIDConnectProviders lists them)
+test_iam::test_verify_update_thumbprintlist_of_oidc,gap,IAM OIDC provider management; providers are configured through the admin API (ListOpenIDConnectProviders lists them)
 test_s3::test_100_continue,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_access_bucket_private_object_publicread,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_access_bucket_private_object_publicreadwrite,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
@@ -108,6 +112,7 @@ test_s3::test_bucket_logging_partitioned_key,aws-compatible-already,a partitione
 test_s3::test_bucket_logging_permission_change_s,aws-compatible-already,a request is never failed because its log can't be delivered (records a target no longer consents to are dropped); RGW fails the client's PUT with AccessDenied
 test_s3::test_bucket_logging_requester_assumed_role,not-implemented-by-design,the IAM API (A15): CreateRole
 test_s3::test_bucket_policy_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
+test_s3::test_bucket_policy_deny_self_denied_policy,gap,"an account root (tenant admin) isn't exempt from its own bucket's policy for the bucket-policy calls, as AWS's root is"
 test_s3::test_bucket_policy_different_tenant,not-implemented-by-design,RGW tenant:bucket naming
 test_s3::test_bucket_policy_put_obj_copy_source,aws-compatible-already,"BucketOwnerEnforced: copied object belongs to bucket owner, alt has no GetObject"
 test_s3::test_bucket_policy_put_obj_copy_source_meta,aws-compatible-already,"BucketOwnerEnforced: copied object belongs to bucket owner, alt has no GetObject"
@@ -244,11 +249,16 @@ test_s3select::test_json_nullif_expressions,not-implemented-by-design,S3 Select
 test_s3select::test_lowerupper_expressions,not-implemented-by-design,S3 Select
 test_s3select::test_progress_expressions,not-implemented-by-design,S3 Select
 test_s3select::test_schema_definition,not-implemented-by-design,S3 Select
-test_sts::test_assume_role_allow,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_assume_role_allow_head_nonexistent,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_assume_role_creds_expiry,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_assume_role_deny,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_assume_role_deny_head_nonexistent,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
+test_sns::test_account_topic,not-implemented-by-design,"SNS (topics, notifications)"
+test_sns::test_account_topic_publish,not-implemented-by-design,"SNS (topics, notifications)"
+test_sns::test_account_user_policy_list_topics,not-implemented-by-design,"SNS (topics, notifications)"
+test_sns::test_cross_account_topic,not-implemented-by-design,"SNS (topics, notifications)"
+test_sns::test_cross_account_topic_publish,not-implemented-by-design,"SNS (topics, notifications)"
+test_sts::test_assume_role_allow,test-environment,expects RGW's tenant-less ARNs (arn:aws:iam:::role/<name>); the s3-tests users are in tenant s3t
+test_sts::test_assume_role_allow_head_nonexistent,test-environment,expects RGW's tenant-less ARNs (arn:aws:iam:::role/<name>); the s3-tests users are in tenant s3t; and puts a Principal in a role's policy, which IAM refuses (MalformedPolicyDocument)
+test_sts::test_assume_role_creds_expiry,test-environment,"expects RGW's tenant-less ARNs (arn:aws:iam:::role/<name>); the s3-tests users are in tenant s3t; and it sleeps 900 s, past the run's 120 s timeout"
+test_sts::test_assume_role_deny,test-environment,expects RGW's tenant-less ARNs (arn:aws:iam:::role/<name>); the s3-tests users are in tenant s3t
+test_sts::test_assume_role_deny_head_nonexistent,test-environment,expects RGW's tenant-less ARNs (arn:aws:iam:::role/<name>); the s3-tests users are in tenant s3t; and puts a Principal in a role's policy, which IAM refuses (MalformedPolicyDocument)
 test_sts::test_assume_role_with_web_identity,test-environment,no [webidentity] section / IdP configured
 test_sts::test_assume_role_with_web_identity_for_all_values,test-environment,no [webidentity] section / IdP configured
 test_sts::test_assume_role_with_web_identity_for_all_values_deny,test-environment,no [webidentity] section / IdP configured
@@ -264,10 +274,6 @@ test_sts::test_assume_role_with_web_identity_with_principal_tag,test-environment
 test_sts::test_assume_role_with_web_identity_with_request_tag,test-environment,no [webidentity] section / IdP configured
 test_sts::test_assume_role_with_web_identity_with_sub,test-environment,no [webidentity] section / IdP configured
 test_sts::test_assume_role_with_web_identity_wrong_resource_tag_deny,test-environment,no [webidentity] section / IdP configured
-test_sts::test_get_caller_identity_after_assume_role,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_get_caller_identity_non_root_user,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_get_caller_identity_root,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
-test_sts::test_get_session_token,not-implemented-by-design,STS AssumeRole/GetSessionToken/GetCallerIdentity need the IAM API
 test_sts::test_session_policy_bucket_policy_deny,test-environment,no [webidentity] section / IdP configured
 test_sts::test_session_policy_bucket_policy_role_arn,test-environment,no [webidentity] section / IdP configured
 test_sts::test_session_policy_bucket_policy_session_arn,test-environment,no [webidentity] section / IdP configured

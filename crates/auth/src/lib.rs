@@ -31,6 +31,7 @@
 
 // Core modules (always available)
 pub mod error;
+pub mod managed;
 pub mod policy;
 pub mod presign;
 pub mod scope;
@@ -57,7 +58,9 @@ pub use policy::{
 pub use scope::{CredentialScope, Operation, is_mutating_method, scope_allows, validate_scope};
 pub use sigv4::SigV4Verifier;
 pub use store::UserStore;
-pub use user::{AccessKey, AuthMode, AuthResult, KeyStatus, User, UserStatus};
+pub use user::{
+    AccessKey, AuthMode, AuthResult, KeyStatus, SYSTEM_ADMIN_USER_ARN, User, UserStatus,
+};
 
 // Re-export pluggable auth types
 pub use chain::{AllowAllEvaluator, DenyAllEvaluator, IdentityProviderChain, PolicyEvaluatorChain};

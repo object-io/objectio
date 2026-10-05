@@ -665,7 +665,7 @@ pub async fn load_table(
 
     // Apply data filters if the caller is authenticated and not admin
     if let Some(Extension(ref auth_result)) = auth
-        && !auth_result.user_arn.ends_with("user/admin")
+        && !auth_result.is_system_admin()
     {
         let applicable_filters = catalog
             .get_data_filters_for_principal(
@@ -1374,7 +1374,7 @@ fn require_admin_with_state(
     };
 
     // Builtin admin check
-    if auth_result.user_arn.ends_with("user/admin") {
+    if auth_result.is_system_admin() {
         return Ok(());
     }
 

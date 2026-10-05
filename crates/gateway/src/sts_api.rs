@@ -2,8 +2,9 @@
 //! credentials of a role.
 //!
 //! The request is unsigned (`POST /` with a form body, as AWS SDKs send it);
-//! the token is the proof. Which identity providers may vouch for a role
-//! depends on the role's scope:
+//! the token is the proof. `iam_api::query_api_layer` routes it here; the
+//! signed STS calls (`AssumeRole`, …) are `iam_api`'s. Which identity
+//! providers may vouch for a role depends on the role's scope:
 //!
 //! - a **system** role: only the operator's providers (the gateway's
 //!   `--oidc-*` provider, and stored providers marked `system_admin`);
@@ -60,7 +61,7 @@ fn denied(message: &str) -> Response {
 }
 
 /// A form-encoded body (and query string) as a map.
-fn form(body: &[u8], query: Option<&str>) -> HashMap<String, String> {
+pub(crate) fn form(body: &[u8], query: Option<&str>) -> HashMap<String, String> {
     let decode = |s: &str| {
         urlencoding::decode(&s.replace('+', " "))
             .map(std::borrow::Cow::into_owned)
@@ -79,14 +80,16 @@ fn form(body: &[u8], query: Option<&str>) -> HashMap<String, String> {
     out
 }
 
-/// `(tenant, role name)` from a role ARN: `arn:obio:iam::<tenant|objectio>:role/<name>`
-/// (`arn:aws:` accepted, as SDKs write it).
-fn parse_role_arn(arn: &str) -> Option<(String, String)> {
+/// `(tenant, role name)` from a role ARN:
+/// `arn:obio:iam::<tenant|objectio>:role/<path/><name>` (`arn:aws:` accepted,
+/// as SDKs write it; an empty account is the system scope too).
+pub(crate) fn parse_role_arn(arn: &str) -> Option<(String, String)> {
     let rest = arn
         .strip_prefix("arn:obio:iam::")
         .or_else(|| arn.strip_prefix("arn:aws:iam::"))?;
-    let (account, name) = rest.split_once(":role/")?;
-    if name.is_empty() || name.contains('/') {
+    let (account, resource) = rest.split_once(":role/")?;
+    let name = resource.rsplit('/').next()?;
+    if name.is_empty() {
         return None;
     }
     let tenant = if account == "objectio" { "" } else { account };
@@ -218,38 +221,6 @@ pub async fn sts_handler(
             "Action is required",
         ),
     }
-}
-
-/// Route an unsigned `POST /` to STS ahead of SigV4.
-///
-/// STS shares the S3 endpoint, as AWS SDKs expect when pointed at a custom
-/// endpoint. Its requests carry no signature (the web identity token is the
-/// proof), so they are taken here, before `auth_layer` would refuse them;
-/// anything signed or presigned goes on to S3 untouched.
-pub async fn sts_layer(
-    State(state): State<Arc<StsState>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let unsigned_post_root = request.method() == axum::http::Method::POST
-        && request.uri().path() == "/"
-        && request.headers().get(header::AUTHORIZATION).is_none()
-        && !request
-            .uri()
-            .query()
-            .is_some_and(|q| q.contains("X-Amz-Signature") || q.contains("Signature="));
-    if !unsigned_post_root {
-        return next.run(request).await;
-    }
-    let (parts, body) = request.into_parts();
-    let Ok(body) = axum::body::to_bytes(body, 64 * 1024).await else {
-        return sts_error(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "request too large",
-        );
-    };
-    sts_handler(State(state), parts.uri, parts.headers, body).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -489,6 +460,14 @@ mod tests {
             Some((String::new(), "ops".into()))
         );
         assert_eq!(parse_role_arn("arn:obio:iam::acme:user/ci"), None);
-        assert_eq!(parse_role_arn("arn:obio:iam::acme:role/a/b"), None);
+        // A role in a path is named by its last segment.
+        assert_eq!(
+            parse_role_arn("arn:obio:iam::acme:role/a/b"),
+            Some(("acme".into(), "b".into()))
+        );
+        assert_eq!(
+            parse_role_arn("arn:aws:iam:::role/ops"),
+            Some((String::new(), "ops".into()))
+        );
     }
 }

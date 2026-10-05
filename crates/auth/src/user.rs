@@ -171,6 +171,9 @@ pub enum AuthMode {
     /// carrying the role's tenant and its attached policies, inside the
     /// tenant boundary like any of the tenant's users.
     AssumedRole,
+    /// A user's own session (`GetSessionToken`): temporary keys that act as
+    /// the user who asked for them (its policies, groups and tenant).
+    SessionToken,
 }
 
 impl AuthMode {
@@ -183,9 +186,13 @@ impl AuthMode {
             Self::Sts => "STS",
             Self::Anonymous => "Anonymous",
             Self::AssumedRole => "AssumedRole",
+            Self::SessionToken => "SessionToken",
         }
     }
 }
+
+/// The system admin's ARN.
+pub const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
 
 /// Authentication result after successful verification
 #[derive(Debug, Clone, Default)]
@@ -227,6 +234,14 @@ pub struct AuthResult {
 }
 
 impl AuthResult {
+    /// Whether this is the system admin: its exact ARN. A suffix match
+    /// (`ends_with("user/admin")`) also took any tenant's user named
+    /// `admin`.
+    #[must_use]
+    pub fn is_system_admin(&self) -> bool {
+        self.user_arn == SYSTEM_ADMIN_USER_ARN
+    }
+
     /// Get the user ARN
     pub fn user_arn(&self) -> &str {
         &self.user_arn

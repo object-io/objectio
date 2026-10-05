@@ -87,6 +87,8 @@ use objectio_proto::metadata::{
     DeleteDataFilterResponse,
     DeleteGroupRequest,
     DeleteGroupResponse,
+    DeleteInlinePolicyRequest,
+    DeleteInlinePolicyResponse,
     DeleteKmsKeyRequest,
     DeleteKmsKeyResponse,
     DeleteObjectRequest,
@@ -149,6 +151,8 @@ use objectio_proto::metadata::{
     GetDataFiltersForPrincipalRequest,
     GetDrainStatusRequest,
     GetDrainStatusResponse,
+    GetInlinePolicyRequest,
+    GetInlinePolicyResponse,
     GetKmsKeyRequest,
     GetKmsKeyResponse,
     GetListingNodesRequest,
@@ -223,6 +227,7 @@ use objectio_proto::metadata::{
     IcebergUpdateNamespacePropertiesRequest,
     IcebergUpdateNamespacePropertiesResponse,
     IcebergWarehouse,
+    InlinePolicy,
     KeyStatus,
     KmsKey,
     LifecycleConfiguration,
@@ -238,6 +243,8 @@ use objectio_proto::metadata::{
     ListDataFiltersResponse,
     ListGroupsRequest,
     ListGroupsResponse,
+    ListInlinePoliciesRequest,
+    ListInlinePoliciesResponse,
     ListKmsKeysRequest,
     ListKmsKeysResponse,
     ListMultipartUploadsRequest,
@@ -275,6 +282,8 @@ use objectio_proto::metadata::{
     PutBucketLifecycleResponse,
     PutBucketVersioningRequest,
     PutBucketVersioningResponse,
+    PutInlinePolicyRequest,
+    PutInlinePolicyResponse,
     PutObjectLockConfigRequest,
     PutObjectLockConfigResponse,
     RegisterOsdRequest,
@@ -385,6 +394,8 @@ use objectio_proto::metadata::{
     UnityVolume,
     UpdateAccessKeyRequest,
     UpdateAccessKeyResponse,
+    UpdateGroupRequest,
+    UpdateGroupResponse,
     UpdatePolicyRequest,
     UpdatePolicyResponse,
     UpdatePoolRequest,
@@ -1847,6 +1858,7 @@ impl MetaService {
                         updated_at: now,
                         tenant: String::new(),
                         shared,
+                        ..Default::default()
                     };
                     store.put_iam_policy(name, &policy.encode_to_vec());
                     map.insert(name.to_string(), policy);
@@ -1988,6 +2000,116 @@ fn iam_key(tenant: &str, name: &str) -> String {
 /// Roles, prost-encoded `RoleObject` by name. Written through
 /// `CasTable::Named(ROLES_TABLE)`.
 const ROLES_TABLE: &str = "iam_roles";
+
+/// Inline policies, prost-encoded `InlinePolicy`, keyed by
+/// [`inline_policy_key`]. Written through `CasTable::Named`.
+const INLINE_POLICIES_TABLE: &str = "iam_inline_policies";
+
+/// Format level that adds IAM paths, role and policy ids, group renames
+/// and inline policies (the IAM API).
+const LEVEL_IAM_API: u32 = 3;
+
+/// Where an inline policy is stored: its principal ("user:<id>",
+/// "group:<id>", "role:<key>"), NUL, its name.
+fn inline_policy_key(principal: &str, name: &str) -> String {
+    format!("{principal}\u{0}{name}")
+}
+
+/// The account segment of an IAM ARN: the tenant, or `objectio` for the
+/// system scope.
+fn iam_account(tenant: &str) -> &str {
+    if tenant.is_empty() {
+        "objectio"
+    } else {
+        tenant
+    }
+}
+
+/// An IAM path as given (empty is `/`), checked: `/` or `/a/b/`, printable
+/// ASCII, at most 512 characters.
+#[allow(clippy::result_large_err)] // the Status the RPC returns, as is
+fn iam_path(path: &str) -> Result<String, Status> {
+    if path.is_empty() || path == "/" {
+        return Ok("/".to_string());
+    }
+    let ok = path.len() <= 512
+        && path.starts_with('/')
+        && path.ends_with('/')
+        && !path.contains("//")
+        && path.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if ok {
+        Ok(path.to_string())
+    } else {
+        Err(Status::invalid_argument(
+            "path must be / or /a/b/: printable ASCII, at most 512 characters",
+        ))
+    }
+}
+
+/// A path as stored: empty for `/`, so a record in the root path is the
+/// same bytes it was before paths existed.
+fn stored_path(path: &str) -> String {
+    if path == "/" {
+        String::new()
+    } else {
+        path.to_string()
+    }
+}
+
+/// A stored path as shown: `/` for empty.
+fn shown_path(stored: &str) -> &str {
+    if stored.is_empty() { "/" } else { stored }
+}
+
+/// A user's ARN. System users keep their account-less form
+/// (`arn:objectio:iam::user/admin`).
+fn user_arn(tenant: &str, path: &str, name: &str) -> String {
+    let path = shown_path(path);
+    if tenant.is_empty() {
+        format!("arn:objectio:iam::user{path}{name}")
+    } else {
+        format!("arn:objectio:iam::{tenant}:user{path}{name}")
+    }
+}
+
+fn group_arn(tenant: &str, path: &str, name: &str) -> String {
+    format!(
+        "arn:obio:iam::{}:group{}{name}",
+        iam_account(tenant),
+        shown_path(path)
+    )
+}
+
+fn role_arn(tenant: &str, path: &str, name: &str) -> String {
+    format!(
+        "arn:obio:iam::{}:role{}{name}",
+        iam_account(tenant),
+        shown_path(path)
+    )
+}
+
+/// An IAM name (policy, inline policy): letters, digits and `+=,.@_-`,
+/// 1 to `max` characters.
+fn iam_name_ok(name: &str, max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= max
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+}
+
+/// A fresh IAM id: AWS's four-letter kind prefix and 17 random uppercase
+/// letters and digits (`AIDA…` user, `AGPA…` group, `AROA…` role, `ANPA…`
+/// policy).
+fn iam_id(prefix: &str) -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut rng = rand::thread_rng();
+    let tail: String = (0..17)
+        .map(|_| char::from(CHARS[rng.gen_range(0..CHARS.len())]))
+        .collect();
+    format!("{prefix}{tail}")
+}
 
 /// Keys whose ObjectMeta copies may disagree, for gateways to heal
 /// (objectio-docs core/object-metadata-quorum.md): `CasTable::Named`,

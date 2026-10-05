@@ -123,6 +123,8 @@ pub struct RaftStatus {
     /// Index the log is purged up to (0: nothing purged).
     pub purged: u64,
     pub voters: Vec<u64>,
+    /// Whether the node's database open at start walked all of it (B25).
+    pub open_repair: bool,
 }
 
 impl HaCluster {
@@ -489,6 +491,7 @@ impl HaCluster {
                 .as_array()
                 .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
                 .unwrap_or_default(),
+            open_repair: v["open_repair"].as_bool().unwrap_or(false),
         })
     }
 

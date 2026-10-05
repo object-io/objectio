@@ -25,7 +25,16 @@ cluster's data; and the results.
 - Users through the admin API (`setup_users.py`):
   - `main` and `alt` in tenant `s3t`;
   - `tenant` in tenant `testx`;
-  - IAM-test users.
+  - IAM-test users: `iam` in `s3t`, with the AWS managed policy
+    `IAMFullAccess` (RGW gives it caps instead); `iamroot` and
+    `iamaltroot`, admins of tenants `iamr` and `iamalt`. A tenant is an
+    IAM account and its admins its root, so the config names each root by
+    its tenant (`user_id`, `account_id`).
+
+    The IAM and STS tests reuse names within an account, and
+    `test_get_session_token` denies `alt` S3 while it runs, so in parallel
+    they trip over each other and over other tests. For their numbers run
+    them alone: `run.sh --jobs 1 -- -k "test_iam or test_sts"`.
 
   None of them is the system admin, which bypasses bucket policies.
 - The cluster default that blocks public access on new buckets turned off,
@@ -48,7 +57,7 @@ Each failure's category and note come from `known-failures.csv`:
 
 | Category | Meaning |
 |---|---|
-| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, the IAM API, S3 Select, torrents, RGW extensions |
+| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, policies across tenants, S3 Select, torrents, RGW extensions |
 | `aws-compatible-already` | ObjectIO does what AWS does; the test expects RGW's behaviour |
 | `test-environment` | can't pass on this setup |
 | `gap` | a feature we lack and could add |

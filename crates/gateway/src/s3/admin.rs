@@ -190,6 +190,7 @@ pub async fn admin_create_user(
             display_name: params.display_name,
             email: params.email,
             tenant,
+            path: String::new(),
         })
         .await
     {

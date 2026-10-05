@@ -555,7 +555,7 @@ async fn check_kms_policy(
     // 1 + 4. Admin short-circuit + no-auth check.
     let auth_result = match auth {
         Some(Extension(a)) => {
-            if a.user_arn.ends_with("user/admin") {
+            if a.is_system_admin() {
                 return None;
             }
             a

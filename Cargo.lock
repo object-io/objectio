@@ -2558,6 +2558,7 @@ dependencies = [
  "futures",
  "hex",
  "md5",
+ "objectio-auth",
  "objectio-common",
  "objectio-erasure",
  "objectio-meta-store",
@@ -2596,6 +2597,7 @@ dependencies = [
 name = "objectio-meta-store"
 version = "0.6.0-dev"
 dependencies = [
+ "crc32c",
  "objectio-common",
  "objectio-placement",
  "objectio-proto",

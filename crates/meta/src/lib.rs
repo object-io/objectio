@@ -108,6 +108,12 @@ pub struct Args {
     #[arg(long, default_value_t = 500_000)]
     pub raft_snapshot_every: u64,
 
+    /// How often the applied state is made durable, in ms (B25): entries
+    /// are applied without a flush each, and a crash re-applies at most
+    /// this much from the log.
+    #[arg(long, default_value_t = 1000)]
+    pub raft_checkpoint_ms: u64,
+
     /// Log entries kept behind the last snapshot: a follower behind by
     /// fewer catches up from the log; one further behind gets a snapshot.
     #[arg(long, default_value_t = 10_000)]
@@ -283,11 +289,40 @@ pub async fn run(
     let (apply_tx, apply_rx) =
         tokio::sync::mpsc::unbounded_channel::<objectio_meta_store::ApplyEvent>();
     meta_service.spawn_apply_listener(apply_rx);
-    let raft_storage = objectio_meta_store::MetaRaftStorage::with_apply_listener(
+    let raft_storage = objectio_meta_store::MetaRaftStorage::open(
         raft_db,
         args.data_dir.join("raft-snapshots"),
-        apply_tx,
-    );
+        &args.data_dir.join("raft-log"),
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "Raft log in {}: {e}",
+            args.data_dir.join("raft-log").display()
+        )
+    })
+    .with_apply_listener(apply_tx);
+    // The state machine is applied without a flush per batch; this makes
+    // it durable every --raft-checkpoint-ms (B25).
+    let checkpointer = raft_storage.clone();
+    let checkpoint_every = std::time::Duration::from_millis(args.raft_checkpoint_ms.max(10));
+    tokio::spawn({
+        let storage = checkpointer.clone();
+        async move {
+            let mut tick = tokio::time::interval(checkpoint_every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let s = storage.clone();
+                match tokio::task::spawn_blocking(move || s.checkpoint().map_err(|e| e.to_string()))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::error!("raft checkpoint failed: {e}"),
+                    Err(e) => tracing::error!("raft checkpoint task: {e}"),
+                }
+            }
+        }
+    });
     let (log_store, state_machine) = openraft::storage::Adaptor::new(raft_storage);
     let raft_config = Arc::new(
         raft_config(
@@ -400,6 +435,13 @@ pub async fn run(
         })
         .await?;
 
+    // What was applied since the last checkpoint, made durable.
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || checkpointer.checkpoint().map_err(|e| e.to_string()))
+            .await?
+    {
+        tracing::error!("raft checkpoint at shutdown failed: {e}");
+    }
     info!("Metadata Service shut down gracefully");
 
     Ok(())
