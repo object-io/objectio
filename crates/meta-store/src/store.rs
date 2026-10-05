@@ -73,7 +73,26 @@ impl MetaStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(path)?;
+        // Every durable commit saves redb's allocator state (B25), so a
+        // crash never needs the full repair that walks the whole file; if
+        // one runs anyway, say so.
+        let started = std::time::Instant::now();
+        let repaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = Arc::clone(&repaired);
+        let db = Database::builder()
+            .set_repair_callback(move |_| {
+                r.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .create(path)?;
+        let repaired = repaired.load(std::sync::atomic::Ordering::Relaxed);
+        crate::commit_metrics::opened(repaired, started.elapsed());
+        if repaired {
+            tracing::warn!(
+                "{}: a full repair ran ({:.1} s): the last durable commit didn't save the allocator state",
+                path.display(),
+                started.elapsed().as_secs_f64()
+            );
+        }
 
         // Create all tables eagerly so later read txns don't fail
         let write_txn = db.begin_write()?;
@@ -102,7 +121,7 @@ impl MetaStore {
             let _t = write_txn.open_table(tables::BUCKET_ENCRYPTION_CONFIGS)?;
             let _t = write_txn.open_table(tables::KMS_KEYS)?;
         }
-        crate::commit_metrics::commit(write_txn)?;
+        crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
 
         Ok(Self { db: Arc::new(db) })
     }
@@ -147,7 +166,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::BUCKET_POLICIES)?;
                 table.insert(bucket, policy_json.as_bytes())?;
             }
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
             Ok(())
         })() {
             error!("Failed to persist bucket policy '{}': {}", bucket, e);
@@ -274,7 +293,7 @@ impl MetaStore {
                 let mut t2 = write_txn.open_table(tables::ACCESS_KEYS)?;
                 t2.insert(key.access_key_id.as_str(), key_bytes.as_slice())?;
             }
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
             Ok(())
         })() {
             error!("Failed to persist admin user+key '{}': {}", user.user_id, e);
@@ -373,7 +392,7 @@ impl MetaStore {
             }
         };
         if swapped {
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
         }
         Ok(swapped)
     }
@@ -416,7 +435,7 @@ impl MetaStore {
                 table.insert(key.as_str(), new.as_slice())?;
             }
         }
-        crate::commit_metrics::commit(write_txn)?;
+        crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
         Ok(failed)
     }
 
@@ -754,7 +773,7 @@ impl MetaStore {
             let mut table = write_txn.open_table(table_def)?;
             table.insert(key, value)?;
         }
-        crate::commit_metrics::commit(write_txn)?;
+        crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
         Ok(())
     }
 
@@ -778,7 +797,7 @@ impl MetaStore {
             let mut table = write_txn.open_table(table_def)?;
             table.remove(key)?;
         }
-        crate::commit_metrics::commit(write_txn)?;
+        crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
         Ok(())
     }
 
@@ -833,7 +852,7 @@ impl MetaStore {
                     table.remove(key.as_str())?;
                 }
             }
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
         }
         Ok(())
     }
@@ -1019,7 +1038,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::POLICY_ATTACHMENTS)?;
                 table.insert(key, policies.as_bytes())?;
             }
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
             Ok(())
         })() {
             error!("Failed to persist policy attachment '{}': {}", key, e);
@@ -1033,7 +1052,7 @@ impl MetaStore {
                 let mut table = write_txn.open_table(tables::POLICY_ATTACHMENTS)?;
                 table.remove(key)?;
             }
-            crate::commit_metrics::commit(write_txn)?;
+            crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
             Ok(())
         })() {
             error!("Failed to delete policy attachment '{}': {}", key, e);
