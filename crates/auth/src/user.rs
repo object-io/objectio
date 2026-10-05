@@ -191,6 +191,9 @@ impl AuthMode {
     }
 }
 
+/// The system admin's ARN.
+pub const SYSTEM_ADMIN_USER_ARN: &str = "arn:objectio:iam::user/admin";
+
 /// Authentication result after successful verification
 #[derive(Debug, Clone, Default)]
 pub struct AuthResult {
@@ -231,6 +234,14 @@ pub struct AuthResult {
 }
 
 impl AuthResult {
+    /// Whether this is the system admin: its exact ARN. A suffix match
+    /// (`ends_with("user/admin")`) also took any tenant's user named
+    /// `admin`.
+    #[must_use]
+    pub fn is_system_admin(&self) -> bool {
+        self.user_arn == SYSTEM_ADMIN_USER_ARN
+    }
+
     /// Get the user ARN
     pub fn user_arn(&self) -> &str {
         &self.user_arn
