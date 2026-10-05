@@ -148,6 +148,9 @@ fn a_follower_lost_and_back_catches_up() {
             && f.last_applied >= l.last_applied
             && f.state == "Follower"
         {
+            // Killed mid-write, it reopened its database without walking
+            // it (B25).
+            assert!(!f.open_repair, "a full repair ran: {f:?}");
             break;
         }
         assert!(Instant::now() < deadline, "never caught up: {f:?} vs {l:?}");

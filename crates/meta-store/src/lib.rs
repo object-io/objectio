@@ -2,6 +2,7 @@
 
 pub mod commit_metrics;
 pub mod raft;
+pub mod raft_log;
 pub mod raft_network;
 pub mod raft_storage;
 pub mod store;

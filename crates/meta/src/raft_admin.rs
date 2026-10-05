@@ -205,6 +205,9 @@ struct StatusResponse {
     state: String,
     voters: Vec<u64>,
     learners: Vec<u64>,
+    /// Whether opening the database at start had to walk all of it (B25:
+    /// never expected).
+    open_repair: bool,
 }
 
 /// GET /status — current leader / term / log / membership.
@@ -225,6 +228,7 @@ async fn status(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
         state: format!("{:?}", m.state),
         voters,
         learners,
+        open_repair: objectio_meta_store::commit_metrics::open_repaired(),
     };
     Json(resp).into_response()
 }
