@@ -294,6 +294,9 @@ fn auth_error(e: &crate::auth_middleware::AuthError) -> IamError {
             "InvalidRequest",
             "Use AWS4-HMAC-SHA256 (Signature Version 4).",
         ),
+        AuthError::Unavailable(m) => {
+            IamError::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", m)
+        }
         AuthError::InternalError => IamError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "ServiceFailure",
