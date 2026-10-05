@@ -544,11 +544,8 @@ fn meta_error(e: &tonic::Status) -> Response {
             StatusCode::NOT_FOUND,
         )
     } else {
-        S3Error::xml_response(
-            "InternalError",
-            e.message(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
+        // 503 when meta was unavailable (retry), as every S3 call answers.
+        S3Error::from_status(e)
     }
 }
 

@@ -40,6 +40,7 @@ fn grpc_error(e: &tonic::Status) -> Response {
         tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
         tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error(status, e.message())

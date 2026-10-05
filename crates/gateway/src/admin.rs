@@ -228,7 +228,7 @@ pub async fn admin_list_config(
         }
         Err(e) => {
             warn!("Failed to list config: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response()
+            meta_failure(&e)
         }
     }
 }
@@ -280,7 +280,7 @@ pub async fn admin_get_config(
         }
         Err(e) => {
             warn!("Failed to get config '{}': {}", section, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response()
+            meta_failure(&e)
         }
     }
 }
@@ -417,7 +417,7 @@ pub async fn admin_set_config(
         }
         Err(e) => {
             warn!("Failed to set config '{}': {}", section, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response()
+            meta_failure(&e)
         }
     }
 }
@@ -457,7 +457,7 @@ pub async fn admin_delete_config(
         }
         Err(e) => {
             warn!("Failed to delete config '{}': {}", section, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response()
+            meta_failure(&e)
         }
     }
 }
@@ -835,7 +835,7 @@ pub async fn admin_list_pools(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -882,7 +882,7 @@ pub async fn admin_get_pool(
                 (StatusCode::NOT_FOUND, "Pool not found").into_response()
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -945,7 +945,7 @@ pub async fn admin_list_pool_placement_groups(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -1029,7 +1029,7 @@ pub async fn admin_list_tenants(
             }
             Json(tenants.iter().map(tenant_to_json).collect::<Vec<_>>()).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -1088,7 +1088,7 @@ pub async fn admin_get_tenant(
                 (StatusCode::NOT_FOUND, "Tenant not found").into_response()
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -1366,7 +1366,7 @@ pub async fn admin_list_buckets(
                 .collect();
             Json(serde_json::json!({ "buckets": buckets })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -1537,7 +1537,7 @@ pub async fn admin_get_bucket_policy(
                 Json(serde_json::json!({ "has_policy": false, "policy": null })).into_response()
             }
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -1895,7 +1895,7 @@ pub async fn admin_list_warehouses(
                 .collect();
             Json(serde_json::json!({ "warehouses": warehouses })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -2040,7 +2040,7 @@ pub async fn admin_list_shares_tenant(
                 .collect();
             Json(serde_json::json!({ "shares": shares })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
@@ -2142,13 +2142,25 @@ pub async fn admin_list_recipients_tenant(
             }
             Json(serde_json::json!({ "recipients": recipients })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response(),
+        Err(e) => meta_failure(&e),
     }
 }
 
 // ============================================================================
 // Nodes / Drives
 // ============================================================================
+
+/// A failed meta call, as the admin API answers it: 503 (retry) when meta
+/// was unavailable, ran out of time or the connection dropped, as the S3
+/// API answers it; 500 otherwise. The body is meta's message.
+pub(crate) fn meta_failure(e: &tonic::Status) -> Response {
+    let status = if crate::s3::S3Error::is_unavailable(e) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (status, e.message().to_string()).into_response()
+}
 
 /// A client of the OSD at `addr`, over mTLS when it is on.
 async fn connect_osd(
@@ -2182,7 +2194,7 @@ pub async fn admin_list_nodes(
     {
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2452,7 +2464,7 @@ pub async fn admin_reboot_osd(
     {
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2526,7 +2538,7 @@ pub async fn admin_drain_status(
     let resp = match meta.get_drain_status(GetDrainStatusRequest {}).await {
         Ok(r) => r.into_inner(),
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2564,7 +2576,7 @@ pub async fn admin_rebalance_status(
     {
         Ok(r) => r.into_inner(),
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
     Json(serde_json::json!({
@@ -2689,7 +2701,7 @@ pub async fn admin_cluster_info(
     {
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2762,7 +2774,7 @@ pub async fn admin_get_topology(
     {
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2919,7 +2931,7 @@ pub async fn admin_validate_placement(
             }
         }
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
 
@@ -2936,7 +2948,7 @@ pub async fn admin_validate_placement(
     {
         Ok(resp) => resp.into_inner().nodes,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.message().to_string()).into_response();
+            return meta_failure(&e);
         }
     };
     let mut keys = std::collections::HashSet::new();
@@ -3496,5 +3508,26 @@ mod tests {
         assert_eq!(merged["client_id"], "b");
         // Nothing stored: no secret, never the placeholder.
         assert_eq!(keep_stored_secret(&back, None)["client_secret"], "");
+    }
+
+    #[test]
+    fn a_meta_call_that_ran_out_of_time_is_retry_not_failure() {
+        let code = |e: tonic::Status| meta_failure(&e).status();
+        assert_eq!(
+            code(tonic::Status::cancelled("Timeout expired")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            code(tonic::Status::unavailable("no raft leader; retry")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            code(tonic::Status::unknown("transport error")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            code(tonic::Status::internal("a bug")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

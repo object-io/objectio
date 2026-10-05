@@ -40,7 +40,7 @@ fn meta_error(e: &tonic::Status) -> Response {
     let status = match e.code() {
         tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
         tonic::Code::Aborted => StatusCode::CONFLICT,
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => StatusCode::SERVICE_UNAVAILABLE,
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json!({"error": e.message()}))).into_response()
