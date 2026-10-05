@@ -223,7 +223,11 @@ fn a_frozen_leader_steps_down_when_it_returns() {
     });
     let new_leader = ha.await_leader_among_others(Duration::from_secs(20), &[leader]);
     assert_ne!(new_leader, leader);
-    assert!(resumed_after(&acked, frozen_at) < Duration::from_secs(10));
+    let resumed = resumed_after(&acked, frozen_at);
+    assert!(
+        resumed < Duration::from_secs(10),
+        "writes took {resumed:?} to resume after the leader froze"
+    );
     ha.thaw_meta(leader);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
