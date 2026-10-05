@@ -320,6 +320,12 @@ impl HaCluster {
         i
     }
 
+    /// The disk file of OSD `i` (to replace it, as a failed drive).
+    #[must_use]
+    pub fn osd_disk(&self, i: usize) -> &Path {
+        &self.osds[i].disk
+    }
+
     /// Stop OSD `i` and start it again from `bins`, on its own data.
     /// Stop OSD `i` (killed, as a crash); [`Self::start_osd`] brings it back.
     pub fn stop_osd(&mut self, i: usize) {
@@ -410,9 +416,15 @@ impl HaCluster {
                 "4",
                 "--ec-m",
                 "2",
-                "--repair-interval-secs",
-                "0",
             ])
+            // Repair off unless the test turns it on (a flag given twice is
+            // refused).
+            .args(
+                (!self.meta_args.iter().any(|a| a == "--repair-interval-secs"))
+                    .then_some(["--repair-interval-secs", "0"])
+                    .into_iter()
+                    .flatten(),
+            )
             .args(&self.meta_args)
             .stdout(log_target())
             .stderr(log_target())
