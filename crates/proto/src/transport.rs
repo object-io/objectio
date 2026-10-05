@@ -129,8 +129,10 @@ pub const META_PROBE_HEADER: &str = "x-objectio-probe";
 /// The longest a call to meta may take before the client gives up on it:
 /// a meta node that stopped answering (frozen, cut off) would otherwise
 /// hold the call, and the request behind it, forever. Meta answers in
-/// milliseconds and elects a new leader in one or two seconds, so 5 s is
-/// ample; a call cut off by it fails as retryable (503 to S3 clients).
+/// milliseconds; a call cut off by this fails as retryable (503 to S3
+/// clients). A call a follower forwarded to a leader that stopped
+/// answering is given up sooner, as soon as the follower learns of a new
+/// leader (`objectio-meta`'s `forward`).
 pub const META_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often each meta address is probed, and how long a probe may take.

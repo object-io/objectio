@@ -58,7 +58,14 @@ fn assert_all_readable(c: &Cluster, bucket: &str, acked: &Acked, when: &str) {
     let acked = acked.lock().unwrap();
     assert!(!acked.is_empty(), "{when}: nothing was written");
     for (key, (body, _)) in acked.iter() {
-        let r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        // Retried while it says "retry", as a client would: right after a
+        // node is lost, meta may still be electing a leader.
+        let mut r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        let until = Instant::now() + Duration::from_secs(30);
+        while r.status == 503 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(200));
+            r = c.request("GET", &format!("/{bucket}/{key}"), &[]);
+        }
         assert_eq!(
             r.status,
             200,
@@ -216,7 +223,11 @@ fn a_frozen_leader_steps_down_when_it_returns() {
     });
     let new_leader = ha.await_leader_among_others(Duration::from_secs(20), &[leader]);
     assert_ne!(new_leader, leader);
-    assert!(resumed_after(&acked, frozen_at) < Duration::from_secs(10));
+    let resumed = resumed_after(&acked, frozen_at);
+    assert!(
+        resumed < Duration::from_secs(10),
+        "writes took {resumed:?} to resume after the leader froze"
+    );
     ha.thaw_meta(leader);
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {

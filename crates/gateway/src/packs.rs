@@ -510,13 +510,14 @@ pub async fn pack_objects(
     let mut written = Vec::new();
     for (position, result, node) in futures::future::join_all(writes).await {
         match result {
-            Ok(loc) => written.push(ShardLocation {
+            Ok((loc, crc32c)) => written.push(ShardLocation {
                 position,
                 node_id: loc.node_id,
                 disk_id: loc.disk_id,
                 offset: loc.offset,
                 shard_type: node.shard_type,
                 local_group: node.local_group,
+                crc32c: Some(crc32c),
             }),
             Err(e) => warn!("pack {}: shard {position}: {e}", hex::encode(&pack_id)),
         }

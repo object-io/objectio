@@ -428,11 +428,16 @@ async fn audit(
         }
     }
     let mut states: HashMap<(usize, usize, u32), Seen> = HashMap::new();
-    for (node, refs) in asks {
+    // Every node at once: one slow or gone node no longer holds up the rest.
+    let answers = futures::future::join_all(asks.into_iter().map(|(node, refs)| async move {
         let answer = match node_address(meta, &node) {
             Some(addr) => check_shards(&addr, objects, &refs).await,
             None => Err(anyhow::anyhow!("node not registered")),
         };
+        (node, refs, answer)
+    }))
+    .await;
+    for (node, refs, answer) in answers {
         match answer {
             Ok(got) => {
                 for (r, st) in refs.into_iter().zip(got) {
@@ -448,46 +453,68 @@ async fn audit(
         }
     }
 
-    for (oi, object) in objects.iter().enumerate() {
-        STATS.objects.fetch_add(1, Ordering::Relaxed);
-        let mut healthy = true;
-        for (si, stripe) in object.stripes.iter().enumerate() {
-            if !repairable(stripe) {
-                continue;
-            }
-            let total = (stripe.ec_k + stripe.ec_m) as usize;
-            let mut seen = vec![Seen::Unplaced; total];
-            for loc in &stripe.shards {
-                if let Some(slot) = seen.get_mut(loc.position as usize) {
-                    *slot = states
-                        .get(&(oi, si, loc.position))
-                        .copied()
-                        .unwrap_or(Seen::Unknown);
-                }
-            }
-            let v = verdict(&seen, stripe.ec_k as usize);
-            healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
-            match v {
-                Verdict::Healthy => {}
-                Verdict::Unrecoverable { good } => {
-                    STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "repair: {}/{} stripe {} has {good} good shards, needs {}",
-                        object.bucket, object.key, stripe.stripe_id, stripe.ec_k
-                    );
-                }
-                Verdict::Rebuild { bad, good } => {
-                    if let Err(e) = rebuild(meta, source, object, stripe, &seen, &bad, &good).await
-                    {
-                        STATS.errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            "repair: {}/{} stripe {}: {e}",
-                            object.bucket, object.key, stripe.stripe_id
-                        );
+    // Rebuilds, REBUILDS_AT_ONCE objects at a time (each one's reads are
+    // parallel too): one at a time, a replaced disk took hours (B24).
+    use futures::FutureExt;
+    let states = &states;
+    let rebuilds: Vec<futures::future::BoxFuture<'_, bool>> = objects
+        .iter()
+        .enumerate()
+        .map(|(oi, object)| {
+            async move {
+                STATS.objects.fetch_add(1, Ordering::Relaxed);
+                let mut healthy = true;
+                for (si, stripe) in object.stripes.iter().enumerate() {
+                    if !repairable(stripe) {
+                        continue;
+                    }
+                    let total = (stripe.ec_k + stripe.ec_m) as usize;
+                    let mut seen = vec![Seen::Unplaced; total];
+                    for loc in &stripe.shards {
+                        if let Some(slot) = seen.get_mut(loc.position as usize) {
+                            *slot = states
+                                .get(&(oi, si, loc.position))
+                                .copied()
+                                .unwrap_or(Seen::Unknown);
+                        }
+                    }
+                    let v = verdict(&seen, stripe.ec_k as usize);
+                    healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
+                    match v {
+                        Verdict::Healthy => {}
+                        Verdict::Unrecoverable { good } => {
+                            STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "repair: {}/{} stripe {} has {good} good shards, needs {}",
+                                object.bucket, object.key, stripe.stripe_id, stripe.ec_k
+                            );
+                        }
+                        Verdict::Rebuild { bad, good } => {
+                            if let Err(e) =
+                                rebuild(meta, source, object, stripe, &seen, &bad, &good).await
+                            {
+                                STATS.errors.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    "repair: {}/{} stripe {}: {e}",
+                                    object.bucket, object.key, stripe.stripe_id
+                                );
+                            }
+                        }
                     }
                 }
+                healthy
             }
-        }
+            .boxed()
+        })
+        .collect();
+    use futures::StreamExt;
+    let healthy: Vec<bool> = futures::stream::iter(rebuilds)
+        .buffered(REBUILDS_AT_ONCE)
+        .collect()
+        .await;
+
+    // Then, in order: backfill (bounded by `moves`) and listings.
+    for (object, healthy) in objects.iter().zip(healthy) {
         let Source::Osd(owner_addr) = source else {
             continue;
         };
@@ -508,6 +535,9 @@ async fn audit(
         }
     }
 }
+
+/// Objects one repair pass rebuilds at once.
+const REBUILDS_AT_ONCE: usize = 16;
 
 fn node_address(meta: &MetaService, node_id: &[u8]) -> Option<String> {
     let id = <[u8; 16]>::try_from(node_id).ok()?;
@@ -576,22 +606,39 @@ async fn rebuild(
     // k good shards, verified against their checksums.
     let mut survivors: Vec<Option<Vec<u8>>> = vec![None; total];
     let mut have = 0;
-    for &p in good {
-        if have == k {
-            break;
-        }
-        let Some(addr) = located
-            .get(&(p as u32))
-            .and_then(|l| node_address(meta, &l.node_id))
-        else {
-            continue;
-        };
-        match read_shard(&addr, &id, stripe.stripe_id, p as u32).await {
-            Ok(bytes) => {
-                survivors[p] = Some(bytes);
-                have += 1;
+    // As many reads at once as shards still needed; a failed one is made
+    // up from the next good positions.
+    let mut candidates: std::collections::VecDeque<usize> = good.iter().copied().collect();
+    while have < k && !candidates.is_empty() {
+        let batch: Vec<usize> = (0..(k - have).min(candidates.len()))
+            .filter_map(|_| candidates.pop_front())
+            .collect();
+        let reads = batch.into_iter().map(|p| {
+            let loc = located.get(&(p as u32)).copied();
+            let addr = loc.and_then(|l| node_address(meta, &l.node_id));
+            let crc = loc.and_then(|l| l.crc32c);
+            let id = &id;
+            async move {
+                let Some(addr) = addr else {
+                    return (
+                        p,
+                        Err(anyhow::anyhow!("position {p} has no reachable holder")),
+                    );
+                };
+                (
+                    p,
+                    read_shard(&addr, id, stripe.stripe_id, p as u32, crc).await,
+                )
             }
-            Err(e) => debug!("repair: read of position {p} from {addr}: {e}"),
+        });
+        for (p, r) in futures::future::join_all(reads).await {
+            match r {
+                Ok(bytes) => {
+                    survivors[p] = Some(bytes);
+                    have += 1;
+                }
+                Err(e) => debug!("repair: read of position {p}: {e}"),
+            }
         }
     }
     if have < k {
@@ -617,6 +664,16 @@ async fn rebuild(
     let mut added = Vec::new();
     for (&p, bytes) in bad.iter().zip(rebuilt) {
         let position = p as u32;
+        // A rebuild is the shard as first written, byte for byte: one that
+        // isn't (decoded from a bad source) is not stored as if it were.
+        let crc = crc32c::crc32c(&bytes);
+        if let Some(recorded) = located.get(&position).and_then(|l| l.crc32c)
+            && recorded != crc
+        {
+            return Err(anyhow::anyhow!(
+                "position {p} rebuilt as crc32c {crc:08x}, its object records {recorded:08x}; not stored"
+            ));
+        }
         let (node_id, addr, shard_type) = match (seen[p], located.get(&position)) {
             (Seen::Lost { .. }, Some(loc)) => (
                 loc.node_id.clone(),
@@ -653,6 +710,7 @@ async fn rebuild(
                 offset: location.offset,
                 shard_type,
                 local_group: 0,
+                crc32c: Some(crc),
             });
         }
     }
@@ -719,6 +777,7 @@ async fn spread(
                 &stripe.object_id,
                 stripe.stripe_id,
                 old.position,
+                old.crc32c,
             )
             .await?;
             let at = write_shard(&to_addr, &stripe.object_id, stripe, old.position, bytes).await?;
@@ -836,11 +895,14 @@ async fn release_moved() {
     }
 }
 
+/// `expected_crc32c`: what the shard's object records (B23); the OSD
+/// refuses a shard that doesn't match it.
 async fn read_shard(
     address: &str,
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
+    expected_crc32c: Option<u32>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut client = StorageServiceClient::new(open_channel(address).await?)
         .max_decoding_message_size(100 * 1024 * 1024);
@@ -852,12 +914,21 @@ async fn read_shard(
                 stripe_id,
                 position,
             }),
+            expected_crc32c,
             ..Default::default()
         }),
     )
     .await??
     .into_inner();
-    Ok(verified_shard(resp)?.to_vec())
+    let bytes = verified_shard(resp)?.to_vec();
+    if let Some(expected) = expected_crc32c
+        && crc32c::crc32c(&bytes) != expected
+    {
+        return Err(anyhow::anyhow!(
+            "position {position}: not the shard its object records"
+        ));
+    }
+    Ok(bytes)
 }
 
 async fn write_shard(
@@ -1021,21 +1092,8 @@ async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<O
     Ok(resp.object.filter(|_| resp.found))
 }
 
-/// Put an object missing from Meta's listing index back, so ListObjects
-/// shows it. Checked against the owner first: an object deleted since the
-/// page was read must not come back.
-async fn restore_listing(
-    meta: &Arc<MetaService>,
-    owner_addr: &str,
-    object: &ObjectMeta,
-) -> anyhow::Result<()> {
-    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
-        return Ok(());
-    }
-    match get_object_meta(owner_addr, object).await? {
-        Some(fresh) if fresh.object_id == object.object_id => {}
-        _ => return Ok(()),
-    }
+/// Meta's listing entry for `object`.
+async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()> {
     MetadataService::create_object(
         meta.as_ref(),
         tonic::Request::new(CreateObjectRequest {
@@ -1056,6 +1114,109 @@ async fn restore_listing(
     )
     .await
     .map_err(|e| anyhow::anyhow!("create_object: {e}"))?;
+    Ok(())
+}
+
+/// The key's current object as a read quorum of its copies has it, as a
+/// GET reads it (objectio-docs core/object-metadata-quorum.md): the newest
+/// object, unless a tombstone is newer. `None`: deleted, or absent. An
+/// error when fewer than a read quorum answer.
+async fn quorum_current(
+    meta: &Arc<MetaService>,
+    object: &ObjectMeta,
+) -> anyhow::Result<Option<ObjectMeta>> {
+    let mut addrs: Vec<String> = Vec::new();
+    let mut seen_nodes: Vec<Vec<u8>> = Vec::new();
+    for n in placement_of(meta, object).await? {
+        if !seen_nodes.contains(&n.node_id) {
+            seen_nodes.push(n.node_id.clone());
+            addrs.push(n.node_address);
+        }
+    }
+    let copies = addrs.len();
+    let read_quorum = copies - (copies / 2 + 1) + 1;
+    let asks = addrs.iter().map(|addr| async move {
+        let mut client = StorageServiceClient::new(open_channel(addr).await?)
+            .max_decoding_message_size(100 * 1024 * 1024);
+        let resp = tokio::time::timeout(
+            RPC_TIMEOUT,
+            client.get_object_meta(GetObjectMetaRequest {
+                bucket: object.bucket.clone(),
+                key: object.key.clone(),
+                version_id: String::new(),
+            }),
+        )
+        .await??
+        .into_inner();
+        Ok::<_, anyhow::Error>((resp.object.filter(|_| resp.found), resp.tombstone_stamp))
+    });
+    let mut answered = 0;
+    let mut newest: Option<ObjectMeta> = None;
+    let mut deleted_at = 0u64;
+    for answer in futures::future::join_all(asks).await.into_iter().flatten() {
+        answered += 1;
+        deleted_at = deleted_at.max(answer.1);
+        if let Some(o) = answer.0
+            && newest
+                .as_ref()
+                .is_none_or(|n| o.write_order() > n.write_order())
+        {
+            newest = Some(o);
+        }
+    }
+    if answered < read_quorum {
+        return Err(anyhow::anyhow!(
+            "{answered} of {copies} copies answered, need {read_quorum}"
+        ));
+    }
+    Ok(newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp))
+}
+
+/// Put an object missing from Meta's listing index back, so ListObjects
+/// shows it: only if a read quorum of its copies has it as the current
+/// object, as a GET would. Checked against the owner alone it listed
+/// objects deleted moments before (a copy that missed or hadn't yet taken
+/// the delete; the B2 soak). And checked again after, in case a delete
+/// landed in between: then the entry goes again.
+async fn restore_listing(
+    meta: &Arc<MetaService>,
+    _owner_addr: &str,
+    object: &ObjectMeta,
+) -> anyhow::Result<()> {
+    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
+        return Ok(());
+    }
+    let is_current = |c: &Option<ObjectMeta>| {
+        c.as_ref()
+            .is_some_and(|c| c.object_id == object.object_id && !c.is_delete_marker)
+    };
+    if !is_current(&quorum_current(meta, object).await?) {
+        return Ok(());
+    }
+    list(meta, object).await?;
+    // A delete or a replacement may have landed since the check: the entry
+    // follows what is current now.
+    match quorum_current(meta, object).await? {
+        Some(c) if c.object_id == object.object_id && !c.is_delete_marker => {}
+        Some(c) if !c.is_delete_marker => {
+            list(meta, &c).await?;
+            return Ok(());
+        }
+        _ => {
+            MetadataService::delete_object(
+                meta.as_ref(),
+                tonic::Request::new(objectio_proto::metadata::DeleteObjectRequest {
+                    bucket: object.bucket.clone(),
+                    key: object.key.clone(),
+                    version_id: String::new(),
+                    forget_home: false,
+                }),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("delete_object: {e}"))?;
+            return Ok(());
+        }
+    }
     STATS.listings_restored.fetch_add(1, Ordering::Relaxed);
     info!(
         "repair: restored the listing entry of {}/{}",

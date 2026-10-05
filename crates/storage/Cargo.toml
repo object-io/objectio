@@ -23,6 +23,7 @@ libc = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 crossbeam-channel = "0.5"
+redb = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -247,13 +247,9 @@ pub(crate) async fn commit_new(
         if_none_match: condition.if_none_match.clone().unwrap_or_default(),
     };
     let new_object = referenced_object_ids(&object_meta);
-    let failed = |e: &dyn std::fmt::Display| {
+    let failed = |e: &crate::osd_pool::MetaWriteError| {
         error!("Failed to store object metadata on OSDs: {e}");
-        S3Error::xml_response(
-            "InternalError",
-            &format!("Failed to store object metadata: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        )
+        S3Error::for_osd_error(&e.error, "Failed to store object metadata")
     };
 
     if condition.is_set() {
@@ -329,10 +325,10 @@ pub(crate) async fn commit_new(
     match committed {
         Ok((_, Committed::Both)) => Ok(()),
         Ok((_, Committed::Unlisted(e))) => {
-            warn!(
-                "create_object on meta failed ({e}); {what} is readable by key \
-                 but will not appear in ListObjects until repair",
-            );
+            // Stored and acknowledged; the listing follows (retried, then
+            // healed), not left to an hourly repair pass.
+            warn!("create_object on meta failed ({e}); listing {what} again");
+            sync_listing(state, nodes, &bucket, &key).await;
             Ok(())
         }
         Err(e) => Err(failed(&e)),
@@ -794,7 +790,7 @@ pub async fn put_object(
             let mut full = false;
             for (pos, result, placement_node) in results {
                 match result {
-                    Ok(location) => {
+                    Ok((location, crc32c)) => {
                         success_count += 1;
                         shard_locs.push(ShardLocation {
                             position: pos,
@@ -803,6 +799,7 @@ pub async fn put_object(
                             offset: location.offset,
                             shard_type: placement_node.shard_type,
                             local_group: placement_node.local_group,
+                            crc32c: Some(crc32c),
                         });
                         debug!(
                             "Wrote stripe {} replica {} to {}",
@@ -1197,7 +1194,7 @@ pub async fn put_object(
         let mut full = false;
         for (pos, result, placement_node) in results {
             match result {
-                Ok(location) => {
+                Ok((location, crc32c)) => {
                     success_count += 1;
                     shard_locs.push(ShardLocation {
                         position: pos,
@@ -1207,6 +1204,7 @@ pub async fn put_object(
                         // Use shard type from placement, or default to data/parity based on position
                         shard_type: placement_node.shard_type,
                         local_group: placement_node.local_group,
+                        crc32c: Some(crc32c),
                     });
                     debug!(
                         "Wrote stripe {} shard {} to {}",

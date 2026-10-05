@@ -179,6 +179,7 @@ pub(crate) async fn read_packed_slice(
             loc.position,
             in_shard,
             u32::try_from(len).ok()?,
+            loc.crc32c,
         )
         .await
         .ok()?;
@@ -985,6 +986,7 @@ pub(crate) async fn get_object_version_once(
                     shard_object_id,
                     stripe.stripe_id,
                     shard_loc.position,
+                    shard_loc.crc32c,
                     None, // Replicated stripes go over gRPC.
                 )
                 .await
@@ -1174,6 +1176,7 @@ pub(crate) async fn get_object_version_once(
                 let pool = &state.osd_pool;
                 let rdma = state.rdma.as_deref();
                 let stripe_id = stripe.stripe_id;
+                let expected_crc32c = shard_loc.crc32c;
                 in_flight.push(async move {
                     let result = read_shard_from_osd(
                         pool,
@@ -1181,6 +1184,7 @@ pub(crate) async fn get_object_version_once(
                         ec_shard_object_id,
                         stripe_id,
                         pos,
+                        expected_crc32c,
                         rdma,
                     )
                     .await;
@@ -1309,6 +1313,7 @@ pub(crate) async fn get_object_version_once(
     );
 
     // Verify data integrity for full (non-range) reads
+    // Never sent: bytes that don't add up to the object are not the object.
     if resolved_range.is_none() && all_data.len() as u64 != total_size {
         error!(
             "Data size mismatch for {}/{}: reassembled {} bytes but object.size={}",
@@ -1316,6 +1321,11 @@ pub(crate) async fn get_object_version_once(
             key,
             all_data.len(),
             total_size
+        );
+        return S3Error::xml_response(
+            "InternalError",
+            "The object's data did not reassemble to its size",
+            StatusCode::INTERNAL_SERVER_ERROR,
         );
     }
 
@@ -1497,11 +1507,12 @@ pub async fn head_object(
         .await
     {
         Ok(resp) => resp.into_inner(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .unwrap();
+        // Unknown, not missing: a 404 here told clients an object was gone
+        // while meta elected a leader.
+        Err(e) => {
+            let mut resp = S3Error::from_status(&e);
+            *resp.body_mut() = Body::empty();
+            return resp;
         }
     };
 

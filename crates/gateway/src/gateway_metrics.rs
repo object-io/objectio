@@ -291,6 +291,7 @@ impl PhaseTimer {
 #[must_use]
 pub fn render() -> String {
     let mut out = String::new();
+    crate::clock_skew::render(&mut out);
     REQUEST_ERRORS.render(
         &mut out,
         "objectio_s3_request_errors_total",
@@ -456,6 +457,7 @@ pub fn render() -> String {
         "",
     );
     crate::audit::render_metrics(&mut out);
+    crate::bucket_logging::render_metrics(&mut out);
     objectio_erasure::metrics::render(&mut out);
     crate::replication::render_metrics(&mut out);
     out

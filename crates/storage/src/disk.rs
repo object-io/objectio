@@ -406,6 +406,12 @@ impl DiskManager {
             .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
         // Parse footer from the end of the extent
+        if block_buf.len() != extent_bytes {
+            return Err(Error::Storage(format!(
+                "block {block_num}: read {} of {extent_bytes} bytes",
+                block_buf.len()
+            )));
+        }
         let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 
@@ -540,7 +546,14 @@ impl DiskManager {
         // to be added to the persisted shard index.
         let first = AlignedBuf::new(block_size);
         let first_owned = self.disk_io.read_at_owned(first, offset).await?;
-        let header = BlockHeader::from_bytes(&first_owned.as_slice()[..BlockHeader::SIZE])?;
+        // Whatever a backend hands back, never slice past it: an error, so
+        // the shard is marked corrupt, not a panic that leaves it "present".
+        let header = BlockHeader::from_bytes(
+            first_owned
+                .as_slice()
+                .get(..BlockHeader::SIZE)
+                .ok_or_else(|| Error::Storage(format!("block {block_num}: short read")))?,
+        )?;
 
         let extent_bytes =
             Self::blocks_for(header.data_size as usize, block_size) as usize * block_size;
@@ -560,6 +573,12 @@ impl DiskManager {
             .fetch_add(extent_bytes as u64, Ordering::Relaxed);
 
         // Parse footer from the end of the extent
+        if block_buf.len() != extent_bytes {
+            return Err(Error::Storage(format!(
+                "block {block_num}: read {} of {extent_bytes} bytes",
+                block_buf.len()
+            )));
+        }
         let footer_start = extent_bytes - BlockFooter::SIZE;
         let footer = BlockFooter::from_bytes(&block_buf[footer_start..])?;
 
@@ -633,6 +652,23 @@ fn write_superblock(file: &RawFile, sb: &Superblock) -> Result<()> {
 
 /// The disk's superblock: the primary, or, when it can't be read (torn by
 /// a power cut, say), the backup, which then repairs the primary.
+/// Whether `path` is blank: both superblock copies all zeros, as a new or
+/// wiped device or file reads. Only a blank disk may be formatted; one
+/// with anything there, even an ObjectIO superblock that won't parse, is
+/// data until an operator says otherwise. A read error is an error, not
+/// "blank".
+pub fn is_blank(path: impl AsRef<Path>) -> Result<bool> {
+    let file = RawFile::open(path.as_ref(), true)?;
+    for offset in [0, crate::layout::BACKUP_SUPERBLOCK_OFFSET] {
+        let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
+        file.read_at(offset, buf.as_mut_slice())?;
+        if buf.as_slice().iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
     let read_at = |offset: u64| -> Result<Superblock> {
         let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);

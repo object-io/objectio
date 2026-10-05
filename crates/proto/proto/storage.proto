@@ -141,6 +141,10 @@ message ReadShardRequest {
     // ReadShardResponse.data is empty. Only sent to OSDs that advertised a
     // `te_segment`.
     RdmaBuffer rdma_dest = 4;
+    // The shard's crc32c as its object records it (B23). The OSD checks the
+    // whole shard against it, as well as against its own, and answers
+    // DATA_LOSS (marking the shard corrupt) when they differ.
+    optional uint32 expected_crc32c = 5;
 }
 
 message ReadShardResponse {
@@ -354,6 +358,9 @@ message PutObjectMetaResponse {
     // not applied. Last writer wins; once every copy says so, the caller
     // frees the shards this write made, which nothing references.
     bool superseded = 5;
+    // With `superseded`: the stamp this copy holds (its object's or its
+    // tombstone's), so the writer can stamp above it and write again.
+    uint64 held_stamp = 6;
 }
 
 // Get object metadata request
@@ -396,6 +403,8 @@ message DeleteObjectMetaResponse {
     objectio.metadata.ObjectMeta removed = 3;
     // This copy already held a newer write than the delete: nothing removed.
     bool superseded = 4;
+    // With `superseded`: the stamp of the write it holds.
+    uint64 held_stamp = 5;
 }
 
 // List objects metadata request (for ListObjects)

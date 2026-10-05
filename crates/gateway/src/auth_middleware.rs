@@ -157,7 +157,17 @@ impl AuthState {
             .await
             .map_err(|e| {
                 warn!("Failed to fetch credential from metadata service: {}", e);
-                AuthError::AccessDenied(format!("credential lookup failed: {}", e))
+                match e.code() {
+                    // Meta answered: the key is not one it accepts.
+                    tonic::Code::NotFound
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::InvalidArgument => {
+                        AuthError::AccessDenied(format!("credential lookup failed: {e}"))
+                    }
+                    // No answer: unknown, not refused.
+                    _ => AuthError::Unavailable(format!("credential lookup failed: {e}; retry")),
+                }
             })?;
 
         let inner = response.into_inner();
@@ -1110,6 +1120,9 @@ pub enum AuthError {
     /// Internal error
     #[allow(dead_code)]
     InternalError,
+    /// The credential couldn't be looked up (meta unreachable, electing):
+    /// 503, which clients retry. A 403 here told them the key was refused.
+    Unavailable(String),
 }
 
 impl AuthError {
@@ -1135,6 +1148,7 @@ impl AuthError {
             AuthError::ExpiredToken(_) => "expired",
             AuthError::UnsupportedSigV2 => "sigv2",
             AuthError::InternalError => "internal",
+            AuthError::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -1145,6 +1159,9 @@ impl IntoResponse for AuthError {
         crate::gateway_metrics::record_auth_failure(self.metric_reason());
         let (status, error_code, message) = match self {
             AuthError::AccessDenied(msg) => (StatusCode::FORBIDDEN, "AccessDenied", msg),
+            AuthError::Unavailable(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", msg)
+            }
             AuthError::SignatureDoesNotMatch => (
                 StatusCode::FORBIDDEN,
                 "SignatureDoesNotMatch",

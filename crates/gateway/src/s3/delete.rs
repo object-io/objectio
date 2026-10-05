@@ -168,11 +168,7 @@ pub(crate) async fn delete_version(
         Ok(None) => return done(false),
         Err(e) => {
             error!("{bucket}/{key} version {vid}: cannot read it: {e}");
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e, "Failed to read object metadata");
         }
     };
 
@@ -217,24 +213,68 @@ pub(crate) async fn delete_version(
     done(version.is_delete_marker)
 }
 
-/// Make meta's listing entry for `bucket/key` match its current object on
-/// the OSDs: listed if it is an object, unlisted if a delete marker or
-/// nothing. Re-checked after the write, since another request may have
-/// changed the current object meanwhile. Returns the current object.
+/// Bring Meta's listing of `bucket/key` in line with what its copies hold,
+/// and return the current object as read (`None`: none, or unreadable).
+///
+/// A read that fails changes nothing: "unreadable" is not "deleted" (taken
+/// as deleted, it dropped existing objects from listings). An update that
+/// fails, as while meta elects a leader, is retried in the background and
+/// then left to the heal queue, whose healing ends with this: a delete
+/// that reached its quorum while meta was down left the key listed for
+/// good (the B2 soak).
 pub(crate) async fn sync_listing(
     state: &Arc<AppState>,
     nodes: &[objectio_proto::metadata::NodePlacement],
     bucket: &str,
     key: &str,
 ) -> Option<ObjectMeta> {
+    match try_sync_listing(state, nodes, bucket, key).await {
+        Ok(current) => current,
+        Err(e) => {
+            warn!("{bucket}/{key}: listing not updated yet ({e}); retrying in the background");
+            let (state, nodes) = (Arc::clone(state), nodes.to_vec());
+            let (bucket, key) = (bucket.to_string(), key.to_string());
+            tokio::spawn(async move {
+                let mut wait = std::time::Duration::from_millis(500);
+                for _ in 0..7 {
+                    tokio::time::sleep(wait).await;
+                    if try_sync_listing(&state, &nodes, &bucket, &key)
+                        .await
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    wait = (wait * 2).min(std::time::Duration::from_secs(16));
+                }
+                warn!("{bucket}/{key}: listing still not updated; left to the heal queue");
+                state.osd_pool.queue_heal(&bucket, &key, "").await;
+            });
+            None
+        }
+    }
+}
+
+/// One attempt of [`sync_listing`]: the current object, once the listing
+/// says the same (re-read after the update, in case a write raced it).
+async fn try_sync_listing(
+    state: &Arc<AppState>,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ObjectMeta>, String> {
     use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
     let mut meta_client = state.meta_client.clone();
-    let mut current = get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
-        .await
-        .ok()
-        .flatten();
+    let read = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        async move {
+            get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
+                .await
+                .map_err(|e| format!("reading its copies: {e}"))
+        }
+    };
+    let mut current = read(state).await?;
     for _ in 0..3 {
-        let written = match &current {
+        match &current {
             Some(c) if !c.is_delete_marker => meta_client
                 .create_object(objectio_proto::metadata::CreateObjectRequest {
                     bucket: bucket.to_string(),
@@ -261,22 +301,16 @@ pub(crate) async fn sync_listing(
                 })
                 .await
                 .map(drop),
-        };
-        if let Err(e) = written {
-            // Readable by key regardless; the repairer restores listings.
-            warn!("{bucket}/{key}: cannot update its listing: {e}");
         }
-        let now = get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
-            .await
-            .ok()
-            .flatten();
+        .map_err(|e| format!("updating the listing: {e}"))?;
+        let now = read(state).await?;
         let same = now.as_ref().map(|o| &o.object_id) == current.as_ref().map(|o| &o.object_id);
         current = now;
         if same {
             break;
         }
     }
-    current
+    Ok(current)
 }
 
 /// For a sub-resource request (tagging, retention, legal hold) naming a
@@ -363,19 +397,16 @@ pub(crate) async fn delete_object_to_the_end(
         .await
     {
         Ok(resp) => resp.into_inner(),
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .unwrap();
-        }
+        // Not "deleted": nothing was. (A 204 here told clients the object
+        // was gone while meta elected a leader; the B2 soak found it.)
+        Err(e) => return S3Error::from_status(&e),
     };
 
     if placement.nodes.is_empty() {
-        return Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())
-            .unwrap();
+        return S3Error::for_osd_error(
+            &crate::osd_pool::OsdPoolError::NoNodesAvailable,
+            "No OSDs to delete from",
+        );
     }
 
     // Check versioning state
@@ -395,17 +426,18 @@ pub(crate) async fn delete_object_to_the_end(
     if DeleteCondition::from_headers(&headers).is_set() {
         let pool = &state.osd_pool;
         let nodes = &placement.nodes;
+        // A condition that can't be checked is not met.
         let target = match &version_id {
-            Some(vid) => find_version(pool, nodes, &bucket, &key, vid)
-                .await
-                .ok()
-                .flatten(),
+            Some(vid) => match find_version(pool, nodes, &bucket, &key, vid).await {
+                Ok(v) => v,
+                Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
+            },
             None => match get_object_meta_from_any(pool, nodes, &bucket, &key).await {
                 Ok(Some(c)) if c.is_delete_marker => {
                     newest_object(pool, nodes, &bucket, &key).await
                 }
                 Ok(current) => current,
-                Err(_) => None,
+                Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
             },
         };
         if target.is_some_and(|t| !DeleteCondition::from_headers(&headers).holds(&t)) {
@@ -416,18 +448,17 @@ pub(crate) async fn delete_object_to_the_end(
     // Lock enforcement: retention and legal hold protect the version a
     // delete would destroy. A versioned delete without a version destroys
     // nothing (it adds a marker), so S3 allows it.
-    let protected = if let Some(vid) = &version_id {
-        find_version(&state.osd_pool, &placement.nodes, &bucket, &key, vid)
-            .await
-            .ok()
-            .flatten()
+    // A lock that can't be read protects what it may cover: no delete.
+    let read = if let Some(vid) = &version_id {
+        find_version(&state.osd_pool, &placement.nodes, &bucket, &key, vid).await
     } else if versioning_enabled {
-        None
+        Ok(None)
     } else {
-        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
-            .await
-            .ok()
-            .flatten()
+        get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key).await
+    };
+    let protected = match read {
+        Ok(p) => p,
+        Err(e) => return S3Error::for_osd_error(&e, "Failed to read object metadata"),
     };
     if let Some(meta) = protected
         && let Some(refusal) = lock_refusal(&meta, &headers)
@@ -495,11 +526,7 @@ pub(crate) async fn delete_object_to_the_end(
         .await
         {
             error!("Failed to create delete marker: {}", e);
-            return S3Error::xml_response(
-                "InternalError",
-                &e.to_string(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
         }
 
         // The key no longer has a current version, so drop it from Meta's
@@ -568,11 +595,7 @@ pub(crate) async fn delete_object_to_the_end(
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to put the null delete marker: {}", e.error);
-                return S3Error::xml_response(
-                    "InternalError",
-                    &e.error.to_string(),
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
             }
         };
         // A null version it replaced: its shards, once every replica agrees.
@@ -663,19 +686,24 @@ pub(crate) async fn delete_object_to_the_end(
         }
     }
 
-    // Unregister from Meta's listing index. Non-fatal if it fails —
-    // the next ListObjects sweep will re-check the OSDs and prune.
+    // Unregister from Meta's listing index. If meta can't take it now (an
+    // election), sync_listing retries and then queues the key for healing:
+    // the error was dropped here, and the key stayed listed for good.
     {
         use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
         let mut meta_client = state.meta_client.clone();
-        let _ = meta_client
+        if let Err(e) = meta_client
             .delete_object(MetaDelReq {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: String::new(),
                 forget_home: never_versioned,
             })
-            .await;
+            .await
+        {
+            warn!("{bucket}/{key}: listing not removed ({e}); retrying");
+            sync_listing(&state, &placement.nodes, &bucket, &key).await;
+        }
     }
 
     info!("Deleted object: {}/{}", bucket, key);
@@ -865,6 +893,19 @@ pub async fn delete_objects(
         bucket,
         deleted.len(),
         errors.len()
+    );
+
+    // Bucket logging gives each deleted key its own record, as S3 does.
+    crate::audit::note_deleted(
+        deleted
+            .iter()
+            .map(|d| {
+                (
+                    d.key.clone(),
+                    d.version_id.clone().or(d.delete_marker_version_id.clone()),
+                )
+            })
+            .collect(),
     );
 
     // Build response: in quiet mode, only what could not be deleted.

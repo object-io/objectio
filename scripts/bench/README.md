@@ -53,3 +53,14 @@ separate.
 - **One object size per cell** — real workloads are mixed.
 - **No multipart.** Objects are single PUTs, so this does not exercise the
   multipart path at all.
+
+## baseline.sh
+
+The B4 single-host baseline: ObjectIO (4+2 aio), RustFS (EC:2) and
+SeaweedFS on one disk, the same warp cells (PUT and GET at 4 KiB, 64 KiB,
+1 MiB and 16 MiB, 32 clients, 30 s each). Results and how to read them:
+the developer guide's performance page.
+
+```bash
+BENCH=/data/bench scripts/bench/baseline.sh objectio rustfs seaweedfs
+```

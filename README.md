@@ -15,7 +15,7 @@ documentation is at **[object-io.github.io](https://object-io.github.io)**.
 
 | Area | State |
 |---|---|
-| **S3** | The most complete part, and the one being made production-ready first: core operations, multipart, versioning, Object Lock, lifecycle, policies, SSE-S3/KMS/C, CORS, presigned and POST uploads, STS, tenancy, audit, bucket replication. Checked against the [ceph s3-tests](https://object-io.github.io/latest/developer-guide/s3-compatibility/) suite on every run. |
+| **S3** | The most complete part, and the one being made production-ready first: core operations, multipart, versioning, Object Lock, lifecycle, policies, SSE-S3/KMS/C, CORS, presigned and POST uploads, STS, tenancy, audit, bucket logging, bucket replication. Checked against the [ceph s3-tests](https://object-io.github.io/latest/developer-guide/s3-compatibility/) suite on every run. |
 | **Storage core** | Erasure coding (Reed-Solomon 4+2 by default; ISA-L on x86), placement groups across failure domains, repair, drain, small-object packing, a Raft metadata service that survives losing a node. Rolling upgrades from v0.5.0 on. |
 | **Data lake** | Iceberg REST Catalog, Unity Catalog API and Delta Sharing are built, but not yet tested end to end against real engines (Spark, Trino, PyIceberg): a preview. |
 | **Block** | Volumes over NBD and gRPC with snapshots, clones and thin provisioning. QoS is not enforced, and iSCSI/NVMe-oF are not built yet: a preview. |

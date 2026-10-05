@@ -46,6 +46,8 @@ pub struct ListObjectsParams {
     pub(crate) cors: Option<String>,
     /// If present, a bucket replication configuration request.
     pub(crate) replication: Option<String>,
+    /// If present, a GetBucketLogging request (see `crate::bucket_logging`).
+    pub(crate) logging: Option<String>,
     /// If present (even empty), this is a policy request
     pub(crate) policy: Option<String>,
     /// If present, this is a list object versions request
@@ -130,6 +132,8 @@ pub struct PutBucketParams {
     pub(crate) cors: Option<String>,
     /// If present, a bucket replication configuration request.
     pub(crate) replication: Option<String>,
+    /// If present, a PutBucketLogging request (see `crate::bucket_logging`).
+    pub(crate) logging: Option<String>,
 }
 
 /// Query parameters for DELETE bucket operations
@@ -425,6 +429,29 @@ impl S3Error {
             "The cluster has no room for this write: its disks are full",
             StatusCode::INSUFFICIENT_STORAGE,
         )
+    }
+
+    /// A failed ObjectMeta read or write, as S3 answers it: 507 when the
+    /// OSDs are full, 503 (retry) when copies were unreachable or this
+    /// gateway's clock may not stamp writes, otherwise 500. `what`
+    /// prefixes the message.
+    pub fn for_osd_error(e: &crate::osd_pool::OsdPoolError, what: &str) -> Response {
+        use crate::osd_pool::OsdPoolError as E;
+        match e {
+            E::Full(_) => Self::storage_full(),
+            E::ConnectionFailed(_) | E::NoNodesAvailable | E::NodeNotFound(_) | E::ClockSkew(_) => {
+                Self::xml_response(
+                    "ServiceUnavailable",
+                    &format!("{what}: {e}"),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+            }
+            E::ChecksumMismatch(_) | E::TooOld(_) => Self::xml_response(
+                "InternalError",
+                &format!("{what}: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        }
     }
 
     pub fn from_status(e: &tonic::Status) -> Response {
