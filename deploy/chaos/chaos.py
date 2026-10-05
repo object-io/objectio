@@ -256,17 +256,27 @@ def leader_vm(timeout=60):
     fail("no leader every meta agrees on")
 
 
-def await_metas_healthy(timeout=300):
-    deadline = time.monotonic() + timeout
+# How long every meta may take to be back in step after a fault. A meta
+# node reopening its database after a power cut walks all of it (roadmap
+# B25), minutes on these VMs: the soak sets this higher and logs the time.
+META_RECOVERY = float(os.environ.get("META_RECOVERY_SECS", "300"))
+
+
+def await_metas_healthy(timeout=None):
+    started = time.monotonic()
+    deadline = started + (timeout or META_RECOVERY)
     while time.monotonic() < deadline:
         seen = [meta_status(vm) for vm in METAS]
         if all(seen) and len({s["leader_id"] for s in seen}) == 1 and all(
                 len(s["voters"]) == 3 for s in seen):
             applied = [s["last_applied"] or 0 for s in seen]
             if max(applied) - min(applied) < 100:
+                took = time.monotonic() - started
+                if took > 30:
+                    say(f"meta back in step after {took:.0f} s")
                 return
         time.sleep(2)
-    fail("meta never became healthy")
+    fail(f"meta never became healthy (waited {timeout or META_RECOVERY:.0f} s)")
 
 
 def nodes():
