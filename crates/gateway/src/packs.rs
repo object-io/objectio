@@ -1090,7 +1090,7 @@ pub async fn admin_test_list(
         .await
     {
         Ok(r) => r.into_inner(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return crate::admin::meta_failure(&e),
     };
     let packs: Vec<serde_json::Value> = page
         .packs
