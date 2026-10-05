@@ -586,13 +586,30 @@ async fn move_shard(
 
     // The bytes: from the draining OSD, checked; or, if it cannot give
     // them, rebuilt from the rest of the stripe.
-    let bytes = match read_shard(draining_addr, &mv.shard).await {
+    // What the shard's object records of it (B23): the bytes moved are
+    // checked against it, read or rebuilt.
+    let expected = stripe
+        .shards
+        .iter()
+        .find(|l| l.position == mv.shard.position)
+        .and_then(|l| l.crc32c);
+    let bytes = match read_shard(draining_addr, &mv.shard, expected).await {
         Ok(b) => b,
         Err(e) => {
             debug!("drain: reading from the draining OSD failed ({e}); rebuilding");
-            rebuild_shard(meta, &stripe, &mv.shard, draining).await?
+            let rebuilt = rebuild_shard(meta, &stripe, &mv.shard, draining).await?;
+            if let Some(recorded) = expected
+                && crc32c::crc32c(&rebuilt) != recorded
+            {
+                return Err(anyhow::anyhow!(
+                    "position {} rebuilt differs from the shard its object records; not moved",
+                    mv.shard.position
+                ));
+            }
+            rebuilt
         }
     };
+    let crc32c = crc32c::crc32c(&bytes);
     let location = write_shard(&target_addr, &mv.shard, bytes).await?;
     let to = ShardLocation {
         position: mv.shard.position,
@@ -601,6 +618,7 @@ async fn move_shard(
         offset: 0,
         shard_type: 0,
         local_group: 0,
+        crc32c: Some(crc32c),
     };
 
     for o in &mv.objects {
@@ -696,7 +714,12 @@ async fn get_object_meta(
     Ok(resp.object.filter(|_| resp.found))
 }
 
-async fn read_shard(addr: &str, shard: &ShardId) -> anyhow::Result<prost::bytes::Bytes> {
+/// `expected_crc32c`: what the shard's object records (B23).
+async fn read_shard(
+    addr: &str,
+    shard: &ShardId,
+    expected_crc32c: Option<u32>,
+) -> anyhow::Result<prost::bytes::Bytes> {
     let mut client = StorageServiceClient::new(open_channel(addr).await?)
         .max_decoding_message_size(100 * 1024 * 1024);
     let resp = tokio::time::timeout(
@@ -706,13 +729,20 @@ async fn read_shard(addr: &str, shard: &ShardId) -> anyhow::Result<prost::bytes:
             shard_id: Some(shard.clone()),
             offset: 0,
             length: 0,
+            expected_crc32c,
         }),
     )
     .await
     .map_err(|_| anyhow::anyhow!("read_shard timeout"))??
     .into_inner();
     // Moving damaged bytes would store them under a checksum of the damage.
-    verified_shard(resp)
+    let bytes = verified_shard(resp)?;
+    if let Some(expected) = expected_crc32c
+        && crc32c::crc32c(&bytes) != expected
+    {
+        return Err(anyhow::anyhow!("not the shard its object records"));
+    }
+    Ok(bytes)
 }
 
 async fn write_shard(
@@ -770,7 +800,8 @@ async fn rebuild_shard(
             position: loc.position,
             ..shard.clone()
         };
-        reads.push(async move { (id.position, read_shard(&addr, &id).await) });
+        let expected = loc.crc32c;
+        reads.push(async move { (id.position, read_shard(&addr, &id, expected).await) });
     }
     let mut survivors: Vec<Option<Vec<u8>>> = vec![None; k + m];
     let mut have = 0;
@@ -821,11 +852,29 @@ async fn find_affected_objects(
     Ok(resp.into_inner().objects)
 }
 
+/// One channel per OSD address, kept: repair and drain made a connection
+/// (with mTLS, a handshake) for every call, which bounded a rebuild at
+/// about 50 shards a second (B24). A tonic channel reconnects by itself
+/// after its OSD restarts; every call has its own timeout.
+static CHANNELS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Channel>>> =
+    std::sync::LazyLock::new(Default::default);
+
 pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
+    if let Some(ch) = CHANNELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(address)
+    {
+        return Ok(ch.clone());
+    }
     let endpoint = objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?;
     let channel = tokio::time::timeout(PER_OSD_TIMEOUT, endpoint.connect())
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+    CHANNELS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(address.to_string(), channel.clone());
     Ok(channel)
 }
 

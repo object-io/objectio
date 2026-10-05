@@ -142,6 +142,15 @@ pub async fn create_bucket(
     if params.replication.is_some() {
         return crate::replication::put_config(&state, &bucket, &body).await;
     }
+    if params.logging.is_some() {
+        return crate::bucket_logging::put_config(
+            &state,
+            &bucket,
+            auth.as_ref().map(|Extension(a)| a),
+            &body,
+        )
+        .await;
+    }
     // Ownership other than BucketOwnerEnforced can't be honoured (ACLs are
     // off): refused, as PutBucketOwnershipControls refuses it, rather than
     // a bucket created that quietly behaves otherwise.

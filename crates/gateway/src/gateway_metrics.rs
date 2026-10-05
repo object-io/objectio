@@ -457,6 +457,7 @@ pub fn render() -> String {
         "",
     );
     crate::audit::render_metrics(&mut out);
+    crate::bucket_logging::render_metrics(&mut out);
     objectio_erasure::metrics::render(&mut out);
     crate::replication::render_metrics(&mut out);
     out

@@ -76,6 +76,7 @@ rm -rf "$DATA"
   --data "$DATA" --port "$PORT" --listen-addr 127.0.0.1 \
   --osds 6 --ec-k 4 --ec-m 2 --auth \
   --lifecycle-interval-secs 2 --lifecycle-day-secs 10 \
+  --bucket-log-roll-secs 3 \
   > "$WORK/aio.log" 2>&1 &
 AIO=$!
 trap 'kill $AIO 2>/dev/null || true; wait $AIO 2>/dev/null || true' EXIT
@@ -103,7 +104,9 @@ fi
 mkdir -p "$REPORT"
 echo "running s3-tests (this takes about an hour) ..."
 set +e
-(cd "$WORK/s3-tests" && S3TEST_CONF="$WORK/s3tests.conf" "$PY" -m pytest s3tests/functional \
+# TZ=UTC: the logging tests compare a log object's name (UTC, as in S3) with
+# the local clock.
+(cd "$WORK/s3-tests" && TZ=UTC S3TEST_CONF="$WORK/s3tests.conf" "$PY" -m pytest s3tests/functional \
   -n "$JOBS" --timeout 120 -p no:cacheprovider -q -rN \
   ${PLUGIN[@]+"${PLUGIN[@]}"} --junitxml="$REPORT/junit.xml" \
   ${PYTEST_EXTRA[@]+"${PYTEST_EXTRA[@]}"}) > "$WORK/pytest.log" 2>&1

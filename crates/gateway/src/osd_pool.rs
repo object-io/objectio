@@ -548,8 +548,11 @@ fn is_transport_failure(e: &tonic::Status) -> bool {
 /// error: error reading a body from connection", as a meta pod's restart
 /// cut a placement answer short, which became a 500).
 pub fn connection_broke(e: &tonic::Status) -> bool {
-    (e.code() == tonic::Code::Unknown && e.message() == "transport error")
-        || (e.code() == tonic::Code::Internal && e.message().starts_with("h2 protocol error"))
+    // tonic reports a connection that dropped mid-call either way round:
+    // "transport error", or the h2 layer's own message (seen as Unknown
+    // when a meta pod restarted during a call: a 500, not a retry, before).
+    matches!(e.code(), tonic::Code::Unknown | tonic::Code::Internal)
+        && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
 }
 
 /// A shard call that did not succeed.
@@ -697,6 +700,8 @@ async fn call_read_shard(
 /// shard is sent again as bytes. `data` is the shard either way — for the
 /// checksum, and for the fallback.
 #[allow(clippy::too_many_arguments)]
+/// Returns where the shard went and its crc32c, which the object records
+/// (B23).
 pub async fn write_shard_to_osd(
     pool: &OsdPool,
     placement: &NodePlacement,
@@ -707,7 +712,7 @@ pub async fn write_shard_to_osd(
     ec_k: u32,
     ec_m: u32,
     rdma: Option<RdmaSource<'_>>,
-) -> Result<objectio_proto::storage::BlockLocation, OsdPoolError> {
+) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
     use objectio_proto::storage::{Checksum, RdmaBuffer, ShardId, WriteShardRequest};
 
     let shard_id = ShardId {
@@ -740,7 +745,7 @@ pub async fn write_shard_to_osd(
                 match call_write_shard(pool, placement, request).await {
                     Ok(location) => {
                         crate::gateway_metrics::record_shard_transfer("write", "rdma");
-                        return Ok(location);
+                        return Ok((location, checksum.crc32c));
                     }
                     Err(e) => {
                         let reason = rdma_failure(src.rdma, &placement.te_segment, &e);
@@ -762,6 +767,7 @@ pub async fn write_shard_to_osd(
         }
     }
 
+    let crc = checksum.crc32c;
     let request = WriteShardRequest {
         shard_id: Some(shard_id),
         ec_k,
@@ -781,10 +787,17 @@ pub async fn write_shard_to_osd(
             }
         })?;
     crate::gateway_metrics::record_shard_transfer("write", "grpc");
-    Ok(location)
+    Ok((location, crc))
 }
 
-/// Read a shard from the OSD in `placement`.
+/// Whether `data` is the shard its object recorded (B23); a shard with no
+/// recorded checksum passes.
+fn matches_recorded(expected_crc32c: Option<u32>, data: &[u8]) -> bool {
+    expected_crc32c.is_none_or(|c| crc32c::crc32c(data) == c)
+}
+
+/// Read a shard from the OSD in `placement`. `expected_crc32c` is the
+/// checksum its object records, checked as well as the OSD's.
 ///
 /// With `rdma`, and an OSD that offers Transfer Engine, the OSD writes the
 /// shard into one of the gateway's read slots and the returned `Bytes` is a
@@ -796,6 +809,7 @@ pub async fn read_shard_from_osd(
     object_id: &[u8],
     stripe_id: u64,
     position: u32,
+    expected_crc32c: Option<u32>,
     rdma: Option<&crate::rdma::GatewayRdma>,
 ) -> Result<Bytes, OsdPoolError> {
     use crate::rdma::Fallback;
@@ -816,6 +830,7 @@ pub async fn read_shard_from_osd(
                         shard_id: Some(shard_id.clone()),
                         offset: 0,
                         length: 0,
+                        expected_crc32c,
                         rdma_dest: Some(RdmaBuffer {
                             segment: r.segment().to_string(),
                             addr: slot.addr(),
@@ -831,7 +846,9 @@ pub async fn read_shard_from_osd(
                                 Fallback::Error
                             } else {
                                 let bytes = slot.into_bytes(len);
-                                if matches_checksum(resp.checksum.as_ref(), &bytes) {
+                                if matches_checksum(resp.checksum.as_ref(), &bytes)
+                                    && matches_recorded(expected_crc32c, &bytes)
+                                {
                                     crate::gateway_metrics::record_shard_transfer("read", "rdma");
                                     return Ok(bytes);
                                 }
@@ -867,12 +884,16 @@ pub async fn read_shard_from_osd(
         shard_id: Some(shard_id),
         offset: 0,
         length: 0, // 0 means read all
+        expected_crc32c,
     };
     let response = call_read_shard(pool, placement, request).await?;
-    // The same check the rdma path makes. A shard damaged on the way is a
-    // failed read, so the caller moves on to another shard or replica
-    // instead of decoding the damage into the object.
-    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+    // The same check the rdma path makes. A shard damaged on the way, or
+    // stored wrong (its OSD's checksum is of the wrong bytes), is a failed
+    // read, so the caller moves on to another shard or replica instead of
+    // decoding the damage into the object.
+    if !matches_checksum(response.checksum.as_ref(), &response.data)
+        || !matches_recorded(expected_crc32c, &response.data)
+    {
         crate::gateway_metrics::record_shard_checksum_mismatch("read");
         warn!(
             "shard {position} from {} does not match its checksum; not using it",
@@ -891,6 +912,7 @@ pub async fn read_shard_from_osd(
 /// slice, without moving the whole shard. The OSD checks the whole shard
 /// against its stored checksum before slicing, and the slice comes back
 /// with a checksum of its own, checked here.
+#[allow(clippy::too_many_arguments)]
 pub async fn read_shard_range_from_osd(
     pool: &OsdPool,
     placement: &NodePlacement,
@@ -899,9 +921,12 @@ pub async fn read_shard_range_from_osd(
     position: u32,
     offset: u64,
     length: u32,
+    expected_crc32c: Option<u32>,
 ) -> Result<Bytes, OsdPoolError> {
     use objectio_proto::storage::{ReadShardRequest, ShardId};
     let request = ReadShardRequest {
+        // The OSD checks the whole shard against it before slicing.
+        expected_crc32c,
         rdma_dest: None,
         shard_id: Some(ShardId {
             object_id: object_id.to_vec(),
@@ -2027,6 +2052,29 @@ pub async fn reclaim_shards(
     }
     crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
     failed
+}
+
+#[cfg(test)]
+mod connection_broke_tests {
+    use super::connection_broke;
+
+    #[test]
+    fn a_dropped_connection_is_recognised_whatever_the_code() {
+        for code in [tonic::Code::Unknown, tonic::Code::Internal] {
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "transport error"
+            )));
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "h2 protocol error: error reading a body from connection"
+            )));
+        }
+        assert!(!connection_broke(&tonic::Status::internal("disk exploded")));
+        assert!(!connection_broke(&tonic::Status::not_found(
+            "transport error"
+        )));
+    }
 }
 
 #[cfg(test)]

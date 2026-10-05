@@ -8,6 +8,7 @@ pub mod audit;
 pub mod audit_spool;
 pub mod auth_middleware;
 pub mod authz;
+pub mod bucket_logging;
 pub mod checksum;
 pub mod chunked_decode;
 pub mod clock_skew;
@@ -41,6 +42,7 @@ pub mod s3;
 pub mod s3_metrics;
 pub mod scatter_gather;
 pub mod sts_api;
+pub mod test_hooks;
 pub mod upgrade;
 
 use crate::s3_metrics::{ProtectionConfig, s3_metrics};
@@ -344,6 +346,34 @@ pub struct Args {
     /// On shutdown, how long to wait for the audit spool to be delivered.
     #[arg(long, env = "OBJECTIO_AUDIT_DRAIN_SECS", default_value_t = 20)]
     pub audit_drain_secs: u64,
+
+    /// Keep bucket access-log records here before they are delivered (A12):
+    /// a gateway killed loses none. Default: `bucket-logging` inside
+    /// `--audit-spool`. Without either, this gateway refuses
+    /// `PutBucketLogging` and drops the records of logged buckets.
+    #[arg(long, env = "OBJECTIO_BUCKET_LOG_SPOOL")]
+    pub bucket_log_spool: Option<std::path::PathBuf>,
+
+    /// The most the bucket-logging spool holds; past it, new records are
+    /// dropped and counted (`objectio_bucket_logging_dropped_total`). Records
+    /// leave it once delivered (a roll time), so it fills only while
+    /// targets can't be written.
+    #[arg(long, env = "OBJECTIO_BUCKET_LOG_SPOOL_MAX_BYTES", default_value_t = 1 << 30)]
+    pub bucket_log_spool_max_bytes: u64,
+
+    /// Seconds a log object collects records before it is written into its
+    /// target bucket.
+    #[arg(long, env = "OBJECTIO_BUCKET_LOG_ROLL_SECS", default_value_t = 300)]
+    pub bucket_log_roll_secs: u64,
+
+    /// A log object is written once it holds this many records, however
+    /// young.
+    #[arg(
+        long,
+        env = "OBJECTIO_BUCKET_LOG_MAX_RECORDS",
+        default_value_t = 50_000
+    )]
+    pub bucket_log_max_records: usize,
 
     /// Days the system bucket keeps events (0: kept).
     #[arg(long, env = "OBJECTIO_AUDIT_RETENTION_DAYS", default_value_t = 365)]
@@ -999,6 +1029,27 @@ pub async fn run(
         trusted_proxies.clone(),
         spool,
     );
+    let bucket_log_spool = match args
+        .bucket_log_spool
+        .clone()
+        .or_else(|| args.audit_spool.as_ref().map(|d| d.join("bucket-logging")))
+    {
+        Some(dir) => Some(
+            audit_spool::Spool::open(&dir, args.bucket_log_spool_max_bytes)
+                .map_err(|e| anyhow::anyhow!("--bucket-log-spool {}: {e}", dir.display()))?,
+        ),
+        None => None,
+    };
+    let bucket_logger = bucket_logging::Logger::new(
+        meta_client.clone(),
+        bucket_log_spool,
+        bucket_logging::Timing {
+            roll: std::time::Duration::from_secs(args.bucket_log_roll_secs.max(1)),
+            max_records: args.bucket_log_max_records.max(1),
+        },
+        args.region.clone(),
+    );
+    auditor.set_bucket_logging(Arc::clone(&bucket_logger));
     let state = Arc::new(AppState {
         meta_client,
         osd_pool,
@@ -1022,6 +1073,8 @@ pub async fn run(
         pack_cache: crate::packs::PackCache::default(),
         replication: crate::replication::Replication::default(),
     });
+
+    bucket_logging::spawn_delivery(Arc::clone(&state), Arc::clone(&bucket_logger));
 
     if let Some(bucket) = &args.audit_system_bucket {
         auditor.start_system_bucket(
@@ -1348,6 +1401,10 @@ pub async fn run(
             )
             .route("/_admin/test/pack-compact", post(packs::admin_test_compact))
             .route("/_admin/test/packs", get(packs::admin_test_list))
+            .route(
+                "/_admin/test/rewrite-shard",
+                post(test_hooks::rewrite_shard),
+            )
     } else {
         admin_routes
     };
@@ -1777,6 +1834,9 @@ pub async fn run(
 
     // What the audit spool holds goes out before the gateway does.
     auditor
+        .drain(std::time::Duration::from_secs(args.audit_drain_secs))
+        .await;
+    bucket_logger
         .drain(std::time::Duration::from_secs(args.audit_drain_secs))
         .await;
 

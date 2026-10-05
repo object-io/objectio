@@ -95,37 +95,22 @@ test_s3::test_bucket_list_prefix_unreadable,aws-compatible-already,ListObjects v
 test_s3::test_bucket_list_unordered,not-implemented-by-design,RGW allow-unordered listing extension
 test_s3::test_bucket_listv2_objects_anonymous,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_bucket_listv2_unordered,not-implemented-by-design,RGW allow-unordered listing extension
-test_s3::test_bucket_logging_bucket_acl_required,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_bucket_auth_type,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_copy_objects,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_copy_objects_bucket,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_copy_objects_bucket_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_copy_objects_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_delete_objects,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_delete_objects_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_get_objects,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_get_objects_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_head_objects,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_head_objects_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_mpu_copy,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_mpu_copy_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_mpu_s,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_mpu_versioned_s,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_mtime,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_multi_delete,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_multi_delete_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_multiple_prefixes,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_object_acl_required,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_owner,not-implemented-by-design,"bucket logging (also: policy without Resource rejected, as AWS)"
-test_s3::test_bucket_logging_partitioned_key,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_permission_change_s,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_put_concurrency,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_put_objects,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_put_objects_versioned,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_request_id,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_requester_assumed_role,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_simple_key,not-implemented-by-design,bucket logging
-test_s3::test_bucket_logging_single_prefix,not-implemented-by-design,bucket logging
+test_s3::test_bucket_logging_bucket_acl_required,not-implemented-by-design,ACL grants (BucketOwnerEnforced): the test opens the bucket with a canned ACL; ACLRequired is always -
+test_s3::test_bucket_logging_bucket_auth_type,not-implemented-by-design,ACL grants (the test opens the object with a canned ACL) and SigV2 presigned URLs
+test_s3::test_bucket_logging_copy_objects,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_copy_objects_bucket,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_copy_objects_bucket_versioned,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_copy_objects_versioned,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_mpu_copy,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_mpu_copy_versioned,aws-compatible-already,a copy is logged REST.COPY.OBJECT (and REST.COPY.OBJECT_GET on the source) as in S3; RGW logs REST.PUT.OBJECT
+test_s3::test_bucket_logging_multi_delete,aws-compatible-already,a batch delete is logged REST.POST.MULTI_OBJECT_DELETE plus BATCH.DELETE.OBJECT per key as in S3; RGW logs REST.POST.DELETE_MULTI_OBJECT per key
+test_s3::test_bucket_logging_multi_delete_versioned,aws-compatible-already,a batch delete is logged REST.POST.MULTI_OBJECT_DELETE plus BATCH.DELETE.OBJECT per key as in S3; RGW logs REST.POST.DELETE_MULTI_OBJECT per key
+test_s3::test_bucket_logging_multiple_prefixes,aws-compatible-already,"every record is delivered within the roll time, the flush's dummy PUT too (its own object, which the test counts as wrong); RGW keeps the last batch open until a later request"
+test_s3::test_bucket_logging_object_acl_required,not-implemented-by-design,ACL grants (BucketOwnerEnforced): the test opens the object with a canned ACL; ACLRequired is always -
+test_s3::test_bucket_logging_owner,aws-compatible-already,"policy without Resource rejected (MalformedPolicy), as AWS"
+test_s3::test_bucket_logging_partitioned_key,aws-compatible-already,a partitioned key names the gateway's region (us-east-1); the test expects RGW's zonegroup name 'default'
+test_s3::test_bucket_logging_permission_change_s,aws-compatible-already,a request is never failed because its log can't be delivered (records a target no longer consents to are dropped); RGW fails the client's PUT with AccessDenied
+test_s3::test_bucket_logging_requester_assumed_role,not-implemented-by-design,the IAM API (A15): CreateRole
 test_s3::test_bucket_policy_acl,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_bucket_policy_deny_self_denied_policy,gap,"an account root (tenant admin) isn't exempt from its own bucket's policy for the bucket-policy calls, as AWS's root is"
 test_s3::test_bucket_policy_different_tenant,not-implemented-by-design,RGW tenant:bucket naming
@@ -239,17 +224,13 @@ test_s3::test_post_object_upload_size_rgw_chunk_size_bug,not-implemented-by-desi
 test_s3::test_post_object_user_specified_header,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
 test_s3::test_post_object_wrong_bucket,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
 test_s3::test_put_bucket_acl_grant_group_read,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
-test_s3::test_put_bucket_logging,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_account_s,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_errors,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_permissions,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_policy_wildcard,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_policy_wildcard_objects,not-implemented-by-design,bucket logging
-test_s3::test_put_bucket_logging_tenant_s,not-implemented-by-design,bucket logging
+test_s3::test_put_bucket_logging_account_s,not-implemented-by-design,a logging target in another tenant is refused (InvalidTargetBucketForLogging); the test logs across RGW accounts
+test_s3::test_put_bucket_logging_errors,aws-compatible-already,a missing target is InvalidTargetBucketForLogging as in S3 (RGW: NoSuchKey); an SSE-S3 target is accepted as in S3; requestPayment is not implemented
+test_s3::test_put_bucket_logging_policy_wildcard_objects,aws-compatible-already,a request is never failed because its log can't be delivered (records a target no longer consents to are dropped); RGW fails the client's PUT with AccessDenied
+test_s3::test_put_bucket_logging_tenant_s,not-implemented-by-design,RGW's tenant:bucket target names; bucket names are global here and a target must be in the source's tenant
 test_s3::test_put_bucket_ownership_bucket_owner_enforced,not-implemented-by-design,ACLs (bucket is BucketOwnerEnforced)
 test_s3::test_put_bucket_ownership_bucket_owner_preferred,not-implemented-by-design,only BucketOwnerEnforced (ACLs disabled)
 test_s3::test_put_bucket_ownership_object_writer,not-implemented-by-design,only BucketOwnerEnforced (ACLs disabled)
-test_s3::test_rm_bucket_logging,not-implemented-by-design,bucket logging
 test_s3::test_sse_kms_default_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
 test_s3::test_sse_kms_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
 test_s3::test_sse_s3_default_post_object_authenticated_request,not-implemented-by-design,POST object signed with SigV2 (HMAC-SHA1 policy)
