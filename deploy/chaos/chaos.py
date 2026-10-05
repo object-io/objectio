@@ -392,6 +392,55 @@ def disk_pull(vm="chaos-5", new=None):
     settle("disk-pull")
 
 
+def drive_lost(vm="chaos-5", new=None):
+    """A drive lost whole, as production loses one (B26): the OSD's state
+    directory (its metadata) is on the drive too, so the blank drive comes
+    back as a new OSD. The old OSD is set out, as the runbook says, and
+    everything it held must be rebuilt elsewhere: shards from the rest of
+    their stripes, metadata copies from the other copies."""
+    new = new or f"{vm}-osd2"
+    old = osd_of(vm)
+    if not old:
+        fail(f"no OSD found on {vm}")
+    say(f"drive-lost: {vm}'s drive and its metadata gone (OSD {old['node_id']})")
+    vm_exec(vm, "systemctl stop objectio-osd")
+    incus("config", "device", "remove", vm, "osd")
+    vm_exec(vm, "rm -rf /var/lib/objectio/osd && mkdir -p /var/lib/objectio/osd")
+    status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "out"})
+    if status != 200:
+        fail(f"set out: {status} {data[:200]}")
+    incus("storage", "volume", "create", "default", new, "--type=block", f"size={DISK_SIZE}")
+    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={new}")
+    vm_exec(vm, "sleep 3; systemctl start objectio-osd")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        back = osd_of(vm)
+        if back and back["node_id"] != old["node_id"] and back.get("online"):
+            break
+        time.sleep(3)
+    else:
+        fail(f"{vm} never came back as a new OSD on the blank drive")
+    say(f"drive-lost: {vm} back as OSD {back['node_id']}; evacuating {old['node_id']}")
+    # The evacuation is finished when the old OSD's drain entry is gone.
+    started = time.monotonic()
+    seen = False
+    while True:
+        status, data = admin("GET", "/_admin/drain-status")
+        if status != 200:
+            fail(f"/_admin/drain-status: {status} {data[:200]}")
+        drains = {d["node_id"]: d for d in json.loads(data).get("drains", [])}
+        if old["node_id"] in drains:
+            seen = True
+        elif seen or time.monotonic() - started > 90:
+            break
+        if time.monotonic() - started > REPAIR_WAIT:
+            d = drains.get(old["node_id"], {})
+            fail(f"drive-lost: evacuation of {old['node_id']} unfinished after {REPAIR_WAIT}s: {d}")
+        time.sleep(10)
+    say(f"drive-lost: {old['node_id']} evacuated in {time.monotonic() - started:.0f} s")
+    settle("drive-lost")
+
+
 def repair_counters():
     """Meta's repair counters, as a gateway exports them: passes, and
     shards rebuilt or moved."""
@@ -484,7 +533,8 @@ def main():
     time.sleep(30)
     phase_report("warm-up")
 
-    faults = os.environ.get("FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull")
+    faults = os.environ.get(
+        "FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull,drive-lost")
     for f in faults.split(","):
         if f == "meta-kill":
             meta_kill()
@@ -496,6 +546,8 @@ def main():
             partition()
         elif f == "disk-pull":
             disk_pull()
+        elif f == "drive-lost":
+            drive_lost("chaos-4")
         else:
             fail(f"unknown fault {f}")
         read_all(f"after {f}")

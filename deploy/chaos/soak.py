@@ -361,7 +361,8 @@ def main():
     time.sleep(60)
     phase_report("warm-up")
 
-    faults = os.environ.get("FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull")
+    faults = os.environ.get(
+        "FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull,drive-lost")
     faults = faults.split(",")
     volume = {}  # the VM pulled from -> its OSD's current volume
     end = time.monotonic() + HOURS * 3600
@@ -382,6 +383,12 @@ def main():
             vm = "chaos-5"
             old = volume.get(vm, f"{vm}-osd")
             chaos.disk_pull(vm, new=f"{vm}-osd-{n}")
+            volume[vm] = f"{vm}-osd-{n}"
+            incus("storage", "volume", "delete", "default", old, check=False)
+        elif f == "drive-lost":
+            vm = "chaos-4"
+            old = volume.get(vm, f"{vm}-osd")
+            chaos.drive_lost(vm, new=f"{vm}-osd-{n}")
             volume[vm] = f"{vm}-osd-{n}"
             incus("storage", "volume", "delete", "default", old, check=False)
         else:
