@@ -71,7 +71,8 @@ impl DiskIndex {
             .set_cache_size(cache_bytes)
             .create(path)
             .map_err(storage_err("open"))?;
-        let tx = db.begin_write().map_err(storage_err("open"))?;
+        let mut tx = db.begin_write().map_err(storage_err("open"))?;
+        tx.set_quick_repair(true);
         {
             tx.open_table(ENTRIES).map_err(storage_err("open"))?;
             tx.open_table(STATE).map_err(storage_err("open"))?;
@@ -258,7 +259,13 @@ impl DiskIndex {
         let Some(frozen) = self.tables.read().frozen.clone() else {
             return Ok(());
         };
-        let tx = self.db.begin_write().map_err(storage_err("checkpoint"))?;
+        let mut tx = self.db.begin_write().map_err(storage_err("checkpoint"))?;
+        // Every commit saves redb's allocator state (quick repair): after a
+        // crash or a power cut the file opens at once, instead of redb
+        // walking all of it to rebuild that state (18 s for a 1 GB index on
+        // a soak VM, and growing with it). It costs each commit an extra
+        // flush, and commits here are one a checkpoint.
+        tx.set_quick_repair(true);
         {
             let mut entries = tx.open_table(ENTRIES).map_err(storage_err("checkpoint"))?;
             for (k, v) in frozen.map.read().iter() {
@@ -385,5 +392,31 @@ mod tests {
         assert_eq!(idx.checkpoint_lsn().unwrap(), 7);
         assert_eq!(idx.get(b"x").unwrap(), Some(b"1".to_vec()));
         assert_eq!(idx.get(b"y").unwrap(), None);
+    }
+
+    #[test]
+    fn after_a_crash_the_file_opens_without_a_full_repair() {
+        let dir = tempdir().unwrap();
+        let idx = open(dir.path());
+        for i in 0..1000u32 {
+            idx.put(i.to_be_bytes().to_vec(), vec![1; 100]);
+        }
+        assert!(idx.freeze());
+        idx.flush_frozen(1).unwrap();
+        // A crash: the file as it is while open, never closed.
+        let crashed = dir.path().join("crashed.redb");
+        std::fs::copy(dir.path().join("index.redb"), &crashed).unwrap();
+        drop(idx);
+        let repaired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = repaired.clone();
+        let db = Database::builder()
+            .set_repair_callback(move |_| r.store(true, std::sync::atomic::Ordering::Relaxed))
+            .create(&crashed)
+            .unwrap();
+        drop(db);
+        assert!(!repaired.load(std::sync::atomic::Ordering::Relaxed), "a full repair ran");
+        let idx = DiskIndex::open(&crashed, 1 << 20).unwrap();
+        assert_eq!(idx.checkpoint_lsn().unwrap(), 1);
+        assert_eq!(idx.get(&7u32.to_be_bytes()).unwrap(), Some(vec![1; 100]));
     }
 }
