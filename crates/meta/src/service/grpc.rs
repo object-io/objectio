@@ -1343,6 +1343,41 @@ impl MetadataService for MetaService {
         Self::delete_role(self, request).await
     }
 
+    async fn update_group(
+        &self,
+        request: Request<UpdateGroupRequest>,
+    ) -> Result<Response<UpdateGroupResponse>, Status> {
+        Self::update_group(self, request).await
+    }
+
+    async fn put_inline_policy(
+        &self,
+        request: Request<PutInlinePolicyRequest>,
+    ) -> Result<Response<PutInlinePolicyResponse>, Status> {
+        Self::put_inline_policy(self, request).await
+    }
+
+    async fn get_inline_policy(
+        &self,
+        request: Request<GetInlinePolicyRequest>,
+    ) -> Result<Response<GetInlinePolicyResponse>, Status> {
+        Self::get_inline_policy(self, request).await
+    }
+
+    async fn list_inline_policies(
+        &self,
+        request: Request<ListInlinePoliciesRequest>,
+    ) -> Result<Response<ListInlinePoliciesResponse>, Status> {
+        Self::list_inline_policies(self, request).await
+    }
+
+    async fn delete_inline_policy(
+        &self,
+        request: Request<DeleteInlinePolicyRequest>,
+    ) -> Result<Response<DeleteInlinePolicyResponse>, Status> {
+        Self::delete_inline_policy(self, request).await
+    }
+
     async fn heal_enqueue(
         &self,
         request: Request<objectio_proto::metadata::HealEnqueueRequest>,

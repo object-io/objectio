@@ -2,7 +2,112 @@
 
 use super::*;
 
+fn user_meta(u: &StoredUser) -> UserMeta {
+    UserMeta {
+        user_id: u.user_id.clone(),
+        display_name: u.display_name.clone(),
+        arn: u.arn.clone(),
+        status: u.status,
+        created_at: u.created_at,
+        email: u.email.clone(),
+        tenant: u.tenant.clone(),
+        path: shown_path(&u.path).to_string(),
+    }
+}
+
+fn group_meta(g: &StoredGroup) -> GroupMeta {
+    GroupMeta {
+        group_id: g.group_id.clone(),
+        group_name: g.group_name.clone(),
+        arn: g.arn.clone(),
+        tenant: group_tenant(&g.arn),
+        member_user_ids: g.member_user_ids.clone(),
+        created_at: g.created_at,
+        path: shown_path(&g.path).to_string(),
+    }
+}
+
 impl MetaService {
+    /// Refuse what format level `level` adds until the cluster is there
+    /// (objectio-docs core/upgrade-path.md).
+    #[allow(clippy::result_large_err)] // the Status the RPC returns, as is
+    fn require_level(&self, level: u32, what: &str) -> Result<(), Status> {
+        if self.active_level() >= level {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(format!(
+                "{what} needs format level {level}; the cluster is at {}: finalize the upgrade first",
+                self.active_level()
+            )))
+        }
+    }
+
+    /// A live user other than `except` whose name is `name`, ignoring case
+    /// (IAM names are case-insensitive).
+    fn user_name_taken(&self, name: &str, except: &str) -> bool {
+        self.users.read().values().any(|u| {
+            u.status != UserStatus::UserDeleted as i32
+                && u.user_id != except
+                && u.display_name.eq_ignore_ascii_case(name)
+        })
+    }
+
+    /// A group of `tenant` other than `except` named `name`, ignoring case.
+    fn group_name_taken(&self, tenant: &str, name: &str, except: &str) -> bool {
+        self.groups.read().values().any(|g| {
+            g.group_id != except
+                && group_tenant(&g.arn) == tenant
+                && g.group_name.eq_ignore_ascii_case(name)
+        })
+    }
+
+    /// Every inline policy of `principal`, with its stored bytes.
+    fn inline_policies_of(&self, principal: &str) -> Vec<(String, Vec<u8>, InlinePolicy)> {
+        let prefix = format!("{principal}\u{0}");
+        self.store
+            .as_ref()
+            .map(|s| s.list_named(INLINE_POLICIES_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .filter_map(|(k, b)| {
+                let p = InlinePolicy::decode(b.as_slice()).ok()?;
+                Some((k, b, p))
+            })
+            .collect()
+    }
+
+    /// The writes that drop everything hanging off `principal` ("user:…",
+    /// "group:…", "role:…"): its inline policies and its attachments. A
+    /// recreated principal of the same name must start with nothing.
+    fn principal_cleanup_ops(&self, principal: &str) -> Vec<objectio_meta_store::CasOp> {
+        use objectio_meta_store::{CasOp, CasTable};
+        let mut ops: Vec<CasOp> = self
+            .inline_policies_of(principal)
+            .into_iter()
+            .map(|(key, bytes, _)| CasOp {
+                table: CasTable::Named(INLINE_POLICIES_TABLE.into()),
+                key,
+                expected: Some(bytes),
+                new_value: None,
+            })
+            .collect();
+        if let Some(names) = self.policy_attachments.read().get(principal) {
+            ops.push(CasOp {
+                table: CasTable::PolicyAttachments,
+                key: principal.to_string(),
+                expected: Some(names.join(",").into_bytes()),
+                new_value: None,
+            });
+        }
+        ops
+    }
+
+    /// Mirror [`Self::principal_cleanup_ops`] once committed.
+    fn forget_principal(&self, principal: &str) {
+        self.policy_attachments.write().remove(principal);
+    }
+
     pub(super) fn apply_user_event(&self, key: &str, new_value: Option<&[u8]>) {
         let mut m = self.users.write();
         match new_value {
@@ -86,8 +191,7 @@ impl MetaService {
             None if self.users.read().is_empty() => self
                 .create_user(Request::new(CreateUserRequest {
                     display_name: admin_name.to_string(),
-                    email: String::new(),
-                    tenant: String::new(),
+                    ..Default::default()
                 }))
                 .await?
                 .into_inner()
@@ -147,6 +251,7 @@ impl MetaService {
             created_at: now,
             email: String::new(),
             tenant: String::new(), // system admin has no tenant
+            path: String::new(),
         };
 
         self.users.write().insert(user_id.clone(), user.clone());
@@ -227,15 +332,18 @@ impl MetaService {
         if req.display_name.is_empty() {
             return Err(Status::invalid_argument("display_name is required"));
         }
+        let path = iam_path(&req.path)?;
+        if path != "/" {
+            self.require_level(LEVEL_IAM_API, "a user path")?;
+        }
 
         // Check if a *live* user with this name exists. DeleteUser is a soft
         // delete — it flips status to Deleted and leaves the record in place —
         // so scanning every value meant a deleted name was taken forever.
         // Listing already hides those users, which made it look like the name
-        // was free right up until the create failed.
-        if self.users.read().values().any(|u| {
-            u.display_name == req.display_name && u.status != UserStatus::UserDeleted as i32
-        }) {
+        // was free right up until the create failed. Names are
+        // case-insensitive, as in IAM.
+        if self.user_name_taken(&req.display_name, "") {
             return Err(Status::already_exists("user with this name already exists"));
         }
 
@@ -249,11 +357,7 @@ impl MetaService {
         }
 
         // Include tenant in ARN if tenant-scoped
-        let arn = if tenant.is_empty() {
-            format!("arn:objectio:iam::user/{}", req.display_name)
-        } else {
-            format!("arn:objectio:iam::{}:user/{}", tenant, req.display_name)
-        };
+        let arn = user_arn(&tenant, &path, &req.display_name);
 
         let user = StoredUser {
             user_id: user_id.clone(),
@@ -263,6 +367,7 @@ impl MetaService {
             created_at: now,
             email: req.email.clone(),
             tenant: tenant.clone(),
+            path: stored_path(&path),
         };
 
         // Replicate through Raft. expected=None ensures the user_id
@@ -310,15 +415,7 @@ impl MetaService {
         );
 
         Ok(Response::new(CreateUserResponse {
-            user: Some(UserMeta {
-                user_id: user.user_id,
-                display_name: user.display_name,
-                arn: user.arn,
-                status: user.status,
-                created_at: user.created_at,
-                email: user.email,
-                tenant,
-            }),
+            user: Some(user_meta(&user)),
         }))
     }
 
@@ -336,15 +433,7 @@ impl MetaService {
             .ok_or_else(|| Status::not_found("user not found"))?;
 
         Ok(Response::new(GetUserResponse {
-            user: Some(UserMeta {
-                user_id: user.user_id.clone(),
-                display_name: user.display_name.clone(),
-                arn: user.arn.clone(),
-                status: user.status,
-                created_at: user.created_at,
-                email: user.email.clone(),
-                tenant: user.tenant.clone(),
-            }),
+            user: Some(user_meta(&user)),
         }))
     }
 
@@ -359,23 +448,18 @@ impl MetaService {
             req.max_results.min(1000)
         };
 
-        let users: Vec<UserMeta> = self
+        // In id order: the marker is the last id of the page before, and
+        // the map has no order of its own.
+        let mut users: Vec<UserMeta> = self
             .users
             .read()
             .values()
             .filter(|u| req.marker.is_empty() || u.user_id > req.marker)
             .filter(|u| u.status != UserStatus::UserDeleted as i32)
-            .take(max_results as usize + 1)
-            .map(|u| UserMeta {
-                user_id: u.user_id.clone(),
-                display_name: u.display_name.clone(),
-                arn: u.arn.clone(),
-                status: u.status,
-                created_at: u.created_at,
-                email: u.email.clone(),
-                tenant: u.tenant.clone(),
-            })
+            .map(user_meta)
             .collect();
+        users.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+        users.truncate(max_results as usize + 1);
 
         let is_truncated = users.len() > max_results as usize;
         let users: Vec<UserMeta> = users.into_iter().take(max_results as usize).collect();
@@ -444,6 +528,22 @@ impl MetaService {
             }
         }
 
+        // Nothing stays hanging off a deleted user: its inline policies,
+        // its attachments, its group memberships.
+        let principal = format!("user:{}", req.user_id);
+        let mut group_transitions: Vec<(String, Vec<u8>, Vec<u8>, StoredGroup)> = Vec::new();
+        for g in self.groups.read().values() {
+            if g.member_user_ids.contains(&req.user_id) {
+                let mut after = g.clone();
+                after.member_user_ids.retain(|m| m != &req.user_id);
+                let old_b = objectio_meta_store::record::serialize(g)
+                    .map_err(|e| Status::internal(format!("group encode: {e}")))?;
+                let new_b = objectio_meta_store::record::serialize(&after)
+                    .map_err(|e| Status::internal(format!("group encode: {e}")))?;
+                group_transitions.push((g.group_id.clone(), old_b, new_b, after));
+            }
+        }
+
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
             let mut ops = Vec::with_capacity(1 + key_transitions.len());
@@ -461,6 +561,15 @@ impl MetaService {
                     new_value: Some(new_b.clone()),
                 });
             }
+            for (gid, old_b, new_b, _) in &group_transitions {
+                ops.push(CasOp {
+                    table: CasTable::Groups,
+                    key: gid.clone(),
+                    expected: Some(old_b.clone()),
+                    new_value: Some(new_b.clone()),
+                });
+            }
+            ops.extend(self.principal_cleanup_ops(&principal));
             let cmd = MetaCommand::MultiCas {
                 ops,
                 requested_by: "delete-user".into(),
@@ -485,6 +594,16 @@ impl MetaService {
             for (kid, _, _, new_key) in &key_transitions {
                 store.put_access_key(kid, new_key);
             }
+            for (gid, _, _, group) in &group_transitions {
+                store.put_group(gid, group);
+            }
+            for op in self.principal_cleanup_ops(&principal) {
+                store.write_named(
+                    objectio_meta_store::cas_table_name(&op.table),
+                    &op.key,
+                    None,
+                );
+            }
         }
 
         // Mirror into in-memory caches after the quorum commit.
@@ -497,6 +616,13 @@ impl MetaService {
                 keys.insert(kid, new_key);
             }
         }
+        {
+            let mut groups = self.groups.write();
+            for (gid, _, _, group) in group_transitions {
+                groups.insert(gid, group);
+            }
+        }
+        self.forget_principal(&principal);
 
         info!("Deleted user: {}", req.user_id);
 
@@ -758,15 +884,7 @@ impl MetaService {
                 scope: key.scope,
                 operation: key.operation,
             }),
-            user: Some(UserMeta {
-                user_id: user.user_id,
-                display_name: user.display_name,
-                arn: user.arn,
-                status: user.status,
-                created_at: user.created_at,
-                email: user.email,
-                tenant: user.tenant,
-            }),
+            user: Some(user_meta(&user)),
         }))
     }
 
@@ -779,18 +897,14 @@ impl MetaService {
         if req.group_name.is_empty() {
             return Err(Status::invalid_argument("group_name is required"));
         }
+        let path = iam_path(&req.path)?;
+        if path != "/" {
+            self.require_level(LEVEL_IAM_API, "a group path")?;
+        }
 
-        // Unique within its tenant (the ARN names both).
-        let arn = format!(
-            "arn:obio:iam::{}:group/{}",
-            if req.tenant.is_empty() {
-                "objectio"
-            } else {
-                &req.tenant
-            },
-            req.group_name
-        );
-        if self.groups.read().values().any(|g| g.arn == arn) {
+        // Unique within its tenant, ignoring case.
+        let arn = group_arn(&req.tenant, &path, &req.group_name);
+        if self.group_name_taken(&req.tenant, &req.group_name, "") {
             return Err(Status::already_exists(
                 "group with this name already exists",
             ));
@@ -805,6 +919,7 @@ impl MetaService {
             arn,
             member_user_ids: Vec::new(),
             created_at: now,
+            path: stored_path(&path),
         };
         let group_bytes = objectio_meta_store::record::serialize(&group)
             .map_err(|e| Status::internal(format!("group encode: {e}")))?;
@@ -843,14 +958,57 @@ impl MetaService {
         info!("Created group: {}", req.group_name);
 
         Ok(Response::new(CreateGroupResponse {
-            group: Some(GroupMeta {
-                group_id: group.group_id,
-                group_name: group.group_name,
-                tenant: group_tenant(&group.arn),
-                arn: group.arn,
-                member_user_ids: group.member_user_ids,
-                created_at: group.created_at,
-            }),
+            group: Some(group_meta(&group)),
+        }))
+    }
+
+    pub(crate) async fn update_group(
+        &self,
+        request: Request<UpdateGroupRequest>,
+    ) -> Result<Response<UpdateGroupResponse>, Status> {
+        let req = request.into_inner();
+        self.require_level(LEVEL_IAM_API, "renaming a group")?;
+        let old = self
+            .groups
+            .read()
+            .get(&req.group_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("group not found"))?;
+        let tenant = group_tenant(&old.arn);
+        let mut new = old.clone();
+        if let Some(name) = req.group_name {
+            if name.is_empty() {
+                return Err(Status::invalid_argument("group_name is required"));
+            }
+            if self.group_name_taken(&tenant, &name, &old.group_id) {
+                return Err(Status::already_exists(
+                    "group with this name already exists",
+                ));
+            }
+            new.group_name = name;
+        }
+        if let Some(path) = req.path {
+            new.path = stored_path(&iam_path(&path)?);
+        }
+        new.arn = group_arn(&tenant, &new.path, &new.group_name);
+        let enc = |g: &StoredGroup| -> Result<Vec<u8>, Box<Status>> {
+            objectio_meta_store::record::serialize(g)
+                .map_err(|e| Box::new(Status::internal(format!("group encode: {e}"))))
+        };
+        self.cas_one(
+            objectio_meta_store::CasTable::Groups,
+            &req.group_id,
+            Some(enc(&old).map_err(|e| *e)?),
+            Some(enc(&new).map_err(|e| *e)?),
+            "update-group",
+        )
+        .await?;
+        self.groups
+            .write()
+            .insert(req.group_id.clone(), new.clone());
+        info!("Updated group {} ({})", req.group_id, new.arn);
+        Ok(Response::new(UpdateGroupResponse {
+            group: Some(group_meta(&new)),
         }))
     }
 
@@ -868,15 +1026,19 @@ impl MetaService {
                 .map_err(|e| Status::internal(format!("group encode: {e}")))?
         };
 
+        // Its inline policies and attachments go with it.
+        let principal = format!("group:{}", req.group_id);
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let mut ops = vec![CasOp {
+                table: CasTable::Groups,
+                key: req.group_id.clone(),
+                expected: Some(expected_bytes),
+                new_value: None,
+            }];
+            ops.extend(self.principal_cleanup_ops(&principal));
             let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Groups,
-                    key: req.group_id.clone(),
-                    expected: Some(expected_bytes),
-                    new_value: None,
-                }],
+                ops,
                 requested_by: "delete-group".into(),
             };
             match raft.client_write(cmd).await {
@@ -894,9 +1056,17 @@ impl MetaService {
             }
         } else if let Some(store) = &self.store {
             store.delete_group(&req.group_id);
+            for op in self.principal_cleanup_ops(&principal) {
+                store.write_named(
+                    objectio_meta_store::cas_table_name(&op.table),
+                    &op.key,
+                    None,
+                );
+            }
         }
 
         self.groups.write().remove(&req.group_id);
+        self.forget_principal(&principal);
         info!("Deleted group: {}", req.group_id);
 
         Ok(Response::new(DeleteGroupResponse { success: true }))
@@ -913,21 +1083,15 @@ impl MetaService {
             req.max_results.min(1000)
         };
 
-        let groups: Vec<GroupMeta> = self
+        let mut groups: Vec<GroupMeta> = self
             .groups
             .read()
             .values()
             .filter(|g| req.marker.is_empty() || g.group_id > req.marker)
-            .take(max_results as usize + 1)
-            .map(|g| GroupMeta {
-                group_id: g.group_id.clone(),
-                group_name: g.group_name.clone(),
-                arn: g.arn.clone(),
-                tenant: group_tenant(&g.arn),
-                member_user_ids: g.member_user_ids.clone(),
-                created_at: g.created_at,
-            })
+            .map(group_meta)
             .collect();
+        groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+        groups.truncate(max_results as usize + 1);
 
         let is_truncated = groups.len() > max_results as usize;
         let groups: Vec<GroupMeta> = groups.into_iter().take(max_results as usize).collect();
@@ -1087,14 +1251,7 @@ impl MetaService {
             .read()
             .values()
             .filter(|g| g.member_user_ids.contains(&req.user_id))
-            .map(|g| GroupMeta {
-                group_id: g.group_id.clone(),
-                group_name: g.group_name.clone(),
-                arn: g.arn.clone(),
-                tenant: group_tenant(&g.arn),
-                member_user_ids: g.member_user_ids.clone(),
-                created_at: g.created_at,
-            })
+            .map(group_meta)
             .collect();
 
         Ok(Response::new(GetUserGroupsResponse { groups }))
@@ -1306,10 +1463,16 @@ impl MetaService {
     ) -> Result<Response<CreatePolicyResponse>, Status> {
         let req = request.into_inner();
         let plain = req.name.trim().to_string();
-        if plain.is_empty() || plain.contains('/') {
+        // An attachment names an AWS managed policy "aws:<name>": a stored
+        // one can't look like that.
+        if !iam_name_ok(&plain, 128) {
             return Err(Status::invalid_argument(
-                "Policy name is required, without \"/\"",
+                "Policy name: 1 to 128 letters, digits and +=,.@_-",
             ));
+        }
+        let path = iam_path(&req.path)?;
+        if path != "/" || !req.description.is_empty() {
+            self.require_level(LEVEL_IAM_API, "a policy path or description")?;
         }
         if req.shared && !req.tenant.is_empty() {
             return Err(Status::invalid_argument(
@@ -1339,6 +1502,13 @@ impl MetaService {
             updated_at: now,
             tenant: req.tenant,
             shared: req.shared,
+            path: stored_path(&path),
+            policy_id: if self.active_level() >= LEVEL_IAM_API {
+                iam_id("ANPA")
+            } else {
+                String::new()
+            },
+            description: req.description,
         };
         let bytes = policy.encode_to_vec();
 
@@ -1513,8 +1683,10 @@ impl MetaService {
         let req = request.into_inner();
         let policy_name = req.policy_name;
 
-        // Validate the policy exists
-        if !self.iam_policies.read().contains_key(&policy_name) {
+        // Validate the policy exists: a stored one, or an AWS managed one.
+        if objectio_auth::managed::attached(&policy_name).is_none()
+            && !self.iam_policies.read().contains_key(&policy_name)
+        {
             return Err(Status::not_found(format!(
                 "Policy '{}' not found",
                 policy_name
@@ -1724,10 +1896,34 @@ impl MetaService {
             new.status = status;
         }
         if let Some(name) = req.display_name {
+            if name.is_empty() {
+                return Err(Status::invalid_argument("display_name is required"));
+            }
+            if self.user_name_taken(&name, &old.user_id) {
+                return Err(Status::already_exists("user with this name already exists"));
+            }
             new.display_name = name;
         }
         if let Some(email) = req.email {
             new.email = email;
+        }
+        if let Some(path) = req.path {
+            let path = iam_path(&path)?;
+            if path != shown_path(&old.path) {
+                self.require_level(LEVEL_IAM_API, "a user path")?;
+            }
+            new.path = stored_path(&path);
+        }
+        // The ARN names the user by path and name, and follows them. The
+        // system admin is known by its ARN, so it keeps both.
+        let arn = user_arn(&new.tenant, &new.path, &new.display_name);
+        if arn != old.arn {
+            if old.arn == "arn:objectio:iam::user/admin" {
+                return Err(Status::failed_precondition(
+                    "the system admin's name and path can't change",
+                ));
+            }
+            new.arn = arn;
         }
         let enc = |u: &StoredUser| -> Result<Vec<u8>, Box<Status>> {
             objectio_meta_store::record::serialize(u)
@@ -1744,15 +1940,7 @@ impl MetaService {
         self.users.write().insert(req.user_id.clone(), new.clone());
         info!("Updated user {} (status {})", req.user_id, new.status);
         Ok(Response::new(UpdateUserResponse {
-            user: Some(UserMeta {
-                user_id: new.user_id,
-                display_name: new.display_name,
-                arn: new.arn,
-                status: new.status,
-                created_at: new.created_at,
-                email: new.email,
-                tenant: new.tenant,
-            }),
+            user: Some(user_meta(&new)),
         }))
     }
 
@@ -1879,16 +2067,34 @@ impl MetaService {
                 "trust policy must be a JSON document",
             ));
         }
+        let path = iam_path(&role.path)?;
+        if path != "/" {
+            self.require_level(LEVEL_IAM_API, "a role path")?;
+        }
+        // Names are unique per tenant, ignoring case (the key keeps the
+        // case it was created with).
+        let taken = self
+            .store
+            .as_ref()
+            .map(|s| s.list_named(ROLES_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, b)| RoleObject::decode(b.as_slice()).ok())
+            .any(|r| r.tenant == role.tenant && r.name.eq_ignore_ascii_case(&role.name));
+        if taken {
+            return Err(Status::already_exists(format!(
+                "role '{}' already exists",
+                role.name
+            )));
+        }
         let now = Self::current_timestamp();
-        role.arn = format!(
-            "arn:obio:iam::{}:role/{}",
-            if role.tenant.is_empty() {
-                "objectio"
-            } else {
-                &role.tenant
-            },
-            role.name
-        );
+        role.arn = role_arn(&role.tenant, &path, &role.name);
+        role.path = stored_path(&path);
+        role.role_id = if self.active_level() >= LEVEL_IAM_API {
+            iam_id("AROA")
+        } else {
+            String::new()
+        };
         role.created_at = now;
         role.updated_at = now;
         self.cas_one(
@@ -1981,16 +2187,152 @@ impl MetaService {
         let old = self
             .role(&name)
             .ok_or_else(|| Status::not_found(format!("role '{name}' not found")))?;
-        self.cas_one(
-            objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
-            &name,
-            Some(old.encode_to_vec()),
-            None,
-            "delete-role",
-        )
-        .await?;
+        // Its inline policies and attachments go with it: a role created
+        // later under the same name must not inherit them.
+        let principal = format!("role:{name}");
+        let mut ops = vec![objectio_meta_store::CasOp {
+            table: objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
+            key: name.clone(),
+            expected: Some(old.encode_to_vec()),
+            new_value: None,
+        }];
+        ops.extend(self.principal_cleanup_ops(&principal));
+        if !self.cas_many(ops, "delete-role").await? {
+            return Err(Status::aborted("role changed since read; retry delete"));
+        }
+        self.forget_principal(&principal);
         info!("Deleted role {}", old.arn);
         Ok(Response::new(DeleteRoleResponse { success: true }))
+    }
+
+    /// Whether the principal an inline policy would hang off exists.
+    fn principal_exists(&self, principal: &str) -> bool {
+        if let Some(id) = principal.strip_prefix("user:") {
+            self.users
+                .read()
+                .get(id)
+                .is_some_and(|u| u.status != UserStatus::UserDeleted as i32)
+        } else if let Some(id) = principal.strip_prefix("group:") {
+            self.groups.read().contains_key(id)
+        } else if let Some(key) = principal.strip_prefix("role:") {
+            self.role(key).is_some()
+        } else {
+            false
+        }
+    }
+
+    pub(crate) async fn put_inline_policy(
+        &self,
+        request: Request<PutInlinePolicyRequest>,
+    ) -> Result<Response<PutInlinePolicyResponse>, Status> {
+        let req = request.into_inner();
+        self.require_level(LEVEL_IAM_API, "inline policies")?;
+        if !iam_name_ok(&req.name, 128) {
+            return Err(Status::invalid_argument(
+                "Policy name: 1 to 128 letters, digits and +=,.@_-",
+            ));
+        }
+        if serde_json::from_str::<serde_json::Value>(&req.policy_json).is_err() {
+            return Err(Status::invalid_argument("Invalid JSON in policy document"));
+        }
+        if !self.principal_exists(&req.principal) {
+            return Err(Status::not_found(format!("{} not found", req.principal)));
+        }
+        let key = inline_policy_key(&req.principal, &req.name);
+        let current = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(INLINE_POLICIES_TABLE, &key));
+        let now = Self::current_timestamp();
+        let created_at = current
+            .as_deref()
+            .and_then(|b| InlinePolicy::decode(b).ok())
+            .map_or(now, |p| p.created_at);
+        let policy = InlinePolicy {
+            principal: req.principal,
+            name: req.name,
+            policy_json: req.policy_json,
+            created_at,
+            updated_at: now,
+        };
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(INLINE_POLICIES_TABLE.into()),
+            &key,
+            current,
+            Some(policy.encode_to_vec()),
+            "put-inline-policy",
+        )
+        .await?;
+        info!(
+            "Put inline policy '{}' on {}",
+            policy.name, policy.principal
+        );
+        Ok(Response::new(PutInlinePolicyResponse {
+            policy: Some(policy),
+        }))
+    }
+
+    pub(crate) async fn get_inline_policy(
+        &self,
+        request: Request<GetInlinePolicyRequest>,
+    ) -> Result<Response<GetInlinePolicyResponse>, Status> {
+        let req = request.into_inner();
+        let policy = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read_named(
+                    INLINE_POLICIES_TABLE,
+                    &inline_policy_key(&req.principal, &req.name),
+                )
+            })
+            .and_then(|b| InlinePolicy::decode(b.as_slice()).ok());
+        Ok(Response::new(GetInlinePolicyResponse {
+            found: policy.is_some(),
+            policy,
+        }))
+    }
+
+    pub(crate) async fn list_inline_policies(
+        &self,
+        request: Request<ListInlinePoliciesRequest>,
+    ) -> Result<Response<ListInlinePoliciesResponse>, Status> {
+        let principal = request.into_inner().principal;
+        let mut policies: Vec<InlinePolicy> = self
+            .inline_policies_of(&principal)
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        policies.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Response::new(ListInlinePoliciesResponse { policies }))
+    }
+
+    pub(crate) async fn delete_inline_policy(
+        &self,
+        request: Request<DeleteInlinePolicyRequest>,
+    ) -> Result<Response<DeleteInlinePolicyResponse>, Status> {
+        let req = request.into_inner();
+        let key = inline_policy_key(&req.principal, &req.name);
+        let current = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_named(INLINE_POLICIES_TABLE, &key))
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "{} has no inline policy '{}'",
+                    req.principal, req.name
+                ))
+            })?;
+        self.cas_one(
+            objectio_meta_store::CasTable::Named(INLINE_POLICIES_TABLE.into()),
+            &key,
+            Some(current),
+            None,
+            "delete-inline-policy",
+        )
+        .await?;
+        info!("Deleted inline policy '{}' of {}", req.name, req.principal);
+        Ok(Response::new(DeleteInlinePolicyResponse { success: true }))
     }
 
     pub(crate) async fn list_attached_policies(
@@ -2013,5 +2355,273 @@ impl MetaService {
         let attachments = self.policy_attachments.read();
         let policy_names = attachments.get(&key).cloned().unwrap_or_default();
         Ok(Response::new(ListAttachedPoliciesResponse { policy_names }))
+    }
+}
+
+#[cfg(test)]
+mod iam_api_tests {
+    //! What the IAM API needs of meta: paths, case-insensitive names,
+    //! renames the ARN follows, inline policies, and principals that take
+    //! everything hanging off them when they go.
+
+    use super::*;
+
+    fn service(level: u32) -> (tempfile::TempDir, MetaService) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MetaStore::open(dir.path().join("meta.redb")).unwrap());
+        let svc = MetaService::with_store(EcConfig::default(), store);
+        svc.config.write().insert(
+            objectio_common::version::ACTIVE_LEVEL_KEY.to_string(),
+            ConfigEntry {
+                key: objectio_common::version::ACTIVE_LEVEL_KEY.to_string(),
+                value: level.to_string().into_bytes(),
+                ..Default::default()
+            },
+        );
+        (dir, svc)
+    }
+
+    async fn user(svc: &MetaService, name: &str, path: &str) -> Result<UserMeta, Status> {
+        svc.create_user(Request::new(CreateUserRequest {
+            display_name: name.to_string(),
+            path: path.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .map(|r| r.into_inner().user.unwrap())
+    }
+
+    const DOC: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#;
+
+    async fn put_inline(svc: &MetaService, principal: &str, name: &str) -> Result<(), Status> {
+        svc.put_inline_policy(Request::new(PutInlinePolicyRequest {
+            principal: principal.to_string(),
+            name: name.to_string(),
+            policy_json: DOC.to_string(),
+        }))
+        .await
+        .map(drop)
+    }
+
+    async fn inline_names(svc: &MetaService, principal: &str) -> Vec<String> {
+        svc.list_inline_policies(Request::new(ListInlinePoliciesRequest {
+            principal: principal.to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .policies
+        .into_iter()
+        .map(|p| p.name)
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn names_are_case_insensitive_and_the_arn_follows_a_rename() {
+        let (_d, svc) = service(LEVEL_IAM_API);
+        let alice = user(&svc, "Alice", "/team/").await.unwrap();
+        assert_eq!(alice.arn, "arn:objectio:iam::user/team/Alice");
+        assert_eq!(alice.path, "/team/");
+        let again = user(&svc, "alice", "/").await.unwrap_err();
+        assert_eq!(again.code(), tonic::Code::AlreadyExists);
+
+        let renamed = svc
+            .update_user(Request::new(UpdateUserRequest {
+                user_id: alice.user_id.clone(),
+                display_name: Some("Bob".into()),
+                path: Some("/ops/".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .user
+            .unwrap();
+        assert_eq!(renamed.arn, "arn:objectio:iam::user/ops/Bob");
+        // The old name is free again.
+        user(&svc, "alice", "/").await.unwrap();
+        // A bad path is refused.
+        let bad = user(&svc, "carol", "no-slashes").await.unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn what_level_3_adds_waits_for_the_cluster_to_reach_it() {
+        let (_d, svc) = service(2);
+        // The root path is what was always written.
+        user(&svc, "alice", "/").await.unwrap();
+        let pathed = user(&svc, "bob", "/team/").await.unwrap_err();
+        assert_eq!(pathed.code(), tonic::Code::FailedPrecondition);
+        let alice = svc.users.read().values().next().unwrap().user_id.clone();
+        let inline = put_inline(&svc, &format!("user:{alice}"), "p")
+            .await
+            .unwrap_err();
+        assert_eq!(inline.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_role_takes_its_policies_and_a_new_one_starts_empty() {
+        let (_d, svc) = service(LEVEL_IAM_API);
+        let role = || RoleObject {
+            name: "ci".into(),
+            tenant: String::new(),
+            trust_policy_json: "{}".into(),
+            ..Default::default()
+        };
+        let created = svc
+            .create_role(Request::new(CreateRoleRequest { role: Some(role()) }))
+            .await
+            .unwrap()
+            .into_inner()
+            .role
+            .unwrap();
+        assert!(created.role_id.starts_with("AROA"));
+        // Names are case-insensitive.
+        let clash = svc
+            .create_role(Request::new(CreateRoleRequest {
+                role: Some(RoleObject {
+                    name: "CI".into(),
+                    ..role()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code(), tonic::Code::AlreadyExists);
+
+        put_inline(&svc, "role:ci", "s3").await.unwrap();
+        svc.attach_policy(Request::new(AttachPolicyRequest {
+            policy_name: "aws:AmazonS3ReadOnlyAccess".into(),
+            role_name: "ci".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(inline_names(&svc, "role:ci").await, vec!["s3"]);
+
+        svc.delete_role(Request::new(DeleteRoleRequest { name: "ci".into() }))
+            .await
+            .unwrap();
+        let recreated = svc
+            .create_role(Request::new(CreateRoleRequest { role: Some(role()) }))
+            .await
+            .unwrap()
+            .into_inner()
+            .role
+            .unwrap();
+        assert_ne!(recreated.role_id, created.role_id);
+        assert!(inline_names(&svc, "role:ci").await.is_empty());
+        let attached = svc
+            .list_attached_policies(Request::new(ListAttachedPoliciesRequest {
+                role_name: "ci".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .policy_names;
+        assert!(attached.is_empty(), "{attached:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_user_leaves_its_groups_and_policies() {
+        let (_d, svc) = service(LEVEL_IAM_API);
+        let alice = user(&svc, "alice", "/").await.unwrap();
+        let group = svc
+            .create_group(Request::new(CreateGroupRequest {
+                group_name: "devs".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .group
+            .unwrap();
+        svc.add_user_to_group(Request::new(AddUserToGroupRequest {
+            group_id: group.group_id.clone(),
+            user_id: alice.user_id.clone(),
+        }))
+        .await
+        .unwrap();
+        let principal = format!("user:{}", alice.user_id);
+        put_inline(&svc, &principal, "p").await.unwrap();
+
+        svc.delete_user(Request::new(DeleteUserRequest {
+            user_id: alice.user_id.clone(),
+        }))
+        .await
+        .unwrap();
+        assert!(inline_names(&svc, &principal).await.is_empty());
+        assert!(
+            svc.groups.read()[&group.group_id]
+                .member_user_ids
+                .is_empty()
+        );
+        // An inline policy needs a live principal.
+        let orphan = put_inline(&svc, &principal, "p").await.unwrap_err();
+        assert_eq!(orphan.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_group_renamed_keeps_its_id_and_its_arn_follows() {
+        let (_d, svc) = service(LEVEL_IAM_API);
+        let create = |name: &str| {
+            svc.create_group(Request::new(CreateGroupRequest {
+                group_name: name.into(),
+                tenant: String::new(),
+                path: "/a/".into(),
+            }))
+        };
+        let devs = create("devs").await.unwrap().into_inner().group.unwrap();
+        create("ops").await.unwrap();
+        assert_eq!(devs.arn, "arn:obio:iam::objectio:group/a/devs");
+        let clash = svc
+            .update_group(Request::new(UpdateGroupRequest {
+                group_id: devs.group_id.clone(),
+                group_name: Some("OPS".into()),
+                path: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(clash.code(), tonic::Code::AlreadyExists);
+        let moved = svc
+            .update_group(Request::new(UpdateGroupRequest {
+                group_id: devs.group_id.clone(),
+                group_name: Some("builders".into()),
+                path: Some("/b/".into()),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .group
+            .unwrap();
+        assert_eq!(moved.group_id, devs.group_id);
+        assert_eq!(moved.arn, "arn:obio:iam::objectio:group/b/builders");
+        assert_eq!(moved.path, "/b/");
+    }
+
+    #[tokio::test]
+    async fn only_known_aws_managed_policies_attach() {
+        let (_d, svc) = service(LEVEL_IAM_API);
+        let alice = user(&svc, "alice", "/").await.unwrap();
+        let attach = |name: &str| {
+            svc.attach_policy(Request::new(AttachPolicyRequest {
+                policy_name: name.into(),
+                user_id: alice.user_id.clone(),
+                ..Default::default()
+            }))
+        };
+        attach("aws:IAMReadOnlyAccess").await.unwrap();
+        let unknown = attach("aws:NoSuchPolicy").await.unwrap_err();
+        assert_eq!(unknown.code(), tonic::Code::NotFound);
+        // A stored policy can't take a name that looks like one.
+        let named = svc
+            .create_policy(Request::new(CreatePolicyRequest {
+                name: "aws:IAMReadOnlyAccess".into(),
+                policy_json: DOC.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(named.code(), tonic::Code::InvalidArgument);
     }
 }

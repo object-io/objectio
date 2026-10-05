@@ -64,6 +64,13 @@ make("iam", "s3t", "iam@example.com")
 make("iamroot", "iamr", "iamroot@example.com")
 make("iamaltroot", "iamalt", "iamaltroot@example.com")
 
+# The IAM API's tests. "iam" manages other users' policies and roles in
+# s3t, as an ordinary user its policy lets do so (RGW gives it caps). The
+# two "root" users are their tenants' admins: the IAM API's account root.
+client.attach_policy("aws:IAMFullAccess", user_id=users["iam"]["user_id"])
+client.add_tenant_admin("iamr", users["iamroot"]["user_id"])
+client.add_tenant_admin("iamalt", users["iamaltroot"]["user_id"])
+
 # s3-tests makes buckets public with policies; the cluster default blocks
 # public access on new buckets.
 try:

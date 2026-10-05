@@ -1447,6 +1447,7 @@ pub async fn oidc_callback(
             display_name: user_id.clone(),
             email: String::new(),
             tenant: tenant.clone(),
+            path: String::new(),
         })
         .await
     {

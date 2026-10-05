@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 objectio-common = { workspace = true }
+# The AWS managed policies an attachment may name (`aws:<name>`).
+objectio-auth = { workspace = true }
 objectio-meta-store = { workspace = true }
 objectio-placement = { workspace = true }
 objectio-proto = { workspace = true }

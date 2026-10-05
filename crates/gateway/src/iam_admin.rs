@@ -46,7 +46,7 @@ fn grpc_error(e: &tonic::Status) -> Response {
 }
 
 /// Where a policy or role is stored.
-fn key(tenant: &str, name: &str) -> String {
+pub(crate) fn key(tenant: &str, name: &str) -> String {
     if tenant.is_empty() {
         name.to_string()
     } else {
@@ -161,7 +161,7 @@ fn role_json(r: &RoleObject) -> Value {
     })
 }
 
-async fn get_policy(state: &AppState, key: &str) -> Option<PolicyObject> {
+pub(crate) async fn get_policy(state: &AppState, key: &str) -> Option<PolicyObject> {
     let r = state
         .meta_client
         .clone()
@@ -263,6 +263,7 @@ pub async fn create_policy(
             policy_json,
             tenant: admin.tenant,
             shared,
+            ..Default::default()
         })
         .await
     {
@@ -460,20 +461,30 @@ async fn principal_of(
     ))
 }
 
+/// Whether a system policy may be attached in a tenant: a shared one, or
+/// any when the system admin attaches it.
+pub(crate) const fn system_policy_usable(p: &PolicyObject, by_system_admin: bool) -> bool {
+    p.tenant.is_empty() && (p.shared || by_system_admin)
+}
+
 /// The stored key of the policy `name` that `admin` may attach to a
 /// principal of `tenant`: the tenant's own, else a system policy it may
-/// use (shared, or any for the system admin).
+/// use (shared, or any for the system admin), else an AWS managed policy
+/// named `aws:<name>`.
 async fn attachable(
     state: &AppState,
     admin: &Admin,
     tenant: &str,
     name: &str,
 ) -> Result<String, Response> {
+    if objectio_auth::managed::attached(name).is_some() {
+        return Ok(name.to_string());
+    }
     if !tenant.is_empty() && get_policy(state, &key(tenant, name)).await.is_some() {
         return Ok(key(tenant, name));
     }
     match get_policy(state, name).await {
-        Some(p) if p.tenant.is_empty() && (p.shared || admin.system) => Ok(name.to_string()),
+        Some(p) if system_policy_usable(&p, admin.system) => Ok(name.to_string()),
         Some(_) => Err(error(
             StatusCode::FORBIDDEN,
             "that policy isn't shared with tenants",
@@ -668,6 +679,7 @@ pub async fn create_group(
         .create_group(CreateGroupRequest {
             group_name: body["group_name"].as_str().unwrap_or_default().to_string(),
             tenant: admin.tenant,
+            path: String::new(),
         })
         .await
     {

@@ -283,7 +283,7 @@ pub async fn auth_layer(
 
     if access_key_id.starts_with("ASIA") {
         let (cred, auth_result) =
-            sts_session(&auth_state, access_key_id, session_token.as_deref())?;
+            resolve_session(&auth_state, access_key_id, session_token.as_deref()).await?;
         // The SAME SigV4 verify path as permanent keys — without this the
         // session token is the only proof, which is replayable.
         verify_request_v4(
@@ -291,7 +291,7 @@ pub async fn auth_layer(
             &parsed.signed_headers,
             &parsed.signature,
             &cred,
-            &auth_state.region,
+            signing_region(auth_header, &auth_state.region),
         )?;
         debug!("STS auth ok: user_arn={}", auth_result.user_arn);
         crate::audit::attach(&mut request, auth_result);
@@ -307,7 +307,7 @@ pub async fn auth_layer(
         &parsed.signed_headers,
         &parsed.signature,
         &cred,
-        &auth_state.region,
+        signing_region(auth_header, &auth_state.region),
     )?;
 
     // Stitch IAM group memberships onto the AuthResult so policies attached
@@ -327,6 +327,165 @@ pub async fn auth_layer(
     // Store auth result in request extensions for handlers to access
     crate::audit::attach(&mut request, auth_result);
     Ok(next.run(request).await)
+}
+
+/// The region an S3 request's signature is checked for: the gateway's, or
+/// none when the client signed for none (boto3 with `region_name=''`
+/// does). Any other region fails the check, as before.
+fn signing_region<'a>(header: &str, configured: &'a str) -> &'a str {
+    match credential_scope_of(header) {
+        Some((region, _)) if region.is_empty() => "",
+        _ => configured,
+    }
+}
+
+/// The region and service a SigV4 `Authorization` header's credential
+/// scope names (`Credential=AKID/20261005/us-east-1/iam/aws4_request`).
+fn credential_scope_of(header: &str) -> Option<(String, String)> {
+    let credential = header.split("Credential=").nth(1)?.split(',').next()?;
+    let parts: Vec<&str> = credential.trim().split('/').collect();
+    if parts.len() != 5 || parts[4] != "aws4_request" {
+        return None;
+    }
+    Some((parts[2].to_string(), parts[3].to_string()))
+}
+
+/// Authenticate a call to the IAM or STS query API (`POST /` with a form
+/// body), whose body is `body`.
+///
+/// As an S3 request is, with three differences: the signature is for the
+/// service `iam` or `sts`; for whatever region the client signed with (IAM
+/// is global, and SDKs sign it for us-east-1); and over the body, whose
+/// hash these clients compute but don't send.
+pub(crate) async fn authenticate_query<B>(
+    auth_state: &AuthState,
+    request: &Request<B>,
+    body: &[u8],
+) -> Result<AuthResult, AuthError> {
+    let header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AuthError::AccessDenied("missing authentication token".to_string()))?;
+    let parsed = parse_authorization_header(header)?;
+    let (region, service) = credential_scope_of(header).ok_or_else(|| {
+        AuthError::AccessDenied("invalid credential scope in the authorization header".to_string())
+    })?;
+    if service != "iam" && service != "sts" {
+        return Err(AuthError::AccessDenied(format!(
+            "credentials for {service} were used to call iam or sts"
+        )));
+    }
+    let payload_hash = request
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| hex_sha256(body), str::to_string);
+    let signed = Signed {
+        signed_headers: &parsed.signed_headers,
+        signature: &parsed.signature,
+        region: &region,
+        service: &service,
+        payload_hash: &payload_hash,
+    };
+    let access_key_id = parsed.access_key_id();
+    if access_key_id.starts_with("ASIA") {
+        let token = request
+            .headers()
+            .get("x-amz-security-token")
+            .and_then(|v| v.to_str().ok());
+        let (cred, auth_result) = resolve_session(auth_state, access_key_id, token).await?;
+        verify_signature_v4(request, &signed, &cred)?;
+        return Ok(auth_result);
+    }
+    let cred = auth_state.lookup_credential(access_key_id).await?;
+    let mut auth_result = verify_signature_v4(request, &signed, &cred)?;
+    let (g_arns, g_ids) = auth_state.lookup_user_groups(&auth_result.user_id).await;
+    auth_result.group_arns = g_arns;
+    auth_result.group_ids = g_ids;
+    Ok(auth_result)
+}
+
+/// What a user's own session (`GetSessionToken`) carries in its token
+/// where a role's carries its session ARN: this prefix and the user's id.
+/// Its scope is [`USER_SESSION_SCOPE`], which matches no bucket, so a
+/// gateway that doesn't know user sessions refuses them.
+pub(crate) const USER_SESSION_PREFIX: &str = "obio-user-session:";
+pub(crate) const USER_SESSION_SCOPE: &str = "user-session";
+
+/// A temporary key's signing secret and the identity it carries, as
+/// [`sts_session`], and a user's own session resolved to the user: its
+/// ARN, tenant and groups, refused once the user is suspended or deleted.
+pub(crate) async fn resolve_session(
+    auth_state: &AuthState,
+    access_key_id: &str,
+    token: Option<&str>,
+) -> Result<(CachedCredential, AuthResult), AuthError> {
+    let user_id = token
+        .and_then(|t| auth_state.sts_provider.as_ref()?.validate(t))
+        .and_then(|info| {
+            info.user_arn
+                .strip_prefix(USER_SESSION_PREFIX)
+                .map(str::to_string)
+        });
+    let Some(user_id) = user_id else {
+        return sts_session(auth_state, access_key_id, token);
+    };
+    let cached = {
+        let cache = auth_state.credential_cache.read();
+        cache
+            .get(access_key_id)
+            .filter(|c| c.cached_at.elapsed().as_secs() < auth_state.cache_ttl_secs)
+            .cloned()
+    };
+    let cred = if let Some(c) = cached {
+        c
+    } else {
+        let user = auth_state
+            .meta_client
+            .clone()
+            .get_user(objectio_proto::metadata::GetUserRequest {
+                user_id: user_id.clone(),
+            })
+            .await
+            .ok()
+            .and_then(|r| r.into_inner().user)
+            .filter(|u| u.status == objectio_proto::metadata::UserStatus::UserActive as i32)
+            .ok_or_else(|| {
+                AuthError::AccessDenied("the session's user is not active".to_string())
+            })?;
+        let sts = auth_state.sts_provider.as_ref().ok_or_else(|| {
+            AuthError::AccessDenied("STS is not configured on this gateway".to_string())
+        })?;
+        let c = CachedCredential {
+            access_key_id: access_key_id.to_string(),
+            secret_access_key: sts.derive_secret(access_key_id),
+            user_id: user.user_id,
+            user_arn: user.arn,
+            tenant: user.tenant,
+            scope: None,
+            cached_at: std::time::Instant::now(),
+        };
+        auth_state
+            .credential_cache
+            .write()
+            .insert(access_key_id.to_string(), c.clone());
+        c
+    };
+    let (group_arns, group_ids) = auth_state.lookup_user_groups(&cred.user_id).await;
+    let auth_result = AuthResult {
+        user_id: cred.user_id.clone(),
+        user_arn: cred.user_arn.clone(),
+        access_key_id: access_key_id.to_string(),
+        group_arns,
+        group_ids,
+        tenant: cred.tenant.clone(),
+        auth_mode: objectio_auth::AuthMode::SessionToken,
+        scope: None,
+        source_ip: None,
+        source_endpoint: None,
+    };
+    Ok((cred, auth_result))
 }
 
 /// A temporary key's signing secret and the identity it carries.
@@ -354,6 +513,13 @@ pub(crate) fn sts_session(
     let session_info = sts
         .validate(token)
         .ok_or_else(|| AuthError::AccessDenied("invalid or expired session token".to_string()))?;
+    // A user's own session (GetSessionToken) is resolved to the user by
+    // `resolve_session`, which can ask meta.
+    if session_info.user_arn.starts_with(USER_SESSION_PREFIX) {
+        return Err(AuthError::AccessDenied(
+            "a user session must be resolved to its user".to_string(),
+        ));
+    }
     // A role's session: "arn:obio:sts::<tenant|objectio>:assumed-role/<role>/<session>".
     let role = session_info
         .user_arn
@@ -432,11 +598,12 @@ async fn run_presigned(
     // presigned with a role's keys skipped the tenant boundary and the
     // role's policies alike.
     let auth_result = if presigned.access_key_id.starts_with("ASIA") {
-        let (cred, session) = sts_session(
+        let (cred, session) = resolve_session(
             &auth_state,
             &presigned.access_key_id,
             presigned.session_token.as_deref(),
-        )?;
+        )
+        .await?;
         // The signature proves the caller holds the session's secret.
         verify_presigned_v4(&request, &presigned, &cred)?;
         session
@@ -782,6 +949,17 @@ pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, AuthError>
     }
 }
 
+/// The payload hash a request was signed with: S3 clients send it in
+/// `x-amz-content-sha256`; one without it signed no payload.
+fn header_payload_hash<B>(request: &Request<B>) -> String {
+    request
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("UNSIGNED-PAYLOAD")
+        .to_string()
+}
+
 /// Verify SigV4 request signature
 pub fn verify_request_v4<B>(
     request: &Request<B>,
@@ -790,6 +968,44 @@ pub fn verify_request_v4<B>(
     cred: &CachedCredential,
     region: &str,
 ) -> Result<AuthResult, AuthError> {
+    let payload_hash = header_payload_hash(request);
+    verify_signature_v4(
+        request,
+        &Signed {
+            signed_headers,
+            signature,
+            region,
+            service: "s3",
+            payload_hash: &payload_hash,
+        },
+        cred,
+    )
+}
+
+/// What a SigV4 signature covers beyond the request itself.
+pub(crate) struct Signed<'a> {
+    pub signed_headers: &'a [String],
+    pub signature: &'a str,
+    /// The credential scope's region and service.
+    pub region: &'a str,
+    pub service: &'a str,
+    /// The payload's SHA-256, hex, or `UNSIGNED-PAYLOAD`.
+    pub payload_hash: &'a str,
+}
+
+/// Verify a SigV4 signature made for `signed.service` in `signed.region`.
+pub(crate) fn verify_signature_v4<B>(
+    request: &Request<B>,
+    signed: &Signed<'_>,
+    cred: &CachedCredential,
+) -> Result<AuthResult, AuthError> {
+    let Signed {
+        signed_headers,
+        signature,
+        region,
+        service,
+        payload_hash,
+    } = *signed;
     // Get the request date
     let date_str = get_request_date(request)?;
     let date = parse_date_v4(&date_str)?;
@@ -802,15 +1018,15 @@ pub fn verify_request_v4<B>(
     }
 
     // Build canonical request
-    let canonical_request = build_canonical_request(request, signed_headers)?;
+    let canonical_request = build_canonical_request(request, signed_headers, payload_hash)?;
 
     // Build string to sign
     let date_stamp = date.format("%Y%m%d").to_string();
-    let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, region);
+    let credential_scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let string_to_sign = build_string_to_sign(&canonical_request, &date_str, &credential_scope);
 
     // Calculate signature
-    let signing_key = derive_signing_key(&cred.secret_access_key, &date_stamp, region, "s3");
+    let signing_key = derive_signing_key(&cred.secret_access_key, &date_stamp, region, service);
     let calculated_signature = calculate_signature_v4(&signing_key, &string_to_sign);
 
     // Compare signatures using constant-time comparison
@@ -895,6 +1111,7 @@ fn parse_date_v4(date_str: &str) -> Result<DateTime<Utc>, AuthError> {
 fn build_canonical_request<B>(
     request: &Request<B>,
     signed_headers: &[String],
+    payload_hash: &str,
 ) -> Result<String, AuthError> {
     let method = request.method().as_str();
     let uri = request.uri();
@@ -940,13 +1157,6 @@ fn build_canonical_request<B>(
         .collect();
 
     let signed_headers_str = signed_headers.join(";");
-
-    let payload_hash = request
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD")
-        .to_string();
 
     Ok(format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
