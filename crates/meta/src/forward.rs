@@ -15,7 +15,10 @@
 //! A call forwarded once is not forwarded again: if the node it reached is
 //! no longer the leader (an election in between), it answers UNAVAILABLE,
 //! which clients retry. With no leader known (an election under way), the
-//! same.
+//! same. And a forwarded call still waiting when this node learns of
+//! another leader is given up at once, UNAVAILABLE too: the leader it went
+//! to has stopped answering (frozen, cut off), and the client's retry
+//! reaches the new one rather than waiting out the call's timeout.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -102,7 +105,7 @@ pub struct ForwardToLeader<S> {
 /// Where a call goes.
 enum Route {
     Here,
-    Leader(String),
+    Leader(u64, String),
     Unavailable(&'static str),
 }
 
@@ -123,7 +126,7 @@ impl ForwardToLeaderLayer {
                 .get_node(&leader)
                 .map_or(
                     Route::Unavailable("the raft leader's address is not known yet; retry"),
-                    |n| Route::Leader(n.addr.clone()),
+                    |n| Route::Leader(leader, n.addr.clone()),
                 ),
             None => Route::Unavailable("no raft leader (an election is under way); retry"),
         }
@@ -177,8 +180,9 @@ where
             Route::Unavailable(why) => {
                 Box::pin(async move { Ok(tonic::Status::unavailable(why).into_http()) })
             }
-            Route::Leader(addr) => {
+            Route::Leader(leader, addr) => {
                 let channel = self.layer.channel(&addr);
+                let mut metrics = self.layer.raft.metrics();
                 Box::pin(async move {
                     let mut channel = match channel {
                         Ok(c) => c,
@@ -189,16 +193,27 @@ where
                         .insert(FORWARDED, http::HeaderValue::from_static("1"));
                     // The request's URI is for this node; the channel
                     // supplies the leader's authority.
-                    match tower::ServiceExt::ready(&mut channel).await {
-                        Ok(ready) => match tower::Service::call(ready, req).await {
-                            Ok(resp) => Ok(resp),
-                            Err(e) => Ok(tonic::Status::unavailable(format!(
-                                "forwarding to the raft leader at {addr} failed: {e}; retry"
+                    let forwarded = async {
+                        match tower::ServiceExt::ready(&mut channel).await {
+                            Ok(ready) => match tower::Service::call(ready, req).await {
+                                Ok(resp) => resp,
+                                Err(e) => tonic::Status::unavailable(format!(
+                                    "forwarding to the raft leader at {addr} failed: {e}; retry"
+                                ))
+                                .into_http(),
+                            },
+                            Err(e) => tonic::Status::unavailable(format!(
+                                "the raft leader at {addr} can't be reached: {e}; retry"
                             ))
-                            .into_http()),
-                        },
-                        Err(e) => Ok(tonic::Status::unavailable(format!(
-                            "the raft leader at {addr} can't be reached: {e}; retry"
+                            .into_http(),
+                        }
+                    };
+                    let superseded = metrics.wait_for(|m| m.current_leader != Some(leader));
+                    tokio::select! {
+                        resp = forwarded => Ok(resp),
+                        _ = superseded => Ok(tonic::Status::unavailable(format!(
+                            "the raft leader at {addr} was replaced while this call waited \
+                             for it; retry"
                         ))
                         .into_http()),
                     }
