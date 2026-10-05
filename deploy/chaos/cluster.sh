@@ -84,6 +84,16 @@ up() {
         fi
     done
     for i in $(seq 1 "$N"); do await_agent "chaos-$i"; done
+    # A gateway refuses writes while its clock is more than 500 ms from
+    # meta's: start only once every VM's clock is synchronised.
+    for i in $(seq 1 "$N"); do
+        local tries=0
+        until [ "$(incus exec "chaos-$i" -- timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ]; do
+            tries=$((tries + 1))
+            [ "$tries" -gt 60 ] && { say "chaos-$i: clock not synchronised after 120 s; going on"; break; }
+            sleep 2
+        done
+    done
 
     declare -A IP
     for i in $(seq 1 "$N"); do IP[$i]=$(ip_of "chaos-$i"); done
