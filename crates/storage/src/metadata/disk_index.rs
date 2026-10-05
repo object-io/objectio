@@ -414,7 +414,10 @@ mod tests {
             .create(&crashed)
             .unwrap();
         drop(db);
-        assert!(!repaired.load(std::sync::atomic::Ordering::Relaxed), "a full repair ran");
+        assert!(
+            !repaired.load(std::sync::atomic::Ordering::Relaxed),
+            "a full repair ran"
+        );
         let idx = DiskIndex::open(&crashed, 1 << 20).unwrap();
         assert_eq!(idx.checkpoint_lsn().unwrap(), 1);
         assert_eq!(idx.get(&7u32.to_be_bytes()).unwrap(), Some(vec![1; 100]));
