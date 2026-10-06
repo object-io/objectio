@@ -426,6 +426,60 @@ fn dedup_note_key(fingerprint: &[u8]) -> MetadataKey {
 /// repair, drain and backfill (as Ceph's `full_ratio`).
 pub const DEFAULT_FULL_RATIO: f64 = 0.95;
 
+/// The share of the metadata store's filesystem that must stay free: below
+/// it, a small shard (B21) goes to a disk block instead, so the index keeps
+/// room for metadata, which has nowhere else to go.
+const META_SPACE_FREE_FLOOR: f64 = 0.10;
+
+/// Whether the metadata store's filesystem is below
+/// [`META_SPACE_FREE_FLOOR`], looked up at most every few seconds.
+struct MetaSpace {
+    dir: PathBuf,
+    /// When it was last looked up (ms since the service started), and the
+    /// answer.
+    checked_ms: AtomicU64,
+    low: std::sync::atomic::AtomicBool,
+    started: Instant,
+}
+
+impl MetaSpace {
+    const EVERY_MS: u64 = 5_000;
+
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            checked_ms: AtomicU64::new(u64::MAX),
+            low: std::sync::atomic::AtomicBool::new(false),
+            started: Instant::now(),
+        }
+    }
+
+    fn low(&self) -> bool {
+        let now = self.started.elapsed().as_millis() as u64;
+        let at = self.checked_ms.load(Ordering::Relaxed);
+        if at == u64::MAX || now.saturating_sub(at) >= Self::EVERY_MS {
+            self.checked_ms.store(now, Ordering::Relaxed);
+            let low = match nix::sys::statvfs::statvfs(&self.dir) {
+                Ok(st) if st.blocks() > 0 => {
+                    (st.blocks_available() as f64) / (st.blocks() as f64) < META_SPACE_FREE_FLOOR
+                }
+                // Unknown: keep the shard out of the index, to be safe.
+                _ => true,
+            };
+            #[cfg(test)]
+            let low = low || META_SPACE_LOW.with(std::cell::Cell::get);
+            self.low.store(low, Ordering::Relaxed);
+        }
+        self.low.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: report the metadata store's filesystem as nearly full.
+    static META_SPACE_LOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub struct OsdService {
     node_id: [u8; 16],
     /// The share of a disk client writes may fill (B3); the rest is kept
@@ -452,6 +506,8 @@ pub struct OsdService {
     /// `CheckShards` so Meta's repairer rebuilds them. In memory only: after
     /// a restart the next scrub pass finds them again.
     corrupt: RwLock<std::collections::HashSet<String>>,
+    /// Whether the metadata store's filesystem has room for small shards.
+    meta_space: MetaSpace,
     scrub: ScrubStats,
     /// Transfer Engine and staging pool, once enabled at startup. Without it
     /// every shard arrives and leaves as gRPC bytes.
@@ -739,6 +795,7 @@ impl OsdService {
         // Initialize metadata store for persistent object metadata
         let mut meta_config = MetadataStoreConfig::with_data_dir(&data_dir);
         tune(&mut meta_config);
+        let meta_space = MetaSpace::new(meta_config.data_dir.clone());
         let meta_store = MetadataStore::open_or_create(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
 
@@ -860,6 +917,7 @@ impl OsdService {
             usage,
             metrics_renderer: std::sync::OnceLock::new(),
             corrupt: RwLock::new(std::collections::HashSet::new()),
+            meta_space,
             scrub: ScrubStats::default(),
             #[cfg(feature = "rdma")]
             rdma: std::sync::OnceLock::new(),
@@ -991,13 +1049,18 @@ impl OsdService {
             )));
         }
         let key = Self::shard_key(&id.object_id, id.stripe_id, id.position);
-        let loc = ShardLocation {
-            disk_idx: SMALL_DISK,
-            block_num: 0,
-            size: shard.data.len() as u32,
-            crc32c,
-            created_at: Self::current_timestamp(),
-            small: Some(shard.data.to_vec()),
+        let loc = if self.meta_space.low() {
+            // No room to spare in the index: a disk block, as WriteShard.
+            self.spill_small_shard(&id, &shard.data, crc32c)?
+        } else {
+            ShardLocation {
+                disk_idx: SMALL_DISK,
+                block_num: 0,
+                size: shard.data.len() as u32,
+                crc32c,
+                created_at: Self::current_timestamp(),
+                small: Some(shard.data.to_vec()),
+            }
         };
         let replaced = self
             .shard_index
@@ -1008,6 +1071,46 @@ impl OsdService {
         }
         self.corrupt.write().remove(&key);
         Ok(())
+    }
+
+    /// Write a small shard to a disk block, synced, as `WriteShard` does:
+    /// for when the metadata store's filesystem is nearly full. Its location
+    /// is the caller's to record; a failure before that frees the extent.
+    #[allow(clippy::result_large_err)] // tonic::Status, as the handlers return
+    fn spill_small_shard(
+        &self,
+        id: &objectio_proto::storage::ShardId,
+        data: &[u8],
+        crc32c: u32,
+    ) -> Result<ShardLocation, Status> {
+        let disk_idx = self.select_disk_for_write();
+        let disk = &self.disks[disk_idx];
+        let blocks = disk.blocks_for_len(data.len());
+        self.check_room(disk_idx, blocks)?;
+        let block_num = self.allocate_extent(disk_idx, blocks)?;
+        let mut object_id = [0u8; 16];
+        let n = id.object_id.len().min(16);
+        object_id[..n].copy_from_slice(&id.object_id[..n]);
+        let started = Instant::now();
+        if let Err(e) = disk.write_block(block_num, object_id, id.stripe_id, data) {
+            let _ = disk.free_extent(block_num, blocks);
+            return Err(Status::internal(format!("write failed: {e}")));
+        }
+        DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
+        let started = Instant::now();
+        if let Err(e) = disk.sync() {
+            let _ = disk.free_extent(block_num, blocks);
+            return Err(Status::internal(format!("sync failed: {e}")));
+        }
+        DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
+        Ok(ShardLocation {
+            disk_idx,
+            block_num,
+            size: data.len() as u32,
+            crc32c,
+            created_at: Self::current_timestamp(),
+            small: None,
+        })
     }
 
     /// This OSD's shard of `object`, if it is kept in its record (B21) and
@@ -3857,6 +3960,77 @@ mod integrity_tests {
         let both = meta(true).await.unwrap().into_inner();
         assert!(both.found && both.small_shard.is_none());
         assert!(osd.corrupt.read().contains(&key));
+    }
+
+    /// B21: with the metadata store's filesystem nearly full, a small shard
+    /// sent with its metadata goes to a disk block; it reads the same, and
+    /// isn't sent with the metadata (the reader reads it).
+    #[tokio::test]
+    async fn a_small_shard_goes_to_a_block_when_the_index_is_short_of_room() {
+        use objectio_proto::storage::{GetObjectMetaRequest, PutObjectMetaRequest, SmallShard};
+        META_SPACE_LOW.with(|c| c.set(true));
+        let (_dir, osd) = osd();
+        let data: Vec<u8> = (0..11_000u32).map(|i| (i % 239) as u8).collect();
+        let object = objectio_proto::metadata::ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            object_id: vec![7; 16],
+            stamp: 10,
+            stripes: vec![objectio_proto::metadata::StripeMeta {
+                object_id: vec![7; 16],
+                shards_in_metadata: true,
+                shards: vec![objectio_proto::metadata::ShardLocation {
+                    position: 1,
+                    node_id: osd.node_id.to_vec(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        osd.put_object_meta(Request::new(PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(object),
+            shard: Some(SmallShard {
+                shard_id: Some(id(1)),
+                data: data.clone(),
+                crc32c: crc32c::crc32c(&data),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        META_SPACE_LOW.with(|c| c.set(false));
+
+        let loc = osd
+            .shard_index
+            .get(&OsdService::shard_key(&id(1).object_id, 0, 1))
+            .unwrap();
+        assert!(
+            loc.small.is_none() && loc.disk_idx != SMALL_DISK,
+            "kept in the index"
+        );
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(1)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
+        let meta = osd
+            .get_object_meta(Request::new(GetObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: String::new(),
+                with_small_shard: true,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(meta.found && meta.small_shard.is_none());
     }
 
     /// B21: a replica older than the current version (replicas arrive in
