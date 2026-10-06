@@ -2448,6 +2448,7 @@ dependencies = [
  "objectio-unity-catalog",
  "parking_lot",
  "pcre2",
+ "prost",
  "quick-xml",
  "rand 0.8.5",
  "regex",
