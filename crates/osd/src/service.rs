@@ -613,6 +613,19 @@ impl OsdService {
         data_dir: PathBuf,
         cache_bytes: usize,
     ) -> Result<Self, String> {
+        Self::new_with_store(disk_paths, block_size, data_dir, |c| {
+            c.cache_bytes = cache_bytes;
+        })
+    }
+
+    /// [`Self::new`], the metadata store's settings changed by `tune` (the
+    /// crash test makes its checkpoints and log truncations frequent).
+    pub fn new_with_store(
+        disk_paths: Vec<String>,
+        block_size: u32,
+        data_dir: PathBuf,
+        tune: impl FnOnce(&mut MetadataStoreConfig),
+    ) -> Result<Self, String> {
         // Node identity: Ceph/Rook pattern — the disk is the source of
         // truth. Three-level cascade:
         //   1. Existing disk's superblock with a non-nil osd_node_id.
@@ -724,10 +737,8 @@ impl OsdService {
         }
 
         // Initialize metadata store for persistent object metadata
-        let meta_config = MetadataStoreConfig {
-            cache_bytes,
-            ..MetadataStoreConfig::with_data_dir(&data_dir)
-        };
+        let mut meta_config = MetadataStoreConfig::with_data_dir(&data_dir);
+        tune(&mut meta_config);
         let meta_store = MetadataStore::open_or_create(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
 
