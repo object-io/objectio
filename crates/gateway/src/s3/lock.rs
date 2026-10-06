@@ -167,6 +167,20 @@ pub(crate) async fn object_to_read(
     version_id: Option<&str>,
     every_copy: bool,
 ) -> Result<ObjectMeta, Response> {
+    object_to_read_with(state, nodes, bucket, key, version_id, every_copy, None).await
+}
+
+/// As [`object_to_read`]; for the current object, `shards` also gets the
+/// shards kept with its metadata (B21), so a small GET reads none.
+pub(crate) async fn object_to_read_with(
+    state: &AppState,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    every_copy: bool,
+    shards: Option<&mut crate::osd_pool::SmallShards>,
+) -> Result<ObjectMeta, Response> {
     let failed = |e: crate::osd_pool::OsdPoolError| {
         error!("Failed to get object metadata from OSDs: {e}");
         S3Error::xml_response(
@@ -187,7 +201,17 @@ pub(crate) async fn object_to_read(
         resp
     };
     let Some(wanted) = version_id else {
-        let read = if every_copy {
+        let read = if let Some(shards) = shards {
+            crate::osd_pool::get_object_meta_with_shards(
+                &state.osd_pool,
+                nodes,
+                bucket,
+                key,
+                every_copy,
+                shards,
+            )
+            .await
+        } else if every_copy {
             crate::osd_pool::get_object_meta_every_copy(&state.osd_pool, nodes, bucket, key).await
         } else {
             get_object_meta_from_any(&state.osd_pool, nodes, bucket, key).await

@@ -1010,6 +1010,34 @@ impl OsdService {
         Ok(())
     }
 
+    /// This OSD's shard of `object`, if it is kept in its record (B21) and
+    /// passes its checksum: sent with the object's metadata, so a small GET
+    /// needs no shard read. A shard that fails is marked for rebuilding and
+    /// not sent; the reader then reads the others.
+    fn small_shard_of(&self, object: &ObjectMeta) -> Option<objectio_proto::storage::SmallShard> {
+        let stripe = object.stripes.first().filter(|s| s.shards_in_metadata)?;
+        let mine = stripe
+            .shards
+            .iter()
+            .find(|s| s.node_id.as_slice() == self.node_id.as_slice())?;
+        let key = Self::shard_key(&stripe.object_id, stripe.stripe_id, mine.position);
+        let loc = self.shard_index.get(&key)?;
+        let data = loc.small?;
+        if crc32c::crc32c(&data) != loc.crc32c {
+            self.mark_corrupt(&key, loc.block_num);
+            return None;
+        }
+        Some(objectio_proto::storage::SmallShard {
+            shard_id: Some(objectio_proto::storage::ShardId {
+                object_id: stripe.object_id.clone(),
+                stripe_id: stripe.stripe_id,
+                position: mine.position,
+            }),
+            crc32c: loc.crc32c,
+            data,
+        })
+    }
+
     /// Where a shard is, as the RPCs report it: its disk and offset, or, for
     /// one kept in its record (B21), no disk.
     fn block_location(&self, loc: &ShardLocation) -> BlockLocation {
@@ -2551,10 +2579,16 @@ impl StorageService for OsdService {
 
                 debug!("Found object metadata: {}/{}", req.bucket, req.key);
 
+                let small_shard = if req.with_small_shard {
+                    self.small_shard_of(&object)
+                } else {
+                    None
+                };
                 Ok(Response::new(GetObjectMetaResponse {
                     object: Some(object),
                     found: true,
                     tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
+                    small_shard,
                 }))
             }
             None => {
@@ -2564,6 +2598,7 @@ impl StorageService for OsdService {
                     object: None,
                     found: false,
                     tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
+                    small_shard: None,
                 }))
             }
         }
@@ -3734,6 +3769,16 @@ mod integrity_tests {
             object_id: vec![7; 16],
             size: 48_000,
             stamp: 10,
+            stripes: vec![objectio_proto::metadata::StripeMeta {
+                object_id: vec![7; 16],
+                shards_in_metadata: true,
+                shards: vec![objectio_proto::metadata::ShardLocation {
+                    position: 3,
+                    node_id: osd.node_id.to_vec(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let put = |crc: u32| PutObjectMetaRequest {
@@ -3777,16 +3822,32 @@ mod integrity_tests {
             .unwrap()
             .into_inner();
         assert_eq!(&got.data[..], &data[..]);
-        let meta = osd
-            .get_object_meta(Request::new(GetObjectMetaRequest {
+        let meta = |with_small_shard| {
+            osd.get_object_meta(Request::new(GetObjectMetaRequest {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: String::new(),
+                with_small_shard,
             }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(meta.found);
+        };
+        let plain = meta(false).await.unwrap().into_inner();
+        assert!(plain.found && plain.small_shard.is_none());
+        // Asked for, the shard comes with the metadata: a GET in one round.
+        let both = meta(true).await.unwrap().into_inner();
+        assert!(both.found);
+        let shard = both.small_shard.expect("the shard, with its metadata");
+        assert_eq!(shard.shard_id, Some(id(3)));
+        assert_eq!(shard.data, data);
+        assert_eq!(shard.crc32c, crc32c::crc32c(&data));
+
+        // A damaged one is not sent, and is marked for rebuilding.
+        let key = OsdService::shard_key(&id(3).object_id, 0, 3);
+        let mut bad = osd.shard_index.get(&key).unwrap();
+        bad.small.as_mut().unwrap()[5] ^= 0xff;
+        OsdService::persist_shard_location(&osd.meta_store, &key, &bad).unwrap();
+        let both = meta(true).await.unwrap().into_inner();
+        assert!(both.found && both.small_shard.is_none());
+        assert!(osd.corrupt.read().contains(&key));
     }
 
     fn reopen_at(dir: &tempfile::TempDir) -> OsdService {
@@ -4023,6 +4084,7 @@ mod integrity_tests {
             bucket: "b".into(),
             key: "k".into(),
             version_id: String::new(),
+            with_small_shard: false,
         }))
         .await
         .unwrap()
@@ -4511,6 +4573,7 @@ mod object_meta_tests {
                 bucket: "b".into(),
                 key: "k".into(),
                 version_id: String::new(),
+                with_small_shard: false,
             }))
             .await
             .unwrap()
