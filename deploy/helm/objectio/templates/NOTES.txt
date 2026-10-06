@@ -10,7 +10,11 @@ Access the S3 gateway:
 
   kubectl port-forward svc/{{ include "objectio.gateway.fullname" . }} 9000:{{ .Values.gateway.service.port }} -n {{ .Release.Namespace }}
 
-Test with AWS CLI:
+The admin's credentials (created on first boot; meta never logs the secret):
+
+  kubectl exec -n {{ .Release.Namespace }} {{ include "objectio.meta.fullname" . }}-0 -- cat /var/lib/objectio/meta/admin-creds.env
+
+Test with AWS CLI (after exporting those):
 
   aws --endpoint-url http://localhost:9000 s3 mb s3://test-bucket
   echo "hello" | aws --endpoint-url http://localhost:9000 s3 cp - s3://test-bucket/hello.txt
