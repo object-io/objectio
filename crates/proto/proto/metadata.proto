@@ -501,6 +501,9 @@ message StripeMeta {
     // in meta (GetPack), which holds the shard locations; `shards` is empty
     // here and `object_id` is the pack id.
     bytes pack_id = 16;
+    // Each shard is kept in its OSD's metadata record, not a disk block, and
+    // was sent with the object's metadata (B21, format level 5).
+    bool shards_in_metadata = 17;
 }
 
 // A pack: one erasure-coded stripe holding many small objects' bytes,

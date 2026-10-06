@@ -295,6 +295,9 @@ fn unpackable_from(
         Some("not a small object")
     } else if !object.inline_data.is_empty() {
         Some("stored inline")
+    } else if object.stripes.iter().any(|s| s.shards_in_metadata) {
+        // Its shards take no disk blocks to pack (B21).
+        Some("kept in metadata")
     } else if encrypted {
         Some("encrypted")
     } else if object.stripes.len() != 1

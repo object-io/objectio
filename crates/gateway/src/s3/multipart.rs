@@ -1282,6 +1282,7 @@ pub(crate) async fn complete_multipart_upload_internal(
                     versioning_enabled,
                     stripe_targets(&object.stripes),
                     &condition,
+                    None,
                 )
                 .await
                 {

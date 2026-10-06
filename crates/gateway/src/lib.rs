@@ -261,6 +261,13 @@ pub struct Args {
     #[arg(long, default_value_t = 4096)]
     pub inline_max_size: usize,
 
+    /// An erasure-coded object of one stripe whose shards are at most this
+    /// many bytes is written with its shards in its metadata copies: one
+    /// call and one flush per OSD (B21), once the cluster is finalized at
+    /// format level 5. At most 16384; 0 turns it off.
+    #[arg(long, default_value_t = objectio_common::version::SMALL_SHARD_MAX)]
+    pub small_shard_max: usize,
+
     /// Move shards over Mooncake Transfer Engine to OSDs that offer it:
     /// `rdma`, or `tcp` to develop without RDMA hardware. Unset: gRPC bytes
     /// only.
@@ -1066,6 +1073,9 @@ pub async fn run(
         prometheus_url: args.prometheus_url.clone(),
         rdma,
         inline_max_size: args.inline_max_size,
+        small_shard_max: args
+            .small_shard_max
+            .min(objectio_common::version::SMALL_SHARD_MAX),
         dedup: dedup::DryRun::start(dedup_meta, Arc::clone(&dedup_pool)),
         trusted_proxies,
         auth_state: Arc::clone(&auth_state),

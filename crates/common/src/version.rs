@@ -25,6 +25,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
 pub const FORMAT_LEVEL: u32 = 5;
 
+/// The level from which small shards are kept in the OSDs' metadata
+/// records and sent with their object's metadata (B21).
+pub const SMALL_SHARDS_LEVEL: u32 = 5;
+
+/// The largest shard kept in an OSD's metadata record rather than a disk
+/// block (B21): a 64 KiB object's shards with 4+2.
+pub const SMALL_SHARD_MAX: usize = 16 * 1024;
+
 /// The lowest active level this binary can run in: it reads every format
 /// from this level up.
 pub const MIN_LEVEL: u32 = 1;

@@ -344,8 +344,8 @@ message PutObjectMetaRequest {
     bool replication_update = 9;
     map<string, string> replication_set = 10;
     // This OSD's shard of a small object (B21): kept in its record and
-    // written with the metadata in one log batch, one flush. Refused (failed
-    // precondition) before the cluster is finalized at format level 5.
+    // written with the metadata in one log batch, one flush. Sent only once
+    // the cluster is finalized at format level 5.
     SmallShard shard = 11;
 }
 

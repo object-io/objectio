@@ -3,6 +3,10 @@
 //! each lets its own stripe go; the pack goes with its last object; and the
 //! pack survives what a stripe survives: copies, overwrites, lost disks,
 //! repair and drain (objectio-docs architecture/design/core/small-object-packing.md).
+//!
+//! With small shards kept in metadata (B21) no object up to PACK_MAX takes
+//! a block of its own, so there is nothing to pack: these clusters run with
+//! `--small-shard-max 0`, as objects written before level 5 are.
 
 use std::time::{Duration, Instant};
 
@@ -85,7 +89,7 @@ fn await_used(c: &Cluster, what: &str, within: Duration, ok: impl Fn(u64) -> boo
 
 #[test]
 fn packed_objects_read_back_and_the_pack_goes_with_its_last_object() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let empty = c.total_used_bytes();
     let objects = put_small(&c, "p", 12);
     let unpacked = await_used(&c, "written", Duration::from_secs(15), |u| u > empty);
@@ -137,7 +141,7 @@ fn packed_objects_read_back_and_the_pack_goes_with_its_last_object() {
 /// other object in the pack, and the pack goes only with it.
 #[test]
 fn a_copy_of_a_packed_object_keeps_the_pack() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let empty = c.total_used_bytes();
     let objects = put_small(&c, "cp", 6);
     pack_all(&c, "cp", &objects);
@@ -167,7 +171,7 @@ fn a_copy_of_a_packed_object_keeps_the_pack() {
 /// What can't be packed is left as it was, and said why.
 #[test]
 fn what_cannot_be_packed_is_left_alone() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let objects = put_small(&c, "s", 2);
     c.request("PUT", "/s/tiny", b"inline").expect(200);
     c.request("PUT", "/s/big", &payload(200_000, 7)).expect(200);
@@ -187,8 +191,18 @@ fn what_cannot_be_packed_is_left_alone() {
 /// packed objects then survive two more losses.
 #[test]
 fn a_pack_is_repaired_so_its_objects_survive_two_more_losses() {
-    let mut c =
-        Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--repair-interval-secs", "1"]);
+    let mut c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        &[
+            "--test-hooks",
+            "--small-shard-max",
+            "0",
+            "--repair-interval-secs",
+            "1",
+        ],
+    );
     let objects = put_small(&c, "r", 10);
     pack_all(&c, "r", &objects);
 
@@ -253,8 +267,18 @@ fn admin_state(c: &Cluster, id: &str) -> String {
 /// pack: the disk can then be pulled with two more lost.
 #[test]
 fn a_drain_moves_pack_shards() {
-    let mut c =
-        Cluster::start_with_ec_and_args(7, 4, 2, &["--test-hooks", "--drain-interval-secs", "1"]);
+    let mut c = Cluster::start_with_ec_and_args(
+        7,
+        4,
+        2,
+        &[
+            "--test-hooks",
+            "--small-shard-max",
+            "0",
+            "--drain-interval-secs",
+            "1",
+        ],
+    );
     let objects = put_small(&c, "d", 10);
     let report = pack_all(&c, "d", &objects);
     let holders: Vec<String> = report["shard_nodes"]
@@ -344,7 +368,8 @@ fn a_packer_that_dies_at_any_step_is_reconciled() {
         ("seal", 0, 8, 0),
         ("switch-one", 0, 7, 1),
     ] {
-        let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+        let c =
+            Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
         let empty = c.total_used_bytes();
         let objects = put_small(&c, "crash", 8);
         let unpacked = await_used(&c, "written", Duration::from_secs(15), |u| u > empty);
@@ -395,7 +420,7 @@ fn a_packer_that_dies_at_any_step_is_reconciled() {
 /// other objects' slices stay readable.
 #[test]
 fn objects_changed_while_being_packed_keep_what_the_client_wrote() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let empty = c.total_used_bytes();
     let objects = put_small(&c, "race", 6);
     pack_stopping(&c, "race", &objects, "seal");
@@ -429,7 +454,7 @@ fn objects_changed_while_being_packed_keep_what_the_client_wrote() {
 /// travel with it, and its version still can't be deleted.
 #[test]
 fn a_locked_object_packs_and_stays_locked() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     c.request_with_headers(
         "PUT",
         "/worm",
@@ -503,6 +528,8 @@ fn the_packer_packs_small_objects_in_the_background() {
         // together, not as they arrive; old stripes released a second
         // after the switch.
         &[
+            "--small-shard-max",
+            "0",
             "--pack-interval-secs",
             "1",
             "--pack-min-age-secs",
@@ -570,7 +597,7 @@ fn compact(c: &Cluster, stop: Option<&str>) -> Value {
 /// new pack, and its space comes back; the survivors read throughout.
 #[test]
 fn a_mostly_deleted_pack_is_compacted() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let empty = c.total_used_bytes();
     let objects = put_small(&c, "cmp", 10);
     pack_all(&c, "cmp", &objects);
@@ -607,7 +634,7 @@ fn a_mostly_deleted_pack_is_compacted() {
 /// copy shares: moving the source wouldn't free it.
 #[test]
 fn live_and_shared_packs_are_not_compacted() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let objects = put_small(&c, "keep", 10);
     pack_all(&c, "keep", &objects);
     delete_all(&c, "keep", &objects[..1]);
@@ -636,7 +663,7 @@ fn live_and_shared_packs_are_not_compacted() {
 /// any pack, and a later pass finishes the job; nothing is lost or leaked.
 #[test]
 fn a_compaction_that_dies_midway_is_reconciled() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks", "--small-shard-max", "0"]);
     let empty = c.total_used_bytes();
     let objects = put_small(&c, "half", 10);
     pack_all(&c, "half", &objects);
@@ -775,6 +802,8 @@ fn a_soak_with_packing_and_compaction_loses_nothing() {
         2,
         &[
             "--test-hooks",
+            "--small-shard-max",
+            "0",
             "--pack-interval-secs",
             "1",
             "--pack-min-age-secs",

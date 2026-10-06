@@ -219,14 +219,7 @@ struct ShardLocation {
 /// The `disk_idx` of a shard kept in its record (B21).
 const SMALL_DISK: usize = u32::MAX as usize;
 
-/// The largest shard kept in its record rather than a disk block (B21): a
-/// 64 KiB object's shards with 4+2.
-pub const SMALL_SHARD_MAX: usize = 16 * 1024;
-
-/// The format level from which shards are kept in their records: an OSD
-/// of an earlier release can't read them, so not before the cluster is
-/// finalized at it.
-pub const SMALL_SHARDS_LEVEL: u32 = 5;
+use objectio_common::version::SMALL_SHARD_MAX;
 
 /// How a [`ShardLocation`] is stored in the metadata log: protobuf.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -460,9 +453,6 @@ pub struct OsdService {
     /// a restart the next scrub pass finds them again.
     corrupt: RwLock<std::collections::HashSet<String>>,
     scrub: ScrubStats,
-    /// Whether small shards are kept in their records (B21): once the
-    /// cluster is finalized at [`SMALL_SHARDS_LEVEL`] (tests choose).
-    small_shards: fn() -> bool,
     /// Transfer Engine and staging pool, once enabled at startup. Without it
     /// every shard arrives and leaves as gRPC bytes.
     #[cfg(feature = "rdma")]
@@ -860,7 +850,6 @@ impl OsdService {
             metrics_renderer: std::sync::OnceLock::new(),
             corrupt: RwLock::new(std::collections::HashSet::new()),
             scrub: ScrubStats::default(),
-            small_shards: || objectio_common::version::allows(SMALL_SHARDS_LEVEL),
             #[cfg(feature = "rdma")]
             rdma: std::sync::OnceLock::new(),
         })
@@ -971,11 +960,10 @@ impl OsdService {
         shard: objectio_proto::storage::SmallShard,
         writes: Vec<(MetadataKey, Vec<u8>)>,
     ) -> Result<(), Status> {
-        if !(self.small_shards)() {
-            return Err(Status::failed_precondition(
-                "small shards are kept in metadata only once the cluster is at format level 5",
-            ));
-        }
+        // No level check here: a gateway sends a shard with the metadata
+        // only once the cluster is finalized at SMALL_SHARDS_LEVEL, which
+        // every node then reads (levels only rise). This OSD may not have
+        // heard yet; it doesn't need to.
         let id = shard
             .shard_id
             .ok_or_else(|| Status::invalid_argument("small shard without an id"))?;
@@ -1836,48 +1824,6 @@ impl StorageService for OsdService {
             shard_id.position,
             data.len()
         );
-
-        // A small shard is kept in its record, not a disk block (B21): one
-        // log flush makes it durable, instead of a block write and flush and
-        // then the record's.
-        if data.len() <= SMALL_SHARD_MAX && (self.small_shards)() {
-            let key = Self::shard_key(&shard_id.object_id, shard_id.stripe_id, shard_id.position);
-            let timestamp = Self::current_timestamp();
-            let loc = ShardLocation {
-                disk_idx: SMALL_DISK,
-                block_num: 0,
-                size: data.len() as u32,
-                crc32c,
-                created_at: timestamp,
-                small: Some(data.to_vec()),
-            };
-            let replaced = self.shard_index.record(&key, &loc).map_err(|e| {
-                self.grpc_metrics.write_shard.record(
-                    false,
-                    start.elapsed().as_micros() as u64,
-                    bytes_in,
-                    0,
-                );
-                Status::unavailable(format!(
-                    "the shard could not be recorded durably ({e}); not stored, retry"
-                ))
-            })?;
-            if let Some(old) = replaced {
-                self.free_location(&old);
-            }
-            self.corrupt.write().remove(&key);
-            let resp = WriteShardResponse {
-                location: Some(self.block_location(&loc)),
-                timestamp,
-            };
-            self.grpc_metrics.write_shard.record(
-                true,
-                start.elapsed().as_micros() as u64,
-                bytes_in,
-                resp.encoded_len() as u64,
-            );
-            return Ok(Response::new(resp));
-        }
 
         // Select disk and allocate an extent sized to this shard.
         //
@@ -3668,27 +3614,49 @@ mod integrity_tests {
         (0..50_000u32).map(|i| (i % 241) as u8 ^ seed).collect()
     }
 
-    /// B21: a shard of at most SMALL_SHARD_MAX is kept in its record: no
+    /// Store `data` as this OSD's small shard of object `b/k` (position 0),
+    /// sent with its metadata as a gateway does (B21).
+    async fn put_small(osd: &OsdService, data: &[u8]) {
+        use objectio_proto::storage::{PutObjectMetaRequest, SmallShard};
+        osd.put_object_meta(Request::new(PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(objectio_proto::metadata::ObjectMeta {
+                bucket: "b".into(),
+                key: "k".into(),
+                object_id: vec![7; 16],
+                stamp: 1,
+                ..Default::default()
+            }),
+            shard: Some(SmallShard {
+                shard_id: Some(id(0)),
+                data: data.to_vec(),
+                crc32c: crc32c::crc32c(data),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// B21: a small shard sent with its metadata is kept in its record: no
     /// disk block, read back, checked, counted, kept across a restart,
-    /// rewritten and deleted like any shard, and found rotten by the
-    /// scrubber when its bytes no longer match their checksum.
+    /// found rotten by the scrubber when its bytes no longer match their
+    /// checksum, rewritten (to a block, as repair does) and deleted like any
+    /// shard.
     #[tokio::test]
     async fn a_small_shard_lives_in_its_record() {
-        let (dir, mut osd) = osd();
-        osd.small_shards = || true;
+        let (dir, osd) = osd();
         let free_before = osd.disks[0].free_space();
         let small: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
-        write(&osd, 0, &small).await;
+        put_small(&osd, &small).await;
         assert_eq!(
             osd.disks[0].free_space(),
             free_before,
             "it took a disk block"
         );
-        let loc = osd
-            .shard_index
-            .get(&OsdService::shard_key(&id(0).object_id, 0, 0))
-            .unwrap();
-        assert!(loc.small.is_some());
+        let key = OsdService::shard_key(&id(0).object_id, 0, 0);
+        assert!(osd.shard_index.get(&key).unwrap().small.is_some());
         async fn read(osd: &OsdService, crc: u32) -> Result<Response<ReadShardResponse>, Status> {
             osd.read_shard(Request::new(ReadShardRequest {
                 shard_id: Some(id(0)),
@@ -3706,8 +3674,7 @@ mod integrity_tests {
         assert_eq!(osd.shard_index.count(), 1);
         drop(osd);
 
-        let mut osd = reopen_at(&dir);
-        osd.small_shards = || true;
+        let osd = reopen_at(&dir);
         assert_eq!(osd.shard_index.count(), 1, "not counted after a restart");
         assert_eq!(
             &read(&osd, crc).await.unwrap().into_inner().data[..],
@@ -3716,7 +3683,6 @@ mod integrity_tests {
 
         // Its bytes rot in the record: the scrubber finds it, reads refuse
         // it, and a rewrite clears it.
-        let key = OsdService::shard_key(&id(0).object_id, 0, 0);
         let mut bad = osd.shard_index.get(&key).unwrap();
         bad.small.as_mut().unwrap()[5] ^= 0xff;
         OsdService::persist_shard_location(&osd.meta_store, &key, &bad).unwrap();
@@ -3728,6 +3694,10 @@ mod integrity_tests {
         );
         write(&osd, 0, &small).await;
         assert_eq!(states(&osd, &[0]).await, vec![ShardState::Ok]);
+        assert_eq!(
+            &read(&osd, crc).await.unwrap().into_inner().data[..],
+            &small[..]
+        );
 
         osd.delete_shard(Request::new(DeleteShardRequest {
             shard_id: Some(id(0)),
@@ -3739,12 +3709,13 @@ mod integrity_tests {
     }
 
     /// B21: an object's metadata and this OSD's small shard of it, in one
-    /// call and one log batch; a damaged shard stores neither; before the
-    /// cluster allows it, the call is refused for the gateway to fall back.
+    /// call and one log batch; a damaged shard stores neither. Taken even
+    /// before this OSD has heard the cluster is at the level: the gateway's
+    /// word for it is the cluster's.
     #[tokio::test]
     async fn a_small_shard_comes_with_its_metadata() {
         use objectio_proto::storage::{GetObjectMetaRequest, PutObjectMetaRequest, SmallShard};
-        let (_dir, mut osd) = osd();
+        let (_dir, osd) = osd();
         let data: Vec<u8> = (0..12_000u32).map(|i| (i % 253) as u8).collect();
         let object = objectio_proto::metadata::ObjectMeta {
             bucket: "b".into(),
@@ -3775,14 +3746,6 @@ mod integrity_tests {
                 .is_some()
         };
 
-        let refused = osd
-            .put_object_meta(Request::new(put(crc32c::crc32c(&data))))
-            .await
-            .unwrap_err();
-        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-        assert!(!found(&osd) && !has_meta(&osd));
-
-        osd.small_shards = || true;
         let damaged = osd
             .put_object_meta(Request::new(put(crc32c::crc32c(&data) ^ 1)))
             .await

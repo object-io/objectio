@@ -137,6 +137,16 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
             body
         })
         .collect();
+    // Small objects whose shards are kept in the OSDs' metadata records
+    // (B21): the lost drive takes its records with it.
+    let mid: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| {
+            let body = payload(20_000, 180 + u8::try_from(i).unwrap());
+            c.request("PUT", &format!("/copies/mid-{i}"), &body)
+                .expect(200);
+            body
+        })
+        .collect();
 
     // The drive is gone for good: its OSD is set out, as the runbook says,
     // and the blank drive comes back as a new OSD.
@@ -155,6 +165,7 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
     let keys: Vec<String> = (0..OBJECTS)
         .map(|i| format!("o-{i}"))
         .chain((0..OBJECTS).map(|i| format!("small-{i}")))
+        .chain((0..OBJECTS).map(|i| format!("mid-{i}")))
         .collect();
     let deadline = Instant::now() + Duration::from_secs(300);
     for key in &keys {
@@ -166,7 +177,7 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    while shard_count(&c, 0) < OBJECTS as u64 {
+    while shard_count(&c, 0) < 2 * OBJECTS as u64 {
         assert!(
             Instant::now() < deadline,
             "the replaced drive holds {} shards, wanted {OBJECTS}",
@@ -184,6 +195,11 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
         let got = c.request("GET", &format!("/copies/small-{i}"), &[]);
         assert_eq!(got.status, 200, "small-{i} unreadable: {}", got.text());
         assert_eq!(&got.bytes, body, "small-{i}");
+    }
+    for (i, body) in mid.iter().enumerate() {
+        let got = c.request("GET", &format!("/copies/mid-{i}"), &[]);
+        assert_eq!(got.status, 200, "mid-{i} unreadable: {}", got.text());
+        assert_eq!(&got.bytes, body, "mid-{i}");
     }
 }
 
