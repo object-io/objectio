@@ -328,6 +328,28 @@ impl HaCluster {
         &self.osds[i].disk
     }
 
+    /// Replace OSD `i`'s drive while it is stopped: its disk and its state
+    /// directory (its metadata and identity, on the same drive in
+    /// production) are gone. Started again, it is a new, empty OSD at the
+    /// old one's address.
+    pub fn lose_osd_drive(&self, i: usize) {
+        let o = &self.osds[i];
+        assert!(o.child.is_none(), "stop OSD {i} first");
+        let state = o.state.join("state");
+        std::fs::remove_dir_all(&state).expect("remove state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::remove_file(&o.disk).expect("remove disk");
+        std::fs::File::create(&o.disk)
+            .and_then(|f| f.set_len(2 << 30))
+            .expect("blank disk");
+    }
+
+    /// The gRPC address of OSD `i`.
+    #[must_use]
+    pub fn osd_endpoint(&self, i: usize) -> String {
+        format!("http://127.0.0.1:{}", self.osds[i].port)
+    }
+
     /// Stop OSD `i` and start it again from `bins`, on its own data.
     /// Stop OSD `i` (killed, as a crash); [`Self::start_osd`] brings it back.
     pub fn stop_osd(&mut self, i: usize) {

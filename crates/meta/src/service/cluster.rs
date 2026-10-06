@@ -39,9 +39,9 @@ impl MetaService {
                 Ok(node) => {
                     {
                         let mut nodes = self.osd_nodes.write();
-                        // A replacement at the same address (lost state, new
-                        // id) supersedes the old entry, as registration does.
-                        nodes.retain(|n| n.node_id == node.node_id || n.address != node.address);
+                        // A replacement at the same address doesn't remove the
+                        // entry it replaces: registration records that one
+                        // as lost (out, no address) in a write of its own.
                         match nodes.iter_mut().find(|n| n.node_id == node.node_id) {
                             Some(existing) => *existing = node.clone(),
                             None => nodes.push(node.clone()),
@@ -367,6 +367,24 @@ impl MetaService {
             .iter()
             .find(|n| &n.node_id == node_id)
             .map(|n| n.address.clone())
+            // A lost OSD whose address a replacement took (B26): nothing
+            // answers for it any more.
+            .filter(|a| !a.is_empty())
+    }
+
+    /// Remove a lost OSD's entry (B26): one a replacement took the address
+    /// of, once nothing refers to it any more. It has no disk left to wipe.
+    pub(crate) async fn forget_osd(&self, node_id: [u8; 16]) -> Result<(), Status> {
+        self.replicate(
+            vec![(OSD_NODES_TABLE, hex::encode(node_id), None)],
+            "forget-lost-osd",
+        )
+        .await?;
+        self.osd_nodes.write().retain(|n| n.node_id != node_id);
+        self.topology
+            .write()
+            .remove_node(NodeId::from_bytes(node_id));
+        Ok(())
     }
 
     pub fn osd_nodes_snapshot(&self) -> Vec<OsdNode> {
@@ -1213,15 +1231,15 @@ impl MetaService {
             )
         });
         let num_disks = disk_ids.len();
-        // Preserve operator intent across re-registrations: if the OSD
-        // was marked Out or Draining and the same node_id (or address)
-        // re-registers, keep it out of placement until an admin
-        // explicitly flips it back to In.
+        // Preserve operator intent across re-registrations: an OSD marked
+        // Out or Draining that re-registers stays out of placement until an
+        // admin flips it back. Only for the same OSD: a new one at another's
+        // address is a replacement and joins In.
         let prev_admin_state = {
             let nodes = self.osd_nodes.read();
             nodes
                 .iter()
-                .find(|n| n.node_id == node_id || n.address == req.address)
+                .find(|n| n.node_id == node_id)
                 .map(|n| n.admin_state)
                 .unwrap_or_default()
         };
@@ -1235,11 +1253,14 @@ impl MetaService {
             te_segment: req.te_segment.clone(),
         };
 
-        // Check if node already exists and update, or add new. We dedupe
-        // on node_id AND on address — an OSD that loses its persistent
-        // state gets a new node_id on restart, but still advertises the
-        // same hostname. Treat "same address, different node_id" as a
-        // replacement so the topology doesn't accumulate ghosts.
+        // Check if node already exists and update, or add new. A new
+        // node_id at an address another OSD holds is a replacement: the old
+        // OSD lost its drive or its state (an OSD's identity is on both), so
+        // what it held must be rebuilt elsewhere (B26). It stays registered,
+        // Out and with no address (nothing answers for it now), and is
+        // evacuated from the other copies; its entry goes once that is done.
+        // One that a drain already emptied (it has a purge record) goes now.
+        let mut lost: Vec<OsdNode> = Vec::new();
         let evicted_ids = {
             let mut nodes = self.osd_nodes.write();
             let mut evicted_ids: Vec<[u8; 16]> = Vec::new();
@@ -1255,19 +1276,29 @@ impl MetaService {
                     req.address
                 );
             } else {
-                // Evict any existing entry at the same address (stale node_id
-                // from a prior OSD process) so the tree shows live nodes only.
-                nodes.retain(|n| {
-                    if n.address == req.address && n.node_id != node_id {
-                        evicted_ids.push(n.node_id);
-                        false
-                    } else {
-                        true
+                for n in nodes.iter_mut() {
+                    if n.address != req.address || n.node_id == node_id {
+                        continue;
                     }
-                });
+                    if self.purge_state(n.node_id).is_some() {
+                        evicted_ids.push(n.node_id);
+                    } else {
+                        warn!(
+                            "OSD {} at {} was replaced by {}: it is lost; setting it out to \
+                             rebuild what it held from the other copies",
+                            hex::encode(n.node_id),
+                            req.address,
+                            hex::encode(node_id)
+                        );
+                        n.admin_state = objectio_common::OsdAdminState::Out;
+                        n.address = String::new();
+                        lost.push(n.clone());
+                    }
+                }
+                nodes.retain(|n| !evicted_ids.contains(&n.node_id));
                 if !evicted_ids.is_empty() {
                     info!(
-                        "Evicted {} stale OSD entry/entries at address {} (node_id changed)",
+                        "Removed {} drained OSD entry/entries at address {} (node_id changed)",
                         evicted_ids.len(),
                         req.address
                     );
@@ -1285,9 +1316,9 @@ impl MetaService {
 
         // Also drop the stale node_ids from the CRUSH topology so listings
         // and placement see a clean view.
-        if !evicted_ids.is_empty() {
+        if !evicted_ids.is_empty() || !lost.is_empty() {
             let mut topology = self.topology.write();
-            for id in &evicted_ids {
+            for id in evicted_ids.iter().chain(lost.iter().map(|n| &n.node_id)) {
                 let stale = NodeId::from_bytes(*id);
                 topology.remove_node(stale);
             }
@@ -1320,6 +1351,16 @@ impl MetaService {
                 .iter()
                 .map(|id| (OSD_NODES_TABLE, hex::encode(id), None)),
         );
+        for n in &lost {
+            writes.push((
+                OSD_NODES_TABLE,
+                hex::encode(n.node_id),
+                Some(
+                    objectio_meta_store::record::serialize(n)
+                        .map_err(|e| Status::internal(format!("OSD encode: {e}")))?,
+                ),
+            ));
+        }
         self.replicate(writes, "register-osd").await?;
 
         // Get current topology version

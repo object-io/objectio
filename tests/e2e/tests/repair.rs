@@ -319,3 +319,95 @@ fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
     c.restart_with_lost_disks(&[hot, (hot + 1) % 6]);
     assert_readable(&c, "spread", &bodies, "with two disks lost");
 }
+
+/// B26, as a drive is replaced in production: the OSD's drive dies with
+/// its metadata on it, a blank one goes in the same slot, and the OSD
+/// comes back new, at the same address. Nobody sets anything: the old OSD
+/// is recorded lost, everything it held is rebuilt from the other copies
+/// (shards and metadata copies, inline objects too), its entry goes, and
+/// the objects then survive two more OSDs down.
+#[test]
+fn a_drive_replaced_in_place_is_rebuilt_without_an_operator() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start(1, 6, 1);
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/swap", &[]).status, 200);
+    let big: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| payload(300_000, 50 + u8::try_from(i).unwrap()))
+        .collect();
+    let small: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| payload(1000, 150 + u8::try_from(i).unwrap()))
+        .collect();
+    for (i, b) in big.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/swap/o-{i}"), b).status, 200);
+    }
+    for (i, b) in small.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/swap/small-{i}"), b).status, 200);
+    }
+    let ids = |c: &Cluster| -> Vec<(String, String, String)> {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node_id"].as_str().unwrap_or_default().to_string(),
+                    n["address"].as_str().unwrap_or_default().to_string(),
+                    n["admin_state"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let endpoint = ha.osd_endpoint(5);
+    let old = ids(&ha.clients[0])
+        .into_iter()
+        .find(|(_, a, _)| *a == endpoint)
+        .map(|(id, ..)| id)
+        .expect("OSD 5 registered");
+
+    ha.stop_osd(5);
+    ha.lose_osd_drive(5);
+    ha.start_osd(5, None);
+
+    let c = &ha.clients[0];
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let now = ids(c);
+        let new_in = now
+            .iter()
+            .any(|(id, a, s)| *a == endpoint && *id != old && s == "in");
+        let old_gone = !now.iter().any(|(id, ..)| *id == old);
+        if new_in && old_gone {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lost OSD was not evacuated and removed: {now:?}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let keys: Vec<String> = (0..OBJECTS)
+        .map(|i| format!("o-{i}"))
+        .chain((0..OBJECTS).map(|i| format!("small-{i}")))
+        .collect();
+    for key in &keys {
+        assert!(
+            osd_has_meta(&endpoint, "swap", key),
+            "the new OSD has no metadata copy of {key}"
+        );
+    }
+
+    ha.stop_osd(0);
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    for (i, b) in big.iter().enumerate() {
+        let got = c.request("GET", &format!("/swap/o-{i}"), &[]);
+        assert_eq!(got.status, 200, "o-{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "o-{i}");
+    }
+    for (i, b) in small.iter().enumerate() {
+        let got = c.request("GET", &format!("/swap/small-{i}"), &[]);
+        assert_eq!(got.status, 200, "small-{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "small-{i}");
+    }
+}
