@@ -481,6 +481,23 @@ thread_local! {
     static META_SPACE_LOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// How long a count of objects at risk serves `GetStatus` before it is
+/// counted again: each count is a scan of every ObjectMeta the OSD holds.
+const SAFETY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A count of objects at risk: when, and for which nodes up.
+type SafetyCount = (Instant, Vec<Vec<u8>>, objectio_proto::storage::ObjectSafety);
+
+/// The last count of objects at risk, for which set of nodes up, and when;
+/// and the one scan that may be running.
+#[derive(Default)]
+struct SafetyCache {
+    last: parking_lot::Mutex<Option<SafetyCount>>,
+    scanning: parking_lot::Mutex<()>,
+    /// Counts taken since start.
+    scans: AtomicU64,
+}
+
 pub struct OsdService {
     node_id: [u8; 16],
     /// The share of a disk client writes may fill (B3); the rest is kept
@@ -499,6 +516,9 @@ pub struct OsdService {
     grpc_metrics: Arc<GrpcMetrics>,
     /// Per-bucket usage of the objects this OSD is primary for
     usage: UsageTracker,
+    /// The last count of objects at risk, for `GetStatus` (B28: it was a
+    /// scan of every ObjectMeta on every poll, from every gateway).
+    safety: SafetyCache,
     /// Renders this OSD's Prometheus exposition for `GetMetrics`. Set once
     /// the metrics state exists, which is after the service is built.
     metrics_renderer: std::sync::OnceLock<MetricsRenderer>,
@@ -915,6 +935,7 @@ impl OsdService {
             next_disk: RwLock::new(0),
             grpc_metrics: Arc::new(GrpcMetrics::default()),
             usage,
+            safety: SafetyCache::default(),
             metrics_renderer: std::sync::OnceLock::new(),
             corrupt: RwLock::new(std::collections::HashSet::new()),
             meta_space,
@@ -993,6 +1014,56 @@ impl OsdService {
     /// families.
     pub fn render_wal_metrics(&self, out: &mut String, osd_label: &str) {
         self.meta_store.render_metrics(out, osd_label);
+    }
+
+    /// Objects at risk with `up` (sorted) the nodes up: the last count if it
+    /// is for the same nodes and under [`SAFETY_EVERY`] old, else a new
+    /// one. Only one count runs at a time; a caller that would start a
+    /// second gets the last count, whatever it was for. Every gateway polls
+    /// every OSD, every few seconds with quotas set: each poll was a scan
+    /// of every ObjectMeta here.
+    fn object_safety(&self, up: Vec<Vec<u8>>) -> objectio_proto::storage::ObjectSafety {
+        let cached = || {
+            self.safety
+                .last
+                .lock()
+                .as_ref()
+                .map(|(at, nodes, s)| (*at, nodes.clone(), *s))
+        };
+        if let Some((at, nodes, s)) = cached()
+            && nodes == up
+            && at.elapsed() < SAFETY_EVERY
+        {
+            return s;
+        }
+        let Some(_one) = self.safety.scanning.try_lock() else {
+            return cached().map(|(_, _, s)| s).unwrap_or_default();
+        };
+        // Counted while this waited for the lock: done.
+        if let Some((at, nodes, s)) = cached()
+            && nodes == up
+            && at.elapsed() < SAFETY_EVERY
+        {
+            return s;
+        }
+        let set: std::collections::HashSet<Vec<u8>> = up.iter().cloned().collect();
+        // A scan of every ObjectMeta this OSD holds: off the async worker
+        // where the runtime allows.
+        let scan = || {
+            self.usage.safety(
+                self.meta_store
+                    .iter_prefix(&MetadataKey::all_object_meta_prefix())
+                    .chain(
+                        self.meta_store
+                            .iter_prefix(&MetadataKey::from_bytes(vec![b'v'])),
+                    ),
+                &set,
+            )
+        };
+        let s = blocking(scan);
+        self.safety.scans.fetch_add(1, Ordering::Relaxed);
+        *self.safety.last.lock() = Some((Instant::now(), up, s));
+        s
     }
 
     /// Per-bucket usage of the objects this OSD is primary for.
@@ -2354,33 +2425,13 @@ impl StorageService for OsdService {
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let up_nodes = request.into_inner().up_nodes;
+        let mut up_nodes = request.into_inner().up_nodes;
         let safety = if up_nodes.is_empty() {
             None
         } else {
-            let up: std::collections::HashSet<Vec<u8>> = up_nodes.into_iter().collect();
-            // A scan of every ObjectMeta this OSD holds; keep it off the
-            // async worker where the runtime allows.
-            let scan = || {
-                self.usage.safety(
-                    self.meta_store
-                        .iter_prefix(&MetadataKey::all_object_meta_prefix())
-                        .chain(
-                            self.meta_store
-                                .iter_prefix(&MetadataKey::from_bytes(vec![b'v'])),
-                        ),
-                    &up,
-                )
-            };
-            Some(
-                if tokio::runtime::Handle::current().runtime_flavor()
-                    == tokio::runtime::RuntimeFlavor::MultiThread
-                {
-                    tokio::task::block_in_place(scan)
-                } else {
-                    scan()
-                },
-            )
+            up_nodes.sort();
+            up_nodes.dedup();
+            Some(self.object_safety(up_nodes))
         };
         let mut total_capacity = 0u64;
         let mut used_capacity = 0u64;
@@ -4075,6 +4126,31 @@ mod integrity_tests {
             .expect("the older replica's shard")
             .into_inner();
         assert_eq!(&got.data[..], &data[..]);
+    }
+
+    /// B28: `GetStatus` counts objects at risk at most once a minute for
+    /// the same nodes up, not once per poll; a change in which nodes are up
+    /// is counted at once.
+    #[tokio::test]
+    async fn objects_at_risk_are_counted_once_a_minute_not_per_poll() {
+        let (_dir, osd) = osd();
+        let up = |ids: &[u8]| ids.iter().map(|i| vec![*i; 16]).collect::<Vec<_>>();
+        let ask = |nodes: Vec<Vec<u8>>| {
+            osd.get_status(Request::new(GetStatusRequest { up_nodes: nodes }))
+        };
+        for _ in 0..5 {
+            ask(up(&[1, 2, 3])).await.unwrap();
+        }
+        assert_eq!(osd.safety.scans.load(Ordering::Relaxed), 1);
+        // The same nodes, given in another order: still the same count.
+        ask(up(&[3, 1, 2])).await.unwrap();
+        assert_eq!(osd.safety.scans.load(Ordering::Relaxed), 1);
+        // A node went down: counted again.
+        ask(up(&[1, 2])).await.unwrap();
+        assert_eq!(osd.safety.scans.load(Ordering::Relaxed), 2);
+        // No nodes given: no count asked for.
+        ask(Vec::new()).await.unwrap();
+        assert_eq!(osd.safety.scans.load(Ordering::Relaxed), 2);
     }
 
     fn reopen_at(dir: &tempfile::TempDir) -> OsdService {
