@@ -112,6 +112,7 @@ fn osd_has_meta(address: &str, bucket: &str, key: &str) -> bool {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 version_id: String::new(),
+                with_small_shard: false,
             })
             .await
             .expect("GetObjectMeta")
@@ -137,6 +138,16 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
             body
         })
         .collect();
+    // Small objects whose shards are kept in the OSDs' metadata records
+    // (B21): the lost drive takes its records with it.
+    let mid: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| {
+            let body = payload(20_000, 180 + u8::try_from(i).unwrap());
+            c.request("PUT", &format!("/copies/mid-{i}"), &body)
+                .expect(200);
+            body
+        })
+        .collect();
 
     // The drive is gone for good: its OSD is set out, as the runbook says,
     // and the blank drive comes back as a new OSD.
@@ -155,6 +166,7 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
     let keys: Vec<String> = (0..OBJECTS)
         .map(|i| format!("o-{i}"))
         .chain((0..OBJECTS).map(|i| format!("small-{i}")))
+        .chain((0..OBJECTS).map(|i| format!("mid-{i}")))
         .collect();
     let deadline = Instant::now() + Duration::from_secs(300);
     for key in &keys {
@@ -166,7 +178,7 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    while shard_count(&c, 0) < OBJECTS as u64 {
+    while shard_count(&c, 0) < 2 * OBJECTS as u64 {
         assert!(
             Instant::now() < deadline,
             "the replaced drive holds {} shards, wanted {OBJECTS}",
@@ -184,6 +196,11 @@ fn a_replaced_drive_gets_back_every_metadata_copy() {
         let got = c.request("GET", &format!("/copies/small-{i}"), &[]);
         assert_eq!(got.status, 200, "small-{i} unreadable: {}", got.text());
         assert_eq!(&got.bytes, body, "small-{i}");
+    }
+    for (i, body) in mid.iter().enumerate() {
+        let got = c.request("GET", &format!("/copies/mid-{i}"), &[]);
+        assert_eq!(got.status, 200, "mid-{i} unreadable: {}", got.text());
+        assert_eq!(&got.bytes, body, "mid-{i}");
     }
 }
 
@@ -409,5 +426,88 @@ fn a_drive_replaced_in_place_is_rebuilt_without_an_operator() {
         let got = c.request("GET", &format!("/swap/small-{i}"), &[]);
         assert_eq!(got.status, 200, "small-{i}: {}", got.text());
         assert_eq!(&got.bytes, b, "small-{i}");
+    }
+}
+
+/// B26, as the soak found it: an OSD down during an overwrite and a delete
+/// keeps stale metadata copies naming the old objects' shards, which the
+/// newer writes freed. When another OSD is then lost for good, those
+/// shards can't be rebuilt, and needn't be: the evacuation brings the
+/// stale copies up to date instead of retrying them forever, and finishes.
+#[test]
+fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start(1, 6, 1);
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/stale", &[]).status, 200);
+    for i in 0..OBJECTS {
+        let body = payload(300_000, 10 + u8::try_from(i).unwrap());
+        assert_eq!(
+            c.request("PUT", &format!("/stale/o-{i}"), &body).status,
+            200
+        );
+        assert_eq!(
+            c.request("PUT", &format!("/stale/d-{i}"), &body).status,
+            200
+        );
+    }
+    // OSD 2 misses an overwrite of every o- and the delete of every d-.
+    ha.stop_osd(2);
+    let c = &ha.clients[0];
+    let newer: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| payload(300_000, 90 + u8::try_from(i).unwrap()))
+        .collect();
+    for (i, body) in newer.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/stale/o-{i}"), body).status, 200);
+        assert_eq!(
+            c.request("DELETE", &format!("/stale/d-{i}"), &[]).status,
+            204
+        );
+    }
+    ha.start_osd(2, None);
+
+    let c = &ha.clients[0];
+    let endpoint = ha.osd_endpoint(5);
+    let ids = |c: &Cluster| -> Vec<(String, String)> {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node_id"].as_str().unwrap_or_default().to_string(),
+                    n["address"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let old = ids(c)
+        .into_iter()
+        .find(|(_, a)| *a == endpoint)
+        .map(|(id, _)| id)
+        .expect("OSD 5 registered");
+    ha.stop_osd(5);
+    ha.lose_osd_drive(5);
+    ha.start_osd(5, None);
+
+    let c = &ha.clients[0];
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while ids(c).iter().any(|(id, _)| *id == old) {
+        assert!(
+            Instant::now() < deadline,
+            "the lost OSD was never evacuated: {:?}",
+            ids(c)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    for (i, body) in newer.iter().enumerate() {
+        let got = c.request("GET", &format!("/stale/o-{i}"), &[]);
+        assert_eq!(got.status, 200, "o-{i}: {}", got.text());
+        assert_eq!(&got.bytes, body, "o-{i}");
+        assert_eq!(
+            c.request("GET", &format!("/stale/d-{i}"), &[]).status,
+            404,
+            "d-{i}"
+        );
     }
 }

@@ -110,8 +110,11 @@ pub struct Args {
 
     /// How often the applied state is made durable, in ms (B25): entries
     /// are applied without a flush each, and a crash re-applies at most
-    /// this much from the log.
-    #[arg(long, default_value_t = 1000)]
+    /// this much from the log. Each checkpoint holds applies while it
+    /// flushes, so small and often: at 1000 ms, under ~700 small PUTs a
+    /// second, a checkpoint took up to 1 s and held every PUT (B21); at 200
+    /// the slowest 1% of PUTs halved.
+    #[arg(long, default_value_t = 200)]
     pub raft_checkpoint_ms: u64,
 
     /// Log entries kept behind the last snapshot: a follower behind by

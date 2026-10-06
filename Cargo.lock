@@ -2627,6 +2627,7 @@ dependencies = [
  "futures",
  "gethostname",
  "hex",
+ "nix",
  "objectio-block",
  "objectio-common",
  "objectio-erasure",

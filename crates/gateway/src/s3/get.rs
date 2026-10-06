@@ -704,13 +704,17 @@ pub(crate) async fn get_object_version_once(
     // This is done lazily below only if a node_id is missing from the map.
     phases.mark("meta_lookup");
 
-    let mut object = match object_to_read(
+    // A small object's shards come with its metadata (B21): its GET then
+    // reads no shards.
+    let mut small_shards = crate::osd_pool::SmallShards::new();
+    let mut object = match crate::s3::lock::object_to_read_with(
         &state,
         &placement.nodes,
         &bucket,
         &key,
         version_id.as_deref(),
         notes.cached_placement,
+        Some(&mut small_shards),
     )
     .await
     {
@@ -1139,6 +1143,26 @@ pub(crate) async fn get_object_version_once(
 
         let ec_shard_object_id = &stripe.object_id;
 
+        // Those that came with the metadata, checked as a shard read checks
+        // them; the loop below reads only what is still missing.
+        if stripe_idx == 0 && stripe.shards_in_metadata {
+            for (pos, data) in small_shards.drain() {
+                let Some(loc) = shard_map.get(&pos) else {
+                    continue;
+                };
+                if (pos as usize) < total_shards
+                    && loc.crc32c.is_none_or(|crc| crc32c::crc32c(&data) == crc)
+                {
+                    shards[pos as usize] = Some(data);
+                    read_count += 1;
+                } else {
+                    warn!(
+                        "shard {pos} of {bucket}/{key} sent with its metadata failed its checksum"
+                    );
+                }
+            }
+        }
+
         // Rank all shard positions by topological distance to this
         // gateway so reads pull from the nearest OSDs first. Any k of the
         // total_shards positions decode correctly, so we no longer need a
@@ -1173,6 +1197,9 @@ pub(crate) async fn get_object_version_once(
                 let Some((pos, dist)) = candidates.next() else {
                     break;
                 };
+                if shards[pos as usize].is_some() {
+                    continue;
+                }
                 let Some(shard_loc) = shard_map.get(&pos) else {
                     continue;
                 };

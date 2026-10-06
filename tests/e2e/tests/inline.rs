@@ -26,7 +26,8 @@ fn payload(len: usize) -> Vec<u8> {
 }
 
 fn ec_cluster(bucket: &str) -> Cluster {
-    let c = Cluster::start_with_ec(6, 4, 2);
+    // Small shards in metadata (B21) off: these are inlining's own tests.
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--small-shard-max", "0"]);
     c.json("POST", "/_admin/buckets", json!({"name": bucket}))
         .expect_ok();
     c
@@ -117,7 +118,12 @@ fn inline_objects_survive_a_restart() {
 /// `--inline-max-size 0` turns it off: every non-empty object is sharded.
 #[test]
 fn a_limit_of_zero_turns_inlining_off() {
-    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--inline-max-size", "0"]);
+    let c = Cluster::start_with_ec_and_args(
+        6,
+        4,
+        2,
+        &["--inline-max-size", "0", "--small-shard-max", "0"],
+    );
     c.json("POST", "/_admin/buckets", json!({"name": "off"}))
         .expect_ok();
     let before = shard_writes(&c);
