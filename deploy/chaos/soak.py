@@ -185,12 +185,23 @@ def usage():
     return None
 
 
+def fullest():
+    """The used share of the fullest OSD: while one rebuilds, the others are
+    fuller than the average and refuse writes first."""
+    status, data = chaos.admin("GET", "/_admin/nodes")
+    if status != 200:
+        return None
+    shares = [n["used_capacity"] / n["total_capacity"]
+              for n in json.loads(data).get("nodes", []) if n.get("total_capacity")]
+    return max(shares, default=None)
+
+
 def fill_control():
-    """Fill past the full ratio, then delete down to FULL_LOW, repeatedly."""
+    """Fill past the full ratio, then delete down to FULL_LOW, repeatedly
+    (on the fullest OSD)."""
     while not stop.is_set():
-        u = usage()
-        if u and u[1]:
-            ratio = u[0] / u[1]
+        ratio = fullest()
+        if ratio is not None:
             if ratio >= FULL_HIGH or (ratio >= FULL_HIGH - 0.03 and stats_full_refusals()):
                 if not draining.is_set():
                     say(f"fill: {ratio:.0%} used, deleting down to {FULL_LOW:.0%}")

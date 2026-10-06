@@ -420,18 +420,27 @@ def drive_lost(vm="chaos-5", new=None):
     say(f"drive-lost: {vm} back as OSD {back['node_id']}; evacuating {old['node_id']}")
     # The old OSD is recorded lost by itself (no admin call), evacuated
     # from the other copies, and its entry removed when that is done.
-    started = time.monotonic()
+    # How long it takes is the disks' business (B24 measures it on real
+    # hardware); here it must keep going until done: a stall fails.
+    started = last_move = time.monotonic()
+    seen = None
     while True:
         status, data = admin("GET", "/_admin/nodes")
         if status != 200:
             fail(f"/_admin/nodes: {status} {data[:200]}")
-        ids = {n["node_id"] for n in json.loads(data).get("nodes", [])}
-        if old["node_id"] not in ids:
+        nodes = {n["node_id"]: n for n in json.loads(data).get("nodes", [])}
+        if old["node_id"] not in nodes:
             break
-        if time.monotonic() - started > REPAIR_WAIT:
-            fail(f"drive-lost: {old['node_id']} not evacuated after {REPAIR_WAIT}s")
+        now = (nodes.get(back["node_id"], {}).get("shard_count"), repair_counters())
+        if now != seen:
+            seen, last_move = now, time.monotonic()
+        elif time.monotonic() - last_move > REPAIR_WAIT:
+            fail(f"drive-lost: evacuating {old['node_id']} made no progress for {REPAIR_WAIT}s")
         time.sleep(10)
-    say(f"drive-lost: {old['node_id']} evacuated in {time.monotonic() - started:.0f} s")
+    took = time.monotonic() - started
+    rebuilt = (seen or (None,))[0] or 0
+    say(f"drive-lost: {old['node_id']} evacuated in {took:.0f} s "
+        f"({rebuilt} shards on the new OSD, {rebuilt / max(took, 1):.0f}/s)")
     settle("drive-lost")
 
 
