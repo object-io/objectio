@@ -991,6 +991,12 @@ impl OsdService {
 
     /// Metadata WAL fsync latency and batching, as Prometheus families.
     pub fn render_wal_metrics(&self, out: &mut String, osd_label: &str) {
+        self.meta_store.checkpoint_seconds().render(
+            out,
+            "objectio_osd_meta_checkpoint_seconds",
+            "Time of each metadata checkpoint step: gate (writes held back), flush (memtable to index file), truncate (WAL cut)",
+            osd_label,
+        );
         let st = self.meta_store.wal_sync_stats();
         st.seconds.render(
             out,
