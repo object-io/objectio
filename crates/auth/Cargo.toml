@@ -44,7 +44,6 @@ chrono = "0.4"
 http = "1.2"
 
 # Regex for pattern matching
-regex = "1.11"
 
 # Random generation
 rand = { workspace = true }
