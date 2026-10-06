@@ -372,6 +372,9 @@ message GetObjectMetaRequest {
     string bucket = 1;
     string key = 2;
     string version_id = 3;  // Optional: get specific version
+    // Return this OSD's shard of the object with it, if the shard is kept
+    // in its metadata store (B21): a small GET in one round trip.
+    bool with_small_shard = 4;
 }
 
 message GetObjectMetaResponse {
@@ -381,6 +384,9 @@ message GetObjectMetaResponse {
     // 0 if none: a reader takes "not found" when it is newer than every
     // copy's object.
     uint64 tombstone_stamp = 3;
+    // This OSD's shard of `object`, when asked for and kept in its
+    // metadata store; checked against its checksum before it is sent.
+    SmallShard small_shard = 4;
 }
 
 // Delete object metadata request

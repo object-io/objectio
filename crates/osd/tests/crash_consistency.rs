@@ -349,6 +349,7 @@ async fn check(data: &Path, state: &Path, acked: &[Acked]) -> Vec<String> {
                 bucket: "b".into(),
                 key: a.key.clone(),
                 version_id: String::new(),
+                with_small_shard: false,
             }))
             .await
         {

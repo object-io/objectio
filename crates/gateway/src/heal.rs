@@ -180,6 +180,7 @@ async fn converge(
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 version_id: version_id.to_string(),
+                with_small_shard: false,
             }),
         )
         .await
