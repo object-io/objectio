@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 2 | object metadata at quorum: an ObjectMeta write succeeds at the write quorum, so a copy may lag (objectio-docs `core/object-metadata-quorum.md`); readers must take the newest copy |
 /// | 3 | the IAM API: paths on users, groups, roles and policies; role and policy ids; group renames; inline policies (meta table `iam_inline_policies`) |
 /// | 4 | meta's Raft log in files of its own, not in its database (objectio-docs `core/meta-log.md`): a meta node of the previous release would find its log empty |
-pub const FORMAT_LEVEL: u32 = 4;
+/// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
+pub const FORMAT_LEVEL: u32 = 5;
 
 /// The lowest active level this binary can run in: it reads every format
 /// from this level up.
