@@ -58,6 +58,9 @@ pub struct MetaStore {
     db: Arc<Database>,
 }
 
+/// A key ("{bucket}/{key}") and its home's OSD ids.
+pub type HomeRow = (String, Vec<Vec<u8>>);
+
 impl MetaStore {
     /// Borrow the underlying shared database handle. Exposed for
     /// [`crate::MetaRaftStorage`] so Raft's state-machine applies can
@@ -496,6 +499,41 @@ impl MetaStore {
             Err(_) => return None,
         };
         table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// Keys ("{bucket}/{key}") whose home has `node` at some position, and
+    /// their homes: at most `limit` of them, and how many there are in all.
+    /// `decode` gives a home's OSD ids. One pass over the table, nothing
+    /// else kept.
+    pub fn object_homes_holding(
+        &self,
+        node: &[u8],
+        limit: usize,
+        decode: impl Fn(&[u8]) -> Option<Vec<Vec<u8>>>,
+    ) -> (Vec<HomeRow>, usize) {
+        let mut found = Vec::new();
+        let mut total = 0;
+        let Ok(read_txn) = self.db.begin_read() else {
+            return (found, total);
+        };
+        let Ok(table) = read_txn.open_table(tables::OBJECT_HOMES) else {
+            return (found, total);
+        };
+        let Ok(iter) = table.iter() else {
+            return (found, total);
+        };
+        for (k, v) in iter.filter_map(Result::ok) {
+            let Some(ids) = decode(v.value()) else {
+                continue;
+            };
+            if ids.iter().any(|id| id.as_slice() == node) {
+                total += 1;
+                if found.len() < limit {
+                    found.push((k.value().to_string(), ids));
+                }
+            }
+        }
+        (found, total)
     }
 
     pub fn put_object_home(&self, key: &str, bytes: &[u8]) {

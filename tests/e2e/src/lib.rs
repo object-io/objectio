@@ -371,6 +371,26 @@ impl Cluster {
         self.restart_with_osds(self.osds);
     }
 
+    /// Restart with OSD `index`'s whole drive lost and replaced by a blank
+    /// one: its shards and, with them, its metadata (the production layout
+    /// keeps an OSD's state on a partition of its own drive). It comes back
+    /// as a new, empty OSD.
+    pub fn restart_with_lost_drive(&mut self, index: usize) {
+        assert!(
+            index < self.osds,
+            "no OSD {index} in a {}-OSD cluster",
+            self.osds
+        );
+        let _ = self.child_mut().kill();
+        let _ = self.child_mut().wait();
+        for part in ["disk0", "state"] {
+            let dir = self.data_dir.path().join(format!("osd-{index}/{part}"));
+            std::fs::remove_dir_all(&dir)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", dir.display()));
+        }
+        self.restart_with_osds(self.osds);
+    }
+
     /// The address OSD `index` registered with, as `/_admin/nodes` lists it.
     #[must_use]
     pub fn osd_address(&self, index: usize) -> String {
