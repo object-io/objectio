@@ -40,7 +40,12 @@ use tracing::{debug, info, warn};
 use crate::service::MetaService;
 
 /// Shard moves in flight at once within a sweep.
-const MOVES_AT_ONCE: usize = 8;
+const MOVES_AT_ONCE: usize = 16;
+
+/// Shards moved per sweep from a lost OSD (Out, not yet emptied: B26), at
+/// least: its shards are each one copy short until moved, so it goes as
+/// fast as rebuilding allows, not at a drain's gentle pace.
+const LOST_BATCH: usize = 512;
 
 /// Per-RPC timeout when talking to an OSD during a sweep.
 const PER_OSD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -156,16 +161,27 @@ async fn run(meta: Arc<MetaService>, every: Duration, batch: usize) {
     // admin-state=Draining) sweep stays.
     loop {
         ticker.tick().await;
-        if let Err(e) = sweep_once(&meta, batch).await {
-            warn!("drain observer sweep failed: {e}");
+        // While a sweep moves anything, the next follows at once: waiting
+        // the interval between batches made a lost OSD's 158,000 shards an
+        // eleven-hour job (B2 soak).
+        loop {
+            match sweep_once(&meta, batch).await {
+                Ok(true) => tokio::task::yield_now().await,
+                Ok(false) => break,
+                Err(e) => {
+                    warn!("drain observer sweep failed: {e}");
+                    break;
+                }
+            }
         }
     }
 }
 
-async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()> {
+/// One sweep; whether it moved anything (another may follow at once).
+async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<bool> {
     if !meta.is_raft_leader() {
         debug!("drain observer: not leader, skipping sweep");
-        return Ok(());
+        return Ok(false);
     }
 
     // Drained OSDs whose purge hasn't been confirmed yet (it was offline,
@@ -205,8 +221,9 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
     }
 
     if draining.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut moved_any = false;
 
     debug!("drain observer: sweeping {} draining OSDs", draining.len());
 
@@ -238,7 +255,9 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
         };
 
         // Move what refers to it; finalise once nothing does.
+        let batch = if out { batch.max(LOST_BATCH) } else { batch };
         let scan = migrate_batch(meta, node_id, &address, observed.is_some(), batch).await;
+        moved_any |= scan.moved > 0;
         if drain_step(Some(scan)) == DrainStep::Finalise {
             info!(
                 "drain observer: nothing refers to OSD {} any more; finalising → Out",
@@ -296,7 +315,7 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
         }
     }
 
-    Ok(())
+    Ok(moved_any)
 }
 
 /// Recorded for a drained OSD until its purge is confirmed.

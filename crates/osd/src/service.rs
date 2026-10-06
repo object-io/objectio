@@ -2439,9 +2439,18 @@ impl StorageService for OsdService {
                         req.bucket, req.key, object.version_id
                     )));
                 }
-                self.meta_store
-                    .put(version_key, value)
-                    .map_err(|e| Status::internal(format!("failed to store version entry: {e}")))?;
+                match req.shard {
+                    // An older replica's small shard (B21): kept with its
+                    // version entry, as a current one's is.
+                    Some(shard) => {
+                        self.store_with_small_shard(shard, vec![(version_key, value)])?
+                    }
+                    None => {
+                        self.meta_store.put(version_key, value).map_err(|e| {
+                            Status::internal(format!("failed to store version entry: {e}"))
+                        })?;
+                    }
+                }
                 self.usage.apply(
                     &req.bucket,
                     EntryKind::Version,
@@ -3848,6 +3857,62 @@ mod integrity_tests {
         let both = meta(true).await.unwrap().into_inner();
         assert!(both.found && both.small_shard.is_none());
         assert!(osd.corrupt.read().contains(&key));
+    }
+
+    /// B21: a replica older than the current version (replicas arrive in
+    /// any order) is kept as a version only, and its small shard with it.
+    #[tokio::test]
+    async fn an_older_replica_keeps_its_small_shard() {
+        use objectio_proto::storage::{PutObjectMetaRequest, SmallShard};
+        let (_dir, osd) = osd();
+        let data: Vec<u8> = (0..9_000u32).map(|i| (i % 241) as u8).collect();
+        let replica =
+            |version_id: String, object_id: u8, shard: Option<SmallShard>| PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(objectio_proto::metadata::ObjectMeta {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    version_id,
+                    object_id: vec![object_id; 16],
+                    stamp: 10,
+                    ..Default::default()
+                }),
+                versioning_enabled: true,
+                keep_newer_current: true,
+                shard,
+                ..Default::default()
+            };
+        let older = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let newer = uuid::Uuid::now_v7().to_string();
+        osd.put_object_meta(Request::new(replica(newer, 8, None)))
+            .await
+            .unwrap();
+        osd.put_object_meta(Request::new(replica(
+            older.clone(),
+            7,
+            Some(SmallShard {
+                shard_id: Some(id(2)),
+                data: data.clone(),
+                crc32c: crc32c::crc32c(&data),
+            }),
+        )))
+        .await
+        .unwrap();
+        assert!(
+            osd.stored_meta(&MetadataKey::object_version("b", "k", &older))
+                .is_some()
+        );
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(2)),
+                ..Default::default()
+            }))
+            .await
+            .expect("the older replica's shard")
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
     }
 
     fn reopen_at(dir: &tempfile::TempDir) -> OsdService {
