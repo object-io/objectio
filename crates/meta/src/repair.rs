@@ -1086,6 +1086,7 @@ async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<O
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             version_id: String::new(),
+            with_small_shard: false,
         }),
     )
     .await??
@@ -1145,6 +1146,7 @@ async fn quorum_current(
                 bucket: object.bucket.clone(),
                 key: object.key.clone(),
                 version_id: String::new(),
+                with_small_shard: false,
             }),
         )
         .await??

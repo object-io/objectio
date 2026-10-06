@@ -1310,7 +1310,27 @@ pub async fn get_object_version_meta_from_any(
     key: &str,
     version_id: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
-    read_object_meta(pool, placements, bucket, key, version_id, true).await
+    read_object_meta(pool, placements, bucket, key, version_id, true, None).await
+}
+
+/// Shards that came with an object's metadata (B21): position → bytes, of
+/// its first stripe, from the copies that keep them in their records.
+pub type SmallShards = HashMap<u32, bytes::Bytes>;
+
+/// As [`get_object_meta_from_any`] (or, with `every_copy`,
+/// [`get_object_meta_every_copy`]), also asking each copy for its shard of
+/// the object: when the object's shards are kept with its metadata, the
+/// read waits for k of them too, and `shards` gets them. A small GET then
+/// needs no shard reads.
+pub async fn get_object_meta_with_shards(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    every_copy: bool,
+    shards: &mut SmallShards,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, "", !every_copy, Some(shards)).await
 }
 
 /// As [`get_object_meta_from_any`], waiting for every copy: for a
@@ -1323,7 +1343,7 @@ pub async fn get_object_meta_every_copy(
     bucket: &str,
     key: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
-    read_object_meta(pool, placements, bucket, key, "", false).await
+    read_object_meta(pool, placements, bucket, key, "", false, None).await
 }
 
 async fn read_object_meta(
@@ -1333,8 +1353,11 @@ async fn read_object_meta(
     key: &str,
     version_id: &str,
     at_quorum: bool,
+    shards: Option<&mut SmallShards>,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
     use objectio_proto::storage::GetObjectMetaRequest;
+
+    let with_small_shard = shards.is_some();
 
     let targets = unique_node_placements(placements);
     if targets.is_empty() {
@@ -1350,6 +1373,7 @@ async fn read_object_meta(
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
+            with_small_shard,
         };
         let mut client = pool
             .get_client_for_placement(placement)
@@ -1372,6 +1396,7 @@ async fn read_object_meta(
                 Ok((
                     if inner.found { inner.object } else { None },
                     inner.tombstone_stamp,
+                    inner.small_shard,
                 ))
             }
             Ok(Err(e)) => {
@@ -1404,6 +1429,24 @@ async fn read_object_meta(
     let mut deleted_at = 0u64;
     let mut answered = 0;
     let mut last_err: Option<OsdPoolError> = None;
+    // Shards that came with the copies, of whichever object each holds.
+    let mut got: Vec<objectio_proto::storage::SmallShard> = Vec::new();
+    // Whether the newest object's shards are in hand: k of them, if it
+    // keeps them with its metadata and they were asked for.
+    let enough = |newest: &Option<objectio_proto::metadata::ObjectMeta>,
+                  got: &[objectio_proto::storage::SmallShard]| {
+        !with_small_shard
+            || newest.as_ref().is_none_or(|o| {
+                small_stripe(o).is_none_or(|s| {
+                    got.iter()
+                        .filter(|g| shard_of(g, s))
+                        .filter_map(|g| g.shard_id.as_ref().map(|id| id.position))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        >= s.ec_k as usize
+                })
+            })
+    };
     while let Some(answer) = futures::StreamExt::next(&mut answers).await {
         let live = |newest: &Option<objectio_proto::metadata::ObjectMeta>, deleted_at: u64| {
             newest
@@ -1411,8 +1454,9 @@ async fn read_object_meta(
                 .is_some_and(|o| deleted_at == 0 || deleted_at < o.stamp)
         };
         match answer {
-            Ok((found, tombstone)) => {
+            Ok((found, tombstone, small)) => {
                 answered += 1;
+                got.extend(small);
                 deleted_at = deleted_at.max(tombstone);
                 if let Some(o) = found
                     && newest
@@ -1424,7 +1468,7 @@ async fn read_object_meta(
             }
             Err(e) => last_err = Some(e),
         }
-        if at_quorum && answered >= quorum && live(&newest, deleted_at) {
+        if at_quorum && answered >= quorum && live(&newest, deleted_at) && enough(&newest, &got) {
             break;
         }
     }
@@ -1443,9 +1487,34 @@ async fn read_object_meta(
                 objectio_common::version::FORMAT_LEVEL
             )));
         }
+        if let (Some(shards), Some(stripe)) = (shards, small_stripe(&o)) {
+            for g in got.into_iter().filter(|g| shard_of(g, stripe)) {
+                let position = g.shard_id.as_ref().map_or(0, |id| id.position);
+                shards.insert(position, g.data.into());
+            }
+        }
         return Ok(Some(o));
     }
     Ok(None)
+}
+
+/// The stripe of `object` whose shards are kept with its metadata (B21).
+fn small_stripe(
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> Option<&objectio_proto::metadata::StripeMeta> {
+    object.stripes.first().filter(|s| s.shards_in_metadata)
+}
+
+/// Whether `shard` is one of `stripe`'s: a copy holding an older object
+/// sends that object's shard.
+fn shard_of(
+    shard: &objectio_proto::storage::SmallShard,
+    stripe: &objectio_proto::metadata::StripeMeta,
+) -> bool {
+    shard
+        .shard_id
+        .as_ref()
+        .is_some_and(|id| id.object_id == stripe.object_id && id.stripe_id == stripe.stripe_id)
 }
 
 /// One OSD's copy of one version of `key` (`""`: the current one). An
@@ -1465,6 +1534,7 @@ pub async fn get_object_version_meta_from_osd(
         bucket: bucket.to_string(),
         key: key.to_string(),
         version_id: version_id.to_string(),
+        with_small_shard: false,
     };
 
     let get_future = pool.watched(
