@@ -355,6 +355,25 @@ impl ShardIndex {
         Ok(old)
     }
 
+    /// Record `loc` for `key` and the `extra` entries in one log batch (one
+    /// flush, all or nothing: B21's small shard with its object's
+    /// metadata); what the location replaced, if anything.
+    fn record_with(
+        &self,
+        key: &str,
+        loc: &ShardLocation,
+        mut extra: Vec<(MetadataKey, Vec<u8>)>,
+    ) -> Result<Option<ShardLocation>, String> {
+        let _key = self.lock(key);
+        let old = self.get(key);
+        extra.push((OsdService::shard_loc_meta_key(key), loc.to_bytes()));
+        self.store
+            .batch_put(extra)
+            .map_err(|e| format!("record shard {key} with its metadata: {e}"))?;
+        self.counted(old.as_ref(), Some(loc));
+        Ok(old)
+    }
+
     /// Forget `key` durably; where the shard was, if it was here. Its
     /// blocks may be freed only after this returns.
     fn forget(&self, key: &str) -> Result<Option<ShardLocation>, String> {
@@ -942,6 +961,54 @@ impl OsdService {
     /// Per-bucket usage of the objects this OSD is primary for.
     pub fn bucket_usage(&self) -> Vec<objectio_proto::storage::BucketUsage> {
         self.usage.snapshot()
+    }
+
+    /// Store a small shard sent with its object's metadata (B21): its
+    /// record and `writes` in one log batch.
+    #[allow(clippy::result_large_err)] // tonic::Status, as the handlers return
+    fn store_with_small_shard(
+        &self,
+        shard: objectio_proto::storage::SmallShard,
+        writes: Vec<(MetadataKey, Vec<u8>)>,
+    ) -> Result<(), Status> {
+        if !(self.small_shards)() {
+            return Err(Status::failed_precondition(
+                "small shards are kept in metadata only once the cluster is at format level 5",
+            ));
+        }
+        let id = shard
+            .shard_id
+            .ok_or_else(|| Status::invalid_argument("small shard without an id"))?;
+        if shard.data.len() > SMALL_SHARD_MAX {
+            return Err(Status::invalid_argument(
+                "shard too large to keep in metadata",
+            ));
+        }
+        let crc32c = crc32c::crc32c(&shard.data);
+        if crc32c != shard.crc32c {
+            return Err(Status::data_loss(format!(
+                "shard has crc32c {crc32c:08x}, expected {:08x}",
+                shard.crc32c
+            )));
+        }
+        let key = Self::shard_key(&id.object_id, id.stripe_id, id.position);
+        let loc = ShardLocation {
+            disk_idx: SMALL_DISK,
+            block_num: 0,
+            size: shard.data.len() as u32,
+            crc32c,
+            created_at: Self::current_timestamp(),
+            small: Some(shard.data.to_vec()),
+        };
+        let replaced = self
+            .shard_index
+            .record_with(&key, &loc, writes)
+            .map_err(|e| Status::internal(format!("failed to store object metadata: {e}")))?;
+        if let Some(old) = replaced {
+            self.free_location(&old);
+        }
+        self.corrupt.write().remove(&key);
+        Ok(())
     }
 
     /// Where a shard is, as the RPCs report it: its disk and offset, or, for
@@ -2430,11 +2497,11 @@ impl StorageService for OsdService {
                     req.bucket, req.key
                 )));
             }
-            self.meta_store
-                .put(key, value.clone())
-                .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
-            self.usage
-                .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
+            // Everything this write stores goes in one log batch: one flush,
+            // all or nothing (B21). Usage follows once it is durable.
+            let mut writes: Vec<(MetadataKey, Vec<u8>)> = vec![(key, value.clone())];
+            let mut usage: Vec<(EntryKind, Option<ObjectMeta>, ObjectMeta)> =
+                vec![(EntryKind::Current, old.clone(), object.clone())];
 
             // The object this write replaces was stored while versioning was
             // off (the "null" version). With versioning on now, S3 keeps it as
@@ -2446,17 +2513,8 @@ impl StorageService for OsdService {
             {
                 let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
                 let replaced = self.stored_meta(&null_key);
-                self.meta_store
-                    .put(null_key, null.encode_to_vec())
-                    .map_err(|e| {
-                        Status::internal(format!("failed to keep the null version: {e}"))
-                    })?;
-                self.usage.apply(
-                    &req.bucket,
-                    EntryKind::Version,
-                    replaced.as_ref(),
-                    Some(null),
-                );
+                writes.push((null_key, null.encode_to_vec()));
+                usage.push((EntryKind::Version, replaced, null.clone()));
             }
 
             // A versioned object's own version entry is the same object: an
@@ -2471,11 +2529,20 @@ impl StorageService for OsdService {
                 let version_key =
                     MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
                 let old = self.stored_meta(&version_key);
-                self.meta_store.put(version_key, value).map_err(|e| {
-                    Status::internal(format!("failed to store version entry: {}", e))
-                })?;
+                writes.push((version_key, value));
+                usage.push((EntryKind::Version, old, object.clone()));
+            }
+
+            match req.shard {
+                // This OSD's small shard of the object, with it (B21).
+                Some(shard) => self.store_with_small_shard(shard, writes)?,
+                None => self.meta_store.batch_put(writes).map(|_| ()).map_err(|e| {
+                    Status::internal(format!("failed to store object metadata: {e}"))
+                })?,
+            }
+            for (kind, before, after) in &usage {
                 self.usage
-                    .apply(&req.bucket, EntryKind::Version, old.as_ref(), Some(&object));
+                    .apply(&req.bucket, *kind, before.as_ref(), Some(after));
             }
 
             let timestamp = Self::current_timestamp();
@@ -3669,6 +3736,83 @@ mod integrity_tests {
         .unwrap();
         assert_eq!(states(&osd, &[0]).await, vec![ShardState::Missing]);
         assert_eq!(osd.shard_index.count(), 0);
+    }
+
+    /// B21: an object's metadata and this OSD's small shard of it, in one
+    /// call and one log batch; a damaged shard stores neither; before the
+    /// cluster allows it, the call is refused for the gateway to fall back.
+    #[tokio::test]
+    async fn a_small_shard_comes_with_its_metadata() {
+        use objectio_proto::storage::{GetObjectMetaRequest, PutObjectMetaRequest, SmallShard};
+        let (_dir, mut osd) = osd();
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i % 253) as u8).collect();
+        let object = objectio_proto::metadata::ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            object_id: vec![7; 16],
+            size: 48_000,
+            stamp: 10,
+            ..Default::default()
+        };
+        let put = |crc: u32| PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(object.clone()),
+            shard: Some(SmallShard {
+                shard_id: Some(id(3)),
+                data: data.clone(),
+                crc32c: crc,
+            }),
+            ..Default::default()
+        };
+        let found = |osd: &OsdService| {
+            osd.shard_index
+                .get(&OsdService::shard_key(&id(3).object_id, 0, 3))
+                .is_some()
+        };
+        let has_meta = |osd: &OsdService| {
+            osd.stored_meta(&MetadataKey::object_meta("b", "k"))
+                .is_some()
+        };
+
+        let refused = osd
+            .put_object_meta(Request::new(put(crc32c::crc32c(&data))))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(!found(&osd) && !has_meta(&osd));
+
+        osd.small_shards = || true;
+        let damaged = osd
+            .put_object_meta(Request::new(put(crc32c::crc32c(&data) ^ 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(damaged.code(), tonic::Code::DataLoss);
+        assert!(!found(&osd) && !has_meta(&osd), "half a write was stored");
+
+        osd.put_object_meta(Request::new(put(crc32c::crc32c(&data))))
+            .await
+            .unwrap();
+        assert!(found(&osd) && has_meta(&osd));
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(3)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
+        let meta = osd
+            .get_object_meta(Request::new(GetObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(meta.found);
     }
 
     fn reopen_at(dir: &tempfile::TempDir) -> OsdService {

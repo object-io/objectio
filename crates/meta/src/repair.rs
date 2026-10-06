@@ -1055,6 +1055,7 @@ async fn update_locations(
             keep_newer_current: false,
             replication_update: false,
             replication_set: std::collections::HashMap::new(),
+            shard: None,
         };
         let result = async {
             let mut client = StorageServiceClient::new(open_channel(&addr).await?);

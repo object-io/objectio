@@ -99,6 +99,7 @@ async fn fanout_put_object_meta(
             keep_newer_current: false,
             replication_update: false,
             replication_set: std::collections::HashMap::new(),
+            shard: None,
             bucket: object.bucket.clone(),
             key: object.key.clone(),
             object: Some(object.clone()),

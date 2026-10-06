@@ -1130,6 +1130,7 @@ pub async fn put_object_meta_with(
                 keep_newer_current,
                 replication_update: false,
                 replication_set: std::collections::HashMap::new(),
+                shard: None,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 object: Some(object_meta.clone()),
@@ -2503,6 +2504,7 @@ pub async fn set_replication_status(
             object: Some(only_ids.clone()),
             replication_update: true,
             replication_set: std::iter::once((target.to_string(), status.to_string())).collect(),
+            shard: None,
             ..Default::default()
         };
         async move {
