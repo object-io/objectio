@@ -82,7 +82,8 @@ async fn fanout_put_object_meta(
             addr_set.insert(addr);
         }
     }
-    for extra in extra_addrs {
+    // A lost OSD has no address: nothing to tell it.
+    for extra in extra_addrs.iter().filter(|a| !a.is_empty()) {
         addr_set.insert((*extra).to_string());
     }
     let mut addrs: Vec<String> = addr_set.into_iter().collect();
