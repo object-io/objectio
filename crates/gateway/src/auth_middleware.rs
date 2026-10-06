@@ -18,7 +18,6 @@ use objectio_proto::metadata::{
     metadata_service_client::MetadataServiceClient,
 };
 use parking_lot::RwLock;
-use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -919,26 +918,13 @@ impl ParsedAuth {
 /// bucket created since June 2020.
 pub fn parse_authorization_header(header: &str) -> Result<ParsedAuth, AuthError> {
     if header.starts_with("AWS4-HMAC-SHA256") {
-        // SigV4 format: AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request,
-        //               SignedHeaders=host;x-amz-date, Signature=xxx
-        let re = Regex::new(
-            r"AWS4-HMAC-SHA256\s+Credential=([^/]+)/[^,]+,\s*SignedHeaders=([^,]+),\s*Signature=(\w+)"
-        ).unwrap();
-
-        let captures = re.captures(header).ok_or_else(|| {
+        let parsed = objectio_auth::sigv4::parse_authorization(header).ok_or_else(|| {
             AuthError::AccessDenied("invalid authorization header format".to_string())
         })?;
-
         Ok(ParsedAuth {
-            access_key_id: captures.get(1).unwrap().as_str().to_string(),
-            signed_headers: captures
-                .get(2)
-                .unwrap()
-                .as_str()
-                .split(';')
-                .map(|s| s.to_lowercase())
-                .collect(),
-            signature: captures.get(3).unwrap().as_str().to_string(),
+            access_key_id: parsed.access_key_id,
+            signed_headers: parsed.signed_headers,
+            signature: parsed.signature,
         })
     } else if header.starts_with("AWS ") {
         Err(AuthError::UnsupportedSigV2)
