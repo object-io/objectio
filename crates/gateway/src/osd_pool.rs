@@ -551,8 +551,19 @@ pub fn connection_broke(e: &tonic::Status) -> bool {
     // tonic reports a connection that dropped mid-call either way round:
     // "transport error", or the h2 layer's own message (seen as Unknown
     // when a meta pod restarted during a call: a 500, not a retry, before).
-    matches!(e.code(), tonic::Code::Unknown | tonic::Code::Internal)
-        && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
+    // The code depends on the h2 reason: Unknown, Internal, and
+    // ResourceExhausted (ENHANCE_YOUR_CALM, seen across a partition healing
+    // in the B2 soak), so only the message tells.
+    // A deliberate answer (not found, refused) is never one, whatever it says.
+    !matches!(
+        e.code(),
+        tonic::Code::NotFound
+            | tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+    ) && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
 }
 
 /// A shard call that did not succeed.
@@ -2098,7 +2109,14 @@ mod connection_broke_tests {
 
     #[test]
     fn a_dropped_connection_is_recognised_whatever_the_code() {
-        for code in [tonic::Code::Unknown, tonic::Code::Internal] {
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Internal,
+            // Seen across a partition healing (B2 soak): h2's
+            // ENHANCE_YOUR_CALM.
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Unavailable,
+        ] {
             assert!(connection_broke(&tonic::Status::new(
                 code,
                 "transport error"
@@ -2109,6 +2127,10 @@ mod connection_broke_tests {
             )));
         }
         assert!(!connection_broke(&tonic::Status::internal("disk exploded")));
+        // A full disk is ResourceExhausted too, and not a dropped connection.
+        assert!(!connection_broke(&tonic::Status::resource_exhausted(
+            "disk 0 is full"
+        )));
         assert!(!connection_broke(&tonic::Status::not_found(
             "transport error"
         )));
