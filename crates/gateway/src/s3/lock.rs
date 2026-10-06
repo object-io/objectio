@@ -153,6 +153,7 @@ pub(crate) async fn object_to_read(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    every_copy: bool,
 ) -> Result<ObjectMeta, Response> {
     let failed = |e: crate::osd_pool::OsdPoolError| {
         error!("Failed to get object metadata from OSDs: {e}");
@@ -174,7 +175,12 @@ pub(crate) async fn object_to_read(
         resp
     };
     let Some(wanted) = version_id else {
-        return match get_object_meta_from_any(&state.osd_pool, nodes, bucket, key).await {
+        let read = if every_copy {
+            crate::osd_pool::get_object_meta_every_copy(&state.osd_pool, nodes, bucket, key).await
+        } else {
+            get_object_meta_from_any(&state.osd_pool, nodes, bucket, key).await
+        };
+        return match read {
             Ok(Some(o)) if o.is_delete_marker => Err(marker_headers(
                 S3Error::xml_response(
                     "NoSuchKey",

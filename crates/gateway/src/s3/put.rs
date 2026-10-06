@@ -681,7 +681,12 @@ pub async fn put_object(
         })
         .await
     {
-        Ok(resp) => resp.into_inner(),
+        Ok(resp) => {
+            let p = resp.into_inner();
+            // Where a read of the key, soon after, finds it (B21).
+            crate::placement_cache::put(&bucket, &key, &p);
+            p
+        }
         Err(e) => {
             error!("Failed to get placement: {}", e);
             return meta_failure(&e, "Failed to get placement");

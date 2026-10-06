@@ -33,6 +33,7 @@ pub mod origin;
 pub mod osd_pool;
 pub mod packer;
 pub mod packs;
+pub mod placement_cache;
 pub mod post_object;
 pub mod prom;
 pub mod public_access;

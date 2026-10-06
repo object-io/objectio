@@ -1290,6 +1290,30 @@ pub async fn get_object_version_meta_from_any(
     key: &str,
     version_id: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, version_id, true).await
+}
+
+/// As [`get_object_meta_from_any`], waiting for every copy: for a
+/// placement that may be stale (the gateway's cache, B21). A quorum taken
+/// from a key's old copies may miss a write made to its new ones; all of
+/// them, which share every position but the one that moved, can't.
+pub async fn get_object_meta_every_copy(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, "", false).await
+}
+
+async fn read_object_meta(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    at_quorum: bool,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
     use objectio_proto::storage::GetObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
@@ -1380,7 +1404,7 @@ pub async fn get_object_version_meta_from_any(
             }
             Err(e) => last_err = Some(e),
         }
-        if answered >= quorum && live(&newest, deleted_at) {
+        if at_quorum && answered >= quorum && live(&newest, deleted_at) {
             break;
         }
     }
