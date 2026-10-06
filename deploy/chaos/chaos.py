@@ -406,9 +406,6 @@ def drive_lost(vm="chaos-5", new=None):
     vm_exec(vm, "systemctl stop objectio-osd")
     incus("config", "device", "remove", vm, "osd")
     vm_exec(vm, "rm -rf /var/lib/objectio/osd && mkdir -p /var/lib/objectio/osd")
-    status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "out"})
-    if status != 200:
-        fail(f"set out: {status} {data[:200]}")
     incus("storage", "volume", "create", "default", new, "--type=block", f"size={DISK_SIZE}")
     incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={new}")
     vm_exec(vm, "sleep 3; systemctl start objectio-osd")
@@ -421,21 +418,18 @@ def drive_lost(vm="chaos-5", new=None):
     else:
         fail(f"{vm} never came back as a new OSD on the blank drive")
     say(f"drive-lost: {vm} back as OSD {back['node_id']}; evacuating {old['node_id']}")
-    # The evacuation is finished when the old OSD's drain entry is gone.
+    # The old OSD is recorded lost by itself (no admin call), evacuated
+    # from the other copies, and its entry removed when that is done.
     started = time.monotonic()
-    seen = False
     while True:
-        status, data = admin("GET", "/_admin/drain-status")
+        status, data = admin("GET", "/_admin/nodes")
         if status != 200:
-            fail(f"/_admin/drain-status: {status} {data[:200]}")
-        drains = {d["node_id"]: d for d in json.loads(data).get("drains", [])}
-        if old["node_id"] in drains:
-            seen = True
-        elif seen or time.monotonic() - started > 90:
+            fail(f"/_admin/nodes: {status} {data[:200]}")
+        ids = {n["node_id"] for n in json.loads(data).get("nodes", [])}
+        if old["node_id"] not in ids:
             break
         if time.monotonic() - started > REPAIR_WAIT:
-            d = drains.get(old["node_id"], {})
-            fail(f"drive-lost: evacuation of {old['node_id']} unfinished after {REPAIR_WAIT}s: {d}")
+            fail(f"drive-lost: {old['node_id']} not evacuated after {REPAIR_WAIT}s")
         time.sleep(10)
     say(f"drive-lost: {old['node_id']} evacuated in {time.monotonic() - started:.0f} s")
     settle("drive-lost")
