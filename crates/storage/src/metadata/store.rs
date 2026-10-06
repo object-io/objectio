@@ -205,6 +205,60 @@ impl MetadataStore {
         self.get(key).is_some()
     }
 
+    /// Apply `ops` (puts and deletes, in order) in one WAL record: durable
+    /// and all or nothing.
+    pub fn write(&self, ops: Vec<MetadataOp>) -> Result<u64> {
+        if ops.is_empty() {
+            return Ok(self.wal.current_lsn());
+        }
+        let lsn = {
+            let _applying = self.gate.read();
+            let lsn = self.wal.append_batch(&ops)?;
+            for op in ops {
+                self.apply(op);
+            }
+            lsn
+        };
+        self.after_write();
+        Ok(lsn)
+    }
+
+    fn apply(&self, op: MetadataOp) {
+        match op {
+            MetadataOp::Put { key, value } => self.index.put(key.0, value),
+            MetadataOp::Delete { key } => self.index.delete(key.0),
+            MetadataOp::Batch { ops } => ops.into_iter().for_each(|op| self.apply(op)),
+        }
+    }
+
+    /// This store's metrics: its WAL's fsyncs and their batching.
+    pub fn render_metrics(&self, out: &mut String, labels: &str) {
+        use std::fmt::Write;
+        let st = self.wal.sync_stats();
+        st.seconds.render(
+            out,
+            "objectio_osd_wal_fsync_seconds",
+            "Time for one metadata WAL fdatasync",
+            labels,
+        );
+        for (name, help, v) in [
+            (
+                "objectio_osd_wal_syncs_total",
+                "Metadata WAL fdatasyncs",
+                st.syncs.load(Ordering::Relaxed),
+            ),
+            (
+                "objectio_osd_wal_records_synced_total",
+                "Metadata WAL records made durable; divide by syncs for records per fsync",
+                st.records.load(Ordering::Relaxed),
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name}{{{labels}}} {v}");
+        }
+    }
+
     /// Batch write operations
     pub fn batch_put(&self, entries: Vec<(MetadataKey, Vec<u8>)>) -> Result<u64> {
         if entries.is_empty() {
@@ -273,33 +327,6 @@ impl MetadataStore {
         self.index
             .for_each_prefix(&prefix.0, after.map(|a| a.0.as_slice()), f)
             .unwrap_or_else(|e| fatal(&e));
-    }
-
-    /// The entries under `prefix` in key order, read a page at a time: for
-    /// prefixes of any size. Not a snapshot: changes made while it runs may
-    /// or may not be seen.
-    pub fn iter_prefix(&self, prefix: &MetadataKey) -> PrefixIter<&Self> {
-        PrefixIter::new(self, prefix.clone(), None)
-    }
-
-    /// [`Self::iter_prefix`] from after `after` (which must sort at or
-    /// after `prefix`, or nothing is found).
-    pub fn iter_prefix_after(
-        &self,
-        prefix: &MetadataKey,
-        after: Option<MetadataKey>,
-    ) -> PrefixIter<&Self> {
-        PrefixIter::new(self, prefix.clone(), after)
-    }
-
-    /// [`Self::iter_prefix_after`], owning its handle on the store: for a
-    /// stream that outlives the call that made it.
-    pub fn iter_prefix_owned(
-        self: &Arc<Self>,
-        prefix: MetadataKey,
-        after: Option<MetadataKey>,
-    ) -> PrefixIter<Arc<Self>> {
-        PrefixIter::new(Arc::clone(self), prefix, after)
     }
 
     /// Take a checkpoint now: the memtable into the index file, the WAL cut.
@@ -415,52 +442,6 @@ impl MetadataStore {
             wal_lsn: self.wal.current_lsn(),
             memtable_bytes: self.index.memtable_bytes() as u64,
         }
-    }
-}
-
-/// [`MetadataStore::iter_prefix`].
-pub struct PrefixIter<S: std::ops::Deref<Target = MetadataStore>> {
-    store: S,
-    prefix: MetadataKey,
-    after: Option<MetadataKey>,
-    page: std::vec::IntoIter<(MetadataKey, Vec<u8>)>,
-    done: bool,
-}
-
-impl<S: std::ops::Deref<Target = MetadataStore>> PrefixIter<S> {
-    const PAGE: usize = 1024;
-
-    fn new(store: S, prefix: MetadataKey, after: Option<MetadataKey>) -> Self {
-        Self {
-            store,
-            prefix,
-            after,
-            page: Vec::new().into_iter(),
-            done: false,
-        }
-    }
-}
-
-impl<S: std::ops::Deref<Target = MetadataStore>> Iterator for PrefixIter<S> {
-    type Item = (MetadataKey, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(e) = self.page.next() {
-            return Some(e);
-        }
-        if self.done {
-            return None;
-        }
-        let mut page = Vec::with_capacity(Self::PAGE);
-        self.store
-            .for_each_prefix(&self.prefix, self.after.as_ref(), |k, v| {
-                page.push((MetadataKey::from_bytes(k.to_vec()), v.to_vec()));
-                page.len() < Self::PAGE
-            });
-        self.done = page.len() < Self::PAGE;
-        self.after = page.last().map(|(k, _)| k.clone());
-        self.page = page.into_iter();
-        self.page.next()
     }
 }
 
