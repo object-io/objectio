@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use objectio_proto::metadata::{ObjectMeta, ShardLocation, StripeMeta};
 use objectio_proto::storage::{
-    Checksum, FindObjectsReferencingNodeRequest, GetObjectMetaRequest, GetStatusRequest,
-    PutObjectMetaRequest, ReadShardRequest, ReadShardResponse, ShardId, WriteShardRequest,
-    storage_service_client::StorageServiceClient,
+    Checksum, DeleteObjectMetaRequest, FindObjectsReferencingNodeRequest, GetObjectMetaRequest,
+    GetStatusRequest, PutObjectMetaRequest, ReadShardRequest, ReadShardResponse, ShardId,
+    WriteShardRequest, storage_service_client::StorageServiceClient,
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tonic::transport::Channel;
@@ -588,9 +588,23 @@ async fn migrate_batch(
                 mv.shard.stripe_id,
                 mv.shard.position
             );
-            move_shard(meta, &draining, draining_addr, source_alive, &mv)
-                .await
-                .map_err(|e| anyhow::anyhow!("{what}: {e}"))
+            match move_shard(meta, &draining, draining_addr, source_alive, &mv).await {
+                Ok(()) => Ok(()),
+                // A shard only stale copies name needs no moving: they
+                // are brought up to date instead.
+                Err(e) => match settle_stale(meta, &draining, &mv).await {
+                    Ok(true) => {
+                        info!(
+                            "drain: {what}: only stale metadata copies named it; brought up to date"
+                        );
+                        Ok(())
+                    }
+                    Ok(false) => Err(anyhow::anyhow!("{what}: {e}")),
+                    Err(s) => Err(anyhow::anyhow!(
+                        "{what}: {e} (and checking for stale copies: {s})"
+                    )),
+                },
+            }
         })
         .buffer_unordered(MOVES_AT_ONCE)
         .collect()
@@ -784,7 +798,16 @@ async fn repoint_object(
     if object.usage_owner == draining.as_slice() {
         object.usage_owner.clone_from(&to.node_id);
     }
-    fanout_put_object_meta(meta, &object, &o.owner_addr, &[draining_addr]).await?;
+    // To every copy of the metadata: the key's home and the copy read, not
+    // only the OSDs with shards. A copy on an OSD that holds no shard of
+    // this object (it was down when the object was written, and healed
+    // since) would otherwise keep naming the evacuated OSD, and be found
+    // and "moved" again on every sweep.
+    let home = home_addrs(meta, &o.bucket, &o.key, draining);
+    let mut extra: Vec<&str> = home.iter().map(String::as_str).collect();
+    extra.push(&o.owner_addr);
+    extra.push(draining_addr);
+    fanout_put_object_meta(meta, &object, &o.owner_addr, &extra).await?;
     // The key's home follows its first stripe, as it is placed.
     if object
         .stripes
@@ -803,6 +826,88 @@ async fn repoint_object(
     Ok(())
 }
 
+/// The addresses of `bucket/key`'s home OSDs, but `draining`'s.
+fn home_addrs(
+    meta: &Arc<MetaService>,
+    bucket: &str,
+    key: &str,
+    draining: &[u8; 16],
+) -> Vec<String> {
+    meta.object_home(bucket, key)
+        .map(|h| h.osd_ids)
+        .unwrap_or_default()
+        .iter()
+        .filter(|id| id.as_slice() != draining.as_slice())
+        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+        .filter_map(|id| meta.osd_address_by_id(&id))
+        .collect()
+}
+
+/// Whether every ObjectMeta copy naming `mv`'s shard is stale: a copy that
+/// missed a later write or delete of its key (its OSD was down) still
+/// names the shards that write freed. Nothing can rebuild them, and no
+/// read needs them: a read quorum of the key's home has the newer object,
+/// or the delete. Each stale copy is brought up to date, the newest object
+/// written over it or the delete applied to it, so no scan finds it again.
+/// `Ok(false)`: some copy names a live object, whose shard must move.
+async fn settle_stale(
+    meta: &Arc<MetaService>,
+    draining: &[u8; 16],
+    mv: &Move,
+) -> anyhow::Result<bool> {
+    if mv.objects.is_empty() || mv.block_stripe.is_some() || mv.pack_stripe.is_some() {
+        return Ok(false);
+    }
+    for o in &mv.objects {
+        let Some(home) = meta.object_home(&o.bucket, &o.key) else {
+            return Ok(false);
+        };
+        let others = home_addrs(meta, &o.bucket, &o.key, draining);
+        let (newest, deleted_at) =
+            read_copies(&others, home.osd_ids.len(), &o.bucket, &o.key).await?;
+        if newest
+            .as_ref()
+            .is_some_and(|n| n.stripes.iter().any(|s| is_shard_of(s, &mv.shard)))
+        {
+            return Ok(false);
+        }
+        let mut client = StorageServiceClient::new(open_channel(&o.owner_addr).await?);
+        match newest {
+            Some(n) => {
+                let req = PutObjectMetaRequest {
+                    bucket: o.bucket.clone(),
+                    key: o.key.clone(),
+                    object: Some(n),
+                    // Over whatever this copy holds, unless it is newer.
+                    expected_object_id: Vec::new(),
+                    ..Default::default()
+                };
+                tokio::time::timeout(PER_OSD_TIMEOUT, client.put_object_meta(req))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("put_object_meta timeout on {}", o.owner_addr)
+                    })??;
+            }
+            None if deleted_at > 0 => {
+                let req = DeleteObjectMetaRequest {
+                    bucket: o.bucket.clone(),
+                    key: o.key.clone(),
+                    version_id: String::new(),
+                    stamp: deleted_at,
+                };
+                tokio::time::timeout(PER_OSD_TIMEOUT, client.delete_object_meta(req))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("delete_object_meta timeout on {}", o.owner_addr)
+                    })??;
+            }
+            // No copy of the key and no delete either: nothing to go by.
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// The newest copy of `bucket/key`'s ObjectMeta among `addrs`, as a read
 /// takes it: at least a read quorum of `copies` must answer, and a delete
 /// newer than every copy means none. `Ok(None)`: no current object.
@@ -812,6 +917,17 @@ async fn newest_copy(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Option<ObjectMeta>> {
+    Ok(read_copies(addrs, copies, bucket, key).await?.0)
+}
+
+/// [`newest_copy`], and the newest delete's stamp among the copies (0 if
+/// none).
+async fn read_copies(
+    addrs: &[String],
+    copies: usize,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<(Option<ObjectMeta>, u64)> {
     let asks = addrs.iter().map(|addr| async move {
         let mut client = StorageServiceClient::new(open_channel(addr).await?)
             .max_decoding_message_size(100 * 1024 * 1024);
@@ -853,7 +969,10 @@ async fn newest_copy(
             "{answered} copies answered, a read needs {read_quorum}"
         ));
     }
-    Ok(newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp))
+    Ok((
+        newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp),
+        deleted_at,
+    ))
 }
 
 /// Give `bucket/key`'s positions on the evacuated OSD to OSDs in service
