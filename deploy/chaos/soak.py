@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import random
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -224,13 +225,25 @@ def stats_full_refusals():
     return n > seen
 
 
+def incusd_mb():
+    """incusd's resident memory, in MB (None if not found)."""
+    r = subprocess.run(["ps", "-o", "rss=", "-C", "incusd"], capture_output=True, text=True)
+    try:
+        return int(r.stdout.split()[0]) // 1024
+    except (IndexError, ValueError):
+        return None
+
+
 def progress():
     while not stop.wait(300):
         u = usage()
         with lock:
             line = {"t": time.strftime("%F %T"), **stats, "keys": len(expect),
                     "draining": draining.is_set(),
-                    "used": None if not u else round(u[0] / max(u[1], 1), 3)}
+                    "used": None if not u else round(u[0] / max(u[1], 1), 3),
+                    # The harness drives everything through incusd, which
+                    # leaked to 16 GB and locked up once (2026-10-06).
+                    "incusd_mb": incusd_mb()}
         print(json.dumps(line), flush=True)
 
 
