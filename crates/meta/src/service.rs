@@ -40,6 +40,7 @@ use objectio_proto::metadata::{
     BucketMeta,
     // Bucket SSE types
     BucketSseConfiguration,
+    CallResult,
     CompleteMultipartUploadRequest,
     CompleteMultipartUploadResponse,
     // Config types
@@ -182,6 +183,8 @@ use objectio_proto::metadata::{
     GetUserGroupsResponse,
     GetUserRequest,
     GetUserResponse,
+    GetWriteContextRequest,
+    GetWriteContextResponse,
     GroupMeta,
     // Iceberg types
     IcebergCommitTableRequest,

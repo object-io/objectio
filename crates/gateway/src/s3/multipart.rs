@@ -77,7 +77,7 @@ pub(crate) async fn initiate_multipart_upload_internal(
     }
     // Object lock asked for now, checked now, applied at completion (with
     // the bucket's default retention when none is asked for).
-    if let Err(resp) = object_lock_for_write(&mut client, &bucket, headers).await {
+    if let Err(resp) = object_lock_for_write(&mut client, &bucket, headers, None).await {
         return resp;
     }
     for name in UPLOAD_LOCK_HEADERS {
@@ -1254,10 +1254,13 @@ pub(crate) async fn complete_multipart_upload_internal(
                         asked.insert(*name, v);
                     }
                 }
-                let lock = match object_lock_for_write(&mut meta_client, &bucket, &asked).await {
+                let lock = match object_lock_for_write(&mut meta_client, &bucket, &asked, None)
+                    .await
+                {
                     Ok(lock) => Ok(lock),
                     Err(_) => {
-                        object_lock_for_write(&mut meta_client, &bucket, &HeaderMap::new()).await
+                        object_lock_for_write(&mut meta_client, &bucket, &HeaderMap::new(), None)
+                            .await
                     }
                 };
                 if let Ok((retention, legal_hold)) = lock {

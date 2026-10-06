@@ -86,6 +86,13 @@ impl MetadataService for MetaService {
         Self::get_placement(self, request).await
     }
 
+    async fn get_write_context(
+        &self,
+        request: Request<GetWriteContextRequest>,
+    ) -> Result<Response<GetWriteContextResponse>, Status> {
+        Self::get_write_context(self, request).await
+    }
+
     #[allow(clippy::result_large_err)]
     async fn create_multipart_upload(
         &self,
