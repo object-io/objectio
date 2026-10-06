@@ -660,7 +660,7 @@ impl MetaService {
 
     /// The OSDs `bucket/key`'s ObjectMeta was written to, by position, if
     /// it has been written.
-    pub(super) fn object_home(&self, bucket: &str, key: &str) -> Option<ObjectHome> {
+    pub(crate) fn object_home(&self, bucket: &str, key: &str) -> Option<ObjectHome> {
         let bytes = self
             .store
             .as_ref()?
