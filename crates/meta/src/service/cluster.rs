@@ -652,6 +652,26 @@ impl MetaService {
             .ok()
     }
 
+    /// Keys whose home has `node` at some position (an OSD lost for good,
+    /// B26): at most `limit` as (bucket, key, home OSD ids), and how many
+    /// there are in all.
+    pub(crate) fn homes_holding(&self, node: &[u8; 16], limit: usize) -> (Vec<KeyHome>, usize) {
+        let Some(store) = self.store.as_ref() else {
+            return (Vec::new(), 0);
+        };
+        let (found, total) = store.object_homes_holding(node, limit, |bytes| {
+            ObjectHome::decode(bytes).ok().map(|h| h.osd_ids)
+        });
+        let found = found
+            .into_iter()
+            .filter_map(|(k, ids)| {
+                let (bucket, key) = k.split_once('/')?;
+                Some((bucket.to_string(), key.to_string(), ids))
+            })
+            .collect();
+        (found, total)
+    }
+
     /// Put `nodes` (a computed placement) at the key's home: each position
     /// on the OSD the key's ObjectMeta was written to, so it is read where
     /// it is, whatever joined or left the cluster since. A home OSD that
@@ -2183,3 +2203,6 @@ impl MetaService {
         }))
     }
 }
+
+/// A key whose home has a given OSD: (bucket, key, the home's OSD ids).
+pub(crate) type KeyHome = (String, String, Vec<Vec<u8>>);
