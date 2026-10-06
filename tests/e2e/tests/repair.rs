@@ -441,8 +441,14 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
     assert_eq!(c.request("PUT", "/stale", &[]).status, 200);
     for i in 0..OBJECTS {
         let body = payload(300_000, 10 + u8::try_from(i).unwrap());
-        assert_eq!(c.request("PUT", &format!("/stale/o-{i}"), &body).status, 200);
-        assert_eq!(c.request("PUT", &format!("/stale/d-{i}"), &body).status, 200);
+        assert_eq!(
+            c.request("PUT", &format!("/stale/o-{i}"), &body).status,
+            200
+        );
+        assert_eq!(
+            c.request("PUT", &format!("/stale/d-{i}"), &body).status,
+            200
+        );
     }
     // OSD 2 misses an overwrite of every o- and the delete of every d-.
     ha.stop_osd(2);
@@ -452,7 +458,10 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
         .collect();
     for (i, body) in newer.iter().enumerate() {
         assert_eq!(c.request("PUT", &format!("/stale/o-{i}"), body).status, 200);
-        assert_eq!(c.request("DELETE", &format!("/stale/d-{i}"), &[]).status, 204);
+        assert_eq!(
+            c.request("DELETE", &format!("/stale/d-{i}"), &[]).status,
+            204
+        );
     }
     ha.start_osd(2, None);
 
@@ -494,6 +503,10 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
         let got = c.request("GET", &format!("/stale/o-{i}"), &[]);
         assert_eq!(got.status, 200, "o-{i}: {}", got.text());
         assert_eq!(&got.bytes, body, "o-{i}");
-        assert_eq!(c.request("GET", &format!("/stale/d-{i}"), &[]).status, 404, "d-{i}");
+        assert_eq!(
+            c.request("GET", &format!("/stale/d-{i}"), &[]).status,
+            404,
+            "d-{i}"
+        );
     }
 }
