@@ -503,13 +503,27 @@ pub(crate) async fn bucket_versioning(
     meta_client: &mut MetadataServiceClient<Channel>,
     bucket: &str,
 ) -> Result<VersioningState, Response> {
-    match meta_client
-        .get_bucket_versioning(GetBucketVersioningRequest {
-            bucket: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(resp) => Ok(resp.into_inner().state()),
+    bucket_versioning_with(meta_client, bucket, None).await
+}
+
+/// [`bucket_versioning`], with meta's answer already fetched (`pre`, from
+/// `GetWriteContext`, B21) when given.
+pub(crate) async fn bucket_versioning_with(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+    pre: Option<Result<objectio_proto::metadata::GetBucketVersioningResponse, tonic::Status>>,
+) -> Result<VersioningState, Response> {
+    let answer = match pre {
+        Some(answer) => answer,
+        None => meta_client
+            .get_bucket_versioning(GetBucketVersioningRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    match answer {
+        Ok(resp) => Ok(resp.state()),
         Err(e) if e.code() == tonic::Code::NotFound => Err(S3Error::xml_response(
             "NoSuchBucket",
             "The specified bucket does not exist",

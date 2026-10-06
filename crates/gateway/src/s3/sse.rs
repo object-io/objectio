@@ -22,6 +22,18 @@ pub(crate) async fn resolve_sse_decision(
     bucket: &str,
     headers: Option<&HeaderMap>,
 ) -> Result<Option<SseDecision>, Response> {
+    resolve_sse_decision_with(meta_client, bucket, headers, None).await
+}
+
+/// [`resolve_sse_decision`], with the bucket's encryption answer already
+/// fetched (`pre`, from `GetWriteContext`, B21) when given.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn resolve_sse_decision_with(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+    headers: Option<&HeaderMap>,
+    pre: Option<Result<objectio_proto::metadata::GetBucketEncryptionResponse, tonic::Status>>,
+) -> Result<Option<SseDecision>, Response> {
     // 1. Request headers.
     if let Some(h) = headers
         && let Some(algo_hdr) = h
@@ -67,13 +79,17 @@ pub(crate) async fn resolve_sse_decision(
     }
 
     // 2. Bucket default.
-    let bucket_enc = match meta_client
-        .get_bucket_encryption(GetBucketEncryptionRequest {
-            bucket: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(r) => r.into_inner(),
+    let answer = match pre {
+        Some(answer) => answer,
+        None => meta_client
+            .get_bucket_encryption(GetBucketEncryptionRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    let bucket_enc = match answer {
+        Ok(r) => r,
         Err(e) => {
             error!("Failed to fetch bucket encryption for {bucket}: {e}");
             return Err(S3Error::from_status(&e));
@@ -353,6 +369,7 @@ pub(crate) async fn apply_put_sse(
     bucket: &str,
     headers: &HeaderMap,
     body: Bytes,
+    pre: Option<Result<objectio_proto::metadata::GetBucketEncryptionResponse, tonic::Status>>,
 ) -> Result<
     (
         Bytes,
@@ -399,7 +416,8 @@ pub(crate) async fn apply_put_sse(
         ));
     }
 
-    let Some(decision) = resolve_sse_decision(meta_client, bucket, Some(headers)).await? else {
+    let Some(decision) = resolve_sse_decision_with(meta_client, bucket, Some(headers), pre).await?
+    else {
         return Ok((
             body,
             SseAlgorithm::SseNone,

@@ -621,6 +621,18 @@ pub async fn put_object(
     // SSE: if the request header or bucket default asks for encryption,
     // encrypt the body before it enters the erasure-coding path. Shards
     // on OSDs see ciphertext; the storage layer is oblivious.
+    // What meta must answer before the data moves, in one call (B21). An
+    // older meta, without it, is asked call by call, as before.
+    let (pre_encryption, pre_versioning, pre_lock, pre_placement) =
+        match write_context(&mut meta_client, &bucket, &key, original_size).await {
+            Some(c) => (
+                Some(c.encryption),
+                Some(c.versioning),
+                Some(c.object_lock),
+                Some(c.placement),
+            ),
+            None => (None, None, None, None),
+        };
     let (
         body,
         sse_algorithm,
@@ -630,19 +642,29 @@ pub async fn put_object(
         sse_encryption_context,
         sse_response_header,
         sse_c_key_md5,
-    ) = match apply_put_sse(&state, &mut meta_client, &bucket, &headers, body).await {
+    ) = match apply_put_sse(
+        &state,
+        &mut meta_client,
+        &bucket,
+        &headers,
+        body,
+        pre_encryption,
+    )
+    .await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     phases.mark("sse");
 
     // Check bucket versioning state: a missing bucket refuses the PUT.
-    let versioning_enabled = match bucket_versioning(&mut meta_client, &bucket).await {
-        Ok(v) => v == VersioningState::VersioningEnabled,
-        Err(resp) => return resp,
-    };
+    let versioning_enabled =
+        match bucket_versioning_with(&mut meta_client, &bucket, pre_versioning).await {
+            Ok(v) => v == VersioningState::VersioningEnabled,
+            Err(resp) => return resp,
+        };
     let (lock_retention, lock_hold) =
-        match object_lock_for_write(&mut meta_client, &bucket, &headers).await {
+        match object_lock_for_write(&mut meta_client, &bucket, &headers, pre_lock).await {
             Ok(lock) => lock,
             Err(resp) => return resp,
         };
@@ -672,17 +694,20 @@ pub async fn put_object(
         .map_or(version_id, |r| r.version_id.clone());
 
     // Get placement from metadata service
-    let placement = match meta_client
-        .get_placement(GetPlacementRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            size: original_size,
-            storage_class: "STANDARD".to_string(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let p = resp.into_inner();
+    let answer = match pre_placement {
+        Some(answer) => answer,
+        None => meta_client
+            .get_placement(GetPlacementRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                size: original_size,
+                storage_class: "STANDARD".to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    let placement = match answer {
+        Ok(p) => {
             // Where a read of the key, soon after, finds it (B21).
             crate::placement_cache::put(&bucket, &key, &p);
             p
@@ -1472,4 +1497,52 @@ pub async fn put_object_with_params(
 
     // Otherwise, it's a regular PUT object
     put_object(State(state), Path((bucket, key)), auth, headers, body).await
+}
+
+/// What [`write_context`] fetched: each answer as its own call gives it.
+struct WriteContext {
+    encryption: Result<objectio_proto::metadata::GetBucketEncryptionResponse, tonic::Status>,
+    versioning: Result<objectio_proto::metadata::GetBucketVersioningResponse, tonic::Status>,
+    object_lock: Result<objectio_proto::metadata::GetObjectLockConfigResponse, tonic::Status>,
+    placement: Result<objectio_proto::metadata::GetPlacementResponse, tonic::Status>,
+}
+
+/// The bucket's encryption, versioning and object lock and the key's
+/// placement, in one meta call (`GetWriteContext`, B21). `None` if meta
+/// can't answer it (an older release): then each is asked on its own.
+async fn write_context(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+    key: &str,
+    size: u64,
+) -> Option<WriteContext> {
+    #[allow(clippy::result_large_err)] // tonic::Status, as every call returns
+    fn unpack<T: prost::Message + Default>(
+        c: Option<objectio_proto::metadata::CallResult>,
+    ) -> Result<T, tonic::Status> {
+        let c = c.ok_or_else(|| tonic::Status::internal("meta left out an answer"))?;
+        if c.code == 0 {
+            T::decode(c.response.as_slice()).map_err(|e| tonic::Status::internal(e.to_string()))
+        } else {
+            Err(tonic::Status::new(tonic::Code::from(c.code), c.message))
+        }
+    }
+    let r = meta_client
+        .get_write_context(objectio_proto::metadata::GetWriteContextRequest {
+            placement: Some(GetPlacementRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                size,
+                storage_class: "STANDARD".to_string(),
+            }),
+        })
+        .await
+        .ok()?
+        .into_inner();
+    Some(WriteContext {
+        encryption: unpack(r.encryption),
+        versioning: unpack(r.versioning),
+        object_lock: unpack(r.object_lock),
+        placement: unpack(r.placement),
+    })
 }

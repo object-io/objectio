@@ -31,16 +31,27 @@ pub(crate) async fn bucket_lock(
     meta_client: &mut MetadataServiceClient<Channel>,
     bucket: &str,
 ) -> Result<Option<ProtoObjectLockConfig>, Response> {
-    match meta_client
-        .get_object_lock_configuration(GetObjectLockConfigRequest {
-            bucket: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            let inner = resp.into_inner();
-            Ok(inner.config.filter(|c| inner.found && c.enabled))
-        }
+    bucket_lock_with(meta_client, bucket, None).await
+}
+
+/// [`bucket_lock`], with meta's answer already fetched (`pre`, from
+/// `GetWriteContext`, B21) when given.
+pub(crate) async fn bucket_lock_with(
+    meta_client: &mut MetadataServiceClient<Channel>,
+    bucket: &str,
+    pre: Option<Result<objectio_proto::metadata::GetObjectLockConfigResponse, tonic::Status>>,
+) -> Result<Option<ProtoObjectLockConfig>, Response> {
+    let answer = match pre {
+        Some(answer) => answer,
+        None => meta_client
+            .get_object_lock_configuration(GetObjectLockConfigRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    match answer {
+        Ok(inner) => Ok(inner.config.filter(|c| inner.found && c.enabled)),
         Err(e) if e.code() == tonic::Code::NotFound => Err(S3Error::xml_response(
             "NoSuchBucket",
             "The specified bucket does not exist",
@@ -74,6 +85,7 @@ pub(crate) async fn object_lock_for_write(
     meta_client: &mut MetadataServiceClient<Channel>,
     bucket: &str,
     headers: &HeaderMap,
+    pre: Option<Result<objectio_proto::metadata::GetObjectLockConfigResponse, tonic::Status>>,
 ) -> Result<(Option<ObjectRetention>, Option<LegalHold>), Response> {
     let header = |name: &str| {
         headers
@@ -87,7 +99,7 @@ pub(crate) async fn object_lock_for_write(
     let invalid =
         |msg: &str| S3Error::xml_response("InvalidArgument", msg, StatusCode::BAD_REQUEST);
 
-    let config = bucket_lock(meta_client, bucket).await?;
+    let config = bucket_lock_with(meta_client, bucket, pre).await?;
     let Some(config) = config else {
         if mode.is_some() || until.is_some() || hold.is_some() {
             return Err(lock_not_configured());

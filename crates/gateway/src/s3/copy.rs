@@ -318,7 +318,7 @@ pub(crate) async fn copy_by_reference(
     // A copy is a new object: its lock is the request's or the bucket's
     // default, never the source's.
     let (lock_retention, lock_hold) =
-        match object_lock_for_write(&mut meta_client, dest_bucket, copy_headers).await {
+        match object_lock_for_write(&mut meta_client, dest_bucket, copy_headers, None).await {
             Ok(lock) => lock,
             Err(resp) => {
                 back_out(state, format!("copy to {dest_bucket}/{dest_key}"));
