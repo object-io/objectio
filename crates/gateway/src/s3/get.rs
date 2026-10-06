@@ -653,14 +653,9 @@ pub(crate) async fn get_object_version_once(
         .iter()
         .map(|n| (n.node_id.clone(), n.te_segment.clone()))
         .collect();
-    if let Ok(resp) = meta_client
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: false,
-        })
-        .await
-    {
-        for n in resp.into_inner().nodes {
+    // From the gateway's list of OSDs, not a meta call per GET (B21).
+    if let Some(nodes) = crate::node_cache::nodes(&meta_client).await {
+        for n in nodes.iter().cloned() {
             node_address_map
                 .entry(n.node_id.clone())
                 .or_insert_with(|| n.address.clone());
@@ -1451,16 +1446,10 @@ pub(crate) async fn resolve_node_address(
         return addr.clone();
     }
 
-    // Slow path: node not in placement (topology may have changed).
-    // Fetch all active nodes and populate the map.
-    if let Ok(resp) = meta_client
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: false,
-        })
-        .await
-    {
-        for n in &resp.into_inner().nodes {
+    // Slow path: an OSD the gateway's list doesn't know (it joined since
+    // the last refresh): ask meta now, and keep the answer.
+    if let Some(nodes) = crate::node_cache::refresh(meta_client).await {
+        for n in nodes.iter() {
             node_map
                 .entry(n.node_id.clone())
                 .or_insert_with(|| n.address.clone());

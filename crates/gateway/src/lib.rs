@@ -28,6 +28,7 @@ pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
 pub mod metrics_middleware;
+pub mod node_cache;
 pub mod origin;
 pub mod osd_pool;
 pub mod packer;
