@@ -2,7 +2,6 @@
 //!
 //! Implements S3-compatible bucket policies with IAM-like permissions.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -1168,18 +1167,7 @@ impl PolicyEvaluator {
 
     /// Match a pattern with wildcards (* and ?)
     fn matches_pattern(&self, pattern: &str, value: &str) -> bool {
-        // Convert S3/IAM wildcard pattern to regex
-        let regex_pattern = pattern
-            .replace('.', r"\.")
-            .replace('*', ".*")
-            .replace('?', ".");
-
-        let regex_pattern = format!("^{}$", regex_pattern);
-
-        match Regex::new(&regex_pattern) {
-            Ok(re) => re.is_match(value),
-            Err(_) => pattern == value,
-        }
+        wildcard_match(pattern, value)
     }
 
     /// Check if IP matches a CIDR range (e.g., `10.0.0.0/8`, `192.168.1.0/24`).
@@ -1189,6 +1177,38 @@ impl PolicyEvaluator {
     fn ip_matches_cidr(&self, ip: &IpAddr, cidr: &str) -> bool {
         cidr_contains(cidr, ip)
     }
+}
+
+/// Whether `value` matches the IAM wildcard `pattern`: `*` is any run of
+/// characters (none too), `?` any one character, everything else itself.
+/// No regex: the pattern used to be turned into one (escaping only `.`, so
+/// `+`, `(`, `[`, `|` or `$` in an ARN were read as regex syntax) and
+/// compiled on every evaluation. Linear in practice: one backtrack point,
+/// the last `*`.
+#[must_use]
+pub fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = value.chars().collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    // The last `*` seen, and where in `value` it started matching.
+    let mut star: Option<(usize, usize)> = None;
+    while j < v.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == v[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some((i, j));
+            i += 1;
+        } else if let Some((si, sj)) = star {
+            // Let the last `*` take one more character.
+            i = si + 1;
+            j = sj + 1;
+            star = Some((si, sj + 1));
+        } else {
+            return false;
+        }
+    }
+    p[i..].iter().all(|&c| c == '*')
 }
 
 /// Whether `ip` is in `cidr` (`10.0.0.0/8`, `fd00::/8`, or a bare address).
@@ -1231,6 +1251,38 @@ pub fn cidr_contains(cidr: &str, ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wildcards_match_as_iam_says_and_nothing_else_is_special() {
+        for (p, v, want) in [
+            ("*", "", true),
+            ("*", "anything", true),
+            ("", "", true),
+            ("", "a", false),
+            ("s3:Get*", "s3:GetObject", true),
+            ("s3:Get*", "s3:PutObject", false),
+            ("a?c", "abc", true),
+            ("a?c", "ac", false),
+            ("a*b*c", "axxbyyc", true),
+            ("a*b*c", "axxbyy", false),
+            ("**", "x", true),
+            ("*a", "bbba", true),
+            ("*a", "bbab", false),
+            // Regex syntax is literal here. The old regex form read `+` as
+            // "one or more" and `(`/`[` as groups and classes.
+            ("arn:obio:s3:::b/a+b", "arn:obio:s3:::b/aab", false),
+            ("arn:obio:s3:::b/a+b", "arn:obio:s3:::b/a+b", true),
+            ("arn:obio:s3:::b/(x|y)", "arn:obio:s3:::b/x", false),
+            ("arn:obio:s3:::b/(x|y)", "arn:obio:s3:::b/(x|y)", true),
+            ("arn:obio:s3:::b/[ab]", "arn:obio:s3:::b/a", false),
+            ("arn:obio:s3:::b/k$", "arn:obio:s3:::b/k$", true),
+            ("arn:obio:s3:::b/a.c", "arn:obio:s3:::b/abc", false),
+            ("ключ/*", "ключ/объект", true),
+            ("ключ/?", "ключ/ж", true),
+        ] {
+            assert_eq!(wildcard_match(p, v), want, "{p:?} vs {v:?}");
+        }
+    }
 
     #[test]
     fn test_policy_parsing() {
