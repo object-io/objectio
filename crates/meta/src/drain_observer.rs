@@ -243,6 +243,24 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<()>
                 "drain observer: nothing refers to OSD {} any more; finalising → Out",
                 hex::encode(node_id)
             );
+            if address.is_empty() {
+                // Lost, its address taken by a replacement: nothing to
+                // wipe, so its entry just goes.
+                match meta.forget_osd(node_id).await {
+                    Ok(()) => {
+                        meta.clear_drain_progress(&node_id);
+                        info!(
+                            "drain observer: lost OSD {} evacuated; entry removed",
+                            hex::encode(node_id)
+                        );
+                    }
+                    Err(e) => warn!(
+                        "drain observer: removing lost OSD {}: {e}",
+                        hex::encode(node_id)
+                    ),
+                }
+                continue;
+            }
             let flipped = if out {
                 Ok(())
             } else {
