@@ -305,10 +305,11 @@ pub(crate) async fn get_object_attributes(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let object = match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref()).await {
-        Ok(o) => o,
-        Err(resp) => return resp,
-    };
+    let object =
+        match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref(), false).await {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
     if let Some(refused) = sse_c_read_refusal(headers, &object) {
         return refused;
     }
@@ -426,10 +427,11 @@ pub(crate) async fn get_object_part(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let object = match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref()).await {
-        Ok(o) => o,
-        Err(resp) => return resp,
-    };
+    let object =
+        match object_to_read(&state, &nodes, &bucket, &key, version_id.as_deref(), false).await {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
     let (start, end, count) = match part_bounds(&object, part_number) {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -550,12 +552,18 @@ pub(crate) async fn get_object_version(
         &mut notes,
     )
     .await;
-    // A packed object read through a cached pack record that failed: the
-    // pack may have moved (repair, drain). Once more, asking meta.
-    if resp.status().is_server_error() && !notes.cached_packs.is_empty() {
+    // A read through a cached pack record or placement that failed (or,
+    // through a cached placement, found nothing): the pack, or the key's
+    // home, may have moved (repair, drain, an evacuation). Once more,
+    // asking meta.
+    let stale_packs = resp.status().is_server_error() && !notes.cached_packs.is_empty();
+    let stale_placement = notes.cached_placement
+        && (resp.status().is_server_error() || resp.status() == StatusCode::NOT_FOUND);
+    if stale_packs || stale_placement {
         state
             .pack_cache
             .forget(notes.cached_packs.iter().map(Vec::as_slice));
+        crate::placement_cache::forget(&bucket, &key);
         resp = get_object_version_once(state, bucket, key, version_id, headers, true, &mut notes)
             .await;
     }
@@ -580,6 +588,8 @@ pub(crate) async fn get_object_version(
 pub(crate) struct ReadNotes {
     /// Packs resolved from the cache.
     pub(crate) cached_packs: Vec<Vec<u8>>,
+    /// Whether the placement came from the cache (B21).
+    pub(crate) cached_placement: bool,
     /// `x-amz-expiration` for the object read.
     pub(crate) expiration: Option<header::HeaderValue>,
     /// `x-amz-replication-status` for the object read.
@@ -587,7 +597,7 @@ pub(crate) struct ReadNotes {
 }
 
 /// One attempt at [`get_object_version`]. `fresh_packs` resolves packs
-/// from meta, not the cache; `notes` gets what the caller needs to know.
+/// and the placement from meta, not the caches; `notes` gets what the caller needs to know.
 pub(crate) async fn get_object_version_once(
     state: Arc<AppState>,
     bucket: String,
@@ -608,20 +618,35 @@ pub(crate) async fn get_object_version_once(
     let mut phases = crate::gateway_metrics::PhaseTimer::start("GetObject");
     let mut meta_client = state.meta_client.clone();
 
-    // Get placement to find primary OSD (CRUSH is deterministic)
-    let placement = match meta_client
-        .get_placement(GetPlacementRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            size: 0, // Size not needed for lookup
-            storage_class: "STANDARD".to_string(),
-        })
-        .await
-    {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            error!("Failed to get placement: {}", e);
-            return meta_failure(&e, "Failed to get placement");
+    // Where the key's copies are: meta's answer, remembered for a while
+    // (B21), unless this is the retry after a stale one.
+    let cached = if fresh_packs {
+        None
+    } else {
+        crate::placement_cache::get(&bucket, &key)
+    };
+    notes.cached_placement = cached.is_some();
+    let placement = if let Some(p) = cached {
+        p
+    } else {
+        match meta_client
+            .get_placement(GetPlacementRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                size: 0, // Size not needed for lookup
+                storage_class: "STANDARD".to_string(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let p = resp.into_inner();
+                crate::placement_cache::put(&bucket, &key, &p);
+                p
+            }
+            Err(e) => {
+                error!("Failed to get placement: {}", e);
+                return meta_failure(&e, "Failed to get placement");
+            }
         }
     };
 
@@ -653,14 +678,9 @@ pub(crate) async fn get_object_version_once(
         .iter()
         .map(|n| (n.node_id.clone(), n.te_segment.clone()))
         .collect();
-    if let Ok(resp) = meta_client
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: false,
-        })
-        .await
-    {
-        for n in resp.into_inner().nodes {
+    // From the gateway's list of OSDs, not a meta call per GET (B21).
+    if let Some(nodes) = crate::node_cache::nodes(&meta_client).await {
+        for n in nodes.iter().cloned() {
             node_address_map
                 .entry(n.node_id.clone())
                 .or_insert_with(|| n.address.clone());
@@ -690,6 +710,7 @@ pub(crate) async fn get_object_version_once(
         &bucket,
         &key,
         version_id.as_deref(),
+        notes.cached_placement,
     )
     .await
     {
@@ -1451,16 +1472,10 @@ pub(crate) async fn resolve_node_address(
         return addr.clone();
     }
 
-    // Slow path: node not in placement (topology may have changed).
-    // Fetch all active nodes and populate the map.
-    if let Ok(resp) = meta_client
-        .get_listing_nodes(GetListingNodesRequest {
-            bucket: String::new(),
-            include_all_states: false,
-        })
-        .await
-    {
-        for n in &resp.into_inner().nodes {
+    // Slow path: an OSD the gateway's list doesn't know (it joined since
+    // the last refresh): ask meta now, and keep the answer.
+    if let Some(nodes) = crate::node_cache::refresh(meta_client).await {
+        for n in nodes.iter() {
             node_map
                 .entry(n.node_id.clone())
                 .or_insert_with(|| n.address.clone());
@@ -1529,6 +1544,7 @@ pub async fn head_object(
         &bucket,
         &key,
         params.version_id.as_deref(),
+        false,
     )
     .await
     {

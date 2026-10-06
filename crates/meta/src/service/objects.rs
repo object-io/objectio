@@ -335,6 +335,50 @@ impl MetaService {
         Ok(response)
     }
 
+    /// Everything a PUT asks before its data moves, in one call (B21): the
+    /// bucket's encryption, versioning and object lock, and the key's
+    /// placement, each answered by its own handler, exactly as if called.
+    pub(crate) async fn get_write_context(
+        &self,
+        request: Request<GetWriteContextRequest>,
+    ) -> Result<Response<GetWriteContextResponse>, Status> {
+        fn packed<T: prost::Message>(r: Result<Response<T>, Status>) -> CallResult {
+            match r {
+                Ok(resp) => CallResult {
+                    code: 0,
+                    message: String::new(),
+                    response: resp.into_inner().encode_to_vec(),
+                },
+                Err(s) => CallResult {
+                    code: s.code() as i32,
+                    message: s.message().to_string(),
+                    response: Vec::new(),
+                },
+            }
+        }
+        let placement = request
+            .into_inner()
+            .placement
+            .ok_or_else(|| Status::invalid_argument("placement request missing"))?;
+        let bucket = placement.bucket.clone();
+        let (encryption, versioning, object_lock, placement) = tokio::join!(
+            self.get_bucket_encryption(Request::new(GetBucketEncryptionRequest {
+                bucket: bucket.clone(),
+            })),
+            self.get_bucket_versioning(Request::new(GetBucketVersioningRequest {
+                bucket: bucket.clone(),
+            })),
+            self.get_object_lock_configuration(Request::new(GetObjectLockConfigRequest { bucket })),
+            self.get_placement(Request::new(placement)),
+        );
+        Ok(Response::new(GetWriteContextResponse {
+            encryption: Some(packed(encryption)),
+            versioning: Some(packed(versioning)),
+            object_lock: Some(packed(object_lock)),
+            placement: Some(packed(placement)),
+        }))
+    }
+
     /// Get all active nodes for scatter-gather listing operations
     pub(crate) async fn get_listing_nodes(
         &self,

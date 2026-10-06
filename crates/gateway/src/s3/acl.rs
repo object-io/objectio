@@ -60,7 +60,7 @@ pub(crate) async fn get_acl(
             Ok(n) => n,
             Err(resp) => return resp,
         };
-        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version_id).await {
+        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version_id, false).await {
             return resp;
         }
     }
@@ -105,7 +105,7 @@ pub(crate) async fn put_acl(
         let version = headers
             .get("x-amz-version-id")
             .and_then(|v| v.to_str().ok());
-        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version).await {
+        if let Err(resp) = object_to_read(state, &nodes, bucket, key, version, false).await {
             return resp;
         }
     }

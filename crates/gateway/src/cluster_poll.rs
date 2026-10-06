@@ -179,10 +179,10 @@ async fn poll_once(
         return false;
     };
 
+    let nodes = resp.into_inner().nodes;
+    crate::node_cache::record(nodes.clone());
     let mut seen = HashSet::new();
-    let targets: Vec<(String, Vec<u8>)> = resp
-        .into_inner()
-        .nodes
+    let targets: Vec<(String, Vec<u8>)> = nodes
         .into_iter()
         .filter(|n| seen.insert(n.address.clone()))
         .map(|n| (n.address, n.node_id))
