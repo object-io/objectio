@@ -464,21 +464,21 @@ fn spawn_admin_bootstrap(
     tokio::spawn(async move {
         loop {
             if let Some((access_key_id, secret_access_key)) = svc.admin_credentials(&admin_name) {
-                info!("============================================");
-                info!("Admin credentials (save these!):");
-                info!("  Access Key ID:     {}", access_key_id);
-                info!("  Secret Access Key: {}", secret_access_key);
-                info!("============================================");
+                // The secret goes only to the file, readable by its owner:
+                // logs are shipped and kept where anyone may read them.
                 let creds_path = data_dir.join("admin-creds.env");
                 let body = format!(
                     "# Created by objectio-meta on first boot. Safe to delete.\n\
                      export AWS_ACCESS_KEY_ID={access_key_id}\n\
                      export AWS_SECRET_ACCESS_KEY={secret_access_key}\n"
                 );
-                match std::fs::write(&creds_path, body) {
-                    Ok(()) => info!("Wrote admin creds to {}", creds_path.display()),
+                match write_private(&creds_path, body.as_bytes()) {
+                    Ok(()) => info!(
+                        "Admin access key {access_key_id}; its secret is in {} (only its owner can read it)",
+                        creds_path.display()
+                    ),
                     Err(e) => error!(
-                        "Failed to write admin creds to {}: {e}",
+                        "Admin access key {access_key_id}; failed to write its credentials to {}: {e}",
                         creds_path.display()
                     ),
                 }
@@ -492,6 +492,22 @@ fn spawn_admin_bootstrap(
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     });
+}
+
+/// Write `body` to `path`, readable and writable by its owner only.
+fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // An existing file keeps its mode through `open`: set it.
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    f.write_all(body)?;
+    f.sync_all()
 }
 
 /// Metrics state for the Meta service
