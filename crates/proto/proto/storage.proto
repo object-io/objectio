@@ -343,6 +343,10 @@ message PutObjectMetaRequest {
     // `object.version_id` are used; refused if neither entry holds it.
     bool replication_update = 9;
     map<string, string> replication_set = 10;
+    // This OSD's shard of a small object (B21): kept in its record and
+    // written with the metadata in one log batch, one flush. Sent only once
+    // the cluster is finalized at format level 5.
+    SmallShard shard = 11;
 }
 
 message PutObjectMetaResponse {
@@ -479,4 +483,11 @@ message PurgeRequest {
 message PurgeResponse {
     uint64 shards = 1;    // shards removed
     uint64 entries = 2;   // object/version metadata entries removed
+}
+
+// A small shard sent with its object's metadata (B21).
+message SmallShard {
+    ShardId shard_id = 1;
+    bytes data = 2;
+    uint32 crc32c = 3;
 }

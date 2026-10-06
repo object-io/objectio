@@ -156,9 +156,10 @@ pub(crate) async fn commit_put(
     versioning_enabled: bool,
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
+    small: Option<&SmallShards>,
 ) -> Result<(), Response> {
     if !object_meta.replica_of.is_empty() {
-        return commit_replica(state, placement, object_meta, sent).await;
+        return commit_replica(state, placement, object_meta, sent, small).await;
     }
     // Marked for replication in the same write that commits it: a version
     // is never committed and then forgotten.
@@ -171,6 +172,7 @@ pub(crate) async fn commit_put(
         versioning_enabled,
         sent,
         condition,
+        small,
     )
     .await?;
     if let Some(object) = marked {
@@ -188,6 +190,7 @@ pub(crate) async fn commit_replica(
     placement: &objectio_proto::metadata::GetPlacementResponse,
     object_meta: ObjectMeta,
     sent: Vec<ShardTarget>,
+    small: Option<&SmallShards>,
 ) -> Result<(), Response> {
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
     let written = crate::osd_pool::put_object_meta_with(
@@ -199,6 +202,9 @@ pub(crate) async fn commit_replica(
         crate::osd_pool::MetaWrite {
             versioning_enabled: true,
             keep_newer_current: true,
+            // A small replica's shards go with its metadata too (B21).
+            small_shards: small.map(|s| &s.shards),
+            min_copies: small.map_or(0, |s| s.quorum),
             ..Default::default()
         },
     )
@@ -227,7 +233,16 @@ pub(crate) async fn commit_new(
     versioning_enabled: bool,
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
+    small: Option<&SmallShards>,
 ) -> Result<(), Response> {
+    // Small shards travel with the metadata (B21): each copy is a shard
+    // too, so the write needs the shard quorum (k + 1) as well.
+    let write = crate::osd_pool::MetaWrite {
+        versioning_enabled,
+        small_shards: small.map(|s| &s.shards),
+        min_copies: small.map_or(0, |s| s.quorum),
+        ..Default::default()
+    };
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
     let what = format!("{bucket}/{key}");
     let nodes = &placement.nodes;
@@ -269,14 +284,13 @@ pub(crate) async fn commit_new(
                 ),
             });
         }
-        let outcome = put_object_meta_to_all(
+        let outcome = crate::osd_pool::put_object_meta_with(
             &state.osd_pool,
             nodes,
             &bucket,
             &key,
             object_meta,
-            versioning_enabled,
-            &[],
+            write,
         )
         .await;
         settle_commit(
@@ -296,14 +310,13 @@ pub(crate) async fn commit_new(
 
     let mut listing_client = state.meta_client.clone();
     let committed = commit_object(
-        put_object_meta_to_all(
+        crate::osd_pool::put_object_meta_with(
             &state.osd_pool,
             nodes,
             &bucket,
             &key,
             object_meta,
-            versioning_enabled,
-            &[],
+            write,
         ),
         async { listing_client.create_object(listing_req).await.map(drop) },
         // The listing follows whatever is current on the OSDs: the object
@@ -963,6 +976,7 @@ pub async fn put_object(
             versioning_enabled,
             sent,
             &condition,
+            None,
         )
         .await
         {
@@ -1048,6 +1062,24 @@ pub async fn put_object(
     let mut all_stripes = Vec::with_capacity(num_stripes);
     let mut total_shards_written = 0;
     let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
+    // A small object (B21): one stripe whose shards each fit in an OSD's
+    // metadata record, on as many OSDs as shards, once the cluster allows
+    // it. Its shards go with its metadata, in the commit: one call and one
+    // flush per OSD.
+    let mut small: Option<SmallShards> = None;
+    let small_object = num_stripes == 1
+        && ec_type == ErasureType::ErasureMds
+        && state.rdma.is_none()
+        && body.len().div_ceil(ec_k as usize) <= state.small_shard_max
+        && objectio_common::version::allows(objectio_common::version::SMALL_SHARDS_LEVEL)
+        && placement.nodes.len() == total_shards
+        && placement
+            .nodes
+            .iter()
+            .map(|n| n.node_id.as_slice())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == total_shards;
 
     for stripe_idx in 0..num_stripes {
         let stripe_start = stripe_idx * max_stripe_data_size;
@@ -1158,6 +1190,57 @@ pub async fn put_object(
             shards.len(),
             shards.first().map(|s| s.len()).unwrap_or(0)
         );
+
+        if small_object {
+            let mut shards_by_node = std::collections::HashMap::with_capacity(total_shards);
+            let mut shard_locs = Vec::with_capacity(total_shards);
+            for (i, (shard, node)) in shards.iter().zip(&placement.nodes).enumerate() {
+                let pos = i as u32;
+                pending.sent(node, &object_id, stripe_idx as u64, pos);
+                let crc = crc32c::crc32c(shard);
+                shard_locs.push(ShardLocation {
+                    position: pos,
+                    node_id: node.node_id.clone(),
+                    disk_id: vec![0u8; 16],
+                    offset: 0,
+                    shard_type: node.shard_type,
+                    local_group: node.local_group,
+                    crc32c: Some(crc),
+                });
+                shards_by_node.insert(
+                    node.node_id.clone(),
+                    objectio_proto::storage::SmallShard {
+                        shard_id: Some(objectio_proto::storage::ShardId {
+                            object_id: object_id.to_vec(),
+                            stripe_id: stripe_idx as u64,
+                            position: pos,
+                        }),
+                        data: shard.to_vec(),
+                        crc32c: crc,
+                    },
+                );
+            }
+            total_shards_written += total_shards;
+            small = Some(SmallShards {
+                shards: shards_by_node,
+                quorum: write_quorum(ec_k, ec_m),
+            });
+            all_stripes.push(StripeMeta {
+                stripe_id: stripe_idx as u64,
+                ec_k,
+                ec_m,
+                shards: shard_locs,
+                ec_type: placement.ec_type,
+                ec_local_parity: placement.ec_local_parity,
+                ec_global_parity: placement.ec_global_parity,
+                local_group_size: placement.local_group_size,
+                data_size: stripe_data_size,
+                object_id: object_id.to_vec(),
+                shards_in_metadata: true,
+                ..Default::default()
+            });
+            continue;
+        }
 
         // Write shards to OSDs in parallel
         let mut write_futures = Vec::with_capacity(total_shards);
@@ -1372,6 +1455,7 @@ pub async fn put_object(
         versioning_enabled,
         sent,
         &condition,
+        small.as_ref(),
     )
     .await
     {
@@ -1545,4 +1629,11 @@ async fn write_context(
         object_lock: unpack(r.object_lock),
         placement: unpack(r.placement),
     })
+}
+
+/// A small object's shards, sent with its metadata (B21): each OSD's by
+/// node id, and how many copies the write needs.
+pub(crate) struct SmallShards {
+    pub(crate) shards: std::collections::HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    pub(crate) quorum: usize,
 }

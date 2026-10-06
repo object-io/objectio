@@ -210,7 +210,16 @@ struct ShardLocation {
     size: u32,
     crc32c: u32,
     created_at: u64,
+    /// A small shard's bytes, kept in its record rather than in a disk block
+    /// (B21: written, with its object's metadata, in one log flush);
+    /// `disk_idx` is then [`SMALL_DISK`].
+    small: Option<Vec<u8>>,
 }
+
+/// The `disk_idx` of a shard kept in its record (B21).
+const SMALL_DISK: usize = u32::MAX as usize;
+
+use objectio_common::version::SMALL_SHARD_MAX;
 
 /// How a [`ShardLocation`] is stored in the metadata log: protobuf.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -225,6 +234,9 @@ struct ShardLocationRecord {
     crc32c: u32,
     #[prost(uint64, tag = "5")]
     created_at: u64,
+    /// A small shard's bytes (B21), with `disk_idx` `u32::MAX`.
+    #[prost(bytes = "vec", tag = "6")]
+    small: Vec<u8>,
 }
 
 impl ShardLocation {
@@ -235,17 +247,24 @@ impl ShardLocation {
             size: self.size,
             crc32c: self.crc32c,
             created_at: self.created_at,
+            small: self.small.clone().unwrap_or_default(),
         })
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
         let r = <ShardLocationRecord as prost::Message>::decode(bytes)?;
+        let small = (r.disk_idx == u32::MAX).then_some(r.small);
         Ok(Self {
-            disk_idx: r.disk_idx as usize,
+            disk_idx: if small.is_some() {
+                SMALL_DISK
+            } else {
+                r.disk_idx as usize
+            },
             block_num: r.block_num,
             size: r.size,
             crc32c: r.crc32c,
             created_at: r.created_at,
+            small,
         })
     }
 }
@@ -264,6 +283,8 @@ struct ShardIndex {
     store: Arc<MetadataStore>,
     /// Shards per disk.
     per_disk: Vec<AtomicU64>,
+    /// Shards kept in their records (B21).
+    small: AtomicU64,
     /// A key's read-modify-write (replace, remove) runs under its stripe.
     stripes: Vec<parking_lot::Mutex<()>>,
 }
@@ -275,6 +296,7 @@ impl ShardIndex {
         Self {
             store,
             per_disk: (0..num_disks).map(|_| AtomicU64::new(0)).collect(),
+            small: AtomicU64::new(0),
             stripes: (0..Self::STRIPES)
                 .map(|_| parking_lot::Mutex::new(()))
                 .collect(),
@@ -300,11 +322,19 @@ impl ShardIndex {
         self.get(key).is_some()
     }
 
+    fn counter(&self, l: &ShardLocation) -> Option<&AtomicU64> {
+        if l.small.is_some() {
+            Some(&self.small)
+        } else {
+            self.per_disk.get(l.disk_idx)
+        }
+    }
+
     fn counted(&self, gone: Option<&ShardLocation>, new: Option<&ShardLocation>) {
-        if let Some(c) = gone.and_then(|l| self.per_disk.get(l.disk_idx)) {
+        if let Some(c) = gone.and_then(|l| self.counter(l)) {
             c.fetch_sub(1, Ordering::Relaxed);
         }
-        if let Some(c) = new.and_then(|l| self.per_disk.get(l.disk_idx)) {
+        if let Some(c) = new.and_then(|l| self.counter(l)) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -314,6 +344,25 @@ impl ShardIndex {
         let _key = self.lock(key);
         let old = self.get(key);
         OsdService::persist_shard_location(&self.store, key, loc)?;
+        self.counted(old.as_ref(), Some(loc));
+        Ok(old)
+    }
+
+    /// Record `loc` for `key` and the `extra` entries in one log batch (one
+    /// flush, all or nothing: B21's small shard with its object's
+    /// metadata); what the location replaced, if anything.
+    fn record_with(
+        &self,
+        key: &str,
+        loc: &ShardLocation,
+        mut extra: Vec<(MetadataKey, Vec<u8>)>,
+    ) -> Result<Option<ShardLocation>, String> {
+        let _key = self.lock(key);
+        let old = self.get(key);
+        extra.push((OsdService::shard_loc_meta_key(key), loc.to_bytes()));
+        self.store
+            .batch_put(extra)
+            .map_err(|e| format!("record shard {key} with its metadata: {e}"))?;
         self.counted(old.as_ref(), Some(loc));
         Ok(old)
     }
@@ -353,7 +402,8 @@ impl ShardIndex {
         self.per_disk
             .iter()
             .map(|c| c.load(Ordering::Relaxed))
-            .sum()
+            .sum::<u64>()
+            + self.small.load(Ordering::Relaxed)
     }
 
     fn count_on(&self, disk_idx: usize) -> u64 {
@@ -727,6 +777,11 @@ impl OsdService {
                     return true;
                 }
             };
+            if loc.small.is_some() {
+                // In its record, on no disk: nothing to reconcile.
+                shard_index.counted(None, Some(&loc));
+                return true;
+            }
             if formatted_now.get(loc.disk_idx).copied().unwrap_or(false) {
                 lost.push(MetadataKey::from_bytes(k.to_vec()));
                 return true;
@@ -908,6 +963,71 @@ impl OsdService {
         self.usage.snapshot()
     }
 
+    /// Store a small shard sent with its object's metadata (B21): its
+    /// record and `writes` in one log batch.
+    #[allow(clippy::result_large_err)] // tonic::Status, as the handlers return
+    fn store_with_small_shard(
+        &self,
+        shard: objectio_proto::storage::SmallShard,
+        writes: Vec<(MetadataKey, Vec<u8>)>,
+    ) -> Result<(), Status> {
+        // No level check here: a gateway sends a shard with the metadata
+        // only once the cluster is finalized at SMALL_SHARDS_LEVEL, which
+        // every node then reads (levels only rise). This OSD may not have
+        // heard yet; it doesn't need to.
+        let id = shard
+            .shard_id
+            .ok_or_else(|| Status::invalid_argument("small shard without an id"))?;
+        if shard.data.len() > SMALL_SHARD_MAX {
+            return Err(Status::invalid_argument(
+                "shard too large to keep in metadata",
+            ));
+        }
+        let crc32c = crc32c::crc32c(&shard.data);
+        if crc32c != shard.crc32c {
+            return Err(Status::data_loss(format!(
+                "shard has crc32c {crc32c:08x}, expected {:08x}",
+                shard.crc32c
+            )));
+        }
+        let key = Self::shard_key(&id.object_id, id.stripe_id, id.position);
+        let loc = ShardLocation {
+            disk_idx: SMALL_DISK,
+            block_num: 0,
+            size: shard.data.len() as u32,
+            crc32c,
+            created_at: Self::current_timestamp(),
+            small: Some(shard.data.to_vec()),
+        };
+        let replaced = self
+            .shard_index
+            .record_with(&key, &loc, writes)
+            .map_err(|e| Status::internal(format!("failed to store object metadata: {e}")))?;
+        if let Some(old) = replaced {
+            self.free_location(&old);
+        }
+        self.corrupt.write().remove(&key);
+        Ok(())
+    }
+
+    /// Where a shard is, as the RPCs report it: its disk and offset, or, for
+    /// one kept in its record (B21), no disk.
+    fn block_location(&self, loc: &ShardLocation) -> BlockLocation {
+        let (disk_id, offset) = match self.disks.get(loc.disk_idx) {
+            Some(disk) if loc.small.is_none() => (
+                self.disk_ids[loc.disk_idx].to_vec(),
+                loc.block_num * disk.block_size() as u64,
+            ),
+            _ => (vec![0u8; 16], 0),
+        };
+        BlockLocation {
+            node_id: self.node_id.to_vec(),
+            disk_id,
+            offset,
+            size: loc.size,
+        }
+    }
+
     /// Return a shard's blocks to the pool. The index entry must already be
     /// gone, so a crash in between leaks a block rather than handing a live
     /// shard's block to the next write.
@@ -962,6 +1082,17 @@ impl OsdService {
             let Some((last, _)) = page.last() else { break };
             after = Some(last.clone());
             for (key, loc) in page {
+                if let Some(data) = &loc.small {
+                    if crc32c::crc32c(data) != loc.crc32c {
+                        self.mark_corrupt(&key, loc.block_num);
+                    }
+                    bytes += u64::from(loc.size);
+                    self.scrub.shards.fetch_add(1, Ordering::Relaxed);
+                    self.scrub
+                        .bytes
+                        .fetch_add(u64::from(loc.size), Ordering::Relaxed);
+                    continue;
+                }
                 if loc.disk_idx >= self.disks.len() {
                     continue;
                 }
@@ -1768,6 +1899,7 @@ impl StorageService for OsdService {
             size: data.len() as u32,
             crc32c,
             created_at: timestamp,
+            small: None,
         };
         // Durable before acknowledged: the shard's bytes are synced, and
         // its location must be too, or a restart forgets the shard and the
@@ -1851,23 +1983,34 @@ impl StorageService for OsdService {
             Status::not_found("shard not found")
         })?;
 
-        let disk = &self.disks[location.disk_idx];
+        let data = if let Some(small) = location.small.clone() {
+            // Kept in its record (B21): checked against the checksum
+            // recorded with it, as a block's own checks would.
+            if crc32c::crc32c(&small) != location.crc32c {
+                self.mark_corrupt(&key, location.block_num);
+                return Err(Status::data_loss("shard failed its checksum"));
+            }
+            small
+        } else {
+            let disk = &self.disks[location.disk_idx];
 
-        // Async read — same semantics, reactor stays free during I/O.
-        let read_started = Instant::now();
-        let read = disk.read_block_async(location.block_num).await;
-        DISK_SECONDS.observe_duration("op=\"read\"", read_started.elapsed());
-        let (_header, data) = read.map_err(|e| {
-            self.grpc_metrics.read_shard.record(
-                false,
-                start.elapsed().as_micros() as u64,
-                bytes_in,
-                0,
-            );
-            // Unreadable is as good as gone: report it for rebuilding.
-            self.mark_corrupt(&key, location.block_num);
-            Status::data_loss(format!("shard is unreadable: {e}"))
-        })?;
+            // Async read — same semantics, reactor stays free during I/O.
+            let read_started = Instant::now();
+            let read = disk.read_block_async(location.block_num).await;
+            DISK_SECONDS.observe_duration("op=\"read\"", read_started.elapsed());
+            let (_header, data) = read.map_err(|e| {
+                self.grpc_metrics.read_shard.record(
+                    false,
+                    start.elapsed().as_micros() as u64,
+                    bytes_in,
+                    0,
+                );
+                // Unreadable is as good as gone: report it for rebuilding.
+                self.mark_corrupt(&key, location.block_num);
+                Status::data_loss(format!("shard is unreadable: {e}"))
+            })?;
+            data
+        };
 
         debug!(
             "ReadShard: object={}, stripe={}, pos={}, size={}",
@@ -2013,16 +2156,9 @@ impl StorageService for OsdService {
             .get(&key)
             .ok_or_else(|| Status::not_found("shard not found"))?;
 
-        let disk = &self.disks[location.disk_idx];
-
         Ok(Response::new(GetShardMetaResponse {
             shard_id: Some(shard_id),
-            location: Some(BlockLocation {
-                node_id: self.node_id.to_vec(),
-                disk_id: self.disk_ids[location.disk_idx].to_vec(),
-                offset: location.block_num * disk.block_size() as u64,
-                size: location.size,
-            }),
+            location: Some(self.block_location(&location)),
             size: location.size,
             checksum: Some(Checksum {
                 crc32c: location.crc32c,
@@ -2062,20 +2198,13 @@ impl StorageService for OsdService {
                 continue;
             }
 
-            let disk = &self.disks[location.disk_idx];
-
             shards.push(GetShardMetaResponse {
                 shard_id: Some(objectio_proto::storage::ShardId {
                     object_id,
                     stripe_id,
                     position,
                 }),
-                location: Some(BlockLocation {
-                    node_id: self.node_id.to_vec(),
-                    disk_id: self.disk_ids[location.disk_idx].to_vec(),
-                    offset: location.block_num * disk.block_size() as u64,
-                    size: location.size,
-                }),
+                location: Some(self.block_location(&location)),
                 size: location.size,
                 checksum: Some(Checksum {
                     crc32c: location.crc32c,
@@ -2282,9 +2411,18 @@ impl StorageService for OsdService {
                         req.bucket, req.key, object.version_id
                     )));
                 }
-                self.meta_store
-                    .put(version_key, value)
-                    .map_err(|e| Status::internal(format!("failed to store version entry: {e}")))?;
+                match req.shard {
+                    // An older replica's small shard (B21): kept with its
+                    // version entry, as a current one's is.
+                    Some(shard) => {
+                        self.store_with_small_shard(shard, vec![(version_key, value)])?
+                    }
+                    None => {
+                        self.meta_store.put(version_key, value).map_err(|e| {
+                            Status::internal(format!("failed to store version entry: {e}"))
+                        })?;
+                    }
+                }
                 self.usage.apply(
                     &req.bucket,
                     EntryKind::Version,
@@ -2325,11 +2463,11 @@ impl StorageService for OsdService {
                     req.bucket, req.key
                 )));
             }
-            self.meta_store
-                .put(key, value.clone())
-                .map_err(|e| Status::internal(format!("failed to store object metadata: {}", e)))?;
-            self.usage
-                .apply(&req.bucket, EntryKind::Current, old.as_ref(), Some(&object));
+            // Everything this write stores goes in one log batch: one flush,
+            // all or nothing (B21). Usage follows once it is durable.
+            let mut writes: Vec<(MetadataKey, Vec<u8>)> = vec![(key, value.clone())];
+            let mut usage: Vec<(EntryKind, Option<ObjectMeta>, ObjectMeta)> =
+                vec![(EntryKind::Current, old.clone(), object.clone())];
 
             // The object this write replaces was stored while versioning was
             // off (the "null" version). With versioning on now, S3 keeps it as
@@ -2341,17 +2479,8 @@ impl StorageService for OsdService {
             {
                 let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
                 let replaced = self.stored_meta(&null_key);
-                self.meta_store
-                    .put(null_key, null.encode_to_vec())
-                    .map_err(|e| {
-                        Status::internal(format!("failed to keep the null version: {e}"))
-                    })?;
-                self.usage.apply(
-                    &req.bucket,
-                    EntryKind::Version,
-                    replaced.as_ref(),
-                    Some(null),
-                );
+                writes.push((null_key, null.encode_to_vec()));
+                usage.push((EntryKind::Version, replaced, null.clone()));
             }
 
             // A versioned object's own version entry is the same object: an
@@ -2366,11 +2495,20 @@ impl StorageService for OsdService {
                 let version_key =
                     MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
                 let old = self.stored_meta(&version_key);
-                self.meta_store.put(version_key, value).map_err(|e| {
-                    Status::internal(format!("failed to store version entry: {}", e))
-                })?;
+                writes.push((version_key, value));
+                usage.push((EntryKind::Version, old, object.clone()));
+            }
+
+            match req.shard {
+                // This OSD's small shard of the object, with it (B21).
+                Some(shard) => self.store_with_small_shard(shard, writes)?,
+                None => self.meta_store.batch_put(writes).map(|_| ()).map_err(|e| {
+                    Status::internal(format!("failed to store object metadata: {e}"))
+                })?,
+            }
+            for (kind, before, after) in &usage {
                 self.usage
-                    .apply(&req.bucket, EntryKind::Version, old.as_ref(), Some(&object));
+                    .apply(&req.bucket, *kind, before.as_ref(), Some(after));
             }
 
             let timestamp = Self::current_timestamp();
@@ -3009,6 +3147,7 @@ mod shard_index_tests {
             size: 64 * 1024,
             crc32c: 0xDEAD_BEEF,
             created_at: 1_700_000_000,
+            small: None,
         }
     }
 
@@ -3493,6 +3632,235 @@ mod integrity_tests {
 
     fn payload(seed: u8) -> Vec<u8> {
         (0..50_000u32).map(|i| (i % 241) as u8 ^ seed).collect()
+    }
+
+    /// Store `data` as this OSD's small shard of object `b/k` (position 0),
+    /// sent with its metadata as a gateway does (B21).
+    async fn put_small(osd: &OsdService, data: &[u8]) {
+        use objectio_proto::storage::{PutObjectMetaRequest, SmallShard};
+        osd.put_object_meta(Request::new(PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(objectio_proto::metadata::ObjectMeta {
+                bucket: "b".into(),
+                key: "k".into(),
+                object_id: vec![7; 16],
+                stamp: 1,
+                ..Default::default()
+            }),
+            shard: Some(SmallShard {
+                shard_id: Some(id(0)),
+                data: data.to_vec(),
+                crc32c: crc32c::crc32c(data),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    }
+
+    /// B21: a small shard sent with its metadata is kept in its record: no
+    /// disk block, read back, checked, counted, kept across a restart,
+    /// found rotten by the scrubber when its bytes no longer match their
+    /// checksum, rewritten (to a block, as repair does) and deleted like any
+    /// shard.
+    #[tokio::test]
+    async fn a_small_shard_lives_in_its_record() {
+        let (dir, osd) = osd();
+        let free_before = osd.disks[0].free_space();
+        let small: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        put_small(&osd, &small).await;
+        assert_eq!(
+            osd.disks[0].free_space(),
+            free_before,
+            "it took a disk block"
+        );
+        let key = OsdService::shard_key(&id(0).object_id, 0, 0);
+        assert!(osd.shard_index.get(&key).unwrap().small.is_some());
+        async fn read(osd: &OsdService, crc: u32) -> Result<Response<ReadShardResponse>, Status> {
+            osd.read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(0)),
+                expected_crc32c: Some(crc),
+                ..Default::default()
+            }))
+            .await
+        }
+        let crc = crc32c::crc32c(&small);
+        assert_eq!(
+            &read(&osd, crc).await.unwrap().into_inner().data[..],
+            &small[..]
+        );
+        assert_eq!(states(&osd, &[0]).await, vec![ShardState::Ok]);
+        assert_eq!(osd.shard_index.count(), 1);
+        drop(osd);
+
+        let osd = reopen_at(&dir);
+        assert_eq!(osd.shard_index.count(), 1, "not counted after a restart");
+        assert_eq!(
+            &read(&osd, crc).await.unwrap().into_inner().data[..],
+            &small[..]
+        );
+
+        // Its bytes rot in the record: the scrubber finds it, reads refuse
+        // it, and a rewrite clears it.
+        let mut bad = osd.shard_index.get(&key).unwrap();
+        bad.small.as_mut().unwrap()[5] ^= 0xff;
+        OsdService::persist_shard_location(&osd.meta_store, &key, &bad).unwrap();
+        osd.scrub_pass(0).await;
+        assert_eq!(states(&osd, &[0]).await, vec![ShardState::Corrupt]);
+        assert_eq!(
+            read(&osd, crc).await.unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        write(&osd, 0, &small).await;
+        assert_eq!(states(&osd, &[0]).await, vec![ShardState::Ok]);
+        assert_eq!(
+            &read(&osd, crc).await.unwrap().into_inner().data[..],
+            &small[..]
+        );
+
+        osd.delete_shard(Request::new(DeleteShardRequest {
+            shard_id: Some(id(0)),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(states(&osd, &[0]).await, vec![ShardState::Missing]);
+        assert_eq!(osd.shard_index.count(), 0);
+    }
+
+    /// B21: an object's metadata and this OSD's small shard of it, in one
+    /// call and one log batch; a damaged shard stores neither. Taken even
+    /// before this OSD has heard the cluster is at the level: the gateway's
+    /// word for it is the cluster's.
+    #[tokio::test]
+    async fn a_small_shard_comes_with_its_metadata() {
+        use objectio_proto::storage::{GetObjectMetaRequest, PutObjectMetaRequest, SmallShard};
+        let (_dir, osd) = osd();
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i % 253) as u8).collect();
+        let object = objectio_proto::metadata::ObjectMeta {
+            bucket: "b".into(),
+            key: "k".into(),
+            object_id: vec![7; 16],
+            size: 48_000,
+            stamp: 10,
+            ..Default::default()
+        };
+        let put = |crc: u32| PutObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            object: Some(object.clone()),
+            shard: Some(SmallShard {
+                shard_id: Some(id(3)),
+                data: data.clone(),
+                crc32c: crc,
+            }),
+            ..Default::default()
+        };
+        let found = |osd: &OsdService| {
+            osd.shard_index
+                .get(&OsdService::shard_key(&id(3).object_id, 0, 3))
+                .is_some()
+        };
+        let has_meta = |osd: &OsdService| {
+            osd.stored_meta(&MetadataKey::object_meta("b", "k"))
+                .is_some()
+        };
+
+        let damaged = osd
+            .put_object_meta(Request::new(put(crc32c::crc32c(&data) ^ 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(damaged.code(), tonic::Code::DataLoss);
+        assert!(!found(&osd) && !has_meta(&osd), "half a write was stored");
+
+        osd.put_object_meta(Request::new(put(crc32c::crc32c(&data))))
+            .await
+            .unwrap();
+        assert!(found(&osd) && has_meta(&osd));
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(3)),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
+        let meta = osd
+            .get_object_meta(Request::new(GetObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(meta.found);
+    }
+
+    /// B21: a replica older than the current version (replicas arrive in
+    /// any order) is kept as a version only, and its small shard with it.
+    #[tokio::test]
+    async fn an_older_replica_keeps_its_small_shard() {
+        use objectio_proto::storage::{PutObjectMetaRequest, SmallShard};
+        let (_dir, osd) = osd();
+        let data: Vec<u8> = (0..9_000u32).map(|i| (i % 241) as u8).collect();
+        let replica =
+            |version_id: String, object_id: u8, shard: Option<SmallShard>| PutObjectMetaRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                object: Some(objectio_proto::metadata::ObjectMeta {
+                    bucket: "b".into(),
+                    key: "k".into(),
+                    version_id,
+                    object_id: vec![object_id; 16],
+                    stamp: 10,
+                    ..Default::default()
+                }),
+                versioning_enabled: true,
+                keep_newer_current: true,
+                shard,
+                ..Default::default()
+            };
+        let older = uuid::Uuid::now_v7().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let newer = uuid::Uuid::now_v7().to_string();
+        osd.put_object_meta(Request::new(replica(newer, 8, None)))
+            .await
+            .unwrap();
+        osd.put_object_meta(Request::new(replica(
+            older.clone(),
+            7,
+            Some(SmallShard {
+                shard_id: Some(id(2)),
+                data: data.clone(),
+                crc32c: crc32c::crc32c(&data),
+            }),
+        )))
+        .await
+        .unwrap();
+        assert!(
+            osd.stored_meta(&MetadataKey::object_version("b", "k", &older))
+                .is_some()
+        );
+        let got = osd
+            .read_shard(Request::new(ReadShardRequest {
+                shard_id: Some(id(2)),
+                ..Default::default()
+            }))
+            .await
+            .expect("the older replica's shard")
+            .into_inner();
+        assert_eq!(&got.data[..], &data[..]);
+    }
+
+    fn reopen_at(dir: &tempfile::TempDir) -> OsdService {
+        OsdService::new(
+            vec![dir.path().join("disk.raw").display().to_string()],
+            64 * 1024,
+            dir.path().join("state"),
+        )
+        .unwrap()
     }
 
     #[tokio::test]

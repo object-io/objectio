@@ -1061,6 +1061,12 @@ pub struct MetaWrite<'a> {
     pub version_only: bool,
     /// A replica: made current only if no newer version is.
     pub keep_newer_current: bool,
+    /// Each OSD's small shard of the object, by node id, sent with the
+    /// metadata (B21): a copy is then the shard too, so the write needs the
+    /// shard quorum as well as the metadata one.
+    pub small_shards: Option<&'a HashMap<Vec<u8>, objectio_proto::storage::SmallShard>>,
+    /// The fewest copies the write needs, if more than the metadata quorum.
+    pub min_copies: usize,
 }
 
 /// As [`put_object_meta_to_all`], with every option the OSD takes.
@@ -1078,6 +1084,8 @@ pub async fn put_object_meta_with(
         expected_object_id,
         version_only,
         keep_newer_current,
+        small_shards,
+        min_copies,
     } = write;
 
     let targets = unique_node_placements(placements);
@@ -1141,6 +1149,7 @@ pub async fn put_object_meta_with(
                 keep_newer_current,
                 replication_update: false,
                 replication_set: std::collections::HashMap::new(),
+                shard: small_shards.and_then(|m| m.get(&placement.node_id).cloned()),
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 object: Some(object_meta.clone()),
@@ -1219,7 +1228,7 @@ pub async fn put_object_meta_with(
             .collect::<Vec<_>>();
     };
 
-    let quorum = meta_write_quorum(targets.len());
+    let quorum = meta_write_quorum(targets.len()).max(min_copies);
     let mut displaced = Vec::with_capacity(results.len());
     let mut failure: Option<OsdPoolError> = None;
     let mut unapplied = true;
@@ -2563,6 +2572,7 @@ pub async fn set_replication_status(
             object: Some(only_ids.clone()),
             replication_update: true,
             replication_set: std::iter::once((target.to_string(), status.to_string())).collect(),
+            shard: None,
             ..Default::default()
         };
         async move {

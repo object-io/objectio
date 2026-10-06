@@ -244,6 +244,11 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     inline_max_size: usize,
 
+    /// The largest shard sent with its object's metadata (B21). Forwarded
+    /// to the gateway; 0 turns it off.
+    #[arg(long, default_value_t = 16 * 1024)]
+    small_shard_max: usize,
+
     /// Seconds between repair passes, which rebuild missing or corrupt
     /// shards and restore missing listing entries. Forwarded to meta; 0
     /// turns it off.
@@ -879,6 +884,8 @@ async fn main() -> Result<()> {
     }
     gw_argv.push("--inline-max-size".into());
     gw_argv.push(args.inline_max_size.to_string());
+    gw_argv.push("--small-shard-max".into());
+    gw_argv.push(args.small_shard_max.to_string());
     if !args.prometheus_url.is_empty() {
         gw_argv.push("--prometheus-url".into());
         gw_argv.push(args.prometheus_url.trim_end_matches('/').to_string());
