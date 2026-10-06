@@ -6,13 +6,14 @@
 use super::disk_index::DiskIndex;
 use super::types::{MetadataKey, MetadataOp};
 use super::wal::{MetadataWal, WalConfig};
+use objectio_common::histogram::{HistogramVec, LATENCY_BUCKETS};
 use objectio_common::{Error, Result};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Metadata store configuration
@@ -73,6 +74,10 @@ pub struct MetadataStore {
     /// and exclusively by a checkpoint to freeze the memtable with nothing
     /// in between ([`checkpoint`]).
     gate: Arc<RwLock<()>>,
+    /// How long each checkpoint step takes (`step`): `gate`, waiting for
+    /// the writes in flight and holding new ones back; `flush`, the frozen
+    /// memtable into the index file; `truncate`, the WAL cut.
+    checkpoint_seconds: Arc<HistogramVec>,
     shutdown: Arc<AtomicBool>,
     /// Wakes the checkpoint thread: for shutdown, and when a write fills
     /// the memtable or the WAL.
@@ -134,6 +139,7 @@ impl MetadataStore {
             config,
             compaction_lock: Arc::new(Mutex::new(())),
             gate: Arc::new(RwLock::new(())),
+            checkpoint_seconds: Arc::new(HistogramVec::new(LATENCY_BUCKETS)),
             shutdown: Arc::new(AtomicBool::new(false)),
             signal: Arc::new((Mutex::new(()), Condvar::new())),
             compaction_handle: Mutex::new(None),
@@ -305,7 +311,7 @@ impl MetadataStore {
     /// Take a checkpoint now: the memtable into the index file, the WAL cut.
     pub fn checkpoint(&self) -> Result<()> {
         let _one = self.compaction_lock.lock();
-        checkpoint(&self.wal, &self.index, &self.gate)
+        checkpoint(&self.wal, &self.index, &self.gate, &self.checkpoint_seconds)
     }
 
     /// Take a checkpoint if one is due.
@@ -331,6 +337,7 @@ impl MetadataStore {
         let signal = Arc::clone(&self.signal);
         let interval = self.config.compaction_interval;
         let gate = Arc::clone(&self.gate);
+        let timings = Arc::clone(&self.checkpoint_seconds);
         let compaction_lock = Arc::clone(&self.compaction_lock);
         let config = self.config.clone();
 
@@ -352,7 +359,7 @@ impl MetadataStore {
                 }
                 if checkpoint_due(&wal, &index, &config) {
                     let _one = compaction_lock.lock();
-                    match checkpoint(&wal, &index, &gate) {
+                    match checkpoint(&wal, &index, &gate, &timings) {
                         Ok(()) => debug!("checkpoint done"),
                         Err(e) => {
                             error!("checkpoint failed: {}", e);
@@ -402,6 +409,11 @@ impl MetadataStore {
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// How long each checkpoint step takes, by `step` (metrics).
+    pub fn checkpoint_seconds(&self) -> &HistogramVec {
+        &self.checkpoint_seconds
     }
 
     /// WAL fsync statistics for metrics.
@@ -479,24 +491,35 @@ fn checkpoint_due(wal: &MetadataWal, index: &DiskIndex, config: &MetadataStoreCo
 /// WAL's mark. The WAL is cut only once the file is durable; a failure in
 /// between leaves both, and the next restart replays what the file already
 /// has (replaying a record twice is harmless: puts and deletes by key).
-fn checkpoint(wal: &MetadataWal, index: &DiskIndex, gate: &RwLock<()>) -> Result<()> {
+fn checkpoint(
+    wal: &MetadataWal,
+    index: &DiskIndex,
+    gate: &RwLock<()>,
+    timings: &HistogramVec,
+) -> Result<()> {
     // A frozen memtable left by a failed checkpoint goes first, with the
     // WAL left whole (its mark is gone): the next freeze's mark is later
     // and covers it.
     if index.has_frozen() {
         index.flush_frozen(index.checkpoint_lsn()?)?;
     }
+    let started = Instant::now();
     let mark = {
         let _nothing_in_flight = gate.write();
         let mark = wal.mark()?;
         index.freeze();
         mark
     };
+    timings.observe_duration("step=\"gate\"", started.elapsed());
+    let started = Instant::now();
     index.flush_frozen(mark.lsn)?;
+    timings.observe_duration("step=\"flush\"", started.elapsed());
     debug!("checkpoint at LSN {}", mark.lsn);
+    let started = Instant::now();
     if let Err(e) = wal.truncate_through(mark) {
         warn!("Failed to truncate WAL: {}", e);
     }
+    timings.observe_duration("step=\"truncate\"", started.elapsed());
     Ok(())
 }
 
