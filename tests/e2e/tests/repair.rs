@@ -112,6 +112,7 @@ fn osd_has_meta(address: &str, bucket: &str, key: &str) -> bool {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 version_id: String::new(),
+                with_small_shard: false,
             })
             .await
             .expect("GetObjectMeta")

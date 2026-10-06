@@ -821,6 +821,7 @@ async fn newest_copy(
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 version_id: String::new(),
+                with_small_shard: false,
             }),
         )
         .await
@@ -945,6 +946,7 @@ async fn get_object_meta(
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: String::new(),
+            with_small_shard: false,
         }),
     )
     .await
