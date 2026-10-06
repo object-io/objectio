@@ -228,10 +228,8 @@ def stats_full_refusals():
 def incusd_mb():
     """incusd's resident memory, in MB (None if not found)."""
     r = subprocess.run(["ps", "-o", "rss=", "-C", "incusd"], capture_output=True, text=True)
-    try:
-        return int(r.stdout.split()[0]) // 1024
-    except (IndexError, ValueError):
-        return None
+    sizes = [int(x) for x in r.stdout.split() if x.isdigit()]
+    return max(sizes) // 1024 if sizes else None
 
 
 def progress():
