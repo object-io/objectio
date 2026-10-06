@@ -1290,6 +1290,30 @@ pub async fn get_object_version_meta_from_any(
     key: &str,
     version_id: &str,
 ) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, version_id, true).await
+}
+
+/// As [`get_object_meta_from_any`], waiting for every copy: for a
+/// placement that may be stale (the gateway's cache, B21). A quorum taken
+/// from a key's old copies may miss a write made to its new ones; all of
+/// them, which share every position but the one that moved, can't.
+pub async fn get_object_meta_every_copy(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, "", false).await
+}
+
+async fn read_object_meta(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    at_quorum: bool,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
     use objectio_proto::storage::GetObjectMetaRequest;
 
     let targets = unique_node_placements(placements);
@@ -1348,13 +1372,24 @@ pub async fn get_object_version_meta_from_any(
             }
         }
     });
-    let answers = futures::future::join_all(asks).await;
-
+    // Answers as they come. Any read quorum of them holds the newest
+    // acknowledged write (R + W > N), so once a quorum has answered and the
+    // newest copy among them is a live object, that is the answer: no
+    // waiting for the slowest copy (B21). "Not found" waits for every copy:
+    // a copy that lacks the object may not have it yet (a replacement OSD
+    // being filled), so it is the answer only when no copy has it.
+    let quorum = meta_read_quorum(targets.len());
+    let mut answers: futures::stream::FuturesUnordered<_> = asks.collect();
     let mut newest: Option<objectio_proto::metadata::ObjectMeta> = None;
     let mut deleted_at = 0u64;
     let mut answered = 0;
     let mut last_err: Option<OsdPoolError> = None;
-    for answer in answers {
+    while let Some(answer) = futures::StreamExt::next(&mut answers).await {
+        let live = |newest: &Option<objectio_proto::metadata::ObjectMeta>, deleted_at: u64| {
+            newest
+                .as_ref()
+                .is_some_and(|o| deleted_at == 0 || deleted_at < o.stamp)
+        };
         match answer {
             Ok((found, tombstone)) => {
                 answered += 1;
@@ -1369,10 +1404,13 @@ pub async fn get_object_version_meta_from_any(
             }
             Err(e) => last_err = Some(e),
         }
+        if at_quorum && answered >= quorum && live(&newest, deleted_at) {
+            break;
+        }
     }
     // Fewer answers than a read quorum could all be copies that missed the
     // last write: no answer rather than a stale one.
-    if answered < meta_read_quorum(targets.len()) {
+    if answered < quorum {
         return Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable));
     }
     // A delete newer than every copy's object: gone, whatever a copy that

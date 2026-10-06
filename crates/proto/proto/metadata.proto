@@ -25,6 +25,10 @@ service MetadataService {
 
     // Placement
     rpc GetPlacement(GetPlacementRequest) returns (GetPlacementResponse);
+    // What a PUT needs before its data moves, in one call (B21): the
+    // bucket's encryption, versioning and object-lock answers and the key's
+    // placement, each exactly as its own call would give it.
+    rpc GetWriteContext(GetWriteContextRequest) returns (GetWriteContextResponse);
 
     // Multipart upload
     rpc CreateMultipartUpload(CreateMultipartUploadRequest) returns (CreateMultipartUploadResponse);
@@ -807,6 +811,25 @@ message NodePlacement {
     ShardType shard_type = 5;       // Type of shard
     uint32 local_group = 6;         // Local group index (for LRC)
     string te_segment = 7;          // OSD's Transfer Engine segment; empty if none
+}
+
+// One call's answer inside another: its status code (0 for OK) and
+// message, and, when OK, its encoded response.
+message CallResult {
+    int32 code = 1;
+    string message = 2;
+    bytes response = 3;
+}
+
+message GetWriteContextRequest {
+    GetPlacementRequest placement = 1;
+}
+
+message GetWriteContextResponse {
+    CallResult encryption = 1;    // GetBucketEncryptionResponse
+    CallResult versioning = 2;    // GetBucketVersioningResponse
+    CallResult object_lock = 3;   // GetObjectLockConfigResponse
+    CallResult placement = 4;     // GetPlacementResponse
 }
 
 // Multipart upload
