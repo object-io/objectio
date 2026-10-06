@@ -401,9 +401,14 @@ async fn acknowledged_writes_survive_a_power_cut_anywhere() {
     sudo(&["chown", &owner, mnt.to_str().unwrap()]);
 
     // The workload, with marks.
+    // Checkpoints, and the log truncations after them, every few hundred
+    // writes rather than every 64 MiB: power is cut through them too.
     let osd = Arc::new(
-        OsdService::new(vec![data.dev()], BLOCK_SIZE, mnt.join("state"))
-            .expect("OSD on the logged devices"),
+        OsdService::new_with_store(vec![data.dev()], BLOCK_SIZE, mnt.join("state"), |c| {
+            c.memtable_bytes = 256 << 10;
+            c.wal.max_size_bytes = 512 << 10;
+        })
+        .expect("OSD on the logged devices"),
     );
     let acked: Arc<Mutex<Vec<Acked>>> = Arc::default();
     let stop = Arc::new(AtomicBool::new(false));

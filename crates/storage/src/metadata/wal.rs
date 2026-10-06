@@ -534,35 +534,55 @@ impl MetadataWal {
     /// Drop the records up to `mark`, which a durable snapshot now holds:
     /// the records after it go to a new file, which replaces this one.
     ///
-    /// Appends wait meanwhile (`writer`), and so do syncs (`sync_handle`):
-    /// a record appended to the old file after the copy would be gone with
-    /// it, and a sync of the old file covers nothing the new one holds.
+    /// In two passes, so appends don't wait for the copy. First, without
+    /// the locks, the records written so far are copied and synced; appends
+    /// go on into the old file meanwhile. Then, with appends and syncs held
+    /// (`writer`, `sync_handle`), only what came in since is copied, synced,
+    /// and the new file renamed over the old: a record appended to the old
+    /// file after the copy would be gone with it, and a sync of the old file
+    /// covers nothing the new one holds. Held across the whole copy, the
+    /// locks stalled every write for as long as the copy took: hundreds of
+    /// milliseconds once B21's small shards went through the log.
     pub fn truncate_through(&self, mark: WalMark) -> Result<()> {
         let storage =
             |what: &str, e: std::io::Error| Error::Storage(format!("WAL truncation: {what}: {e}"));
         let new_path = self.path.with_extension("wal.new");
+        let stale =
+            || Error::Storage("WAL truncation: the mark is from a log since replaced".into());
 
-        let mut writer = self.writer.lock();
-        let mut sync_handle = self.sync_handle.lock();
-        writer.flush().map_err(|e| storage("flush", e))?;
-        let len = self.size.load(Ordering::SeqCst);
-        if mark.file != self.file.load(Ordering::SeqCst) || mark.offset > len {
-            return Err(Error::Storage(
-                "WAL truncation: the mark is from a log since replaced".into(),
-            ));
-        }
-
-        let mut old = File::open(&self.path).map_err(|e| storage("open", e))?;
-        old.seek(SeekFrom::Start(mark.offset))
-            .map_err(|e| storage("seek", e))?;
+        // Pass one: what is in the file now, copied without holding appends.
+        let first = {
+            let mut writer = self.writer.lock();
+            writer.flush().map_err(|e| storage("flush", e))?;
+            let len = self.size.load(Ordering::SeqCst);
+            if mark.file != self.file.load(Ordering::SeqCst) || mark.offset > len {
+                return Err(stale());
+            }
+            len
+        };
         let mut new = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&new_path)
             .map_err(|e| storage("create", e))?;
-        let kept = std::io::copy(&mut old.take(len - mark.offset), &mut new)
+        let mut old = File::open(&self.path).map_err(|e| storage("open", e))?;
+        old.seek(SeekFrom::Start(mark.offset))
+            .map_err(|e| storage("seek", e))?;
+        let mut kept = std::io::copy(&mut (&mut old).take(first - mark.offset), &mut new)
             .map_err(|e| storage("copy", e))?;
+        new.sync_data().map_err(|e| storage("sync", e))?;
+
+        // Pass two: the rest, with appends and syncs held.
+        let mut writer = self.writer.lock();
+        let mut sync_handle = self.sync_handle.lock();
+        writer.flush().map_err(|e| storage("flush", e))?;
+        let len = self.size.load(Ordering::SeqCst);
+        if mark.file != self.file.load(Ordering::SeqCst) || first > len {
+            return Err(stale());
+        }
+        kept +=
+            std::io::copy(&mut old.take(len - first), &mut new).map_err(|e| storage("copy", e))?;
         new.sync_all().map_err(|e| storage("sync", e))?;
         std::fs::rename(&new_path, &self.path).map_err(|e| storage("rename", e))?;
         sync_parent_dir(&self.path)?;
@@ -1100,6 +1120,46 @@ mod group_commit_tests {
         })
         .unwrap();
         assert_eq!(lsns, vec![9, 10]);
+    }
+
+    /// Appends go on while a truncation copies (it holds them only for the
+    /// last few records): every record appended after the mark, before,
+    /// during or after the copy, is in the log afterwards, in order, and in
+    /// it again when the log is opened from disk.
+    #[test]
+    fn appends_during_a_truncation_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = wal(&dir);
+        for i in 0..500 {
+            w.append(&op(i)).unwrap();
+        }
+        let mark = w.mark().unwrap();
+        let after_mark = w.current_lsn();
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                for i in 500..2500 {
+                    w.append(&op(i)).unwrap();
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            w.truncate_through(mark).unwrap();
+            writer.join().unwrap();
+        });
+        let replayed = |w: &MetadataWal| {
+            let mut lsns = Vec::new();
+            w.replay(1, |lsn, _| {
+                lsns.push(lsn);
+                Ok(())
+            })
+            .unwrap();
+            lsns
+        };
+        let want: Vec<u64> = (after_mark + 1..=w.current_lsn()).collect();
+        assert_eq!(want.len(), 2000);
+        assert_eq!(replayed(&w), want);
+        drop(w);
+        let reopened = MetadataWal::open(dir.path().join("g.wal"), WalConfig::default()).unwrap();
+        assert_eq!(replayed(&reopened), want, "not so on disk");
     }
 
     /// A mark is a byte offset in one file: after another truncation it
