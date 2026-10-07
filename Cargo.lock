@@ -2672,6 +2672,7 @@ name = "objectio-osd"
 version = "0.6.0-dev"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.8",
  "clap",
  "config",
