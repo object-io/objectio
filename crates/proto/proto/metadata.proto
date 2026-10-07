@@ -967,6 +967,7 @@ message CompleteMultipartUploadRequest {
     // caller settles it (SettleMultipartUpload) once the object is stored
     // or certainly isn't. Sent again meanwhile, the completion returns the
     // same object. Without it the upload goes at once (the release before).
+    // Meta honours it only once the cluster is at COMPLETED_UPLOADS_LEVEL.
     bool settle_after_commit = 6;
 }
 
@@ -981,6 +982,9 @@ message CompleteMultipartUploadResponse {
     // Stripes of parts that were uploaded but left out of the object. The
     // upload is gone, so nothing refers to them; the caller frees them.
     repeated StripeMeta unused_stripes = 2;
+    // The upload is kept, being completed, until the caller settles it.
+    // False: it is gone already, and a failed store frees the parts.
+    bool settling = 3;
 }
 
 message SettleMultipartUploadRequest {

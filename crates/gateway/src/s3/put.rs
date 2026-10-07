@@ -364,11 +364,17 @@ pub(crate) async fn commit_new(
                     "{what}: conditional commit undecided ({s}); keeping its shards, healing the key"
                 );
                 state.osd_pool.queue_heal(&bucket, &key, "").await;
-                return Err(S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!("could not commit the object: {}", s.message()),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                ));
+                // Maybe stored: meta may hold the entry. A multipart
+                // completion stays being completed, and sent again commits
+                // the same object, which meta then takes as applied.
+                return Err(CommitRefused {
+                    response: S3Error::xml_response(
+                        "ServiceUnavailable",
+                        &format!("could not commit the object: {}", s.message()),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ),
+                    not_stored: false,
+                });
             }
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what);
             // Refused before any copy was written: certainly not stored.

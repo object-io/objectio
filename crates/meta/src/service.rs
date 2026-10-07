@@ -2785,6 +2785,10 @@ mod multipart_reclaim_tests {
     }
 
     fn two_phase(id: &str, parts: &[u32]) -> CompleteMultipartUploadRequest {
+        // Recorded only at the level every node reads it.
+        objectio_common::version::set_active_level(
+            objectio_common::version::COMPLETED_UPLOADS_LEVEL,
+        );
         CompleteMultipartUploadRequest {
             bucket: "b".into(),
             key: "k".into(),
@@ -2842,6 +2846,7 @@ mod multipart_reclaim_tests {
             .await
             .unwrap()
             .into_inner();
+        assert!(first.settling);
         assert_eq!(ids(&first.unused_stripes), [3]);
         let object = first.object.unwrap();
         assert_eq!(object.version_id, "v1");

@@ -410,7 +410,12 @@ impl MetaService {
         // object was stored, a completion that then failed freed parts the
         // client had been told were uploaded, and its retry found no upload.
         let now = Self::current_timestamp();
-        let (object, unused_stripes) = self
+        // Recorded only once every node reads the mark: one of the release
+        // before would take the upload for open, and an abort there would
+        // free the parts of a stored object.
+        let two_phase = req.settle_after_commit
+            && objectio_common::version::allows(objectio_common::version::COMPLETED_UPLOADS_LEVEL);
+        let (object, unused_stripes, settling) = self
             .update_multipart(&req.upload_id, "complete-multipart", |upload| {
                 let mut upload = upload.ok_or_else(|| {
                     Status::not_found(format!("multipart upload not found: {}", req.upload_id))
@@ -422,12 +427,12 @@ impl MetaService {
                             "bucket/key mismatch for upload_id",
                         ));
                     }
-                    return Ok((Some(upload), (object, Vec::new())));
+                    return Ok((Some(upload), (object, Vec::new(), true)));
                 }
                 let (mut object, unused) = complete_upload(&upload, &req)?;
                 object.version_id.clone_from(&req.version_id);
-                if !req.settle_after_commit {
-                    return Ok((None, (object, unused)));
+                if !two_phase {
+                    return Ok((None, (object, unused, false)));
                 }
                 // Parts left out are freed by the caller now: not the
                 // upload's any more.
@@ -436,7 +441,7 @@ impl MetaService {
                 upload.parts.retain(|n, _| used.contains(n));
                 upload.completing = Some(object.clone());
                 upload.completing_since = now;
-                Ok((Some(upload), (object, unused)))
+                Ok((Some(upload), (object, unused, true)))
             })
             .await?;
 
@@ -452,6 +457,7 @@ impl MetaService {
         Ok(Response::new(CompleteMultipartUploadResponse {
             object: Some(object),
             unused_stripes,
+            settling,
         }))
     }
 

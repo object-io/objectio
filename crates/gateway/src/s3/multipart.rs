@@ -1180,17 +1180,23 @@ pub(crate) async fn complete_multipart_upload_internal(
     // Complete the multipart upload via metadata service: two-phase, so
     // the upload stays (being completed) until the object is stored, and
     // a completion that fails to store it can be sent again.
-    match meta_client
+    let completed = meta_client
         .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
             parts,
             version_id: version_id.clone(),
-            settle_after_commit: true,
+            // Two-phase once every node reads the mark (format level 6);
+            // before that, as the release before: the upload goes at once.
+            settle_after_commit: objectio_common::version::allows(
+                objectio_common::version::COMPLETED_UPLOADS_LEVEL,
+            ),
         })
-        .await
-    {
+        .await;
+    // A lost answer, for --test-hooks (as a leader change or timeout loses
+    // one): the completion stays, being completed, for the retry.
+    match crate::test_hooks::maybe_lost("complete_multipart_upload", completed) {
         Ok(response) => {
             let resp = response.into_inner();
             // Parts left out of the object went with the upload.
@@ -1293,21 +1299,32 @@ pub(crate) async fn complete_multipart_upload_internal(
                 // certainly not stored, the upload is open again and they
                 // are its parts; maybe stored, it stays being completed and
                 // the completion sent again stores the same object.
+                //
+                // Not settling (meta dropped the upload at once, below the
+                // level): the parts belong to nothing on a failure that
+                // stored nothing, and commit_put frees them, as before.
+                let sent = if resp.settling {
+                    Vec::new()
+                } else {
+                    stripe_targets(&object.stripes)
+                };
                 let committed = commit_put_outcome(
                     &state,
                     &placement,
                     object.clone(),
                     versioning_enabled,
-                    Vec::new(),
+                    sent,
                     &condition,
                     None,
                 )
                 .await;
                 match committed {
-                    Ok(()) => {
+                    Ok(()) if resp.settling => {
                         settle_upload(&state, &bucket, &key, &upload_id, &object.object_id, true)
                             .await;
                     }
+                    Ok(()) => {}
+                    Err(refused) if !resp.settling => return refused.response,
                     Err(refused) => {
                         if refused.not_stored {
                             settle_upload(
