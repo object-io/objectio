@@ -35,7 +35,7 @@ use objectio_proto::storage::{
 };
 use tokio::time::{MissedTickBehavior, interval};
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::service::MetaService;
 
@@ -599,6 +599,18 @@ async fn migrate_batch(
                         );
                         Ok(())
                     }
+                    // Too few shards left to rebuild it, and the object is
+                    // current: lost already (B29). Recorded, and the
+                    // evacuation goes on rather than wait on it forever.
+                    Ok(false) if e.downcast_ref::<TooFewShards>().is_some() => {
+                        match settle_lost(meta, &draining, &mv).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(anyhow::anyhow!("{what}: {e}")),
+                            Err(l) => {
+                                Err(anyhow::anyhow!("{what}: {e} (and recording it lost: {l})"))
+                            }
+                        }
+                    }
                     Ok(false) => Err(anyhow::anyhow!("{what}: {e}")),
                     Err(s) => Err(anyhow::anyhow!(
                         "{what}: {e} (and checking for stale copies: {s})"
@@ -824,6 +836,162 @@ async fn repoint_object(
         warn!("drain: {}/{}: home not moved: {e}", o.bucket, o.key);
     }
     Ok(())
+}
+
+/// A shard that can't be rebuilt: fewer than k of its stripe's other
+/// shards could be read.
+#[derive(Debug)]
+struct TooFewShards {
+    have: usize,
+    k: usize,
+}
+
+impl std::fmt::Display for TooFewShards {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "only {} good shards reachable, need {}",
+            self.have, self.k
+        )
+    }
+}
+
+impl std::error::Error for TooFewShards {}
+
+/// Whether `mv`'s shard belongs to an object that is lost (B29), and if so
+/// record it: fewer than k shards of its stripe left, every holder of the
+/// others answering that it has none (an OSD that doesn't answer may have
+/// one: then this waits), and a read quorum of the key's copies holding
+/// that object as current. The lost OSD's location is then dropped from the
+/// object's copies, so the evacuation stops finding it and finishes.
+/// `Ok(false)`: not shown to be lost; the evacuation tries it again.
+async fn settle_lost(
+    meta: &Arc<MetaService>,
+    draining: &[u8; 16],
+    mv: &Move,
+) -> anyhow::Result<bool> {
+    if mv.objects.is_empty() || mv.block_stripe.is_some() || mv.pack_stripe.is_some() {
+        return Ok(false);
+    }
+    let stripe = stripe_of(mv).await?;
+    let k = stripe.ec_k as usize;
+    let mut good = 0usize;
+    for loc in &stripe.shards {
+        if loc.node_id.as_slice() == draining.as_slice() || loc.position == mv.shard.position {
+            continue;
+        }
+        let Some(addr) = <[u8; 16]>::try_from(loc.node_id.as_slice())
+            .ok()
+            .and_then(|n| meta.osd_address_by_id(&n))
+        else {
+            return Ok(false);
+        };
+        let id = ShardId {
+            position: loc.position,
+            ..mv.shard.clone()
+        };
+        match shard_state(&addr, id).await {
+            Ok(objectio_proto::storage::ShardState::Ok) => good += 1,
+            Ok(_) => {}
+            Err(_) => return Ok(false),
+        }
+    }
+    if good >= k {
+        return Ok(false);
+    }
+    let mut settled = false;
+    // Each copy of a key's metadata names the shard: one record per key.
+    let mut done: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+    for o in &mv.objects {
+        if !done.insert((o.bucket.as_str(), o.key.as_str())) {
+            continue;
+        }
+        let Some(copy) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await? else {
+            continue;
+        };
+        if !copy.stripes.iter().any(|s| is_shard_of(s, &mv.shard)) {
+            continue;
+        }
+        let (addrs, copies) = match meta.object_home(&o.bucket, &o.key) {
+            Some(home) => (
+                home_addrs(meta, &o.bucket, &o.key, draining),
+                home.osd_ids.len(),
+            ),
+            None => (
+                stripe
+                    .shards
+                    .iter()
+                    .filter(|l| l.node_id.as_slice() != draining.as_slice())
+                    .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
+                    .filter_map(|id| meta.osd_address_by_id(&id))
+                    .collect(),
+                stripe.shards.len(),
+            ),
+        };
+        let Some(mut object) = newest_copy(&addrs, copies, &o.bucket, &o.key)
+            .await?
+            .filter(|n| n.stripes.iter().any(|s| is_shard_of(s, &mv.shard)))
+        else {
+            // Not the current object: a stale copy's to settle, not a loss.
+            return Ok(false);
+        };
+        let key = format!("{}/{}", o.bucket, o.key);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        meta.record_lost(
+            &key,
+            &objectio_proto::metadata::LostObject {
+                object_id: object.object_id.clone(),
+                stripe_id: mv.shard.stripe_id,
+                good: u32::try_from(good).unwrap_or(u32::MAX),
+                needed: stripe.ec_k,
+                recorded_at: now,
+                found_by: "evacuation".into(),
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("record: {e}"))?;
+        error!(
+            "LOST: {key} stripe {}: {good} of the {k} shards a read needs are left; recorded as lost",
+            mv.shard.stripe_id
+        );
+        for s in &mut object.stripes {
+            if is_shard_of(s, &mv.shard) {
+                s.shards.retain(|l| {
+                    !(l.node_id.as_slice() == draining.as_slice()
+                        && l.position == mv.shard.position)
+                });
+            }
+        }
+        let mut extra: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        extra.push(&o.owner_addr);
+        fanout_put_object_meta(meta, &object, &o.owner_addr, &extra).await?;
+        settled = true;
+    }
+    Ok(settled)
+}
+
+/// One shard's state on the OSD at `addr`.
+async fn shard_state(
+    addr: &str,
+    id: ShardId,
+) -> anyhow::Result<objectio_proto::storage::ShardState> {
+    let mut client = StorageServiceClient::new(open_channel(addr).await?);
+    let states = tokio::time::timeout(
+        PER_OSD_TIMEOUT,
+        client.check_shards(objectio_proto::storage::CheckShardsRequest { shards: vec![id] }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("check_shards timeout on {addr}"))??
+    .into_inner()
+    .states;
+    let s = states
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no answer for the shard"))?;
+    objectio_proto::storage::ShardState::try_from(s)
+        .map_err(|_| anyhow::anyhow!("unknown state {s}"))
 }
 
 /// The addresses of `bucket/key`'s home OSDs, but `draining`'s.
@@ -1177,9 +1345,7 @@ async fn rebuild_shard(
         }
     }
     if have < k {
-        return Err(anyhow::anyhow!(
-            "only {have} good shards reachable, need {k}"
-        ));
+        return Err(TooFewShards { have, k }.into());
     }
     let codec =
         objectio_erasure::ErasureCodec::new(objectio_common::ErasureConfig::new(k as u8, m as u8))

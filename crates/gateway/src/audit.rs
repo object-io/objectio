@@ -1479,6 +1479,21 @@ pub async fn audit_layer(
         duration_ms: 0,
         complete: false,
     };
+    // A change is recorded before it is acknowledged: the event was
+    // submitted when the response body ended, after the client could have
+    // its answer, and a gateway killed in between lost the event of a
+    // change it had made (A8c). Its response is in hand, its size known. A
+    // read is recorded when its body ends, with the bytes actually sent.
+    let mut event = event;
+    let pending = if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        Some((event, auditor, started))
+    } else {
+        event.response_bytes = HttpBody::size_hint(response.body()).exact().unwrap_or(0);
+        event.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        event.complete = true;
+        auditor.submit(event);
+        None
+    };
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
@@ -1486,7 +1501,7 @@ pub async fn audit_layer(
             inner: body,
             bytes: AtomicU64::new(0),
             done: AtomicBool::new(false),
-            pending: Some((event, auditor, started)),
+            pending,
             log: log.map(|l| (l, started)),
         }),
     )
@@ -1906,6 +1921,57 @@ mod tests {
             duration_ms: 0,
             complete: true,
         }
+    }
+
+    /// A8c: a change's event is on the spool before its response leaves
+    /// the gateway: a gateway killed right after answering must not lose
+    /// it. A read's is recorded when its body ends, with the bytes sent.
+    #[tokio::test]
+    async fn a_change_is_recorded_before_it_is_acknowledged() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let spool = crate::audit_spool::Spool::open(dir.path(), 1 << 20).unwrap();
+        let (tx, _rx) = mpsc::channel(10);
+        let auditor = Arc::new(Auditor {
+            tx,
+            spool: Some(Arc::clone(&spool)),
+            active: Arc::new(AtomicBool::new(true)),
+            reload: tokio::sync::Notify::new(),
+            trusted_proxies: crate::origin::TrustedProxies::default(),
+            bucket_logging: std::sync::OnceLock::new(),
+        });
+        let app = axum::Router::new()
+            .route(
+                "/b/k",
+                axum::routing::put(|| async { "" }).get(|| async { "0123456789" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&auditor),
+                audit_layer,
+            ));
+        let request = |method: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri("/b/k")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // The PUT's response, its body not read yet: the event is there.
+        let put = app.clone().oneshot(request("PUT")).await.unwrap();
+        let after_put = spool.bytes();
+        assert!(
+            after_put > 0,
+            "a change answered before its event was spooled"
+        );
+        drop(put);
+
+        // The GET's event waits for its body, to count what was sent.
+        let get = app.oneshot(request("GET")).await.unwrap();
+        assert_eq!(spool.bytes(), after_put);
+        let body = axum::body::to_bytes(get.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"0123456789");
+        assert!(spool.bytes() > after_put);
     }
 
     #[tokio::test]
