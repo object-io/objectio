@@ -598,3 +598,50 @@ impl MetaService {
         }
     }
 }
+
+impl MetaService {
+    /// Record `bucket/key`'s object as lost (B29), through Raft.
+    pub(crate) async fn record_lost(
+        &self,
+        key: &str,
+        lost: &objectio_proto::metadata::LostObject,
+    ) -> Result<(), String> {
+        use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        let Some(raft) = self.raft_handle() else {
+            return Ok(());
+        };
+        let current = self.store.as_ref().and_then(|s| s.read_lost(key));
+        let cmd = MetaCommand::MultiCas {
+            ops: vec![CasOp {
+                table: CasTable::Named("lost_objects".into()),
+                key: key.to_string(),
+                expected: current,
+                new_value: Some(lost.encode_to_vec()),
+            }],
+            requested_by: "lost-object".into(),
+        };
+        match raft.client_write(cmd).await {
+            Ok(r) => match r.data {
+                MetaResponse::MultiCasOk => Ok(()),
+                MetaResponse::MultiCasConflict { .. } => Err("recorded meanwhile; again".into()),
+                other => Err(format!("unexpected raft response: {other:?}")),
+            },
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// How many objects are recorded as lost (B29).
+    pub(crate) fn lost_objects(&self) -> Vec<(String, objectio_proto::metadata::LostObject)> {
+        self.store
+            .as_ref()
+            .map(|s| s.lost_all())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, v)| {
+                objectio_proto::metadata::LostObject::decode(v.as_slice())
+                    .ok()
+                    .map(|l| (k, l))
+            })
+            .collect()
+    }
+}

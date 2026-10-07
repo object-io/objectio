@@ -160,6 +160,11 @@ pub fn render_metrics(out: &mut String) {
             DEGRADED.load(Ordering::Relaxed) as f64,
         ),
         (
+            "objectio_meta_lost_objects",
+            "Objects recorded as lost: fewer than k shards left (B29). Anything above 0 is data loss: alert",
+            LOST.load(Ordering::Relaxed) as f64,
+        ),
+        (
             "objectio_meta_degraded_oldest_seconds",
             "Age of the oldest object short of shards: alert when it grows while every OSD is up",
             DEGRADED_OLDEST_SECS.load(Ordering::Relaxed) as f64,
@@ -487,9 +492,31 @@ async fn audit(
     // parallel too): one at a time, a replaced disk took hours (B24).
     use futures::FutureExt;
     let states = &states;
-    let rebuilds: Vec<futures::future::BoxFuture<'_, bool>> = objects
-        .iter()
-        .enumerate()
+    // The objects with the fewest shards to spare first (B29): one a
+    // single loss from unreadable is rebuilt before one with a shard to
+    // spare.
+    let spare = |oi: usize| -> i64 {
+        objects[oi]
+            .stripes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| repairable(s))
+            .map(|(si, s)| {
+                let ok = s
+                    .shards
+                    .iter()
+                    .filter(|l| states.get(&(oi, si, l.position)) == Some(&Seen::Ok))
+                    .count();
+                i64::try_from(ok).unwrap_or(i64::MAX) - i64::from(s.ec_k)
+            })
+            .min()
+            .unwrap_or(i64::MAX)
+    };
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by_key(|&oi| spare(oi));
+    let rebuilds: Vec<futures::future::BoxFuture<'_, (usize, bool)>> = order
+        .into_iter()
+        .map(|oi| (oi, &objects[oi]))
         .map(|(oi, object)| {
             async move {
                 STATS.objects.fetch_add(1, Ordering::Relaxed);
@@ -520,28 +547,41 @@ async fn audit(
                             );
                         }
                         Verdict::Rebuild { bad, good } => {
-                            if let Err(e) =
-                                rebuild(meta, source, object, stripe, &seen, &bad, &good).await
+                            match rebuild(meta, source, object, stripe, &seen, &bad, &good).await
                             {
-                                STATS.errors.fetch_add(1, Ordering::Relaxed);
-                                warn!(
-                                    "repair: {}/{} stripe {}: {e}",
-                                    object.bucket, object.key, stripe.stripe_id
-                                );
+                                Ok(()) => info!(
+                                    "repair: {}/{} stripe {}: rebuilt positions {bad:?} from {} good shards",
+                                    object.bucket,
+                                    object.key,
+                                    stripe.stripe_id,
+                                    good.len()
+                                ),
+                                Err(e) => {
+                                    STATS.errors.fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        "repair: {}/{} stripe {}: positions {bad:?} not rebuilt: {e}",
+                                        object.bucket, object.key, stripe.stripe_id
+                                    );
+                                }
                             }
                         }
                     }
                 }
-                healthy
+                (oi, healthy)
             }
             .boxed()
         })
         .collect();
     use futures::StreamExt;
-    let healthy: Vec<bool> = futures::stream::iter(rebuilds)
+    let done: Vec<(usize, bool)> = futures::stream::iter(rebuilds)
         .buffered(REBUILDS_AT_ONCE)
         .collect()
         .await;
+    // Back in the objects' order.
+    let mut healthy = vec![false; objects.len()];
+    for (oi, h) in done {
+        healthy[oi] = h;
+    }
 
     // Then, in order: backfill (bounded by `moves`) and listings.
     for (object, &healthy) in objects.iter().zip(&healthy) {
@@ -576,6 +616,7 @@ const DEGRADED_EVERY: Duration = Duration::from_secs(5);
 /// can't be done yet (an OSD down, too few shards to read) stays for the
 /// next round.
 pub async fn work_degraded(meta: &Arc<MetaService>) {
+    LOST.store(meta.lost_objects().len() as u64, Ordering::Relaxed);
     let records = meta.degraded_objects();
     DEGRADED.store(records.len() as u64, Ordering::Relaxed);
     let now = std::time::SystemTime::now()
@@ -639,6 +680,8 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
 /// Degraded-object records, and the age of the oldest, as last counted.
 static DEGRADED: AtomicU64 = AtomicU64::new(0);
 static DEGRADED_OLDEST_SECS: AtomicU64 = AtomicU64::new(0);
+/// Objects recorded as lost, as last counted.
+static LOST: AtomicU64 = AtomicU64::new(0);
 
 /// Objects one repair pass rebuilds at once.
 const REBUILDS_AT_ONCE: usize = 16;

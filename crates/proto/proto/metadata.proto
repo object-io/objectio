@@ -687,6 +687,22 @@ message DegradedObject {
     uint64 recorded_at = 3;
 }
 
+// An object found unrecoverable (B29): a stripe with fewer than k shards
+// left, every holder of the rest answering that it has none. Recorded so
+// the loss is seen (a metric that alerts, the key in the record) rather
+// than waited on; keyed by "{bucket}/{key}".
+message LostObject {
+    bytes object_id = 1;
+    uint64 stripe_id = 2;
+    // Shards left, and how many a read needs (k).
+    uint32 good = 3;
+    uint32 needed = 4;
+    // Unix seconds.
+    uint64 recorded_at = 5;
+    // What found it, e.g. "evacuation".
+    string found_by = 6;
+}
+
 message DegradedStripe {
     uint64 stripe_id = 1;
     // Positions the write left without a shard.

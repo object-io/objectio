@@ -137,6 +137,9 @@ pub const OBJECT_HOMES: TableDefinition<&str, &[u8]> = TableDefinition::new("obj
 /// Objects acknowledged short of shards (B29): "{bucket}/{key}" ->
 /// prost-encoded `DegradedObject`.
 pub const DEGRADED_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("degraded_objects");
+/// Objects found unrecoverable (B29): "{bucket}/{key}" -> prost-encoded
+/// `LostObject`.
+pub const LOST_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lost_objects");
 
 // Placement groups. One row per PG, keyed as "{pool}\0{pg_id:010}"
 // (10-digit zero-padded so a range scan over a pool returns PGs in

@@ -124,6 +124,7 @@ impl MetaStore {
             let _t = write_txn.open_table(tables::BUCKET_ENCRYPTION_CONFIGS)?;
             let _t = write_txn.open_table(tables::KMS_KEYS)?;
             let _t = write_txn.open_table(tables::DEGRADED_OBJECTS)?;
+            let _t = write_txn.open_table(tables::LOST_OBJECTS)?;
         }
         crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
 
@@ -507,6 +508,29 @@ impl MetaStore {
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(tables::DEGRADED_OBJECTS).ok()?;
         table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// A key's lost-object record (B29), prost-encoded `LostObject`.
+    pub fn read_lost(&self, key: &str) -> Option<Vec<u8>> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(tables::LOST_OBJECTS).ok()?;
+        table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// Every lost-object record (B29): key and bytes.
+    pub fn lost_all(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = read_txn.open_table(tables::LOST_OBJECTS) else {
+            return Vec::new();
+        };
+        let Ok(iter) = table.iter() else {
+            return Vec::new();
+        };
+        iter.filter_map(Result::ok)
+            .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            .collect()
     }
 
     /// Every degraded-object record (B29): key and bytes. The table holds
