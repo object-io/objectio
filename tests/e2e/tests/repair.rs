@@ -450,8 +450,15 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
             c.request("PUT", &format!("/stale/d-{i}"), &body).status,
             200
         );
+        assert_eq!(
+            c.request("PUT", &format!("/stale/od-{i}"), &body).status,
+            200
+        );
     }
-    // OSD 2 misses an overwrite of every o- and the delete of every d-.
+    // OSD 2 misses an overwrite of every o-, the delete of every d-, and
+    // an overwrite then a delete of every od-: the overwrite frees the
+    // first object's shards everywhere else, and the delete removes the
+    // key's home (as the soak found: no home to read the key from).
     ha.stop_osd(2);
     let c = &ha.clients[0];
     let newer: Vec<Vec<u8>> = (0..OBJECTS)
@@ -461,6 +468,14 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
         assert_eq!(c.request("PUT", &format!("/stale/o-{i}"), body).status, 200);
         assert_eq!(
             c.request("DELETE", &format!("/stale/d-{i}"), &[]).status,
+            204
+        );
+        assert_eq!(
+            c.request("PUT", &format!("/stale/od-{i}"), body).status,
+            200
+        );
+        assert_eq!(
+            c.request("DELETE", &format!("/stale/od-{i}"), &[]).status,
             204
         );
     }
@@ -508,6 +523,11 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
             c.request("GET", &format!("/stale/d-{i}"), &[]).status,
             404,
             "d-{i}"
+        );
+        assert_eq!(
+            c.request("GET", &format!("/stale/od-{i}"), &[]).status,
+            404,
+            "od-{i}"
         );
     }
 }
