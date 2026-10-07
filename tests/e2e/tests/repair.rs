@@ -748,3 +748,72 @@ fn holder_of_position(
         .find(|&i| ha.osd_endpoint(i) == address)
         .expect("holder is one of the cluster's OSDs")
 }
+
+/// A small PUT (shards with their metadata, B21) refused with two OSDs
+/// down, after four copies took it: k copies, enough for a read, none to
+/// spare. Soak run 10 found such an object left as it was, and lost it to
+/// the next drive lost. It is kept, readable, and brought back to all six
+/// shards at once, so it then survives two other OSDs down.
+#[test]
+fn a_small_write_refused_on_k_copies_is_repaired() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/short", &[]).status, 200);
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let body = payload(58_620, 61);
+    let put = ha.clients[0].request("PUT", "/short/k", &body);
+    assert_ne!(put.status, 200, "acknowledged on four copies of six");
+    let got = ha.clients[0].request("GET", "/short/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+
+    ha.start_osd(4, None);
+    ha.start_osd(5, None);
+    // Rounds of the degraded worker (every 5 s) and the heal queue (10 s).
+    std::thread::sleep(Duration::from_secs(30));
+    ha.stop_osd(0);
+    ha.stop_osd(1);
+    let got = ha.clients[0].request("GET", "/short/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+}
+
+/// A small PUT refused with three OSDs down, after only three copies took
+/// it: fewer than a read needs. It is withdrawn from them: a new key reads
+/// as never written, an overwritten one as the object it was, never as an
+/// error, once the OSDs are back.
+#[test]
+fn a_small_write_refused_below_k_copies_is_withdrawn() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/short", &[]).status, 200);
+    let old = payload(40_000, 71);
+    assert_eq!(c.request("PUT", "/short/old", &old).status, 200);
+
+    ha.stop_osd(3);
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    let put = c.request("PUT", "/short/new", &payload(58_620, 72));
+    assert_ne!(put.status, 200, "acknowledged on three copies of six");
+    let put = c.request("PUT", "/short/old", &payload(50_000, 73));
+    assert_ne!(put.status, 200, "acknowledged on three copies of six");
+
+    ha.start_osd(3, None);
+    ha.start_osd(4, None);
+    ha.start_osd(5, None);
+    // Past the gateway's fail-fast window, and a heal round.
+    std::thread::sleep(Duration::from_secs(15));
+    let c = &ha.clients[0];
+    let got = c.request("GET", "/short/new", &[]);
+    assert_eq!(got.status, 404, "{}", got.text());
+    let got = c.request("GET", "/short/old", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, old, "the refused overwrite won");
+    let list = c.request("GET", "/short?list-type=2", &[]).text();
+    assert!(!list.contains("<Key>new</Key>"), "{list}");
+}

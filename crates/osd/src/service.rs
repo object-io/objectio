@@ -47,7 +47,7 @@ use objectio_proto::storage::{
     health_check_response::Status as HealthStatus,
     storage_service_server::StorageService,
 };
-use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataStoreConfig};
+use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataOp, MetadataStoreConfig};
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -589,6 +589,77 @@ impl OsdService {
         self.meta_store
             .get(key)
             .and_then(|v| ObjectMeta::decode(&v[..]).ok())
+    }
+
+    /// `DeleteObjectMeta` with `withdraw_object_id`: take back one write of
+    /// `bucket/object_key`, under the key lock the caller holds. Every entry
+    /// holding `object_id` goes, in one store write, and nothing else: no
+    /// tombstone, so whatever the other copies hold of the key stands. If
+    /// the current entry went, the newest version left becomes current.
+    #[allow(clippy::result_large_err)]
+    fn withdraw(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        object_id: &[u8],
+    ) -> Result<Response<DeleteObjectMetaResponse>, Status> {
+        let current_key = MetadataKey::object_meta(bucket, object_key);
+        let current = self.stored_meta(&current_key);
+        let mut ops = Vec::new();
+        let mut usage = Vec::new();
+        let mut removed = None;
+        let mut versions = Vec::new();
+        for (key, value) in self
+            .meta_store
+            .scan_prefix(&MetadataKey::object_version_prefix(bucket, object_key))
+        {
+            let Ok(version) = ObjectMeta::decode(&value[..]) else {
+                continue;
+            };
+            if version.object_id == object_id {
+                ops.push(MetadataOp::Delete { key });
+                usage.push((EntryKind::Version, Some(version.clone()), None));
+                removed = Some(version);
+            } else {
+                versions.push(version);
+            }
+        }
+        let mut now_current = current.clone();
+        if let Some(c) = current.as_ref().filter(|c| c.object_id == object_id) {
+            let newest = versions
+                .into_iter()
+                .max_by(|a, b| version_age(a).cmp(&version_age(b)));
+            ops.push(match &newest {
+                Some(n) => MetadataOp::Put {
+                    key: current_key,
+                    value: n.encode_to_vec(),
+                },
+                None => MetadataOp::Delete { key: current_key },
+            });
+            usage.push((EntryKind::Current, Some(c.clone()), newest.clone()));
+            removed = Some(c.clone());
+            now_current = newest;
+        }
+        if !ops.is_empty() {
+            self.meta_store
+                .write(ops)
+                .map_err(|e| Status::internal(format!("failed to withdraw the write: {e}")))?;
+            for (kind, before, after) in &usage {
+                self.usage
+                    .apply(bucket, *kind, before.as_ref(), after.as_ref());
+            }
+            info!(
+                "Withdrew {bucket}/{object_key} object {}",
+                hex::encode(object_id)
+            );
+        }
+        Ok(Response::new(DeleteObjectMetaResponse {
+            success: true,
+            current: now_current.map(for_listing),
+            removed,
+            superseded: false,
+            held_stamp: 0,
+        }))
     }
 
     /// `PutObjectMeta` with `replication_update`: merge the replication
@@ -1608,6 +1679,10 @@ impl StorageService for OsdService {
             let req = request.into_inner();
 
             let _guard = self.usage.lock_key(&req.bucket, &req.key);
+
+            if !req.withdraw_object_id.is_empty() {
+                return self.withdraw(&req.bucket, &req.key, &req.withdraw_object_id);
+            }
 
             // A copy that holds a newer write than this delete keeps it
             // (last writer wins); the delete changes nothing here.
@@ -3510,6 +3585,53 @@ mod object_meta_tests {
         assert!(!second.replaced_version_kept);
     }
 
+    async fn withdraw(osd: &OsdService, id: u8) -> DeleteObjectMetaResponse {
+        osd.delete_object_meta(Request::new(DeleteObjectMetaRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            withdraw_object_id: vec![id; 16],
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    /// A refused write withdrawn from a copy: its entries go and nothing
+    /// else, with no tombstone; the version it hid is current again; another
+    /// object's id changes nothing.
+    #[tokio::test]
+    async fn a_withdrawn_write_leaves_what_it_hid() {
+        let (_dir, osd) = osd();
+        let current = |osd: &OsdService| osd.stored_meta(&MetadataKey::object_meta("b", "k"));
+        put(&osd, object(1, ""), false, &[]).await.unwrap();
+        assert!(withdraw(&osd, 9).await.removed.is_none());
+        assert_eq!(current(&osd).unwrap().object_id, vec![1; 16]);
+        assert_eq!(
+            withdraw(&osd, 1).await.removed.unwrap().object_id,
+            vec![1; 16]
+        );
+        assert!(current(&osd).is_none());
+        assert_eq!(osd.tombstone("b", "k", ""), 0, "it left a tombstone");
+
+        let v1 = ObjectMeta {
+            modified_at: 1,
+            ..object(2, "v1")
+        };
+        let v2 = ObjectMeta {
+            modified_at: 2,
+            ..object(3, "v2")
+        };
+        put(&osd, v1, true, &[]).await.unwrap();
+        put(&osd, v2, true, &[]).await.unwrap();
+        let after = withdraw(&osd, 3).await;
+        assert_eq!(after.current.unwrap().object_id, vec![2; 16]);
+        assert_eq!(current(&osd).unwrap().object_id, vec![2; 16]);
+        let version = |v: &str| osd.stored_meta(&MetadataKey::object_version("b", "k", v));
+        assert!(version("v2").is_none(), "the withdrawn version stayed");
+        assert!(version("v1").is_some(), "the version it hid went too");
+    }
+
     /// With versioning the replaced object is still a version: its shards
     /// are referenced, and the response says so.
     #[tokio::test]
@@ -3558,6 +3680,7 @@ mod object_meta_tests {
             key: "k".into(),
             version_id: String::new(),
             stamp: 0,
+            ..Default::default()
         }))
         .await
         .unwrap();

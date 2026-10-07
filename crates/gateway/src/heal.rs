@@ -244,6 +244,7 @@ async fn converge(
                         key: key.to_string(),
                         version_id: version_id.to_string(),
                         stamp: deleted_at,
+                        ..Default::default()
                     }),
                 )
                 .await

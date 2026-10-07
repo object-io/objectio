@@ -116,9 +116,16 @@ impl MetaService {
 
         // Written short of shards: recorded in the same command (B29), so
         // repair takes it at once and no crash loses it. A write of the key
-        // replaces the record of the object it replaces.
+        // replaces the record of the object it replaces. Listing the same
+        // object again (a listing re-synced after its write was refused)
+        // leaves its record: that makes no shard whole.
         let current_degraded = self.store.as_ref().and_then(|s| s.read_degraded(&home_key));
         let new_degraded = degraded_record(&req, now);
+        let current_degraded = current_degraded.filter(|c| {
+            new_degraded.is_some()
+                || objectio_proto::metadata::DegradedObject::decode(c.as_slice())
+                    .is_ok_and(|d| d.object_id != req.object_id)
+        });
 
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
