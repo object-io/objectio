@@ -756,6 +756,15 @@ impl OsdService {
                             }
                         }
                     }
+                    // A device that isn't there is a wrong path or a missing
+                    // drive, not a file to create: under /dev that file was
+                    // made in memory (devtmpfs), and the OSD ran on it.
+                    if !std::path::Path::new(path).exists() && path.starts_with("/dev/") {
+                        return Err(format!(
+                            "disk {path} does not exist: no such device (a file is created \
+                             for a disk only outside /dev)"
+                        ));
+                    }
                     // Get device/file size - for block devices we need to check
                     let size = if std::path::Path::new(path).exists() {
                         // Use raw_io to get size
@@ -4126,6 +4135,20 @@ mod integrity_tests {
             .expect("the older replica's shard")
             .into_inner();
         assert_eq!(&got.data[..], &data[..]);
+    }
+
+    /// A disk path under /dev that doesn't exist is a missing drive, not a
+    /// file to create (it was made in memory, and the OSD ran on it).
+    #[test]
+    fn a_missing_device_is_refused_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/dev/objectio-test-no-such-device";
+        let Err(e) = OsdService::new(vec![path.to_string()], 64 * 1024, dir.path().join("state"))
+        else {
+            panic!("an OSD started on a device that isn't there");
+        };
+        assert!(e.contains("no such device"), "{e}");
+        assert!(!std::path::Path::new(path).exists());
     }
 
     /// B28: `GetStatus` counts objects at risk at most once a minute for
