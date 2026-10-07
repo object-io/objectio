@@ -42,6 +42,11 @@ use crate::service::MetaService;
 /// Shard moves in flight at once within a sweep.
 const MOVES_AT_ONCE: usize = 16;
 
+/// Shard moves in flight at once off a lost OSD (B26): each is mostly waiting
+/// on RPCs and a Raft commit, and 16 evacuated a lost drive of the soak's
+/// 200,000 objects in over an hour.
+const LOST_MOVES_AT_ONCE: usize = 64;
+
 /// Shards moved per sweep from a lost OSD (Out, not yet emptied: B26), at
 /// least: its shards are each one copy short until moved, so it goes as
 /// fast as rebuilding allows, not at a drain's gentle pace.
@@ -460,6 +465,7 @@ async fn migrate_batch(
     source_alive: bool,
     batch: usize,
 ) -> Scan {
+    let sweep_started = std::time::Instant::now();
     let mut scan = Scan {
         complete: true,
         ..Scan::default()
@@ -497,8 +503,15 @@ async fn migrate_batch(
         })
         .map(|n| n.address.clone())
         .collect();
-    for addr in scanned {
-        match find_affected_objects(&addr, &draining, limit).await {
+    // Every OSD at once: one after another, the sweep waited for the sum of
+    // their scans, each a walk of every ObjectMeta the OSD holds.
+    let scans = futures::future::join_all(scanned.into_iter().map(|addr| async move {
+        let found = find_affected_objects(&addr, &draining, limit).await;
+        (addr, found)
+    }))
+    .await;
+    for (addr, found) in scans {
+        match found {
             Ok(objects) => {
                 for o in objects {
                     for s in o.shards {
@@ -577,10 +590,33 @@ async fn migrate_batch(
     // that takes its place, and the home moves there (B26).
     let (homes, homes_left) = meta.homes_holding(&draining, batch);
     scan.found = moves.len() + unsealed + homes_left;
+    let scanned_in = sweep_started.elapsed();
+    moves.truncate(batch);
+    // A key whose shard moves in this sweep has its home moved with it: not
+    // moved again on its own (the home read before the shard moved), which
+    // was as much work again for every object.
+    let moving: std::collections::HashSet<(&str, &str)> = moves
+        .iter()
+        .flat_map(|mv| &mv.objects)
+        .map(|o| (o.bucket.as_str(), o.key.as_str()))
+        .collect();
+    let homes: Vec<(String, String, Vec<Vec<u8>>)> = homes
+        .into_iter()
+        .filter(|(b, k, _)| !moving.contains(&(b.as_str(), k.as_str())))
+        .collect();
+    drop(moving);
+    // A lost OSD's shards are each a copy short until moved: as many at
+    // once as the cluster takes; a drain's (the OSD still serves them) a
+    // few at a time.
+    let at_once = if source_alive {
+        MOVES_AT_ONCE
+    } else {
+        LOST_MOVES_AT_ONCE
+    };
 
-    // A few at a time: each reads and writes a shard.
+    // Several at a time: each reads and writes a shard.
     use futures::StreamExt;
-    let results: Vec<anyhow::Result<()>> = futures::stream::iter(moves.into_iter().take(batch))
+    let results: Vec<anyhow::Result<()>> = futures::stream::iter(moves)
         .map(|mv| async move {
             let what = format!(
                 "{} stripe={} pos={}",
@@ -618,7 +654,7 @@ async fn migrate_batch(
                 },
             }
         })
-        .buffer_unordered(MOVES_AT_ONCE)
+        .buffer_unordered(at_once)
         .collect()
         .await;
     let homes_moved: Vec<anyhow::Result<()>> = futures::stream::iter(homes)
@@ -627,7 +663,7 @@ async fn migrate_batch(
                 .await
                 .map_err(|e| anyhow::anyhow!("{bucket}/{key}: {e}"))
         })
-        .buffer_unordered(MOVES_AT_ONCE)
+        .buffer_unordered(at_once)
         .collect::<Vec<anyhow::Result<bool>>>()
         .await
         .into_iter()
@@ -653,6 +689,14 @@ async fn migrate_batch(
             }
         }
     }
+    info!(
+        "drain: {}: {} found, {} moved; scan {:?}, moves {:?}",
+        hex::encode(draining),
+        scan.found,
+        scan.moved,
+        scanned_in,
+        sweep_started.elapsed().saturating_sub(scanned_in)
+    );
     scan
 }
 
@@ -751,6 +795,68 @@ async fn move_shard(
             .map_err(|e| anyhow::anyhow!("pack record: {e}"))?;
     }
     Ok(())
+}
+
+/// Move `object`'s shards off every OSD being evacuated (Out, not emptied
+/// yet: lost for good, B26), as the evacuation would, now: rebuilt from the
+/// rest of each stripe (or copied, if the OSD still answers) onto an OSD in
+/// service, and every copy of the object re-pointed. `owner_addr` holds a
+/// current copy of its metadata. Returns the shards moved.
+///
+/// For the degraded worker (B29). A shard on such an OSD can't be rebuilt
+/// in place, so a degraded object whose missing shard is there waited for
+/// the evacuation's sweeps to reach it: over an hour for a lost drive of
+/// 200,000 objects (soak run 12), while reads kept finding it a shard
+/// short. The worker takes the objects most at risk first.
+pub(crate) async fn move_off_evacuated(
+    meta: &Arc<MetaService>,
+    object: &ObjectMeta,
+    owner_addr: &str,
+) -> anyhow::Result<usize> {
+    let evacuated: Vec<([u8; 16], String)> = {
+        let nodes = meta.osd_nodes_read().clone();
+        nodes
+            .into_iter()
+            .filter(|n| n.admin_state == objectio_common::OsdAdminState::Out)
+            .map(|n| (n.node_id, n.address))
+            .collect()
+    };
+    let evacuated: Vec<([u8; 16], String)> = evacuated
+        .into_iter()
+        .filter(|(id, _)| meta.purge_state(*id).is_none())
+        .collect();
+    let mut moved = 0;
+    for stripe in &object.stripes {
+        for loc in &stripe.shards {
+            let Some((node, addr)) = evacuated
+                .iter()
+                .find(|(id, _)| id.as_slice() == loc.node_id.as_slice())
+            else {
+                continue;
+            };
+            let mv = Move {
+                shard: ShardId {
+                    object_id: if stripe.object_id.is_empty() {
+                        object.object_id.clone()
+                    } else {
+                        stripe.object_id.clone()
+                    },
+                    stripe_id: stripe.stripe_id,
+                    position: loc.position,
+                },
+                objects: vec![ObjectRef {
+                    owner_addr: owner_addr.to_string(),
+                    bucket: object.bucket.clone(),
+                    key: object.key.clone(),
+                }],
+                block_stripe: None,
+                pack_stripe: None,
+            };
+            move_shard(meta, node, addr, !addr.is_empty(), &mv).await?;
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 /// The stripe a shard belongs to, from one of the ObjectMetas referring

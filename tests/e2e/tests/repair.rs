@@ -700,6 +700,58 @@ fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
     assert_eq!(got.bytes, body);
 }
 
+/// A degraded object whose missing shard is on a drive lost for good (B26)
+/// is moved off it from its record (B29), without waiting for the
+/// evacuation's sweeps to reach it (here: not for an hour). A shard there
+/// can't be rebuilt in place, so the record used to wait for the
+/// evacuation: soak run 12's lost drive took over an hour to evacuate, and
+/// objects that reads had found a shard short stayed so all that time.
+#[test]
+fn a_degraded_object_on_a_lost_drive_is_moved_off_from_its_record() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(
+        1,
+        6,
+        1,
+        &[
+            "--repair-interval-secs",
+            "3600",
+            "--drain-interval-secs",
+            "3600",
+        ],
+    );
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/lostrec", &[]).status, 200);
+    let body = payload(300_000, 21);
+    assert_eq!(c.request("PUT", "/lostrec/k", &body).status, 200);
+
+    // The drive holding position 0 is lost with its metadata: it comes
+    // back as a new OSD, the old one is set out, to be evacuated.
+    let holder = holder_of_position(&ha, "lostrec", "k", 0);
+    ha.stop_osd(holder);
+    ha.lose_osd_drive(holder);
+    ha.start_osd(holder, None);
+
+    // A read decodes around position 0, and reports the object.
+    let c = &ha.clients[0];
+    let got = c.request("GET", "/lostrec/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+    // Rounds of the degraded worker (every 5 s).
+    std::thread::sleep(Duration::from_secs(20));
+
+    // Two other OSDs down: it reads only if position 0 was moved off the
+    // lost drive (else three shards are left of the four it needs).
+    for i in (0..6).filter(|&i| i != holder).take(2) {
+        ha.stop_osd(i);
+    }
+    let c = &ha.clients[0];
+    let got = c.request("GET", "/lostrec/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+}
+
 /// Which of `ha`'s OSDs holds position `pos` of `bucket/key`'s first
 /// stripe, from the object's metadata.
 fn holder_of_position(

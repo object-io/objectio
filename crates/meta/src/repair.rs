@@ -745,10 +745,36 @@ async fn work_one(
         }
         return true;
     };
-    let Some(owner_addr) = owner(&object).and_then(|n| node_address(meta, n)) else {
-        debug!("repair: degraded {key}: its owner is not registered; later");
+    // Its owner, or any OSD of it that answers: an owner lost for good
+    // (B26) left the record waiting for the evacuation to move it.
+    let Some(owner_addr) = owner(&object)
+        .and_then(|n| node_address(meta, n))
+        .or_else(|| {
+            object
+                .stripes
+                .iter()
+                .flat_map(|s| &s.shards)
+                .find_map(|l| node_address(meta, &l.node_id))
+        })
+    else {
+        debug!("repair: degraded {key}: none of its OSDs is registered; later");
         return false;
     };
+    // Shards on an OSD being evacuated can't be rebuilt in place: moved
+    // off it now, as the evacuation would, rather than wait for its sweeps
+    // to get here.
+    match crate::drain_observer::move_off_evacuated(meta, &object, &owner_addr).await {
+        Ok(0) => {}
+        Ok(n) => {
+            info!("repair: degraded {key}: {n} shards moved off an evacuated OSD");
+            // Checked again, as moved, next round.
+            return false;
+        }
+        Err(e) => {
+            debug!("repair: degraded {key}: moving off an evacuated OSD: {e}; later");
+            return false;
+        }
+    }
     let healthy = audit(
         meta,
         Source::Osd(&owner_addr),
