@@ -119,7 +119,10 @@ pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
     let degraded = Arc::clone(&meta);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = WALK_NOW.notified() => {}
+            }
             if meta.is_raft_leader() {
                 pass(&meta).await;
             }
@@ -605,6 +608,16 @@ async fn audit(
         }
     }
     healthy
+}
+
+/// Wakes the walk before it is due: an OSD came back without the shards
+/// it held (a replaced disk). Called on the leader, which serves every
+/// registration; calls while a pass runs start one more after it.
+static WALK_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Start a repair walk now, rather than when next due.
+pub(crate) fn walk_now() {
+    WALK_NOW.notify_one();
 }
 
 /// How often the objects recorded short of shards are worked (B29).

@@ -349,6 +349,12 @@ impl OsdService {
     /// The Transfer Engine segment to register with meta; empty unless
     /// rdma is enabled.
     #[must_use]
+    /// Shards forgotten when this OSD opened its store, their disk having
+    /// come back blank (replaced): reported to Meta at registration.
+    pub fn shards_dropped_at_open(&self) -> u64 {
+        self.shards.dropped_at_open()
+    }
+
     pub fn te_segment(&self) -> String {
         #[cfg(feature = "rdma")]
         if let Some(staging) = self.rdma.get() {

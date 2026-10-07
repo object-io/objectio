@@ -1106,6 +1106,10 @@ message RegisterOsdRequest {
     // Transfer Engine segment ("ip:port") this OSD accepts shard transfers
     // on. Empty when it has none; gateways then use gRPC bytes.
     string te_segment = 8;
+    // Shards the OSD forgot at start because their disk came back blank
+    // (replaced, or wiped): Meta starts its repair walk at once rather
+    // than when it is next due (up to its interval, an hour by default).
+    uint64 shards_dropped = 9;
 }
 
 message RegisterOsdResponse {

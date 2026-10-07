@@ -140,6 +140,11 @@ pub trait ShardStore: Send + Sync {
     /// Shards found corrupt since start, by a read or a scrub.
     fn corrupt_found(&self) -> u64;
 
+    /// Shards this store forgot when it opened, because the device that
+    /// held them came back blank (replaced, or wiped): Meta is told, so
+    /// repair rebuilds them now rather than when its walk gets there.
+    fn dropped_at_open(&self) -> u64;
+
     /// Each device's space, shards and I/O counts.
     fn disks(&self) -> Vec<DiskReport>;
 
@@ -799,6 +804,8 @@ pub struct BlockStore {
     corrupt: RwLock<HashSet<String>>,
     /// Shards found corrupt since start.
     corrupt_found: AtomicU64,
+    /// Shards forgotten at open: their disk came back formatted.
+    dropped_at_open: u64,
     /// Whether the metadata store's filesystem has room for small shards.
     meta_space: MetaSpace,
 }
@@ -906,6 +913,7 @@ impl BlockStore {
             next_disk: RwLock::new(0),
             corrupt: RwLock::new(HashSet::new()),
             corrupt_found: AtomicU64::new(0),
+            dropped_at_open: lost.len() as u64,
             meta_space: MetaSpace::new(meta_dir),
         }
     }
@@ -1420,6 +1428,10 @@ impl ShardStore for BlockStore {
 
     fn corrupt_found(&self) -> u64 {
         self.corrupt_found.load(Ordering::Relaxed)
+    }
+
+    fn dropped_at_open(&self) -> u64 {
+        self.dropped_at_open
     }
 
     fn disks(&self) -> Vec<DiskReport> {
