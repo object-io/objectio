@@ -1524,11 +1524,353 @@ pub(crate) fn rot_small(meta: &dyn MetaIndex, id: &ShardId, rot: impl FnOnce(&mu
     persist_shard_location(meta, &key, &loc).unwrap();
 }
 
+/// The contract as tests, for any implementation: each takes an [`Engine`]
+/// that opens the implementation's store in a directory (and opens it again
+/// there, to check what survives).
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::{ShardInfo, ShardStore};
+    use objectio_proto::storage::{ShardId, ShardState, SmallShard};
+    use objectio_storage::metadata::{MetaIndex, MetadataKey};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// A store, and the metadata index it records into.
+    pub type Opened = (Arc<dyn ShardStore>, Arc<dyn MetaIndex>);
+
+    /// An implementation, as the suite drives it.
+    pub struct Engine {
+        /// Open the store kept in a directory, with the metadata index it
+        /// records into.
+        pub open: fn(&Path) -> Opened,
+        /// Damage the stored bytes of a shard held as a block (`needle` is
+        /// some of them), as a bad sector would.
+        pub rot: fn(&Path, &dyn ShardStore, &ShardId, &[u8]),
+        /// Make writes of the metadata index fail (or not), as an
+        /// unwritable log would.
+        pub fail_records: fn(bool),
+    }
+
+    fn id(object: u8, position: u32) -> ShardId {
+        ShardId {
+            object_id: vec![object; 16],
+            stripe_id: 0,
+            position,
+        }
+    }
+
+    fn data(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 241) as u8 ^ seed).collect()
+    }
+
+    fn free(store: &dyn ShardStore) -> u64 {
+        store.disks().iter().map(|d| d.free).sum()
+    }
+
+    async fn put(store: &dyn ShardStore, id: &ShardId, data: &[u8]) -> ShardInfo {
+        store
+            .write(id, data, crc32c::crc32c(data), false)
+            .await
+            .unwrap()
+    }
+
+    fn small(id: &ShardId, data: &[u8]) -> SmallShard {
+        SmallShard {
+            shard_id: Some(id.clone()),
+            crc32c: crc32c::crc32c(data),
+            data: data.to_vec(),
+        }
+    }
+
+    /// Every check, against one implementation.
+    pub async fn run(engine: &Engine) {
+        reads_its_writes(engine).await;
+        a_damaged_write_is_refused(engine).await;
+        writes_survive_a_reopen(engine).await;
+        a_delete_frees_and_forgets(engine).await;
+        an_overwrite_frees_the_old_copy(engine).await;
+        rot_is_found_and_a_rewrite_clears_it(engine).await;
+        a_shard_with_metadata_is_all_or_nothing(engine).await;
+        shards_page_in_key_order(engine).await;
+        client_writes_stop_at_the_full_ratio(engine).await;
+    }
+
+    async fn reads_its_writes(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        assert_eq!(store.count(), 0);
+        assert_eq!(store.state(&id(1, 0)), ShardState::Missing);
+        assert_eq!(
+            store.read(&id(1, 0)).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        let bytes = data(1, 70_000);
+        let info = put(&*store, &id(1, 0), &bytes).await;
+        assert_eq!(info.size, 70_000);
+        assert_eq!(info.crc32c, crc32c::crc32c(&bytes));
+        assert_eq!(store.info(&id(1, 0)), Some(info.clone()));
+        let (got, read_info) = store.read(&id(1, 0)).await.unwrap();
+        assert_eq!(got, bytes);
+        assert_eq!(read_info, info);
+        assert_eq!(store.state(&id(1, 0)), ShardState::Ok);
+        assert_eq!(store.count(), 1);
+        assert_eq!(store.disks().iter().map(|d| d.shard_count).sum::<u64>(), 1);
+        assert!(store.healthy());
+    }
+
+    async fn a_damaged_write_is_refused(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let before = free(&*store);
+        let bytes = data(2, 100_000);
+        let err = store
+            .write(&id(2, 0), &bytes, crc32c::crc32c(&bytes) ^ 1, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+        assert_eq!(store.state(&id(2, 0)), ShardState::Missing);
+        assert_eq!(free(&*store), before, "a refused shard kept its space");
+    }
+
+    async fn writes_survive_a_reopen(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let big = data(3, 200_000);
+        let little = data(4, 5_000);
+        let (used, info) = {
+            let (store, _meta) = (engine.open)(dir.path());
+            let before = free(&*store);
+            let info = put(&*store, &id(3, 0), &big).await;
+            store
+                .write_with_metadata(small(&id(3, 1), &little), Vec::new())
+                .unwrap();
+            put(&*store, &id(3, 2), &data(5, 1000)).await;
+            assert!(store.delete(&id(3, 2)).unwrap());
+            (before - free(&*store), info)
+        };
+        let (store, _meta) = (engine.open)(dir.path());
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.info(&id(3, 0)), Some(info));
+        assert_eq!(store.read(&id(3, 0)).await.unwrap().0, big);
+        assert_eq!(store.read(&id(3, 1)).await.unwrap().0, little);
+        assert_eq!(store.state(&id(3, 2)), ShardState::Missing);
+        let capacity: u64 = store.disks().iter().map(|d| d.capacity).sum();
+        assert_eq!(capacity - free(&*store), used, "space not as it was");
+    }
+
+    async fn a_delete_frees_and_forgets(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let before = free(&*store);
+        put(&*store, &id(6, 0), &data(6, 150_000)).await;
+        assert!(free(&*store) < before);
+        assert!(store.delete(&id(6, 0)).unwrap());
+        assert_eq!(free(&*store), before, "its space did not come back");
+        assert_eq!(store.state(&id(6, 0)), ShardState::Missing);
+        assert_eq!(store.info(&id(6, 0)), None);
+        assert_eq!(store.count(), 0);
+        assert!(!store.delete(&id(6, 0)).unwrap(), "deleted twice");
+
+        // A delete that can't be made durable keeps the shard.
+        put(&*store, &id(6, 1), &data(7, 10_000)).await;
+        let with = free(&*store);
+        (engine.fail_records)(true);
+        let err = store.delete(&id(6, 1));
+        (engine.fail_records)(false);
+        assert_eq!(err.unwrap_err().code(), tonic::Code::Unavailable);
+        assert_eq!(store.state(&id(6, 1)), ShardState::Ok);
+        assert_eq!(free(&*store), with, "freed anyway");
+    }
+
+    async fn an_overwrite_frees_the_old_copy(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let bytes = data(8, 120_000);
+        put(&*store, &id(8, 0), &bytes).await;
+        let once = free(&*store);
+        put(&*store, &id(8, 0), &bytes).await;
+        assert_eq!(free(&*store), once, "the old copy kept its space");
+        assert_eq!(store.count(), 1);
+        // Moved into its record (B21), the block is freed too.
+        let before = free(&*store);
+        store
+            .write_with_metadata(small(&id(8, 0), &bytes[..4000]), Vec::new())
+            .unwrap();
+        assert!(free(&*store) > before, "the block copy kept its space");
+        assert_eq!(store.read(&id(8, 0)).await.unwrap().0, &bytes[..4000]);
+        assert_eq!(store.count(), 1);
+    }
+
+    async fn rot_is_found_and_a_rewrite_clears_it(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let bytes = data(9, 50_000);
+        put(&*store, &id(9, 0), &bytes).await;
+        put(&*store, &id(9, 1), &data(10, 50_000)).await;
+        (engine.rot)(dir.path(), &*store, &id(9, 0), &bytes[1000..1064]);
+
+        let err = store.read(&id(9, 0)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+        assert_eq!(store.state(&id(9, 0)), ShardState::Corrupt);
+        assert_eq!(store.state(&id(9, 1)), ShardState::Ok);
+        assert_eq!(store.corrupt_now(), 1);
+        assert_eq!(store.corrupt_found(), 1);
+
+        put(&*store, &id(9, 0), &bytes).await;
+        assert_eq!(store.state(&id(9, 0)), ShardState::Ok);
+        assert_eq!(store.corrupt_now(), 0);
+        assert_eq!(store.read(&id(9, 0)).await.unwrap().0, bytes);
+
+        // The scrubber finds rot nobody reads.
+        let other = data(11, 50_000);
+        put(&*store, &id(9, 2), &other).await;
+        (engine.rot)(dir.path(), &*store, &id(9, 2), &other[2000..2064]);
+        let seen = std::sync::atomic::AtomicU64::new(0);
+        store
+            .scrub(0, &|n| {
+                seen.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            })
+            .await;
+        assert_eq!(seen.into_inner(), 150_000);
+        assert_eq!(store.state(&id(9, 2)), ShardState::Corrupt);
+        assert_eq!(store.state(&id(9, 0)), ShardState::Ok);
+
+        // A copy the caller finds wrong is marked; a stale report is not.
+        let stale = store.info(&id(9, 1)).unwrap();
+        put(&*store, &id(9, 1), &data(10, 50_000)).await;
+        store.mark_corrupt(&id(9, 1), &stale);
+        assert_eq!(store.state(&id(9, 1)), ShardState::Ok);
+        store.mark_corrupt(&id(9, 1), &store.info(&id(9, 1)).unwrap());
+        assert_eq!(store.state(&id(9, 1)), ShardState::Corrupt);
+        assert!(store.delete(&id(9, 1)).unwrap());
+        assert_eq!(store.state(&id(9, 1)), ShardState::Missing);
+    }
+
+    async fn a_shard_with_metadata_is_all_or_nothing(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta) = (engine.open)(dir.path());
+        let bytes = data(12, 9_000);
+        let entry = || vec![(MetadataKey::object_meta("b", "k"), b"meta".to_vec())];
+
+        // A damaged shard stores neither.
+        let mut damaged = small(&id(12, 0), &bytes);
+        damaged.crc32c ^= 1;
+        let err = store.write_with_metadata(damaged, entry()).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::DataLoss);
+        // Nor does a write that can't be made durable.
+        (engine.fail_records)(true);
+        let err = store.write_with_metadata(small(&id(12, 0), &bytes), entry());
+        (engine.fail_records)(false);
+        assert!(err.is_err());
+        assert_eq!(store.state(&id(12, 0)), ShardState::Missing);
+        assert_eq!(meta.get(&MetadataKey::object_meta("b", "k")), None);
+        assert_eq!(store.count(), 0);
+
+        store
+            .write_with_metadata(small(&id(12, 0), &bytes), entry())
+            .unwrap();
+        assert_eq!(
+            meta.get(&MetadataKey::object_meta("b", "k")).as_deref(),
+            Some(&b"meta"[..])
+        );
+        assert_eq!(store.read(&id(12, 0)).await.unwrap().0, bytes);
+        let got = store
+            .small_shard(&id(12, 0))
+            .expect("kept with its metadata");
+        assert_eq!(got, small(&id(12, 0), &bytes));
+        assert!(store.small_shard(&id(12, 1)).is_none());
+        let too_big = data(13, objectio_common::version::SMALL_SHARD_MAX + 1);
+        let err = store
+            .write_with_metadata(small(&id(12, 2), &too_big), entry())
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    async fn shards_page_in_key_order(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let mut ids = Vec::new();
+        for object in 0..6u8 {
+            for position in 0..5u32 {
+                let i = id(object.wrapping_mul(37), position);
+                if position == 0 {
+                    put(&*store, &i, &data(object, 3000)).await;
+                } else {
+                    store
+                        .write_with_metadata(small(&i, &data(object, 100)), Vec::new())
+                        .unwrap();
+                }
+                ids.push(i);
+            }
+        }
+        assert_eq!(store.count(), 30);
+        let mut seen = Vec::new();
+        let mut after: Option<ShardId> = None;
+        loop {
+            let page = store.page(after.as_ref(), 7);
+            assert!(page.len() <= 7);
+            let Some((last, _)) = page.last() else { break };
+            after = Some(last.clone());
+            seen.extend(page.into_iter().map(|(i, _)| i));
+        }
+        let key = |i: &ShardId| super::shard_key(&i.object_id, i.stripe_id, i.position);
+        ids.sort_by_key(key);
+        assert_eq!(seen, ids, "not every shard, once, in key order");
+
+        // Purged, none is left and their space is back.
+        assert_eq!(store.purge().unwrap(), 30);
+        assert_eq!(store.count(), 0);
+        assert!(store.page(None, 10).is_empty());
+    }
+
+    async fn client_writes_stop_at_the_full_ratio(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _meta) = (engine.open)(dir.path());
+        let bytes = data(14, 10_000);
+        store.set_full_ratio(0.0);
+        let before = free(&*store);
+        let err = store
+            .write(&id(14, 0), &bytes, crc32c::crc32c(&bytes), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+        assert_eq!(free(&*store), before);
+        // Writes that restore redundancy may use the rest.
+        store
+            .write(&id(14, 0), &bytes, crc32c::crc32c(&bytes), true)
+            .await
+            .unwrap();
+        assert_eq!(store.state(&id(14, 0)), ShardState::Ok);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use objectio_storage::metadata::{MetadataStore, MetadataStoreConfig};
     use std::collections::HashMap;
+
+    const BLOCK: u32 = 64 * 1024;
+
+    fn open(dir: &Path) -> conformance::Opened {
+        let disks = Disks::open(&[dir.join("disk.raw").display().to_string()], BLOCK).unwrap();
+        let meta_dir = dir.join("state");
+        let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(&meta_dir))
+            .unwrap();
+        let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir);
+        (Arc::new(store), meta)
+    }
+
+    #[tokio::test]
+    async fn block_store_keeps_the_contract() {
+        conformance::run(&conformance::Engine {
+            open,
+            rot: |dir, store, id, needle| {
+                rot_block(&dir.join("disk.raw"), BLOCK, store, id, needle);
+            },
+            fail_records: |on| LOCATION_RECORDS_FAIL.with(|f| f.set(on)),
+        })
+        .await;
+    }
 
     /// A shard key gives back the shard it was made from, and nothing else
     /// reads as one.
