@@ -12,15 +12,9 @@ impl MetaService {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let uploads = self.multipart_uploads.read();
-        let ages: Vec<u64> = uploads
-            .values()
-            .map(|u| now.saturating_sub(u.initiated))
-            .collect();
-        let bytes: u64 = uploads
-            .values()
-            .flat_map(|u| u.parts.values())
-            .map(|p| p.size)
-            .sum();
+        let open = || uploads.values().filter(|u| u.completed.is_none());
+        let ages: Vec<u64> = open().map(|u| now.saturating_sub(u.initiated)).collect();
+        let bytes: u64 = open().flat_map(|u| u.parts.values()).map(|p| p.size).sum();
         drop(uploads);
 
         let mut out = String::new();
@@ -200,6 +194,7 @@ impl MetaService {
             encrypted_dek: req.encrypted_dek.clone(),
             customer_key_md5: req.customer_key_md5.clone(),
             encryption_context: req.encryption_context.clone(),
+            completed: None,
         };
         self.update_multipart(&upload_id, "create-multipart", |_| {
             Ok((Some(state.clone()), ()))
@@ -286,7 +281,7 @@ impl MetaService {
         // lands; hand its stripes back so the gateway can free them.
         let replaced = self
             .update_multipart(&req.upload_id, "register-part", |upload| {
-                let mut upload = upload.ok_or_else(|| {
+                let mut upload = upload.filter(|u| u.completed.is_none()).ok_or_else(|| {
                     Status::not_found(format!("multipart upload not found: {}", req.upload_id))
                 })?;
                 if upload.bucket != req.bucket || upload.key != req.key {
@@ -381,17 +376,46 @@ impl MetaService {
     ) -> Result<Response<CompleteMultipartUploadResponse>, Status> {
         let req = request.into_inner();
 
-        // Validate and take the upload in one step (a compare-and-set
+        // Validate and complete the upload in one step (a compare-and-set
         // through Raft, or under the lock): a read-then-remove let an
         // abort, or a part re-upload, land in between — the abort freed
         // parts this completion went on to use, and a re-uploaded part was
         // dropped with the upload, unreferenced.
+        //
+        // The upload is kept, marked completed with its object, until the
+        // gateway has committed that object and forgets it. Taken out here,
+        // a completion whose answer was lost (a leader change, a timeout),
+        // or whose commit then failed, left the parts belonging to nothing:
+        // the client's retry found no upload, and its object was gone.
+        let keep =
+            objectio_common::version::allows(objectio_common::version::COMPLETED_UPLOADS_LEVEL);
         let (object, unused_stripes) = self
             .update_multipart(&req.upload_id, "complete-multipart", |upload| {
                 let upload = upload.ok_or_else(|| {
                     Status::not_found(format!("multipart upload not found: {}", req.upload_id))
                 })?;
-                Ok((None, complete_upload(&upload, &req)?))
+                if let Some(done) = &upload.completed {
+                    // Sent again: the same object, for the same parts.
+                    let (again, _) = complete_upload(&upload, &req)?;
+                    if again.etag != done.etag {
+                        return Err(Status::not_found(format!(
+                            "multipart upload not found: {}",
+                            req.upload_id
+                        )));
+                    }
+                    let done = done.clone();
+                    return Ok((Some(upload), (done, Vec::new())));
+                }
+                let (object, unused) = complete_upload(&upload, &req)?;
+                if !keep {
+                    return Ok((None, (object, unused)));
+                }
+                let used: std::collections::HashSet<u32> =
+                    req.parts.iter().map(|p| p.part_number).collect();
+                let mut kept = upload;
+                kept.parts.retain(|n, _| used.contains(n));
+                kept.completed = Some(object.clone());
+                Ok((Some(kept), (object, unused)))
             })
             .await?;
 
@@ -428,7 +452,19 @@ impl MetaService {
             })
             .await?;
 
-        if removed.is_some() {
+        if removed.as_ref().is_some_and(|u| u.completed.is_some()) {
+            // Completed: forgotten once its object is committed (by the
+            // gateway that completed it, or a client's abort after). Its
+            // parts are the object's: nothing is freed.
+            debug!(
+                "Forgot completed multipart upload: bucket={}, key={}, upload_id={}",
+                req.bucket, req.key, req.upload_id
+            );
+            return Err(Status::not_found(format!(
+                "multipart upload not found: {}",
+                req.upload_id
+            )));
+        } else if removed.is_some() {
             info!(
                 "Aborted multipart upload: bucket={}, key={}, upload_id={}",
                 req.bucket, req.key, req.upload_id
@@ -477,7 +513,7 @@ impl MetaService {
         let uploads_lock = self.multipart_uploads.read();
         let mut uploads: Vec<MultipartUpload> = uploads_lock
             .values()
-            .filter(|u| u.bucket == req.bucket)
+            .filter(|u| u.bucket == req.bucket && u.completed.is_none())
             .filter(|u| req.prefix.is_empty() || u.key.starts_with(&req.prefix))
             .filter(|u| {
                 if req.key_marker.is_empty() || u.key > req.key_marker {

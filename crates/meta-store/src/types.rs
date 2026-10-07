@@ -208,6 +208,13 @@ pub struct MultipartUploadState {
     /// binding on the wrapped DEK still validates.
     #[prost(map = "string, string", tag = "12")]
     pub encryption_context: HashMap<String, String>,
+    /// Set once the upload is completed: the object its parts make, kept
+    /// until the gateway has committed it and forgets the upload. A
+    /// completion sent again (its answer lost, or the commit after it
+    /// failed) gets the same object; the upload is no longer listed, takes
+    /// no parts, and an abort frees nothing (the parts are the object's).
+    #[prost(message, optional, tag = "13")]
+    pub completed: Option<objectio_proto::metadata::ObjectMeta>,
 }
 
 /// State for a completed part within a multipart upload

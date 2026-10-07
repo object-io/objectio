@@ -512,3 +512,54 @@ fn aborting_frees_parts_wherever_they_were_placed() {
         after.saturating_sub(baseline)
     );
 }
+
+/// A completion meta applied whose answer was lost (a leader change, a
+/// timeout: here a test hook) is completed by the client's retry, into the
+/// object its parts make. Meta used to drop the upload when it applied the
+/// completion: the retry found no upload (`NoSuchUpload`), the object never
+/// existed, and its parts belonged to nothing.
+#[test]
+fn a_completion_whose_answer_was_lost_completes_on_the_retry() {
+    for versioned in [false, true] {
+        let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+        c.json("POST", "/_admin/buckets", json!({ "name": "mpu-lost" }))
+            .expect_ok();
+        if versioned {
+            c.request(
+                "PUT",
+                "/mpu-lost?versioning",
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            )
+            .expect(200);
+        }
+        let upload = initiate(&c, "mpu-lost", "k");
+        let first = upload_part(&c, "mpu-lost", "k", &upload, 1, &mib(1));
+        c.json(
+            "POST",
+            "/_admin/test/lose-reply",
+            json!({ "call": "complete_multipart_upload" }),
+        )
+        .expect_ok();
+        let lost = complete(&c, "mpu-lost", "k", &upload, &[(1, first.clone())]);
+        assert_eq!(lost.status, 503, "versioned {versioned}: {}", lost.text());
+        let again = complete(&c, "mpu-lost", "k", &upload, &[(1, first.clone())]);
+        assert_eq!(again.status, 200, "versioned {versioned}: {}", again.text());
+        let got = c.request("GET", "/mpu-lost/k", &[]);
+        assert_eq!(got.status, 200, "versioned {versioned}: {}", got.text());
+        assert!(got.bytes == mib(1), "versioned {versioned}: wrong bytes");
+        // Sent a third time, it answers as completed, and makes no second
+        // version of the same parts.
+        complete(&c, "mpu-lost", "k", &upload, &[(1, first)]).expect(200);
+        if versioned {
+            let versions = c.request("GET", "/mpu-lost?versions", &[]).text();
+            assert_eq!(
+                versions.matches("<Version>").count(),
+                1,
+                "one completion, one version: {versions}"
+            );
+        }
+        // Forgotten once committed: no upload is left open.
+        let open = c.request("GET", "/mpu-lost?uploads", &[]).text();
+        assert!(!open.contains("<Upload>"), "versioned {versioned}: {open}");
+    }
+}

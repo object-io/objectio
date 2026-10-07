@@ -1146,16 +1146,22 @@ pub(crate) async fn complete_multipart_upload_internal(
         }
     }
 
+    // Meta keeps the upload, completed, until its object is committed
+    // here: a completion sent again gets the same object.
+    let kept = objectio_common::version::allows(objectio_common::version::COMPLETED_UPLOADS_LEVEL);
     // Complete the multipart upload via metadata service
-    match meta_client
-        .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
-            parts,
-        })
-        .await
-    {
+    let completed = crate::test_hooks::maybe_lost(
+        "complete_multipart_upload",
+        meta_client
+            .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                parts,
+            })
+            .await,
+    );
+    match completed {
         Ok(response) => {
             let resp = response.into_inner();
             // Parts left out of the object went with the upload.
@@ -1219,9 +1225,17 @@ pub(crate) async fn complete_multipart_upload_internal(
                     .await
                     .map_or(true, |v| v == VersioningState::VersioningEnabled);
                 // A new version, as a single-part PUT makes — or a replica's,
-                // which keeps its source's version id and ETag.
+                // which keeps its source's version id and ETag. Named after
+                // the object (a UUIDv7, as version ids are): a completion
+                // sent again commits the same version, not a second one
+                // sharing its parts.
                 if versioning_enabled {
-                    object.version_id = new_version_id();
+                    object.version_id = if kept {
+                        uuid::Uuid::from_slice(&object.object_id)
+                            .map_or_else(|_| new_version_id(), |u| u.to_string())
+                    } else {
+                        new_version_id()
+                    };
                 }
                 if let Some(v) = object
                     .user_metadata
@@ -1275,21 +1289,35 @@ pub(crate) async fn complete_multipart_upload_internal(
                     object.checksum = Some(c.clone());
                     object.part_checksums = part_checksums;
                 }
-                // Listed with its ObjectMeta, as a single-part PUT is. On
-                // failure the parts belong to nothing: meta has already
-                // dropped the upload, and commit_put frees them.
-                if let Err(resp) = commit_put(
-                    &state,
-                    &placement,
-                    object.clone(),
-                    versioning_enabled,
-                    stripe_targets(&object.stripes),
-                    &condition,
-                    None,
-                )
-                .await
-                {
-                    return resp;
+                // Listed with its ObjectMeta, as a single-part PUT is. The
+                // parts stay the kept upload's until it is committed: on a
+                // failure nothing is freed, and the client's retry commits
+                // the same object. (Before the upload was kept, meta had
+                // dropped it, and commit_put freed the parts on a failure.)
+                let committed_already =
+                    kept && committed(&state, &placement.nodes, &bucket, &key, &object).await;
+                if !committed_already {
+                    let sent = if kept {
+                        Vec::new()
+                    } else {
+                        stripe_targets(&object.stripes)
+                    };
+                    if let Err(resp) = commit_put(
+                        &state,
+                        &placement,
+                        object.clone(),
+                        versioning_enabled,
+                        sent,
+                        &condition,
+                        None,
+                    )
+                    .await
+                    {
+                        return resp;
+                    }
+                }
+                if kept {
+                    forget_upload(&state, &bucket, &key, &upload_id).await;
                 }
 
                 let cx = ChecksumXml::of(object.checksum.as_ref(), true);
@@ -1391,6 +1419,78 @@ pub(crate) async fn complete_multipart_upload_internal(
             }
         }
     }
+}
+
+/// Whether `object` (a completed upload's) is already committed: the key's
+/// current object, or its version. A completion sent again after its
+/// commit then only answers, and forgets the upload.
+async fn committed(
+    state: &AppState,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    object: &ObjectMeta,
+) -> bool {
+    let current = get_object_meta_from_any(&state.osd_pool, nodes, bucket, key)
+        .await
+        .ok()
+        .flatten();
+    if current.is_some_and(|c| c.object_id == object.object_id) {
+        return true;
+    }
+    !object.version_id.is_empty()
+        && find_version(&state.osd_pool, nodes, bucket, key, &object.version_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.object_id == object.object_id)
+}
+
+/// Forget a completed upload whose object is committed. Meta answers
+/// NotFound once it is gone (an abort of a completed upload frees
+/// nothing); any other answer is retried in the background for a while: a
+/// completed upload left in meta is a small record, not listed, and only
+/// holds parts its committed object already uses.
+async fn forget_upload(state: &Arc<AppState>, bucket: &str, key: &str, upload_id: &str) {
+    let request = AbortMultipartUploadRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+    };
+    let forgotten = |r: &Result<_, tonic::Status>| {
+        r.as_ref()
+            .err()
+            .is_some_and(|s| s.code() == tonic::Code::NotFound)
+    };
+    let r = state
+        .meta_client
+        .clone()
+        .abort_multipart_upload(request.clone())
+        .await;
+    if forgotten(&r) {
+        return;
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut wait = std::time::Duration::from_secs(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(wait).await;
+            let r = state
+                .meta_client
+                .clone()
+                .abort_multipart_upload(request.clone())
+                .await;
+            if forgotten(&r) {
+                return;
+            }
+            wait = (wait * 2).min(std::time::Duration::from_secs(30));
+        }
+        warn!(
+            "{}/{} upload {}: completed, committed, not forgotten in 10 minutes; its record stays",
+            request.bucket, request.key, request.upload_id
+        );
+    });
 }
 
 /// The composite checksum of an object made of `numbers`' parts, when they

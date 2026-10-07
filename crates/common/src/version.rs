@@ -23,7 +23,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 3 | the IAM API: paths on users, groups, roles and policies; role and policy ids; group renames; inline policies (meta table `iam_inline_policies`) |
 /// | 4 | meta's Raft log in files of its own, not in its database (objectio-docs `core/meta-log.md`): a meta node of the previous release would find its log empty |
 /// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
-pub const FORMAT_LEVEL: u32 = 5;
+/// | 6 | a completed multipart upload kept, marked completed, until its object is committed: a meta node of the previous release would take it for an open upload, list it and let an abort free the object's parts |
+pub const FORMAT_LEVEL: u32 = 6;
+
+/// The level from which meta keeps a completed multipart upload (marked
+/// with its object) until the gateway has committed that object, so a
+/// completion sent again gets the same object.
+pub const COMPLETED_UPLOADS_LEVEL: u32 = 6;
 
 /// The level from which small shards are kept in the OSDs' metadata
 /// records and sent with their object's metadata (B21).
