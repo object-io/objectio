@@ -48,6 +48,7 @@ WRITERS = 6
 MAX_GAP = float(os.environ.get("MAX_GAP", "60"))
 HOLD = int(os.environ.get("HOLD", "60"))
 REPAIR_WAIT = int(os.environ.get("REPAIR_WAIT", "900"))
+DISK_SIZE = os.environ.get("DISK_SIZE", "16GiB")  # as cluster.sh
 
 
 def say(msg):
@@ -130,16 +131,24 @@ def sigv4(method, url, body):
     return headers
 
 
-def admin(method, path, payload=None):
+def admin(method, path, payload=None, retry_for=120):
+    """An admin call through the first gateway that answers. 503 means
+    "retry" (meta electing a leader, a node coming back), as for S3 calls:
+    it is retried for up to `retry_for` seconds; anything else is final."""
     body = None if payload is None else json.dumps(payload).encode()
-    for url in GW:
-        headers = sigv4(method, url + path, body)
-        if body is not None:
-            headers["content-type"] = "application/json"
-        status, data = http(method, url + path, body, 10, headers)
-        if status is not None:
+    deadline = time.monotonic() + retry_for
+    while True:
+        status, data = None, b"no gateway answered"
+        for url in GW:
+            headers = sigv4(method, url + path, body)
+            if body is not None:
+                headers["content-type"] = "application/json"
+            status, data = http(method, url + path, body, 10, headers)
+            if status is not None:
+                break
+        if status != 503 or time.monotonic() > deadline:
             return status, data
-    return None, b"no gateway answered"
+        time.sleep(2)
 
 
 # --- traffic ---------------------------------------------------------------
@@ -255,17 +264,27 @@ def leader_vm(timeout=60):
     fail("no leader every meta agrees on")
 
 
-def await_metas_healthy(timeout=300):
-    deadline = time.monotonic() + timeout
+# How long every meta may take to be back in step after a fault. A meta
+# node reopening its database after a power cut walks all of it (roadmap
+# B25), minutes on these VMs: the soak sets this higher and logs the time.
+META_RECOVERY = float(os.environ.get("META_RECOVERY_SECS", "300"))
+
+
+def await_metas_healthy(timeout=None):
+    started = time.monotonic()
+    deadline = started + (timeout or META_RECOVERY)
     while time.monotonic() < deadline:
         seen = [meta_status(vm) for vm in METAS]
         if all(seen) and len({s["leader_id"] for s in seen}) == 1 and all(
                 len(s["voters"]) == 3 for s in seen):
             applied = [s["last_applied"] or 0 for s in seen]
             if max(applied) - min(applied) < 100:
+                took = time.monotonic() - started
+                if took > 30:
+                    say(f"meta back in step after {took:.0f} s")
                 return
         time.sleep(2)
-    fail("meta never became healthy")
+    fail(f"meta never became healthy (waited {timeout or META_RECOVERY:.0f} s)")
 
 
 def nodes():
@@ -338,7 +357,9 @@ def partition():
     settle("partition")
 
 
-def disk_pull(vm="chaos-5"):
+def disk_pull(vm="chaos-5", new=None):
+    """`new`: the Incus volume to plug in (default `<vm>-osd2`)."""
+    new = new or f"{vm}-osd2"
     old = osd_of(vm)
     if not old:
         fail(f"no OSD found on {vm}")
@@ -349,8 +370,8 @@ def disk_pull(vm="chaos-5"):
     status, data = admin("PUT", f"/_admin/osds/{old['node_id']}/admin-state", {"state": "out"})
     if status != 200:
         fail(f"set out: {status} {data[:200]}")
-    incus("storage", "volume", "create", "default", f"{vm}-osd2", "--type=block", "size=16GiB")
-    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={vm}-osd2")
+    incus("storage", "volume", "create", "default", new, "--type=block", f"size={DISK_SIZE}")
+    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={new}")
     vm_exec(vm, "sleep 3; systemctl restart objectio-osd")
     # The documented replacement: the OSD comes back on the new disk under
     # its identity (its metadata lives in its state directory; the shards
@@ -369,6 +390,58 @@ def disk_pull(vm="chaos-5"):
         fail(f"set in: {status} {data[:200]}")
     say(f"disk-pull: OSD {old['node_id']} back on the new disk, set in")
     settle("disk-pull")
+
+
+def drive_lost(vm="chaos-5", new=None):
+    """A drive lost whole, as production loses one (B26): the OSD's state
+    directory (its metadata) is on the drive too, so the blank drive comes
+    back as a new OSD. The old OSD is set out, as the runbook says, and
+    everything it held must be rebuilt elsewhere: shards from the rest of
+    their stripes, metadata copies from the other copies."""
+    new = new or f"{vm}-osd2"
+    old = osd_of(vm)
+    if not old:
+        fail(f"no OSD found on {vm}")
+    say(f"drive-lost: {vm}'s drive and its metadata gone (OSD {old['node_id']})")
+    vm_exec(vm, "systemctl stop objectio-osd")
+    incus("config", "device", "remove", vm, "osd")
+    vm_exec(vm, "rm -rf /var/lib/objectio/osd && mkdir -p /var/lib/objectio/osd")
+    incus("storage", "volume", "create", "default", new, "--type=block", f"size={DISK_SIZE}")
+    incus("config", "device", "add", vm, "osd", "disk", "pool=default", f"source={new}")
+    vm_exec(vm, "sleep 3; systemctl start objectio-osd")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        back = osd_of(vm)
+        if back and back["node_id"] != old["node_id"] and back.get("online"):
+            break
+        time.sleep(3)
+    else:
+        fail(f"{vm} never came back as a new OSD on the blank drive")
+    say(f"drive-lost: {vm} back as OSD {back['node_id']}; evacuating {old['node_id']}")
+    # The old OSD is recorded lost by itself (no admin call), evacuated
+    # from the other copies, and its entry removed when that is done.
+    # How long it takes is the disks' business (B24 measures it on real
+    # hardware); here it must keep going until done: a stall fails.
+    started = last_move = time.monotonic()
+    seen = None
+    while True:
+        status, data = admin("GET", "/_admin/nodes")
+        if status != 200:
+            fail(f"/_admin/nodes: {status} {data[:200]}")
+        nodes = {n["node_id"]: n for n in json.loads(data).get("nodes", [])}
+        if old["node_id"] not in nodes:
+            break
+        now = (nodes.get(back["node_id"], {}).get("shard_count"), repair_counters())
+        if now != seen:
+            seen, last_move = now, time.monotonic()
+        elif time.monotonic() - last_move > REPAIR_WAIT:
+            fail(f"drive-lost: evacuating {old['node_id']} made no progress for {REPAIR_WAIT}s")
+        time.sleep(10)
+    took = time.monotonic() - started
+    rebuilt = (seen or (None,))[0] or 0
+    say(f"drive-lost: {old['node_id']} evacuated in {took:.0f} s "
+        f"({rebuilt} shards on the new OSD, {rebuilt / max(took, 1):.0f}/s)")
+    settle("drive-lost")
 
 
 def repair_counters():
@@ -401,30 +474,39 @@ def await_repair_quiet(deadline):
         if start is None or now[1] != start[1]:
             start = now  # still working: count passes from here
         elif now[0] >= start[0] + 2:
-            return  # a whole pass began and ended with nothing to do
+            return True  # a whole pass began and ended with nothing to do
         time.sleep(10)
+    return False
 
 
-def redundancy_restored():
+def redundancy_restored(keys=None, intact=None):
     """With every node up, wait for repair (meta runs it every minute
-    here) to have nothing left to do, then any two OSDs may go."""
+    here) to have nothing left to do, then any two OSDs may go. `keys`
+    (default: the acknowledged ones) are sampled; `intact(key, data)`
+    (default: its acknowledged digest) says whether a read is right."""
+    if keys is None:
+        with lock:
+            keys = list(acked)
+    if intact is None:
+        def intact(key, data):
+            return hashlib.sha256(data).hexdigest() == acked[key]
     say("redundancy: running repair until two OSDs can be stopped")
     pairs = [("chaos-1", "chaos-2"), ("chaos-3", "chaos-4"), ("chaos-5", "chaos-6")]
     deadline = time.monotonic() + REPAIR_WAIT
     while True:
-        await_repair_quiet(deadline)
-        say("redundancy: repair is quiet; stopping OSDs in pairs")
+        if await_repair_quiet(deadline):
+            say("redundancy: repair is quiet; stopping OSDs in pairs")
+        else:
+            say(f"redundancy: repair still working after {REPAIR_WAIT}s; stopping OSDs in pairs anyway")
         ok = True
         for a, b in pairs:
             for vm in (a, b):
                 vm_exec(vm, "systemctl stop objectio-osd")
             try:
-                with lock:
-                    items = list(acked.items())
                 unreadable = 0
-                for key, digest in random.sample(items, min(len(items), 400)):
+                for key in random.sample(keys, min(len(keys), 400)):
                     status, data = http("GET", f"{GW[0]}/{BUCKET}/{key}", timeout=10)
-                    if status != 200 or hashlib.sha256(data).hexdigest() != digest:
+                    if status != 200 or not intact(key, data):
                         unreadable += 1
             finally:
                 for vm in (a, b):
@@ -454,7 +536,8 @@ def main():
     time.sleep(30)
     phase_report("warm-up")
 
-    faults = os.environ.get("FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull")
+    faults = os.environ.get(
+        "FAULTS", "meta-kill,power-off,meta-power-off,partition,disk-pull,drive-lost")
     for f in faults.split(","):
         if f == "meta-kill":
             meta_kill()
@@ -466,6 +549,8 @@ def main():
             partition()
         elif f == "disk-pull":
             disk_pull()
+        elif f == "drive-lost":
+            drive_lost("chaos-4")
         else:
             fail(f"unknown fault {f}")
         read_all(f"after {f}")
