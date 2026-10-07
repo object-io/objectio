@@ -48,7 +48,7 @@ use objectio_proto::storage::{
     storage_service_server::StorageService,
 };
 use objectio_storage::DiskManager;
-use objectio_storage::metadata::{MetadataKey, MetadataStore, MetadataStoreConfig};
+use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataStoreConfig};
 use parking_lot::RwLock;
 use prost::Message;
 use std::collections::HashMap;
@@ -280,7 +280,7 @@ const SHARD_LOC_PREFIX: &[u8] = b"osd_loc:";
 /// in-memory map of every shard this held made an OSD's memory grow with
 /// its shard count (B22).
 struct ShardIndex {
-    store: Arc<MetadataStore>,
+    store: Arc<dyn MetaIndex>,
     /// Shards per disk.
     per_disk: Vec<AtomicU64>,
     /// Shards kept in their records (B21).
@@ -292,7 +292,7 @@ struct ShardIndex {
 impl ShardIndex {
     const STRIPES: usize = 256;
 
-    fn new(store: Arc<MetadataStore>, num_disks: usize) -> Self {
+    fn new(store: Arc<dyn MetaIndex>, num_disks: usize) -> Self {
         Self {
             store,
             per_disk: (0..num_disks).map(|_| AtomicU64::new(0)).collect(),
@@ -343,7 +343,7 @@ impl ShardIndex {
     fn record(&self, key: &str, loc: &ShardLocation) -> Result<Option<ShardLocation>, String> {
         let _key = self.lock(key);
         let old = self.get(key);
-        OsdService::persist_shard_location(&self.store, key, loc)?;
+        OsdService::persist_shard_location(&*self.store, key, loc)?;
         self.counted(old.as_ref(), Some(loc));
         Ok(old)
     }
@@ -374,7 +374,7 @@ impl ShardIndex {
         let Some(old) = self.get(key) else {
             return Ok(None);
         };
-        OsdService::forget_shard_location(&self.store, key)?;
+        OsdService::forget_shard_location(&*self.store, key)?;
         self.counted(Some(&old), None);
         Ok(Some(old))
     }
@@ -385,16 +385,17 @@ impl ShardIndex {
         let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
         let after = after.map(OsdService::shard_loc_meta_key);
         let mut out = Vec::with_capacity(n.min(4096));
-        self.store.for_each_prefix(&prefix, after.as_ref(), |k, v| {
-            if let (Some(key), Ok(loc)) = (
-                k.strip_prefix(SHARD_LOC_PREFIX)
-                    .and_then(|k| std::str::from_utf8(k).ok()),
-                ShardLocation::from_bytes(v),
-            ) {
-                out.push((key.to_string(), loc));
-            }
-            out.len() < n
-        });
+        self.store
+            .for_each_prefix(&prefix, after.as_ref(), &mut |k: &[u8], v: &[u8]| {
+                if let (Some(key), Ok(loc)) = (
+                    k.strip_prefix(SHARD_LOC_PREFIX)
+                        .and_then(|k| std::str::from_utf8(k).ok()),
+                    ShardLocation::from_bytes(v),
+                ) {
+                    out.push((key.to_string(), loc));
+                }
+                out.len() < n
+            });
         out
     }
 
@@ -507,7 +508,7 @@ pub struct OsdService {
     /// Shard index: object_id:stripe_id:position -> location (in-memory cache)
     shard_index: ShardIndex,
     /// Persistent metadata store (WAL + B-tree + ARC cache)
-    meta_store: Arc<MetadataStore>,
+    meta_store: Arc<dyn MetaIndex>,
     start_time: Instant,
     /// Round-robin disk selection for writes
     next_disk: RwLock<usize>,
@@ -816,7 +817,7 @@ impl OsdService {
         let mut meta_config = MetadataStoreConfig::with_data_dir(&data_dir);
         tune(&mut meta_config);
         let meta_space = MetaSpace::new(meta_config.data_dir.clone());
-        let meta_store = MetadataStore::open_or_create(meta_config)
+        let meta_store = objectio_storage::metadata::open(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
 
         info!(
@@ -827,13 +828,12 @@ impl OsdService {
 
         let num_disks = disks.len();
         // Rebuild the in-memory shard index from persisted entries
-        // (replayed from the WAL as part of `MetadataStore::open_or_create`
+        // (replayed from its log when the metadata index was opened
         // above). Before this step the OSD used to report 0 shards on
         // every restart even though disk.raw was full.
-        let meta_store = Arc::new(meta_store);
         let shard_index = ShardIndex::new(Arc::clone(&meta_store), num_disks);
         // One pass over the persisted shard locations (replayed from the
-        // WAL as part of `MetadataStore::open_or_create` above), streamed:
+        // log when the metadata index was opened above), streamed:
         //
         // - A disk that had to be formatted (replaced, or wiped) holds none
         //   of the shards the index remembers on it. They are forgotten, so
@@ -846,7 +846,7 @@ impl OsdService {
         let mut lost = Vec::new();
         let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
         let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
-        meta_store.for_each_prefix(&prefix, None, |k, v| {
+        meta_store.for_each_prefix(&prefix, None, &mut |k: &[u8], v: &[u8]| {
             let loc = match ShardLocation::from_bytes(v) {
                 Ok(loc) => loc,
                 Err(e) => {
@@ -1010,37 +1010,10 @@ impl OsdService {
         }
     }
 
-    /// Metadata WAL fsync latency and batching, as Prometheus families.
+    /// The metadata index's own metrics (its engine's), as Prometheus
+    /// families.
     pub fn render_wal_metrics(&self, out: &mut String, osd_label: &str) {
-        self.meta_store.checkpoint_seconds().render(
-            out,
-            "objectio_osd_meta_checkpoint_seconds",
-            "Time of each metadata checkpoint step: gate (writes held back), flush (memtable to index file), truncate (WAL cut)",
-            osd_label,
-        );
-        let st = self.meta_store.wal_sync_stats();
-        st.seconds.render(
-            out,
-            "objectio_osd_wal_fsync_seconds",
-            "Time for one metadata WAL fdatasync",
-            osd_label,
-        );
-        for (name, help, v) in [
-            (
-                "objectio_osd_wal_syncs_total",
-                "Metadata WAL fdatasyncs",
-                st.syncs.load(Ordering::Relaxed),
-            ),
-            (
-                "objectio_osd_wal_records_synced_total",
-                "Metadata WAL records made durable; divide by syncs for records per fsync",
-                st.records.load(Ordering::Relaxed),
-            ),
-        ] {
-            let _ = writeln!(out, "# HELP {name} {help}");
-            let _ = writeln!(out, "# TYPE {name} counter");
-            let _ = writeln!(out, "{name}{{{osd_label}}} {v}");
-        }
+        self.meta_store.render_metrics(out, osd_label);
     }
 
     /// Objects at risk with `up` (sorted) the nodes up: the last count if it
@@ -1538,7 +1511,7 @@ impl OsdService {
     /// Whether `object` is also stored as a version of `bucket/key`, which
     /// keeps its shards referenced after it stops being current.
     fn version_entry_holds(
-        store: &MetadataStore,
+        store: &dyn MetaIndex,
         bucket: &str,
         key: &str,
         object: &ObjectMeta,
@@ -1689,7 +1662,7 @@ impl OsdService {
     /// Persist a ShardLocation so a restart can rebuild the in-memory
     /// index. Called on every successful WriteShard.
     fn persist_shard_location(
-        meta_store: &MetadataStore,
+        meta_store: &dyn MetaIndex,
         shard_key: &str,
         loc: &ShardLocation,
     ) -> std::result::Result<(), String> {
@@ -1707,7 +1680,7 @@ impl OsdService {
 
     /// Remove a persisted ShardLocation (delete_shard path).
     fn forget_shard_location(
-        meta_store: &MetadataStore,
+        meta_store: &dyn MetaIndex,
         shard_key: &str,
     ) -> std::result::Result<(), String> {
         #[cfg(test)]
@@ -1727,7 +1700,7 @@ impl OsdService {
     /// and the OSD reported 0 shards to meta even when disk.raw was
     /// full of real data.
     #[cfg(test)]
-    fn load_persisted_shard_index(meta_store: &MetadataStore) -> HashMap<String, ShardLocation> {
+    fn load_persisted_shard_index(meta_store: &dyn MetaIndex) -> HashMap<String, ShardLocation> {
         let prefix_key = objectio_storage::MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
         let mut out = HashMap::new();
         for (key, value) in meta_store.scan_prefix(&prefix_key) {
@@ -2677,7 +2650,7 @@ impl StorageService for OsdService {
             // id checks a lock that isn't there.
             let updates_its_version = !req.versioning_enabled
                 && !object.version_id.is_empty()
-                && Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, &object);
+                && Self::version_entry_holds(&*self.meta_store, &req.bucket, &req.key, &object);
             // If versioning is enabled and version_id is set, also store version entry
             if (req.versioning_enabled || updates_its_version) && !object.version_id.is_empty() {
                 let version_key =
@@ -2711,7 +2684,7 @@ impl StorageService for OsdService {
             // entry still holds it is checked after this write's own version
             // entry has gone in.
             let replaced_version_kept = old.as_ref().is_some_and(|o| {
-                Self::version_entry_holds(&self.meta_store, &req.bucket, &req.key, o)
+                Self::version_entry_holds(&*self.meta_store, &req.bucket, &req.key, o)
             });
 
             Ok(Response::new(PutObjectMetaResponse {
@@ -2925,7 +2898,8 @@ impl StorageService for OsdService {
                 }
             })
             .filter(|a| a.0 > prefix.0);
-        let entries = self.meta_store.iter_prefix_after(&prefix, after);
+        let entries =
+            objectio_storage::metadata::iter_prefix(&*self.meta_store, prefix.clone(), after);
 
         let mut objects = Vec::new();
         let mut count = 0;
@@ -3102,7 +3076,8 @@ impl StorageService for OsdService {
         let after = (!cursor.is_empty())
             .then(|| MetadataKey::object_meta(&req.bucket, cursor))
             .filter(|a| a.0 > prefix.0);
-        let entries = self.meta_store.iter_prefix_owned(prefix, after);
+        let entries =
+            objectio_storage::metadata::iter_prefix(Arc::clone(&self.meta_store), prefix, after);
 
         let stream = futures::stream::unfold(Some(entries), |state| async move {
             let mut entries = state?;
@@ -3181,7 +3156,9 @@ impl StorageService for OsdService {
         );
         let mut v_keys = 0usize;
         let mut v_last = String::new();
-        for (meta_key, value) in self.meta_store.iter_prefix_after(&v_prefix, v_after) {
+        for (meta_key, value) in
+            objectio_storage::metadata::iter_prefix(&*self.meta_store, v_prefix.clone(), v_after)
+        {
             let Some((_, key, _)) = meta_key.parse_object_version() else {
                 continue;
             };
@@ -3212,9 +3189,14 @@ impl StorageService for OsdService {
             })
             .flatten();
         let mut m_keys = 0usize;
-        for (meta_key, value) in marker_current
-            .into_iter()
-            .chain(self.meta_store.iter_prefix_after(&m_prefix, m_after))
+        for (meta_key, value) in
+            marker_current
+                .into_iter()
+                .chain(objectio_storage::metadata::iter_prefix(
+                    &*self.meta_store,
+                    m_prefix.clone(),
+                    m_after,
+                ))
         {
             let Some((_, key)) = meta_key.parse_object_meta() else {
                 continue;
@@ -3900,7 +3882,7 @@ mod integrity_tests {
         // it, and a rewrite clears it.
         let mut bad = osd.shard_index.get(&key).unwrap();
         bad.small.as_mut().unwrap()[5] ^= 0xff;
-        OsdService::persist_shard_location(&osd.meta_store, &key, &bad).unwrap();
+        OsdService::persist_shard_location(&*osd.meta_store, &key, &bad).unwrap();
         osd.scrub_pass(0).await;
         assert_eq!(states(&osd, &[0]).await, vec![ShardState::Corrupt]);
         assert_eq!(
@@ -4013,7 +3995,7 @@ mod integrity_tests {
         let key = OsdService::shard_key(&id(3).object_id, 0, 3);
         let mut bad = osd.shard_index.get(&key).unwrap();
         bad.small.as_mut().unwrap()[5] ^= 0xff;
-        OsdService::persist_shard_location(&osd.meta_store, &key, &bad).unwrap();
+        OsdService::persist_shard_location(&*osd.meta_store, &key, &bad).unwrap();
         let both = meta(true).await.unwrap().into_inner();
         assert!(both.found && both.small_shard.is_none());
         assert!(osd.corrupt.read().contains(&key));
