@@ -1,0 +1,83 @@
+# Release binaries for x86_64 and arm64, built on every merge to main and
+# on demand for any branch (Actions → binaries → Run workflow, or
+# `gh workflow run binaries.yml --ref <branch>`).
+#
+# They are for test machines (objectio-infra's `deploy fetch`): a fresh
+# cloud cluster used to spend ~40 minutes compiling on one of its own
+# nodes (four cores, RocksDB's C++ and all) before a benchmark could
+# start. Not a release: that is release.yml, from a tag.
+
+name: binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: binaries (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            # ISA-L is x86_64 only.
+            features: >-
+              objectio-osd-bin/isal,objectio-osd-bin/io-uring,objectio-osd-bin/rocksdb,
+              objectio-gateway-bin/isal,
+              objectio-aio/isal,objectio-aio/io-uring,objectio-aio/rocksdb
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            features: >-
+              objectio-osd-bin/io-uring,objectio-osd-bin/rocksdb,
+              objectio-aio/io-uring,objectio-aio/rocksdb
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The cache keeps RocksDB's C++ build too: rebuilt only when its
+      # version changes.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: binaries-${{ matrix.arch }}
+      - name: build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev mold
+      # aio embeds the console.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: console
+        working-directory: console
+        run: npm ci && npm run build
+      - name: build
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          features=$(echo "${{ matrix.features }}" | tr -d ' \n')
+          cargo build --release --features "$features" \
+            --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-aio --bin obioctl
+          mkdir -p out
+          cp target/release/objectio-meta target/release/objectio-osd target/release/objectio-gateway \
+            target/release/objectio-aio target/release/obioctl out/
+          cd out
+          echo "${{ github.sha }}" > REF
+          sha256sum objectio-* obioctl > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: objectio-linux-${{ matrix.arch }}
+          path: out/
+          retention-days: 30
