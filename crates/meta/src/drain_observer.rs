@@ -1027,12 +1027,32 @@ async fn settle_stale(
         return Ok(false);
     }
     for o in &mv.objects {
-        let Some(home) = meta.object_home(&o.bucket, &o.key) else {
-            return Ok(false);
+        // Where the key's copies are: its home, or, for a key deleted since
+        // (a delete removes its home), the OSDs the stale copy itself names,
+        // which hold the delete's tombstones.
+        let (others, copies) = match meta.object_home(&o.bucket, &o.key) {
+            Some(home) => (
+                home_addrs(meta, &o.bucket, &o.key, draining),
+                home.osd_ids.len(),
+            ),
+            None => {
+                let Some(stale) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await? else {
+                    continue; // gone from that copy since: nothing to settle
+                };
+                let Some(stripe) = stale.stripes.iter().find(|s| is_shard_of(s, &mv.shard)) else {
+                    continue; // that copy no longer names this shard
+                };
+                let addrs: Vec<String> = stripe
+                    .shards
+                    .iter()
+                    .filter(|l| l.node_id.as_slice() != draining.as_slice())
+                    .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
+                    .filter_map(|id| meta.osd_address_by_id(&id))
+                    .collect();
+                (addrs, stripe.shards.len())
+            }
         };
-        let others = home_addrs(meta, &o.bucket, &o.key, draining);
-        let (newest, deleted_at) =
-            read_copies(&others, home.osd_ids.len(), &o.bucket, &o.key).await?;
+        let (newest, deleted_at) = read_copies(&others, copies, &o.bucket, &o.key).await?;
         if newest
             .as_ref()
             .is_some_and(|n| n.stripes.iter().any(|s| is_shard_of(s, &mv.shard)))
