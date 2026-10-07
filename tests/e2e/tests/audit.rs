@@ -271,6 +271,48 @@ fn the_command_line_log_gets_every_event() {
     }
 }
 
+/// A target added gets the event of every request answered after the
+/// change was: with and without the spool. The config used to take effect
+/// in the background, and the requests right after it lost their events.
+#[test]
+fn a_target_added_gets_every_request_after_it() {
+    for args in [&[][..], &["--audit-system-bucket", "objectio-audit"][..]] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let events = receiver(listener);
+        let c = Cluster::start_with_ec_and_args(6, 4, 2, args);
+        c.json("PUT", "/_admin/audit", webhook(port)).expect_ok();
+        let made = c.request("PUT", "/added", &[]);
+        made.expect(200);
+        let mut ids = vec![made.header("x-amz-request-id").unwrap()];
+        for i in 0..10 {
+            let r = c.request("PUT", &format!("/added/k{i}"), b"x");
+            r.expect(200);
+            ids.push(r.header("x-amz-request-id").unwrap());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let got: std::collections::HashSet<String> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["id"].as_str().map(str::to_string))
+                .collect();
+            let missing: Vec<&String> = ids.iter().filter(|id| !got.contains(*id)).collect();
+            if missing.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{args:?}: {} of {} events never arrived: {missing:?}",
+                missing.len(),
+                ids.len()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 /// Every event in the system bucket's objects.
 fn system_bucket_events(c: &Cluster, bucket: &str) -> Vec<Value> {
     let list = c

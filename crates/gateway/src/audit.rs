@@ -88,6 +88,10 @@ const DEFAULT_BATCH: usize = 500;
 const DEFAULT_FLUSH_MS: u64 = 2_000;
 const RELOAD_EVERY: Duration = Duration::from_secs(10);
 
+/// How long a change to the audit config waits to be applied before it is
+/// answered.
+const APPLY_WITHIN: Duration = Duration::from_secs(5);
+
 static EVENTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DROPPED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
@@ -400,6 +404,10 @@ pub struct Auditor {
     /// an ID but no event is built.
     active: Arc<AtomicBool>,
     reload: tokio::sync::Notify,
+    /// Reloads asked for by [`Self::reload_applied`], and the last one the
+    /// dispatcher has acted on.
+    requested: AtomicU64,
+    applied: Arc<watch::Sender<u64>>,
     trusted_proxies: crate::origin::TrustedProxies,
     /// Bucket logging (A12), which this layer feeds: it sees every request.
     bucket_logging: std::sync::OnceLock<Arc<crate::bucket_logging::Logger>>,
@@ -423,17 +431,20 @@ impl Auditor {
             spool: spool.clone(),
             active: Arc::clone(&active),
             reload: tokio::sync::Notify::new(),
+            requested: AtomicU64::new(0),
+            applied: Arc::new(watch::channel(0).0),
             trusted_proxies,
             bucket_logging: std::sync::OnceLock::new(),
         });
-        let (cfg_tx, cfg_rx) = watch::channel(Config::default());
+        let (cfg_tx, cfg_rx) = watch::channel((Config::default(), 0));
+        let applied = Arc::clone(&auditor.applied);
         tokio::spawn(reload_loop(Arc::clone(&auditor), meta, cfg_tx));
         match spool {
             Some(spool) => {
-                tokio::spawn(dispatch_spooled(spool, cfg_rx, log));
+                tokio::spawn(dispatch_spooled(spool, cfg_rx, log, applied));
             }
             None => {
-                tokio::spawn(dispatch(rx, cfg_rx, log, active));
+                tokio::spawn(dispatch(rx, cfg_rx, log, active, applied));
             }
         }
         auditor
@@ -542,9 +553,20 @@ impl Auditor {
         self.bucket_logging.get()
     }
 
-    /// Re-read the configuration now (after this gateway changed it).
-    pub fn reload_now(&self) {
+    /// Re-read the configuration now, after this gateway changed it, and
+    /// wait (up to `within`) until its targets are running: a target added
+    /// gets the event of every request answered after the change was, none
+    /// lost to a reload still under way.
+    pub async fn reload_applied(&self, within: Duration) {
+        let want = self.requested.fetch_add(1, Ordering::SeqCst) + 1;
         self.reload.notify_one();
+        let mut applied = self.applied.subscribe();
+        if tokio::time::timeout(within, applied.wait_for(|a| *a >= want))
+            .await
+            .is_err()
+        {
+            warn!("audit: the new configuration is not applied yet; it will be shortly");
+        }
     }
 }
 
@@ -587,14 +609,18 @@ async fn load_config(meta: &mut MetadataServiceClient<Channel>) -> Option<Config
 async fn reload_loop(
     auditor: Arc<Auditor>,
     mut meta: MetadataServiceClient<Channel>,
-    cfg_tx: watch::Sender<Config>,
+    cfg_tx: watch::Sender<(Config, u64)>,
 ) {
     loop {
+        // Asked before the load: the load sees every change made by then.
+        let asked = auditor.requested.load(Ordering::SeqCst);
         if let Some(cfg) = load_config(&mut meta).await {
+            // A reload asked for wakes the dispatcher even with nothing
+            // changed: only it can say the config is in effect.
             cfg_tx.send_if_modified(|current| {
-                let changed = *current != cfg;
-                *current = cfg;
-                changed
+                let wake = current.0 != cfg || current.1 != asked;
+                *current = (cfg, asked);
+                wake
             });
         }
         tokio::select! {
@@ -607,6 +633,17 @@ async fn reload_loop(
     }
 }
 
+/// The dispatcher has acted on every reload up to `asked`.
+fn mark_applied(applied: &watch::Sender<u64>, asked: u64) {
+    applied.send_if_modified(|a| {
+        let newer = *a < asked;
+        if newer {
+            *a = asked;
+        }
+        newer
+    });
+}
+
 /// A running target: its queue, and the config it was started with.
 struct Running {
     tx: mpsc::Sender<AuditEvent>,
@@ -615,9 +652,10 @@ struct Running {
 
 async fn dispatch(
     mut rx: mpsc::Receiver<AuditEvent>,
-    mut cfg_rx: watch::Receiver<Config>,
+    mut cfg_rx: watch::Receiver<(Config, u64)>,
     log: Option<String>,
     active: Arc<AtomicBool>,
+    applied: Arc<watch::Sender<u64>>,
 ) {
     let log_tx = log.map(|path| {
         let (tx, rx) = mpsc::channel(INGEST_QUEUE);
@@ -626,14 +664,16 @@ async fn dispatch(
     });
     // Keyed "c/<name>" (the operator's) and "t/<tenant>/<name>".
     let mut running: HashMap<String, Running> = HashMap::new();
-    let mut cfg = cfg_rx.borrow().clone();
+    let mut cfg = cfg_rx.borrow().0.clone();
     loop {
         tokio::select! {
             changed = cfg_rx.changed() => {
                 if changed.is_err() { return; }
-                cfg = cfg_rx.borrow_and_update().clone();
+                let asked;
+                (cfg, asked) = cfg_rx.borrow_and_update().clone();
                 reconcile(&mut running, &cfg);
                 active.store(log_tx.is_some() || !running.is_empty(), Ordering::Relaxed);
+                mark_applied(&applied, asked);
             }
             event = rx.recv() => {
                 let Some(event) = event else { return; };
@@ -1130,8 +1170,9 @@ struct Shipper {
 /// Spooled: start, restart and stop shippers so they match the config.
 async fn dispatch_spooled(
     spool: Arc<Spool>,
-    mut cfg_rx: watch::Receiver<Config>,
+    mut cfg_rx: watch::Receiver<(Config, u64)>,
     log: Option<String>,
+    applied: Arc<watch::Sender<u64>>,
 ) {
     // The command-line file takes every event, whatever the config.
     let _log_stop = log.map(|path| {
@@ -1147,7 +1188,7 @@ async fn dispatch_spooled(
     });
     let mut running: HashMap<String, Shipper> = HashMap::new();
     while cfg_rx.changed().await.is_ok() {
-        let cfg = cfg_rx.borrow_and_update().clone();
+        let (cfg, asked) = cfg_rx.borrow_and_update().clone();
         let mut wanted: HashMap<String, (Target, Filter)> = HashMap::new();
         if let Some(c) = cfg.cluster.as_ref().filter(|c| c.enabled) {
             for t in &c.targets {
@@ -1201,6 +1242,10 @@ async fn dispatch_spooled(
             if running.contains_key(&key) {
                 continue;
             }
+            // A new target's cursor is placed now, before the change is
+            // reported applied, not when its shipper first runs: an event
+            // spooled in between would be behind it, never delivered.
+            let _ = spool.cursor(&key);
             let (stop, rx) = watch::channel(false);
             tokio::spawn(ship(
                 Arc::clone(&spool),
@@ -1211,6 +1256,7 @@ async fn dispatch_spooled(
             ));
             running.insert(key, Shipper { stop, spec });
         }
+        mark_applied(&applied, asked);
     }
 }
 
@@ -1774,7 +1820,7 @@ pub async fn admin_put(
         .await
     {
         Ok(_) => {
-            state.auditor.reload_now();
+            state.auditor.reload_applied(APPLY_WITHIN).await;
             let mut out = redact_tokens(doc);
             out["tenant"] = json!(admin.tenant);
             Json(out).into_response()
@@ -1810,7 +1856,7 @@ pub async fn admin_delete(
         .await
     {
         Ok(_) => {
-            state.auditor.reload_now();
+            state.auditor.reload_applied(APPLY_WITHIN).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => admin_error(StatusCode::INTERNAL_SERVER_ERROR, e.message()),
@@ -1937,6 +1983,8 @@ mod tests {
             spool: Some(Arc::clone(&spool)),
             active: Arc::new(AtomicBool::new(true)),
             reload: tokio::sync::Notify::new(),
+            requested: AtomicU64::new(0),
+            applied: Arc::new(watch::channel(0).0),
             trusted_proxies: crate::origin::TrustedProxies::default(),
             bucket_logging: std::sync::OnceLock::new(),
         });
