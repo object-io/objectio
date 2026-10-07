@@ -95,6 +95,12 @@ up() {
         done
     done
 
+    # Logs for a whole soak: the default journal keeps about five hours of
+    # a busy node, and soak run 9 needed ones from before that.
+    for i in $(seq 1 "$N"); do
+        incus exec "chaos-$i" -- sh -c 'mkdir -p /etc/systemd/journald.conf.d && printf "[Journal]\nSystemMaxUse=3G\n" > /etc/systemd/journald.conf.d/objectio.conf && systemctl restart systemd-journald'
+    done
+
     declare -A IP
     for i in $(seq 1 "$N"); do IP[$i]=$(ip_of "chaos-$i"); done
     local metas="" i

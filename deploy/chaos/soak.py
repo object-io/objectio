@@ -232,6 +232,26 @@ def incusd_mb():
     return max(sizes) // 1024 if sizes else None
 
 
+def degraded():
+    """(objects short of shards, age of the oldest in seconds), from a
+    gateway's metrics (meta's, polled by the gateway); None before B29."""
+    for url in GW:
+        status, body = http("GET", f"{url}/metrics", timeout=10)
+        if status != 200:
+            continue
+        got = {}
+        for line in body.decode(errors="replace").splitlines():
+            name = line.split("{")[0].split(" ")[0]
+            if name in ("objectio_meta_degraded_objects", "objectio_meta_degraded_oldest_seconds"):
+                got[name] = max(got.get(name, 0.0), float(line.rsplit(" ", 1)[1]))
+        if len(got) == 2:
+            return int(got["objectio_meta_degraded_objects"]), int(got["objectio_meta_degraded_oldest_seconds"])
+    return None
+
+
+DEGRADED_MAX_SECS = int(os.environ.get("DEGRADED_MAX_SECS", "3600"))
+
+
 def progress():
     while not stop.wait(300):
         u = usage()
@@ -241,8 +261,14 @@ def progress():
                     "used": None if not u else round(u[0] / max(u[1], 1), 3),
                     # The harness drives everything through incusd, which
                     # leaked to 16 GB and locked up once (2026-10-06).
-                    "incusd_mb": incusd_mb()}
+                    "incusd_mb": incusd_mb(),
+                    "degraded": degraded()}
         print(json.dumps(line), flush=True)
+        d = line["degraded"]
+        if d and d[1] > DEGRADED_MAX_SECS:
+            print(f"✗ an object has been short of shards for {d[1]} s ({d[0]} degraded)", flush=True)
+            OPLOG.flush()
+            os._exit(1)
 
 
 def read_outcome(key, attempts=20):
@@ -297,6 +323,43 @@ def check(what, everything=False):
             say(f"  reads now: {read_outcome(key)}; allowed: {expect[key]}")
         fail(f"{what}: {len(bad)} of {len(items)} keys read wrong: {bad[:10]}")
     say(f"{what}: {len(items)} keys read as expected" + (" (all)" if everything else ""))
+
+
+VERIFY_RATE = float(os.environ.get("VERIFY_RATE", "200"))  # keys read a second
+
+
+def verifier():
+    """Read every key, over and over, at VERIFY_RATE a second, faults or
+    not: an acknowledged object unreadable (a 5xx that persists) fails the
+    run within one cycle. The checks after each fault sample; this sees
+    every key, and keeps going through a fault that lasts hours (soak run
+    9 lost an object during a four-hour evacuation, and overwrote it before
+    any check read it)."""
+    cycle = 0
+    while not stop.is_set():
+        cycle += 1
+        with lock:
+            keys = list(expect)
+        random.shuffle(keys)
+        started = time.monotonic()
+        for i, key in enumerate(keys):
+            if stop.is_set():
+                return
+            status, _ = http("GET", f"{GW[i % len(GW)]}/{BUCKET}/{key}", timeout=30)
+            if status is not None and status >= 500 and status != 503:
+                # Not "retry later": read it again, as check_one would.
+                with lock:
+                    allowed = set(expect.get(key, ()))
+                bad = check_one((key, allowed))
+                if bad:
+                    # fail() exits only this thread: end the run.
+                    print(f"✗ verifier: {key} reads {status}; {bad}", flush=True)
+                    OPLOG.flush()
+                    os._exit(1)
+            pause = (i + 1) / VERIFY_RATE - (time.monotonic() - started)
+            if pause > 0:
+                stop.wait(pause)
+        say(f"verifier: cycle {cycle}: {len(keys)} keys read in {time.monotonic() - started:.0f} s")
 
 
 def listed():
@@ -377,7 +440,8 @@ def main():
     baseline = usage()[0]
     threads = [threading.Thread(target=writer, args=(n,), daemon=True) for n in range(WRITERS)]
     threads += [threading.Thread(target=fill_control, daemon=True),
-                threading.Thread(target=progress, daemon=True)]
+                threading.Thread(target=progress, daemon=True),
+                threading.Thread(target=verifier, daemon=True)]
     for t in threads:
         t.start()
     time.sleep(60)
