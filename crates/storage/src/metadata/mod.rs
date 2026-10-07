@@ -46,10 +46,12 @@
 //! 3. Ready to serve
 
 mod disk_index;
+mod index;
 mod store;
 mod types;
 mod wal;
 
-pub use store::{MetadataStore, MetadataStoreConfig, PrefixIter};
+pub use index::{MetaIndex, PrefixIter, iter_prefix, open};
+pub use store::{MetadataStore, MetadataStoreConfig};
 pub use types::{MetadataEntry, MetadataKey, MetadataOp};
 pub use wal::{MetadataWal, WalSyncStats};
