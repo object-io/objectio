@@ -100,3 +100,48 @@ pub async fn rewrite_shard(
         Err(e) => fail(e.to_string()),
     }
 }
+
+/// Calls to meta whose next answer is lost on purpose, by name.
+static LOSE_REPLY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(serde::Deserialize)]
+pub struct LoseReply {
+    call: String,
+}
+
+/// `POST /_admin/test/lose-reply`: the next answer meta gives to `call`
+/// (applied there) is taken as lost, as a leader change or a timeout loses
+/// one: the gateway sees UNAVAILABLE for a call meta did apply.
+pub async fn lose_reply(
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<LoseReply>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    LOSE_REPLY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(req.call);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `answer`, unless a test asked for the next answer to `call` to be lost
+/// (only ever with `--test-hooks`).
+#[allow(clippy::result_large_err)] // tonic's own error type, passed through
+pub fn maybe_lost<T>(call: &str, answer: Result<T, tonic::Status>) -> Result<T, tonic::Status> {
+    let mut lose = LOSE_REPLY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match lose.iter().position(|c| c == call) {
+        Some(i) if answer.is_ok() => {
+            lose.remove(i);
+            Err(tonic::Status::unavailable(format!(
+                "{call}: answer lost (test hook)"
+            )))
+        }
+        _ => answer,
+    }
+}

@@ -64,6 +64,7 @@ impl MetaService {
             // per-object CRUSH path.
             pg_id: req.pg_id,
             pool: req.pool.clone(),
+            object_id: req.object_id.clone(),
         };
         let listing_key = format!("{}\0{}\0", req.bucket, req.key);
         let new_bytes = entry.encode_to_vec();
@@ -79,10 +80,21 @@ impl MetaService {
         // MultiCas below expects: a write that changes it meanwhile makes
         // the MultiCas conflict, so two conditional writers can't both win.
         if !req.if_match.is_empty() || !req.if_none_match.is_empty() {
-            let current_etag = expected_bytes
+            let current = expected_bytes
                 .as_deref()
-                .and_then(|b| ObjectListingEntry::decode(b).ok())
-                .map(|e| e.etag.trim_matches('"').to_string());
+                .and_then(|b| ObjectListingEntry::decode(b).ok());
+            // This very write, sent again: its first send was applied and
+            // only the answer lost (a leader change, a timeout). Refused by
+            // its own entry, the PUT failed and freed the shards of an
+            // object the listing names, and every If-None-Match after was
+            // refused for an object no GET found.
+            if current
+                .as_ref()
+                .is_some_and(|e| !req.object_id.is_empty() && e.object_id == req.object_id)
+            {
+                return Ok(Response::new(CreateObjectResponse { object: None }));
+            }
+            let current_etag = current.map(|e| e.etag.trim_matches('"').to_string());
             let matches = |want: &str| {
                 current_etag
                     .as_deref()
