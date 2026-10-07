@@ -398,6 +398,13 @@ message DeleteObjectMetaRequest {
     // tombstone, so a copy that missed this delete is outvoted and a late,
     // older write is refused. 0 = unstamped (a previous-release writer).
     uint64 stamp = 4;
+    // Withdraw one write rather than delete the key: remove the entries
+    // (current, version) that hold this object, and only those, with no
+    // tombstone; a version left becomes current. For a small write (B21)
+    // refused on fewer copies than a read needs: its copies hold the only
+    // shards it has, and newest on a read, it would be unreadable.
+    // `version_id` and `stamp` are ignored.
+    bytes withdraw_object_id = 5;
 }
 
 message DeleteObjectMetaResponse {

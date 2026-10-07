@@ -1082,6 +1082,7 @@ async fn settle_stale(
                     key: o.key.clone(),
                     version_id: String::new(),
                     stamp: deleted_at,
+                    ..Default::default()
                 };
                 tokio::time::timeout(PER_OSD_TIMEOUT, client.delete_object_meta(req))
                     .await

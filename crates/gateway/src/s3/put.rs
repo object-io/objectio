@@ -455,6 +455,19 @@ pub(crate) fn settle_commit(
         Err(e) if e.unapplied => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
         }
+        // A refused small write some copies didn't answer the withdrawal
+        // of: its shards go once they have.
+        Err(MetaWriteError {
+            withdrawing: Some(w),
+            ..
+        }) => {
+            let (state, w, what) = (Arc::clone(state), w.clone(), what.to_string());
+            tokio::spawn(async move {
+                if crate::osd_pool::withdraw_later(&state.osd_pool, w).await {
+                    spawn_reclaim(&state, sent, Reclaim::FailedWrite, what);
+                }
+            });
+        }
         Err(_) if !sent.is_empty() => warn!(
             "{what}: {} shards stay allocated: a replica may hold the failed write's metadata",
             sent.len()

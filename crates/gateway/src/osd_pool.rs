@@ -183,6 +183,35 @@ impl OsdPool {
         }
     }
 
+    /// Record an object as degraded on meta (B29), so repair rebuilds what
+    /// it lacks now rather than at its next walk. Retried like
+    /// [`Self::queue_heal`]: the write it follows was likely refused because
+    /// the cluster is in trouble, meta perhaps among it.
+    pub async fn report_degraded(&self, request: objectio_proto::metadata::ReportDegradedRequest) {
+        let Some(meta) = self.heal.get() else {
+            return;
+        };
+        let name = format!("{}/{}", request.bucket, request.key);
+        if meta.clone().report_degraded(request.clone()).await.is_ok() {
+            info!("{name}: short of shards; recorded for repair");
+            return;
+        }
+        let meta = meta.clone();
+        tokio::spawn(async move {
+            let mut wait = std::time::Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(wait).await;
+                if meta.clone().report_degraded(request.clone()).await.is_ok() {
+                    info!("{name}: short of shards; recorded for repair");
+                    return;
+                }
+                wait = (wait * 2).min(std::time::Duration::from_secs(30));
+            }
+            warn!("{name}: could not record it as short of shards in 10 minutes; given up");
+        });
+    }
+
     /// `address` failed at the transport level: fail it fast for a while,
     /// unless it answers a fresh connection at once. An OSD that restarted
     /// closes every connection to it, so the next call on each fails though
@@ -1005,6 +1034,21 @@ pub struct MetaWriteError {
     /// inside the OSD, a replica may hold the new ObjectMeta, and reads
     /// served from it would find its shards gone.
     pub unapplied: bool,
+    /// A refused small write some copies may still hold, to be withdrawn
+    /// from them in the background ([`withdraw_later`]); its shards are
+    /// free once it is.
+    pub withdrawing: Option<Withdrawal>,
+}
+
+/// A refused small write still to be withdrawn from `copies`, which didn't
+/// answer when asked.
+#[derive(Debug, Clone)]
+pub struct Withdrawal {
+    pub copies: Vec<NodePlacement>,
+    pub bucket: String,
+    pub key: String,
+    pub object_id: Vec<u8>,
+    pub version_id: String,
 }
 
 impl std::fmt::Display for MetaWriteError {
@@ -1093,12 +1137,14 @@ pub async fn put_object_meta_with(
         return Err(MetaWriteError {
             error: OsdPoolError::NoNodesAvailable,
             unapplied: true,
+            withdrawing: None,
         });
     }
     if let Some(why) = crate::clock_skew::refusal() {
         return Err(MetaWriteError {
             error: OsdPoolError::ClockSkew(why),
             unapplied: true,
+            withdrawing: None,
         });
     }
 
@@ -1233,7 +1279,12 @@ pub async fn put_object_meta_with(
     let mut failure: Option<OsdPoolError> = None;
     let mut unapplied = true;
     let mut applied = 0;
+    // Per copy: it holds this write; it may (an answer that never came).
+    let mut holds = Vec::with_capacity(results.len());
+    let mut may_hold = Vec::with_capacity(results.len());
     for r in results {
+        holds.push(r.as_ref().is_ok_and(|d| !d.superseded));
+        may_hold.push(matches!(&r, Err((_, false))));
         match r {
             Ok(d) => {
                 unapplied = false;
@@ -1255,7 +1306,36 @@ pub async fn put_object_meta_with(
         }
     }
     match failure {
-        Some(error) if applied < quorum => Err(MetaWriteError { error, unapplied }),
+        Some(error) if applied < quorum => {
+            let mut withdrawing = None;
+            let unapplied = if unapplied {
+                true
+            } else if let Some(shards) = small_shards {
+                settle_short_small_write(
+                    &mut withdrawing,
+                    pool,
+                    &targets,
+                    &holds,
+                    &may_hold,
+                    shards,
+                    bucket,
+                    key,
+                    &object_meta,
+                )
+                .await
+            } else {
+                // Shards at their quorum, metadata on some copies: a read
+                // may find it (a failed PUT may land, as S3 allows), so the
+                // copies are brought to agree rather than left to differ.
+                pool.queue_heal(bucket, key, &object_meta.version_id).await;
+                false
+            };
+            Err(MetaWriteError {
+                error,
+                unapplied,
+                withdrawing,
+            })
+        }
         Some(error) => {
             warn!(
                 "{bucket}/{key}: metadata on {applied} of {} copies (quorum {quorum}); \
@@ -1263,10 +1343,194 @@ pub async fn put_object_meta_with(
                 targets.len()
             );
             pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            if let Some(shards) = small_shards {
+                // The copies that missed it are positions without a shard.
+                report_missing_small_shards(
+                    pool,
+                    &targets,
+                    &holds,
+                    shards,
+                    bucket,
+                    key,
+                    &object_meta,
+                )
+                .await;
+            }
             Ok(displaced)
         }
         None => Ok(displaced),
     }
+}
+
+/// A small write (B21) refused short of its shard quorum after some copies
+/// took it. Its shards are on those copies only, so they decide what it
+/// may become: with at least k, a readable object a read may find, kept
+/// and brought to full redundancy at once (healed, and recorded as
+/// degraded for repair to rebuild the positions it lacks); with fewer, an
+/// object no read could decode, withdrawn from every copy that may hold
+/// it. Soak run 10 found the first case left as it was: a refused PUT,
+/// current on four copies with no shard to spare, lost to the next drive.
+///
+/// Returns whether no copy holds it any longer (the caller may then free
+/// its shards). Copies that didn't answer the withdrawal go in
+/// `withdrawing`.
+#[allow(clippy::too_many_arguments)]
+async fn settle_short_small_write(
+    withdrawing: &mut Option<Withdrawal>,
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    holds: &[bool],
+    may_hold: &[bool],
+    shards: &HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    bucket: &str,
+    key: &str,
+    object_meta: &objectio_proto::metadata::ObjectMeta,
+) -> bool {
+    let k = object_meta.stripes.first().map_or(0, |s| s.ec_k as usize);
+    let held = holds.iter().filter(|&&h| h).count();
+    if held >= k {
+        warn!(
+            "{bucket}/{key}: refused, but on {held} copies (k = {k}): kept, healed and \
+             repaired to full redundancy"
+        );
+        pool.queue_heal(bucket, key, &object_meta.version_id).await;
+        report_missing_small_shards(pool, targets, holds, shards, bucket, key, object_meta).await;
+        return false;
+    }
+
+    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
+    let suspects: Vec<NodePlacement> = targets
+        .iter()
+        .zip(holds.iter().zip(may_hold))
+        .filter(|(_, (h, m))| **h || **m)
+        .map(|(t, _)| t.clone())
+        .collect();
+    let left = withdraw_from(pool, suspects, bucket, key, &object_meta.object_id).await;
+    if left.is_empty() {
+        // A copy that took it lost what it replaced: the others have that.
+        pool.queue_heal(bucket, key, &object_meta.version_id).await;
+        return true;
+    }
+    // A copy that didn't answer may still hold it: the caller keeps at it
+    // ([`withdraw_later`]). Until then its shards stay (a leak, not a loss).
+    *withdrawing = Some(Withdrawal {
+        copies: left,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        object_id: object_meta.object_id.clone(),
+        version_id: object_meta.version_id.clone(),
+    });
+    false
+}
+
+/// Keep withdrawing `w` from the copies that didn't answer, for ten
+/// minutes; true once none can hold it (its shards may then go).
+pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
+    let Withdrawal {
+        mut copies,
+        bucket,
+        key,
+        object_id,
+        version_id,
+    } = w;
+    let mut wait = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while !copies.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(wait).await;
+        copies = withdraw_from(pool, copies, &bucket, &key, &object_id).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+    if copies.is_empty() {
+        pool.queue_heal(&bucket, &key, &version_id).await;
+        return true;
+    }
+    warn!(
+        "{bucket}/{key}: a refused write could not be withdrawn from {} copies in 10 minutes",
+        copies.len()
+    );
+    false
+}
+
+/// Withdraw object `object_id` of `bucket/key` from `copies`; returns the
+/// copies that couldn't be asked.
+async fn withdraw_from(
+    pool: &OsdPool,
+    copies: Vec<NodePlacement>,
+    bucket: &str,
+    key: &str,
+    object_id: &[u8],
+) -> Vec<NodePlacement> {
+    use objectio_proto::storage::DeleteObjectMetaRequest;
+    let asks = copies.into_iter().map(|p| async move {
+        let Ok(mut client) = pool.get_client_for_placement(&p).await else {
+            return Some(p);
+        };
+        let req = DeleteObjectMetaRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            withdraw_object_id: object_id.to_vec(),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pool.watched(&p.node_address, client.delete_object_meta(req)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                warn!("{bucket}/{key}: withdraw on {}: {e}", p.node_address);
+                Some(p)
+            }
+            Err(_) => Some(p),
+        }
+    });
+    futures::future::join_all(asks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Tell meta which positions of a small object's stripe the copies that
+/// missed its write left without a shard (B29): it records the object as
+/// degraded, and repair rebuilds them within seconds.
+async fn report_missing_small_shards(
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    holds: &[bool],
+    shards: &HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    bucket: &str,
+    key: &str,
+    object_meta: &objectio_proto::metadata::ObjectMeta,
+) {
+    let Some(stripe) = object_meta.stripes.first() else {
+        return;
+    };
+    let mut missing: Vec<u32> = targets
+        .iter()
+        .zip(holds)
+        .filter(|(_, h)| !**h)
+        .filter_map(|(t, _)| shards.get(&t.node_id)?.shard_id.as_ref())
+        .map(|id| id.position)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    missing.sort_unstable();
+    let present = holds.iter().filter(|&&h| h).count();
+    pool.report_degraded(objectio_proto::metadata::ReportDegradedRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        object_id: object_meta.object_id.clone(),
+        stripes: vec![objectio_proto::metadata::DegradedStripe {
+            stripe_id: stripe.stripe_id,
+            missing,
+            present: u32::try_from(present).unwrap_or(u32::MAX),
+            needed: stripe.ec_k,
+        }],
+    })
+    .await;
 }
 
 /// How many copies of a key's ObjectMeta a write (or delete) needs
@@ -1616,6 +1880,7 @@ pub async fn delete_meta_from_all(
                 key: key.to_string(),
                 version_id: version_id.to_string(),
                 stamp,
+                ..Default::default()
             });
             let resp = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
