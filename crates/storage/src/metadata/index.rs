@@ -214,12 +214,35 @@ impl MetaIndex for MetadataStore {
     }
 }
 
-/// Open the OSD's metadata index at `config`: today the only engine.
+/// Open the OSD's metadata index at `config`, with the engine it names.
+/// A directory another engine wrote is refused, not opened empty.
 ///
 /// # Errors
-/// The store could not be opened or created.
+/// The index could not be opened or created; the directory holds the other
+/// engine's index; RocksDB was asked for in a build without it.
 pub fn open(config: super::store::MetadataStoreConfig) -> Result<Arc<dyn MetaIndex>> {
-    Ok(Arc::new(MetadataStore::open_or_create(config)?))
+    use super::store::MetaEngine;
+    use objectio_common::Error;
+    let dir = config.data_dir.clone();
+    let native_here = dir.join("metadata.wal").exists() || dir.join("index.redb").exists();
+    let rocks_here = dir.join("rocksdb").exists();
+    match config.engine {
+        MetaEngine::Native if rocks_here => Err(Error::Storage(format!(
+            "{} holds a RocksDB metadata index; open it with --meta-engine rocksdb",
+            dir.display()
+        ))),
+        MetaEngine::Native => Ok(Arc::new(MetadataStore::open_or_create(config)?)),
+        MetaEngine::RocksDb if native_here => Err(Error::Storage(format!(
+            "{} holds a native metadata index; open it with --meta-engine native",
+            dir.display()
+        ))),
+        #[cfg(feature = "rocksdb")]
+        MetaEngine::RocksDb => Ok(Arc::new(super::rocks::RocksIndex::open(&config)?)),
+        #[cfg(not(feature = "rocksdb"))]
+        MetaEngine::RocksDb => Err(Error::Storage(
+            "this build has no RocksDB metadata engine (the rocksdb feature)".into(),
+        )),
+    }
 }
 
 /// The contract as tests, for any implementation: each takes a function
