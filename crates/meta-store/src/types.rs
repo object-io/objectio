@@ -208,6 +208,14 @@ pub struct MultipartUploadState {
     /// binding on the wrapped DEK still validates.
     #[prost(map = "string, string", tag = "12")]
     pub encryption_context: HashMap<String, String>,
+    /// Being completed (two-phase): the object the completion made, kept
+    /// until the gateway says whether it was stored. Its parts are this
+    /// object's; nothing may free or change them meanwhile.
+    #[prost(message, optional, tag = "13")]
+    pub completing: Option<objectio_proto::metadata::ObjectMeta>,
+    /// When the completion began (Unix seconds).
+    #[prost(uint64, tag = "14")]
+    pub completing_since: u64,
 }
 
 /// State for a completed part within a multipart upload

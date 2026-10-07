@@ -200,6 +200,8 @@ impl MetaService {
             encrypted_dek: req.encrypted_dek.clone(),
             customer_key_md5: req.customer_key_md5.clone(),
             encryption_context: req.encryption_context.clone(),
+            completing: None,
+            completing_since: 0,
         };
         self.update_multipart(&upload_id, "create-multipart", |_| {
             Ok((Some(state.clone()), ()))
@@ -248,6 +250,17 @@ impl MetaService {
             encrypted_dek: upload.encrypted_dek.clone(),
             customer_key_md5: upload.customer_key_md5.clone(),
             encryption_context: upload.encryption_context.clone(),
+            completing_object_id: upload
+                .completing
+                .as_ref()
+                .map(|o| o.object_id.clone())
+                .unwrap_or_default(),
+            completing_version_id: upload
+                .completing
+                .as_ref()
+                .map(|o| o.version_id.clone())
+                .unwrap_or_default(),
+            completing_since: upload.completing_since,
         }))
     }
 
@@ -293,6 +306,10 @@ impl MetaService {
                     return Err(Status::invalid_argument(
                         "bucket/key mismatch for upload_id",
                     ));
+                }
+                // Its parts are the object being stored: none changes now.
+                if upload.completing.is_some() {
+                    return Err(Status::failed_precondition("the upload is being completed"));
                 }
                 let replaced = upload.parts.insert(req.part_number, part_state.clone());
                 Ok((Some(upload), replaced))
@@ -386,12 +403,40 @@ impl MetaService {
         // abort, or a part re-upload, land in between — the abort freed
         // parts this completion went on to use, and a re-uploaded part was
         // dropped with the upload, unreferenced.
+        //
+        // Two-phase (`settle_after_commit`): the upload stays, marked as
+        // being completed with the object it makes, until the gateway has
+        // stored that object or knows it didn't. Dropped here, before the
+        // object was stored, a completion that then failed freed parts the
+        // client had been told were uploaded, and its retry found no upload.
+        let now = Self::current_timestamp();
         let (object, unused_stripes) = self
             .update_multipart(&req.upload_id, "complete-multipart", |upload| {
-                let upload = upload.ok_or_else(|| {
+                let mut upload = upload.ok_or_else(|| {
                     Status::not_found(format!("multipart upload not found: {}", req.upload_id))
                 })?;
-                Ok((None, complete_upload(&upload, &req)?))
+                if let Some(object) = upload.completing.clone() {
+                    // Sent again while being completed: the same object.
+                    if upload.bucket != req.bucket || upload.key != req.key {
+                        return Err(Status::invalid_argument(
+                            "bucket/key mismatch for upload_id",
+                        ));
+                    }
+                    return Ok((Some(upload), (object, Vec::new())));
+                }
+                let (mut object, unused) = complete_upload(&upload, &req)?;
+                object.version_id.clone_from(&req.version_id);
+                if !req.settle_after_commit {
+                    return Ok((None, (object, unused)));
+                }
+                // Parts left out are freed by the caller now: not the
+                // upload's any more.
+                let used: std::collections::HashSet<u32> =
+                    req.parts.iter().map(|p| p.part_number).collect();
+                upload.parts.retain(|n, _| used.contains(n));
+                upload.completing = Some(object.clone());
+                upload.completing_since = now;
+                Ok((Some(upload), (object, unused)))
             })
             .await?;
 
@@ -419,11 +464,17 @@ impl MetaService {
 
         // Remove the upload from state. Only the bucket/key it was started
         // for may abort it: the caller frees every part it held.
+        // One being completed can't be: its parts may be the object's
+        // already. The gateway settles it first (it can see whether the
+        // object was stored).
         let removed = self
             .update_multipart(&req.upload_id, "abort-multipart", |upload| match upload {
                 Some(u) if u.bucket != req.bucket || u.key != req.key => Err(Status::not_found(
                     format!("multipart upload not found: {}", req.upload_id),
                 )),
+                Some(u) if u.completing.is_some() => {
+                    Err(Status::failed_precondition("the upload is being completed"))
+                }
                 other => Ok((None, other)),
             })
             .await?;
@@ -454,6 +505,52 @@ impl MetaService {
             success: true,
             stripes,
         }))
+    }
+
+    /// Settle a two-phase completion: its object stored (the upload goes,
+    /// its parts are the object's) or certainly not (the upload is open
+    /// again, as before the completion). Only the completion that made
+    /// `object_id`; anything else is left as it is.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn settle_multipart_upload(
+        &self,
+        request: Request<SettleMultipartUploadRequest>,
+    ) -> Result<Response<SettleMultipartUploadResponse>, Status> {
+        let req = request.into_inner();
+        let settled = self
+            .update_multipart(&req.upload_id, "settle-multipart", |upload| match upload {
+                Some(mut u)
+                    if u.bucket == req.bucket
+                        && u.key == req.key
+                        && u.completing
+                            .as_ref()
+                            .is_some_and(|o| o.object_id == req.object_id) =>
+                {
+                    if req.committed {
+                        Ok((None, true))
+                    } else {
+                        u.completing = None;
+                        u.completing_since = 0;
+                        Ok((Some(u), true))
+                    }
+                }
+                other => Ok((other, false)),
+            })
+            .await?;
+        if settled {
+            info!(
+                "Settled multipart upload {}/{} {}: {}",
+                req.bucket,
+                req.key,
+                req.upload_id,
+                if req.committed {
+                    "stored"
+                } else {
+                    "open again"
+                }
+            );
+        }
+        Ok(Response::new(SettleMultipartUploadResponse { settled }))
     }
 
     pub(crate) async fn list_multipart_uploads(

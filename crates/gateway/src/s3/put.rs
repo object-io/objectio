@@ -152,12 +152,43 @@ pub(crate) fn condition_refused(code: &str) -> Response {
 pub(crate) async fn commit_put(
     state: &Arc<AppState>,
     placement: &objectio_proto::metadata::GetPlacementResponse,
-    mut object_meta: ObjectMeta,
+    object_meta: ObjectMeta,
     versioning_enabled: bool,
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
     small: Option<&SmallShards>,
 ) -> Result<(), Response> {
+    commit_put_outcome(
+        state,
+        placement,
+        object_meta,
+        versioning_enabled,
+        sent,
+        condition,
+        small,
+    )
+    .await
+    .map_err(|refused| refused.response)
+}
+
+/// A commit that didn't succeed: the answer for the client, and whether the
+/// object is certainly not stored (no copy took it) rather than maybe.
+pub(crate) struct CommitRefused {
+    pub(crate) response: Response,
+    pub(crate) not_stored: bool,
+}
+
+/// [`commit_put`], saying on a failure whether the object may still have
+/// been stored: a multipart completion keeps its upload for a retry then.
+pub(crate) async fn commit_put_outcome(
+    state: &Arc<AppState>,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+    mut object_meta: ObjectMeta,
+    versioning_enabled: bool,
+    sent: Vec<ShardTarget>,
+    condition: &PutCondition,
+    small: Option<&SmallShards>,
+) -> Result<(), CommitRefused> {
     if !object_meta.replica_of.is_empty() {
         return commit_replica(state, placement, object_meta, sent, small).await;
     }
@@ -191,7 +222,7 @@ pub(crate) async fn commit_replica(
     object_meta: ObjectMeta,
     sent: Vec<ShardTarget>,
     small: Option<&SmallShards>,
-) -> Result<(), Response> {
+) -> Result<(), CommitRefused> {
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
     let written = crate::osd_pool::put_object_meta_with(
         &state.osd_pool,
@@ -216,11 +247,14 @@ pub(crate) async fn commit_replica(
             if e.unapplied {
                 spawn_reclaim(state, sent, Reclaim::FailedWrite, format!("{bucket}/{key}"));
             }
-            Err(S3Error::xml_response(
-                "ServiceUnavailable",
-                &format!("storing the replica: {}", e.error),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ))
+            Err(CommitRefused {
+                response: S3Error::xml_response(
+                    "ServiceUnavailable",
+                    &format!("storing the replica: {}", e.error),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                not_stored: e.unapplied,
+            })
         }
     }
 }
@@ -234,7 +268,7 @@ pub(crate) async fn commit_new(
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
     small: Option<&SmallShards>,
-) -> Result<(), Response> {
+) -> Result<(), CommitRefused> {
     // Small shards travel with the metadata (B21): each copy is a shard
     // too, so the write needs the shard quorum (k + 1) as well.
     let write = crate::osd_pool::MetaWrite {
@@ -264,24 +298,31 @@ pub(crate) async fn commit_new(
     let new_object = referenced_object_ids(&object_meta);
     let failed = |e: &crate::osd_pool::MetaWriteError| {
         error!("Failed to store object metadata on OSDs: {e}");
-        S3Error::for_osd_error(&e.error, "Failed to store object metadata")
+        CommitRefused {
+            response: S3Error::for_osd_error(&e.error, "Failed to store object metadata"),
+            not_stored: e.unapplied,
+        }
     };
 
     if condition.is_set() {
         if let Err(s) = state.meta_client.clone().create_object(listing_req).await {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what);
-            return Err(match s.code() {
-                tonic::Code::FailedPrecondition => condition_refused(s.message()),
-                tonic::Code::NotFound => S3Error::xml_response(
-                    "NoSuchBucket",
-                    "The specified bucket does not exist",
-                    StatusCode::NOT_FOUND,
-                ),
-                _ => S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!("could not commit the object: {}", s.message()),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                ),
+            // Refused before any copy was written: certainly not stored.
+            return Err(CommitRefused {
+                response: match s.code() {
+                    tonic::Code::FailedPrecondition => condition_refused(s.message()),
+                    tonic::Code::NotFound => S3Error::xml_response(
+                        "NoSuchBucket",
+                        "The specified bucket does not exist",
+                        StatusCode::NOT_FOUND,
+                    ),
+                    _ => S3Error::xml_response(
+                        "ServiceUnavailable",
+                        &format!("could not commit the object: {}", s.message()),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ),
+                },
+                not_stored: true,
             });
         }
         let outcome = crate::osd_pool::put_object_meta_with(
