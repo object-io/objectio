@@ -2,12 +2,13 @@
 //! (fsync) cost every metadata change pays — and Raft snapshots: built
 //! (to send to a replica that fell behind or joined) and installed.
 
-use objectio_common::histogram::{Histogram, LATENCY_BUCKETS};
+use objectio_common::histogram::{Histogram, HistogramVec, LATENCY_BUCKETS};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-static COMMIT_SECONDS: LazyLock<Histogram> = LazyLock::new(|| Histogram::new(LATENCY_BUCKETS));
+static COMMIT_SECONDS: LazyLock<HistogramVec> =
+    LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static SNAPSHOT_BUILD_SECONDS: LazyLock<Histogram> =
     LazyLock::new(|| Histogram::new(LATENCY_BUCKETS));
 static SNAPSHOT_INSTALL_SECONDS: LazyLock<Histogram> =
@@ -49,7 +50,13 @@ pub fn commit(mut txn: redb::WriteTransaction, kind: Commit) -> Result<(), redb:
     }
     let started = Instant::now();
     let res = txn.commit();
-    COMMIT_SECONDS.observe_duration(started.elapsed());
+    COMMIT_SECONDS.observe_duration(
+        match kind {
+            Commit::Durable => "kind=\"durable\"",
+            Commit::Applied => "kind=\"applied\"",
+        },
+        started.elapsed(),
+    );
     res
 }
 
@@ -79,7 +86,7 @@ pub fn render(out: &mut String) {
     COMMIT_SECONDS.render(
         out,
         "objectio_meta_commit_seconds",
-        "Time to commit one redb write transaction (a durable one includes its fsync)",
+        "Time to commit one redb write transaction, by kind: durable (with its fsync) or applied (made durable by the next checkpoint)",
         "",
     );
     SNAPSHOT_BUILD_SECONDS.render(

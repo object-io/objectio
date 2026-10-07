@@ -63,10 +63,35 @@ pub struct DiskIndex {
     tables: RwLock<Tables>,
 }
 
+/// Make sure a redb database file exists at `path`, created whole: redb
+/// writes a new file's header and first pages in place, so a process killed
+/// while creating one (a restart a moment after a first start) left a file
+/// that never opened again ("invalid data"). It is created under another
+/// name, made durable, then renamed into place: there is a whole database
+/// at `path`, or none, and a leftover from an interrupted creation is
+/// thrown away. An existing file is left as it is.
+fn create_whole(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let mut new = path.as_os_str().to_owned();
+    new.push(".new");
+    let new = std::path::PathBuf::from(new);
+    let _ = std::fs::remove_file(&new);
+    drop(redb::Database::create(&new).map_err(std::io::Error::other)?);
+    std::fs::File::open(&new)?.sync_all()?;
+    std::fs::rename(&new, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl DiskIndex {
     /// Open the index file at `path`, creating it if there is none, with a
     /// page cache of at most `cache_bytes`.
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
+        create_whole(path).map_err(storage_err("create"))?;
         let db = Database::builder()
             .set_cache_size(cache_bytes)
             .create(path)
