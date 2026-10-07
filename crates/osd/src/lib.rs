@@ -7,6 +7,7 @@ pub mod discovery;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod service;
+pub mod shard_store;
 mod usage;
 
 use anyhow::Result;
@@ -953,7 +954,7 @@ fn render_metrics(state: &OsdMetricsState) -> String {
     state
         .osd_service
         .render_scrub_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
-    service::render_disk_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
+    shard_store::render_disk_metrics(&mut output, &format!("osd_id=\"{}\"", state.osd_id));
 
     // gRPC calls served, every method
     RPC_METRICS.render(
