@@ -292,8 +292,8 @@ fn spooled_events_survive_a_killed_gateway_and_a_receiver_down() {
     for i in 0..50 {
         put(&c, i);
     }
-    // Killed with events undelivered: they are on its disk.
-    std::thread::sleep(Duration::from_millis(100));
+    // Killed the moment the last PUT is answered, with events
+    // undelivered: an acknowledged change's event is on its disk.
     c.restart();
     for i in 50..60 {
         put(&c, i);
