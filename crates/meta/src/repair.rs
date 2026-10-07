@@ -613,9 +613,18 @@ const DEGRADED_EVERY: Duration = Duration::from_secs(5);
 /// Repair the objects recorded as written short of shards (B29), those with
 /// the fewest to spare first. A record goes once its object has every
 /// shard back, or once the key holds another object or none; one that
-/// can't be done yet (an OSD down, too few shards to read) stays for the
-/// next round.
+/// can't be done yet (an OSD down, too few shards to read) stays for a
+/// later round.
+///
+/// A round works [`DEGRADED_AT_ONCE`] records at a time and stops after
+/// [`DEGRADED_ROUND`]; the next one reads and sorts the list again. A round
+/// used to take the whole list, one record at a time: after a partition
+/// left thousands, an object written meanwhile with nothing to spare waited
+/// 23 minutes behind them, and a drive lost then took it below k (B2 soak
+/// run 11).
 pub async fn work_degraded(meta: &Arc<MetaService>) {
+    use futures::StreamExt;
+
     LOST.store(meta.lost_objects().len() as u64, Ordering::Relaxed);
     let records = meta.degraded_objects();
     DEGRADED.store(records.len() as u64, Ordering::Relaxed);
@@ -630,51 +639,120 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
             .unwrap_or(0),
         Ordering::Relaxed,
     );
-    for (key, record, bytes) in records {
-        if !meta.is_raft_leader() {
-            return;
+
+    let started = std::time::Instant::now();
+    let todo = due(&mut DEFERRED.lock(), records, started);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let mut work = futures::stream::iter(todo)
+        .map(|(key, record, bytes)| {
+            let stop = &stop;
+            async move {
+                // Past the round's time, or no longer leader: what is left
+                // waits for the next round. Nothing started is cut short.
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let done = work_one(meta, &key, &record, bytes).await;
+                Some((key, done))
+            }
+        })
+        .buffer_unordered(DEGRADED_AT_ONCE);
+    while let Some(outcome) = work.next().await {
+        if let Some((key, false)) = outcome {
+            DEFERRED
+                .lock()
+                .insert(key, std::time::Instant::now() + DEGRADED_RETRY_AFTER);
         }
-        let Some((bucket, k)) = key.split_once('/') else {
-            continue;
-        };
-        let probe = ObjectMeta {
-            bucket: bucket.to_string(),
-            key: k.to_string(),
-            ..Default::default()
-        };
-        let current = match quorum_current(meta, &probe).await {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("repair: degraded {key}: {e}; next round");
-                continue;
-            }
-        };
-        let Some(object) = current.filter(|o| o.object_id == record.object_id) else {
-            // Replaced or deleted since: nothing of it to repair.
-            if let Err(e) = meta.forget_degraded(&key, bytes).await {
-                debug!("repair: degraded {key}: {e}");
-            }
-            continue;
-        };
-        let Some(owner_addr) = owner(&object).and_then(|n| node_address(meta, n)) else {
-            debug!("repair: degraded {key}: its owner is not registered; next round");
-            continue;
-        };
-        let healthy = audit(
-            meta,
-            Source::Osd(&owner_addr),
-            std::slice::from_ref(&object),
-            &mut 0,
-        )
-        .await;
-        if healthy.first().copied().unwrap_or(false) {
-            info!("repair: {key} has every shard again; no longer degraded");
-            STATS.degraded_repaired.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = meta.forget_degraded(&key, bytes).await {
-                debug!("repair: degraded {key}: {e}");
-            }
+        if started.elapsed() >= DEGRADED_ROUND || !meta.is_raft_leader() {
+            stop.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// How long a round of degraded objects runs before the list is read and
+/// sorted again: how long a record made meanwhile, however much at risk,
+/// can wait for the round under way.
+const DEGRADED_ROUND: Duration = Duration::from_secs(10);
+
+/// Degraded objects worked at once.
+const DEGRADED_AT_ONCE: usize = 16;
+
+/// A record that wasn't done (an OSD down, a shard still being rebuilt) is
+/// left this long, so a run of them can't hold the front of the list.
+const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// Records left until a later round, and until when.
+static DEFERRED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The records due this round, in the order given (most at risk first):
+/// every one not left for later. Deferrals that ran out, or whose record is
+/// gone, are dropped.
+fn due<R, B>(
+    deferred: &mut HashMap<String, std::time::Instant>,
+    records: Vec<(String, R, B)>,
+    now: std::time::Instant,
+) -> Vec<(String, R, B)> {
+    let present: std::collections::HashSet<&str> =
+        records.iter().map(|(k, _, _)| k.as_str()).collect();
+    deferred.retain(|k, until| *until > now && present.contains(k.as_str()));
+    records
+        .into_iter()
+        .filter(|(k, _, _)| !deferred.contains_key(k))
+        .collect()
+}
+
+/// Work one degraded record: true once it is settled (repaired, or its
+/// object gone), false to try it again later.
+async fn work_one(
+    meta: &Arc<MetaService>,
+    key: &str,
+    record: &objectio_proto::metadata::DegradedObject,
+    bytes: Vec<u8>,
+) -> bool {
+    let Some((bucket, k)) = key.split_once('/') else {
+        return true;
+    };
+    let probe = ObjectMeta {
+        bucket: bucket.to_string(),
+        key: k.to_string(),
+        ..Default::default()
+    };
+    let current = match quorum_current(meta, &probe).await {
+        Ok(c) => c,
+        Err(e) => {
+            debug!("repair: degraded {key}: {e}; later");
+            return false;
+        }
+    };
+    let Some(object) = current.filter(|o| o.object_id == record.object_id) else {
+        // Replaced or deleted since: nothing of it to repair.
+        if let Err(e) = meta.forget_degraded(key, bytes).await {
+            debug!("repair: degraded {key}: {e}");
+        }
+        return true;
+    };
+    let Some(owner_addr) = owner(&object).and_then(|n| node_address(meta, n)) else {
+        debug!("repair: degraded {key}: its owner is not registered; later");
+        return false;
+    };
+    let healthy = audit(
+        meta,
+        Source::Osd(&owner_addr),
+        std::slice::from_ref(&object),
+        &mut 0,
+    )
+    .await;
+    if !healthy.first().copied().unwrap_or(false) {
+        // Rebuilt just now (checked again next time), or not yet possible.
+        return false;
+    }
+    info!("repair: {key} has every shard again; no longer degraded");
+    STATS.degraded_repaired.fetch_add(1, Ordering::Relaxed);
+    if let Err(e) = meta.forget_degraded(key, bytes).await {
+        debug!("repair: degraded {key}: {e}");
+    }
+    true
 }
 
 /// Degraded-object records, and the age of the oldest, as last counted.
@@ -1377,7 +1455,31 @@ async fn restore_listing(
 
 #[cfg(test)]
 mod tests {
-    use super::{Seen, Verdict, verdict};
+    use super::{Seen, Verdict, due, verdict};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_deferred_record_waits_and_the_rest_keep_their_order() {
+        let now = Instant::now();
+        let records = |keys: &[&str]| -> Vec<(String, (), ())> {
+            keys.iter().map(|k| ((*k).to_string(), (), ())).collect()
+        };
+        let mut deferred = HashMap::from([
+            ("b/stuck".to_string(), now + Duration::from_secs(30)),
+            ("b/ran-out".to_string(), now - Duration::from_secs(1)),
+            ("b/gone".to_string(), now + Duration::from_secs(30)),
+        ]);
+        let picked = due(
+            &mut deferred,
+            records(&["b/zero-spare", "b/stuck", "b/ran-out", "b/one-spare"]),
+            now,
+        );
+        let keys: Vec<&str> = picked.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys, ["b/zero-spare", "b/ran-out", "b/one-spare"]);
+        // Kept: only a deferral still running for a record still there.
+        assert_eq!(deferred.keys().collect::<Vec<_>>(), ["b/stuck"]);
+    }
 
     const LOST: Seen = Seen::Lost { corrupt: false };
     const ROT: Seen = Seen::Lost { corrupt: true };
