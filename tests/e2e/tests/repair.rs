@@ -531,3 +531,132 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
         );
     }
 }
+
+/// B29: a PUT acknowledged with only k + 1 shards (an OSD down while it
+/// was written) is recorded as degraded when it is written, and repaired
+/// from that record once the OSD is back, without waiting for a walk of
+/// every object (the walk is all but off here). It then survives two more
+/// OSDs down. Soak run 9 lost an object written this way: five shards for
+/// an hour, then two more lost.
+#[test]
+fn a_write_short_of_shards_is_repaired_from_its_record() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/partial", &[]).status, 200);
+    ha.stop_osd(2);
+    let c = &ha.clients[0];
+    let bodies: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| payload(300_000, 30 + u8::try_from(i).unwrap()))
+        .collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/partial/k{i}"), b).status, 200);
+    }
+    ha.start_osd(2, None);
+    // A few rounds of the degraded worker (every 5 s).
+    std::thread::sleep(Duration::from_secs(25));
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/partial/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
+}
+
+/// B29: an evacuation that meets an object with fewer than k shards left
+/// records it as lost and finishes, rather than wait on it forever; but
+/// never while a holder of the rest is only down (it may have its shard).
+#[test]
+fn an_evacuation_records_a_lost_object_and_finishes() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(
+        1,
+        6,
+        1,
+        &[
+            "--repair-interval-secs",
+            "3600",
+            "--drain-interval-secs",
+            "1",
+        ],
+    );
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/gone", &[]).status, 200);
+    assert_eq!(
+        c.request("PUT", "/gone/k", &payload(300_000, 7)).status,
+        200
+    );
+    let ids = |c: &Cluster| -> Vec<(String, String)> {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node_id"].as_str().unwrap_or_default().to_string(),
+                    n["address"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let endpoint = ha.osd_endpoint(5);
+    let old = ids(c)
+        .into_iter()
+        .find(|(_, a)| *a == endpoint)
+        .map(|(id, _)| id)
+        .expect("OSD 5 registered");
+
+    // Two OSDs down with their disks gone, and a third lost for good.
+    ha.stop_osd(0);
+    ha.stop_osd(1);
+    std::fs::remove_file(ha.osd_disk(0)).unwrap();
+    std::fs::remove_file(ha.osd_disk(1)).unwrap();
+    ha.stop_osd(5);
+    ha.lose_osd_drive(5);
+    ha.start_osd(5, None);
+
+    // Only down, OSDs 0 and 1 may still have their shards: no verdict.
+    std::thread::sleep(Duration::from_secs(15));
+    let c = &ha.clients[0];
+    assert!(
+        ids(c).iter().any(|(id, _)| *id == old),
+        "the lost OSD was removed while two holders were only down"
+    );
+
+    // Back, on blank disks: three shards left of the four a read needs.
+    ha.start_osd(0, None);
+    ha.start_osd(1, None);
+    let c = &ha.clients[0];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ids(c).iter().any(|(id, _)| *id == old) {
+        assert!(
+            Instant::now() < deadline,
+            "the evacuation never finished: {:?}",
+            ids(c)
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // The object is gone, and says so; and it is counted.
+    assert_eq!(c.request("GET", "/gone/k", &[]).status, 500);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let m = c.request("GET", "/metrics", &[]).text();
+        let lost = m
+            .lines()
+            .find(|l| l.starts_with("objectio_meta_lost_objects"))
+            .and_then(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if lost >= 1.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the lost object was never counted"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
