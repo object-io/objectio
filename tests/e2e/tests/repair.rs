@@ -911,3 +911,60 @@ fn a_pg_pool_places_around_a_lost_osd() {
         assert_eq!(&got.bytes, body, "{name}");
     }
 }
+
+/// A disk replaced under the same OSD (the documented replacement, and the
+/// soak's disk-pull fault): the OSD forgets the shards the old disk held
+/// and tells Meta, whose repair walk starts at once. It used to wait until
+/// next due, an hour by default, with every object it held a shard short
+/// all that time (and after it, until the walk reached it).
+#[test]
+fn a_replaced_disk_is_rebuilt_without_waiting_for_the_walk() {
+    use objectio_e2e::ha::HaCluster;
+    // The walk's default interval: an hour.
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/replaced", &[]).status, 200);
+    let bodies: Vec<Vec<u8>> = (0..20u8).map(|i| payload(300_000, 60 + i)).collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/replaced/k{i}"), b).status, 200);
+    }
+    let endpoint = ha.osd_endpoint(2);
+    let shards_on_2 = |c: &Cluster| -> u64 {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["address"].as_str() == Some(endpoint.as_str()))
+            .and_then(|n| n["shard_count"].as_u64())
+            .unwrap_or(0)
+    };
+
+    // The disk pulled and a blank one put in; the OSD's identity and
+    // metadata (its state directory) stay.
+    ha.stop_osd(2);
+    std::fs::remove_file(ha.osd_disk(2)).unwrap();
+    ha.start_osd(2, None);
+
+    // Rebuilt in place: one shard of each object on it again.
+    let c = &ha.clients[0];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while shards_on_2(c) < bodies.len() as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "OSD 2 holds {} shards of {} two minutes after its disk was replaced",
+            shards_on_2(c),
+            bodies.len()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // Two other OSDs down: every object still has four.
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/replaced/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
+}

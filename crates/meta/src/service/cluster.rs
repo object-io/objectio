@@ -1272,6 +1272,19 @@ impl MetaService {
         if req.node_id.len() != 16 {
             return Err(Status::invalid_argument("node_id must be 16 bytes"));
         }
+        // Back on a blank disk (the documented replacement: same OSD, new
+        // drive): every shard it held is one short until rebuilt, and the
+        // walk would get to them only when next due.
+        if req.shards_dropped > 0 {
+            warn!(
+                "OSD {} at {} came back without {} shards (its disk was replaced or wiped); \
+                 repair walk starting now",
+                hex::encode(&req.node_id),
+                req.address,
+                req.shards_dropped
+            );
+            crate::repair::walk_now();
+        }
 
         // Resolve cluster_uuid upfront — any resolution that goes to
         // Raft needs to finish before we grab the osd_nodes write lock,

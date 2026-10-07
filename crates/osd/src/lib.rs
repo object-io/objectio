@@ -730,6 +730,7 @@ async fn register_with_meta(
             weight,
             disk_capacity_bytes: disk_capacity_bytes.to_vec(),
             te_segment: osd_service.te_segment(),
+            shards_dropped: osd_service.shards_dropped_at_open(),
         })
         .await
         .map_err(|e| format!("Failed to register OSD: {}", e))?;
