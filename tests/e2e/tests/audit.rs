@@ -6,6 +6,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,11 +15,32 @@ use serde_json::{Value, json};
 
 /// A webhook receiver on `listener`: every event it is sent.
 fn receiver(listener: TcpListener) -> Arc<Mutex<Vec<Value>>> {
+    receiver_from(listener, Arc::new(AtomicBool::new(true)))
+}
+
+/// A port the receiver keeps from the start, so nothing else can take it
+/// before the receiver is up: the port, its listener, and the switch that
+/// brings the receiver up. Freed and bound again later, the port went to a
+/// server of the cluster starting meanwhile, which took (and lost) events.
+fn held_receiver() -> (u16, Arc<Mutex<Vec<Value>>>, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let up = Arc::new(AtomicBool::new(false));
+    let events = receiver_from(listener, Arc::clone(&up));
+    (port, events, up)
+}
+
+/// [`receiver`], down (every connection dropped unanswered, as a
+/// receiver that isn't there) until `up` is set.
+fn receiver_from(listener: TcpListener, up: Arc<AtomicBool>) -> Arc<Mutex<Vec<Value>>> {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
+            if !up.load(Ordering::SeqCst) {
+                continue;
+            }
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut length = 0usize;
             loop {
@@ -141,10 +163,7 @@ fn every_request_is_one_event_with_the_id_the_client_got() {
 #[test]
 fn events_wait_for_a_receiver_that_is_down() {
     // Reserve a port, start nothing on it yet.
-    let port = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let (port, events, up) = held_receiver();
     let c = Cluster::start();
     c.json("PUT", "/_admin/audit", webhook(port)).expect_ok();
     c.request("PUT", "/late", &[]).expect(200);
@@ -153,7 +172,7 @@ fn events_wait_for_a_receiver_that_is_down() {
 
     // The receiver comes up a few seconds later: the event still arrives.
     std::thread::sleep(Duration::from_secs(3));
-    let events = receiver(TcpListener::bind(("127.0.0.1", port)).unwrap());
+    up.store(true, Ordering::SeqCst);
     let e = wait_for(&events, 40, |e| e["id"] == id.as_str());
     assert!(
         !e.is_empty(),
@@ -275,10 +294,7 @@ fn system_bucket_events(c: &Cluster, bucket: &str) -> Vec<Value> {
 /// bucket, the copy the system always keeps.
 #[test]
 fn spooled_events_survive_a_killed_gateway_and_a_receiver_down() {
-    let port = {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let (port, events, up) = held_receiver();
     let mut c =
         Cluster::start_with_ec_and_args(6, 4, 2, &["--audit-system-bucket", "objectio-audit"]);
     c.json("PUT", "/_admin/audit", webhook(port)).expect_ok();
@@ -299,7 +315,7 @@ fn spooled_events_survive_a_killed_gateway_and_a_receiver_down() {
         put(&c, i);
     }
 
-    let events = receiver(TcpListener::bind(("127.0.0.1", port)).unwrap());
+    up.store(true, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let got: std::collections::HashSet<String> = events
