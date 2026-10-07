@@ -201,3 +201,60 @@ fn healed(c: &objectio_e2e::Cluster) -> u64 {
         .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
         .sum()
 }
+
+/// A delete refused (503) after it reached some copies, short of the
+/// quorum, may still take effect, as S3 allows: those copies hold the
+/// newest stamp. It is healed like any write left on some copies: every
+/// copy then agrees, so the object can't come back when the copies that
+/// took the delete are down, and its space is freed. No heal was queued:
+/// the copies disagreed for good and the shards were never freed.
+#[test]
+fn a_refused_delete_that_reached_some_copies_is_healed() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    assert_eq!(
+        ha.clients[0].request("DELETE", "/quorum/probe", &[]).status,
+        204
+    );
+    let empty = ha.clients[0].await_total_used_bytes(0);
+    let r = ha.clients[0].request("PUT", "/quorum/d", &payload(300_000, 1));
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // Three of six copies down: the delete (after its read, which needs
+    // three) reaches three, short of four.
+    for i in 3..6 {
+        ha.stop_osd(i);
+    }
+    let r = ha.clients[0].request("DELETE", "/quorum/d", &[]);
+    assert_eq!(r.status, 503, "{}", r.text());
+    for i in 3..6 {
+        ha.start_osd(i, None);
+    }
+    let c = &ha.clients[0];
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while healed(c) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the refused delete was never healed"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // The copies that took the delete down: the rest agree with them now.
+    for i in 0..3 {
+        ha.stop_osd(i);
+    }
+    let c = &ha.clients[0];
+    let r = c.request("GET", "/quorum/d", &[]);
+    assert_eq!(r.status, 404, "the deleted object came back: {}", r.status);
+    for i in 0..3 {
+        ha.start_osd(i, None);
+    }
+    let c = &ha.clients[0];
+    assert_eq!(
+        c.await_total_used_bytes(empty),
+        empty,
+        "its space was never freed"
+    );
+}
