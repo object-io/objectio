@@ -146,6 +146,14 @@ impl MetadataService for MetaService {
         Self::abort_multipart_upload(self, request).await
     }
 
+    #[allow(clippy::result_large_err)]
+    async fn settle_multipart_upload(
+        &self,
+        request: Request<SettleMultipartUploadRequest>,
+    ) -> Result<Response<SettleMultipartUploadResponse>, Status> {
+        Self::settle_multipart_upload(self, request).await
+    }
+
     async fn list_multipart_uploads(
         &self,
         request: Request<ListMultipartUploadsRequest>,

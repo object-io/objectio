@@ -72,6 +72,7 @@ use objectio_proto::metadata::{
     RetentionMode,
     RetentionRule,
     SetBucketPolicyRequest,
+    SettleMultipartUploadRequest,
     ShardLocation,
     SseAlgorithm,
     SseRule,

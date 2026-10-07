@@ -512,3 +512,65 @@ fn aborting_frees_parts_wherever_they_were_placed() {
         after.saturating_sub(baseline)
     );
 }
+
+/// A completion refused because its object couldn't be stored (here every
+/// OSD down) leaves the upload as it was: the parts, acknowledged, are
+/// still there, and the completion sent again once the OSDs are back makes
+/// the object. Meta used to drop the upload before the object was stored:
+/// the parts were freed and a retry was told `NoSuchUpload`.
+#[test]
+fn a_completion_that_fails_to_store_can_be_retried() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(std::time::Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/retry", &[]).status, 200);
+    let upload = initiate(c, "retry", "big.bin");
+    let first = mib(7);
+    let first = [
+        first.as_slice(),
+        first.as_slice(),
+        first.as_slice(),
+        first.as_slice(),
+        first.as_slice(),
+    ]
+    .concat();
+    let second = b"the last part".to_vec();
+    let etags = vec![
+        (1, upload_part(c, "retry", "big.bin", &upload, 1, &first)),
+        (2, upload_part(c, "retry", "big.bin", &upload, 2, &second)),
+    ];
+
+    for i in 0..6 {
+        ha.stop_osd(i);
+    }
+    let c = &ha.clients[0];
+    let refused = complete(c, "retry", "big.bin", &upload, &etags);
+    assert!(
+        refused.status >= 500,
+        "a completion with every OSD down can't succeed: {} {}",
+        refused.status,
+        refused.text()
+    );
+    for i in 0..6 {
+        ha.start_osd(i, None);
+    }
+    let c = &ha.clients[0];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let r = complete(c, "retry", "big.bin", &upload, &etags);
+        if r.status == 200 {
+            break;
+        }
+        assert!(
+            r.status >= 500 && std::time::Instant::now() < deadline,
+            "the completion sent again: {} {}",
+            r.status,
+            r.text()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let got = c.request("GET", "/retry/big.bin", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, [first, second].concat());
+}

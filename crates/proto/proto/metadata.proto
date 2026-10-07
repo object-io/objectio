@@ -40,6 +40,9 @@ service MetadataService {
     rpc ListParts(ListPartsRequest) returns (ListPartsResponse);
     rpc CompleteMultipartUpload(CompleteMultipartUploadRequest) returns (CompleteMultipartUploadResponse);
     rpc AbortMultipartUpload(AbortMultipartUploadRequest) returns (AbortMultipartUploadResponse);
+    // After a two-phase CompleteMultipartUpload: the object was stored (the
+    // upload goes) or certainly wasn't (the upload is as it was before).
+    rpc SettleMultipartUpload(SettleMultipartUploadRequest) returns (SettleMultipartUploadResponse);
     rpc ListMultipartUploads(ListMultipartUploadsRequest) returns (ListMultipartUploadsResponse);
 
     // Bucket policy
@@ -946,6 +949,11 @@ message GetMultipartUploadResponse {
     bytes encrypted_dek = 7;
     string customer_key_md5 = 8;
     map<string, string> encryption_context = 9;
+    // Being completed (two-phase): the object the completion made, its
+    // version, and since when (Unix seconds). Empty otherwise.
+    bytes completing_object_id = 10;
+    string completing_version_id = 11;
+    uint64 completing_since = 12;
 }
 
 message CompleteMultipartUploadRequest {
@@ -953,6 +961,13 @@ message CompleteMultipartUploadRequest {
     string key = 2;
     string upload_id = 3;
     repeated PartInfo parts = 4;
+    // The version the object gets (empty: unversioned).
+    string version_id = 5;
+    // Two-phase: keep the upload, marked as being completed, until the
+    // caller settles it (SettleMultipartUpload) once the object is stored
+    // or certainly isn't. Sent again meanwhile, the completion returns the
+    // same object. Without it the upload goes at once (the release before).
+    bool settle_after_commit = 6;
 }
 
 message PartInfo {
@@ -966,6 +981,22 @@ message CompleteMultipartUploadResponse {
     // Stripes of parts that were uploaded but left out of the object. The
     // upload is gone, so nothing refers to them; the caller frees them.
     repeated StripeMeta unused_stripes = 2;
+}
+
+message SettleMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    // The object the completion made: settles only that completion.
+    bytes object_id = 4;
+    // Stored: the upload goes (its parts are the object's now). Not stored:
+    // the upload is open again, its parts kept.
+    bool committed = 5;
+}
+
+message SettleMultipartUploadResponse {
+    // False when there was nothing of that completion to settle.
+    bool settled = 1;
 }
 
 message AbortMultipartUploadRequest {
