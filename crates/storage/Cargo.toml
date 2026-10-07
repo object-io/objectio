@@ -28,6 +28,14 @@ redb = { workspace = true }
 # cold build.
 rocksdb = { version = "0.25", default-features = false, optional = true }
 
+[build-dependencies]
+# Not used here: it gives RocksDB's bindgen (0.72) the "runtime" feature.
+# ISA-L's bindgen (0.71) has it by default, which puts the shared clang-sys
+# in runtime-loading mode; RocksDB's bindgen, without it, then never loads
+# libclang and its build panics ("a libclang shared library is not loaded
+# on this thread"). With both features on, one binary can have both.
+bindgen = { version = "0.72", features = ["runtime"], optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rand = { workspace = true }
@@ -35,7 +43,7 @@ rand = { workspace = true }
 [features]
 default = []
 # The OSD's metadata index on RocksDB, selected with --meta-engine rocksdb.
-rocksdb = ["dep:rocksdb"]
+rocksdb = ["dep:rocksdb", "dep:bindgen"]
 # Compile the io_uring I/O backend in alongside the default pread one
 # (Linux only; the flag silently does nothing on macOS / Windows).
 # Opt-in because not every deployment target has a new-enough kernel

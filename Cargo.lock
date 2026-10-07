@@ -421,6 +421,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -2764,6 +2766,7 @@ name = "objectio-storage"
 version = "0.6.0-dev"
 dependencies = [
  "async-trait",
+ "bindgen 0.72.1",
  "bytes",
  "crc32c",
  "crossbeam-channel",
