@@ -47,6 +47,7 @@ SAMPLE = int(os.environ.get("SAMPLE", "20000"))
 GONE = "-"  # the outcome "no object"
 # A bucket of its own: keys left by an earlier run would read as wrong.
 BUCKET = os.environ.get("SOAK_BUCKET", f"soak-{int(time.time())}")
+POOL = os.environ.get("SOAK_POOL", "")
 chaos.BUCKET = BUCKET  # for chaos's redundancy check
 OPLOG = open(os.environ.get("OPLOG", "soak-ops.log"), "a", buffering=1)  # noqa: SIM115
 
@@ -433,7 +434,20 @@ def await_no_leak(baseline):
 def main():
     say(f"soak: {HOURS} h, a fault every {FAULT_EVERY / 60:.0f} min, {WRITERS} writers; "
         f"cluster {chaos.IP}")
-    while http("PUT", f"{GW[0]}/{BUCKET}")[0] not in (200, 409):
+    # SOAK_POOL: the bucket goes in a pool of its own that places through
+    # placement groups (4+2, 32 PGs, one shard per host), the layout the
+    # docs recommend; without it, the default pool (CRUSH, no PGs). The
+    # PG path went untested here, and a lost OSD stayed in its PGs.
+    headers = {}
+    if POOL:
+        status, reply = chaos.admin("POST", "/_admin/pools", {
+            "name": POOL, "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 32, "failure_domain": "host", "enabled": True})
+        if status not in (200, 201, 409):
+            fail(f"pool {POOL}: {status} {reply[:300]!r}")
+        headers = {"x-objectio-pool": POOL}
+        say(f"bucket {BUCKET} in pool {POOL} (placement groups)")
+    while http("PUT", f"{GW[0]}/{BUCKET}", headers=headers)[0] not in (200, 409):
         time.sleep(2)
     chaos.await_metas_healthy()
     chaos.await_osds_online(6)
