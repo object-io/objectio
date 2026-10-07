@@ -119,6 +119,12 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_OSD_META_CACHE_MIB", default_value_t = 1024)]
     pub meta_cache_mib: usize,
 
+    /// The engine of the metadata index (B27): `native`, or `rocksdb` (in a
+    /// build with the `rocksdb` feature). A data directory is opened only
+    /// by the engine that wrote it.
+    #[arg(long, env = "OBJECTIO_OSD_META_ENGINE", default_value = "native")]
+    pub meta_engine: objectio_storage::metadata::MetaEngine,
+
     /// Accept shard transfers over Mooncake Transfer Engine: `rdma`, or
     /// `tcp` to develop without RDMA hardware. Unset: gRPC bytes only.
     #[cfg(feature = "rdma")]
@@ -396,18 +402,19 @@ pub async fn run(
     let data_path = PathBuf::from(&data_dir);
     info!("Data directory: {}", data_dir);
     let disk_paths = disks.clone();
-    let osd_service = match OsdService::new_with_cache(
-        disk_paths,
-        block_size as u32,
-        data_path,
-        args.meta_cache_mib << 20,
-    ) {
-        Ok(s) => s.with_full_ratio(args.full_ratio),
-        Err(e) => {
-            error!("Failed to initialize OSD: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let (cache_bytes, engine) = (args.meta_cache_mib << 20, args.meta_engine);
+    info!("Metadata index: {engine:?}");
+    let osd_service =
+        match OsdService::new_with_store(disk_paths, block_size as u32, data_path, |c| {
+            c.cache_bytes = cache_bytes;
+            c.engine = engine;
+        }) {
+            Ok(s) => s.with_full_ratio(args.full_ratio),
+            Err(e) => {
+                error!("Failed to initialize OSD: {}", e);
+                std::process::exit(1);
+            }
+        };
     // Wrap in Arc early so the registration task (which needs to stamp
     // cluster_uuid into disk superblocks on the response) can share
     // it with the gRPC server and the metrics state.

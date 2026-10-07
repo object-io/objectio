@@ -322,11 +322,22 @@ async fn write_one(osd: &OsdService, n: u64) -> Acked {
 }
 
 /// What an OSD opened on replayed images is missing of `acked`.
+/// The metadata engine under test: `OBJECTIO_META_ENGINE` (native, or
+/// rocksdb in a build with that feature), native by default.
+fn engine() -> objectio_storage::metadata::MetaEngine {
+    std::env::var("OBJECTIO_META_ENGINE")
+        .map_or(Ok(objectio_storage::metadata::MetaEngine::Native), |e| {
+            e.parse()
+        })
+        .expect("OBJECTIO_META_ENGINE")
+}
+
 async fn check(data: &Path, state: &Path, acked: &[Acked]) -> Vec<String> {
-    let osd = match OsdService::new(
+    let osd = match OsdService::new_with_store(
         vec![data.display().to_string()],
         BLOCK_SIZE,
         state.to_path_buf(),
+        |c| c.engine = engine(),
     ) {
         Ok(o) => o,
         Err(e) => return vec![format!("the OSD does not open: {e}")],
@@ -408,6 +419,7 @@ async fn acknowledged_writes_survive_a_power_cut_anywhere() {
         OsdService::new_with_store(vec![data.dev()], BLOCK_SIZE, mnt.join("state"), |c| {
             c.memtable_bytes = 256 << 10;
             c.wal.max_size_bytes = 512 << 10;
+            c.engine = engine();
         })
         .expect("OSD on the logged devices"),
     );

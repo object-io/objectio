@@ -96,6 +96,9 @@ jobs:
         run: sudo apt-get install -y nasm autoconf automake libtool libclang-dev
       - run: cargo test -p objectio-erasure --features isal
       - run: cargo test -p objectio-storage --features io-uring
+      # The RocksDB metadata engine (B27): its conformance suite and the
+      # refusal to open the other engine's directory.
+      - run: cargo test -p objectio-storage --features rocksdb --lib metadata
 
   # The end-to-end suite boots real clusters and took ~40 minutes run as
   # one job, test after test: the critical path of every PR. It is built

@@ -50,6 +50,8 @@ io-uring = ["objectio-storage/io-uring"]
 # development). Linux only, and needs a Mooncake build — see
 # crates/transport-te. Enabled at run time with `--rdma`.
 rdma = ["objectio-transport-te/te"]
+# The metadata index on RocksDB (B27), selected with --meta-engine rocksdb.
+rocksdb = ["objectio-storage/rocksdb"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

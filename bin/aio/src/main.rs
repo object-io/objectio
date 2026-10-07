@@ -190,6 +190,11 @@ struct Args {
     #[arg(long, hide = true)]
     pack_grace_secs: Option<u64>,
 
+    /// The OSDs' metadata index engine: `native`, or `rocksdb` (a build
+    /// with the `rocksdb` feature).
+    #[arg(long, env = "OBJECTIO_OSD_META_ENGINE", default_value = "native")]
+    meta_engine: String,
+
     /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
     /// Bound on `--listen-addr`. When set, admin endpoints move OFF
     /// the data port. Pass 0 to leave admin co-mounted on `--port`
@@ -813,6 +818,8 @@ async fn main() -> Result<()> {
             &args.log_level,
             "--scrub-interval-secs",
             &args.scrub_interval_secs.to_string(),
+            "--meta-engine",
+            &args.meta_engine,
         ]
         .map(str::to_string)
         .to_vec();
