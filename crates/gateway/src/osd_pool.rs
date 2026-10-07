@@ -1932,7 +1932,13 @@ pub async fn delete_meta_from_all(
             Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
         }
     }
-    if out.ok >= out.quorum && out.ok < out.of {
+    // Left on some copies, the copies are brought to agree: a delete that
+    // made its quorum, and one refused short of it, which may take effect
+    // all the same (its copies hold the newest stamp). Not healed, the
+    // refused one left the copies disagreeing for good: the object came
+    // back whenever the copies that took the delete were down, and its
+    // shards were never freed.
+    if out.ok > 0 && out.ok < out.of {
         pool.queue_heal(bucket, key, version_id).await;
     }
     out
