@@ -91,6 +91,7 @@ struct Stats {
     block_stripes: AtomicU64,
     last_pass_ms: AtomicU64,
     last_pass_end: AtomicU64,
+    degraded_repaired: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -105,6 +106,7 @@ static STATS: Stats = Stats {
     block_stripes: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
     last_pass_end: AtomicU64::new(0),
+    degraded_repaired: AtomicU64::new(0),
 };
 
 /// Start the repairer: a full pass every `interval`, on the Raft leader
@@ -114,6 +116,7 @@ pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
         info!("Repairer off");
         return;
     }
+    let degraded = Arc::clone(&meta);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
@@ -122,7 +125,19 @@ pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
             }
         }
     });
-    info!("Repairer spawned (a pass every {interval:?})");
+    // Objects written short of shards, worked apart from the walk and far
+    // more often (B29).
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(DEGRADED_EVERY).await;
+            if degraded.is_raft_leader() {
+                work_degraded(&degraded).await;
+            }
+        }
+    });
+    info!(
+        "Repairer spawned (a pass every {interval:?}, degraded objects every {DEGRADED_EVERY:?})"
+    );
 }
 
 /// Repairer metrics as Prometheus families.
@@ -138,6 +153,16 @@ pub fn render_metrics(out: &mut String) {
             "objectio_meta_repair_last_pass_timestamp_seconds",
             "When the last repair pass completed (Unix time; 0: none yet on this node)",
             s.last_pass_end.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "objectio_meta_degraded_objects",
+            "Objects acknowledged short of shards and not yet repaired (as last counted by the leader's repairer)",
+            DEGRADED.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "objectio_meta_degraded_oldest_seconds",
+            "Age of the oldest object short of shards: alert when it grows while every OSD is up",
+            DEGRADED_OLDEST_SECS.load(Ordering::Relaxed) as f64,
         ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {v}");
@@ -172,6 +197,11 @@ pub fn render_metrics(out: &mut String) {
             "objectio_meta_repair_errors_total",
             "Repairs that failed and will be retried next pass",
             &s.errors,
+        ),
+        (
+            "objectio_meta_degraded_repaired_total",
+            "Objects written short of shards that repair made whole",
+            &s.degraded_repaired,
         ),
         (
             "objectio_meta_repair_block_stripes_checked_total",
@@ -412,7 +442,7 @@ async fn audit(
     source: Source<'_>,
     objects: &[ObjectMeta],
     moves: &mut usize,
-) {
+) -> Vec<bool> {
     // Every listed shard of every repairable stripe, grouped by node, so
     // each node is asked once for the whole page.
     let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
@@ -514,7 +544,7 @@ async fn audit(
         .await;
 
     // Then, in order: backfill (bounded by `moves`) and listings.
-    for (object, healthy) in objects.iter().zip(healthy) {
+    for (object, &healthy) in objects.iter().zip(&healthy) {
         let Source::Osd(owner_addr) = source else {
             continue;
         };
@@ -534,7 +564,81 @@ async fn audit(
             warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
         }
     }
+    healthy
 }
+
+/// How often the objects recorded short of shards are worked (B29).
+const DEGRADED_EVERY: Duration = Duration::from_secs(5);
+
+/// Repair the objects recorded as written short of shards (B29), those with
+/// the fewest to spare first. A record goes once its object has every
+/// shard back, or once the key holds another object or none; one that
+/// can't be done yet (an OSD down, too few shards to read) stays for the
+/// next round.
+pub async fn work_degraded(meta: &Arc<MetaService>) {
+    let records = meta.degraded_objects();
+    DEGRADED.store(records.len() as u64, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    DEGRADED_OLDEST_SECS.store(
+        records
+            .iter()
+            .map(|(_, d, _)| now.saturating_sub(d.recorded_at))
+            .max()
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    for (key, record, bytes) in records {
+        if !meta.is_raft_leader() {
+            return;
+        }
+        let Some((bucket, k)) = key.split_once('/') else {
+            continue;
+        };
+        let probe = ObjectMeta {
+            bucket: bucket.to_string(),
+            key: k.to_string(),
+            ..Default::default()
+        };
+        let current = match quorum_current(meta, &probe).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("repair: degraded {key}: {e}; next round");
+                continue;
+            }
+        };
+        let Some(object) = current.filter(|o| o.object_id == record.object_id) else {
+            // Replaced or deleted since: nothing of it to repair.
+            if let Err(e) = meta.forget_degraded(&key, bytes).await {
+                debug!("repair: degraded {key}: {e}");
+            }
+            continue;
+        };
+        let Some(owner_addr) = owner(&object).and_then(|n| node_address(meta, n)) else {
+            debug!("repair: degraded {key}: its owner is not registered; next round");
+            continue;
+        };
+        let healthy = audit(
+            meta,
+            Source::Osd(&owner_addr),
+            std::slice::from_ref(&object),
+            &mut 0,
+        )
+        .await;
+        if healthy.first().copied().unwrap_or(false) {
+            info!("repair: {key} has every shard again; no longer degraded");
+            STATS.degraded_repaired.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = meta.forget_degraded(&key, bytes).await {
+                debug!("repair: degraded {key}: {e}");
+            }
+        }
+    }
+}
+
+/// Degraded-object records, and the age of the oldest, as last counted.
+static DEGRADED: AtomicU64 = AtomicU64::new(0);
+static DEGRADED_OLDEST_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// Objects one repair pass rebuilds at once.
 const REBUILDS_AT_ONCE: usize = 16;

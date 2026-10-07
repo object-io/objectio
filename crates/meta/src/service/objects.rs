@@ -114,6 +114,12 @@ impl MetaService {
             })
             .filter(|h| current_home.as_ref() != Some(h));
 
+        // Written short of shards: recorded in the same command (B29), so
+        // repair takes it at once and no crash loses it. A write of the key
+        // replaces the record of the object it replaces.
+        let current_degraded = self.store.as_ref().and_then(|s| s.read_degraded(&home_key));
+        let new_degraded = degraded_record(&req, now);
+
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
             let mut ops = vec![CasOp {
@@ -122,6 +128,14 @@ impl MetaService {
                 expected: expected_bytes,
                 new_value: Some(new_bytes),
             }];
+            if current_degraded.is_some() || new_degraded.is_some() {
+                ops.push(CasOp {
+                    table: CasTable::Named("degraded_objects".into()),
+                    key: home_key.clone(),
+                    expected: current_degraded,
+                    new_value: new_degraded,
+                });
+            }
             if let Some(home) = new_home {
                 ops.push(CasOp {
                     table: CasTable::Named("object_homes".into()),
@@ -480,5 +494,107 @@ impl MetaService {
             nodes,
             topology_version: topology.version,
         }))
+    }
+}
+
+/// The degraded-object record (B29) of `req`'s object, if it was written
+/// with fewer shards than its stripes have positions: erasure-coded stripes
+/// of its own (a slice of a pack is the pack's to repair).
+fn degraded_record(req: &CreateObjectRequest, now: u64) -> Option<Vec<u8>> {
+    use objectio_proto::metadata::{DegradedObject, DegradedStripe, ErasureType};
+    let stripes: Vec<DegradedStripe> = req
+        .stripes
+        .iter()
+        .filter(|s| {
+            ErasureType::try_from(s.ec_type).unwrap_or(ErasureType::ErasureMds)
+                == ErasureType::ErasureMds
+                && s.ec_k > 0
+                && s.ec_m > 0
+                && s.pack_id.is_empty()
+        })
+        .filter_map(|s| {
+            let total = s.ec_k + s.ec_m;
+            let mut present: Vec<u32> = s
+                .shards
+                .iter()
+                .map(|l| l.position)
+                .filter(|p| *p < total)
+                .collect();
+            present.sort_unstable();
+            present.dedup();
+            let missing: Vec<u32> = (0..total)
+                .filter(|p| present.binary_search(p).is_err())
+                .collect();
+            (!missing.is_empty()).then(|| DegradedStripe {
+                stripe_id: s.stripe_id,
+                missing,
+                present: u32::try_from(present.len()).unwrap_or(u32::MAX),
+                needed: s.ec_k,
+            })
+        })
+        .collect();
+    (!stripes.is_empty()).then(|| {
+        DegradedObject {
+            object_id: req.object_id.clone(),
+            stripes,
+            recorded_at: now,
+        }
+        .encode_to_vec()
+    })
+}
+
+impl MetaService {
+    /// Objects acknowledged short of shards (B29), not yet repaired:
+    /// `("{bucket}/{key}", record, its bytes)`, those with the fewest
+    /// shards to spare first.
+    pub(crate) fn degraded_objects(
+        &self,
+    ) -> Vec<(String, objectio_proto::metadata::DegradedObject, Vec<u8>)> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<_> = store
+            .degraded_all()
+            .into_iter()
+            .filter_map(|(k, v)| {
+                objectio_proto::metadata::DegradedObject::decode(v.as_slice())
+                    .ok()
+                    .map(|d| (k, d, v))
+            })
+            .collect();
+        let spare = |d: &objectio_proto::metadata::DegradedObject| {
+            d.stripes
+                .iter()
+                .map(|s| i64::from(s.present) - i64::from(s.needed))
+                .min()
+                .unwrap_or(i64::MAX)
+        };
+        out.sort_by_key(|(_, d, _)| (spare(d), d.recorded_at));
+        out
+    }
+
+    /// Remove a degraded-object record (B29), if it is still `expected`:
+    /// a write of the key meanwhile replaced it with its own.
+    pub(crate) async fn forget_degraded(&self, key: &str, expected: Vec<u8>) -> Result<(), String> {
+        use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        let Some(raft) = self.raft_handle() else {
+            return Ok(());
+        };
+        let cmd = MetaCommand::MultiCas {
+            ops: vec![CasOp {
+                table: CasTable::Named("degraded_objects".into()),
+                key: key.to_string(),
+                expected: Some(expected),
+                new_value: None,
+            }],
+            requested_by: "repair-degraded".into(),
+        };
+        match raft.client_write(cmd).await {
+            Ok(r) => match r.data {
+                MetaResponse::MultiCasOk | MetaResponse::MultiCasConflict { .. } => Ok(()),
+                other => Err(format!("unexpected raft response: {other:?}")),
+            },
+            Err(e) => Err(e.to_string()),
+        }
     }
 }

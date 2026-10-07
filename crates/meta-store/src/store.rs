@@ -123,6 +123,7 @@ impl MetaStore {
             let _t = write_txn.open_table(tables::LIFECYCLE_CONFIGS)?;
             let _t = write_txn.open_table(tables::BUCKET_ENCRYPTION_CONFIGS)?;
             let _t = write_txn.open_table(tables::KMS_KEYS)?;
+            let _t = write_txn.open_table(tables::DEGRADED_OBJECTS)?;
         }
         crate::commit_metrics::commit(write_txn, crate::commit_metrics::Commit::Durable)?;
 
@@ -499,6 +500,30 @@ impl MetaStore {
             Err(_) => return None,
         };
         table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// A key's degraded-object record (B29), prost-encoded `DegradedObject`.
+    pub fn read_degraded(&self, key: &str) -> Option<Vec<u8>> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(tables::DEGRADED_OBJECTS).ok()?;
+        table.get(key).ok()?.map(|v| v.value().to_vec())
+    }
+
+    /// Every degraded-object record (B29): key and bytes. The table holds
+    /// only objects not yet repaired, so it stays small.
+    pub fn degraded_all(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(read_txn) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(table) = read_txn.open_table(tables::DEGRADED_OBJECTS) else {
+            return Vec::new();
+        };
+        let Ok(iter) = table.iter() else {
+            return Vec::new();
+        };
+        iter.filter_map(Result::ok)
+            .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
+            .collect()
     }
 
     /// Keys ("{bucket}/{key}") whose home has `node` at some position, and

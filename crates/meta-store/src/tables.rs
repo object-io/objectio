@@ -134,6 +134,9 @@ pub const OBJECT_LISTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("
 // changed since never hides an object. Key: "{bucket}/{key}".
 // Value: prost-encoded ObjectHome. Written by CasTable::Named("object_homes").
 pub const OBJECT_HOMES: TableDefinition<&str, &[u8]> = TableDefinition::new("object_homes");
+/// Objects acknowledged short of shards (B29): "{bucket}/{key}" ->
+/// prost-encoded `DegradedObject`.
+pub const DEGRADED_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("degraded_objects");
 
 // Placement groups. One row per PG, keyed as "{pool}\0{pg_id:010}"
 // (10-digit zero-padded so a range scan over a pool returns PGs in

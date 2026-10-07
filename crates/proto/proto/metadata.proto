@@ -677,6 +677,26 @@ message ObjectHome {
     repeated bytes osd_ids = 1;
 }
 
+// An object acknowledged short of shards (B29): recorded in the Raft
+// command that creates it, removed once repair has every position back.
+// Keyed by "{bucket}/{key}"; a later write of the key replaces it.
+message DegradedObject {
+    bytes object_id = 1;
+    repeated DegradedStripe stripes = 2;
+    // Unix seconds.
+    uint64 recorded_at = 3;
+}
+
+message DegradedStripe {
+    uint64 stripe_id = 1;
+    // Positions the write left without a shard.
+    repeated uint32 missing = 2;
+    // Shards written, and how many a read needs (k): repair takes the
+    // objects with the fewest to spare first.
+    uint32 present = 3;
+    uint32 needed = 4;
+}
+
 message CreateObjectResponse {
     ObjectMeta object = 1;
 }

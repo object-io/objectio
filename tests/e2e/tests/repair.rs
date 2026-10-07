@@ -511,3 +511,37 @@ fn stale_copies_do_not_hold_up_a_lost_osds_evacuation() {
         );
     }
 }
+
+/// B29: a PUT acknowledged with only k + 1 shards (an OSD down while it
+/// was written) is recorded as degraded when it is written, and repaired
+/// from that record once the OSD is back, without waiting for a walk of
+/// every object (the walk is all but off here). It then survives two more
+/// OSDs down. Soak run 9 lost an object written this way: five shards for
+/// an hour, then two more lost.
+#[test]
+fn a_write_short_of_shards_is_repaired_from_its_record() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/partial", &[]).status, 200);
+    ha.stop_osd(2);
+    let c = &ha.clients[0];
+    let bodies: Vec<Vec<u8>> = (0..OBJECTS)
+        .map(|i| payload(300_000, 30 + u8::try_from(i).unwrap()))
+        .collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/partial/k{i}"), b).status, 200);
+    }
+    ha.start_osd(2, None);
+    // A few rounds of the degraded worker (every 5 s).
+    std::thread::sleep(Duration::from_secs(25));
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/partial/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
+}
