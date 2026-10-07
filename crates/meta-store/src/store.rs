@@ -61,6 +61,30 @@ pub struct MetaStore {
 /// A key ("{bucket}/{key}") and its home's OSD ids.
 pub type HomeRow = (String, Vec<Vec<u8>>);
 
+/// Make sure a redb database file exists at `path`, created whole: redb
+/// writes a new file's header and first pages in place, so a process killed
+/// while creating one (a restart a moment after a first start) left a file
+/// that never opened again ("invalid data"). It is created under another
+/// name, made durable, then renamed into place: there is a whole database
+/// at `path`, or none, and a leftover from an interrupted creation is
+/// thrown away. An existing file is left as it is.
+fn create_whole(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let mut new = path.as_os_str().to_owned();
+    new.push(".new");
+    let new = std::path::PathBuf::from(new);
+    let _ = std::fs::remove_file(&new);
+    drop(redb::Database::create(&new).map_err(std::io::Error::other)?);
+    std::fs::File::open(&new)?.sync_all()?;
+    std::fs::rename(&new, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl MetaStore {
     /// Borrow the underlying shared database handle. Exposed for
     /// [`crate::MetaRaftStorage`] so Raft's state-machine applies can
@@ -79,6 +103,7 @@ impl MetaStore {
         // Every durable commit saves redb's allocator state (B25), so a
         // crash never needs the full repair that walks the whole file; if
         // one runs anyway, say so.
+        create_whole(path)?;
         let started = std::time::Instant::now();
         let repaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let r = Arc::clone(&repaired);
@@ -1566,4 +1591,25 @@ impl MetaStore {
 /// already removed: `{key}\0{version}` → `{key}`.
 fn listing_object_key(entry: &str) -> &str {
     entry.split('\0').next().unwrap_or(entry)
+}
+
+#[cfg(test)]
+mod create_whole_tests {
+    use super::*;
+
+    /// A creation interrupted earlier left only a partial `.new` file: it
+    /// is thrown away and the database created whole; and nothing named
+    /// `meta.redb` exists until it is whole.
+    #[test]
+    fn a_database_is_created_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.redb");
+        std::fs::write(dir.path().join("meta.redb.new"), b"half a header").unwrap();
+        let store = MetaStore::open(&path).unwrap();
+        drop(store);
+        assert!(path.exists());
+        assert!(!dir.path().join("meta.redb.new").exists());
+        // And it opens again.
+        MetaStore::open(&path).unwrap();
+    }
 }
