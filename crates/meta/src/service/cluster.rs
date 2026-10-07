@@ -695,6 +695,86 @@ impl MetaService {
     /// it is, whatever joined or left the cluster since. A home OSD that
     /// is no longer active gives its position to the first computed OSD
     /// not already in the set, as the computed placement would have.
+    /// Replace every position of a placement-group placement whose OSD
+    /// can't take a write — not registered (a lost OSD, forgotten), not
+    /// `In`, not up, or with no address — by an OSD that can and isn't in
+    /// the placement already: one in a failure domain (at the pool's
+    /// level) the placement doesn't use yet if there is one, chosen by
+    /// `key_hash` so every caller picks the same. A position no OSD can
+    /// stand in for is left as it is.
+    pub(super) fn stand_in_for_unusable(
+        &self,
+        nodes: &mut [NodePlacement],
+        failure_domain: &str,
+        key_hash: u64,
+    ) {
+        use objectio_common::FailureDomain;
+        let level = match failure_domain {
+            "node" => FailureDomain::Node,
+            "rack" => FailureDomain::Rack,
+            "datacenter" => FailureDomain::Datacenter,
+            "zone" => FailureDomain::Zone,
+            "region" => FailureDomain::Region,
+            "disk" => FailureDomain::Disk,
+            _ => FailureDomain::Host,
+        };
+        let topology = self.topology.read();
+        let osd_nodes = self.osd_nodes.read();
+        let usable = |id: &[u8]| -> Option<&OsdNode> {
+            let id = <[u8; 16]>::try_from(id).ok()?;
+            let node = osd_nodes.iter().find(|n| n.node_id == id)?;
+            let up = topology
+                .get_node(NodeId::from_bytes(id))
+                .is_some_and(|t| t.status == NodeStatus::Active);
+            (up && node.admin_state == objectio_common::OsdAdminState::In
+                && !node.address.is_empty())
+            .then_some(node)
+        };
+        if nodes.iter().all(|n| usable(&n.node_id).is_some()) {
+            return;
+        }
+        let domain_of = |id: &[u8]| -> Option<String> {
+            let id = <[u8; 16]>::try_from(id).ok()?;
+            topology
+                .get_node(NodeId::from_bytes(id))
+                .map(|t| t.failure_domain.at_level(level).to_string())
+        };
+        for i in 0..nodes.len() {
+            if usable(&nodes[i].node_id).is_some() {
+                continue;
+            }
+            let taken: Vec<Vec<u8>> = nodes.iter().map(|n| n.node_id.clone()).collect();
+            let used_domains: std::collections::HashSet<String> = nodes
+                .iter()
+                .filter(|n| usable(&n.node_id).is_some())
+                .filter_map(|n| domain_of(&n.node_id))
+                .collect();
+            let spare = topology
+                .active_nodes()
+                .map(|t| t.id.as_bytes().to_vec())
+                .filter(|id| !taken.contains(id))
+                .filter_map(|id| usable(&id).map(|n| (id, n)))
+                .min_by_key(|(id, _)| {
+                    let shared = domain_of(id).is_some_and(|d| used_domains.contains(&d));
+                    let mut seed = key_hash.to_le_bytes().to_vec();
+                    seed.extend_from_slice(&(i as u64).to_le_bytes());
+                    seed.extend_from_slice(id);
+                    (shared, xxhash_rust::xxh64::xxh64(&seed, 0))
+                });
+            let Some((id, node)) = spare else {
+                continue;
+            };
+            let slot = &mut nodes[i];
+            slot.node_id = id;
+            slot.node_address = node.address.clone();
+            slot.disk_id = node
+                .disk_ids
+                .first()
+                .map_or_else(|| vec![0u8; 16], |d| d.to_vec());
+            slot.te_segment = node.te_segment.clone();
+        }
+    }
+
     pub(super) fn place_at_home(&self, nodes: &mut [NodePlacement], home: &ObjectHome) {
         if home.osd_ids.len() != nodes.len() {
             // The pool's protection changed since, so positions no longer
@@ -993,7 +1073,7 @@ impl MetaService {
                 };
                 if pg.osd_ids.len() == expected_shards && expected_shards > 0 {
                     let nodes_snap = self.osd_nodes.read();
-                    let placements: Vec<NodePlacement> = pg
+                    let mut placements: Vec<NodePlacement> = pg
                         .osd_ids
                         .iter()
                         .enumerate()
@@ -1037,6 +1117,18 @@ impl MetaService {
                             }
                         })
                         .collect();
+                    drop(nodes_snap);
+                    // A member that can't take a write (lost and forgotten,
+                    // set out, down) is stood in for, as CRUSH placement
+                    // skips it: a PG keeps its members until the balancer
+                    // moves it, which a lost OSD never makes it do.
+                    let failure_domain = self
+                        .pools
+                        .read()
+                        .get(&pool_name)
+                        .map(|p| p.failure_domain.clone())
+                        .unwrap_or_default();
+                    self.stand_in_for_unusable(&mut placements, &failure_domain, key_hash);
                     debug!(
                         "PG placement for {}/{}: pool={}, pg_id={}, {} shards",
                         req.bucket,

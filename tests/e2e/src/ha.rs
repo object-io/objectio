@@ -70,6 +70,9 @@ pub struct HaCluster {
     /// rolling upgrade) runs plain, also once its nodes run this build: a
     /// cluster can't run half on TLS.
     tls: bool,
+    /// Each OSD on a host of its own (`h0`, `h1`, …) rather than all on
+    /// one: what a pool with placement groups needs to spread over them.
+    osd_hosts: bool,
 }
 
 impl Drop for HaCluster {
@@ -139,7 +142,7 @@ impl HaCluster {
     /// release's), or from this build when `None`.
     #[must_use]
     pub fn start_from(bins: Option<&Path>, metas: usize, osds: usize, gateways: usize) -> Self {
-        Self::start_with(bins, metas, osds, gateways, &[])
+        Self::start_with(bins, metas, osds, gateways, &[], false)
     }
 
     /// As [`Self::start`], every meta node also given `meta_args`.
@@ -150,7 +153,15 @@ impl HaCluster {
         gateways: usize,
         meta_args: &[&str],
     ) -> Self {
-        Self::start_with(None, metas, osds, gateways, meta_args)
+        Self::start_with(None, metas, osds, gateways, meta_args, false)
+    }
+
+    /// As [`Self::start`], each OSD on a host of its own, so a pool's
+    /// placement groups can spread over them (one host can't hold k + m
+    /// failure domains).
+    #[must_use]
+    pub fn start_with_osd_hosts(metas: usize, osds: usize, gateways: usize) -> Self {
+        Self::start_with(None, metas, osds, gateways, &[], true)
     }
 
     fn start_with(
@@ -159,6 +170,7 @@ impl HaCluster {
         osds: usize,
         gateways: usize,
         meta_args: &[&str],
+        osd_hosts: bool,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
@@ -180,6 +192,7 @@ impl HaCluster {
             secret_key: String::new(),
             meta_args: meta_args.iter().map(ToString::to_string).collect(),
             tls: bins.is_none(),
+            osd_hosts,
         };
         for i in 0..metas {
             // A port it lost to another process: new ones, before any peer
@@ -235,10 +248,17 @@ impl HaCluster {
     /// Start OSD `i` from `bins` (see [`Self::start_from`]).
     fn spawn_osd(&mut self, i: usize, bins: Option<&Path>) {
         let endpoints = self.meta_endpoints();
+        let osd_hosts = self.osd_hosts;
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
         if self.tls {
             crate::tls::apply(&mut cmd);
+        }
+        if osd_hosts {
+            let config = o.state.join("osd.toml");
+            std::fs::write(&config, format!("[osd.failure_domain]\nhost = \"h{i}\"\n"))
+                .expect("osd config");
+            cmd.arg("--config").arg(&config);
         }
         let child = cmd
             .args([
