@@ -58,6 +58,13 @@ impl MetadataService for MetaService {
         Self::create_object(self, request).await
     }
 
+    async fn report_degraded(
+        &self,
+        request: Request<objectio_proto::metadata::ReportDegradedRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ReportDegradedResponse>, Status> {
+        Self::report_degraded(self, request).await
+    }
+
     async fn delete_object(
         &self,
         request: Request<DeleteObjectRequest>,

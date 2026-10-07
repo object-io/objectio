@@ -645,3 +645,68 @@ impl MetaService {
             .collect()
     }
 }
+
+impl MetaService {
+    /// A reader found `bucket/key` short of shards (B29, heal on read):
+    /// recorded as degraded unless a record is there already, so repair
+    /// takes it within seconds. Repair checks the object itself; the
+    /// positions reported only order the work.
+    pub(crate) async fn report_degraded(
+        &self,
+        request: Request<objectio_proto::metadata::ReportDegradedRequest>,
+    ) -> Result<Response<objectio_proto::metadata::ReportDegradedResponse>, Status> {
+        use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        let req = request.into_inner();
+        if req.bucket.is_empty() || req.key.is_empty() || req.object_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "bucket, key and object_id required",
+            ));
+        }
+        let key = format!("{}/{}", req.bucket, req.key);
+
+        if self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_degraded(&key))
+            .is_some()
+        {
+            return Ok(Response::new(
+                objectio_proto::metadata::ReportDegradedResponse { recorded: false },
+            ));
+        }
+        let Some(raft) = self.raft_handle() else {
+            return Ok(Response::new(
+                objectio_proto::metadata::ReportDegradedResponse { recorded: false },
+            ));
+        };
+        let record = objectio_proto::metadata::DegradedObject {
+            object_id: req.object_id,
+            stripes: req.stripes,
+            recorded_at: Self::current_timestamp(),
+        };
+        let cmd = MetaCommand::MultiCas {
+            ops: vec![CasOp {
+                table: CasTable::Named("degraded_objects".into()),
+                key,
+                expected: None,
+                new_value: Some(record.encode_to_vec()),
+            }],
+            requested_by: "report-degraded".into(),
+        };
+        match raft.client_write(cmd).await {
+            Ok(r) => match r.data {
+                MetaResponse::MultiCasOk => Ok(Response::new(
+                    objectio_proto::metadata::ReportDegradedResponse { recorded: true },
+                )),
+                MetaResponse::MultiCasConflict { .. } => Ok(Response::new(
+                    objectio_proto::metadata::ReportDegradedResponse { recorded: false },
+                )),
+                other => {
+                    error!("unexpected raft response for report_degraded: {other:?}");
+                    Err(Status::internal("raft commit wrong variant"))
+                }
+            },
+            Err(e) => Err(raft_write_to_status(&e)),
+        }
+    }
+}

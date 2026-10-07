@@ -19,6 +19,9 @@ service MetadataService {
 
     // Object metadata operations
     rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
+    // A reader found an object short of shards (B29, heal on read): it is
+    // recorded as degraded, and repaired from the record.
+    rpc ReportDegraded(ReportDegradedRequest) returns (ReportDegradedResponse);
     rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
     rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
     rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
@@ -701,6 +704,20 @@ message LostObject {
     uint64 recorded_at = 5;
     // What found it, e.g. "evacuation".
     string found_by = 6;
+}
+
+message ReportDegradedRequest {
+    string bucket = 1;
+    string key = 2;
+    // The object read: a key holding another one by now is not recorded.
+    bytes object_id = 3;
+    // What the reader found: positions it could not read, per stripe.
+    repeated DegradedStripe stripes = 4;
+}
+
+message ReportDegradedResponse {
+    // Whether a record was made (false: one was there already).
+    bool recorded = 1;
 }
 
 message DegradedStripe {
