@@ -24,6 +24,9 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 crossbeam-channel = "0.5"
 redb = { workspace = true }
+# The RocksDB metadata engine (B27): optional, it is C++ and minutes of a
+# cold build.
+rocksdb = { version = "0.25", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -31,6 +34,8 @@ rand = { workspace = true }
 
 [features]
 default = []
+# The OSD's metadata index on RocksDB, selected with --meta-engine rocksdb.
+rocksdb = ["dep:rocksdb"]
 # Compile the io_uring I/O backend in alongside the default pread one
 # (Linux only; the flag silently does nothing on macOS / Windows).
 # Opt-in because not every deployment target has a new-enough kernel

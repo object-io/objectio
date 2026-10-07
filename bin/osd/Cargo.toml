@@ -28,3 +28,5 @@ isal = ["objectio-osd/isal"]
 io-uring = ["objectio-osd/io-uring"]
 # Shard transfers over Mooncake Transfer Engine.
 rdma = ["objectio-osd/rdma"]
+# The metadata index on RocksDB, with --meta-engine rocksdb.
+rocksdb = ["objectio-osd/rocksdb"]

@@ -31,6 +31,33 @@ pub struct MetadataStoreConfig {
     pub background_compaction: bool,
     /// How often the checkpoint thread looks, when no write wakes it.
     pub compaction_interval: Duration,
+    /// Which engine keeps the index (B27): this store, or RocksDB.
+    pub engine: MetaEngine,
+}
+
+/// The engine behind the OSD's metadata index (B27). A directory written by
+/// one is not opened by the other: a drive changes engine by being replaced
+/// and rebuilt, never by converting in place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetaEngine {
+    /// ObjectIO's own WAL, memtable and redb index file.
+    #[default]
+    Native,
+    /// RocksDB (the `rocksdb` feature).
+    RocksDb,
+}
+
+impl std::str::FromStr for MetaEngine {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "native" => Ok(Self::Native),
+            "rocksdb" => Ok(Self::RocksDb),
+            other => Err(format!(
+                "unknown metadata engine '{other}' (native, rocksdb)"
+            )),
+        }
+    }
 }
 
 impl Default for MetadataStoreConfig {
@@ -42,6 +69,7 @@ impl Default for MetadataStoreConfig {
             memtable_bytes: 64 << 20,
             background_compaction: true,
             compaction_interval: Duration::from_secs(60),
+            engine: MetaEngine::Native,
         }
     }
 }
@@ -545,6 +573,7 @@ mod tests {
             memtable_bytes: 4096,
             background_compaction: false, // Manual for tests
             compaction_interval: Duration::from_secs(1),
+            engine: MetaEngine::Native,
         }
     }
 

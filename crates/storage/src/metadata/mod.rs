@@ -47,11 +47,13 @@
 
 mod disk_index;
 mod index;
+#[cfg(feature = "rocksdb")]
+pub mod rocks;
 mod store;
 mod types;
 mod wal;
 
 pub use index::{MetaIndex, PrefixIter, iter_prefix, open};
-pub use store::{MetadataStore, MetadataStoreConfig};
+pub use store::{MetaEngine, MetadataStore, MetadataStoreConfig};
 pub use types::{MetadataEntry, MetadataKey, MetadataOp};
 pub use wal::{MetadataWal, WalSyncStats};
