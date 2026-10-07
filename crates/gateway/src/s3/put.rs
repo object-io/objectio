@@ -225,6 +225,55 @@ pub(crate) async fn commit_replica(
     }
 }
 
+/// How long a conditional commit whose answer is lost is sent again.
+const CONDITIONAL_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a failed call to meta may have been applied: its answer lost to
+/// a leader change, a timeout or a dropped connection, not a refusal.
+const fn is_ambiguous(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::Internal
+    )
+}
+
+/// Commit a conditional PUT's listing entry: meta decides the condition.
+/// An answer lost (the write applied or not) is sent again until meta
+/// decides. Meta takes the same write sent twice as applied once (it knows
+/// its entry by object id); refused by its own entry, the PUT failed, freed
+/// its shards and left the listing naming an object no GET finds, refusing
+/// every If-None-Match after.
+async fn create_conditional(
+    state: &Arc<AppState>,
+    req: objectio_proto::metadata::CreateObjectRequest,
+) -> Result<(), tonic::Status> {
+    let deadline = std::time::Instant::now() + CONDITIONAL_SETTLE;
+    let mut wait = std::time::Duration::from_millis(250);
+    let mut answer = crate::test_hooks::maybe_lost(
+        "create_object",
+        state.meta_client.clone().create_object(req.clone()).await,
+    );
+    loop {
+        match answer {
+            Ok(_) => return Ok(()),
+            Err(s) if is_ambiguous(s.code()) && std::time::Instant::now() < deadline => {
+                debug!(
+                    "{}/{}: conditional commit undecided ({s}); sending it again",
+                    req.bucket, req.key
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(4));
+            }
+            Err(s) => return Err(s),
+        }
+        answer = state.meta_client.clone().create_object(req.clone()).await;
+    }
+}
+
 /// [`commit_put`] for a version written here.
 pub(crate) async fn commit_new(
     state: &Arc<AppState>,
@@ -268,7 +317,22 @@ pub(crate) async fn commit_new(
     };
 
     if condition.is_set() {
-        if let Err(s) = state.meta_client.clone().create_object(listing_req).await {
+        if let Err(s) = create_conditional(state, listing_req).await {
+            if is_ambiguous(s.code()) {
+                // Meta may have taken it, its answer lost every time: the
+                // listing may name an object no copy holds. Healing puts
+                // the listing back to what the copies hold; the shards stay
+                // (a leak) rather than be freed under a listed object.
+                warn!(
+                    "{what}: conditional commit undecided ({s}); keeping its shards, healing the key"
+                );
+                state.osd_pool.queue_heal(&bucket, &key, "").await;
+                return Err(S3Error::xml_response(
+                    "ServiceUnavailable",
+                    &format!("could not commit the object: {}", s.message()),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            }
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what);
             return Err(match s.code() {
                 tonic::Code::FailedPrecondition => condition_refused(s.message()),

@@ -1417,6 +1417,7 @@ pub async fn run(
                 "/_admin/test/rewrite-shard",
                 post(test_hooks::rewrite_shard),
             )
+            .route("/_admin/test/lose-reply", post(test_hooks::lose_reply))
     } else {
         admin_routes
     };

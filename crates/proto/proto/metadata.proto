@@ -793,6 +793,10 @@ message ObjectListingEntry {
     uint32 pg_id = 13;
     // The pool name the PG lives in. Empty = default pool.
     string pool = 14;
+    // The object this entry lists: a conditional create sent again (its
+    // answer lost to a leader change or a timeout) is recognised as
+    // already applied, rather than refused by its own entry.
+    bytes object_id = 15;
 }
 
 // List objects
