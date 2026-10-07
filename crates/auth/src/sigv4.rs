@@ -9,7 +9,6 @@ use crate::user::AuthResult;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use http::Request;
-use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -111,30 +110,10 @@ impl SigV4Verifier {
 
     /// Parse the Authorization header
     fn parse_authorization_header(&self, header: &str) -> Result<ParsedAuth, AuthError> {
-        // Format: AWS4-HMAC-SHA256 Credential=AKID/date/region/service/aws4_request,
-        //         SignedHeaders=host;x-amz-date, Signature=xxx
-
         if !header.starts_with("AWS4-HMAC-SHA256") {
             return Err(AuthError::InvalidSignatureVersion);
         }
-
-        let re = Regex::new(
-            r"AWS4-HMAC-SHA256\s+Credential=([^/]+)/[^,]+,\s*SignedHeaders=([^,]+),\s*Signature=(\w+)"
-        ).unwrap();
-
-        let captures = re.captures(header).ok_or(AuthError::InvalidAuthHeader)?;
-
-        Ok(ParsedAuth {
-            access_key_id: captures.get(1).unwrap().as_str().to_string(),
-            signed_headers: captures
-                .get(2)
-                .unwrap()
-                .as_str()
-                .split(';')
-                .map(|s| s.to_lowercase())
-                .collect(),
-            signature: captures.get(3).unwrap().as_str().to_string(),
-        })
+        parse_authorization(header).ok_or(AuthError::InvalidAuthHeader)
     }
 
     /// Get the request date from headers
@@ -291,10 +270,51 @@ impl SigV4Verifier {
 }
 
 /// Parsed authorization header
-struct ParsedAuth {
-    access_key_id: String,
-    signed_headers: Vec<String>,
-    signature: String,
+/// The parts of a SigV4 `Authorization` header a verifier needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedAuth {
+    pub access_key_id: String,
+    /// Lower-cased, in the order given.
+    pub signed_headers: Vec<String>,
+    pub signature: String,
+}
+
+/// Parse a SigV4 `Authorization` header:
+///
+/// ```text
+/// AWS4-HMAC-SHA256 Credential=AKID/20261007/us-east-1/s3/aws4_request,
+///   SignedHeaders=host;x-amz-date, Signature=<hex>
+/// ```
+///
+/// By hand, not with a regex: it runs on every request (a regex compiled
+/// per call was a quarter of a gateway's CPU on small PUTs). `None` when
+/// the header is not of that form.
+#[must_use]
+pub fn parse_authorization(header: &str) -> Option<ParsedAuth> {
+    let rest = header.strip_prefix("AWS4-HMAC-SHA256")?;
+    // At least one space after the algorithm.
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut parts = rest.split(',').map(str::trim);
+    let credential = parts.next()?.strip_prefix("Credential=")?;
+    let signed = parts.next()?.strip_prefix("SignedHeaders=")?;
+    let signature = parts.next()?.strip_prefix("Signature=")?;
+    // The access key is the credential's first part; a scope must follow.
+    let (access_key_id, scope) = credential.split_once('/')?;
+    // The signature: its leading word characters (letters, digits, `_`).
+    let end = signature
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(signature.len());
+    let signature = &signature[..end];
+    if access_key_id.is_empty() || scope.is_empty() || signed.is_empty() || signature.is_empty() {
+        return None;
+    }
+    Some(ParsedAuth {
+        access_key_id: access_key_id.to_string(),
+        signed_headers: signed.split(';').map(str::to_lowercase).collect(),
+        signature: signature.to_string(),
+    })
 }
 
 /// Calculate HMAC-SHA256
@@ -370,6 +390,37 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_authorization_header_parses_without_a_regex() {
+        let h = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261007/us-east-1/s3/aws4_request, \
+                 SignedHeaders=Host;x-amz-content-sha256;x-amz-date, Signature=fe5f80f77d5fa3be";
+        let p = parse_authorization(h).unwrap();
+        assert_eq!(p.access_key_id, "AKIDEXAMPLE");
+        assert_eq!(
+            p.signed_headers,
+            ["host", "x-amz-content-sha256", "x-amz-date"]
+        );
+        assert_eq!(p.signature, "fe5f80f77d5fa3be");
+        // No spaces after the commas, several before Credential.
+        let tight = "AWS4-HMAC-SHA256   Credential=AK/scope,SignedHeaders=host,Signature=abc";
+        assert_eq!(parse_authorization(tight).unwrap().signature, "abc");
+        // The signature is its word characters.
+        let trailing = "AWS4-HMAC-SHA256 Credential=AK/s, SignedHeaders=host, Signature=abc def";
+        assert_eq!(parse_authorization(trailing).unwrap().signature, "abc");
+        for bad in [
+            "AWS AKID:sig",
+            "AWS4-HMAC-SHA256Credential=AK/s, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=AK, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=/s, SignedHeaders=host, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=AK/s, SignedHeaders=host",
+            "AWS4-HMAC-SHA256 Credential=AK/s, SignedHeaders=, Signature=abc",
+            "AWS4-HMAC-SHA256 Credential=AK/s, SignedHeaders=host, Signature=",
+            "AWS4-HMAC-SHA256 SignedHeaders=host, Credential=AK/s, Signature=abc",
+        ] {
+            assert_eq!(parse_authorization(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn test_url_encode() {
