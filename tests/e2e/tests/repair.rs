@@ -817,3 +817,97 @@ fn a_small_write_refused_below_k_copies_is_withdrawn() {
     let list = c.request("GET", "/short?list-type=2", &[]).text();
     assert!(!list.contains("<Key>new</Key>"), "{list}");
 }
+
+/// A lost OSD in a pool with placement groups: a PG keeps its members
+/// until the balancer moves it, and a lost one never makes it, so the PG
+/// still named the lost OSD (set out, its address taken by the drive that
+/// replaced it, then forgotten). Placement handed it out with no address:
+/// a gateway that had it cached wrote to the replacement under its name,
+/// one started since wrote five shards of six, every new object in the
+/// pool a shard short, and repair had nowhere to put the sixth. Placement
+/// now stands another OSD in for it, during the evacuation and after.
+#[test]
+fn a_pg_pool_places_around_a_lost_osd() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_osd_hosts(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "pgp", "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 8, "failure_domain": "host", "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    let pgs = c
+        .request("GET", "/_admin/pools/pgp/placement-groups", &[])
+        .json();
+    // Pre-allocated: the pool places through its PGs. (The listing leaves
+    // out PG 0: its default `start_after` is 0.)
+    assert!(
+        pgs["pgs"].as_array().is_some_and(|p| !p.is_empty()),
+        "{pgs}"
+    );
+    c.request_with_headers("PUT", "/pgpool", &[], &[("x-objectio-pool", "pgp")])
+        .expect(200);
+
+    let ids = |c: &Cluster| -> Vec<(String, String)> {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node_id"].as_str().unwrap_or_default().to_string(),
+                    n["address"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let endpoint = ha.osd_endpoint(5);
+    let old = ids(c)
+        .into_iter()
+        .find(|(_, a)| *a == endpoint)
+        .map(|(id, _)| id)
+        .expect("OSD 5 registered");
+    ha.stop_osd(5);
+    ha.lose_osd_drive(5);
+    ha.start_osd(5, None);
+    // A gateway with nothing cached of the lost OSD.
+    ha.restart_gateway(0, None);
+    let mut bodies: Vec<(String, Vec<u8>)> = Vec::new();
+    let put = |c: &Cluster, bodies: &mut Vec<(String, Vec<u8>)>, name: String, seed: u8| {
+        let body = payload(300_000, seed);
+        let r = c.request("PUT", &format!("/pgpool/{name}"), &body);
+        assert_eq!(r.status, 200, "{name}: {}", r.text());
+        bodies.push((name, body));
+    };
+    // While the lost OSD is out and being evacuated...
+    let c = &ha.clients[0];
+    for i in 0..10u8 {
+        put(c, &mut bodies, format!("during-{i}"), i);
+    }
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while ids(&ha.clients[0]).iter().any(|(id, _)| *id == old) {
+        assert!(
+            Instant::now() < deadline,
+            "the lost OSD was never evacuated"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // ...and once it is forgotten.
+    ha.restart_gateway(0, None);
+    let c = &ha.clients[0];
+    for i in 0..10u8 {
+        put(c, &mut bodies, format!("after-{i}"), 100 + i);
+    }
+    // Every one on six OSDs: it survives two more down.
+    ha.stop_osd(0);
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    for (name, body) in &bodies {
+        let got = c.request("GET", &format!("/pgpool/{name}"), &[]);
+        assert_eq!(got.status, 200, "{name}: {}", got.text());
+        assert_eq!(&got.bytes, body, "{name}");
+    }
+}
