@@ -33,6 +33,7 @@ crc32c = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 toml = "0.8"
 gethostname = "0.5"
 sys-info = "0.9"
