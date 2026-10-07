@@ -22,6 +22,10 @@ on:
   # exactly the tree that lands; testing the merge commit again only
   # repeated work already done.
   pull_request:
+  # The merge queue tests each batch of queued PRs on top of main, once,
+  # instead of every PR being brought up to date and run again after each
+  # merge.
+  merge_group:
   # Nightly on main instead: GitHub Actions caches saved on main are the
   # ones every PR can restore, so this keeps the Rust and Docker caches
   # warm for new PRs, and catches anything that breaks without a code
@@ -72,12 +76,15 @@ jobs:
   test:
     name: unit tests
     runs-on: ubuntu-latest
+    env:
+      # mold: linking the test binaries is a large part of this job.
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       # Excluding the e2e package: it boots a cluster and belongs in its own
       # job so its runtime and its failures stay legible.
       - run: cargo test --workspace --exclude objectio-e2e
@@ -90,19 +97,21 @@ jobs:
       - run: cargo test -p objectio-erasure --features isal
       - run: cargo test -p objectio-storage --features io-uring
 
-  e2e:
-    name: end-to-end
+  # The end-to-end suite boots real clusters and took ~40 minutes run as
+  # one job, test after test: the critical path of every PR. It is built
+  # once, then run as shards in parallel, each on its own runner (the
+  # tests stay one at a time within a shard: each boots a cluster).
+  e2e-build:
+    name: end-to-end (build)
     runs-on: ubuntu-latest
-    # Boots a real single-process cluster and drives it over HTTP, so it is
-    # slower than everything above put together. The suite runs one test
-    # at a time and takes about 25 minutes now.
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@nextest
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       # aio embeds console/dist. build.rs creates it empty when absent so a
       # clone still builds, but the e2e job should exercise the real thing.
       - uses: actions/setup-node@v4
@@ -113,10 +122,51 @@ jobs:
       - name: build the console aio embeds
         working-directory: console
         run: npm ci && npm run build
-      - name: build the aio binary the tests drive
-        run: cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway
-      - name: run
-        run: cargo test --package objectio-e2e -- --test-threads=1 --nocapture
+      - name: build the binaries the tests drive, and archive the tests
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+          cargo nextest archive --package objectio-e2e --archive-file e2e.tar.zst
+          mkdir -p bins && cp target/debug/objectio-aio target/debug/obioctl target/debug/objectio-meta target/debug/objectio-osd target/debug/objectio-gateway target/debug/objectio-block-gateway bins/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e
+          path: |
+            e2e.tar.zst
+            bins/
+          retention-days: 1
+
+  e2e-shard:
+    name: end-to-end (${{ matrix.shard }}/6)
+    needs: e2e-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e
+      - name: run this shard
+        run: |
+          # The tests find the services' binaries next to their own.
+          mkdir -p target/debug && cp bins/* target/debug/ && chmod +x target/debug/*
+          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --partition hash:${{ matrix.shard }}/6 --test-threads 1 --no-fail-fast --success-output never --failure-output final
+
+  # The check the main ruleset requires: every shard passed.
+  e2e:
+    name: end-to-end
+    needs: e2e-shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.e2e-shard.result }}" = success
 
   upgrade:
     name: rolling upgrade
@@ -125,14 +175,16 @@ jobs:
     # under traffic (objectio-docs core/upgrade-path.md). The e2e job skips
     # this test: it needs the previous release's binaries, built here.
     timeout-minutes: 40
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the previous release is the latest tag
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
       - name: build this release
         run: cargo build --bin objectio-meta --bin objectio-osd --bin objectio-gateway
       - name: build the previous release
