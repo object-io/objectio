@@ -640,3 +640,91 @@ fn an_evacuation_records_a_lost_object_and_finishes() {
         std::thread::sleep(Duration::from_secs(2));
     }
 }
+
+/// B29, heal on read: a shard lost with nothing recording it (a disk
+/// wiped) is found by a GET, which decodes around it and reports the
+/// object; repair rebuilds it within seconds, with the walk all but off.
+/// The object then survives two more OSDs down.
+#[test]
+fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/heal", &[]).status, 200);
+    let body = payload(300_000, 9);
+    assert_eq!(c.request("PUT", "/heal/k", &body).status, 200);
+
+    // The disk holding position 0 is wiped (a read takes the data
+    // positions first, so it meets this one): its shard is gone, and
+    // nothing says so.
+    let holder = holder_of_position(&ha, "heal", "k", 0);
+    ha.stop_osd(holder);
+    std::fs::remove_file(ha.osd_disk(holder)).unwrap();
+    ha.start_osd(holder, None);
+
+    // A read decodes around it, and reports it.
+    let c = &ha.clients[0];
+    let got = c.request("GET", "/heal/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+    std::thread::sleep(Duration::from_secs(15));
+
+    // Two other OSDs down: it reads only if position 0 is back.
+    for i in (0..6).filter(|&i| i != holder).take(2) {
+        ha.stop_osd(i);
+    }
+    let c = &ha.clients[0];
+    let got = c.request("GET", "/heal/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+}
+
+/// Which of `ha`'s OSDs holds position `pos` of `bucket/key`'s first
+/// stripe, from the object's metadata.
+fn holder_of_position(
+    ha: &objectio_e2e::ha::HaCluster,
+    bucket: &str,
+    key: &str,
+    pos: u32,
+) -> usize {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    let object = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut client = StorageServiceClient::new(
+            objectio_e2e::tls::channel(&ha.osd_endpoint(0))
+                .await
+                .expect("connect OSD"),
+        );
+        client
+            .get_object_meta(GetObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: String::new(),
+                with_small_shard: false,
+            })
+            .await
+            .expect("GetObjectMeta")
+            .into_inner()
+            .object
+            .expect("a copy on OSD 0")
+    });
+    let node = &object.stripes[0]
+        .shards
+        .iter()
+        .find(|l| l.position == pos)
+        .expect("position placed")
+        .node_id;
+    let nodes = ha.clients[0].request("GET", "/_admin/nodes", &[]).json();
+    let address = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node_id"].as_str() == Some(hex::encode(node).as_str()))
+        .and_then(|n| n["address"].as_str())
+        .expect("holder registered")
+        .to_string();
+    (0..6)
+        .find(|&i| ha.osd_endpoint(i) == address)
+        .expect("holder is one of the cluster's OSDs")
+}

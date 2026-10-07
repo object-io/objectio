@@ -1135,6 +1135,10 @@ pub(crate) async fn get_object_version_once(
 
         // Read shards from OSDs - we need at least k shards
         let mut shards: Vec<Option<Bytes>> = vec![None; total_shards];
+        // Positions found without a shard: reported to meta (B29).
+        let mut unreadable: Vec<u32> = (0..total_shards as u32)
+            .filter(|p| stripe.shards.iter().all(|l| l.position != *p))
+            .collect();
         let mut read_count = 0;
 
         // Create a map of position -> shard location for quick lookup
@@ -1258,6 +1262,7 @@ pub(crate) async fn get_object_version_once(
                 }
                 Err(e) => {
                     warn!("Failed to read shard {}: {}", pos, e);
+                    unreadable.push(pos);
                 }
             }
         }
@@ -1304,6 +1309,18 @@ pub(crate) async fn get_object_version_once(
             }
         };
 
+        if !unreadable.is_empty() && stripe_ec_type == ErasureType::ErasureMds {
+            crate::heal::report_degraded(
+                &state,
+                &bucket,
+                &key,
+                &object.object_id,
+                stripe.stripe_id,
+                &unreadable,
+                read_count,
+                stripe.ec_k,
+            );
+        }
         let stripe_data = match codec.decode(&mut shards, stripe_data_size) {
             Ok(d) => d,
             Err(e) => {
