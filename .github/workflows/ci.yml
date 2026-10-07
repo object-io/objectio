@@ -17,14 +17,15 @@
 name: CI
 
 on:
-  # No run on push to main. The main ruleset requires these checks with
-  # "branches must be up to date before merging", so a PR is tested on
-  # exactly the tree that lands; testing the merge commit again only
-  # repeated work already done.
+  # A pull request runs the fast checks only (format, lints, unit tests,
+  # console, chart: ~9 minutes); the heavy jobs (end-to-end, docker image,
+  # rolling upgrade, rdma, aio release build) are skipped there, which the
+  # ruleset counts as passed. They run once, in the merge queue, on the
+  # tree that lands. Running everything on both doubled the time to merge
+  # (~16 minutes, twice) for the same answer.
   pull_request:
-  # The merge queue tests each batch of queued PRs on top of main, once,
-  # instead of every PR being brought up to date and run again after each
-  # merge.
+  # The merge queue tests each batch of queued PRs on top of main: the one
+  # full run every change gets before it lands.
   merge_group:
   # Nightly on main instead: GitHub Actions caches saved on main are the
   # ones every PR can restore, so this keeps the Rust and Docker caches
@@ -106,6 +107,7 @@ jobs:
   # tests stay one at a time within a shard: each boots a cluster).
   e2e-build:
     name: end-to-end (build)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -141,14 +143,16 @@ jobs:
           retention-days: 1
 
   e2e-shard:
-    name: end-to-end (${{ matrix.shard }}/6)
+    name: end-to-end (${{ matrix.shard }}/8)
     needs: e2e-build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        # Eight: with six, the shard holding full_disk (~4 minutes alone)
+        # ran ~10 minutes while others took 3.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@nextest
@@ -160,19 +164,23 @@ jobs:
           # The tests find the services' binaries next to their own.
           mkdir -p target/debug && cp bins/* target/debug/ && chmod +x target/debug/*
           cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-            --partition hash:${{ matrix.shard }}/6 --test-threads 1 --no-fail-fast --success-output never --failure-output final
+            --partition hash:${{ matrix.shard }}/8 --test-threads 1 --no-fail-fast --success-output never --failure-output final
 
-  # The check the main ruleset requires: every shard passed.
+  # The check the main ruleset requires: every shard passed (or, on a pull
+  # request, the suite was left to the merge queue).
   e2e:
     name: end-to-end
     needs: e2e-shard
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: test "${{ needs.e2e-shard.result }}" = success
+      - run: |
+          r="${{ needs.e2e-shard.result }}"
+          test "$r" = success || { test "$r" = skipped && test "${{ github.event_name }}" = pull_request; }
 
   upgrade:
     name: rolling upgrade
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # A cluster on the previous release, rolled node by node to this one
     # under traffic (objectio-docs core/upgrade-path.md). The e2e job skips
@@ -199,6 +207,7 @@ jobs:
 
   image:
     name: docker image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # The image build broke the moment tests/e2e became a workspace member —
     # cargo would not read the workspace without its manifest, so `cargo fetch`
@@ -225,6 +234,7 @@ jobs:
 
   rdma:
     name: rdma (transfer engine, tcp)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # The Transfer Engine code paths (objectio-transport-te, and the OSD's,
     # gateway's and aio's `rdma` features) only build against a Mooncake build,
@@ -309,6 +319,7 @@ jobs:
 
   aio-release-build:
     name: aio (release features)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # The release compiles objectio-aio with feature flags nothing else turns
     # on — ISA-L erasure coding, io_uring, the PCRE2 and Hyperscan grep

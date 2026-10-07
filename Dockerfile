@@ -83,30 +83,60 @@ RUN rustup component add rustfmt clippy
 WORKDIR /build
 
 # =============================================================================
-# Stage 2: Dependency caching layer
+# Stage 2: Dependencies, cached apart from the source (cargo-chef)
 # =============================================================================
-FROM builder-base AS deps
+# The dependency layer used to copy the whole source tree, so any change to
+# any crate rebuilt every dependency from scratch: ~15 minutes per image
+# build, cache or not. cargo-chef builds them from a recipe of the
+# manifests alone, a layer that changes only with Cargo.lock or a
+# manifest.
+FROM builder-base AS chef
+RUN cargo install cargo-chef --locked --version 0.1.73
 
-# Copy only Cargo files for dependency caching
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-
-# Create dummy source files to build dependencies
 COPY crates ./crates
 COPY bin ./bin
 # The end-to-end suite is a workspace member, so cargo refuses to read the
-# workspace at all without its manifest — `cargo fetch` failed with "failed to
-# load manifest for workspace member /build/tests/e2e" and took the whole image
-# build with it. Nothing caught that: CI runs the test suite but never builds
-# the image.
+# workspace at all without its manifest.
 COPY tests ./tests
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Build dependencies only (this layer gets cached)
-RUN cargo fetch
+# The features the image builds with, per architecture:
+# - x86_64/amd64: ISA-L for hardware-accelerated erasure coding (~3-5x
+#   faster than the pure Rust code via Intel's assembly routines);
+# - both: io-uring. The image is always Linux and tokio-uring is pure Rust,
+#   so it adds no build or runtime library: the documented +25% throughput
+#   and -43% p99.9 on 4 MiB stripes. The helm deployment (the production
+#   path) once ran a less optimised build than the standalone aio binary
+#   because the image had never enabled it.
+# grep-pcre2 is deliberately not here: it links a C library, so it needs
+# libpcre2-dev in this stage and libpcre2-8 in runtime-base. Enabling a
+# feature whose shared library the runtime lacks is how the v0.0.1 binary
+# shipped needing libhs.so.5 and failed to start.
+# `FEATURES` overrides.
+FROM chef AS builder
+ARG TARGETARCH
+ARG TARGETPLATFORM
+ARG FEATURES=""
+RUN set -e; ARCH="$(uname -m)"; \
+    if [ -n "$FEATURES" ]; then F="$FEATURES"; \
+    elif [ "$TARGETARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then F="isal,io-uring"; \
+    elif [ "$TARGETARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then F="io-uring"; \
+    else F=""; fi; \
+    echo "platform ${TARGETPLATFORM:-native}, features: ${F:-default}"; \
+    echo "$F" > /build/.features
+COPY --from=planner /build/recipe.json recipe.json
+RUN F="$(cat /build/.features)"; \
+    cargo chef cook --release ${F:+--features "$F"} --recipe-path recipe.json
 
 # =============================================================================
 # Stage 3: Build all binaries
 # =============================================================================
-FROM deps AS builder
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bin ./bin
+COPY tests ./tests
 
 # objectio-aio embeds the console SPA at compile time via
 # `include_dir!("$CARGO_MANIFEST_DIR/../../console/dist")`, so the
@@ -114,61 +144,14 @@ FROM deps AS builder
 # console-builder stage.
 COPY --from=console-builder /build/console/dist /build/console/dist
 
-# Build arguments - TARGETARCH is provided by Docker buildx
-ARG TARGETARCH
-ARG TARGETPLATFORM
-ARG FEATURES=""
 # Baked into objectio_build_info. The release workflow passes the tag and
 # the commit; a local build reports the crate version and "unknown".
 ARG OBJECTIO_VERSION
 ARG OBJECTIO_GIT_COMMIT
 ENV OBJECTIO_VERSION=${OBJECTIO_VERSION} OBJECTIO_GIT_COMMIT=${OBJECTIO_GIT_COMMIT}
 
-# Determine features based on architecture
-# - x86_64/amd64: Enable ISA-L for hardware-accelerated erasure coding
-# - arm64/aarch64: Use pure Rust reed-solomon-simd (no ISA-L)
-#
-# ISA-L provides ~3-5x faster erasure coding on x86_64 via Intel's
-# optimized assembly routines. On ARM, we fall back to the pure Rust
-# implementation which is still performant via SIMD intrinsics.
-RUN set -ex && \
-    ARCH="$(uname -m)" && \
-    echo "Build platform: ${TARGETPLATFORM:-native}" && \
-    echo "Target arch: ${TARGETARCH:-$ARCH}" && \
-    echo "Native arch: $ARCH" && \
-    # Determine features based on architecture
-    CARGO_FEATURES="" && \
-    # io-uring on both: the image is always Linux, tokio-uring is pure Rust
-    # so it adds no build or runtime library, and it is the documented +25%
-    # throughput / -43% p99.9 on 4 MiB stripes. The image had never enabled it,
-    # so the helm deployment — the production path — was running a *less*
-    # optimised build than the standalone aio binary, which gets it.
-    #
-    # grep-pcre2 is deliberately not here: it links a C library, so it needs
-    # libpcre2-dev in this stage and libpcre2-8 in runtime-base. Enabling a
-    # feature whose shared library the runtime lacks is how the v0.0.1 binary
-    # shipped needing libhs.so.5 and failed to start.
-    if [ "$TARGETARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then \
-        echo "Detected x86_64 - enabling ISA-L acceleration + io_uring" && \
-        CARGO_FEATURES="isal,io-uring"; \
-    elif [ "$TARGETARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
-        echo "Detected ARM64 - pure Rust erasure coding + io_uring" && \
-        CARGO_FEATURES="io-uring"; \
-    else \
-        echo "Unknown architecture: $ARCH - using default features"; \
-    fi && \
-    # Allow override via build arg
-    if [ -n "$FEATURES" ]; then \
-        echo "Feature override: $FEATURES" && \
-        CARGO_FEATURES="$FEATURES"; \
-    fi && \
-    # Build with determined features
-    echo "Final cargo features: ${CARGO_FEATURES:-default}" && \
-    if [ -n "$CARGO_FEATURES" ]; then \
-        cargo build --release --features "$CARGO_FEATURES"; \
-    else \
-        cargo build --release; \
-    fi
+RUN F="$(cat /build/.features)"; \
+    cargo build --release ${F:+--features "$F"}
 
 # =============================================================================
 # Stage 4: Runtime base image (minimal)
