@@ -780,15 +780,25 @@ impl OsdService {
         })
     }
 
+    /// Whether a write built from the object `expected` may go over what
+    /// this copy holds: that object, or one older than `incoming` (a copy
+    /// that missed the writes since: an OSD out or down when the key was
+    /// overwritten). A newer object is answered as superseded before this
+    /// is asked. Refusing older copies left one OSD's stale copy refusing
+    /// the object an evacuation moved there, every sweep (soak run 14).
     fn precondition_holds(
         current: Option<&ObjectMeta>,
         expected: &[u8],
         require_existing: bool,
+        incoming: &ObjectMeta,
     ) -> bool {
         if expected.is_empty() {
             return true;
         }
-        current.map_or(!require_existing, |c| c.object_id == expected)
+        current.map_or(!require_existing, |c| {
+            c.object_id == expected
+                || (incoming.stamp != 0 && c.write_order() < incoming.write_order())
+        })
     }
 
     /// Whether `object` is also stored as a version of `bucket/key`, which
@@ -1493,6 +1503,7 @@ impl StorageService for OsdService {
                         prev.as_ref(),
                         &req.expected_object_id,
                         req.require_existing,
+                        &object,
                     )
                 {
                     return Err(Status::failed_precondition(format!(
@@ -1546,6 +1557,7 @@ impl StorageService for OsdService {
                 old.as_ref(),
                 &req.expected_object_id,
                 req.require_existing,
+                &object,
             ) {
                 return Err(Status::failed_precondition(format!(
                     "{}/{} is no longer the object this write was built from",
@@ -3041,6 +3053,23 @@ mod integrity_tests {
         );
 
         put(&osd, stamped(3, 300), &[]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
+    }
+
+    /// A write built from an object (an evacuation moving a key's copy, a
+    /// repair re-pointing a shard) goes over a copy that missed it and holds
+    /// an older one; a copy holding a newer one keeps it. Refusing the older
+    /// copy left an evacuation retrying the same move forever (soak run 14).
+    #[tokio::test]
+    async fn a_write_built_from_an_object_replaces_an_older_copy() {
+        let (_dir, osd) = osd();
+        put(&osd, stamped(1, 100), &[]).await.unwrap();
+        put(&osd, stamped(2, 200), &[2; 16]).await.unwrap();
+        assert_eq!(stored(&osd).unwrap().object_id, vec![2; 16]);
+
+        // Built from 2 again, with 3 here since: superseded, 3 stays.
+        put(&osd, stamped(3, 300), &[]).await.unwrap();
+        put(&osd, stamped(2, 200), &[2; 16]).await.unwrap();
         assert_eq!(stored(&osd).unwrap().object_id, vec![3; 16]);
     }
 

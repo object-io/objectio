@@ -1327,19 +1327,46 @@ async fn move_home(
         taken.push(target);
         moves.push((position, draining.to_vec(), target.to_vec()));
     }
-    if let Some(mut o) = object {
+    if let Some(o) = object {
         let targets: Vec<String> = moves
             .iter()
             .filter_map(|(_, _, t)| <[u8; 16]>::try_from(t.as_slice()).ok())
             .filter_map(|t| meta.osd_address_by_id(&t))
             .collect();
-        let mut extra: Vec<&str> = targets.iter().map(String::as_str).collect();
-        if o.usage_owner == draining.as_slice() {
-            o.usage_owner.clone_from(&moves[0].2);
-            // Every copy changes: they all record the owner.
-            extra.extend(others.iter().map(String::as_str));
+        let put = |mut o: ObjectMeta| {
+            let (targets, others, moves) = (&targets, &others, &moves);
+            async move {
+                let mut extra: Vec<&str> = targets.iter().map(String::as_str).collect();
+                if o.usage_owner == draining.as_slice() {
+                    o.usage_owner.clone_from(&moves[0].2);
+                    // Every copy changes: they all record the owner.
+                    extra.extend(others.iter().map(String::as_str));
+                }
+                fanout_put_object_meta(meta, &o, &targets[0], &extra).await
+            }
+        };
+        if let Err(e) = put(o.clone()).await {
+            // Built from a read a copy has moved past: a write since, or a
+            // copy the read didn't ask (a target that kept an object an
+            // overwrite missed). Read again from every copy that may hold
+            // the key, the targets too, and redo it once from that, as
+            // MinIO re-reads before it heals; never the same refused move
+            // every sweep (soak run 14).
+            let mut all = others.clone();
+            all.extend(targets.iter().cloned());
+            match newest_copy(&all, home.len(), bucket, key).await? {
+                Some(fresh) if fresh.write_order() != o.write_order() => put(fresh)
+                    .await
+                    .map_err(|e2| anyhow::anyhow!("{e}; read again and retried: {e2}"))?,
+                Some(_) => {
+                    return Err(anyhow::anyhow!(
+                        "{e} (read again: no newer object, so a target refuses the current one)"
+                    ));
+                }
+                // Deleted since: no copy to move, only the home.
+                None => {}
+            }
         }
-        fanout_put_object_meta(meta, &o, &targets[0], &extra).await?;
     }
     meta.move_object_home(bucket, key, &moves)
         .await
