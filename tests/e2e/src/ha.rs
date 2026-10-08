@@ -678,6 +678,7 @@ impl HaCluster {
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, Vec::len);
             if r.status == 200 && online >= osds {
+                self.await_default_pool();
                 return;
             }
             assert!(
@@ -685,6 +686,20 @@ impl HaCluster {
                 "only {online} of {osds} OSDs registered"
             );
             std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// Wait until the default pool's placement groups are made (B31): until
+    /// then a PUT is answered 503. A cluster on a release before placement
+    /// groups has none: given up on after a while.
+    pub fn await_default_pool(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let r = self.clients[0].request("GET", "/_admin/pools/default/placement-groups", &[]);
+            if r.status == 200 && r.json()["pgs"].as_array().is_some_and(|p| !p.is_empty()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

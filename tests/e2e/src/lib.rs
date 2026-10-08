@@ -527,6 +527,7 @@ impl Cluster {
                     .as_array()
                     .map_or(0, |n| n.iter().filter(|n| n["online"] == true).count());
                 if online >= self.osds {
+                    self.wait_default_pool();
                     return self.wait_block_gateway(deadline);
                 }
                 last = format!("{online} of {} OSDs online", self.osds);
@@ -550,6 +551,21 @@ impl Cluster {
     /// With a block gateway, wait until it serves on its port. Something
     /// else answering there (the port was taken between being picked and
     /// being bound) fails the start, so it is retried on fresh ports.
+    /// Wait until the default pool's placement groups are made (B31): a
+    /// key is placed through them, and until they are a PUT is answered
+    /// 503. Meta makes them once enough OSDs are up. A cluster on a
+    /// release before placement groups has none: given up on after a while.
+    fn wait_default_pool(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let r = self.request("GET", "/_admin/pools/default/placement-groups", &[]);
+            if r.status == 200 && r.json()["pgs"].as_array().is_some_and(|p| !p.is_empty()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     fn wait_block_gateway(&mut self, deadline: Instant) -> Result<(), String> {
         use objectio_proto::block::ListVolumesRequest;
         use objectio_proto::block::block_service_client::BlockServiceClient;

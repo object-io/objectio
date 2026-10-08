@@ -294,12 +294,15 @@ fn shard_count(c: &Cluster, index: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// Backfill (B20): objects written while an OSD is out have two shards on
-/// one of the other five; once it is back in, the repairer moves one of
-/// them to it, so every OSD holds one shard of each object again and the
-/// objects survive any two losses.
+/// An OSD set out with no other to stand in for it (six OSDs, 4+2): its
+/// placement groups are undersized, and objects written meanwhile go to the
+/// other five, one shard each, short one and recorded so (B31): nothing is
+/// put on the OSD that is out, and nothing doubles up on another (it did,
+/// before placement groups: two shards of every such object on one OSD,
+/// spread again by repair later). Once the OSD is back in, repair puts the
+/// missing shard there, and the objects survive any two losses.
 #[test]
-fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
+fn objects_written_while_an_osd_is_out_get_their_missing_shard_when_it_is_back() {
     let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--repair-interval-secs", "1"]);
     let out = osd_id(&c, 0);
     let set = |state: &str| {
@@ -311,30 +314,35 @@ fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
         .expect_ok();
     };
     set("out");
-    let bodies = put_objects(&c, "spread");
+    let bodies = put_objects(&c, "undersized");
     let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
-    let hot = counts
-        .iter()
-        .position(|n| *n > OBJECTS as u64)
-        .unwrap_or_else(|| panic!("nothing doubled up with an OSD out: {counts:?}"));
+    assert_eq!(
+        counts[0], 0,
+        "a shard went to the OSD that is out: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|n| *n <= OBJECTS as u64),
+        "shards doubled up: {counts:?}"
+    );
 
     set("in");
-    // Moved, and the old copies deleted after their grace.
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
         if counts.iter().all(|n| *n == OBJECTS as u64) {
             break;
         }
-        assert!(Instant::now() < deadline, "shards never spread: {counts:?}");
+        assert!(
+            Instant::now() < deadline,
+            "the missing shards never came: {counts:?}"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
-    assert!(metric(&c, "objectio_meta_repair_shards_moved_total", &[]) >= OBJECTS as u64);
-    assert_readable(&c, "spread", &bodies, "after the shards were spread");
+    assert_readable(&c, "undersized", &bodies, "once the OSD was back");
 
-    // The OSD that held two of each, and one more.
-    c.restart_with_lost_disks(&[hot, (hot + 1) % 6]);
-    assert_readable(&c, "spread", &bodies, "with two disks lost");
+    // The OSD that was out, and one more.
+    c.restart_with_lost_disks(&[0, 1]);
+    assert_readable(&c, "undersized", &bodies, "with two disks lost");
 }
 
 /// B26, as a drive is replaced in production: the OSD's drive dies with
@@ -842,8 +850,7 @@ fn a_pg_pool_places_around_a_lost_osd() {
     let pgs = c
         .request("GET", "/_admin/pools/pgp/placement-groups", &[])
         .json();
-    // Pre-allocated: the pool places through its PGs. (The listing leaves
-    // out PG 0: its default `start_after` is 0.)
+    // Pre-allocated: the pool places through its PGs.
     assert!(
         pgs["pgs"].as_array().is_some_and(|p| !p.is_empty()),
         "{pgs}"

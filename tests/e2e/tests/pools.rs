@@ -42,7 +42,8 @@ fn create_in(c: &Cluster, keys: Option<(&str, &str)>, bucket: &str, pool: &str) 
 
 #[test]
 fn a_bucket_lives_in_the_pool_it_was_created_in() {
-    let c = Cluster::start();
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
     pool(&c, "rep3");
     create_in(&c, None, "in-pool", "rep3").expect(200);
     create_in(&c, None, "no-pool", "").expect(200);
@@ -71,7 +72,8 @@ fn a_bucket_lives_in_the_pool_it_was_created_in() {
 
 #[test]
 fn a_tenant_uses_its_default_pool_and_only_the_pools_it_is_allowed() {
-    let c = Cluster::start();
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
     pool(&c, "gold");
     pool(&c, "silver");
     c.json(
@@ -135,7 +137,8 @@ fn a_tenant_uses_its_default_pool_and_only_the_pools_it_is_allowed() {
 /// other way, with only a warning in meta's log.
 #[test]
 fn a_pool_whose_pgs_cannot_be_spread_is_refused() {
-    let c = Cluster::start();
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
     let r = c.json(
         "POST",
         "/_admin/pools",
