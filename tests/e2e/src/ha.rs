@@ -756,7 +756,8 @@ impl HaCluster {
 
     /// Wait until every OSD is known to the cluster (placement works).
     fn await_osds(&self, osds: usize) {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // Generous: clusters of ten OSDs start alongside other tests'.
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let r = self.clients[0].request("GET", "/_admin/nodes", &[]);
             let online = r
