@@ -9,6 +9,7 @@
 //! rebuilt.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use objectio_e2e::ha::HaCluster;
@@ -192,7 +193,7 @@ fn a_replicated_pools_lost_copies_are_copied_back() {
     lose_drives(&mut ha, &[lost], &ids);
     await_clean(&ha, "rep3", 180);
     assert!(
-        metric(&ha, "objectio_meta_pg_replica_copies_total") >= bodies.len() as f64,
+        metric(&ha, "objectio_meta_pg_replica_copies_total") >= count(&bodies),
         "recovery copied {} replicas for {} objects",
         metric(&ha, "objectio_meta_pg_replica_copies_total"),
         bodies.len()
@@ -296,14 +297,17 @@ fn an_lrc_shard_is_rebuilt_from_its_local_group() {
         "objectio_meta_pg_lrc_shards_read_total{kind=\"local\"}",
     );
     assert!(
-        local >= bodies.len() as f64,
+        local >= count(&bodies),
         "{local} local rebuilds for {} objects",
         bodies.len()
     );
-    assert_eq!(global, 0.0, "a rebuild went to the whole stripe");
+    assert!(global < 0.5, "{global} rebuilds went to the whole stripe");
     // Each read its group's two other members: the data shard beside it
     // and the local parity, both in its rack.
-    assert_eq!(local_reads, 2.0 * local, "reads outside the group");
+    assert!(
+        2.0f64.mul_add(-local, local_reads).abs() < 0.5,
+        "{local_reads} reads for {local} rebuilds: reads outside the group"
+    );
     all_read(&ha, "lrc", &bodies);
 }
 
@@ -316,7 +320,7 @@ fn an_lrc_group_short_of_two_is_rebuilt_from_the_whole_stripe() {
     let (ha, bodies) = lrc(&[0, 4]);
     let global = metric(&ha, "objectio_meta_pg_lrc_rebuilds_total{kind=\"global\"}");
     assert!(
-        global >= 2.0 * bodies.len() as f64,
+        global >= 2.0 * count(&bodies),
         "{global} whole-stripe rebuilds for {} objects, two shards each",
         bodies.len()
     );
@@ -360,9 +364,10 @@ fn a_multipart_objects_parts_are_already_in_its_placement_group() {
         );
         assert_eq!(r.status, 200, "part {n}: {}", r.text());
         let etag = r.header("etag").unwrap_or_else(|| format!("\"part{n}\""));
-        xml.push_str(&format!(
+        let _ = write!(
+            xml,
             "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
-        ));
+        );
     }
     xml.push_str("</CompleteMultipartUpload>");
     let r = c.request(
@@ -376,13 +381,17 @@ fn a_multipart_objects_parts_are_already_in_its_placement_group() {
     std::thread::sleep(Duration::from_secs(8));
     await_clean(&ha, "default", 60);
     let shards_after = metric(&ha, "objectio_meta_pg_recovered_shards_total");
-    assert_eq!(
-        shards_after,
-        shards_before,
+    assert!(
+        (shards_after - shards_before).abs() < 0.5,
         "recovery wrote {} shards for the completed object",
         shards_after - shards_before
     );
     let got = c.request("GET", "/mpu/big", &[]);
     assert_eq!(got.status, 200, "{}", got.text());
     assert_eq!(got.bytes, parts.concat());
+}
+
+/// How many objects, as the metrics count them.
+fn count(bodies: &[(String, Vec<u8>)]) -> f64 {
+    f64::from(u32::try_from(bodies.len()).unwrap())
 }
