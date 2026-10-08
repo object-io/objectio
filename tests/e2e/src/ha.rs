@@ -18,6 +18,7 @@ struct Meta {
     id: u64,
     grpc: u16,
     admin: u16,
+    metrics: u16,
     dir: PathBuf,
     /// Where its binary comes from: `None` for this build, or a directory
     /// holding another release's (rolling-upgrade tests).
@@ -179,6 +180,7 @@ impl HaCluster {
                     id: i as u64,
                     grpc: free_port(),
                     admin: free_port(),
+                    metrics: free_port(),
                     dir: dir.path().join(format!("meta{i}")),
                     bins: Mutex::new(bins.map(Path::to_path_buf)),
                     child: Mutex::new(None),
@@ -314,6 +316,25 @@ impl HaCluster {
         let gateway = &mut self.gateways[i];
         gateway.child = Some(child);
         await_child_listening(gateway.child.as_mut().unwrap(), &[port])
+    }
+
+    /// The highest value of meta metric `name` (no labels) across the
+    /// running meta nodes: the leader's, for a gauge only it sets.
+    pub fn meta_metric(&self, name: &str) -> Option<f64> {
+        self.metas
+            .iter()
+            .filter(|m| m.running())
+            .filter_map(|m| {
+                let text = http()
+                    .get(format!("http://127.0.0.1:{}/metrics", m.metrics))
+                    .send()
+                    .ok()?
+                    .text()
+                    .ok()?;
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+            })
+            .reduce(f64::max)
     }
 
     /// Start one more gateway, from `bins`, with a signed client of it in
@@ -459,7 +480,7 @@ impl HaCluster {
                 "--data-dir",
                 &m.dir.display().to_string(),
                 "--metrics-port",
-                "0",
+                &m.metrics.to_string(),
                 "--admin-port",
                 &m.admin.to_string(),
                 "--ec-k",
@@ -643,6 +664,7 @@ impl HaCluster {
             id: new_id,
             grpc: free_port(),
             admin: free_port(),
+            metrics: free_port(),
             dir: self.dir.path().join(format!("meta{new_id}")),
             bins: Mutex::new(None),
             child: Mutex::new(None),

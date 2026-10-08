@@ -10,7 +10,7 @@ fn pool(c: &Cluster, name: &str) {
     let r = c.json(
         "POST",
         "/_admin/pools",
-        json!({"name": name, "ec_type": 2, "replication_count": 3, "enabled": true}),
+        json!({"name": name, "ec_type": 0, "ec_k": 2, "ec_m": 1, "enabled": true}),
     );
     assert!(r.status < 300, "create pool {name}: {}", r.text());
 }
@@ -146,4 +146,41 @@ fn a_pool_whose_pgs_cannot_be_spread_is_refused() {
     assert!(r.text().contains("placement groups"), "{}", r.text());
     let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
     assert!(!pools.to_string().contains("\"pgp\""), "{pools}");
+}
+
+/// LRC and replicated pools aren't released (B10): repair rebuilds MDS
+/// stripes only, so their lost shards would never be rebuilt. Asking for
+/// one is refused, saying why, and nothing is made.
+#[test]
+fn lrc_and_replicated_pools_are_refused_until_their_repair_exists() {
+    let c = Cluster::start();
+    for (name, body) in [
+        (
+            "rep3",
+            json!({"name": "rep3", "ec_type": 2, "replication_count": 3, "enabled": true}),
+        ),
+        (
+            "lrc",
+            json!({"name": "lrc", "ec_type": 1, "ec_k": 4, "ec_local_parity": 2,
+            "ec_global_parity": 1, "enabled": true}),
+        ),
+    ] {
+        let r = c.json("POST", "/_admin/pools", body);
+        assert!(
+            (400..500).contains(&r.status),
+            "{name}: {}: {}",
+            r.status,
+            r.text()
+        );
+        assert!(
+            r.text().contains("not available yet"),
+            "{name}: {}",
+            r.text()
+        );
+        let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+        assert!(
+            !pools.to_string().contains(&format!("\"{name}\"")),
+            "{pools}"
+        );
+    }
 }

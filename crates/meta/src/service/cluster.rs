@@ -1862,6 +1862,19 @@ impl MetaService {
                 pool.name
             )));
         }
+        // LRC and replication aren't released: repair rebuilds MDS stripes
+        // only, and a pool whose lost shards are never rebuilt loses
+        // protection with every failure until data is lost (B10).
+        if pool.ec_type() != ErasureType::ErasureMds
+            && !super::ALLOW_UNREPAIRED_SCHEMES.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Status::failed_precondition(format!(
+                "pool '{}': LRC and replicated pools are not available yet: their repair is \
+                 not built, so lost shards or copies would never be rebuilt. Use erasure \
+                 coding (ec_type 0).",
+                pool.name
+            )));
+        }
         // A pool with placement groups is refused up front when the
         // topology can't spread a PG's copies across failure domains: it
         // used to be created anyway, with no PGs, a warning in meta's log,
