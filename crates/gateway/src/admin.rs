@@ -2529,7 +2529,11 @@ pub async fn admin_set_osd_state(
             // FailedPrecondition from meta means Raft isn't the leader
             // or is not initialised; surface as 503 so the console can
             // retry rather than treating it as a permanent error.
-            let code = if e.code() == tonic::Code::FailedPrecondition {
+            // Unavailable too (soak run 21: setting an OSD out during a
+            // meta election timed out, was answered 500, and wasn't retried).
+            let code = if e.code() == tonic::Code::FailedPrecondition
+                || crate::s3::S3Error::is_unavailable(&e)
+            {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -2807,7 +2811,11 @@ async fn admin_rebalance_set_paused(
     match meta.set_config(req).await {
         Ok(_) => Json(serde_json::json!({ "paused": paused })).into_response(),
         Err(e) => {
-            let code = if e.code() == tonic::Code::FailedPrecondition {
+            // Unavailable too (soak run 21: setting an OSD out during a
+            // meta election timed out, was answered 500, and wasn't retried).
+            let code = if e.code() == tonic::Code::FailedPrecondition
+                || crate::s3::S3Error::is_unavailable(&e)
+            {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -3252,6 +3260,7 @@ fn status_response(e: &tonic::Status) -> Response {
         tonic::Code::FailedPrecondition | tonic::Code::Unavailable => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, e.message().to_string()).into_response()
@@ -3455,6 +3464,7 @@ fn grpc_error(e: &tonic::Status) -> Response {
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, e.message())
