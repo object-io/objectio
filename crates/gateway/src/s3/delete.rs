@@ -712,7 +712,7 @@ pub(crate) async fn delete_object_to_the_end(
         }
     }
 
-    info!("Deleted object: {}/{}", bucket, key);
+    debug!("Deleted object: {}/{}", bucket, key);
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())

@@ -1840,7 +1840,7 @@ impl StorageService for OsdService {
 
             let timestamp = Self::current_timestamp();
 
-            info!(
+            debug!(
                 "Stored object metadata: {}/{} ({} bytes, version={})",
                 req.bucket, req.key, object.size, object.version_id
             );
@@ -1979,7 +1979,7 @@ impl StorageService for OsdService {
                 })?;
                 self.usage
                     .apply(&req.bucket, EntryKind::Current, old.as_ref(), None);
-                info!("Deleted object metadata: {}/{}", req.bucket, req.key);
+                debug!("Deleted object metadata: {}/{}", req.bucket, req.key);
             } else {
                 // Delete specific version entry
                 let version_key =

@@ -1183,7 +1183,7 @@ async fn put_object_placed(
             &body,
             sse_algorithm != SseAlgorithm::SseNone,
         );
-        info!(
+        debug!(
             "Created object (replication): {}/{}, size={}, stripes={}, replicas_written={}",
             bucket, key, original_size, num_stripes, total_success,
         );
@@ -1671,7 +1671,7 @@ async fn put_object_placed(
         &body,
         sse_algorithm != SseAlgorithm::SseNone,
     );
-    info!(
+    debug!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
         bucket,
         key,

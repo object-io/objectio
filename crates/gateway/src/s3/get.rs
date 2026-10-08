@@ -1363,7 +1363,7 @@ pub(crate) async fn get_object_version_once(
     }
     phases.mark("shards");
 
-    info!(
+    debug!(
         "Read object: {}/{}, size={}, stripes_fetched={}/{}{}",
         bucket,
         key,

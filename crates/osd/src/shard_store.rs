@@ -1165,7 +1165,7 @@ impl ShardStore for BlockStore {
         }
         self.corrupt.write().remove(&key);
 
-        info!(
+        debug!(
             "Wrote shard: disk={}, block={}, size={}, crc32c={:08x}",
             disk_idx,
             block_num,
