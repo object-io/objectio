@@ -404,6 +404,7 @@ pub async fn run(
     // acting members that can't take writes, and stand-ins filled.
     service::pgs::spawn(meta_service.clone());
     service::peering::spawn(meta_service.clone());
+    service::recovery::spawn(meta_service.clone());
     repair::spawn(
         meta_service.clone(),
         std::time::Duration::from_secs(args.repair_interval_secs),
@@ -595,6 +596,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     repair::render_metrics(&mut output);
     service::pgs::render_metrics(&mut output);
     service::peering::render_metrics(&mut output);
+    service::recovery::render_metrics(&mut output);
 
     // User counts
     writeln!(output, "# HELP objectio_meta_users_total Total users").unwrap();

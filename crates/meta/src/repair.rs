@@ -38,6 +38,12 @@
 //! Out of scope here: replicated and LRC stripes, shards on OSDs that do
 //! not answer (they may be rebooting; drain handles OSDs that are gone),
 //! and version entries other than the current one.
+//!
+//! From format level 7 (B31 phase 3a) a key placed through a placement
+//! group is its PG's recovery's (`service/recovery.rs`): the walk only puts
+//! its listing entry back, and a degraded record of it marks its PG for
+//! peering. What the walk still rebuilds: block chunks, packs, and keys
+//! written before placement groups.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -92,6 +98,8 @@ struct Stats {
     last_pass_ms: AtomicU64,
     last_pass_end: AtomicU64,
     degraded_repaired: AtomicU64,
+    found_missing: AtomicU64,
+    found_corrupt: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -107,6 +115,8 @@ static STATS: Stats = Stats {
     last_pass_ms: AtomicU64::new(0),
     last_pass_end: AtomicU64::new(0),
     degraded_repaired: AtomicU64::new(0),
+    found_missing: AtomicU64::new(0),
+    found_corrupt: AtomicU64::new(0),
 };
 
 /// Start the repairer: a full pass every `interval`, on the Raft leader
@@ -221,6 +231,23 @@ pub fn render_metrics(out: &mut String) {
         let _ = writeln!(out, "# TYPE {name} counter");
         let _ = writeln!(out, "{name} {}", v.load(Ordering::Relaxed));
     }
+    let name = "objectio_meta_repair_shards_found_bad_total";
+    let _ = writeln!(
+        out,
+        "# HELP {name} Shards of objects in placement groups the walk found missing or corrupt \
+         (their PGs' recovery rebuilds them)"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(
+        out,
+        "{name}{{reason=\"missing\"}} {}",
+        s.found_missing.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "{name}{{reason=\"corrupt\"}} {}",
+        s.found_corrupt.load(Ordering::Relaxed)
+    );
     let name = "objectio_meta_repair_shards_rebuilt_total";
     let _ = writeln!(
         out,
@@ -267,7 +294,20 @@ pub async fn pass(meta: &Arc<MetaService>) {
                 .into_iter()
                 .filter(|o| owner(o) == Some(node_id.as_slice()))
                 .collect();
-            audit(meta, Source::Osd(&address), &owned, &mut moves).await;
+            // A key placed through a placement group is rebuilt by its PG's
+            // recovery (B31 phase 3a); the walk only puts its listing entry
+            // back. The rest (keys written before PGs) as before.
+            let (in_pgs, others): (Vec<ObjectMeta>, Vec<ObjectMeta>) = owned
+                .into_iter()
+                .partition(|o| meta.key_pg(&o.bucket, &o.key).is_some());
+            detect(meta, &in_pgs).await;
+            for object in &in_pgs {
+                if let Err(e) = restore_listing(meta, &address, object).await {
+                    STATS.errors.fetch_add(1, Ordering::Relaxed);
+                    warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
+                }
+            }
+            audit(meta, Source::Osd(&address), &others, &mut moves).await;
             if next.is_empty() {
                 break;
             }
@@ -613,6 +653,54 @@ async fn audit(
     healthy
 }
 
+/// Check the shards of objects placed through placement groups, rebuilding
+/// nothing: an object with a shard missing or corrupt (rot the OSD's
+/// scrubber found) marks its PG to be peered, by listing, and its PG's
+/// recovery rebuilds it (B31 phase 3a). A shard whose holder doesn't answer
+/// is left for the next pass.
+async fn detect(meta: &Arc<MetaService>, objects: &[ObjectMeta]) {
+    let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
+    for (oi, o) in objects.iter().enumerate() {
+        for (si, s) in o.stripes.iter().enumerate() {
+            if repairable(s) {
+                for loc in &s.shards {
+                    asks.entry(loc.node_id.clone())
+                        .or_default()
+                        .push((oi, si, loc.position));
+                }
+            }
+        }
+    }
+    let answers = futures::future::join_all(asks.into_iter().map(|(node, refs)| async move {
+        let answer = match node_address(meta, &node) {
+            Some(addr) => check_shards(&addr, objects, &refs).await,
+            None => Err(anyhow::anyhow!("node not registered")),
+        };
+        (refs, answer)
+    }))
+    .await;
+    let mut bad: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (refs, answer) in answers {
+        let Ok(states) = answer else { continue };
+        for ((oi, _, _), state) in refs.iter().zip(states) {
+            if let Seen::Lost { corrupt } = state {
+                bad.insert(*oi);
+                if corrupt {
+                    STATS.found_corrupt.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    STATS.found_missing.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    STATS
+        .objects
+        .fetch_add(objects.len() as u64, Ordering::Relaxed);
+    for oi in bad {
+        meta.mark_key_dirty(&objects[oi].bucket, &objects[oi].key);
+    }
+}
+
 /// Wakes the walk before it is due: an OSD came back without the shards
 /// it held (a replaced disk). Called on the leader, which serves every
 /// registration; calls while a pass runs start one more after it.
@@ -655,6 +743,31 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
             .unwrap_or(0),
         Ordering::Relaxed,
     );
+
+    // A key placed through a placement group is its PG's recovery's (B31
+    // phase 3a): its record marks the PG for peering, which recovery acts
+    // on, and goes once the object is whole (recovery forgets it) or the PG
+    // has been found clean since it was made.
+    let (in_pgs, records): (Vec<_>, Vec<_>) = records.into_iter().partition(|(key, _, _)| {
+        key.split_once('/')
+            .is_some_and(|(b, k)| meta.key_pg(b, k).is_some())
+    });
+    for (key, record, bytes) in in_pgs {
+        let Some((bucket, k)) = key.split_once('/') else {
+            continue;
+        };
+        let (pg_id, pool) = meta.listing_pg(bucket, k);
+        let clean_since = meta
+            .pg_state(&pool, pg_id)
+            .is_some_and(|s| s.state == "Clean" && s.computed_at > record.recorded_at);
+        if clean_since {
+            if let Err(e) = meta.forget_degraded(&key, bytes).await {
+                debug!("repair: degraded {key}: {e}");
+            }
+        } else {
+            meta.mark_key_dirty(bucket, k);
+        }
+    }
 
     let started = std::time::Instant::now();
     let todo = due(&mut DEFERRED.lock(), records, started);

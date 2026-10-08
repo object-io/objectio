@@ -14,6 +14,7 @@ mod objects;
 mod packs;
 pub(crate) mod peering;
 pub(crate) mod pgs;
+pub(crate) mod recovery;
 mod tenants;
 mod unity;
 mod upgrade;

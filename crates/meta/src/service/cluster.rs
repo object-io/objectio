@@ -1089,6 +1089,9 @@ impl MetaService {
                 req.shards_dropped
             );
             crate::repair::walk_now();
+            // Its placement groups are listed at the next look, and
+            // recovery rebuilds what they lack (B31 phase 3a).
+            self.mark_osd_dirty(&req.node_id);
         }
 
         // Resolve cluster_uuid upfront — any resolution that goes to
@@ -1660,8 +1663,13 @@ impl MetaService {
         }
         // LRC and replication aren't released: repair rebuilds MDS stripes
         // only, and a pool whose lost shards are never rebuilt loses
-        // protection with every failure until data is lost (B10).
+        // protection with every failure until data is lost (B10). One copy
+        // (aio's single-disk default pool) promises no protection: nothing
+        // for repair to keep.
+        let single_copy =
+            pool.ec_type() == ErasureType::ErasureReplication && pool.replication_count <= 1;
         if pool.ec_type() != ErasureType::ErasureMds
+            && !single_copy
             && !super::ALLOW_UNREPAIRED_SCHEMES.load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(Status::failed_precondition(format!(

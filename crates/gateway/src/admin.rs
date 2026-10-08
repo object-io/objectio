@@ -916,6 +916,17 @@ fn pg_state_json(s: Option<&objectio_proto::metadata::PgState>) -> serde_json::V
         "last_error": s.last_error,
         "since": s.since,
         "computed_at": s.computed_at,
+        "min_spare": s.min_spare,
+        "recovery": {
+            "cursor": s.cursor.replace('\0', "/"),
+            "cursor_epoch": s.cursor_epoch,
+            "recovered": s.recovered,
+            "remaining": s.remaining,
+            "bytes_remaining": s.bytes_remaining,
+            "reserved_on": s.reserved_on.iter().map(hex::encode).collect::<Vec<_>>(),
+            "unfound_keys": s.unfound_keys,
+            "retry_at": s.retry_at,
+        },
         "members": s.members.iter().map(|m| serde_json::json!({
             "node_id": hex::encode(&m.node_id),
             "position": m.position,

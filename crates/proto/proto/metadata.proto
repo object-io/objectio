@@ -2574,14 +2574,17 @@ message ListPlacementGroupsResponse {
 
 // What peering found of a placement group (B31 phase 2, objectio-docs
 // core/pg-recovery.md): computed by the leader from its members' summaries
-// and, when they differ, their listings; nothing is acted on yet. Kept in
-// the Raft table `pg_state`, keyed "{pool}\0{pg_id:010}", written when it
-// changes.
+// and, when they differ, their listings, and recovery's progress through it
+// (phase 3a). Kept in the Raft table `pg_state`, keyed
+// "{pool}\0{pg_id:010}", written when it changes.
 message PgState {
     string pool = 1;
     uint32 pg_id = 2;
-    // Clean, Degraded, Undersized, Incomplete or Down (most severe first:
-    // Down, Incomplete, Undersized, Degraded, Clean).
+    // Peering's: Clean, Degraded, Undersized, Incomplete or Down (most
+    // severe first: Down, Incomplete, Undersized, Degraded, Clean).
+    // Recovery's, while it works the PG: Recovering (members lack objects
+    // or shards), Backfilling (a member is being filled: a stand-in, or
+    // one the up set names), WaitTooFull (a member to fill is too full).
     string state = 3;
     // The PG's epoch when this was computed.
     uint64 epoch = 4;
@@ -2610,6 +2613,29 @@ message PgState {
     uint64 since = 16;
     uint64 computed_at = 17;
     repeated PgMemberState members = 18;
+
+    // Recovery (B31 phase 3a). The fewest copies to spare any object has:
+    // complete copies (a member holding the newest object and every shard
+    // at its position) beyond what a read needs. Recovery takes the PGs
+    // with the least first.
+    sint64 min_spare = 19;
+    // How far recovery got through the PG at `cursor_epoch`, in key order:
+    // every key up to `cursor` ("{bucket}\0{key}") is done. A new leader
+    // resumes from it; another epoch starts again.
+    string cursor = 20;
+    uint64 cursor_epoch = 21;
+    // Objects recovery has made whole in this PG, counted over every
+    // leader since it was last Clean; and what was left at the last count.
+    uint64 recovered = 22;
+    uint64 remaining = 23;
+    uint64 bytes_remaining = 24;
+    // OSDs recovery holds a reservation on for this PG.
+    repeated bytes reserved_on = 25;
+    // Keys ("{bucket}/{key}") recovery found unfound: fewer complete shards
+    // anywhere than a read needs. Up to 64; `objects_unfound` counts all.
+    repeated string unfound_keys = 26;
+    // While WaitTooFull: not tried again before this (Unix s).
+    uint64 retry_at = 27;
 }
 
 message PgMemberState {

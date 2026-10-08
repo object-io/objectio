@@ -17,7 +17,10 @@
 //! answered: a newer write may be on those that didn't), `Undersized` (a
 //! position has no usable member), `Degraded` (something is missing), and
 //! `Clean`. The result is kept in the Raft table `pg_state` when it
-//! changes, with when the PG entered its state.
+//! changes, with when the PG entered its state, and with recovery's
+//! progress through the PG (phase 3a, `recovery.rs`), which acts on it. A
+//! PG recovery is working is not peered meanwhile: recovery peers it when
+//! it is done.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -67,12 +70,28 @@ static LAST: LazyLock<parking_lot::Mutex<HashMap<(String, u32), Instant>>> =
 static LATEST: LazyLock<parking_lot::Mutex<HashMap<(String, u32), PgState>>> =
     LazyLock::new(Default::default);
 
+/// Make `state` the leader's latest of its PG (recovery's own writes).
+pub(crate) fn set_latest(state: PgState) {
+    LATEST
+        .lock()
+        .insert((state.pool.clone(), state.pg_id), state);
+}
+
 /// Placement groups peered, and those that needed a listing.
 static PEERED: AtomicU64 = AtomicU64::new(0);
 static LISTED: AtomicU64 = AtomicU64::new(0);
 
-/// The states, most severe first.
-pub(crate) const STATES: [&str; 5] = ["Down", "Incomplete", "Undersized", "Degraded", "Clean"];
+/// The states, most severe first: peering's, then recovery's.
+pub(crate) const STATES: [&str; 8] = [
+    "Down",
+    "Incomplete",
+    "Undersized",
+    "Degraded",
+    "Clean",
+    "Recovering",
+    "Backfilling",
+    "WaitTooFull",
+];
 
 /// Peering metrics as Prometheus families (the leader's view).
 pub fn render_metrics(out: &mut String) {
@@ -132,7 +151,7 @@ pub fn render_metrics(out: &mut String) {
 
 /// The order of a key's writes: a delete wins a tie with an object of its
 /// stamp (a write never lands under a newer or equal delete).
-fn order(e: &PgEntry) -> (u64, bool, &[u8], u64) {
+pub(crate) fn order(e: &PgEntry) -> (u64, bool, &[u8], u64) {
     (e.stamp, e.tombstone, e.object_id.as_slice(), e.update_stamp)
 }
 
@@ -153,7 +172,7 @@ struct Answer {
 
 /// How many shards a read of the pool's objects needs (its k; 1 for
 /// replicas), and how many metadata copies a read must hear from.
-fn needs(pool: &PoolConfig, copies: usize) -> (usize, usize) {
+pub(crate) fn needs(pool: &PoolConfig, copies: usize) -> (usize, usize) {
     let k = match pool.ec_type() {
         ErasureType::ErasureMds | ErasureType::ErasureLrc => pool.ec_k.max(1) as usize,
         ErasureType::ErasureReplication => 1,
@@ -175,6 +194,9 @@ pub(crate) struct Merged {
     pub shards_missing: u64,
     /// Per acting member (by position): missing, stale, shards missing.
     pub members: Vec<(u64, u64, u64)>,
+    /// The fewest complete copies beyond what a read needs, over every
+    /// object (None: no objects).
+    pub min_spare: Option<i64>,
 }
 
 /// Merge what members answered. `acting[i]` is the entries of the member
@@ -255,6 +277,9 @@ pub(crate) fn merge(
             if complete < needed {
                 m.objects_unfound += 1;
             }
+            let spare = i64::try_from(complete).unwrap_or(i64::MAX)
+                - i64::try_from(needed).unwrap_or(i64::MAX);
+            m.min_spare = Some(m.min_spare.map_or(spare, |s| s.min(spare)));
         }
         if degraded {
             m.objects_degraded += 1;
@@ -271,6 +296,20 @@ impl MetaService {
         if !pool.is_empty() {
             DIRTY.lock().insert((pool, pg));
         }
+    }
+
+    /// Mark every placement group OSD `node` is an acting member of for
+    /// peering at the next look: it came back without shards it held (a
+    /// replaced or wiped disk), which only a listing shows.
+    pub(crate) fn mark_osd_dirty(&self, node: &[u8]) {
+        let ids: Vec<(String, u32)> = self
+            .placement_groups
+            .read()
+            .values()
+            .filter(|pg| pg.acting.iter().any(|m| m.as_slice() == node))
+            .map(|pg| (pg.pool.clone(), pg.pg_id))
+            .collect();
+        DIRTY.lock().extend(ids);
     }
 
     /// What peering last found of `pool/pg_id`: on the leader, its latest
@@ -332,6 +371,14 @@ impl MetaService {
             let states = self.pg_states(pool);
             for pg in self.placement_groups_for_pool(pool) {
                 let id = (pg.pool.clone(), pg.pg_id);
+                // Recovery is working it, and peers it when done; marked
+                // meanwhile, it is peered (listed) after.
+                if super::recovery::is_busy(&id) {
+                    if dirty.contains(&id) {
+                        DIRTY.lock().insert(id);
+                    }
+                    continue;
+                }
                 let peered = last.get(&id).copied();
                 let rank = if dirty.contains(&id) {
                     0
@@ -353,19 +400,21 @@ impl MetaService {
                 DIRTY.lock().insert((pg.pool.clone(), pg.pg_id));
             }
         }
-        let due: Vec<PlacementGroup> = due
+        let due: Vec<(bool, PlacementGroup)> = due
             .into_iter()
             .take(per_look)
-            .map(|(_, _, pg)| pg)
+            .map(|(rank, _, pg)| (rank == 0, pg))
             .collect();
         futures::stream::iter(due)
-            .map(|pg| {
+            .map(|(marked, pg)| {
                 let pools = &pools;
                 async move {
                     let Some(pool) = pools.get(&pg.pool) else {
                         return;
                     };
-                    let state = self.peer(&pg, pool).await;
+                    // Marked by a report of something missing: listed, as
+                    // a summary can't see a shard lost under its metadata.
+                    let state = self.peer(&pg, pool, marked).await;
                     LAST.lock()
                         .insert((pg.pool.clone(), pg.pg_id), Instant::now());
                     PEERED.fetch_add(1, Ordering::Relaxed);
@@ -378,7 +427,11 @@ impl MetaService {
     }
 
     /// Peer one placement group: its state as its members show it now.
-    pub(crate) async fn peer(&self, pg: &PlacementGroup, pool: &PoolConfig) -> PgState {
+    /// With `list`, every member is listed even if their summaries agree:
+    /// a summary counts the shards an object names on a member, not those
+    /// it holds, so a shard lost or rotted under intact metadata (a wiped
+    /// disk, rot the scrubber found) shows only in a listing.
+    pub(crate) async fn peer(&self, pg: &PlacementGroup, pool: &PoolConfig, list: bool) -> PgState {
         let members: Vec<Member> = pg
             .acting
             .iter()
@@ -437,7 +490,8 @@ impl MetaService {
             ..PgState::default()
         };
 
-        let agree = answered == copies
+        let agree = !list
+            && answered == copies
             && pg.filling.is_empty()
             && answers.windows(2).all(|w| {
                 let (a, b) = (w[0].summary.as_ref(), w[1].summary.as_ref());
@@ -467,6 +521,8 @@ impl MetaService {
                     ..PgMemberState::default()
                 })
                 .collect();
+            state.min_spare =
+                i64::try_from(copies).unwrap_or(i64::MAX) - i64::try_from(k).unwrap_or(i64::MAX);
             state.state = if undersized { "Undersized" } else { "Clean" }.into();
         } else {
             // GetMissing: every answering member's entries, and the strays'.
@@ -517,6 +573,9 @@ impl MetaService {
             state.copies_missing = merged.copies_missing;
             state.copies_stale = merged.copies_stale;
             state.shards_missing = merged.shards_missing;
+            state.min_spare = merged.min_spare.unwrap_or_else(|| {
+                i64::try_from(answered).unwrap_or(i64::MAX) - i64::try_from(k).unwrap_or(i64::MAX)
+            });
             state.members = members
                 .iter()
                 .zip(&acting)
@@ -560,7 +619,7 @@ impl MetaService {
 
     /// The address of OSD `id`, if it can be a member: registered, `In`,
     /// with an address.
-    fn usable_address(&self, id: &[u8]) -> Option<String> {
+    pub(crate) fn usable_address(&self, id: &[u8]) -> Option<String> {
         let id = <[u8; 16]>::try_from(id).ok()?;
         self.osd_nodes
             .read()
@@ -572,7 +631,9 @@ impl MetaService {
 
     /// Keep `state` in `pg_state` if it differs from what is there (other
     /// than when it was computed), with when the PG entered its state.
-    async fn record_pg_state(&self, mut state: PgState) {
+    /// Recovery's progress (cursor, counts, unfound keys, retry time) is
+    /// kept from what is there, until the PG is clean.
+    pub(crate) async fn record_pg_state(&self, mut state: PgState) {
         use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
         let key = MetaStore::pg_key(&state.pool, state.pg_id);
         let held_bytes = self
@@ -582,6 +643,11 @@ impl MetaService {
         let held = held_bytes
             .as_ref()
             .and_then(|b| PgState::decode(b.as_slice()).ok());
+        if let Some(h) = &held
+            && state.state != "Clean"
+        {
+            super::recovery::keep_progress(&mut state, h);
+        }
         state.since = match &held {
             Some(h) if h.state == state.state => h.since,
             _ => state.computed_at,
@@ -645,7 +711,7 @@ impl MetaService {
 }
 
 /// OSD `address`'s summary of `pool/pg_id`.
-async fn info_of(address: &str, pool: &str, pg_id: u32) -> Result<PgSummary, String> {
+pub(crate) async fn info_of(address: &str, pool: &str, pg_id: u32) -> Result<PgSummary, String> {
     let channel = crate::drain_observer::open_channel(address)
         .await
         .map_err(|e| e.to_string())?;
@@ -663,7 +729,7 @@ async fn info_of(address: &str, pool: &str, pg_id: u32) -> Result<PgSummary, Str
 }
 
 /// Every entry OSD `address` holds of `pool/pg_id`.
-async fn list_of(
+pub(crate) async fn list_of(
     address: &str,
     pool: &str,
     pg_id: u32,

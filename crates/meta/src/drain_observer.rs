@@ -1,5 +1,12 @@
 //! Drain observer **and** migrator (Phase 3a + 3b).
 //!
+//! From format level 7 (B31) a key placed through a placement group is not
+//! moved here: its PG stands in for an OSD being drained or lost, and
+//! recovery (`service/recovery.rs`) backfills the stand-in. What this moves
+//! is what no PG holds: block chunk stripes and packs (recorded in meta's
+//! own tables) and keys written before placement groups. An OSD is
+//! finalised once nothing of those refers to it and no PG holds it.
+//!
 //! Per sweep on the Raft leader, this task:
 //!
 //!  1. Finds OSDs marked `admin_state = Draining`.
@@ -502,6 +509,26 @@ async fn migrate_batch(
         match find_affected_objects(&addr, &draining, limit).await {
             Ok(objects) => {
                 for o in objects {
+                    // A key whose placement group has the OSD (an acting
+                    // member, or one a stand-in is filled from) is
+                    // recovery's (B31 phase 3a): the PG stands in for it
+                    // and backfills the stand-in, every stripe of every
+                    // object; what holds the OSD open is the PG
+                    // (`pgs_holding`, below). A key whose PG hasn't it may
+                    // still have a stripe there (a multipart part placed
+                    // elsewhere): moved here, to the PG's member at its
+                    // position.
+                    if meta.key_pg(&o.bucket, &o.key).is_some_and(|pg| {
+                        pg.acting
+                            .iter()
+                            .any(|m| m.as_slice() == draining.as_slice())
+                            || pg
+                                .filling
+                                .iter()
+                                .any(|f| f.from.as_slice() == draining.as_slice())
+                    }) {
+                        continue;
+                    }
                     for s in o.shards {
                         let shard = ShardId {
                             object_id: if s.shard_object_id.is_empty() {
@@ -573,10 +600,9 @@ async fn migrate_batch(
             moves[i].pack_stripe = Some(stripe.clone());
         }
     }
-    // Placement groups it is still in, or whose stand-in for it hasn't got
-    // their objects' metadata yet (inline objects too, which have no shards
-    // for the scan above to find): the leader stands in for it and fills
-    // the stand-in (B31); the OSD isn't empty until then.
+    // Placement groups it is still in (acting or up), or whose stand-in
+    // for it isn't filled yet: the leader stands in for it and recovery
+    // backfills the stand-in (B31); the OSD isn't empty until then.
     let pgs_left = meta.pgs_holding(&draining);
     scan.found = moves.len() + unsealed + pgs_left;
 

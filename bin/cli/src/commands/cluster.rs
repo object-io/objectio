@@ -610,6 +610,8 @@ pub async fn pg(cmd: PgCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                             ("STALE", "state.copies_stale"),
                             ("SHARDS", "state.shards_missing"),
                             ("DOWN", "state.members_down"),
+                            ("RECOVERED", "state.recovery.recovered"),
+                            ("LEFT", "state.recovery.remaining"),
                         ],
                     ));
                 }
@@ -652,6 +654,33 @@ pub async fn pg(cmd: PgCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                             .map(|e| format!("\nlast error: {e}"))
                             .unwrap_or_default()
                     );
+                    let r = &st["recovery"];
+                    if r["recovered"].as_u64().unwrap_or(0) > 0
+                        || r["remaining"].as_u64().unwrap_or(0) > 0
+                    {
+                        let _ = writeln!(
+                            s,
+                            "recovery: {} done, {} left ({} bytes), at {}, reserved on {}",
+                            cell(&r["recovered"]),
+                            cell(&r["remaining"]),
+                            cell(&r["bytes_remaining"]),
+                            r["cursor"]
+                                .as_str()
+                                .filter(|c| !c.is_empty())
+                                .unwrap_or("-"),
+                            r["reserved_on"].as_array().map_or(0, Vec::len)
+                        );
+                    }
+                    if let Some(keys) = r["unfound_keys"].as_array().filter(|k| !k.is_empty()) {
+                        let _ = writeln!(
+                            s,
+                            "unfound: {}",
+                            keys.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
                     let members = rows_of(st, "members");
                     if !members.is_empty() {
                         s.push('\n');

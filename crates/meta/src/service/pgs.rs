@@ -254,9 +254,9 @@ impl MetaService {
         Some((addrs, pg.acting.len()))
     }
 
-    /// The placement groups that still hold `node`: an acting member, or a
-    /// stand-in for it not yet filled. An OSD being emptied is done only
-    /// when there are none.
+    /// The placement groups that still hold `node`: an acting or up member,
+    /// or the member a stand-in is being filled from. An OSD being emptied
+    /// is done only when there are none.
     pub(crate) fn pgs_holding(&self, node: &[u8]) -> usize {
         if !pg_placement() {
             return 0; // nothing stands in for members below level 7
@@ -266,6 +266,7 @@ impl MetaService {
             .values()
             .filter(|pg| {
                 pg.acting.iter().any(|id| id.as_slice() == node)
+                    || pg.up.iter().any(|id| id.as_slice() == node)
                     || pg.filling.iter().any(|f| f.from.as_slice() == node)
             })
             .count()
@@ -412,9 +413,9 @@ impl MetaService {
     /// preferably in a failure domain the PG doesn't use yet, chosen the
     /// same way by any leader; the change is one commit that raises the
     /// PG's epoch, and the members old and new are told the epoch. The
-    /// stand-in is recorded as filling: it gets the PG's existing objects'
-    /// metadata from the others ([`Self::fill_stand_ins`]). A position no
-    /// OSD can take is left as it is (the PG is undersized).
+    /// stand-in is recorded as filling: recovery's backfill (`recovery.rs`)
+    /// gives it the PG's existing objects and their shards at its position.
+    /// A position no OSD can take is left as it is (the PG is undersized).
     ///
     /// `down_since` is this leader's record of when each OSD was first seen
     /// down.
@@ -460,15 +461,28 @@ impl MetaService {
                         .iter()
                         .all(|id| self.acting_usable(id, down_since, grace))
                 };
-                if usable(&pg) {
+                // An up member gone for good where acting is elsewhere: up
+                // goes back to acting there (recovery would move the PG
+                // onto nothing, and a drain would wait on it forever).
+                let fixed = self.without_gone_up(&pg);
+                let base = fixed.clone().unwrap_or_else(|| pg.clone());
+                if usable(&base) {
+                    if let Some(f) = fixed {
+                        changed.push((pg, f));
+                    }
                     continue;
                 }
-                match self.stand_in(&pg, &rule, down_since, grace) {
+                match self.stand_in(&base, &rule, down_since, grace) {
                     Some(new) => {
                         undersized += u64::from(!usable(&new));
                         changed.push((pg, new));
                     }
-                    None => undersized += 1,
+                    None => {
+                        undersized += 1;
+                        if let Some(f) = fixed {
+                            changed.push((pg, f));
+                        }
+                    }
                 }
             }
         }
@@ -550,6 +564,29 @@ impl MetaService {
         }
     }
 
+    /// `pg` with each up member that is gone for good (set out or draining,
+    /// lost, unregistered), where acting has another, replaced by the acting
+    /// one; None if there is none such.
+    fn without_gone_up(&self, pg: &PlacementGroup) -> Option<PlacementGroup> {
+        if pg.up.len() != pg.acting.len() {
+            return None;
+        }
+        let none = HashMap::new();
+        let mut up = pg.up.clone();
+        let mut any = false;
+        for (p, member) in up.iter_mut().enumerate() {
+            if *member != pg.acting[p] && !self.acting_usable(member, &none, Duration::MAX) {
+                member.clone_from(&pg.acting[p]);
+                any = true;
+            }
+        }
+        any.then(|| PlacementGroup {
+            up,
+            updated_at: Self::current_timestamp(),
+            ..pg.clone()
+        })
+    }
+
     /// `pg` with every unusable acting member stood in for, or None if no
     /// position could change. A stand-in keeps the pool's placement rule
     /// (phase 1b): in the domain of the rest of its LRC group, or in a
@@ -570,13 +607,20 @@ impl MetaService {
             topology.get_node(NodeId::from_bytes(id)).cloned()
         };
         let mut acting = pg.acting.clone();
+        let mut up = pg.up.clone();
         let mut filling = pg.filling.clone();
         let epoch = pg.epoch + 1;
         let mut any = false;
+        let no_grace = HashMap::new();
         for position in 0..acting.len() {
             if self.acting_usable(&acting[position], down_since, grace) {
                 continue;
             }
+            // Gone for good (set out or draining, lost, unregistered), not
+            // merely down: the up set lets it go too, so recovery doesn't
+            // move the PG back onto it (phase 3a). A member only down stays
+            // in `up`: when it is back, recovery moves the PG back to it.
+            let gone = !self.acting_usable(&acting[position], &no_grace, Duration::MAX);
             // The other members, where they are, for the rule: an unusable
             // one too, until it is replaced (it still holds its domain's
             // share; counted out, a stand-in for another position could
@@ -633,17 +677,16 @@ impl MetaService {
             UNDERSIZED_LOGGED
                 .lock()
                 .remove(&(pg.pool.clone(), pg.pg_id, position));
-            let from = std::mem::replace(&mut acting[position], spare);
-            filling.retain(|f| f.position != position as u32);
-            filling.push(PgFill {
-                position: position as u32,
-                from,
-                epoch,
-            });
+            let from = std::mem::replace(&mut acting[position], spare.clone());
+            if gone && up.get(position) == Some(&from) {
+                up[position] = spare;
+            }
+            set_filling(&mut filling, position as u32, from, epoch);
             any = true;
         }
         any.then(|| PlacementGroup {
             acting,
+            up,
             epoch,
             filling,
             updated_at: Self::current_timestamp(),
@@ -756,10 +799,6 @@ impl MetaService {
     }
 }
 
-/// A placement group's keys: the newest copy of each, and the OSD it was
-/// listed on.
-type Newest = HashMap<(String, String), (ObjectMeta, String)>;
-
 /// How long the default pool waits for OSDs registered but not up yet,
 /// once there are enough to make it.
 const SETTLE: Duration = Duration::from_secs(30);
@@ -767,16 +806,13 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// How often the leader looks after placement groups.
 const KEEP_EVERY: Duration = Duration::from_secs(2);
 
-/// Stand-ins are filled every this many looks.
-const FILL_EVERY: u64 = 5;
-
 /// Run the leader's placement-group upkeep (B31): make the default pool,
-/// stand in for acting members that can't take writes, fill stand-ins.
+/// stand in for acting members that can't take writes. Recovery
+/// (`recovery.rs`) fills the stand-ins.
 pub fn spawn(meta: Arc<MetaService>) {
     tokio::spawn(async move {
         let mut down_since = HashMap::new();
         let mut ready_since = None;
-        let mut looks: u64 = 0;
         loop {
             tokio::time::sleep(KEEP_EVERY).await;
             if !meta.is_raft_leader() {
@@ -786,231 +822,20 @@ pub fn spawn(meta: Arc<MetaService>) {
             }
             meta.ensure_default_pool(&mut ready_since).await;
             meta.keep_acting_sets(&mut down_since).await;
-            if looks.is_multiple_of(FILL_EVERY) {
-                meta.fill_stand_ins().await;
-            }
-            looks += 1;
         }
     });
 }
 
-impl MetaService {
-    /// Give each stand-in the metadata of the objects its placement group
-    /// held before it joined (leader, level 7): the newest copy of each,
-    /// read from every other acting member, written to it unless it has
-    /// one as new. A PG whose members all answered a whole walk, and whose
-    /// every object reached its stand-ins, is filled: the entries go (the
-    /// epoch stays). Shards are not copied here: a shard on a member that
-    /// was set out or lost is moved by its evacuation; one on a member that
-    /// was only down stays where its object says it is.
-    ///
-    /// Current objects only: versions of a versioned key are not filled
-    /// (B31 phase 2's listing covers them).
-    pub(crate) async fn fill_stand_ins(&self) {
-        use objectio_proto::storage::{GetObjectMetaRequest, PutObjectMetaRequest};
-        if !self.is_raft_leader() || !pg_placement() {
-            return;
-        }
-        let filling: Vec<PlacementGroup> = self
-            .placement_groups
-            .read()
-            .values()
-            .filter(|pg| !pg.filling.is_empty())
-            .cloned()
-            .collect();
-        if filling.is_empty() {
-            return;
-        }
-        let wanted: std::collections::HashSet<(String, u32)> = filling
-            .iter()
-            .map(|pg| (pg.pool.clone(), pg.pg_id))
-            .collect();
-        let filling_at = |pg: &PlacementGroup, position: usize| {
-            pg.filling.iter().any(|f| f.position as usize == position)
-        };
-        // Every acting member that isn't a stand-in still being filled.
-        let mut sources: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-        for pg in &filling {
-            for (position, id) in pg.acting.iter().enumerate() {
-                if !filling_at(pg, position) {
-                    sources.insert(id.clone());
-                }
-            }
-        }
-        // The newest copy of each key, by PG, and the OSD it was listed on;
-        // the sources walked whole.
-        let mut newest: HashMap<(String, u32), Newest> = HashMap::new();
-        let mut walked: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for source in &sources {
-            let Some(address) = <[u8; 16]>::try_from(source.as_slice())
-                .ok()
-                .and_then(|id| self.osd_address_by_id(&id))
-            else {
-                continue;
-            };
-            let mut cursor = String::new();
-            let complete = loop {
-                let (page, next) = match crate::repair::list_page(&address, &cursor).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        debug!("fill: walking {address}: {e}");
-                        break false;
-                    }
-                };
-                for object in page {
-                    let pool = self.bucket_pool_name(&object.bucket);
-                    let Some(pg_count) = self.pools.read().get(&pool).map(|p| p.pg_count) else {
-                        continue;
-                    };
-                    if pg_count == 0 {
-                        continue;
-                    }
-                    let pg = (pool, pg_of_key(&object.bucket, &object.key, pg_count));
-                    if !wanted.contains(&pg) || self.key_is_legacy(&object.bucket, &object.key) {
-                        continue;
-                    }
-                    let slot = newest
-                        .entry(pg)
-                        .or_default()
-                        .entry((object.bucket.clone(), object.key.clone()));
-                    match slot {
-                        std::collections::hash_map::Entry::Occupied(mut held) => {
-                            if object.write_order() > held.get().0.write_order() {
-                                held.insert((object, address.clone()));
-                            }
-                        }
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert((object, address.clone()));
-                        }
-                    }
-                }
-                if next.is_empty() {
-                    break true;
-                }
-                cursor = next;
-            };
-            if complete {
-                walked.insert(source.clone());
-            }
-        }
-
-        let mut filled: Vec<(PlacementGroup, PlacementGroup)> = Vec::new();
-        for pg in &filling {
-            let mut whole = pg
-                .acting
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| !filling_at(pg, *position))
-                .all(|(_, id)| walked.contains(id));
-            let objects = newest
-                .remove(&(pg.pool.clone(), pg.pg_id))
-                .unwrap_or_default();
-            for fill in &pg.filling {
-                let Some(address) = pg
-                    .acting
-                    .get(fill.position as usize)
-                    .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
-                    .and_then(|id| self.osd_address_by_id(&id))
-                else {
-                    whole = false;
-                    continue;
-                };
-                let Ok(channel) = crate::drain_observer::open_channel(&address).await else {
-                    whole = false;
-                    continue;
-                };
-                let mut client =
-                    StorageServiceClient::new(channel).max_decoding_message_size(100 * 1024 * 1024);
-                for ((bucket, key), (listed, source)) in &objects {
-                    let held = client
-                        .get_object_meta(GetObjectMetaRequest {
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            version_id: String::new(),
-                            with_small_shard: false,
-                        })
-                        .await
-                        .map(|r| r.into_inner());
-                    let current = match held {
-                        Ok(r) => r.object.filter(|_| r.found),
-                        Err(e) => {
-                            debug!("fill: {bucket}/{key} on {address}: {e}");
-                            whole = false;
-                            continue;
-                        }
-                    };
-                    if current.is_some_and(|c| c.write_order() >= listed.write_order()) {
-                        continue;
-                    }
-                    // Whole, from the copy it was listed on: a listing
-                    // leaves out an inline object's bytes.
-                    let object = match whole_copy(source, bucket, key).await {
-                        Ok(Some(o)) if o.write_order() >= listed.write_order() => o,
-                        Ok(_) => continue, // gone or replaced there since: next round
-                        Err(e) => {
-                            debug!("fill: reading {bucket}/{key} from {source}: {e}");
-                            whole = false;
-                            continue;
-                        }
-                    };
-                    let put = client
-                        .put_object_meta(PutObjectMetaRequest {
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            object: Some(object.clone()),
-                            ..Default::default()
-                        })
-                        .await;
-                    if let Err(e) = put {
-                        debug!("fill: {bucket}/{key} to {address}: {e}");
-                        whole = false;
-                    }
-                }
-            }
-            if whole {
-                filled.push((
-                    pg.clone(),
-                    PlacementGroup {
-                        filling: Vec::new(),
-                        updated_at: Self::current_timestamp(),
-                        ..pg.clone()
-                    },
-                ));
-            }
-        }
-        for chunk in filled.chunks(PG_CHUNK) {
-            match self.commit_pgs(chunk, "pg-filled").await {
-                Ok(()) => {
-                    for (_, pg) in chunk {
-                        info!("pg {}/{}: stand-ins filled", pg.pool, pg.pg_id);
-                    }
-                }
-                Err(e) => debug!("fill: not recorded yet: {e}"),
-            }
-        }
-    }
-}
-
-/// `bucket/key`'s current ObjectMeta on the OSD at `address`, as stored
-/// (an inline object's bytes included).
-async fn whole_copy(address: &str, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
-    use objectio_proto::storage::GetObjectMetaRequest;
-    let channel = crate::drain_observer::open_channel(address).await?;
-    let r = tokio::time::timeout(
-        PUSH_TIMEOUT,
-        StorageServiceClient::new(channel)
-            .max_decoding_message_size(100 * 1024 * 1024)
-            .get_object_meta(GetObjectMetaRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: String::new(),
-                with_small_shard: false,
-            }),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("timed out"))??
-    .into_inner();
-    Ok(r.object.filter(|_| r.found))
+/// Record that `position` is now filled from `from` (the member that held
+/// it until `epoch`, which holds what was written there), replacing an
+/// earlier fill of that position.
+pub(crate) fn set_filling(filling: &mut Vec<PgFill>, position: u32, from: Vec<u8>, epoch: u64) {
+    filling.retain(|f| f.position != position);
+    filling.push(PgFill {
+        position,
+        from,
+        epoch,
+    });
 }
 
 /// "position 2: 1a2b… → 3c4d…" for each position that changed.
