@@ -123,6 +123,49 @@ static LEFT: LazyLock<parking_lot::Mutex<HashMap<PgId, (u64, u64)>>> =
 static STUCK: LazyLock<parking_lot::Mutex<HashMap<PgId, StuckAt>>> =
     LazyLock::new(Default::default);
 
+/// PGs whose last recovery pass got nowhere (a member it needed didn't
+/// answer, a remap or plan that failed, nothing written): how many such
+/// passes in a row, and not before when the next. Doubling from
+/// [`BACKOFF_BASE`] to [`BACKOFF_MAX`]: a pass that can't succeed is
+/// retried less and less often, never in a tight loop.
+/// The PG's epoch and members down when it was set end it early when they
+/// change: a member back, or another epoch, is worth a pass at once.
+static BACKOFF: LazyLock<parking_lot::Mutex<HashMap<PgId, Backoff>>> =
+    LazyLock::new(Default::default);
+struct Backoff {
+    passes: u32,
+    until: std::time::Instant,
+    epoch: u64,
+    members_down: u32,
+}
+const BACKOFF_BASE: Duration = Duration::from_secs(2);
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// The wait before the next pass after `n` in a row that got nowhere.
+fn backoff_after(n: u32) -> Duration {
+    BACKOFF_BASE
+        .saturating_mul(1u32 << n.min(16))
+        .min(BACKOFF_MAX)
+}
+
+/// Note a pass of `id` that got nowhere, at `epoch` with `members_down`:
+/// the next waits longer.
+fn no_progress(id: &PgId, epoch: u64, members_down: u32) {
+    RETRIES.fetch_add(1, Ordering::Relaxed);
+    let mut b = BACKOFF.lock();
+    let n = b.get(id).map_or(0, |b| b.passes);
+    b.insert(
+        id.clone(),
+        Backoff {
+            passes: n + 1,
+            until: std::time::Instant::now() + backoff_after(n),
+            epoch,
+            members_down,
+        },
+    );
+}
+
+static RETRIES: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
 static TOO_FULL: AtomicU64 = AtomicU64::new(0);
 static OBJECTS: AtomicU64 = AtomicU64::new(0);
@@ -134,6 +177,12 @@ static LRC_GLOBAL: AtomicU64 = AtomicU64::new(0);
 static LRC_LOCAL_READS: AtomicU64 = AtomicU64::new(0);
 static LRC_GLOBAL_READS: AtomicU64 = AtomicU64::new(0);
 static REPLICAS: AtomicU64 = AtomicU64::new(0);
+
+/// The members down peering last recorded of `pg`.
+fn held_down(meta: &MetaService, pg: &PlacementGroup) -> u32 {
+    meta.pg_state(&pg.pool, pg.pg_id)
+        .map_or(0, |s| s.members_down)
+}
 
 /// Whether recovery is working `pool/pg` on this leader (peering leaves it).
 pub(crate) fn is_busy(id: &(String, u32)) -> bool {
@@ -177,6 +226,15 @@ pub fn render_metrics(out: &mut String) {
             BUSY.lock().len() as u64,
         ),
         (
+            "objectio_meta_pg_recovery_backing_off",
+            "Placement groups whose recovery is waiting out a backoff",
+            BACKOFF
+                .lock()
+                .values()
+                .filter(|b| std::time::Instant::now() < b.until)
+                .count() as u64,
+        ),
+        (
             "objectio_meta_pg_recovery_objects_remaining",
             "Objects recovery has left to do in the PGs it is working",
             objects,
@@ -194,6 +252,11 @@ pub fn render_metrics(out: &mut String) {
             "objectio_meta_pg_reservations_refused_total",
             "Times a PG could not reserve a slot on every OSD it needed",
             &REFUSED,
+        ),
+        (
+            "objectio_meta_pg_recovery_retries_total",
+            "Recovery passes that got nowhere (each waits twice as long for the next, to 5 min)",
+            &RETRIES,
         ),
         (
             "objectio_meta_pg_too_full_total",
@@ -429,6 +492,7 @@ pub fn spawn(meta: Arc<MetaService>) {
                 meta.recovery_round().await;
             } else {
                 STUCK.lock().clear();
+                BACKOFF.lock().clear();
             }
         }
     });
@@ -527,6 +591,20 @@ impl MetaService {
         now: u64,
     ) -> Option<(i64, u8, u64)> {
         let moving = !pg.filling.is_empty() || !remap_positions(self, pg).is_empty();
+        // The last pass got nowhere: not before its backoff ends, unless the
+        // PG's epoch or the members down changed since.
+        {
+            let mut b = BACKOFF.lock();
+            let id = (pg.pool.clone(), pg.pg_id);
+            if let Some(off) = b.get(&id) {
+                let down = state.map_or(off.members_down, |s| s.members_down);
+                if off.epoch != pg.epoch || off.members_down != down {
+                    b.remove(&id);
+                } else if std::time::Instant::now() < off.until {
+                    return None;
+                }
+            }
+        }
         if let Some(s) = state {
             // Too few members answer to know what is current: nothing is
             // rebuilt from a view that may be old.
@@ -605,6 +683,7 @@ impl MetaService {
                 Ok(new) => pg = new,
                 Err(e) => {
                     debug!("pg {}/{}: remap not committed: {e}", pg.pool, pg.pg_id);
+                    no_progress(&id, pg.epoch, held_down(self, &pg));
                     return;
                 }
             }
@@ -625,6 +704,7 @@ impl MetaService {
             Err(e) => {
                 self.note_recovery(&pg, |s| s.last_error = e.clone()).await;
                 debug!("pg {}/{}: not planned: {e}", pg.pool, pg.pg_id);
+                no_progress(&id, pg.epoch, held_down(self, &pg));
                 return;
             }
         };
@@ -806,6 +886,13 @@ impl MetaService {
         // again; counted as the peer now sees them, it would wait forever.
         let down_at_plan =
             u32::try_from(plan.members.iter().filter(|m| m.is_none()).count()).unwrap_or(u32::MAX);
+        // Got somewhere (wrote something, or it is clean): the next pass may
+        // go at once. Otherwise it waits, longer each time.
+        if wrote || state.state == "Clean" {
+            BACKOFF.lock().remove(&id);
+        } else {
+            no_progress(&id, now.epoch, state.members_down);
+        }
         if (!unfound.is_empty() || !wrote) && failed.is_none() && state.state != "Clean" {
             STUCK.lock().insert(
                 id.clone(),
@@ -2127,6 +2214,20 @@ async fn delete_meta(
     .map_err(|_| anyhow::anyhow!("timed out"))??
     .into_inner();
     Ok(r.removed)
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn passes_that_get_nowhere_wait_longer_each_time_up_to_five_minutes() {
+        assert_eq!(backoff_after(0), Duration::from_secs(2));
+        assert_eq!(backoff_after(1), Duration::from_secs(4));
+        assert_eq!(backoff_after(5), Duration::from_secs(64));
+        assert_eq!(backoff_after(8), Duration::from_secs(300));
+        assert_eq!(backoff_after(60), Duration::from_secs(300));
+    }
 }
 
 #[cfg(test)]

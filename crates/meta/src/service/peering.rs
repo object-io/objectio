@@ -80,6 +80,16 @@ pub(crate) fn set_latest(state: PgState) {
 /// Placement groups peered, and those that needed a listing.
 static PEERED: AtomicU64 = AtomicU64::new(0);
 static LISTED: AtomicU64 = AtomicU64::new(0);
+static LISTINGS_ADDED: AtomicU64 = AtomicU64::new(0);
+/// In-service OSDs (In) not up, as the leader last counted.
+static OSDS_DOWN: AtomicU64 = AtomicU64::new(0);
+static LISTINGS_REMOVED: AtomicU64 = AtomicU64::new(0);
+
+/// How long after its write a key's listing entry may still lag its copies
+/// (a PUT commits its listing entry and its copies side by side): a
+/// listing peering leaves the key's entry alone until then
+/// (`pg/listing_grace_seconds`).
+const LISTING_GRACE_SECS: u64 = 60;
 
 /// The states, most severe first: peering's, then recovery's.
 pub(crate) const STATES: [&str; 8] = [
@@ -106,7 +116,29 @@ pub fn render_metrics(out: &mut String) {
         let n = latest.values().filter(|s| s.state == state).count();
         let _ = writeln!(out, "objectio_meta_pgs{{state=\"{state}\"}} {n}");
     }
+    let now = MetaService::current_timestamp();
+    let not_clean: Vec<&PgState> = latest.values().filter(|s| s.state != "Clean").collect();
     for (name, help, v) in [
+        (
+            "objectio_meta_pgs_not_clean",
+            "Placement groups in any state but Clean",
+            not_clean.len() as u64,
+        ),
+        (
+            "objectio_meta_pg_not_clean_oldest_seconds",
+            "How long the placement group longest out of Clean has been: alert when it passes \
+             an hour while objectio_meta_osds_down is 0",
+            not_clean
+                .iter()
+                .map(|s| now.saturating_sub(s.since))
+                .max()
+                .unwrap_or(0),
+        ),
+        (
+            "objectio_meta_osds_down",
+            "OSDs in service (In) that aren't up",
+            OSDS_DOWN.load(Ordering::Relaxed),
+        ),
         (
             "objectio_meta_pg_objects_degraded",
             "Objects some acting member of their placement group lacks something of",
@@ -141,6 +173,16 @@ pub fn render_metrics(out: &mut String) {
             "Placement groups whose members disagreed by summary, so were listed",
             LISTED.load(Ordering::Relaxed),
         ),
+        (
+            "objectio_meta_pg_listings_added_total",
+            "Listing entries a listing peering put back: their copies hold the object",
+            LISTINGS_ADDED.load(Ordering::Relaxed),
+        ),
+        (
+            "objectio_meta_pg_listings_removed_total",
+            "Listing entries a listing peering removed: their copies hold the key deleted",
+            LISTINGS_REMOVED.load(Ordering::Relaxed),
+        ),
     ] {
         let _ = writeln!(
             out,
@@ -154,6 +196,104 @@ pub fn render_metrics(out: &mut String) {
 pub(crate) fn order(e: &PgEntry) -> (u64, bool, &[u8], u64) {
     (e.stamp, e.tombstone, e.object_id.as_slice(), e.update_stamp)
 }
+
+/// The authoritative view: for each key (and version), the newest entry
+/// any of `acting` or `strays` holds, a delete winning a tie.
+pub(crate) fn newest_entries(
+    acting: &[Option<&HashMap<(String, String), PgEntry>>],
+    strays: &[&HashMap<(String, String), PgEntry>],
+) -> HashMap<(String, String), PgEntry> {
+    let mut newest: HashMap<(String, String), PgEntry> = HashMap::new();
+    for entries in acting.iter().flatten().chain(strays.iter()) {
+        for (k, e) in entries.iter() {
+            match newest.get(k) {
+                Some(n) if order(n) >= order(e) => {}
+                _ => {
+                    newest.insert(k.clone(), e.clone());
+                }
+            }
+        }
+    }
+    newest
+}
+
+/// What a listing peering does about a key's listing entry, given the
+/// authoritative entry and the entry meta's listing index holds (its object
+/// id and when it was made, in ms), at `now_ms`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ListingFix {
+    /// It agrees, or it is too soon to tell.
+    Leave,
+    /// List the current object (unless it turns out a delete marker).
+    Add,
+    /// Remove the entry: the key's newest write is a delete.
+    Remove,
+}
+
+pub(crate) fn listing_fix(
+    auth: &PgEntry,
+    listed: Option<(&[u8], u64)>,
+    now_ms: u64,
+    grace_ms: u64,
+) -> ListingFix {
+    let written_ms = auth.stamp >> 16;
+    if now_ms.saturating_sub(written_ms) < grace_ms {
+        return ListingFix::Leave;
+    }
+    if let Some((_, listed_ms)) = listed
+        && now_ms.saturating_sub(listed_ms) < grace_ms
+    {
+        // Listed lately: a write whose copies may still be landing.
+        return ListingFix::Leave;
+    }
+    match (auth.tombstone, listed) {
+        (true, Some(_)) => ListingFix::Remove,
+        (true, None) => ListingFix::Leave,
+        (false, Some((id, _))) if id == auth.object_id.as_slice() => ListingFix::Leave,
+        (false, _) => ListingFix::Add,
+    }
+}
+
+/// Why a PG is Down, Incomplete or Undersized, for the admin API and
+/// `obioctl pg`: what an operator has to bring back. Empty otherwise.
+fn stuck_reason(
+    state: &PgState,
+    members: &[Member],
+    copies: usize,
+    k: usize,
+    quorum: usize,
+) -> String {
+    let answered = copies.saturating_sub(state.members_down as usize);
+    match state.state.as_str() {
+        "Down" => format!(
+            "{answered} of {copies} members answered and a read needs {k}: no reads or writes \
+             until members come back"
+        ),
+        "Incomplete" => format!(
+            "{answered} of {copies} members answered and a read needs {quorum} metadata copies: \
+             a newer write may be on those that didn't, so nothing is rebuilt until they answer \
+             or are declared lost"
+        ),
+        "Undersized" => {
+            let empty: Vec<String> = members
+                .iter()
+                .filter(|m| m.address.is_none())
+                .map(|m| m.position.to_string())
+                .collect();
+            format!(
+                "position{} {} {} no usable OSD and none can stand in within the pool's rule: \
+                 add OSDs or bring the member back",
+                if empty.len() == 1 { "" } else { "s" },
+                empty.join(", "),
+                if empty.len() == 1 { "has" } else { "have" }
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// A member's entries, by bucket and entry name.
+type Entries = HashMap<(String, String), PgEntry>;
 
 /// A member, as peering sees it.
 struct Member {
@@ -298,6 +438,11 @@ impl MetaService {
         }
     }
 
+    /// Mark `pool/pg_id` for peering, by listing, at the next look.
+    pub(crate) fn mark_pg_dirty(&self, pool: &str, pg_id: u32) {
+        DIRTY.lock().insert((pool.to_string(), pg_id));
+    }
+
     /// Mark every placement group OSD `node` is an acting member of for
     /// peering at the next look: it came back without shards it held (a
     /// replaced or wiped disk), which only a listing shows.
@@ -364,6 +509,23 @@ impl MetaService {
             .filter(|p| p.pg_count > 0)
             .map(|p| (p.name.clone(), p))
             .collect();
+        let in_service: HashSet<[u8; 16]> = self
+            .osd_nodes
+            .read()
+            .iter()
+            .filter(|n| n.admin_state == objectio_common::OsdAdminState::In)
+            .map(|n| n.node_id)
+            .collect();
+        let down = self
+            .topology
+            .read()
+            .all_nodes()
+            .filter(|n| {
+                in_service.contains(n.id.as_bytes())
+                    && n.status != objectio_common::NodeStatus::Active
+            })
+            .count();
+        OSDS_DOWN.store(down as u64, Ordering::Relaxed);
         let dirty: HashSet<(String, u32)> = std::mem::take(&mut *DIRTY.lock());
         let last = LAST.lock().clone();
         let mut due: Vec<(u8, Option<Instant>, PlacementGroup)> = Vec::new();
@@ -565,6 +727,19 @@ impl MetaService {
             let stray_refs: Vec<&HashMap<(String, String), PgEntry>> = strays.iter().collect();
             let merged = merge(&acting, &stray_refs);
             let answered = acting.iter().flatten().count();
+            // A listing peering also brings meta's listing index in line
+            // with what the members hold, once a read quorum answered: what
+            // the gateways' heal queue did for keys in placement groups.
+            if list && answered >= read_quorum.max(k) {
+                let newest = newest_entries(&acting, &stray_refs);
+                let holders: Vec<(&str, &Entries)> = members
+                    .iter()
+                    .zip(&answers)
+                    .filter(|(_, a)| a.summary.is_some())
+                    .filter_map(|(m, a)| Some((m.address.as_deref()?, &a.entries)))
+                    .collect();
+                self.sync_listings(&newest, &holders).await;
+            }
             state.members_down = u32::try_from(copies - answered).unwrap_or(u32::MAX);
             state.objects = merged.objects;
             state.tombstones = merged.tombstones;
@@ -613,8 +788,129 @@ impl MetaService {
             }
             .into();
         }
+        let reason = stuck_reason(&state, &members, copies, k, read_quorum);
+        if !reason.is_empty() {
+            last_error = if last_error.is_empty() {
+                reason
+            } else {
+                format!("{reason} ({last_error})")
+            };
+        }
         state.last_error = last_error;
         state
+    }
+
+    /// Bring meta's listing entries of the current objects in `newest` in
+    /// line with them: a key whose newest write is an object gets it listed
+    /// (unless it is a delete marker), one whose newest write is a delete
+    /// gets its entry removed. Writes newer than [`LISTING_GRACE_SECS`], and
+    /// entries listed as recently, are left alone: their copies or their
+    /// listing may still be landing.
+    async fn sync_listings(
+        &self,
+        newest: &HashMap<(String, String), PgEntry>,
+        holders: &[(&str, &Entries)],
+    ) {
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let grace_ms = self
+            .config_parsed("pg/listing_grace_seconds", LISTING_GRACE_SECS)
+            .saturating_mul(1000);
+        for ((bucket, name), auth) in newest {
+            if name.contains('\0') {
+                continue; // a version's entry: the listing names current objects
+            }
+            let key = name.as_str();
+            let listed = self
+                .store
+                .as_ref()
+                .and_then(|s| s.read_object_listing(&format!("{bucket}\0{key}\0")))
+                .and_then(|b| {
+                    objectio_proto::metadata::ObjectListingEntry::decode(b.as_slice()).ok()
+                });
+            let fix = listing_fix(
+                auth,
+                listed
+                    .as_ref()
+                    .map(|l| (l.object_id.as_slice(), l.modified_at.saturating_mul(1000))),
+                now_ms,
+                grace_ms,
+            );
+            let remove = match fix {
+                ListingFix::Leave => continue,
+                ListingFix::Remove => true,
+                ListingFix::Add => {
+                    // The object as a holder of it has it, whole.
+                    let mut object = None;
+                    for (address, entries) in holders {
+                        if entries
+                            .get(&(bucket.clone(), name.clone()))
+                            .is_some_and(|e| e.object_id == auth.object_id && !e.tombstone)
+                            && let Ok(Some(o)) = current_meta(address, bucket, key).await
+                            && o.object_id == auth.object_id
+                        {
+                            object = Some(o);
+                            break;
+                        }
+                    }
+                    let Some(o) = object else { continue };
+                    if o.is_delete_marker {
+                        if listed.is_none() {
+                            continue;
+                        }
+                        true
+                    } else {
+                        let (pg_id, pool) = self.listing_pg(bucket, key);
+                        let r = self
+                            .create_object(tonic::Request::new(CreateObjectRequest {
+                                bucket: bucket.clone(),
+                                key: key.to_string(),
+                                size: o.size,
+                                content_type: o.content_type.clone(),
+                                etag: o.etag.clone(),
+                                user_metadata: o.user_metadata.clone(),
+                                stripes: o.stripes.clone(),
+                                object_id: o.object_id.clone(),
+                                pg_id,
+                                pool,
+                                ..Default::default()
+                            }))
+                            .await;
+                        match r {
+                            Ok(_) => {
+                                LISTINGS_ADDED.fetch_add(1, Ordering::Relaxed);
+                                info!("pg peering: listed {bucket}/{key}, which its copies hold");
+                            }
+                            Err(e) => debug!("pg peering: listing {bucket}/{key}: {e}"),
+                        }
+                        continue;
+                    }
+                }
+            };
+            if remove {
+                let r = MetadataService::delete_object(
+                    self,
+                    tonic::Request::new(objectio_proto::metadata::DeleteObjectRequest {
+                        bucket: bucket.clone(),
+                        key: key.to_string(),
+                        version_id: String::new(),
+                    }),
+                )
+                .await;
+                match r {
+                    Ok(_) => {
+                        LISTINGS_REMOVED.fetch_add(1, Ordering::Relaxed);
+                        info!("pg peering: unlisted {bucket}/{key}, which its copies hold deleted");
+                    }
+                    Err(e) => debug!("pg peering: unlisting {bucket}/{key}: {e}"),
+                }
+            }
+        }
     }
 
     /// The address of OSD `id`, if it can be a member: registered, `In`,
@@ -744,6 +1040,33 @@ pub(crate) fn split_entry_name(name: &str) -> (&str, &str) {
     name.split_once('\0').unwrap_or((name, ""))
 }
 
+/// The current object OSD `address` holds of `bucket/key`, if any.
+async fn current_meta(
+    address: &str,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ObjectMeta>, String> {
+    let channel = crate::drain_observer::open_channel(address)
+        .await
+        .map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(
+        RPC_TIMEOUT,
+        StorageServiceClient::new(channel)
+            .max_decoding_message_size(100 * 1024 * 1024)
+            .get_object_meta(objectio_proto::storage::GetObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: String::new(),
+                with_small_shard: false,
+            }),
+    )
+    .await
+    .map_err(|_| "timed out".to_string())?
+    .map_err(|e| e.message().to_string())?
+    .into_inner();
+    Ok(r.object.filter(|_| r.found))
+}
+
 /// Every entry OSD `address` holds of `pool/pg_id`.
 pub(crate) async fn list_of(
     address: &str,
@@ -827,6 +1150,56 @@ mod tests {
                 ..PgEntry::default()
             },
         )
+    }
+
+    #[test]
+    fn a_listing_entry_follows_the_newest_write_once_it_has_settled() {
+        let now = 10_000_000u64;
+        let at = |ms: u64| ms << 16;
+        let grace = 60_000;
+        let object = |stamp_ms: u64, id: &[u8]| PgEntry {
+            stamp: at(stamp_ms),
+            object_id: id.to_vec(),
+            ..PgEntry::default()
+        };
+        let delete = |stamp_ms: u64| PgEntry {
+            stamp: at(stamp_ms),
+            tombstone: true,
+            ..PgEntry::default()
+        };
+        let old = now - 120_000;
+        // Listed as it should be, or not listed and deleted: left.
+        assert_eq!(
+            listing_fix(&object(old, b"a"), Some((b"a", old)), now, grace),
+            ListingFix::Leave
+        );
+        assert_eq!(
+            listing_fix(&delete(old), None, now, grace),
+            ListingFix::Leave
+        );
+        // Missing, or listing another object: listed.
+        assert_eq!(
+            listing_fix(&object(old, b"a"), None, now, grace),
+            ListingFix::Add
+        );
+        assert_eq!(
+            listing_fix(&object(old, b"a"), Some((b"b", old)), now, grace),
+            ListingFix::Add
+        );
+        // Deleted, still listed: unlisted.
+        assert_eq!(
+            listing_fix(&delete(old), Some((b"a", old)), now, grace),
+            ListingFix::Remove
+        );
+        // A write or a listing entry within the grace: may still be landing.
+        assert_eq!(
+            listing_fix(&object(now - 1000, b"a"), None, now, grace),
+            ListingFix::Leave
+        );
+        assert_eq!(
+            listing_fix(&delete(old), Some((b"a", now - 1000)), now, grace),
+            ListingFix::Leave
+        );
     }
 
     #[test]
