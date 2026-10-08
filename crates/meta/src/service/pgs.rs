@@ -27,9 +27,34 @@ use objectio_proto::storage::{
 /// The pool a bucket that names none is placed in.
 pub const DEFAULT_POOL: &str = "default";
 
-/// Placement groups in the default pool, and in a pool made without a
-/// count. Fixed for the pool's life: capacity grows by adding pools.
+/// The fewest placement groups a pool made without a count gets. Fixed for
+/// the pool's life: capacity grows by adding pools.
 pub const DEFAULT_PG_COUNT: u32 = 256;
+
+/// The most a pool made without a count gets: each PG is peered, scrubbed
+/// and recovered on its own, so their number has a cost of its own.
+pub const MAX_PG_COUNT: u32 = 4096;
+
+/// PG members each OSD in service should hold when a pool is made without
+/// a count (config `pg/members_per_osd`). A lost drive's PGs are rebuilt
+/// onto as many drives as they have members on it, so with few PGs a drive
+/// a big cluster rebuilds barely faster than a small one (B24). Ceph aims
+/// at 100 PGs an OSD too.
+const MEMBERS_PER_OSD: u32 = 100;
+
+/// The PG count for a pool made without one: `per_osd` members on each of
+/// `osds` OSDs, `copies` members a PG, rounded up to a power of two, from
+/// [`DEFAULT_PG_COUNT`] to [`MAX_PG_COUNT`].
+pub(crate) fn sized_pg_count(osds: usize, copies: usize, per_osd: u32) -> u32 {
+    let members = u64::try_from(osds)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(per_osd));
+    let pgs = members.div_ceil(u64::try_from(copies.max(1)).unwrap_or(1));
+    pgs.checked_next_power_of_two()
+        .and_then(|p| u32::try_from(p).ok())
+        .unwrap_or(MAX_PG_COUNT)
+        .clamp(DEFAULT_PG_COUNT, MAX_PG_COUNT)
+}
 
 /// How long an acting member may be down before another OSD stands in for
 /// it (config `pg/down_out_seconds`). Shorter than this, a write goes to
@@ -272,6 +297,16 @@ impl MetaService {
             .count()
     }
 
+    /// The PG count for a pool made now without one, of `copies` members
+    /// a PG: sized from the OSDs in service ([`sized_pg_count`]).
+    pub(crate) fn sized_pg_count(&self, copies: usize) -> u32 {
+        let osds = self.topology.read().active_nodes().count();
+        let per_osd = self
+            .config_parsed("pg/members_per_osd", MEMBERS_PER_OSD)
+            .max(1);
+        sized_pg_count(osds, copies, per_osd)
+    }
+
     /// The widest failure-domain level with at least `copies` domains in
     /// service: a host if there are enough, else each OSD. None while there
     /// are fewer OSDs than copies.
@@ -358,7 +393,8 @@ impl MetaService {
                 if up < registered && since.elapsed() < SETTLE {
                     return; // some OSD registered isn't up yet
                 }
-                let pool = self.default_pool_config(domain);
+                let mut pool = self.default_pool_config(domain);
+                pool.pg_count = self.sized_pg_count(copies);
                 match self
                     .create_pool(Request::new(CreatePoolRequest {
                         pool: Some(pool.clone()),
@@ -863,6 +899,20 @@ mod tests {
 
     fn id(n: u8) -> Vec<u8> {
         vec![n; 16]
+    }
+
+    #[test]
+    fn a_pool_made_without_a_count_has_about_100_members_a_drive() {
+        // Small clusters keep the floor.
+        assert_eq!(sized_pg_count(6, 6, 100), 256);
+        assert_eq!(sized_pg_count(0, 6, 100), 256);
+        // 40 drives, 4+2: 4000 / 6 = 667, rounded up to 1024.
+        assert_eq!(sized_pg_count(40, 6, 100), 1024);
+        // 3-way replicas: 40 * 100 / 3 = 1334 -> 2048.
+        assert_eq!(sized_pg_count(40, 3, 100), 2048);
+        // Large clusters stop at the ceiling.
+        assert_eq!(sized_pg_count(1000, 6, 100), MAX_PG_COUNT);
+        assert_eq!(sized_pg_count(usize::MAX, 6, u32::MAX), MAX_PG_COUNT);
     }
 
     /// A service with OSDs `1..=count` registered, OSD `n` on host `hosts(n)`.

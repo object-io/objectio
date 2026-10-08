@@ -150,3 +150,39 @@ fn a_pool_whose_pgs_cannot_be_spread_is_refused() {
     let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
     assert!(!pools.to_string().contains("\"pgp\""), "{pools}");
 }
+
+/// A pool made without a PG count gets one sized from the OSDs in service,
+/// about `pg/members_per_osd` members on each (B24: a lost drive's PGs are
+/// rebuilt onto as many drives as it held members of), a power of two, at
+/// least 256.
+#[test]
+fn a_pool_made_without_a_count_is_sized_from_its_drives() {
+    let c = Cluster::start_with_osds(3);
+    pool(&c, "small");
+    // 3 OSDs, 3 copies: 100 members a drive is 100 PGs, below the floor.
+    let pg_count = |name: &str| {
+        let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+        pools
+            .as_array()
+            .or_else(|| pools["pools"].as_array())
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .map(|p| p["pg_count"].as_u64().unwrap_or_default())
+            .unwrap_or_else(|| panic!("no pool {name}: {pools}"))
+    };
+    assert_eq!(pg_count("small"), 256);
+    // 1000 members a drive: 3 * 1000 / 3 = 1000 PGs, rounded up to 1024.
+    let r = c.json("PUT", "/_admin/config/pg/members_per_osd", json!(1000));
+    assert!(r.status < 300, "{}", r.text());
+    pool(&c, "wide");
+    assert_eq!(pg_count("wide"), 1024);
+    // A count given is kept.
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "given", "ec_type": 0, "ec_k": 2, "ec_m": 1, "pg_count": 16, "enabled": true}),
+    );
+    assert!(r.status < 300, "{}", r.text());
+    assert_eq!(pg_count("given"), 16);
+}

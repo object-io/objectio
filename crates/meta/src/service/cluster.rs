@@ -1663,11 +1663,12 @@ impl MetaService {
         }
         let mut pool = pool;
         // From level 7 every pool places through placement groups (B31): a
-        // pool made without a count gets the default, and one that names no
+        // pool made without a count gets one sized from the OSDs in service
+        // (about 100 members a drive, B24), and one that names no
         // failure domain spreads over the widest level with enough domains.
         if super::pgs::pg_placement() {
             if pool.pg_count == 0 {
-                pool.pg_count = super::pgs::DEFAULT_PG_COUNT;
+                pool.pg_count = self.sized_pg_count(super::pgs::copy_count(&pool));
             }
             if pool.failure_domain.is_empty() {
                 let copies = super::pgs::copy_count(&pool);
