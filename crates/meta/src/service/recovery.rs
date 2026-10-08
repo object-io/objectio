@@ -727,11 +727,16 @@ impl MetaService {
             return;
         };
         let mut state = self.peer(&now, &pool, false).await;
-        // Nothing more to change now: left until something does.
+        // Nothing more to change now: left until something does. "Members
+        // down" as the plan saw them: one that didn't answer then but does
+        // now (back meanwhile) makes the next look differ, so it is tried
+        // again; counted as the peer now sees them, it would wait forever.
+        let down_at_plan =
+            u32::try_from(plan.members.iter().filter(|m| m.is_none()).count()).unwrap_or(u32::MAX);
         if (!unfound.is_empty() || !wrote) && failed.is_none() && state.state != "Clean" {
             STUCK.lock().insert(
                 id.clone(),
-                (now.epoch, state.members_down, state.objects_degraded),
+                (now.epoch, down_at_plan, state.objects_degraded),
             );
         } else {
             STUCK.lock().remove(&id);
@@ -1018,6 +1023,7 @@ impl MetaService {
         if w.newest.tombstone {
             // Members still holding an object a newer delete removed.
             let mut outcome = Outcome::Done;
+            let mut displaced: Vec<ObjectMeta> = Vec::new();
             for &p in &w.behind {
                 let Some(address) = &members[p] else {
                     outcome = Outcome::Partial;
@@ -1031,11 +1037,16 @@ impl MetaService {
                     withdraw_object_id: Vec::new(),
                     pg: Some(pg_ref.clone()),
                 };
-                if let Err(e) = delete_meta(address, request).await {
-                    outcome = Outcome::Failed(format!("delete on {address}: {e}"));
-                } else {
-                    COPIES.fetch_add(1, Ordering::Relaxed);
+                match delete_meta(address, request).await {
+                    Ok(removed) => {
+                        COPIES.fetch_add(1, Ordering::Relaxed);
+                        displaced.extend(removed);
+                    }
+                    Err(e) => outcome = Outcome::Failed(format!("delete on {address}: {e}")),
                 }
+            }
+            if outcome == Outcome::Done {
+                self.free_displaced(&w.bucket, &[], displaced).await;
             }
             return outcome;
         }
@@ -1244,6 +1255,7 @@ impl MetaService {
         } else {
             Outcome::Done
         };
+        let mut displaced: Vec<ObjectMeta> = Vec::new();
         for p in to {
             let Some(address) = &members[p] else {
                 continue;
@@ -1266,13 +1278,104 @@ impl MetaService {
                 pg: Some(pg_ref.clone()),
             };
             match put_meta(address, request).await {
-                Ok(()) => {
+                Ok(replaced) => {
                     COPIES.fetch_add(1, Ordering::Relaxed);
+                    displaced.extend(replaced);
                 }
                 Err(e) => outcome = Outcome::Failed(format!("metadata to {address}: {e}")),
             }
         }
+        if outcome == Outcome::Done {
+            self.free_displaced(&w.bucket, &object.object_id, displaced)
+                .await;
+        }
         outcome
+    }
+
+    /// Free the shards of objects recovery's writes displaced from stale
+    /// copies (an overwrite or a delete they missed), as the gateway's heal
+    /// would have: every acting member now holds the newest, so those were
+    /// the last copies naming them. Through meta's shared-stripe registry,
+    /// so a stripe another object (a copy, a pack) still uses stays. Not in
+    /// a bucket that has had versioning (an object replaced on one copy
+    /// may be a version kept on the others), and not `current` itself (a
+    /// location update displaces the same object).
+    async fn free_displaced(&self, bucket: &str, current: &[u8], displaced: Vec<ObjectMeta>) {
+        use objectio_proto::metadata::{ReleaseStripesRequest, VersioningState};
+        let unversioned = self
+            .buckets
+            .read()
+            .get(bucket)
+            .is_some_and(|b| b.versioning == VersioningState::VersioningDisabled as i32);
+        if !unversioned {
+            return;
+        }
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for object in displaced {
+            if object.object_id.is_empty()
+                || object.object_id == current
+                || !seen.insert(object.object_id.clone())
+            {
+                continue;
+            }
+            let stripe_ids: Vec<Vec<u8>> = object
+                .stripes
+                .iter()
+                .filter_map(|s| {
+                    if !s.pack_id.is_empty() {
+                        Some(s.pack_id.clone())
+                    } else if !s.object_id.is_empty() {
+                        Some(s.object_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if stripe_ids.is_empty() {
+                continue; // inline: nothing on disk
+            }
+            let released = MetadataService::release_stripes(
+                self,
+                tonic::Request::new(ReleaseStripesRequest {
+                    stripe_ids,
+                    referrer: object.object_id.clone(),
+                }),
+            )
+            .await;
+            let released = match released {
+                Ok(r) => r.into_inner(),
+                Err(e) => {
+                    debug!(
+                        "recovery: releasing {}: {e}",
+                        hex::encode(&object.object_id)
+                    );
+                    continue;
+                }
+            };
+            let free: HashSet<Vec<u8>> = released.freeable.into_iter().collect();
+            let stripes = object
+                .stripes
+                .iter()
+                .filter(|s| s.pack_id.is_empty() && free.contains(&s.object_id))
+                .chain(&released.freed_packs);
+            for stripe in stripes {
+                for loc in &stripe.shards {
+                    let Some(address) = self.node_addr(&loc.node_id) else {
+                        continue;
+                    };
+                    let shard = ShardId {
+                        object_id: stripe.object_id.clone(),
+                        stripe_id: stripe.stripe_id,
+                        position: loc.position,
+                    };
+                    if let Err(e) = delete_shard(&address, shard).await {
+                        debug!("recovery: freeing a displaced shard on {address}: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Rebuild `missing` positions of `stripe` from k good shards: those
@@ -1610,28 +1713,58 @@ async fn write_shard(
     .ok_or_else(|| anyhow::anyhow!("no location returned"))
 }
 
-async fn put_meta(address: &str, request: PutObjectMetaRequest) -> anyhow::Result<()> {
+/// Delete one shard (a displaced object's, nothing referring to it).
+async fn delete_shard(address: &str, shard: ShardId) -> anyhow::Result<()> {
     let channel = crate::drain_observer::open_channel(address).await?;
     tokio::time::timeout(
         RPC_TIMEOUT,
-        StorageServiceClient::new(channel)
-            .max_encoding_message_size(100 * 1024 * 1024)
-            .put_object_meta(request),
+        StorageServiceClient::new(channel).delete_shard(
+            objectio_proto::storage::DeleteShardRequest {
+                shard_id: Some(shard),
+            },
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("timed out"))??;
     Ok(())
 }
 
-async fn delete_meta(address: &str, request: DeleteObjectMetaRequest) -> anyhow::Result<()> {
+/// Write a metadata copy; the object it displaced on that copy, if any
+/// (and not kept there as a version).
+async fn put_meta(
+    address: &str,
+    request: PutObjectMetaRequest,
+) -> anyhow::Result<Option<ObjectMeta>> {
     let channel = crate::drain_observer::open_channel(address).await?;
-    tokio::time::timeout(
+    let r = tokio::time::timeout(
         RPC_TIMEOUT,
-        StorageServiceClient::new(channel).delete_object_meta(request),
+        StorageServiceClient::new(channel)
+            .max_encoding_message_size(100 * 1024 * 1024)
+            .max_decoding_message_size(100 * 1024 * 1024)
+            .put_object_meta(request),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("timed out"))??;
-    Ok(())
+    .map_err(|_| anyhow::anyhow!("timed out"))??
+    .into_inner();
+    Ok(r.replaced.filter(|_| !r.replaced_version_kept))
+}
+
+/// Apply a delete (or a withdrawal) to a copy; the object it removed there.
+async fn delete_meta(
+    address: &str,
+    request: DeleteObjectMetaRequest,
+) -> anyhow::Result<Option<ObjectMeta>> {
+    let channel = crate::drain_observer::open_channel(address).await?;
+    let r = tokio::time::timeout(
+        RPC_TIMEOUT,
+        StorageServiceClient::new(channel)
+            .max_decoding_message_size(100 * 1024 * 1024)
+            .delete_object_meta(request),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out"))??
+    .into_inner();
+    Ok(r.removed)
 }
 
 #[cfg(test)]
