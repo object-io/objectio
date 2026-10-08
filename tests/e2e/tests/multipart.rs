@@ -482,9 +482,9 @@ fn completing_onto_an_existing_key_frees_the_old_object() {
     assert_eq!(c.await_total_used_bytes(baseline), baseline);
 }
 
-/// Abort frees each part where that part was placed. Parts are placed by
-/// their own key, not the object's, so with more OSDs than one stripe
-/// spans they land on OSDs the object's placement does not name.
+/// Abort frees each part where that part was placed (in the object's
+/// placement group; with more OSDs than one stripe spans, wherever a
+/// part's placement put it, should the PG's members have changed).
 #[test]
 fn aborting_frees_parts_wherever_they_were_placed() {
     let c = ec_cluster(9, "mpu-spread");

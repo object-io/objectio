@@ -557,12 +557,15 @@ pub(crate) async fn upload_part_internal(
         (None, None) => None,
     };
 
-    // Get placement for this part (using a unique key for the part)
-    let part_key = format!("__mpu/{}/part{:05}", upload_id, part_number);
+    // Placed where the object will be: its key's placement group, each
+    // shard on the acting member at its position. Placed by a key of its
+    // own (`__mpu/{upload}/part{n}`), as parts were, they landed in another
+    // PG, and recovery copied every completed object's parts into the
+    // object's PG (B31): one more copy of every multipart upload.
     let placement = match meta_client
         .get_placement(GetPlacementRequest {
             bucket: bucket.clone(),
-            key: part_key.clone(),
+            key: key.clone(),
             size: part_size,
             storage_class: "STANDARD".to_string(),
         })

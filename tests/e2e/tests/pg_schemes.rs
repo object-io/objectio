@@ -2,7 +2,8 @@
 //! `core/pg-recovery.md`, B10): a replicated pool's lost copies are copied
 //! back from an intact one; an LRC pool's lost shard is rebuilt from its
 //! local group, inside the group's rack, and from the whole stripe only
-//! when the group can't.
+//! when the group can't. A multipart upload's parts are placed in its
+//! object's placement group, so completing it copies nothing.
 //!
 //! Repair's walk is off (an hour) in all of them: what is rebuilt, recovery
 //! rebuilt.
@@ -320,4 +321,68 @@ fn an_lrc_group_short_of_two_is_rebuilt_from_the_whole_stripe() {
         bodies.len()
     );
     all_read(&ha, "lrc", &bodies);
+}
+
+/// A multipart upload's parts land in the object's placement group, on
+/// the acting member at each position: the completed object is already
+/// where recovery wants it, so recovery writes no shard for it (parts
+/// placed by a key of their own landed in other PGs, and recovery copied
+/// every one into the object's).
+#[test]
+fn a_multipart_objects_parts_are_already_in_its_placement_group() {
+    let ha = HaCluster::start_with_meta_args(1, 7, 1, &["--repair-interval-secs", "3600"]);
+    eager(&ha);
+    let c = &ha.clients[0];
+    c.request("PUT", "/mpu", &[]).expect(200);
+    // Settled before: nothing for recovery to do.
+    await_clean(&ha, "default", 60);
+    let shards_before = metric(&ha, "objectio_meta_pg_recovered_shards_total");
+
+    let r = c.request("POST", "/mpu/big?uploads", &[]);
+    assert!(r.status < 300, "initiate: {}", r.text());
+    let text = r.text();
+    let upload = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|t| t.split("</UploadId>").next())
+        .expect("an upload id")
+        .to_string();
+    let parts: Vec<Vec<u8>> = (0..3u8)
+        .map(|i| payload(if i < 2 { 5 * 1024 * 1024 } else { 700_000 }, 80 + i))
+        .collect();
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (i, body) in parts.iter().enumerate() {
+        let n = i + 1;
+        let r = c.request(
+            "PUT",
+            &format!("/mpu/big?partNumber={n}&uploadId={upload}"),
+            body,
+        );
+        assert_eq!(r.status, 200, "part {n}: {}", r.text());
+        let etag = r.header("etag").unwrap_or_else(|| format!("\"part{n}\""));
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    let r = c.request(
+        "POST",
+        &format!("/mpu/big?uploadId={upload}"),
+        xml.as_bytes(),
+    );
+    assert_eq!(r.status, 200, "complete: {}", r.text());
+
+    // Peered (every PG looked at, more than once) and clean.
+    std::thread::sleep(Duration::from_secs(8));
+    await_clean(&ha, "default", 60);
+    let shards_after = metric(&ha, "objectio_meta_pg_recovered_shards_total");
+    assert_eq!(
+        shards_after,
+        shards_before,
+        "recovery wrote {} shards for the completed object",
+        shards_after - shards_before
+    );
+    let got = c.request("GET", "/mpu/big", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, parts.concat());
 }
