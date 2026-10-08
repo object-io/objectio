@@ -128,3 +128,22 @@ fn a_tenant_uses_its_default_pool_and_only_the_pools_it_is_allowed() {
     assert_eq!(r.status, 400, "{}", r.text());
     assert!(r.text().contains("acme"), "{}", r.text());
 }
+
+/// A pool with placement groups on a topology that can't spread a PG's
+/// copies across hosts (here every OSD is on one) is refused, and not
+/// made: it used to be created with no PGs, and its objects placed some
+/// other way, with only a warning in meta's log.
+#[test]
+fn a_pool_whose_pgs_cannot_be_spread_is_refused() {
+    let c = Cluster::start();
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "pgp", "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 8, "failure_domain": "host", "enabled": true}),
+    );
+    assert!((400..500).contains(&r.status), "{}: {}", r.status, r.text());
+    assert!(r.text().contains("placement groups"), "{}", r.text());
+    let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+    assert!(!pools.to_string().contains("\"pgp\""), "{pools}");
+}

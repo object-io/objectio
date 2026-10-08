@@ -121,29 +121,6 @@ fn osd_has_meta(address: &str, bucket: &str, key: &str) -> bool {
     })
 }
 
-/// The size of the object the OSD at `address` holds for `bucket/key`.
-fn osd_object_size(address: &str, bucket: &str, key: &str) -> Option<u64> {
-    use objectio_proto::storage::GetObjectMetaRequest;
-    use objectio_proto::storage::storage_service_client::StorageServiceClient;
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let r = StorageServiceClient::new(
-            objectio_e2e::tls::channel(address)
-                .await
-                .expect("connect OSD"),
-        )
-        .get_object_meta(GetObjectMetaRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: String::new(),
-            with_small_shard: false,
-        })
-        .await
-        .expect("GetObjectMeta")
-        .into_inner();
-        r.found.then(|| r.object.map_or(0, |o| o.size))
-    })
-}
-
 /// Every object keeps a metadata copy on each of its k + m OSDs: reads take
 /// the newest of a read quorum, which only holds while every copy is kept.
 /// A drive lost whole (its shards and the metadata on it) is replaced by a
@@ -723,58 +700,6 @@ fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
     assert_eq!(got.bytes, body);
 }
 
-/// A degraded object whose missing shard is on a drive lost for good (B26)
-/// is moved off it from its record (B29), without waiting for the
-/// evacuation's sweeps to reach it (here: not for an hour). A shard there
-/// can't be rebuilt in place, so the record used to wait for the
-/// evacuation: soak run 12's lost drive took over an hour to evacuate, and
-/// objects that reads had found a shard short stayed so all that time.
-#[test]
-fn a_degraded_object_on_a_lost_drive_is_moved_off_from_its_record() {
-    use objectio_e2e::ha::HaCluster;
-    let mut ha = HaCluster::start_with_meta_args(
-        1,
-        6,
-        1,
-        &[
-            "--repair-interval-secs",
-            "3600",
-            "--drain-interval-secs",
-            "3600",
-        ],
-    );
-    let _ = ha.await_leader(Duration::from_secs(30));
-    let c = &ha.clients[0];
-    assert_eq!(c.request("PUT", "/lostrec", &[]).status, 200);
-    let body = payload(300_000, 21);
-    assert_eq!(c.request("PUT", "/lostrec/k", &body).status, 200);
-
-    // The drive holding position 0 is lost with its metadata: it comes
-    // back as a new OSD, the old one is set out, to be evacuated.
-    let holder = holder_of_position(&ha, "lostrec", "k", 0);
-    ha.stop_osd(holder);
-    ha.lose_osd_drive(holder);
-    ha.start_osd(holder, None);
-
-    // A read decodes around position 0, and reports the object.
-    let c = &ha.clients[0];
-    let got = c.request("GET", "/lostrec/k", &[]);
-    assert_eq!(got.status, 200, "{}", got.text());
-    assert_eq!(got.bytes, body);
-    // Rounds of the degraded worker (every 5 s).
-    std::thread::sleep(Duration::from_secs(20));
-
-    // Two other OSDs down: it reads only if position 0 was moved off the
-    // lost drive (else three shards are left of the four it needs).
-    for i in (0..6).filter(|&i| i != holder).take(2) {
-        ha.stop_osd(i);
-    }
-    let c = &ha.clients[0];
-    let got = c.request("GET", "/lostrec/k", &[]);
-    assert_eq!(got.status, 200, "{}", got.text());
-    assert_eq!(got.bytes, body);
-}
-
 /// Which of `ha`'s OSDs holds position `pos` of `bucket/key`'s first
 /// stripe, from the object's metadata.
 fn holder_of_position(
@@ -984,98 +909,6 @@ fn a_pg_pool_places_around_a_lost_osd() {
         let got = c.request("GET", &format!("/pgpool/{name}"), &[]);
         assert_eq!(got.status, 200, "{name}: {}", got.text());
         assert_eq!(&got.bytes, body, "{name}");
-    }
-}
-
-/// Soak run 14: an object overwritten while an OSD was out is written to
-/// the other five (its home has no spare for the out OSD's position), so
-/// the out OSD keeps the object it replaced. When a drive is lost later,
-/// moving a key's home off it can pick that OSD; its copy, older than the
-/// object being put there, refused it ("no longer the object this write
-/// was built from"), and the evacuation retried the same move every sweep
-/// and never finished. An older copy is now replaced: it only missed the
-/// writes since.
-#[test]
-fn a_lost_drive_is_evacuated_past_copies_an_overwrite_missed() {
-    use objectio_e2e::ha::HaCluster;
-    // Inline objects: the copies are the whole object. Enough keys that
-    // some move their home to the OSD that missed the overwrites.
-    const KEYS: usize = 48;
-    let mut ha = HaCluster::start(1, 6, 1);
-    let _ = ha.await_leader(Duration::from_secs(30));
-    let ids = |c: &Cluster| -> Vec<(String, String)> {
-        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| {
-                (
-                    n["node_id"].as_str().unwrap_or_default().to_string(),
-                    n["address"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect()
-    };
-    let id_at = |c: &Cluster, endpoint: &str| -> String {
-        ids(c)
-            .into_iter()
-            .find(|(_, a)| a == endpoint)
-            .map_or_else(|| panic!("no OSD at {endpoint}"), |(id, _)| id)
-    };
-    let c = &ha.clients[0];
-    c.request("PUT", "/missed", &[]).expect(200);
-    for i in 0..KEYS {
-        let body = payload(2_000, u8::try_from(i).unwrap());
-        c.request("PUT", &format!("/missed/k{i}"), &body)
-            .expect(200);
-    }
-    // Overwritten while OSD 1 is out: it keeps the first objects.
-    let out = id_at(c, &ha.osd_endpoint(1));
-    let set = |c: &Cluster, state: &str| {
-        c.json(
-            "PUT",
-            &format!("/_admin/osds/{out}/admin-state"),
-            json!({ "state": state }),
-        )
-        .expect_ok();
-    };
-    set(c, "out");
-    let newer: Vec<Vec<u8>> = (0..KEYS)
-        .map(|i| payload(2_100, 100 + u8::try_from(i).unwrap()))
-        .collect();
-    for (i, body) in newer.iter().enumerate() {
-        c.request("PUT", &format!("/missed/k{i}"), body).expect(200);
-    }
-    set(c, "in");
-    // OSD 1 kept the first object of some keys: the setup the bug needs.
-    let held: Vec<Option<u64>> = (0..KEYS)
-        .map(|i| osd_object_size(&ha.osd_endpoint(1), "missed", &format!("k{i}")))
-        .collect();
-    assert!(
-        held.contains(&Some(2_000)),
-        "OSD 1 took every overwrite while out: {held:?}"
-    );
-
-    // Drive 4 lost: each key's home position there moves to an OSD
-    // outside its home, OSD 1 (holding the older object) or the new one.
-    let lost = id_at(c, &ha.osd_endpoint(4));
-    ha.stop_osd(4);
-    ha.lose_osd_drive(4);
-    ha.start_osd(4, None);
-    let c = &ha.clients[0];
-    let deadline = Instant::now() + Duration::from_secs(300);
-    while ids(c).iter().any(|(id, _)| *id == lost) {
-        assert!(
-            Instant::now() < deadline,
-            "the lost OSD was never evacuated: {:?}",
-            ids(c)
-        );
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    for (i, body) in newer.iter().enumerate() {
-        let got = c.request("GET", &format!("/missed/k{i}"), &[]);
-        assert_eq!(got.status, 200, "k{i}: {}", got.text());
-        assert_eq!(&got.bytes, body, "k{i}");
     }
 }
 

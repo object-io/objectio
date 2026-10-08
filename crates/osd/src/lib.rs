@@ -514,13 +514,19 @@ pub async fn run(
         warn!("could not write {}: {e}", addr_file.display());
     }
 
-    // Log failure domain configuration
-    let failure_domain = config.osd.failure_domain.clone();
+    // The host defaults to this machine's name, as Ceph's does. Left
+    // empty, every OSD of a cluster set up without a host in its config
+    // was one failure domain: nothing spread across machines, and a pool
+    // with placement groups could not be made ("have 1 failure domain").
+    let mut failure_domain = config.osd.failure_domain.clone();
+    if failure_domain.host.is_empty() {
+        failure_domain.host = gethostname::gethostname().to_string_lossy().into_owned();
+    }
     let node_name = config.osd.node_name.clone();
     let weight = config.osd.weight;
     info!(
-        "Failure domain: region={}, datacenter={}, rack={}",
-        failure_domain.region, failure_domain.datacenter, failure_domain.rack
+        "Failure domain: region={}, datacenter={}, rack={}, host={}",
+        failure_domain.region, failure_domain.datacenter, failure_domain.rack, failure_domain.host
     );
 
     // Register with metadata service

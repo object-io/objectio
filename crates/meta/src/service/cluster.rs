@@ -157,10 +157,22 @@ impl MetaService {
     /// written (or on the non-Raft fallback path). Commits in
     /// MultiCas batches of ≤128 ops to stay under the storage
     /// limit (see `raft_storage::MAX_OPS = 256`).
-    pub(super) async fn preallocate_placement_groups(
+    /// The copysets a pool's placement groups would be drawn from, on the
+    /// topology as it is: copy count, failure-domain level, copysets. An
+    /// error when the topology can't spread a PG's copies over that many
+    /// failure domains.
+    #[allow(clippy::result_large_err)] // a gRPC status, as every handler returns
+    fn pg_copysets(
         &self,
         pool: &PoolConfig,
-    ) -> Result<(), Status> {
+    ) -> Result<
+        (
+            usize,
+            objectio_common::FailureDomain,
+            objectio_placement::CopysetPool,
+        ),
+        Status,
+    > {
         use objectio_common::FailureDomain;
         use objectio_placement::CopysetPool;
 
@@ -211,6 +223,14 @@ impl MetaService {
                 "no feasible copysets for current topology",
             ));
         }
+        Ok((copy_count, fd_level, cs_pool))
+    }
+
+    pub(super) async fn preallocate_placement_groups(
+        &self,
+        pool: &PoolConfig,
+    ) -> Result<(), Status> {
+        let (copy_count, fd_level, cs_pool) = self.pg_copysets(pool)?;
 
         let now = Self::current_timestamp();
         let mut pgs: Vec<PlacementGroup> = Vec::with_capacity(pool.pg_count as usize);
@@ -1841,6 +1861,19 @@ impl MetaService {
                 "pool '{}' already exists",
                 pool.name
             )));
+        }
+        // A pool with placement groups is refused up front when the
+        // topology can't spread a PG's copies across failure domains: it
+        // used to be created anyway, with no PGs, a warning in meta's log,
+        // and its objects placed some other way.
+        if pool.pg_count > 0 {
+            self.pg_copysets(&pool).map_err(|e| {
+                Status::failed_precondition(format!(
+                    "pool '{}' can't have placement groups on this topology: {}",
+                    pool.name,
+                    e.message()
+                ))
+            })?;
         }
         let mut pool = pool;
         pool.created_at = Self::current_timestamp();
