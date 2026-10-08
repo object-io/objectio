@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use objectio_common::FailureDomain;
 use objectio_common::version::{self, PG_PLACEMENT_LEVEL};
+use objectio_placement::PlacementRule;
+use objectio_placement::copyset::{domain_name, unit_name};
 use objectio_placement::topology::NodeInfo;
 use objectio_proto::storage::{
     PgRef, SetPgEpochsRequest, storage_service_client::StorageServiceClient,
@@ -62,13 +64,25 @@ pub(crate) fn fd_level(name: &str) -> Option<FailureDomain> {
     })
 }
 
-/// The failure domain `node` is in at `level`. Finer than a host each OSD
-/// is its own.
-fn domain_of(node: &NodeInfo, level: FailureDomain) -> String {
-    match level {
-        FailureDomain::Node | FailureDomain::Disk => node.id.to_string(),
-        _ => node.failure_domain.at_level(level).to_string(),
-    }
+/// Placement groups with a member no OSD can stand in for within their
+/// pool's placement rule, as the leader last counted.
+static PGS_UNDERSIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Positions already logged as undersized: logged once, not every pass.
+static UNDERSIZED_LOGGED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<(String, u32, usize)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Placement-group metrics as Prometheus families.
+pub fn render_metrics(out: &mut String) {
+    use std::fmt::Write as _;
+    let name = "objectio_meta_pgs_undersized";
+    let _ = writeln!(
+        out,
+        "# HELP {name} Placement groups with a member no OSD can stand in for within the \
+         pool's placement rule (as the leader last counted)\n# TYPE {name} gauge\n{name} {}",
+        PGS_UNDERSIZED.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 /// The placement group `bucket/key` maps to in a pool of `pg_count`.
@@ -86,6 +100,80 @@ pub(crate) fn copy_count(pool: &PoolConfig) -> usize {
             (pool.ec_k + pool.ec_local_parity + pool.ec_global_parity) as usize
         }
         ErasureType::ErasureReplication => pool.replication_count as usize,
+    }
+}
+
+/// A pool's placement rule (B31 phase 1b): its copies over
+/// `spread_domains` domains at its failure-domain level, at most
+/// `per_domain` in one; an LRC pool with `lrc_groups_per_domain` keeps each
+/// local group (data and local parity) in a domain of its own, its global
+/// parity in others. Unset (0, 0, false): one copy per domain.
+///
+/// # Errors
+/// What is wrong with the pool's rule fields.
+pub(crate) fn placement_rule(pool: &PoolConfig) -> Result<PlacementRule, String> {
+    let level = fd_level(&pool.failure_domain)
+        .ok_or_else(|| format!("failure_domain '{}' not recognised", pool.failure_domain))?;
+    let copies = copy_count(pool);
+    let mut together: Vec<Vec<usize>> = Vec::new();
+    if pool.lrc_groups_per_domain {
+        if pool.ec_type() != ErasureType::ErasureLrc {
+            return Err("lrc_groups_per_domain is for an LRC pool".into());
+        }
+        let (k, l) = (pool.ec_k as usize, pool.ec_local_parity as usize);
+        if l == 0 || k % l != 0 {
+            return Err(format!(
+                "LRC {k} data shards don't split into {l} local groups"
+            ));
+        }
+        // The layout `pg_position_local_group` gives: data in groups of
+        // k / l, then one local parity per group, then global parity.
+        let size = k / l;
+        together = (0..l)
+            .map(|g| {
+                let mut positions: Vec<usize> = (g * size..(g + 1) * size).collect();
+                positions.push(k + g);
+                positions
+            })
+            .collect();
+    }
+    let per_domain = match pool.per_domain {
+        // A local group needs its whole size in one domain.
+        0 => together.iter().map(Vec::len).max().unwrap_or(1),
+        n => n as usize,
+    };
+    let singles = copies - together.iter().map(Vec::len).sum::<usize>();
+    let domains = match pool.spread_domains {
+        0 => together.len() + singles.div_ceil(per_domain),
+        n => n as usize,
+    };
+    let rule = PlacementRule {
+        level,
+        copy_count: copies,
+        domains,
+        per_domain,
+        together,
+    };
+    rule.validate().map_err(|e| e.to_string())?;
+    Ok(rule)
+}
+
+/// Whether losing any one domain of `rule` leaves `pool`'s objects
+/// readable: for erasure coding no domain holds more than m shards; for
+/// LRC with groups per domain, a whole group lost (its local parity with
+/// it) is rebuilt from global parity, so a group's data is no more than
+/// the global parity count; for replication a copy survives elsewhere.
+pub(crate) fn tolerates_domain_loss(pool: &PoolConfig, rule: &PlacementRule) -> bool {
+    let most_in_one = rule.slots().iter().map(Vec::len).max().unwrap_or(0);
+    match pool.ec_type() {
+        ErasureType::ErasureReplication => most_in_one < pool.replication_count as usize,
+        ErasureType::ErasureLrc if !rule.together.is_empty() => {
+            // A group: its data positions are all but its local parity.
+            rule.together
+                .iter()
+                .all(|g| g.len().saturating_sub(1) <= pool.ec_global_parity as usize)
+        }
+        _ => most_in_one <= pool.ec_m as usize,
     }
 }
 
@@ -351,26 +439,40 @@ impl MetaService {
             }
         }
         let mut changed: Vec<(PlacementGroup, PlacementGroup)> = Vec::new();
+        let mut undersized = 0u64;
         for pool in self.pools_snapshot() {
             if pool.pg_count == 0 {
                 continue;
             }
-            let Some(level) = fd_level(&pool.failure_domain) else {
-                continue;
-            };
-            for pg in self.placement_groups_for_pool(&pool.name) {
-                if pg
-                    .acting
-                    .iter()
-                    .all(|id| self.acting_usable(id, down_since, grace))
-                {
+            let rule = match placement_rule(&pool) {
+                Ok(rule) => rule,
+                Err(e) => {
+                    warn!(
+                        "pool '{}': {e}; its placement groups are left as they are",
+                        pool.name
+                    );
                     continue;
                 }
-                if let Some(new) = self.stand_in(&pg, level, down_since, grace) {
-                    changed.push((pg, new));
+            };
+            for pg in self.placement_groups_for_pool(&pool.name) {
+                let usable = |pg: &PlacementGroup| {
+                    pg.acting
+                        .iter()
+                        .all(|id| self.acting_usable(id, down_since, grace))
+                };
+                if usable(&pg) {
+                    continue;
+                }
+                match self.stand_in(&pg, &rule, down_since, grace) {
+                    Some(new) => {
+                        undersized += u64::from(!usable(&new));
+                        changed.push((pg, new));
+                    }
+                    None => undersized += 1,
                 }
             }
         }
+        PGS_UNDERSIZED.store(undersized, std::sync::atomic::Ordering::Relaxed);
         for chunk in changed.chunks(PG_CHUNK) {
             if let Err(e) = self.commit_pgs(chunk, "pg-stand-in").await {
                 warn!("stand-ins not committed: {e}");
@@ -413,15 +515,15 @@ impl MetaService {
         {
             return pg;
         }
-        let Some(level) = self
+        let Some(rule) = self
             .pools
             .read()
             .get(&pg.pool)
-            .and_then(|p| fd_level(&p.failure_domain))
+            .and_then(|p| placement_rule(p).ok())
         else {
             return pg;
         };
-        let Some(new) = self.stand_in(&pg, level, &none, Duration::MAX) else {
+        let Some(new) = self.stand_in(&pg, &rule, &none, Duration::MAX) else {
             return pg; // nothing can stand in: undersized
         };
         match self
@@ -449,20 +551,23 @@ impl MetaService {
     }
 
     /// `pg` with every unusable acting member stood in for, or None if no
-    /// position could change.
+    /// position could change. A stand-in keeps the pool's placement rule
+    /// (phase 1b): in the domain of the rest of its LRC group, or in a
+    /// domain under its limit of copies and holding no group, on a host
+    /// none of that domain's members are on; preferably a domain the PG
+    /// doesn't use yet. A position no OSD can take within the rule is left
+    /// as it is: the PG is undersized rather than less spread.
     fn stand_in(
         &self,
         pg: &PlacementGroup,
-        level: FailureDomain,
+        rule: &PlacementRule,
         down_since: &HashMap<[u8; 16], std::time::Instant>,
         grace: Duration,
     ) -> Option<PlacementGroup> {
         let topology = self.topology.read().clone();
-        let domain = |id: &[u8]| -> Option<String> {
+        let node = |id: &[u8]| -> Option<NodeInfo> {
             let id = <[u8; 16]>::try_from(id).ok()?;
-            topology
-                .get_node(NodeId::from_bytes(id))
-                .map(|n| domain_of(n, level))
+            topology.get_node(NodeId::from_bytes(id)).cloned()
         };
         let mut acting = pg.acting.clone();
         let mut filling = pg.filling.clone();
@@ -472,33 +577,62 @@ impl MetaService {
             if self.acting_usable(&acting[position], down_since, grace) {
                 continue;
             }
-            let used: std::collections::HashSet<String> = acting
+            // The other members, where they are, for the rule: an unusable
+            // one too, until it is replaced (it still holds its domain's
+            // share; counted out, a stand-in for another position could
+            // take that share, and its own stand-in then break the rule).
+            // A member the topology no longer knows holds nothing.
+            let others: Vec<(usize, String, String)> = acting
                 .iter()
-                .filter(|id| self.acting_usable(id, down_since, grace))
-                .filter_map(|id| domain(id))
+                .enumerate()
+                .filter(|(p, _)| *p != position)
+                .filter_map(|(p, id)| {
+                    let n = node(id)?;
+                    Some((p, domain_name(&n, rule.level), unit_name(&n, rule)))
+                })
                 .collect();
             let spare = topology
                 .active_nodes()
-                .map(|n| n.id.as_bytes().to_vec())
-                .filter(|id| !acting.contains(id))
-                .filter(|id| self.acting_usable(id, down_since, grace))
-                .min_by_key(|id| {
-                    let shared = domain(id).is_some_and(|d| used.contains(&d));
+                .filter(|n| !acting.contains(&n.id.as_bytes().to_vec()))
+                .filter(|n| self.acting_usable(n.id.as_bytes(), down_since, grace))
+                .filter(|n| {
+                    rule.admits(
+                        position,
+                        &domain_name(n, rule.level),
+                        &unit_name(n, rule),
+                        &others,
+                    )
+                })
+                .map(|n| {
+                    let domain = domain_name(n, rule.level);
+                    let shared = others.iter().any(|(_, d, _)| *d == domain);
+                    let id = n.id.as_bytes().to_vec();
                     let mut seed = pg.pool.as_bytes().to_vec();
                     seed.extend_from_slice(&pg.pg_id.to_le_bytes());
                     seed.extend_from_slice(&(position as u64).to_le_bytes());
-                    seed.extend_from_slice(id);
-                    (shared, xxhash_rust::xxh64::xxh64(&seed, 0))
-                });
+                    seed.extend_from_slice(&id);
+                    ((shared, xxhash_rust::xxh64::xxh64(&seed, 0)), id)
+                })
+                .min_by(|a, b| a.0.cmp(&b.0))
+                .map(|(_, id)| id);
             let Some(spare) = spare else {
-                warn!(
-                    "pg {}/{} position {position}: no OSD can stand in for {}; undersized",
-                    pg.pool,
-                    pg.pg_id,
-                    hex::encode(&acting[position])
-                );
+                if UNDERSIZED_LOGGED
+                    .lock()
+                    .insert((pg.pool.clone(), pg.pg_id, position))
+                {
+                    warn!(
+                        "pg {}/{} position {position}: no OSD can stand in for {} within the \
+                         pool's placement rule; undersized",
+                        pg.pool,
+                        pg.pg_id,
+                        hex::encode(&acting[position])
+                    );
+                }
                 continue;
             };
+            UNDERSIZED_LOGGED
+                .lock()
+                .remove(&(pg.pool.clone(), pg.pg_id, position));
             let from = std::mem::replace(&mut acting[position], spare);
             filling.retain(|f| f.position != position as u32);
             filling.push(PgFill {
@@ -908,8 +1042,14 @@ mod tests {
 
     /// A service with OSDs `1..=count` registered, OSD `n` on host `hosts(n)`.
     async fn cluster(count: u8, hosts: impl Fn(u8) -> String) -> MetaService {
+        racked(count, |n| (String::new(), hosts(n))).await
+    }
+
+    /// As [`cluster`], OSD `n` in rack and host `place(n)`.
+    async fn racked(count: u8, place: impl Fn(u8) -> (String, String)) -> MetaService {
         let svc = MetaService::new();
         for n in 1..=count {
+            let (rack, host) = place(n);
             MetadataService::register_osd(
                 &svc,
                 Request::new(RegisterOsdRequest {
@@ -918,7 +1058,8 @@ mod tests {
                     disk_ids: vec![id(n)],
                     disk_capacity_bytes: vec![1 << 30],
                     failure_domain: Some(FailureDomainInfo {
-                        host: hosts(n),
+                        rack,
+                        host,
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -951,16 +1092,16 @@ mod tests {
 
     const GRACE: Duration = Duration::from_secs(120);
 
+    /// One copy per host, six copies: the rule a pool has unless it asks.
+    fn host_rule() -> PlacementRule {
+        PlacementRule::spread(FailureDomain::Host, 6)
+    }
+
     #[tokio::test]
     async fn a_member_down_past_the_grace_is_stood_in_for_with_a_new_epoch() {
         let svc = cluster(7, |n| format!("h{n}")).await;
         let new = svc
-            .stand_in(
-                &pg(&[1, 2, 3, 4, 5, 6]),
-                FailureDomain::Host,
-                &down(2),
-                GRACE,
-            )
+            .stand_in(&pg(&[1, 2, 3, 4, 5, 6]), &host_rule(), &down(2), GRACE)
             .expect("a stand-in");
         assert_eq!(new.acting, [1, 7, 3, 4, 5, 6].map(id));
         assert_eq!(new.epoch, 5);
@@ -981,13 +1122,8 @@ mod tests {
         let svc = cluster(7, |n| format!("h{n}")).await;
         let just_now = HashMap::from([([2u8; 16], std::time::Instant::now())]);
         assert!(
-            svc.stand_in(
-                &pg(&[1, 2, 3, 4, 5, 6]),
-                FailureDomain::Host,
-                &just_now,
-                GRACE
-            )
-            .is_none()
+            svc.stand_in(&pg(&[1, 2, 3, 4, 5, 6]), &host_rule(), &just_now, GRACE)
+                .is_none()
         );
     }
 
@@ -995,13 +1131,8 @@ mod tests {
     async fn with_no_osd_to_spare_the_pg_is_left_undersized() {
         let svc = cluster(6, |n| format!("h{n}")).await;
         assert!(
-            svc.stand_in(
-                &pg(&[1, 2, 3, 4, 5, 6]),
-                FailureDomain::Host,
-                &down(2),
-                GRACE
-            )
-            .is_none()
+            svc.stand_in(&pg(&[1, 2, 3, 4, 5, 6]), &host_rule(), &down(2), GRACE)
+                .is_none()
         );
     }
 
@@ -1014,11 +1145,121 @@ mod tests {
         for pg_id in 0..32 {
             let mut p = pg(&[1, 2, 3, 4, 5, 6]);
             p.pg_id = pg_id;
-            let new = svc
-                .stand_in(&p, FailureDomain::Host, &down(2), GRACE)
-                .unwrap();
+            let new = svc.stand_in(&p, &host_rule(), &down(2), GRACE).unwrap();
             assert_eq!(new.acting[1], id(8), "pg {pg_id}");
         }
+    }
+
+    /// 4+2 over three racks, two per rack (B31 phase 1b). Racks: A holds
+    /// 1, 2 and 7; B 3 and 4; C 5 and 6. A member of rack B lost can't be
+    /// stood in for: the only spare, 7, is in rack A, which has its two
+    /// already. The PG is left undersized rather than spread less. A
+    /// member of rack A lost is stood in for by 7.
+    #[tokio::test]
+    async fn a_stand_in_keeps_the_rules_limit_per_rack() {
+        let rack = |n: u8| match n {
+            1 | 2 | 7 => "A",
+            3 | 4 => "B",
+            _ => "C",
+        };
+        let svc = racked(7, |n| (rack(n).into(), format!("h{n}"))).await;
+        let rule = PlacementRule {
+            level: FailureDomain::Rack,
+            copy_count: 6,
+            domains: 3,
+            per_domain: 2,
+            together: Vec::new(),
+        };
+        let p = pg(&[1, 2, 3, 4, 5, 6]);
+        assert!(svc.stand_in(&p, &rule, &down(3), GRACE).is_none());
+        let new = svc.stand_in(&p, &rule, &down(1), GRACE).unwrap();
+        assert_eq!(new.acting, [7, 2, 3, 4, 5, 6].map(id));
+        // Both out: 3's position, looked at first if 1 didn't count, would
+        // take 7 and leave rack A with three once 1 stays. 1 still holds
+        // rack A's share until it is replaced, so 7 goes to 1's place.
+        let mut both = down(1);
+        both.extend(down(3));
+        let new = svc.stand_in(&p, &rule, &both, GRACE).unwrap();
+        assert_eq!(new.acting, [7, 2, 3, 4, 5, 6].map(id));
+    }
+
+    /// LRC 4+2+1 with each local group in a rack of its own: positions 0,
+    /// 1 and 4 in rack A, 2, 3 and 5 in rack B, the global parity (6) in
+    /// rack C. A lost member of a group is stood in for from its group's
+    /// rack only; the global parity from a rack holding no group.
+    #[tokio::test]
+    async fn an_lrc_stand_in_stays_in_its_groups_rack() {
+        let rack = |n: u8| match n {
+            1 | 2 | 3 | 8 => "A",
+            4 | 5 | 6 | 9 => "B",
+            _ => "C",
+        };
+        let svc = racked(10, |n| (rack(n).into(), format!("h{n}"))).await;
+        let rule = PlacementRule {
+            level: FailureDomain::Rack,
+            copy_count: 7,
+            domains: 3,
+            per_domain: 3,
+            together: vec![vec![0, 1, 4], vec![2, 3, 5]],
+        };
+        // Positions 0..6: 1 2 | 4 5 data, 3 6 local parity, 7 global.
+        let p = pg(&[1, 2, 4, 5, 3, 6, 7]);
+        for pg_id in 0..16 {
+            let mut p = p.clone();
+            p.pg_id = pg_id;
+            let new = svc.stand_in(&p, &rule, &down(2), GRACE).unwrap();
+            assert_eq!(new.acting[1], id(8), "pg {pg_id}: out of its group's rack");
+            let new = svc.stand_in(&p, &rule, &down(7), GRACE).unwrap();
+            assert_eq!(
+                new.acting[6],
+                id(10),
+                "pg {pg_id}: global parity with a group"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pools_fields_make_its_rule() {
+        let lrc = PoolConfig {
+            ec_type: ErasureType::ErasureLrc as i32,
+            ec_k: 4,
+            ec_local_parity: 2,
+            ec_global_parity: 1,
+            ec_m: 3,
+            failure_domain: "rack".into(),
+            lrc_groups_per_domain: true,
+            ..Default::default()
+        };
+        let rule = placement_rule(&lrc).unwrap();
+        assert_eq!(rule.together, vec![vec![0, 1, 4], vec![2, 3, 5]]);
+        assert_eq!((rule.domains, rule.per_domain), (3, 3));
+        // A whole group lost is 2 data shards, more than 1 global parity.
+        assert!(!tolerates_domain_loss(&lrc, &rule));
+
+        let spread = PoolConfig {
+            ec_type: ErasureType::ErasureMds as i32,
+            ec_k: 4,
+            ec_m: 2,
+            failure_domain: "rack".into(),
+            per_domain: 2,
+            ..Default::default()
+        };
+        let rule = placement_rule(&spread).unwrap();
+        assert_eq!((rule.domains, rule.per_domain), (3, 2));
+        assert!(tolerates_domain_loss(&spread, &rule));
+        // Three per rack loses data with a rack.
+        let three = PoolConfig {
+            per_domain: 3,
+            ..spread.clone()
+        };
+        let rule = placement_rule(&three).unwrap();
+        assert!(!tolerates_domain_loss(&three, &rule));
+        // An MDS pool can't ask for LRC groups.
+        let wrong = PoolConfig {
+            lrc_groups_per_domain: true,
+            ..spread
+        };
+        assert!(placement_rule(&wrong).is_err());
     }
 
     /// Any leader picks the same: the choice depends on the PG and position,
@@ -1028,7 +1269,7 @@ mod tests {
         let a = cluster(9, |n| format!("h{n}")).await;
         let b = cluster(9, |n| format!("h{n}")).await;
         let p = pg(&[1, 2, 3, 4, 5, 6]);
-        let pick = |svc: &MetaService| svc.stand_in(&p, FailureDomain::Host, &down(2), GRACE);
+        let pick = |svc: &MetaService| svc.stand_in(&p, &host_rule(), &down(2), GRACE);
         assert_eq!(pick(&a).unwrap().acting, pick(&b).unwrap().acting);
     }
 

@@ -67,6 +67,10 @@ fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
         // default (256).
         pg_count: v["pg_count"].as_u64().unwrap_or_default() as u32,
         tier: v["tier"].as_str().unwrap_or_default().to_string(),
+        // The placement rule (B31 phase 1b); 0 and 0: one copy per domain.
+        spread_domains: v["spread_domains"].as_u64().unwrap_or_default() as u32,
+        per_domain: v["per_domain"].as_u64().unwrap_or_default() as u32,
+        lrc_groups_per_domain: v["lrc_groups_per_domain"].as_bool().unwrap_or_default(),
     }
 }
 
@@ -142,6 +146,9 @@ fn pool_to_json(p: &PoolConfig) -> serde_json::Value {
         "updated_at": p.updated_at,
         "pg_count": p.pg_count,
         "tier": p.tier,
+        "spread_domains": p.spread_domains,
+        "per_domain": p.per_domain,
+        "lrc_groups_per_domain": p.lrc_groups_per_domain,
     })
 }
 
@@ -2938,7 +2945,16 @@ pub async fn admin_validate_placement(
         }
     };
 
-    let shard_count = u64::from(pool.ec_k) + u64::from(pool.ec_m);
+    // Domains the pool's placement rule uses (B31 phase 1b): as many as
+    // copies at one per domain, fewer with more per domain. (Meta checks
+    // the rest of the rule, hosts inside each domain included, when the
+    // pool is made.)
+    let copies = u64::from(pool.ec_k) + u64::from(pool.ec_m);
+    let shard_count = if pool.spread_domains > 0 {
+        u64::from(pool.spread_domains)
+    } else {
+        copies.div_ceil(u64::from(pool.per_domain.max(1)))
+    };
     let level = pool.failure_domain.as_str();
 
     // Fetch nodes and count distinct domain keys at the pool's level.
@@ -2984,7 +3000,9 @@ pub async fn admin_validate_placement(
         "available_count": available,
         "satisfiable": satisfiable,
         "reason": if satisfiable {
-            format!("{} distinct {}s available for {} shards", available, level, shard_count)
+            format!(
+                "{available} distinct {level}s available; the pool's {copies} copies need {shard_count}"
+            )
         } else {
             format!(
                 "Pool needs {} distinct {}s but topology has only {}. Add more {}s or relax the pool's failure_domain.",

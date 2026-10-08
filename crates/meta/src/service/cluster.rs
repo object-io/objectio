@@ -175,9 +175,10 @@ impl MetaService {
     /// MultiCas batches of ≤128 ops to stay under the storage
     /// limit (see `raft_storage::MAX_OPS = 256`).
     /// The copysets a pool's placement groups would be drawn from, on the
-    /// topology as it is: copy count, failure-domain level, copysets. An
-    /// error when the topology can't spread a PG's copies over that many
-    /// failure domains.
+    /// topology as it is, each keeping the pool's placement rule (B31
+    /// phase 1b): the copy count, the rule, the copysets. An error when the
+    /// rule is inconsistent (invalid argument) or the topology can't hold
+    /// it (failed precondition).
     #[allow(clippy::result_large_err)] // a gRPC status, as every handler returns
     fn pg_copysets(
         &self,
@@ -185,7 +186,7 @@ impl MetaService {
     ) -> Result<
         (
             usize,
-            objectio_common::FailureDomain,
+            objectio_placement::PlacementRule,
             objectio_placement::CopysetPool,
         ),
         Status,
@@ -198,13 +199,7 @@ impl MetaService {
                 "pool has zero shards per PG — check ec_k / ec_m / replication_count",
             ));
         }
-
-        let fd_level = super::pgs::fd_level(&pool.failure_domain).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "pool.failure_domain '{}' not recognised",
-                pool.failure_domain
-            ))
-        })?;
+        let rule = super::pgs::placement_rule(pool).map_err(Status::invalid_argument)?;
 
         let topology = self.topology.read().clone();
         // Seed = topology.version × pg_count so concurrent pool creates
@@ -218,21 +213,22 @@ impl MetaService {
         let scatter_width = self
             .config_parsed::<usize>("balancer/scatter_width", 10)
             .max(1);
-        let cs_pool = CopysetPool::build(&topology, fd_level, copy_count, scatter_width, seed)
+        let cs_pool = CopysetPool::build_with_rule(&topology, &rule, scatter_width, seed)
             .map_err(|e| Status::failed_precondition(format!("copyset pool build failed: {e}")))?;
         if cs_pool.sets.is_empty() {
             return Err(Status::failed_precondition(
                 "no feasible copysets for current topology",
             ));
         }
-        Ok((copy_count, fd_level, cs_pool))
+        Ok((copy_count, rule, cs_pool))
     }
 
     pub(super) async fn preallocate_placement_groups(
         &self,
         pool: &PoolConfig,
     ) -> Result<(), Status> {
-        let (copy_count, fd_level, cs_pool) = self.pg_copysets(pool)?;
+        let (copy_count, rule, cs_pool) = self.pg_copysets(pool)?;
+        let fd_level = rule.level;
 
         let now = Self::current_timestamp();
         let mut pgs: Vec<PlacementGroup> = Vec::with_capacity(pool.pg_count as usize);
@@ -247,13 +243,13 @@ impl MetaService {
             // domains as copies there is a single copyset, and every PG
             // had the same order: the same OSDs held every object's parity
             // and every read went to the others. The order changes nothing
-            // about how the copies are spread.
+            // about how the copies are spread: it stays within the rule (an
+            // LRC local group keeps its domain).
             {
                 use rand::SeedableRng;
-                use rand::seq::SliceRandom;
                 let seed =
                     xxhash_rust::xxh64::xxh64(format!("{}/{pg_id}", pool.name).as_bytes(), 0);
-                members.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+                rule.shuffle(&mut members, &mut rand::rngs::StdRng::seed_from_u64(seed));
             }
             pgs.push(PlacementGroup {
                 pool: pool.name.clone(),
@@ -1681,13 +1677,25 @@ impl MetaService {
         // used to be created anyway, with no PGs, a warning in meta's log,
         // and its objects placed some other way.
         if pool.pg_count > 0 {
-            self.pg_copysets(&pool).map_err(|e| {
-                Status::failed_precondition(format!(
+            let (_, rule, _) = self.pg_copysets(&pool).map_err(|e| {
+                let why = format!(
                     "pool '{}' can't have placement groups on this topology: {}",
                     pool.name,
                     e.message()
-                ))
+                );
+                if e.code() == tonic::Code::InvalidArgument {
+                    Status::invalid_argument(why)
+                } else {
+                    Status::failed_precondition(why)
+                }
             })?;
+            if !super::pgs::tolerates_domain_loss(&pool, &rule) {
+                warn!(
+                    "pool '{}': its placement rule ({} {:?}s, up to {} copies in one) does \
+                     not survive a whole {:?} lost; objects are unreadable while one is down",
+                    pool.name, rule.domains, rule.level, rule.per_domain, rule.level
+                );
+            }
         }
         pool.created_at = Self::current_timestamp();
         pool.updated_at = pool.created_at;
@@ -1779,10 +1787,36 @@ impl MetaService {
             .ok_or_else(|| Status::invalid_argument("missing pool"))?;
         let expected_bytes = {
             let pools = self.pools.read();
-            pools
+            let current = pools
                 .get(&pool.name)
-                .ok_or_else(|| Status::not_found(format!("pool '{}' not found", pool.name)))?
-                .encode_to_vec()
+                .ok_or_else(|| Status::not_found(format!("pool '{}' not found", pool.name)))?;
+            // Its placement groups were made by these: changed, a PG's
+            // members would no longer keep the pool's rule (B31 phase 1b).
+            let placement = |p: &PoolConfig| {
+                (
+                    p.pg_count,
+                    p.failure_domain.clone(),
+                    p.spread_domains,
+                    p.per_domain,
+                    p.lrc_groups_per_domain,
+                    (
+                        p.ec_type,
+                        p.ec_k,
+                        p.ec_m,
+                        p.ec_local_parity,
+                        p.ec_global_parity,
+                    ),
+                    p.replication_count,
+                )
+            };
+            if current.pg_count > 0 && placement(current) != placement(&pool) {
+                return Err(Status::failed_precondition(format!(
+                    "pool '{}': its protection, failure domain, placement rule and placement \
+                     groups are fixed when it is made; make a new pool for others",
+                    pool.name
+                )));
+            }
+            current.encode_to_vec()
         };
         pool.updated_at = Self::current_timestamp();
         let new_bytes = pool.encode_to_vec();

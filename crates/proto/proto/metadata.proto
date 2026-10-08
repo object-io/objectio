@@ -2498,6 +2498,17 @@ message PoolConfig {
     // placement groups): the default.
     uint32 pg_count = 15;
     string tier = 16;
+
+    // Placement rule (B31 phase 1b, objectio-docs core/pg-recovery.md): a
+    // PG's copies over `spread_domains` domains at `failure_domain`, at
+    // most `per_domain` in one, on distinct hosts above the host level.
+    // 0 and 0: one copy per domain, as many domains as copies. With
+    // `lrc_groups_per_domain`, an LRC pool keeps each local group (its
+    // data and its local parity) in a domain of its own, and its global
+    // parity in others: a lost shard is rebuilt from inside its domain.
+    uint32 spread_domains = 17;
+    uint32 per_domain = 18;
+    bool lrc_groups_per_domain = 19;
 }
 
 // One placement group (B31, objectio-docs core/pg-recovery.md). A key maps

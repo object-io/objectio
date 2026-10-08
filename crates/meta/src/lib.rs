@@ -572,6 +572,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     writeln!(output, "# TYPE objectio_meta_osds_total gauge").unwrap();
     writeln!(output, "objectio_meta_osds_total {}", stats.osd_count).unwrap();
     repair::render_metrics(&mut output);
+    service::pgs::render_metrics(&mut output);
 
     // User counts
     writeln!(output, "# HELP objectio_meta_users_total Total users").unwrap();

@@ -73,6 +73,9 @@ pub struct HaCluster {
     /// Each OSD on a host of its own (`h0`, `h1`, …) rather than all on
     /// one: what a pool with placement groups needs to spread over them.
     osd_hosts: bool,
+    /// The rack of each OSD, by index, when given: for pools spread over
+    /// racks (B31 phase 1b).
+    osd_racks: Vec<String>,
 }
 
 impl Drop for HaCluster {
@@ -164,6 +167,33 @@ impl HaCluster {
         Self::start_with(None, metas, osds, gateways, &[], true)
     }
 
+    /// As [`Self::start_with_osd_hosts`], OSD `i` also in rack `racks[i]`
+    /// (one OSD per entry): for pools whose copies are spread over racks.
+    #[must_use]
+    pub fn start_with_osd_racks(metas: usize, racks: &[&str], gateways: usize) -> Self {
+        Self::start_with_racks(metas, racks, gateways, &[])
+    }
+
+    /// As [`Self::start_with_osd_racks`], every meta node also given
+    /// `meta_args`.
+    #[must_use]
+    pub fn start_with_racks(
+        metas: usize,
+        racks: &[&str],
+        gateways: usize,
+        meta_args: &[&str],
+    ) -> Self {
+        Self::start_inner(
+            None,
+            metas,
+            racks.len(),
+            gateways,
+            meta_args,
+            true,
+            racks.iter().map(ToString::to_string).collect(),
+        )
+    }
+
     fn start_with(
         bins: Option<&Path>,
         metas: usize,
@@ -171,6 +201,26 @@ impl HaCluster {
         gateways: usize,
         meta_args: &[&str],
         osd_hosts: bool,
+    ) -> Self {
+        Self::start_inner(
+            bins,
+            metas,
+            osds,
+            gateways,
+            meta_args,
+            osd_hosts,
+            Vec::new(),
+        )
+    }
+
+    fn start_inner(
+        bins: Option<&Path>,
+        metas: usize,
+        osds: usize,
+        gateways: usize,
+        meta_args: &[&str],
+        osd_hosts: bool,
+        osd_racks: Vec<String>,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
@@ -193,6 +243,7 @@ impl HaCluster {
             meta_args: meta_args.iter().map(ToString::to_string).collect(),
             tls: bins.is_none(),
             osd_hosts,
+            osd_racks,
         };
         for i in 0..metas {
             // A port it lost to another process: new ones, before any peer
@@ -249,6 +300,11 @@ impl HaCluster {
     fn spawn_osd(&mut self, i: usize, bins: Option<&Path>) {
         let endpoints = self.meta_endpoints();
         let osd_hosts = self.osd_hosts;
+        let rack = self
+            .osd_racks
+            .get(i)
+            .map(|r| format!("rack = \"{r}\"\n"))
+            .unwrap_or_default();
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
         if self.tls {
@@ -256,8 +312,11 @@ impl HaCluster {
         }
         if osd_hosts {
             let config = o.state.join("osd.toml");
-            std::fs::write(&config, format!("[osd.failure_domain]\nhost = \"h{i}\"\n"))
-                .expect("osd config");
+            std::fs::write(
+                &config,
+                format!("[osd.failure_domain]\nhost = \"h{i}\"\n{rack}"),
+            )
+            .expect("osd config");
             cmd.arg("--config").arg(&config);
         }
         let child = cmd

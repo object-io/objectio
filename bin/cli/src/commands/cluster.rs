@@ -451,6 +451,9 @@ pub async fn pool(cmd: PoolCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
             name,
             fields,
             pg_count,
+            spread_domains,
+            per_domain,
+            lrc_groups_per_domain,
             disabled,
         } => {
             let mut body = pool_body(fields)?;
@@ -458,6 +461,15 @@ pub async fn pool(cmd: PoolCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
             body.insert("enabled".into(), json!(!disabled));
             if let Some(pg) = pg_count {
                 body.insert("pg_count".into(), json!(pg));
+            }
+            if let Some(d) = spread_domains {
+                body.insert("spread_domains".into(), json!(d));
+            }
+            if let Some(p) = per_domain {
+                body.insert("per_domain".into(), json!(p));
+            }
+            if lrc_groups_per_domain {
+                body.insert("lrc_groups_per_domain".into(), json!(true));
             }
             let v = ctx
                 .api

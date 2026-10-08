@@ -340,15 +340,12 @@ async fn evaluate_pool(
 
     // Build the copyset pool once per pass — scoring candidate
     // replacements reuses it across every overloaded PG.
-    let fd_level = parse_failure_domain(&pool.failure_domain);
+    // Within the pool's placement rule (B31 phase 1b): a copyset the
+    // balancer picks keeps the pool's spread and LRC groups.
+    let rule = crate::service::pgs::placement_rule(pool).map_err(|e| anyhow::anyhow!(e))?;
     let seed = topology_seed(meta, pool);
-    let cs_pool = CopysetPool::build(
-        &meta.topology_snapshot(),
-        fd_level,
-        k_plus_m,
-        tuning.scatter_width,
-        seed,
-    )?;
+    let cs_pool =
+        CopysetPool::build_with_rule(&meta.topology_snapshot(), &rule, tuning.scatter_width, seed)?;
     if cs_pool.sets.is_empty() {
         warn!("balancer: pool '{}' has no feasible copysets", pool.name);
         return Ok(stats);
@@ -497,19 +494,6 @@ async fn commit_pg(
             other => Err(anyhow::anyhow!("unexpected raft response: {other:?}")),
         },
         Err(e) => Err(anyhow::anyhow!("raft write failed: {e}")),
-    }
-}
-
-fn parse_failure_domain(s: &str) -> objectio_common::FailureDomain {
-    use objectio_common::FailureDomain as Fd;
-    match s {
-        "node" => Fd::Node,
-        "rack" => Fd::Rack,
-        "datacenter" => Fd::Datacenter,
-        "zone" => Fd::Zone,
-        "region" => Fd::Region,
-        "disk" => Fd::Disk,
-        _ => Fd::Host,
     }
 }
 

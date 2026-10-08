@@ -51,5 +51,5 @@ pub use crush2::{
 // provides the set of valid `(k+m)`-tuples the balancer assigns PGs
 // from, respecting failure domains. CRUSH2 stays available as the
 // fallback for pools with `pg_count = 0`.
-pub use copyset::{Copyset, CopysetError, CopysetPool};
+pub use copyset::{Copyset, CopysetError, CopysetPool, PlacementRule};
 pub use jump_hash::jump_consistent_hash;

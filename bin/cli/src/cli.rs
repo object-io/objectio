@@ -880,6 +880,16 @@ pub enum PoolCmd {
         /// Placement groups (fixed at creation; 0 = per-object placement)
         #[arg(long)]
         pg_count: Option<u32>,
+        /// Domains (at --failure-domain) each placement group's copies are
+        /// spread over; with --per-domain, e.g. 4+2 over 3 racks, 2 per rack
+        #[arg(long)]
+        spread_domains: Option<u32>,
+        /// Most copies of a placement group in one domain (default 1)
+        #[arg(long)]
+        per_domain: Option<u32>,
+        /// LRC: each local group in a domain of its own
+        #[arg(long)]
+        lrc_groups_per_domain: bool,
         #[arg(long)]
         disabled: bool,
     },
