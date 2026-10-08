@@ -84,10 +84,12 @@ fn a_lost_disk_is_rebuilt_so_objects_survive_two_more_losses() {
     let bodies = put_objects(&c, "lost");
 
     c.restart_with_lost_disk(0);
+    // Rebuilt by its placement groups' recovery (B31 phase 3a), which the
+    // OSD's report of shards dropped at start sets off.
     await_metric(
         &c,
-        "objectio_meta_repair_shards_rebuilt_total",
-        &["reason=\"missing\""],
+        "objectio_meta_pg_recovered_shards_total",
+        &[],
         OBJECTS as u64,
         Duration::from_secs(120),
     );
@@ -257,10 +259,19 @@ fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
     let rotted = (0..6).any(|i| rot(&c.osd_disk(i), needle));
     assert!(rotted, "shard bytes not found on any disk");
 
+    // Found by the walk (the scrubber marked it), rebuilt by its placement
+    // group's recovery (B31 phase 3a).
     await_metric(
         &c,
-        "objectio_meta_repair_shards_rebuilt_total",
+        "objectio_meta_repair_shards_found_bad_total",
         &["reason=\"corrupt\""],
+        1,
+        Duration::from_secs(120),
+    );
+    await_metric(
+        &c,
+        "objectio_meta_pg_recovered_shards_total",
+        &[],
         1,
         Duration::from_secs(120),
     );

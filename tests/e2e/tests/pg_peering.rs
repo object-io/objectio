@@ -259,6 +259,9 @@ fn cluster() -> HaCluster {
     ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
     let _ = ha.await_leader(Duration::from_secs(30));
     peer_often(&ha);
+    // Nor recovers what peering counts (B31 phase 3a acts on it).
+    let r = ha.clients[0].json("PUT", "/_admin/config/pg/recovery_enabled", json!(false));
+    assert!(r.status < 300, "recovery off: {}", r.text());
     ha
 }
 
