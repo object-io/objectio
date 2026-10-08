@@ -7,6 +7,8 @@ import {
   GitBranch,
   HardDrive,
   AlertTriangle,
+  ShieldCheck,
+  ScanSearch,
 } from "lucide-react";
 import {
   placementGroups,
@@ -42,10 +44,68 @@ function copyCount(p: Pool): number {
   return p.ec_k + p.ec_m;
 }
 
-/// `/cluster/pools/:name` — drills into a pool's placement. Two
-/// complementary views: a per-OSD load bar chart (which OSDs are hot
-/// or cold) and a PG × OSD matrix (which OSDs each PG lives on). The
-/// latter is scrollable so it scales to thousands of PGs.
+/** States most severe first, as peering and recovery name them (B31). */
+const STATES = [
+  "Down",
+  "Incomplete",
+  "Undersized",
+  "WaitTooFull",
+  "Degraded",
+  "Recovering",
+  "Backfilling",
+  "Clean",
+  "Unknown",
+];
+
+/** A state's tone: what needs attention, what is being worked, what's fine. */
+function stateTone(state: string): string {
+  switch (state) {
+    case "Down":
+    case "Incomplete":
+      return "bg-err-soft text-err border-err/30";
+    case "Undersized":
+    case "WaitTooFull":
+    case "Degraded":
+      return "bg-warn-soft text-warn border-warn/30";
+    case "Recovering":
+    case "Backfilling":
+      return "bg-accent-soft text-accent border-accent/30";
+    case "Clean":
+      return "bg-ok-soft text-ok border-ok/30";
+    default:
+      return "bg-surface-2 text-muted border-border";
+  }
+}
+
+function stateOf(pg: PlacementGroup): string {
+  return pg.state?.state ?? "Unknown";
+}
+
+function ago(unixSecs: number): string {
+  if (!unixSecs) return "never";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - unixSecs));
+  if (s < 90) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  if (s < 172800) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function bytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
+
+/// `/cluster/pools/:name` — a pool's placement groups: their health (the
+/// state peering last found, recovery's progress, the last scrub), each
+/// one's detail, and placement: a per-OSD load bar chart and a PG × OSD
+/// matrix (scrollable, so it scales to thousands of PGs).
 export default function PoolPlacement() {
   const { name: poolName } = useParams<{ name: string }>();
   const nav = useNavigate();
@@ -56,19 +116,32 @@ export default function PoolPlacement() {
   const [loading, setLoading] = useState(true);
   const [selectedOsd, setSelectedOsd] = useState<string | null>(null);
   const [selectedPg, setSelectedPg] = useState<number | null>(null);
+  const [stateFilter, setStateFilter] = useState<string | null>(null);
+  const [scrubNote, setScrubNote] = useState<string | null>(null);
 
   const load = async () => {
     if (!poolName) return;
     setLoading(true);
     setErr(null);
     try {
-      const [p, pgsResp, nodesResp] = await Promise.all([
+      const [p, nodesResp] = await Promise.all([
         request<Pool>("GET", `/_admin/pools/${encodeURIComponent(poolName)}`),
-        placementGroups.list(poolName, { max: 10000 }),
         nodesApi.list(),
       ]);
+      // Every page of the pool's PGs.
+      const all: PlacementGroup[] = [];
+      let start = 0;
+      for (;;) {
+        const page = await placementGroups.list(poolName, {
+          start_at: start,
+          max: 10000,
+        });
+        all.push(...page.pgs);
+        if (!page.next_pg_id) break;
+        start = page.next_pg_id;
+      }
       setPool(p);
-      setPgs(pgsResp.pgs);
+      setPgs(all);
       setOsds(nodesResp.nodes);
     } catch (e) {
       setErr(String(e));
@@ -82,14 +155,20 @@ export default function PoolPlacement() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [poolName]);
 
-  // Per-OSD PG-membership count — the number the balancer actually
+  const osdName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const o of osds) m.set(o.node_id, o.node_name || o.node_id.slice(0, 8));
+    return m;
+  }, [osds]);
+
+  // Per-OSD PG-membership count (acting) — the number the balancer
   // reasons about. Distinct from the shard count (which reflects
   // objects that have been written to PGs that happen to include
   // this OSD).
   const osdPgCount = useMemo(() => {
     const c = new Map<string, number>();
     for (const pg of pgs) {
-      for (const osd of pg.osd_ids) {
+      for (const osd of pg.acting) {
         c.set(osd, (c.get(osd) ?? 0) + 1);
       }
     }
@@ -110,6 +189,12 @@ export default function PoolPlacement() {
     return entries;
   }, [osds, osdPgCount]);
 
+  const byState = useMemo(() => {
+    const c = new Map<string, number>();
+    for (const pg of pgs) c.set(stateOf(pg), (c.get(stateOf(pg)) ?? 0) + 1);
+    return c;
+  }, [pgs]);
+
   const cc = pool ? copyCount(pool) : 0;
   const pgCount = pgs.length;
   const totalSlots = pgCount * cc;
@@ -126,9 +211,38 @@ export default function PoolPlacement() {
     return m;
   }, [osdEntries]);
 
-  const migratingCount = pgs.filter(
-    (pg) => pg.migrating_to_osd_ids.length > 0,
+  /** Up members a PG is moving to: in `up`, not yet in `acting`. */
+  const movingTo = (pg: PlacementGroup) =>
+    pg.up.filter((u) => u && !pg.acting.includes(u));
+
+  const movingCount = pgs.filter(
+    (pg) => movingTo(pg).length > 0 || pg.filling.length > 0,
   ).length;
+  const notClean = pgs.filter((pg) => stateOf(pg) !== "Clean").length;
+
+  const listed = pgs
+    .filter((pg) => !stateFilter || stateOf(pg) === stateFilter)
+    .sort(
+      (a, b) =>
+        STATES.indexOf(stateOf(a)) - STATES.indexOf(stateOf(b)) ||
+        a.pg_id - b.pg_id,
+    );
+
+  const detail =
+    selectedPg !== null ? pgs.find((p) => p.pg_id === selectedPg) : undefined;
+
+  const scrubNow = async (pg: PlacementGroup) => {
+    if (!poolName) return;
+    setScrubNote(null);
+    try {
+      await placementGroups.scrub(poolName, pg.pg_id);
+      setScrubNote(`PG ${pg.pg_id}: scrub requested`);
+      const fresh = await placementGroups.get(poolName, pg.pg_id);
+      setPgs((all) => all.map((p) => (p.pg_id === fresh.pg_id ? fresh : p)));
+    } catch (e) {
+      setScrubNote(`PG ${pg.pg_id}: ${String(e)}`);
+    }
+  };
 
   return (
     <div className="p-4">
@@ -149,10 +263,15 @@ export default function PoolPlacement() {
               {ecString(pool)}
             </span>
           )}
-          {migratingCount > 0 && (
+          {notClean > 0 && (
             <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-warn-soft text-warn border border-warn/25">
               <AlertTriangle size={11} />
-              {migratingCount} migrating
+              {notClean} not clean
+            </span>
+          )}
+          {movingCount > 0 && (
+            <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-accent-soft text-accent border border-accent/25">
+              {movingCount} moving
             </span>
           )}
         </div>
@@ -183,6 +302,12 @@ export default function PoolPlacement() {
             : undefined}
         />
         <StatCard
+          label="Clean"
+          value={`${(byState.get("Clean") ?? 0).toLocaleString()} / ${pgCount.toLocaleString()}`}
+          icon={<ShieldCheck size={14} />}
+          hint={notClean > 0 ? `${notClean} need attention or are recovering` : "every PG clean"}
+        />
+        <StatCard
           label="Shards per PG (k+m)"
           value={cc.toString()}
           icon={<GitBranch size={14} />}
@@ -194,12 +319,112 @@ export default function PoolPlacement() {
           icon={<HardDrive size={14} />}
           hint={`overload ≥ ${overloadThresh.toFixed(1)}, underload ≤ ${underloadThresh.toFixed(1)}`}
         />
-        <StatCard
-          label="Active OSDs"
-          value={osdEntries.length.toString()}
-          icon={<HardDrive size={14} />}
-          hint={pool?.tier ? `tier=${pool.tier}` : undefined}
-        />
+      </div>
+
+      {/* Health: PGs by state, the list, one PG's detail */}
+      <div className="bg-surface rounded-lg border border-border overflow-hidden mb-4">
+        <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2 flex-wrap">
+          <h2 className="text-[12px] font-medium text-text-2 uppercase tracking-wide">
+            Placement group health
+          </h2>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <button
+              onClick={() => setStateFilter(null)}
+              className={`text-[11px] px-1.5 py-0.5 rounded border ${
+                stateFilter === null
+                  ? "bg-accent-soft text-accent border-accent/30"
+                  : "bg-surface-2 text-text-2 border-border"
+              }`}
+            >
+              All {pgCount}
+            </button>
+            {STATES.filter((s) => byState.has(s)).map((s) => (
+              <button
+                key={s}
+                onClick={() => setStateFilter(stateFilter === s ? null : s)}
+                className={`text-[11px] px-1.5 py-0.5 rounded border ${stateTone(s)} ${
+                  stateFilter === s ? "ring-1 ring-current" : ""
+                }`}
+              >
+                {s} {byState.get(s)}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+          <div className="overflow-auto border-r border-border" style={{ maxHeight: "360px" }}>
+            <table className="w-full text-[11px]">
+              <thead className="sticky top-0 bg-surface z-10 text-muted">
+                <tr className="border-b border-border">
+                  <th className="px-2 py-1 text-left font-normal">PG</th>
+                  <th className="px-2 py-1 text-left font-normal">State</th>
+                  <th className="px-2 py-1 text-right font-normal">Objects</th>
+                  <th className="px-2 py-1 text-right font-normal">Degraded</th>
+                  <th className="px-2 py-1 text-right font-normal">Unfound</th>
+                  <th className="px-2 py-1 text-right font-normal">Left</th>
+                  <th className="px-2 py-1 text-right font-normal">Scrubbed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {listed.map((pg) => {
+                  const st = pg.state;
+                  return (
+                    <tr
+                      key={pg.pg_id}
+                      onClick={() =>
+                        setSelectedPg(selectedPg === pg.pg_id ? null : pg.pg_id)
+                      }
+                      className={`cursor-pointer hover:bg-surface-2 ${
+                        selectedPg === pg.pg_id ? "bg-accent-soft" : ""
+                      }`}
+                    >
+                      <td className="px-2 py-0.5 font-mono text-text-2">{pg.pg_id}</td>
+                      <td className="px-2 py-0.5">
+                        <span className={`px-1 py-px rounded border text-[10px] ${stateTone(stateOf(pg))}`}>
+                          {stateOf(pg)}
+                        </span>
+                      </td>
+                      <td className="px-2 py-0.5 text-right font-mono">{st?.objects ?? "–"}</td>
+                      <td className={`px-2 py-0.5 text-right font-mono ${st?.objects_degraded ? "text-warn" : ""}`}>
+                        {st?.objects_degraded ?? "–"}
+                      </td>
+                      <td className={`px-2 py-0.5 text-right font-mono ${st?.objects_unfound ? "text-err font-semibold" : ""}`}>
+                        {st?.objects_unfound ?? "–"}
+                      </td>
+                      <td className="px-2 py-0.5 text-right font-mono">
+                        {st?.recovery.remaining ? st.recovery.remaining : "–"}
+                      </td>
+                      <td className="px-2 py-0.5 text-right text-faint">
+                        {pg.scrub?.running ? "running" : ago(pg.scrub?.last_complete ?? 0)}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {listed.length === 0 && !loading && (
+                  <tr>
+                    <td colSpan={7} className="px-3 py-6 text-center text-faint">
+                      No placement groups{stateFilter ? ` in state ${stateFilter}` : ""}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="p-3 text-[11px] overflow-auto" style={{ maxHeight: "360px" }}>
+            {detail ? (
+              <PgDetail
+                pg={detail}
+                osdName={osdName}
+                onScrub={() => scrubNow(detail)}
+                note={scrubNote}
+              />
+            ) : (
+              <div className="text-faint py-6 text-center">
+                Select a placement group to see its members, recovery and scrub.
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Per-OSD bar chart */}
@@ -305,11 +530,8 @@ export default function PoolPlacement() {
                 Clear PG filter
               </button>
             )}
-            <LegendSwatch color="bg-accent" label="member" />
-            <LegendSwatch
-              color="bg-warn-dot"
-              label="migrating-to"
-            />
+            <LegendSwatch color="bg-accent" label="acting" />
+            <LegendSwatch color="bg-warn-dot" label="moving to" />
           </div>
         </div>
         <div className="overflow-auto" style={{ maxHeight: "480px" }}>
@@ -334,7 +556,7 @@ export default function PoolPlacement() {
                   </th>
                 ))}
                 <th className="px-2 py-1 text-center text-muted font-normal border-b border-border">
-                  v
+                  epoch
                 </th>
               </tr>
             </thead>
@@ -343,18 +565,19 @@ export default function PoolPlacement() {
                 const row = new Array(osdEntries.length).fill(
                   0,
                 ) as Array<0 | 1 | 2>;
-                pg.osd_ids.forEach((osd) => {
+                const moving = movingTo(pg);
+                pg.acting.forEach((osd) => {
                   const i = osdIndex.get(osd);
                   if (i !== undefined) row[i] = 1;
                 });
-                pg.migrating_to_osd_ids.forEach((osd) => {
+                moving.forEach((osd) => {
                   const i = osdIndex.get(osd);
                   if (i !== undefined) row[i] = 2;
                 });
                 const hidden =
                   (selectedOsd &&
-                    !pg.osd_ids.includes(selectedOsd) &&
-                    !pg.migrating_to_osd_ids.includes(selectedOsd)) ||
+                    !pg.acting.includes(selectedOsd) &&
+                    !moving.includes(selectedOsd)) ||
                   (selectedPg !== null && pg.pg_id !== selectedPg);
                 if (hidden) return null;
                 return (
@@ -388,7 +611,7 @@ export default function PoolPlacement() {
                       </td>
                     ))}
                     <td className="px-2 py-0.5 font-mono text-faint">
-                      v{pg.version}
+                      {pg.epoch}
                     </td>
                   </tr>
                 );
@@ -406,6 +629,113 @@ export default function PoolPlacement() {
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** One PG: its members and what each lacks, recovery, and its scrub. */
+function PgDetail({
+  pg,
+  osdName,
+  onScrub,
+  note,
+}: {
+  pg: PlacementGroup;
+  osdName: Map<string, string>;
+  onScrub: () => void;
+  note: string | null;
+}) {
+  const st = pg.state;
+  const name = (id: string) => osdName.get(id) ?? id.slice(0, 8);
+  const member = new Map((st?.members ?? []).map((m) => [m.position, m]));
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold text-text">PG {pg.pg_id}</span>
+          <span className={`px-1 py-px rounded border text-[10px] ${stateTone(stateOf(pg))}`}>
+            {stateOf(pg)}
+          </span>
+          <span className="text-faint">epoch {pg.epoch}</span>
+          {st && <span className="text-faint">since {ago(st.since)}</span>}
+        </div>
+        <button
+          onClick={onScrub}
+          className="flex items-center gap-1 px-2 py-0.5 border border-border rounded text-[11px] text-text-2 hover:bg-surface-2"
+        >
+          <ScanSearch size={12} />
+          Scrub now
+        </button>
+      </div>
+      {note && <div className="text-[11px] text-muted">{note}</div>}
+      {st?.last_error && (
+        <div className="rounded border border-warn/30 bg-warn-soft px-2 py-1 text-warn">
+          {st.last_error}
+        </div>
+      )}
+      {st && (
+        <div className="grid grid-cols-3 gap-x-3 gap-y-0.5 text-text-2">
+          <span>objects {st.objects}</span>
+          <span>degraded {st.objects_degraded}</span>
+          <span className={st.objects_unfound ? "text-err font-semibold" : ""}>
+            unfound {st.objects_unfound}
+          </span>
+          <span>copies missing {st.copies_missing}</span>
+          <span>copies stale {st.copies_stale}</span>
+          <span>shards missing {st.shards_missing}</span>
+        </div>
+      )}
+      <table className="w-full">
+        <thead className="text-muted">
+          <tr className="border-b border-border">
+            <th className="text-left font-normal py-0.5">Pos</th>
+            <th className="text-left font-normal">OSD</th>
+            <th className="text-right font-normal">Missing</th>
+            <th className="text-right font-normal">Stale</th>
+            <th className="text-right font-normal">Shards</th>
+          </tr>
+        </thead>
+        <tbody>
+          {pg.acting.map((id, pos) => {
+            const m = member.get(pos);
+            const up = pg.up[pos];
+            const filling = pg.filling.find((f) => f.position === pos);
+            return (
+              <tr key={pos}>
+                <td className="font-mono py-0.5">{pos}</td>
+                <td className="font-mono">
+                  <span className={m && !m.answered ? "text-err" : ""}>{id ? name(id) : "—"}</span>
+                  {up && up !== id && <span className="text-warn"> → {name(up)}</span>}
+                  {filling && <span className="text-accent"> (filling from {name(filling.from)})</span>}
+                  {m && !m.answered && <span className="text-err"> down</span>}
+                </td>
+                <td className="text-right font-mono">{m?.copies_missing ?? "–"}</td>
+                <td className="text-right font-mono">{m?.copies_stale ?? "–"}</td>
+                <td className="text-right font-mono">{m?.shards_missing ?? "–"}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {st && (st.recovery.remaining > 0 || st.recovery.recovered > 0) && (
+        <div className="text-text-2">
+          recovery: {st.recovery.recovered} done, {st.recovery.remaining} left (
+          {bytes(st.recovery.bytes_remaining)}), at {st.recovery.cursor || "the start"}
+          {st.recovery.reserved_on.length > 0 &&
+            `, reserved on ${st.recovery.reserved_on.length} OSDs`}
+        </div>
+      )}
+      {st && st.recovery.unfound_keys.length > 0 && (
+        <div className="text-err">unfound: {st.recovery.unfound_keys.join(", ")}</div>
+      )}
+      <div className="text-text-2">
+        scrub:{" "}
+        {pg.scrub?.running
+          ? `running (${pg.scrub.members_done.length} of ${pg.acting.length} members through, ${bytes(pg.scrub.bytes)} read, ${pg.scrub.bad} bad)`
+          : pg.scrub?.requested
+            ? "requested"
+            : `last completed ${ago(pg.scrub?.last_complete ?? 0)}`}
       </div>
     </div>
   );
