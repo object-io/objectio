@@ -930,9 +930,17 @@ pub enum PgCmd {
         #[arg(long)]
         state: Option<String>,
     },
-    /// One placement group, with each member's part
+    /// One placement group, with each member's part and its scrub
     /// (GET /_admin/pools/{pool}/placement-groups/{pg_id})
     Get {
+        pg_id: u32,
+        #[arg(long, default_value = "default")]
+        pool: String,
+    },
+    /// Scrub a placement group now, before any merely due: every member
+    /// reads back its shards and checks them
+    /// (POST /_admin/pools/{pool}/placement-groups/{pg_id}/scrub)
+    Scrub {
         pg_id: u32,
         #[arg(long, default_value = "default")]
         pool: String,

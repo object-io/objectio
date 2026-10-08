@@ -609,6 +609,17 @@ impl MetadataService for MetaService {
         Self::get_placement_group(self, request).await
     }
 
+    async fn request_pg_scrub(
+        &self,
+        request: Request<objectio_proto::metadata::RequestPgScrubRequest>,
+    ) -> Result<Response<objectio_proto::metadata::RequestPgScrubResponse>, Status> {
+        let r = request.into_inner();
+        self.request_pg_scrub(&r.pool, r.pg_id).await?;
+        Ok(Response::new(
+            objectio_proto::metadata::RequestPgScrubResponse {},
+        ))
+    }
+
     async fn list_placement_groups(
         &self,
         request: Request<ListPlacementGroupsRequest>,

@@ -938,11 +938,33 @@ fn pg_state_json(s: Option<&objectio_proto::metadata::PgState>) -> serde_json::V
     })
 }
 
+/// A placement group's scrub (B31 phase 4), as JSON; null if none has run.
+fn pg_scrub_json(s: Option<&objectio_proto::metadata::PgScrub>) -> serde_json::Value {
+    let Some(s) = s else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "running": s.started_at > 0,
+        "requested": s.requested,
+        "epoch": s.epoch,
+        "started_at": s.started_at,
+        "last_complete": s.last_complete,
+        "members_done": s.done,
+        "cursors": s.cursors.iter()
+            .map(|(m, c)| (m.clone(), serde_json::Value::String(c.replace('\0', "/"))))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "bytes": s.bytes,
+        "shards": s.shards,
+        "bad": s.bad,
+    })
+}
+
 /// A placement group as JSON: epoch, acting and up sets, stand-ins being
-/// filled, and what peering last found.
+/// filled, what peering last found, and its scrub.
 fn pg_json(
     pg: &objectio_proto::metadata::PlacementGroup,
     state: Option<&objectio_proto::metadata::PgState>,
+    scrub: Option<&objectio_proto::metadata::PgScrub>,
 ) -> serde_json::Value {
     serde_json::json!({
         "pool": pg.pool,
@@ -957,6 +979,7 @@ fn pg_json(
         })).collect::<Vec<_>>(),
         "updated_at": pg.updated_at,
         "state": pg_state_json(state),
+        "scrub": pg_scrub_json(scrub),
     })
 }
 
@@ -981,9 +1004,39 @@ pub async fn admin_get_pool_placement_group(
         Ok(resp) => {
             let r = resp.into_inner();
             match r.pg.filter(|_| r.found) {
-                Some(pg) => Json(pg_json(&pg, r.state.as_ref())).into_response(),
+                Some(pg) => Json(pg_json(&pg, r.state.as_ref(), r.scrub.as_ref())).into_response(),
                 None => (StatusCode::NOT_FOUND, "Placement group not found").into_response(),
             }
+        }
+        Err(e) => meta_failure(&e),
+    }
+}
+
+/// `POST /_admin/pools/{name}/placement-groups/{pg_id}/scrub` — scrub the
+/// placement group before any merely due (B31 phase 4).
+pub async fn admin_scrub_pool_placement_group(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((name, pg_id)): Path<(String, u32)>,
+) -> Response {
+    use objectio_proto::metadata::RequestPgScrubRequest;
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    match state
+        .meta_client
+        .clone()
+        .request_pg_scrub(RequestPgScrubRequest { pool: name, pg_id })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"requested": true})),
+        )
+            .into_response(),
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, e.message().to_string()).into_response()
         }
         Err(e) => meta_failure(&e),
     }
@@ -1028,6 +1081,8 @@ pub async fn admin_list_pool_placement_groups(
             let r = resp.into_inner();
             let states: std::collections::HashMap<u32, &objectio_proto::metadata::PgState> =
                 r.states.iter().map(|s| (s.pg_id, s)).collect();
+            let scrubs: std::collections::HashMap<u32, &objectio_proto::metadata::PgScrub> =
+                r.scrubs.iter().map(|s| (s.pg_id, s)).collect();
             let mut by_state: std::collections::BTreeMap<String, u64> =
                 std::collections::BTreeMap::new();
             for pg in &r.pgs {
@@ -1039,7 +1094,13 @@ pub async fn admin_list_pool_placement_groups(
             let pgs: Vec<serde_json::Value> = r
                 .pgs
                 .iter()
-                .map(|pg| pg_json(pg, states.get(&pg.pg_id).copied()))
+                .map(|pg| {
+                    pg_json(
+                        pg,
+                        states.get(&pg.pg_id).copied(),
+                        scrubs.get(&pg.pg_id).copied(),
+                    )
+                })
                 .collect();
             Json(serde_json::json!({
                 "pgs": pgs,

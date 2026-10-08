@@ -197,6 +197,8 @@ service MetadataService {
     // balancer service; consumed by Gateway read/write paths.
     rpc GetPlacementGroup(GetPlacementGroupRequest) returns (GetPlacementGroupResponse);
     rpc ListPlacementGroups(ListPlacementGroupsRequest) returns (ListPlacementGroupsResponse);
+    // Scrub a placement group now rather than when next due (B31 phase 4).
+    rpc RequestPgScrub(RequestPgScrubRequest) returns (RequestPgScrubResponse);
 
     // Tenants (multi-tenancy)
     rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
@@ -2557,6 +2559,8 @@ message GetPlacementGroupResponse {
     bool found = 2;
     // What peering last found (B31 phase 2); unset if it hasn't run yet.
     PgState state = 3;
+    // Its scrub (B31 phase 4); unset if none has run.
+    PgScrub scrub = 4;
 }
 message ListPlacementGroupsRequest {
     string pool = 1;
@@ -2570,6 +2574,37 @@ message ListPlacementGroupsResponse {
     uint32 next_pg_id = 2;            // the next page's start_at; 0 = end of list
     // What peering last found for each PG listed that it has run on.
     repeated PgState states = 3;
+    // Each listed PG's scrub, where one has run or is running.
+    repeated PgScrub scrubs = 4;
+}
+
+message RequestPgScrubRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message RequestPgScrubResponse {}
+
+// A placement group's scrub (B31 phase 4): how far it got through each
+// member, so a new leader resumes, and when it last went through all of
+// them. Kept in Raft table `pg_scrub`.
+message PgScrub {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // The epoch the cursors are for: another starts the scrub again.
+    uint64 epoch = 3;
+    // Per member (hex node id): the last entry scrubbed; a member with
+    // none is not started, one in `done` is through.
+    map<string, string> cursors = 4;
+    repeated string done = 5;
+    // Unix s: when this scrub started, and when the last one finished.
+    uint64 started_at = 6;
+    uint64 last_complete = 7;
+    // In this scrub: shard bytes read, shards checked, shards bad.
+    uint64 bytes = 8;
+    uint64 shards = 9;
+    uint64 bad = 10;
+    // Asked for (RequestPgScrub): scrubbed before PGs merely due.
+    bool requested = 11;
 }
 
 // What peering found of a placement group (B31 phase 2, objectio-docs

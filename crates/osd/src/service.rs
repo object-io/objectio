@@ -46,6 +46,9 @@ use objectio_proto::storage::{
     ReadShardResponse,
     ResetChunkNotesRequest,
     ResetChunkNotesResponse,
+    ScrubBadShard,
+    ScrubPgRequest,
+    ScrubPgResponse,
     SetPgEpochsRequest,
     SetPgEpochsResponse,
     WriteShardRequest,
@@ -616,6 +619,64 @@ impl OsdService {
         }
     }
 
+    /// Scrub what entry `e` names on this OSD: read back each of its shards
+    /// here, checking it (a read that fails marks it corrupt), and add what
+    /// was read, and what is missing or bad, to `out`.
+    async fn scrub_entry(&self, e: &objectio_proto::storage::PgEntry, out: &mut ScrubPgResponse) {
+        let at = if e.version_id.is_empty() {
+            MetadataKey::object_meta(&e.bucket, &e.key)
+        } else {
+            MetadataKey::object_version(&e.bucket, &e.key, &e.version_id)
+        };
+        let Some(o) = self.stored_meta(&at).filter(|o| o.object_id == e.object_id) else {
+            return;
+        };
+        for stripe in crate::pg_index::own_stripes(&o) {
+            let mut mine: Vec<u32> = stripe
+                .shards
+                .iter()
+                .filter(|l| l.node_id.as_slice() == self.node_id.as_slice())
+                .map(|l| l.position)
+                .collect();
+            mine.sort_unstable();
+            mine.dedup();
+            let shard_object = if stripe.object_id.is_empty() {
+                o.object_id.clone()
+            } else {
+                stripe.object_id.clone()
+            };
+            for position in mine {
+                let id = objectio_proto::storage::ShardId {
+                    object_id: shard_object.clone(),
+                    stripe_id: stripe.stripe_id,
+                    position,
+                };
+                out.shards += 1;
+                let bad = match self.shards.state(&id) {
+                    objectio_proto::storage::ShardState::Missing => Some(false),
+                    objectio_proto::storage::ShardState::Corrupt => Some(true),
+                    objectio_proto::storage::ShardState::Ok => match self.shards.read(&id).await {
+                        Ok((data, _)) => {
+                            out.bytes += data.len() as u64;
+                            None
+                        }
+                        Err(_) => Some(true),
+                    },
+                };
+                if let Some(corrupt) = bad {
+                    out.bad.push(ScrubBadShard {
+                        bucket: e.bucket.clone(),
+                        key: e.key.clone(),
+                        version_id: e.version_id.clone(),
+                        stripe_id: stripe.stripe_id,
+                        position,
+                        corrupt,
+                    });
+                }
+            }
+        }
+    }
+
     /// Of the shard positions `bucket/key`'s current object (if it is still
     /// `object_id`) names on this OSD, how many it holds intact.
     fn held_here(&self, bucket: &str, key: &str, version_id: &str, object_id: &[u8]) -> u32 {
@@ -1051,6 +1112,48 @@ impl StorageService for OsdService {
             }
             Response::new(ListPgResponse { entries, next })
         }))
+    }
+
+    async fn scrub_pg(
+        &self,
+        request: Request<ScrubPgRequest>,
+    ) -> Result<Response<ScrubPgResponse>, Status> {
+        let r = request.into_inner();
+        let pg = (r.pool.clone(), r.pg_id);
+        let max_entries = if r.max_entries == 0 {
+            1000
+        } else {
+            r.max_entries.min(10_000)
+        } as usize;
+        let mut out = ScrubPgResponse::default();
+        let mut after = r.after.clone();
+        // A page of entries at a time, until the byte budget is spent or
+        // the PG ends; `next` is the last entry looked at.
+        'pages: loop {
+            let (entries, next) = blocking(|| self.pg_index.list(&pg, &after, 256));
+            for e in &entries {
+                after = if e.version_id.is_empty() {
+                    format!("{}\0{}", e.bucket, e.key)
+                } else {
+                    format!("{}\0{}\0{}", e.bucket, e.key, e.version_id)
+                };
+                out.entries += 1;
+                if !e.tombstone && e.named_here > 0 {
+                    self.scrub_entry(e, &mut out).await;
+                }
+                if out.entries as usize >= max_entries
+                    || (r.max_bytes > 0 && out.bytes >= r.max_bytes)
+                {
+                    break 'pages;
+                }
+            }
+            if next.is_empty() {
+                after.clear();
+                break;
+            }
+        }
+        out.next = after;
+        Ok(Response::new(out))
     }
 
     async fn check_shards(

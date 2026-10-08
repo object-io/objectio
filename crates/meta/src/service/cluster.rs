@@ -1951,10 +1951,12 @@ impl MetaService {
         let pg = self.placement_group(&req.pool, req.pg_id);
         let found = pg.is_some();
         let state = self.pg_state(&req.pool, req.pg_id);
+        let scrub = self.pg_scrub(&req.pool, req.pg_id);
         Ok(Response::new(GetPlacementGroupResponse {
             pg,
             found,
             state,
+            scrub,
         }))
     }
 
@@ -1984,10 +1986,16 @@ impl MetaService {
             .iter()
             .filter_map(|pg| all_states.remove(&pg.pg_id))
             .collect();
+        let mut all_scrubs = self.pg_scrubs(&req.pool);
+        let scrubs = pgs
+            .iter()
+            .filter_map(|pg| all_scrubs.remove(&pg.pg_id))
+            .collect();
         Ok(Response::new(ListPlacementGroupsResponse {
             pgs,
             next_pg_id,
             states,
+            scrubs,
         }))
     }
 
@@ -2117,6 +2125,17 @@ impl MetaService {
         request: Request<objectio_proto::metadata::HealEnqueueRequest>,
     ) -> Result<Response<objectio_proto::metadata::HealEnqueueResponse>, Status> {
         let req = request.into_inner();
+        // A key in a placement group is its PG's (B31 phase 4): marked, its
+        // PG is peered by listing, its copies brought to agree by recovery
+        // and its listing entry by the peering. The queue is for keys
+        // written before placement groups (the rolling upgrade's; it goes
+        // in the release after).
+        if self.key_pg(&req.bucket, &req.key).is_some() {
+            self.mark_key_dirty(&req.bucket, &req.key);
+            return Ok(Response::new(
+                objectio_proto::metadata::HealEnqueueResponse {},
+            ));
+        }
         let key = heal_key(&req.bucket, &req.key, &req.version_id);
         // Always a fresh, unclaimed entry: a heal in progress finds it
         // changed when done, and the key is healed again.

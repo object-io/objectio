@@ -681,6 +681,27 @@ pub async fn pg(cmd: PgCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                                 .join(", ")
                         );
                     }
+                    let sc = &v["scrub"];
+                    if !sc.is_null() {
+                        let _ = writeln!(
+                            s,
+                            "scrub: {}, last completed {}, {} shards and {} bytes checked, {} bad",
+                            if sc["running"].as_bool().unwrap_or(false) {
+                                "running"
+                            } else if sc["requested"].as_bool().unwrap_or(false) {
+                                "requested"
+                            } else {
+                                "idle"
+                            },
+                            match sc["last_complete"].as_u64() {
+                                Some(t) if t > 0 => t.to_string(),
+                                _ => "never".to_string(),
+                            },
+                            cell(&sc["shards"]),
+                            cell(&sc["bytes"]),
+                            cell(&sc["bad"])
+                        );
+                    }
                     let members = rows_of(st, "members");
                     if !members.is_empty() {
                         s.push('\n');
@@ -698,6 +719,24 @@ pub async fn pg(cmd: PgCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                     }
                 }
                 s
+            })?;
+        }
+        PgCmd::Scrub { pg_id, pool } => {
+            let v = ctx
+                .api
+                .call(
+                    "POST",
+                    &format!(
+                        "/_admin/pools/{}/placement-groups/{pg_id}/scrub",
+                        seg(&pool)
+                    ),
+                    &[],
+                    crate::http::Body::Empty,
+                )
+                .await?
+                .json()?;
+            ctx.out.emit(&v, |_| {
+                format!("pg {pool}/{pg_id}: scrub requested (obioctl pg get {pg_id} --pool {pool} shows it)")
             })?;
         }
     }

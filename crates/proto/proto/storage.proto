@@ -76,6 +76,11 @@ service StorageService {
     rpc GetPgInfo(GetPgInfoRequest) returns (GetPgInfoResponse);
     rpc ListPg(ListPgRequest) returns (ListPgResponse);
 
+    // Scrub (B31 phase 4): read back the shards this OSD holds of a
+    // placement group's objects, a page at a time from `after`, checking
+    // each against its checksum; a shard that fails is marked corrupt.
+    rpc ScrubPg(ScrubPgRequest) returns (ScrubPgResponse);
+
     // Dedup dry-run: record chunk fingerprints this OSD is primary for and
     // say which it had already seen; and forget them all, to start a new
     // measurement window.
@@ -185,6 +190,35 @@ message PgEntry {
     // while versioning was off); empty for the key's current object or
     // delete. Each version is an entry of its own.
     string version_id = 13;
+}
+
+message ScrubPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // As ListPg's: the last entry of the previous page; empty: from the start.
+    string after = 3;
+    // Stop once this many shard bytes were read (0: no limit), or this
+    // many entries were looked at (0: 1000).
+    uint64 max_bytes = 4;
+    uint32 max_entries = 5;
+}
+message ScrubPgResponse {
+    // For the next page; empty after the last.
+    string next = 1;
+    uint32 entries = 2;
+    uint32 shards = 3;
+    uint64 bytes = 4;
+    repeated ScrubBadShard bad = 5;
+}
+// A shard an object's metadata copy here names on this OSD that it doesn't
+// hold (`corrupt` false), or holds and fails its checksum.
+message ScrubBadShard {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;
+    uint64 stripe_id = 4;
+    uint32 position = 5;
+    bool corrupt = 6;
 }
 
 message GetPgInfoRequest {
