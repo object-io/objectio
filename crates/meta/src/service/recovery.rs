@@ -132,6 +132,26 @@ const BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// The wait before the next pass after `n` in a row that got nowhere.
+/// A PG out of Clean this long goes ahead of every PG that hasn't waited
+/// as long, oldest first, whatever its copies to spare.
+const AGED_SECS: u64 = 900;
+
+/// The order PGs are recovered in (lowest first): fewest copies to spare,
+/// recovery before a move, longest waiting. One that has waited
+/// [`AGED_SECS`] goes first: with writes going on, PGs that keep falling
+/// back to one or two objects short (spare -1) otherwise always come
+/// first, and a lost drive's PGs left with only their fill to finish
+/// waited forever behind them, so its evacuation never ended (soak run 20:
+/// 256 empty PGs waited 90 minutes and counting).
+fn rank(spare: i64, degraded: bool, since: u64, now: u64) -> (i64, u8, u64) {
+    let spare = if since > 0 && now.saturating_sub(since) >= AGED_SECS {
+        i64::MIN
+    } else {
+        spare
+    };
+    (spare, u8::from(!degraded), since)
+}
+
 fn backoff_after(n: u32) -> Duration {
     BACKOFF_BASE
         .saturating_mul(1u32 << n.min(16))
@@ -619,7 +639,7 @@ impl MetaService {
             return None;
         }
         let spare = state.map_or(i64::MAX, |s| s.min_spare);
-        Some((spare, u8::from(!degraded), state.map_or(0, |s| s.since)))
+        Some(rank(spare, degraded, state.map_or(0, |s| s.since), now))
     }
 
     /// Whether `w`'s newest copy, as the plan listed it, has been replaced
@@ -2255,6 +2275,22 @@ async fn delete_meta(
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+
+    #[test]
+    fn a_pg_that_has_waited_long_goes_first_oldest_first() {
+        let now = 10_000;
+        // Fresh: fewest to spare first, recovery before a move.
+        let short = rank(-1, true, now - 60, now);
+        let moving = rank(1, false, now - 120, now);
+        assert!(short < moving);
+        // Waited 15 minutes: ahead of the short one, and of one waiting less.
+        let aged = rank(1, false, now - AGED_SECS, now);
+        let older = rank(1, false, now - AGED_SECS - 600, now);
+        assert!(aged < short);
+        assert!(older < aged);
+        // No time recorded: not aged.
+        assert_eq!(rank(2, true, 0, now), (2, 0, 0));
+    }
 
     #[test]
     fn passes_that_get_nowhere_wait_longer_each_time_up_to_five_minutes() {
