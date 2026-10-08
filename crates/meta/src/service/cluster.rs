@@ -1658,6 +1658,19 @@ impl MetaService {
                 pool.name
             )));
         }
+        // LRC and replication aren't released: repair rebuilds MDS stripes
+        // only, and a pool whose lost shards are never rebuilt loses
+        // protection with every failure until data is lost (B10).
+        if pool.ec_type() != ErasureType::ErasureMds
+            && !super::ALLOW_UNREPAIRED_SCHEMES.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Status::failed_precondition(format!(
+                "pool '{}': LRC and replicated pools are not available yet: their repair is \
+                 not built, so lost shards or copies would never be rebuilt. Use erasure \
+                 coding (ec_type 0).",
+                pool.name
+            )));
+        }
         let mut pool = pool;
         // From level 7 every pool places through placement groups (B31): a
         // pool made without a count gets the default, and one that names no

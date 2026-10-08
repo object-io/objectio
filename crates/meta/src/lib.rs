@@ -102,6 +102,12 @@ pub struct Args {
     #[arg(long, default_value_t = 30)]
     pub drain_interval_secs: u64,
 
+    /// Let pools be made with LRC or replication. Not released: repair
+    /// rebuilds MDS stripes only, so a lost shard or copy of theirs would
+    /// never be rebuilt (B10). For developing and testing those schemes.
+    #[arg(long, hide = true)]
+    pub allow_unrepaired_schemes: bool,
+
     /// Snapshot the state machine, and compact the Raft log into it, every
     /// this many log entries (B18). A snapshot is the whole metadata
     /// database (a listing entry per object), so not too often.
@@ -197,6 +203,20 @@ pub async fn run(
 
     // Initialize metadata service with EC config
     // Replication mode takes precedence over EC settings
+    crate::service::ALLOW_UNREPAIRED_SCHEMES.store(
+        args.allow_unrepaired_schemes,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // One copy (aio's single-disk default) promises no protection, so
+    // there is nothing for repair to keep; two or more would promise what
+    // nothing keeps.
+    if args.replication.is_some_and(|n| n >= 2) && !args.allow_unrepaired_schemes {
+        anyhow::bail!(
+            "--replication {} is not available yet: repair rebuilds erasure-coded stripes \
+             only, so a lost copy would never be rebuilt (B10). Use --ec-k / --ec-m.",
+            args.replication.unwrap_or_default()
+        );
+    }
     let ec_config = if let Some(replication_count) = args.replication {
         info!("Storage mode: Replication (count={})", replication_count);
         objectio_meta_store::EcConfig::Replication {

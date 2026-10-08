@@ -594,8 +594,16 @@ fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
         assert_eq!(c.request("PUT", &format!("/owner/k{i}"), b).status, 200);
     }
     ha.start_osd(0, None);
-    // Rounds of the degraded worker (every 5 s).
-    std::thread::sleep(Duration::from_secs(30));
+    // Until the degraded worker has repaired every one of them.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ha.meta_metric("objectio_meta_degraded_objects") != Some(0.0) {
+        assert!(
+            Instant::now() < deadline,
+            "still degraded after 120 s: {:?}",
+            ha.meta_metric("objectio_meta_degraded_objects")
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
     ha.stop_osd(4);
     ha.stop_osd(5);
     let c = &ha.clients[0];
