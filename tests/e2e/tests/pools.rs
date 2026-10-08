@@ -168,8 +168,10 @@ fn a_pool_made_without_a_count_is_sized_from_its_drives() {
             .unwrap()
             .iter()
             .find(|p| p["name"] == name)
-            .map(|p| p["pg_count"].as_u64().unwrap_or_default())
-            .unwrap_or_else(|| panic!("no pool {name}: {pools}"))
+            .map_or_else(
+                || panic!("no pool {name}: {pools}"),
+                |p| p["pg_count"].as_u64().unwrap_or_default(),
+            )
     };
     assert_eq!(pg_count("small"), 256);
     // 1000 members a drive: 3 * 1000 / 3 = 1000 PGs, rounded up to 1024.
