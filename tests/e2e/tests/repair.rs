@@ -622,13 +622,20 @@ fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
         assert_eq!(c.request("PUT", &format!("/owner/k{i}"), b).status, 200);
     }
     ha.start_osd(0, None);
-    // Until the degraded worker has repaired every one of them.
+    // Until every one of them is repaired: no degraded record left, and
+    // (keys in placement groups mark their PG rather than keep a record)
+    // every PG Clean.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while ha.meta_metric("objectio_meta_degraded_objects") != Some(0.0) {
+    let repaired = |ha: &HaCluster| {
+        ha.meta_metric("objectio_meta_degraded_objects") == Some(0.0)
+            && ha.meta_metric("objectio_meta_pgs_not_clean") == Some(0.0)
+    };
+    while !repaired(&ha) {
         assert!(
             Instant::now() < deadline,
-            "still degraded after 120 s: {:?}",
-            ha.meta_metric("objectio_meta_degraded_objects")
+            "still degraded after 120 s: {:?} records, {:?} PGs not Clean",
+            ha.meta_metric("objectio_meta_degraded_objects"),
+            ha.meta_metric("objectio_meta_pgs_not_clean")
         );
         std::thread::sleep(Duration::from_secs(2));
     }

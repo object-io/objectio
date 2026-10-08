@@ -622,6 +622,39 @@ impl MetaService {
         Some((spare, u8::from(!degraded), state.map_or(0, |s| s.since)))
     }
 
+    /// Whether `w`'s newest copy, as the plan listed it, has been replaced
+    /// since: Some(true) if a member answering holds a newer write or a
+    /// newer delete of the key, or none holds it any more; Some(false) if
+    /// it is still the newest; None if no member answered.
+    async fn superseded(&self, members: &[Option<String>], w: &Work) -> Option<bool> {
+        let listed = (
+            w.newest.stamp,
+            w.newest.object_id.as_slice(),
+            w.newest.update_stamp,
+        );
+        let mut answered = 0;
+        let mut holds = false;
+        for address in members.iter().flatten() {
+            let Ok((object, deleted_at)) =
+                key_state(address, &w.bucket, &w.key, &w.version_id).await
+            else {
+                continue;
+            };
+            answered += 1;
+            if deleted_at > w.newest.stamp {
+                return Some(true);
+            }
+            if let Some(o) = object {
+                let held = (o.stamp, o.object_id.as_slice(), o.update_stamp);
+                if held > listed {
+                    return Some(true);
+                }
+                holds |= held == listed;
+            }
+        }
+        (answered > 0).then_some(!holds)
+    }
+
     /// Recover one placement group, its OSDs reserved: move it to its up set
     /// if it is to move, plan, work every object, record progress, then
     /// peer it.
@@ -762,6 +795,13 @@ impl MetaService {
                     }
                     Outcome::Partial | Outcome::Changed => {}
                     Outcome::Unfound(stripe_id, good, needed) => {
+                        // Fewer than k shards of a copy a client has since
+                        // overwritten or deleted (which freed them) is not
+                        // lost: soak run 19 recorded a key deleted five
+                        // minutes before as lost.
+                        if self.superseded(&plan.members, w).await != Some(false) {
+                            continue;
+                        }
                         let name = w.name();
                         lost.push((
                             name.clone(),
@@ -2017,6 +2057,32 @@ async fn whole_copy(
     .map_err(|_| anyhow::anyhow!("timed out"))??
     .into_inner();
     Ok(r.object.filter(|_| r.found))
+}
+
+/// What the OSD at `address` holds of a key: its copy, if any, and the
+/// stamp of the newest delete it applied (0 for none).
+async fn key_state(
+    address: &str,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> anyhow::Result<(Option<ObjectMeta>, u64)> {
+    let channel = crate::drain_observer::open_channel(address).await?;
+    let r = tokio::time::timeout(
+        RPC_TIMEOUT,
+        StorageServiceClient::new(channel)
+            .max_decoding_message_size(100 * 1024 * 1024)
+            .get_object_meta(GetObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+                with_small_shard: false,
+            }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out"))??
+    .into_inner();
+    Ok((r.object.filter(|_| r.found), r.tombstone_stamp))
 }
 
 /// Whether the OSD at `address` holds each of `positions` of a stripe.
