@@ -224,7 +224,12 @@ fn group_active_by_level(
 ) -> BTreeMap<String, Vec<NodeId>> {
     let mut out: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     for node in topology.active_nodes() {
-        let key = node.failure_domain.at_level(level).to_string();
+        // Finer than a host, each OSD is its own domain: `at_level` has no
+        // name for that level, and every OSD would fall into one group.
+        let key = match level {
+            FailureDomain::Node | FailureDomain::Disk => node.id.to_string(),
+            _ => node.failure_domain.at_level(level).to_string(),
+        };
         out.entry(key).or_default().push(node.id);
     }
     out
