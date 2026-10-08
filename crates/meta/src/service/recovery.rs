@@ -376,6 +376,27 @@ fn rebuild_slots(id: &[u8], permits: usize) -> Arc<tokio::sync::Semaphore> {
         .clone()
 }
 
+/// A rebuild slot on each of the OSDs `ids`, taken in one order for every
+/// caller (by id, each once): taken in each PG's acting order, two PGs on
+/// the same OSDs each held slots the other waited for, and both waited
+/// for ever (soak run 20: two PGs' backfills stopped with 1827 objects
+/// left).
+async fn take_rebuild_slots(
+    ids: &[&[u8]],
+    permits: usize,
+) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut slots = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Ok(permit) = rebuild_slots(id, permits).acquire_owned().await {
+            slots.push(permit);
+        }
+    }
+    slots
+}
+
 /// Removes a PG from [`BUSY`] when its recovery ends, however it ends.
 struct Busy((String, u32));
 
@@ -1179,15 +1200,14 @@ impl MetaService {
             .map(|w| -> futures::future::BoxFuture<'_, Outcome> {
                 Box::pin(async move {
                     // A rebuild slot on every member it writes to.
-                    let mut slots = Vec::new();
-                    for (id, member) in pg.acting.iter().zip(members) {
-                        if member.is_none() {
-                            continue;
-                        }
-                        if let Ok(permit) = rebuild_slots(id, permits).acquire_owned().await {
-                            slots.push(permit);
-                        }
-                    }
+                    let ids: Vec<&[u8]> = pg
+                        .acting
+                        .iter()
+                        .zip(members)
+                        .filter(|(_, member)| member.is_some())
+                        .map(|(id, _)| id.as_slice())
+                        .collect();
+                    let slots = take_rebuild_slots(&ids, permits).await;
                     let outcome = self.recover_object(pg, members, &w).await;
                     drop(slots);
                     outcome
@@ -2275,6 +2295,35 @@ async fn delete_meta(
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+
+    /// Many objects of two PGs on the same OSDs, listed in opposite orders,
+    /// take their slots at once: none waits for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuild_slots_taken_in_any_order_never_deadlock() {
+        let a = b"slots-test-osd-a".to_vec();
+        let b = b"slots-test-osd-b".to_vec();
+        let c = b"slots-test-osd-c".to_vec();
+        let mut tasks = Vec::new();
+        for i in 0..64 {
+            let order: Vec<Vec<u8>> = if i % 2 == 0 {
+                vec![a.clone(), b.clone(), c.clone()]
+            } else {
+                vec![c.clone(), b.clone(), a.clone()]
+            };
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..50 {
+                    let ids: Vec<&[u8]> = order.iter().map(Vec::as_slice).collect();
+                    let slots = take_rebuild_slots(&ids, 2).await;
+                    assert_eq!(slots.len(), 3);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        let all = futures::future::join_all(tasks);
+        tokio::time::timeout(Duration::from_secs(20), all)
+            .await
+            .expect("rebuild slots deadlocked");
+    }
 
     #[test]
     fn a_pg_that_has_waited_long_goes_first_oldest_first() {

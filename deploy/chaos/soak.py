@@ -263,7 +263,9 @@ def pg_health():
 # The run fails on recovery that is stuck, not on recovery that is slow:
 # the pool's placement groups out of Clean while, for STALL_MAX_SECS with
 # every OSD up, neither their objects degraded fell below their lowest nor
-# any object was recovered (B31, objectio-docs core/pg-recovery.md). Per
+# meta's count of objects recovered moved (B31, objectio-docs
+# core/pg-recovery.md). A PG's own counts only change when its pass ends,
+# and a pass can take an hour on these disks. Per
 # pool, not per PG: a lost drive's replacement is in every PG of the lab's
 # 6 hosts, so its PGs backfill a few at a time and the rest queue (run
 # 19). How fast it gets back to Clean is B24's to measure on real disks;
@@ -272,10 +274,23 @@ def pg_health():
 STALL_MAX_SECS = int(os.environ.get("STALL_MAX_SECS", "1800"))
 NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", "10800"))
 last_osd_down = [time.monotonic()]
-# (lowest objects degraded, most recovered, when either last moved), since
+# (lowest objects degraded, objects recovered, when either last moved), since
 # the pool last was all Clean
 pool_mark = [None]
 all_clean_since = [None]  # when the pool last left all Clean: None = all Clean
+
+
+def recovered_total():
+    """Meta's objectio_meta_pg_recovered_objects_total, through a gateway;
+    None if no gateway answers with it."""
+    for url in GW:
+        status, body = http("GET", f"{url}/metrics", timeout=10)
+        if status != 200:
+            continue
+        for line in body.decode(errors="replace").splitlines():
+            if line.startswith("objectio_meta_pg_recovered_objects_total"):
+                return int(float(line.rsplit(" ", 1)[1]))
+    return None
 
 
 def pg_watch():
@@ -304,12 +319,13 @@ def pg_watch():
         if all_clean_since[0] is None:
             all_clean_since[0] = now
         degraded = sum(s.get("objects_degraded", 0) for s in out)
-        recovered = sum((s.get("recovery") or {}).get("recovered", 0) for s in states)
+        # A counter on the leader: any change is progress (a new leader
+        # starts it again).
+        recovered = recovered_total()
         mark = pool_mark[0]
-        if mark is None or degraded < mark[0] or recovered > mark[1]:
+        if mark is None or degraded < mark[0] or recovered != mark[1]:
             low = degraded if mark is None else min(degraded, mark[0])
-            most = recovered if mark is None else max(recovered, mark[1])
-            pool_mark[0] = (low, most, now)
+            pool_mark[0] = (low, recovered, now)
             continue
         stalled = now - mark[2]
         all_up_for = now - last_osd_down[0]
