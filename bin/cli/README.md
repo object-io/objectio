@@ -136,7 +136,8 @@ Secrets are printed only once, when they are created: by `key create`,
 | `node list` / `show ID\|NAME` | `GET /_admin/nodes` |
 | `osd set-state ID in\|out\|draining` | `PUT /_admin/osds/ID/admin-state` |
 | `pool list` / `show` / `create` / `update` (only the fields given) / `delete` | `/_admin/pools[/N]` |
-| `pool placement-groups N [--start-after --max]` | `GET /_admin/pools/N/placement-groups` |
+| `pool placement-groups N [--start-at --max]` | `GET /_admin/pools/N/placement-groups` |
+| `pg list [--pool P --state S]` (every page; a count by state, then each PG's state and what its members lack) / `pg get PG [--pool P]` (each member's part) | `GET /_admin/pools/P/placement-groups[/PG]` |
 | `kms status`, `kms keys list` / `create [--key-id --description]` / `show K` | `/_admin/kms/status`, `/_admin/kms/keys[/K]` |
 | `warehouse list [--tenant]` / `create N [--property k=v --tenant]` / `delete N` | `/_admin/warehouses[/N]` |
 | `config list [--prefix]` / `get K` / `set K --value J \| --file F` / `delete K` | `/_admin/config[/K]` |

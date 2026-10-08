@@ -1940,7 +1940,12 @@ impl MetaService {
         let req = request.into_inner();
         let pg = self.placement_group(&req.pool, req.pg_id);
         let found = pg.is_some();
-        Ok(Response::new(GetPlacementGroupResponse { pg, found }))
+        let state = self.pg_state(&req.pool, req.pg_id);
+        Ok(Response::new(GetPlacementGroupResponse {
+            pg,
+            found,
+            state,
+        }))
     }
 
     pub(crate) async fn list_placement_groups(
@@ -1953,8 +1958,9 @@ impl MetaService {
         } else {
             (req.max_results as usize).min(10_000)
         };
-        let map = self.placement_groups.read();
-        let mut pgs: Vec<PlacementGroup> = map
+        let mut pgs: Vec<PlacementGroup> = self
+            .placement_groups
+            .read()
             .iter()
             .filter(|((p, id), _)| p == &req.pool && *id >= req.start_at_pg_id)
             .map(|(_, v)| v.clone())
@@ -1963,9 +1969,15 @@ impl MetaService {
         // The first PG not listed starts the next page.
         let next_pg_id = pgs.get(max).map_or(0, |p| p.pg_id);
         pgs.truncate(max);
+        let mut all_states = self.pg_states(&req.pool);
+        let states = pgs
+            .iter()
+            .filter_map(|pg| all_states.remove(&pg.pg_id))
+            .collect();
         Ok(Response::new(ListPlacementGroupsResponse {
             pgs,
             next_pg_id,
+            states,
         }))
     }
 

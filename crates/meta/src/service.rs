@@ -12,6 +12,7 @@ mod kms;
 mod multipart;
 mod objects;
 mod packs;
+pub(crate) mod peering;
 pub(crate) mod pgs;
 mod tenants;
 mod unity;

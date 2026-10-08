@@ -153,6 +153,11 @@ pub enum Command {
         #[command(subcommand)]
         action: PoolCmd,
     },
+    /// Placement groups and what peering last found of them (system admin)
+    Pg {
+        #[command(subcommand)]
+        action: PgCmd,
+    },
     /// Key management (SSE-KMS)
     Kms {
         #[command(subcommand)]
@@ -910,6 +915,27 @@ pub enum PoolCmd {
         start_at: Option<u32>,
         #[arg(long)]
         max: Option<u32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PgCmd {
+    /// Every placement group of a pool, its state and what its members
+    /// lack (GET /_admin/pools/{pool}/placement-groups, every page)
+    List {
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// Only placement groups in this state (Clean, Degraded,
+        /// Undersized, Incomplete, Down)
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// One placement group, with each member's part
+    /// (GET /_admin/pools/{pool}/placement-groups/{pg_id})
+    Get {
+        pg_id: u32,
+        #[arg(long, default_value = "default")]
+        pool: String,
     },
 }
 

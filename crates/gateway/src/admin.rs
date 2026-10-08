@@ -894,10 +894,95 @@ pub async fn admin_get_pool(
     }
 }
 
+/// What peering last found of a placement group (B31 phase 2), as JSON;
+/// null if it hasn't run on it yet.
+fn pg_state_json(s: Option<&objectio_proto::metadata::PgState>) -> serde_json::Value {
+    let Some(s) = s else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "state": s.state,
+        "epoch": s.epoch,
+        "objects": s.objects,
+        "tombstones": s.tombstones,
+        "objects_degraded": s.objects_degraded,
+        "objects_unfound": s.objects_unfound,
+        "copies_missing": s.copies_missing,
+        "copies_stale": s.copies_stale,
+        "shards_missing": s.shards_missing,
+        "members_down": s.members_down,
+        "remapped": s.remapped,
+        "by_summary": s.by_summary,
+        "last_error": s.last_error,
+        "since": s.since,
+        "computed_at": s.computed_at,
+        "members": s.members.iter().map(|m| serde_json::json!({
+            "node_id": hex::encode(&m.node_id),
+            "position": m.position,
+            "answered": m.answered,
+            "copies_missing": m.copies_missing,
+            "copies_stale": m.copies_stale,
+            "shards_missing": m.shards_missing,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A placement group as JSON: epoch, acting and up sets, stand-ins being
+/// filled, and what peering last found.
+fn pg_json(
+    pg: &objectio_proto::metadata::PlacementGroup,
+    state: Option<&objectio_proto::metadata::PgState>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pool": pg.pool,
+        "pg_id": pg.pg_id,
+        "epoch": pg.epoch,
+        "acting": pg.acting.iter().map(hex::encode).collect::<Vec<_>>(),
+        "up": pg.up.iter().map(hex::encode).collect::<Vec<_>>(),
+        "filling": pg.filling.iter().map(|f| serde_json::json!({
+            "position": f.position,
+            "from": hex::encode(&f.from),
+            "epoch": f.epoch,
+        })).collect::<Vec<_>>(),
+        "updated_at": pg.updated_at,
+        "state": pg_state_json(state),
+    })
+}
+
+/// `GET /_admin/pools/{name}/placement-groups/{pg_id}` — one placement
+/// group and what peering last found of it (B31).
+pub async fn admin_get_pool_placement_group(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((name, pg_id)): Path<(String, u32)>,
+) -> Response {
+    use objectio_proto::metadata::GetPlacementGroupRequest;
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    match state
+        .meta_client
+        .clone()
+        .get_placement_group(GetPlacementGroupRequest { pool: name, pg_id })
+        .await
+    {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            match r.pg.filter(|_| r.found) {
+                Some(pg) => Json(pg_json(&pg, r.state.as_ref())).into_response(),
+                None => (StatusCode::NOT_FOUND, "Placement group not found").into_response(),
+            }
+        }
+        Err(e) => meta_failure(&e),
+    }
+}
+
 /// `GET /_admin/pools/{name}/placement-groups[?start_at=N&max=1000]`
 /// — paginated listing of a pool's placement groups: epoch, acting and up
-/// sets, stand-ins being filled (B31). `next_pg_id` starts the next page.
-/// Feeds the console's PG view.
+/// sets, stand-ins being filled, what peering last found (B31), and how
+/// many of the listed PGs are in each state. `next_pg_id` starts the next
+/// page. Feeds the console's PG view.
 pub async fn admin_list_pool_placement_groups(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -930,27 +1015,24 @@ pub async fn admin_list_pool_placement_groups(
     {
         Ok(resp) => {
             let r = resp.into_inner();
+            let states: std::collections::HashMap<u32, &objectio_proto::metadata::PgState> =
+                r.states.iter().map(|s| (s.pg_id, s)).collect();
+            let mut by_state: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for pg in &r.pgs {
+                let st = states
+                    .get(&pg.pg_id)
+                    .map_or_else(|| "Unknown".to_string(), |s| s.state.clone());
+                *by_state.entry(st).or_default() += 1;
+            }
             let pgs: Vec<serde_json::Value> = r
                 .pgs
                 .iter()
-                .map(|pg| {
-                    serde_json::json!({
-                        "pool": pg.pool,
-                        "pg_id": pg.pg_id,
-                        "epoch": pg.epoch,
-                        "acting": pg.acting.iter().map(hex::encode).collect::<Vec<_>>(),
-                        "up": pg.up.iter().map(hex::encode).collect::<Vec<_>>(),
-                        "filling": pg.filling.iter().map(|f| serde_json::json!({
-                            "position": f.position,
-                            "from": hex::encode(&f.from),
-                            "epoch": f.epoch,
-                        })).collect::<Vec<_>>(),
-                        "updated_at": pg.updated_at,
-                    })
-                })
+                .map(|pg| pg_json(pg, states.get(&pg.pg_id).copied()))
                 .collect();
             Json(serde_json::json!({
                 "pgs": pgs,
+                "by_state": by_state,
                 "next_pg_id": r.next_pg_id,
             }))
             .into_response()

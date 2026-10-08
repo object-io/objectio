@@ -2,8 +2,8 @@
 
 use super::{Ctx, escape_path, format_size, key_values, parse_size, q, read_json, seg};
 use crate::cli::{
-    ClusterCmd, ConfigCmd, KmsCmd, KmsKeysCmd, MetricsCmd, NodeCmd, OsdCmd, PoolCmd, PoolFields,
-    RebalanceCmd, UpgradeCmd, WarehouseCmd,
+    ClusterCmd, ConfigCmd, KmsCmd, KmsKeysCmd, MetricsCmd, NodeCmd, OsdCmd, PgCmd, PoolCmd,
+    PoolFields, RebalanceCmd, UpgradeCmd, WarehouseCmd,
 };
 use crate::output::{cell, key_values as kv, rows_of, table, ts};
 use anyhow::{Context, Result, anyhow, bail};
@@ -543,6 +543,130 @@ pub async fn pool(cmd: PoolCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                 };
                 if v["next_pg_id"].as_u64().is_some_and(|n| n > 0) {
                     let _ = writeln!(s, "\nmore: --start-at {}", cell(&v["next_pg_id"]));
+                }
+                s
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// `obioctl pg`: placement groups and what peering last found (B31).
+pub async fn pg(cmd: PgCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
+    match cmd {
+        PgCmd::List { pool, state } => {
+            let mut pgs: Vec<Value> = Vec::new();
+            let mut start_at = 0u64;
+            loop {
+                let v = ctx
+                    .api
+                    .get(
+                        &format!("/_admin/pools/{}/placement-groups", seg(&pool)),
+                        &[("start_at".to_string(), start_at.to_string())],
+                    )
+                    .await?;
+                pgs.extend(rows_of(&v, "pgs"));
+                match v["next_pg_id"].as_u64() {
+                    Some(n) if n > 0 => start_at = n,
+                    _ => break,
+                }
+            }
+            let state_of = |p: &Value| {
+                p["state"]["state"]
+                    .as_str()
+                    .unwrap_or("Unknown")
+                    .to_string()
+            };
+            let mut by_state: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for p in &pgs {
+                *by_state.entry(state_of(p)).or_default() += 1;
+            }
+            if let Some(want) = &state {
+                pgs.retain(|p| state_of(p).eq_ignore_ascii_case(want));
+            }
+            let v = json!({ "pgs": pgs, "by_state": by_state });
+            ctx.out.emit(&v, |v| {
+                let rows = rows_of(v, "pgs");
+                let mut s = String::new();
+                let summary: Vec<String> = v["by_state"]
+                    .as_object()
+                    .map(|m| m.iter().map(|(k, n)| format!("{k}: {n}")).collect())
+                    .unwrap_or_default();
+                let _ = writeln!(s, "{}\n", summary.join(", "));
+                if rows.is_empty() {
+                    s.push_str("No placement groups.\n");
+                } else {
+                    s.push_str(&table(
+                        &rows,
+                        &[
+                            ("PG", "pg_id"),
+                            ("STATE", "state.state"),
+                            ("EPOCH", "epoch"),
+                            ("OBJECTS", "state.objects"),
+                            ("DEGRADED", "state.objects_degraded"),
+                            ("UNFOUND", "state.objects_unfound"),
+                            ("MISSING", "state.copies_missing"),
+                            ("STALE", "state.copies_stale"),
+                            ("SHARDS", "state.shards_missing"),
+                            ("DOWN", "state.members_down"),
+                        ],
+                    ));
+                }
+                s
+            })?;
+        }
+        PgCmd::Get { pg_id, pool } => {
+            let v = ctx
+                .api
+                .get(
+                    &format!("/_admin/pools/{}/placement-groups/{pg_id}", seg(&pool)),
+                    &[],
+                )
+                .await?;
+            ctx.out.emit(&v, |v| {
+                let mut s = String::new();
+                let st = &v["state"];
+                let _ = writeln!(
+                    s,
+                    "pg {}/{}  epoch {}  {}",
+                    cell(&v["pool"]),
+                    cell(&v["pg_id"]),
+                    cell(&v["epoch"]),
+                    st["state"].as_str().unwrap_or("not peered yet")
+                );
+                if !st.is_null() {
+                    let _ = writeln!(
+                        s,
+                        "objects {}  degraded {}  unfound {}  copies missing {}  stale {}  \
+                         shards missing {}{}",
+                        cell(&st["objects"]),
+                        cell(&st["objects_degraded"]),
+                        cell(&st["objects_unfound"]),
+                        cell(&st["copies_missing"]),
+                        cell(&st["copies_stale"]),
+                        cell(&st["shards_missing"]),
+                        st["last_error"]
+                            .as_str()
+                            .filter(|e| !e.is_empty())
+                            .map(|e| format!("\nlast error: {e}"))
+                            .unwrap_or_default()
+                    );
+                    let members = rows_of(st, "members");
+                    if !members.is_empty() {
+                        s.push('\n');
+                        s.push_str(&table(
+                            &members,
+                            &[
+                                ("POS", "position"),
+                                ("OSD", "node_id"),
+                                ("ANSWERED", "answered"),
+                                ("MISSING", "copies_missing"),
+                                ("STALE", "copies_stale"),
+                                ("SHARDS", "shards_missing"),
+                            ],
+                        ));
+                    }
                 }
                 s
             })?;

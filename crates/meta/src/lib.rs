@@ -383,6 +383,7 @@ pub async fn run(
     // Placement groups (B31): the default pool, stand-ins committed for
     // acting members that can't take writes, and stand-ins filled.
     service::pgs::spawn(meta_service.clone());
+    service::peering::spawn(meta_service.clone());
     repair::spawn(
         meta_service.clone(),
         std::time::Duration::from_secs(args.repair_interval_secs),
@@ -573,6 +574,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     writeln!(output, "objectio_meta_osds_total {}", stats.osd_count).unwrap();
     repair::render_metrics(&mut output);
     service::pgs::render_metrics(&mut output);
+    service::peering::render_metrics(&mut output);
 
     // User counts
     writeln!(output, "# HELP objectio_meta_users_total Total users").unwrap();

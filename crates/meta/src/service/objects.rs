@@ -135,6 +135,9 @@ impl MetaService {
             .as_ref()
             .and_then(|s| s.read_degraded(&record_key));
         let new_degraded = degraded_record(&req, now);
+        if new_degraded.is_some() {
+            self.mark_key_dirty(&req.bucket, &req.key);
+        }
         let current_degraded = current_degraded.filter(|c| {
             new_degraded.is_some()
                 || objectio_proto::metadata::DegradedObject::decode(c.as_slice())
@@ -646,6 +649,7 @@ impl MetaService {
             ));
         }
         let key = format!("{}/{}", req.bucket, req.key);
+        self.mark_key_dirty(&req.bucket, &req.key);
 
         if self
             .store

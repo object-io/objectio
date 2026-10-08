@@ -1246,6 +1246,10 @@ pub async fn run(
             "/_admin/pools/{name}/placement-groups",
             get(admin::admin_list_pool_placement_groups),
         )
+        .route(
+            "/_admin/pools/{name}/placement-groups/{pg_id}",
+            get(admin::admin_get_pool_placement_group),
+        )
         .route("/_admin/tenants", get(admin::admin_list_tenants))
         .route("/_admin/tenants", post(admin::admin_create_tenant))
         .route("/_admin/tenants/{name}", get(admin::admin_get_tenant))
