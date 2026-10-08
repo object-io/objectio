@@ -239,16 +239,13 @@ fn rot(path: &std::path::Path, needle: &[u8]) -> bool {
     false
 }
 
-/// Rot nobody reads is found by the scrubber and rebuilt in place, and the
-/// object reads back correctly throughout.
+/// Rot nobody reads is found by its placement group's scrub (B31 phase 4),
+/// which reads every member's shards back and checks them, and rebuilt by
+/// the PG's recovery; the object reads back correctly throughout. The
+/// OSDs' own scrubber is off: the PG scrub finds it by itself.
 #[test]
 fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
-    let c = Cluster::start_with_ec_and_args(
-        6,
-        4,
-        2,
-        &["--repair-interval-secs", "1", "--scrub-interval-secs", "1"],
-    );
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--scrub-interval-secs", "0"]);
     c.json("POST", "/_admin/buckets", json!({"name": "rot"}))
         .expect_ok();
     let body = payload(400_000, 0x5a);
@@ -259,11 +256,31 @@ fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
     let rotted = (0..6).any(|i| rot(&c.osd_disk(i), needle));
     assert!(rotted, "shard bytes not found on any disk");
 
-    // Found by the walk (the scrubber marked it), rebuilt by its placement
-    // group's recovery (B31 phase 3a).
+    // The PG holding it (the only one with an object) scrubbed now.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pg = loop {
+        let pgs = c
+            .request("GET", "/_admin/pools/default/placement-groups", &[])
+            .json();
+        if let Some(id) = pgs["pgs"].as_array().and_then(|a| {
+            a.iter()
+                .find(|p| p["state"]["objects"].as_u64().unwrap_or(0) > 0)
+                .and_then(|p| p["pg_id"].as_u64())
+        }) {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "no PG holds the object: {pgs}");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let r = c.request(
+        "POST",
+        &format!("/_admin/pools/default/placement-groups/{pg}/scrub"),
+        &[],
+    );
+    assert_eq!(r.status, 202, "{}", r.text());
     await_metric(
         &c,
-        "objectio_meta_repair_shards_found_bad_total",
+        "objectio_meta_scrub_shards_bad_total",
         &["reason=\"corrupt\""],
         1,
         Duration::from_secs(120),
@@ -747,7 +764,15 @@ fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
     let got = c.request("GET", "/heal/k", &[]);
     assert_eq!(got.status, 200, "{}", got.text());
     assert_eq!(got.bytes, body);
-    std::thread::sleep(Duration::from_secs(15));
+    // Until its placement group's recovery has rebuilt it.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ha
+        .meta_metric("objectio_meta_pg_recovered_shards_total")
+        .is_none_or(|n| n < 0.5)
+    {
+        assert!(Instant::now() < deadline, "never rebuilt");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     // Two other OSDs down: it reads only if position 0 is back.
     for i in (0..6).filter(|&i| i != holder).take(2) {

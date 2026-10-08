@@ -172,13 +172,15 @@ fn healing_brings_a_returning_copy_up_to_date_and_frees_space() {
     ha.start_osd(2, None);
     let c = &ha.clients[0];
 
-    // Both keys healed.
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    while healed(c) < 2 {
+    // Both keys healed: every copy agrees again, brought up to date by
+    // the keys' placement group (B31 phase 4).
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !(agree(&ha, "a") && agree(&ha, "d")) {
         assert!(
             std::time::Instant::now() < deadline,
-            "never healed: {}",
-            healed(c)
+            "never healed: a {:?}, d {:?}",
+            copies(&ha, "a"),
+            copies(&ha, "d")
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -193,13 +195,37 @@ fn healing_brings_a_returning_copy_up_to_date_and_frees_space() {
     );
 }
 
-fn healed(c: &objectio_e2e::Cluster) -> u64 {
-    c.request("GET", "/metrics", &[])
-        .text()
-        .lines()
-        .filter(|l| l.starts_with("objectio_gateway_heal_total{result=\"healed\"}"))
-        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
-        .sum()
+/// Each OSD's copy of `quorum/key`: its object id, or None.
+fn copies(ha: &HaCluster, key: &str) -> Vec<Option<Vec<u8>>> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    (0..6)
+        .map(|i| {
+            let address = ha.osd_endpoint(i).trim_start_matches("http://").to_string();
+            rt.block_on(async {
+                let r = StorageServiceClient::new(objectio_e2e::tls::channel(&address).await.ok()?)
+                    .get_object_meta(GetObjectMetaRequest {
+                        bucket: "quorum".to_string(),
+                        key: key.to_string(),
+                        version_id: String::new(),
+                        with_small_shard: false,
+                    })
+                    .await
+                    .ok()?
+                    .into_inner();
+                let found = r.found;
+                r.object.filter(|_| found).map(|o| o.object_id)
+            })
+        })
+        .collect()
+}
+
+/// Whether every OSD's copy of `quorum/key` is the same: one object, or
+/// none (deleted).
+fn agree(ha: &HaCluster, key: &str) -> bool {
+    let all = copies(ha, key);
+    all.windows(2).all(|w| w[0] == w[1])
 }
 
 /// A delete refused (503) after it reached some copies, short of the
@@ -232,12 +258,12 @@ fn a_refused_delete_that_reached_some_copies_is_healed() {
     for i in 3..6 {
         ha.start_osd(i, None);
     }
-    let c = &ha.clients[0];
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    while healed(c) < 1 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !agree(&ha, "d") {
         assert!(
             std::time::Instant::now() < deadline,
-            "the refused delete was never healed"
+            "the refused delete was never healed: {:?}",
+            copies(&ha, "d")
         );
         std::thread::sleep(Duration::from_millis(500));
     }
