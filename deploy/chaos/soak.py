@@ -260,26 +260,28 @@ def pg_health():
     return None
 
 
-# The run fails on recovery that is stuck, not on recovery that is slow: a
-# placement group out of Clean whose objects degraded haven't fallen below
-# their lowest since it left Clean for STALL_MAX_SECS, while every OSD was
-# up (B31, objectio-docs core/pg-recovery.md). How fast it gets back to
-# Clean is B24's to measure on real disks; here it is logged, and only a
-# ceiling (NOT_CLEAN_MAX_SECS) fails the run. The time a fault had an OSD
-# down doesn't count. Run 18's drive-lost took 61 minutes on the VMs'
-# shared disks (67-94% iowait), every group progressing.
+# The run fails on recovery that is stuck, not on recovery that is slow:
+# the pool's placement groups out of Clean while, for STALL_MAX_SECS with
+# every OSD up, neither their objects degraded fell below their lowest nor
+# any object was recovered (B31, objectio-docs core/pg-recovery.md). Per
+# pool, not per PG: a lost drive's replacement is in every PG of the lab's
+# 6 hosts, so its PGs backfill a few at a time and the rest queue (run
+# 19). How fast it gets back to Clean is B24's to measure on real disks;
+# here it is logged, and only a ceiling (NOT_CLEAN_MAX_SECS) fails the
+# run. Run 18's drive-lost took 61 minutes on the VMs' shared disks.
 STALL_MAX_SECS = int(os.environ.get("STALL_MAX_SECS", "1800"))
 NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", "10800"))
 last_osd_down = [time.monotonic()]
-# pg id -> (lowest objects degraded since it left Clean, when it got there)
-pg_low = {}
-all_clean_since = [None]  # when every PG was last seen out of Clean: None = all Clean
+# (lowest objects degraded, most recovered, when either last moved), since
+# the pool last was all Clean
+pool_mark = [None]
+all_clean_since = [None]  # when the pool last left all Clean: None = all Clean
 
 
 def pg_watch():
-    """Every minute: each placement group's progress, and the run failed
-    when one is stuck (above). Logs how long the pool took to get back to
-    all Clean."""
+    """Every minute: the pool's recovery progress, and the run failed when
+    it is stuck (above). Logs how long the pool took to get back to all
+    Clean."""
     while not stop.wait(60):
         if not POOL:
             continue
@@ -291,33 +293,34 @@ def pg_watch():
         if not pgs:
             continue
         now = time.monotonic()
-        if any((p.get("state") or {}).get("members_down", 0) > 0 for p in pgs):
-            last_osd_down[0] = now
-        all_up_for = now - last_osd_down[0]
-        out = [p for p in pgs if (p.get("state") or {}).get("state") != "Clean"]
-        if out and all_clean_since[0] is None:
-            all_clean_since[0] = now
-        if not out and all_clean_since[0] is not None:
-            say(f"pgs: all {len(pgs)} Clean again after {int(now - all_clean_since[0])} s")
+        states = [p.get("state") or {} for p in pgs]
+        out = [s for s in states if s.get("state") != "Clean"]
+        if not out:
+            if all_clean_since[0] is not None:
+                say(f"pgs: all {len(pgs)} Clean again after {int(now - all_clean_since[0])} s")
             all_clean_since[0] = None
-        for p in pgs:
-            st, pid = p.get("state") or {}, p["pg_id"]
-            if st.get("state") == "Clean":
-                pg_low.pop(pid, None)
-                continue
-            degraded = st.get("objects_degraded", 0)
-            low = pg_low.get(pid)
-            if low is None or degraded < low[0]:
-                pg_low[pid] = (degraded, now)
-                continue
-            stalled = now - low[1]
-            if stalled > STALL_MAX_SECS and all_up_for > STALL_MAX_SECS:
-                say(f"pg {POOL}/{pid}: {st.get('state')}, {degraded} degraded, no progress "
-                    f"for {int(stalled)} s: {json.dumps({k: v for k, v in st.items() if k != 'members'})[:600]}")
-                print(f"✗ placement group {POOL}/{pid} made no progress for {int(stalled)} s "
-                      f"with every OSD up for {int(all_up_for)} s", flush=True)
-                OPLOG.flush()
-                os._exit(1)
+            pool_mark[0] = None
+            continue
+        if all_clean_since[0] is None:
+            all_clean_since[0] = now
+        degraded = sum(s.get("objects_degraded", 0) for s in out)
+        recovered = sum((s.get("recovery") or {}).get("recovered", 0) for s in states)
+        mark = pool_mark[0]
+        if mark is None or degraded < mark[0] or recovered > mark[1]:
+            low = degraded if mark is None else min(degraded, mark[0])
+            most = recovered if mark is None else max(recovered, mark[1])
+            pool_mark[0] = (low, most, now)
+            continue
+        stalled = now - mark[2]
+        all_up_for = now - last_osd_down[0]
+        if stalled > STALL_MAX_SECS and all_up_for > STALL_MAX_SECS:
+            worst = max(out, key=lambda s: s.get("objects_degraded", 0))
+            say(f"pool {POOL}: {len(out)} PGs out of Clean, {degraded} objects degraded; e.g. "
+                f"{json.dumps({k: v for k, v in worst.items() if k != 'members'})[:600]}")
+            print(f"✗ pool {POOL}'s recovery made no progress for {int(stalled)} s "
+                  f"with every OSD up for {int(all_up_for)} s", flush=True)
+            OPLOG.flush()
+            os._exit(1)
 
 
 def progress():
