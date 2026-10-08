@@ -93,6 +93,7 @@ pub async fn rewrite_shard(
         stripe.ec_k,
         stripe.ec_m,
         None,
+        None,
     )
     .await
     {
@@ -144,4 +145,50 @@ pub fn maybe_lost<T>(call: &str, answer: Result<T, tonic::Status>) -> Result<T, 
         }
         _ => answer,
     }
+}
+
+/// PUTs to hold, by "bucket/key", after they are placed: how long.
+static HOLD_PLACED: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(serde::Deserialize)]
+pub struct HoldPlaced {
+    bucket: String,
+    key: String,
+    millis: u64,
+}
+
+/// `POST /_admin/test/hold-placed`: the next PUT of `bucket/key` waits
+/// `millis` between being placed and writing anything, so a test can change
+/// the placement group's acting set meanwhile (B31): the write is then
+/// placed under an epoch that is no longer current.
+pub async fn hold_placed(
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<HoldPlaced>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    HOLD_PLACED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((format!("{}/{}", req.bucket, req.key), req.millis));
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Wait, if a test asked the next PUT of `bucket/key` to (only ever with
+/// `--test-hooks`).
+pub async fn held_after_placement(bucket: &str, key: &str) {
+    let millis = {
+        let mut held = HOLD_PLACED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = format!("{bucket}/{key}");
+        let Some(i) = held.iter().position(|(k, _)| *k == name) else {
+            return;
+        };
+        held.remove(i).1
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }

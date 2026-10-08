@@ -497,12 +497,12 @@ pub async fn pool(cmd: PoolCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         }
         PoolCmd::PlacementGroups {
             name,
-            start_after,
+            start_at,
             max,
         } => {
             let mut query = Vec::new();
-            if let Some(s) = start_after {
-                query.push(("start_after".to_string(), s.to_string()));
+            if let Some(s) = start_at {
+                query.push(("start_at".to_string(), s.to_string()));
             }
             if let Some(m) = max {
                 query.push(("max".to_string(), m.to_string()));
@@ -523,14 +523,14 @@ pub async fn pool(cmd: PoolCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
                         &rows,
                         &[
                             ("PG", "pg_id"),
-                            ("VERSION", "version"),
-                            ("OSDS", "osd_ids"),
-                            ("MIGRATING TO", "migrating_to_osd_ids"),
+                            ("EPOCH", "epoch"),
+                            ("ACTING", "acting"),
+                            ("UP", "up"),
                         ],
                     )
                 };
                 if v["next_pg_id"].as_u64().is_some_and(|n| n > 0) {
-                    let _ = writeln!(s, "\nmore: --start-after {}", cell(&v["next_pg_id"]));
+                    let _ = writeln!(s, "\nmore: --start-at {}", cell(&v["next_pg_id"]));
                 }
                 s
             })?;

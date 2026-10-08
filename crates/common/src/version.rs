@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 4 | meta's Raft log in files of its own, not in its database (objectio-docs `core/meta-log.md`): a meta node of the previous release would find its log empty |
 /// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
 /// | 6 | multipart uploads kept, marked as being completed, until their object is stored: a meta node of the previous release would take one for open and let an abort free the parts of a stored object |
-pub const FORMAT_LEVEL: u32 = 6;
+/// | 7 | every key placed through a placement group whose acting set and epoch are committed before use (objectio-docs `core/pg-recovery.md`, B31): a meta node of the previous release would place the default pool's keys elsewhere |
+pub const FORMAT_LEVEL: u32 = 7;
 
 /// The level from which small shards are kept in the OSDs' metadata
 /// records and sent with their object's metadata (B21).
@@ -33,6 +34,12 @@ pub const SMALL_SHARDS_LEVEL: u32 = 5;
 /// The level from which a multipart completion is two-phase: meta keeps the
 /// upload, marked as being completed, until the gateway settles it.
 pub const COMPLETED_UPLOADS_LEVEL: u32 = 6;
+
+/// The level from which every key is placed through a placement group
+/// (B31): the default pool has PGs, acting sets are committed with an
+/// epoch before use, and OSDs refuse requests placed under an older epoch.
+/// Keys written before it keep the placement they were written with.
+pub const PG_PLACEMENT_LEVEL: u32 = 7;
 
 /// The largest shard kept in an OSD's metadata record rather than a disk
 /// block (B21): a 64 KiB object's shards with 4+2.

@@ -63,6 +63,12 @@ pub fn forget(bucket: &str, key: &str) {
     lock().remove(&cache_key(bucket, key));
 }
 
+/// Forget every answer naming placement group `pool/pg_id` (B31): an OSD
+/// refused a request placed under one of its epochs as old.
+pub fn forget_pg(pool: &str, pg_id: u32) {
+    lock().retain(|_, (_, p)| !(p.pool == pool && p.pg_id == pg_id));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

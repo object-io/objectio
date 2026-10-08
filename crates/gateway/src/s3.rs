@@ -484,12 +484,6 @@ pub async fn post_object(
 // List Object Versions
 // ============================================================================
 
-/// The OSDs `nodes` (a placement) puts an ObjectMeta on, by position: what
-/// meta records as the key's home when the write lands.
-fn home_of(nodes: &[objectio_proto::metadata::NodePlacement]) -> Vec<Vec<u8>> {
-    nodes.iter().map(|n| n.node_id.clone()).collect()
-}
-
 /// Helper to get the primary OSD placement for an object
 pub(crate) async fn get_placement_nodes_for_object(
     state: &AppState,

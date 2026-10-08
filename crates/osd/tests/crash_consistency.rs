@@ -307,6 +307,7 @@ async fn write_one(osd: &OsdService, n: u64) -> Acked {
         }),
         rdma: None,
         use_reserve: false,
+        pg: None,
     }))
     .await
     .unwrap();

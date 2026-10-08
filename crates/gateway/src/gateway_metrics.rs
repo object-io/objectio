@@ -30,6 +30,7 @@ static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static HEAL_QUEUED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static HEALED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static QUOTA_REFUSALS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
+static STALE_PLACEMENTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_CHUNKS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static DEDUP_BYTES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
@@ -226,6 +227,12 @@ pub fn record_heal(result: &str) {
     HEALED.inc(&format!("result=\"{result}\""));
 }
 
+/// A PUT placed again: an OSD refused it as placed under an older epoch of
+/// its placement group than it knew (B31).
+pub fn record_stale_placement() {
+    STALE_PLACEMENTS.inc("request=\"put\"");
+}
+
 /// A write refused for passing a quota: `scope` is `bucket` or `tenant`.
 pub fn record_quota_refusal(scope: &str) {
     QUOTA_REFUSALS.inc(&format!("scope=\"{scope}\""));
@@ -359,6 +366,11 @@ pub fn render() -> String {
         &mut out,
         "objectio_s3_quota_refusals_total",
         "Writes refused for passing a bucket's or tenant's quota",
+    );
+    STALE_PLACEMENTS.render(
+        &mut out,
+        "objectio_gateway_stale_placement_total",
+        "Requests placed again because an OSD knew a newer epoch of their placement group",
     );
     SHARDS_RECLAIMED.render(
         &mut out,

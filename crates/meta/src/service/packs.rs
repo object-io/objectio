@@ -653,7 +653,7 @@ impl MetaService {
                     let pg_id = objectio_placement::jump_consistent_hash(h, pg_count as i32) as u32;
                     return self
                         .placement_group(&pool, pg_id)
-                        .and_then(|pg| pg.osd_ids.first().cloned())
+                        .and_then(|pg| pg.acting.first().cloned())
                         .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
                         .and_then(|id| self.osd_address_by_id(&id).map(|a| (a, id.to_vec())))
                         .unwrap_or_default();

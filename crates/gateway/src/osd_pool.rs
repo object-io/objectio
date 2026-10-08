@@ -38,6 +38,40 @@ pub enum OsdPoolError {
     /// This gateway's clock is too far from meta's to stamp a write.
     #[error("{0}")]
     ClockSkew(String),
+
+    /// The OSD knows a newer epoch of the placement group than the write
+    /// was placed under (B31): it was refused, and is placed again.
+    #[error("{0}")]
+    StaleEpoch(String),
+}
+
+/// Marks a response to a request refused because an OSD knew a newer
+/// epoch of its placement group than it was placed under (B31): nothing
+/// was stored, and the request can be placed again and retried.
+#[derive(Clone, Copy, Debug)]
+pub struct StalePlacement;
+
+/// Whether `status` is an OSD refusing a request placed under an older
+/// epoch of its placement group than it knows (B31).
+#[must_use]
+pub fn is_stale_epoch(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(objectio_proto::STALE_EPOCH_HEADER)
+        .is_some()
+}
+
+/// The placement group and epoch a placement is, for the requests that
+/// write by it (B31). None for one made without a placement group.
+#[must_use]
+pub fn pg_ref(
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+) -> Option<objectio_proto::storage::PgRef> {
+    (placement.pg_epoch > 0).then(|| objectio_proto::storage::PgRef {
+        pool: placement.pool.clone(),
+        pg_id: placement.pg_id,
+        epoch: placement.pg_epoch,
+    })
 }
 
 /// Node identifier (16-byte UUID)
@@ -608,6 +642,12 @@ impl OsdPoolError {
     pub const fn is_full(&self) -> bool {
         matches!(self, Self::Full(_))
     }
+
+    /// Whether this is an OSD refusing a write placed under an old epoch.
+    #[must_use]
+    pub const fn is_stale_epoch(&self) -> bool {
+        matches!(self, Self::StaleEpoch(_))
+    }
 }
 
 impl From<ShardCallError> for OsdPoolError {
@@ -617,6 +657,9 @@ impl From<ShardCallError> for OsdPoolError {
             ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
             ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
                 Self::Full(s.message().to_string())
+            }
+            ShardCallError::Status(s) if is_stale_epoch(&s) => {
+                Self::StaleEpoch(s.message().to_string())
             }
             ShardCallError::Status(s) => Self::ConnectionFailed(s.to_string()),
         }
@@ -752,6 +795,7 @@ pub async fn write_shard_to_osd(
     ec_k: u32,
     ec_m: u32,
     rdma: Option<RdmaSource<'_>>,
+    pg: Option<&objectio_proto::storage::PgRef>,
 ) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
     use objectio_proto::storage::{Checksum, RdmaBuffer, ShardId, WriteShardRequest};
 
@@ -781,6 +825,7 @@ pub async fn write_shard_to_osd(
                         len: data.len() as u64,
                     }),
                     use_reserve: false,
+                    pg: pg.cloned(),
                 };
                 match call_write_shard(pool, placement, request).await {
                     Ok(location) => {
@@ -816,6 +861,7 @@ pub async fn write_shard_to_osd(
         data,
         rdma: None,
         use_reserve: false,
+        pg: pg.cloned(),
     };
     let location = call_write_shard(pool, placement, request)
         .await
@@ -1111,6 +1157,8 @@ pub struct MetaWrite<'a> {
     pub small_shards: Option<&'a HashMap<Vec<u8>, objectio_proto::storage::SmallShard>>,
     /// The fewest copies the write needs, if more than the metadata quorum.
     pub min_copies: usize,
+    /// The placement group and epoch the write was placed under (B31).
+    pub pg: Option<&'a objectio_proto::storage::PgRef>,
 }
 
 /// As [`put_object_meta_to_all`], with every option the OSD takes.
@@ -1130,6 +1178,7 @@ pub async fn put_object_meta_with(
         keep_newer_current,
         small_shards,
         min_copies,
+        pg,
     } = write;
 
     let targets = unique_node_placements(placements);
@@ -1201,6 +1250,7 @@ pub async fn put_object_meta_with(
                 object: Some(object_meta.clone()),
                 versioning_enabled,
                 expected_object_id: expected_object_id.to_vec(),
+                pg: pg.cloned(),
             };
             let p = placement.clone();
             // The bool on an error: this replica certainly did not apply it.
@@ -1231,6 +1281,9 @@ pub async fn put_object_meta_with(
                             e.code(),
                             tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
                         );
+                        if is_stale_epoch(&e) {
+                            return (OsdPoolError::StaleEpoch(e.message().to_string()), true);
+                        }
                         (OsdPoolError::ConnectionFailed(e.to_string()), refused)
                     })?
                     .into_inner();
@@ -1853,6 +1906,7 @@ pub async fn delete_meta_from_all(
     bucket: &str,
     key: &str,
     version_id: &str,
+    pg: Option<&objectio_proto::storage::PgRef>,
 ) -> MetaDeleted {
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
@@ -1880,6 +1934,7 @@ pub async fn delete_meta_from_all(
                 key: key.to_string(),
                 version_id: version_id.to_string(),
                 stamp,
+                pg: pg.cloned(),
                 ..Default::default()
             });
             let resp = tokio::time::timeout(

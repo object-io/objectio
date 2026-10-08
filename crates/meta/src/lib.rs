@@ -380,6 +380,9 @@ pub async fn run(
     // tick. Currently observational (Phase 4a); execution lands with
     // the Phase 5 migration path.
     balancer::spawn(meta_service.clone());
+    // Placement groups (B31): the default pool, stand-ins committed for
+    // acting members that can't take writes, and stand-ins filled.
+    service::pgs::spawn(meta_service.clone());
     repair::spawn(
         meta_service.clone(),
         std::time::Duration::from_secs(args.repair_interval_secs),

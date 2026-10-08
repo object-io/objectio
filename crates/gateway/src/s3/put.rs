@@ -224,6 +224,7 @@ pub(crate) async fn commit_replica(
     small: Option<&SmallShards>,
 ) -> Result<(), CommitRefused> {
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
+    let pg = crate::osd_pool::pg_ref(placement);
     let written = crate::osd_pool::put_object_meta_with(
         &state.osd_pool,
         &placement.nodes,
@@ -236,6 +237,7 @@ pub(crate) async fn commit_replica(
             // A small replica's shards go with its metadata too (B21).
             small_shards: small.map(|s| &s.shards),
             min_copies: small.map_or(0, |s| s.quorum),
+            pg: pg.as_ref(),
             ..Default::default()
         },
     )
@@ -320,10 +322,12 @@ pub(crate) async fn commit_new(
 ) -> Result<(), CommitRefused> {
     // Small shards travel with the metadata (B21): each copy is a shard
     // too, so the write needs the shard quorum (k + 1) as well.
+    let pg = crate::osd_pool::pg_ref(placement);
     let write = crate::osd_pool::MetaWrite {
         versioning_enabled,
         small_shards: small.map(|s| &s.shards),
         min_copies: small.map_or(0, |s| s.quorum),
+        pg: pg.as_ref(),
         ..Default::default()
     };
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
@@ -340,7 +344,6 @@ pub(crate) async fn commit_new(
         object_id: object_meta.object_id.clone(),
         pg_id: placement.pg_id,
         pool: placement.pool.clone(),
-        home_osd_ids: home_of(nodes),
         if_match: condition.if_match.clone().unwrap_or_default(),
         if_none_match: condition.if_none_match.clone().unwrap_or_default(),
     };
@@ -587,9 +590,58 @@ pub(crate) fn settle_commit(
     }
 }
 
+/// The 503 for a stripe whose writes OSDs refused as placed under an old
+/// epoch of its placement group (B31): marked, so the PUT is placed again.
+fn stale_placement(stripe: usize) -> Response {
+    let mut resp = S3Error::xml_response(
+        "ServiceUnavailable",
+        &format!(
+            "stripe {stripe}: the placement group's acting set changed while it was written; retry"
+        ),
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    resp.extensions_mut()
+        .insert(crate::osd_pool::StalePlacement);
+    resp
+}
+
+/// PUT, placed again once when an OSD refused it as placed under an older
+/// epoch of its placement group than it knows (B31): the acting set changed
+/// between placing and writing, and nothing was stored. The client never
+/// sees that.
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let first = put_object_placed(
+        Arc::clone(&state),
+        bucket.clone(),
+        key.clone(),
+        auth.clone(),
+        headers.clone(),
+        body.clone(),
+    )
+    .await;
+    if first
+        .extensions()
+        .get::<crate::osd_pool::StalePlacement>()
+        .is_none()
+    {
+        return first;
+    }
+    crate::gateway_metrics::record_stale_placement();
+    crate::placement_cache::forget(&bucket, &key);
+    tracing::info!("{bucket}/{key}: placed under an old epoch; placed again");
+    put_object_placed(state, bucket, key, auth, headers, body).await
+}
+
+async fn put_object_placed(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
     body: Bytes,
@@ -854,6 +906,10 @@ pub async fn put_object(
             return meta_failure(&e, "Failed to get placement");
         }
     };
+    crate::test_hooks::held_after_placement(&bucket, &key).await;
+    // Every write below names the placement group and epoch it was placed
+    // under (B31): an OSD that knows a newer one refuses it.
+    let pg = crate::osd_pool::pg_ref(&placement);
     phases.mark("meta_lookup");
 
     // If-Match / If-None-Match: refused now if the current object already
@@ -930,6 +986,7 @@ pub async fn put_object(
                 let shard_data = stripe_data.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
+                let pg = pg.clone();
                 pending.sent(&placement_node, &obj_id, s_idx, pos);
 
                 write_futures.push(async move {
@@ -943,6 +1000,7 @@ pub async fn put_object(
                         1,    // ec_k=1 for replication (full data)
                         0,    // ec_m=0 for replication (no parity)
                         None, // Replicated stripes go over gRPC.
+                        pg.as_ref(),
                     )
                     .await;
                     (pos, result, placement_node)
@@ -955,6 +1013,7 @@ pub async fn put_object(
             let mut shard_locs = Vec::with_capacity(total_replicas);
 
             let mut full = false;
+            let mut stale = false;
             for (pos, result, placement_node) in results {
                 match result {
                     Ok((location, crc32c)) => {
@@ -975,6 +1034,7 @@ pub async fn put_object(
                     }
                     Err(e) => {
                         full |= e.is_full();
+                        stale |= e.is_stale_epoch();
                         warn!(
                             "Failed to write stripe {} replica {} to {}: {}",
                             stripe_idx, pos, placement_node.node_address, e
@@ -993,6 +1053,9 @@ pub async fn put_object(
                 );
                 if full {
                     return S3Error::storage_full();
+                }
+                if stale {
+                    return stale_placement(stripe_idx);
                 }
                 return S3Error::xml_response(
                     "ServiceUnavailable",
@@ -1390,6 +1453,7 @@ pub async fn put_object(
             let shard_data = shard.clone();
             let pos = i as u32;
             let s_idx = stripe_idx as u64;
+            let pg = pg.clone();
             pending.sent(&placement_node, &obj_id, s_idx, pos);
             let rdma = state.rdma.clone();
             let shard_addr = rdma_base.map(|base| base + (i * shard_data.len()) as u64);
@@ -1416,6 +1480,7 @@ pub async fn put_object(
                     ec_k,
                     ec_m,
                     source,
+                    pg.as_ref(),
                 )
                 .await;
                 (pos, result, placement_node)
@@ -1429,6 +1494,7 @@ pub async fn put_object(
         let mut shard_locs = Vec::with_capacity(total_shards);
 
         let mut full = false;
+        let mut stale = false;
         for (pos, result, placement_node) in results {
             match result {
                 Ok((location, crc32c)) => {
@@ -1450,6 +1516,7 @@ pub async fn put_object(
                 }
                 Err(e) => {
                     full |= e.is_full();
+                    stale |= e.is_stale_epoch();
                     warn!(
                         "Failed to write stripe {} shard {} to {}: {}",
                         stripe_idx, pos, placement_node.node_address, e
@@ -1469,6 +1536,9 @@ pub async fn put_object(
             );
             if full {
                 return S3Error::storage_full();
+            }
+            if stale {
+                return stale_placement(stripe_idx);
             }
             return S3Error::xml_response(
                 "ServiceUnavailable",

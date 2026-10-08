@@ -12,6 +12,7 @@ mod kms;
 mod multipart;
 mod objects;
 mod packs;
+pub(crate) mod pgs;
 mod tenants;
 mod unity;
 mod upgrade;
@@ -271,11 +272,12 @@ use objectio_proto::metadata::{
     ListingNode,
     MultipartUpload,
     NodePlacement,
-    ObjectHome,
     ObjectListingEntry,
     ObjectLockConfiguration,
     ObjectMeta,
     PartMeta,
+    PgEpoch,
+    PgFill,
     PlacementGroup,
     PolicyObject,
     PoolConfig,
@@ -1029,6 +1031,10 @@ impl MetaService {
                         CasTable::PlacementGroups => {
                             svc.apply_placement_group_event(&key, new_value.as_deref());
                         }
+                        // Every node, not only the one that took the call: a
+                        // follower knew a pool only after a restart, and a
+                        // leader elected meanwhile placed none of its keys.
+                        CasTable::Pools => svc.apply_pool_event(&key, new_value.as_deref()),
                         CasTable::Config => {
                             svc.apply_config_event(&key, new_value.as_deref());
                         }

@@ -113,6 +113,7 @@ async fn fanout_put_object_meta(
             // Built from an earlier read: refuse to put the object back if a
             // PUT has replaced it since (that PUT freed its shards).
             expected_object_id: object.object_id.clone(),
+            pg: None,
         };
         futs.push(async move {
             let ch = open_channel(&addr).await?;
@@ -572,11 +573,12 @@ async fn migrate_batch(
             moves[i].pack_stripe = Some(stripe.clone());
         }
     }
-    // Keys whose home has it, inline objects too (they have no shards for
-    // the scan above to find): each gets its metadata copy on the OSD
-    // that takes its place, and the home moves there (B26).
-    let (homes, homes_left) = meta.homes_holding(&draining, batch);
-    scan.found = moves.len() + unsealed + homes_left;
+    // Placement groups it is still in, or whose stand-in for it hasn't got
+    // their objects' metadata yet (inline objects too, which have no shards
+    // for the scan above to find): the leader stands in for it and fills
+    // the stand-in (B31); the OSD isn't empty until then.
+    let pgs_left = meta.pgs_holding(&draining);
+    scan.found = moves.len() + unsealed + pgs_left;
 
     // A few at a time: each reads and writes a shard.
     use futures::StreamExt;
@@ -621,21 +623,7 @@ async fn migrate_batch(
         .buffer_unordered(MOVES_AT_ONCE)
         .collect()
         .await;
-    let homes_moved: Vec<anyhow::Result<()>> = futures::stream::iter(homes)
-        .map(|(bucket, key, ids)| async move {
-            move_home(meta, &draining, &bucket, &key, &ids)
-                .await
-                .map_err(|e| anyhow::anyhow!("{bucket}/{key}: {e}"))
-        })
-        .buffer_unordered(MOVES_AT_ONCE)
-        .collect::<Vec<anyhow::Result<bool>>>()
-        .await
-        .into_iter()
-        // A key whose shard there moves first (then its home with it).
-        .filter(|r| !matches!(r, Ok(false)))
-        .map(|r| r.map(|_| ()))
-        .collect();
-    for r in results.into_iter().chain(homes_moved) {
+    for r in results {
         match r {
             Ok(()) => {
                 scan.moved += 1;
@@ -680,11 +668,14 @@ async fn move_shard(
         .iter()
         .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
         .collect();
-    let target_node = meta
-        .pick_drain_target(&id, mv.shard.position, &holders)
-        .ok_or_else(|| {
-            anyhow::anyhow!("no in-service OSD without a shard of this stripe to move it to")
-        })?;
+    let target_node = match pg_target(meta, mv, draining, &holders)? {
+        Some(t) => t,
+        None => meta
+            .pick_drain_target(&id, mv.shard.position, &holders)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no in-service OSD without a shard of this stripe to move it to")
+            })?,
+    };
     let target_addr = meta
         .osd_address_by_id(&target_node)
         .ok_or_else(|| anyhow::anyhow!("target not registered"))?;
@@ -753,6 +744,44 @@ async fn move_shard(
     Ok(())
 }
 
+/// Where a shard of a key placed through a placement group goes: the OSD
+/// at its position in the PG's acting set, so the key's copies stay where
+/// its PG says they are (B31). `Err` while that is still the draining OSD
+/// itself (the leader hasn't stood in for it yet): the shard waits for the
+/// next sweep rather than go somewhere else. `None` for a key placed
+/// otherwise, or a shard its acting member already holds a sibling of.
+fn pg_target(
+    meta: &Arc<MetaService>,
+    mv: &Move,
+    draining: &[u8; 16],
+    holders: &[[u8; 16]],
+) -> anyhow::Result<Option<[u8; 16]>> {
+    if mv.block_stripe.is_some() || mv.pack_stripe.is_some() {
+        return Ok(None);
+    }
+    let Some(o) = mv.objects.first() else {
+        return Ok(None);
+    };
+    let Some(pg) = meta.key_pg(&o.bucket, &o.key) else {
+        return Ok(None);
+    };
+    let Some(member) = pg
+        .acting
+        .get(mv.shard.position as usize)
+        .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+    else {
+        return Ok(None);
+    };
+    if member == *draining {
+        return Err(anyhow::anyhow!(
+            "placement group {}/{} has no stand-in for it yet",
+            pg.pool,
+            pg.pg_id
+        ));
+    }
+    Ok((!holders.contains(&member)).then_some(member))
+}
+
 /// The stripe a shard belongs to, from one of the ObjectMetas referring
 /// to it.
 async fn stripe_of(mv: &Move) -> anyhow::Result<StripeMeta> {
@@ -810,31 +839,19 @@ async fn repoint_object(
     if object.usage_owner == draining.as_slice() {
         object.usage_owner.clone_from(&to.node_id);
     }
-    // To every copy of the metadata: the key's home and the copy read, not
-    // only the OSDs with shards. A copy on an OSD that holds no shard of
-    // this object (it was down when the object was written, and healed
-    // since) would otherwise keep naming the evacuated OSD, and be found
-    // and "moved" again on every sweep.
-    let home = home_addrs(meta, &o.bucket, &o.key, draining);
-    let mut extra: Vec<&str> = home.iter().map(String::as_str).collect();
+    // To every copy of the metadata: its PG's acting set and the copy
+    // read, not only the OSDs with shards. A copy on an OSD that holds no
+    // shard of this object (it was down when the object was written, and
+    // healed since) would otherwise keep naming the evacuated OSD, and be
+    // found and "moved" again on every sweep.
+    let copies = meta
+        .key_copy_addrs(&o.bucket, &o.key, draining)
+        .map(|(addrs, _)| addrs)
+        .unwrap_or_default();
+    let mut extra: Vec<&str> = copies.iter().map(String::as_str).collect();
     extra.push(&o.owner_addr);
     extra.push(draining_addr);
     fanout_put_object_meta(meta, &object, &o.owner_addr, &extra).await?;
-    // The key's home follows its first stripe, as it is placed.
-    if object
-        .stripes
-        .first()
-        .is_some_and(|s| s.stripe_id == shard.stripe_id && s.object_id == shard.object_id)
-        && let Err(e) = meta
-            .move_object_home(
-                &o.bucket,
-                &o.key,
-                &[(shard.position, draining.to_vec(), to.node_id.clone())],
-            )
-            .await
-    {
-        warn!("drain: {}/{}: home not moved: {e}", o.bucket, o.key);
-    }
     Ok(())
 }
 
@@ -912,11 +929,8 @@ async fn settle_lost(
         if !copy.stripes.iter().any(|s| is_shard_of(s, &mv.shard)) {
             continue;
         }
-        let (addrs, copies) = match meta.object_home(&o.bucket, &o.key) {
-            Some(home) => (
-                home_addrs(meta, &o.bucket, &o.key, draining),
-                home.osd_ids.len(),
-            ),
+        let (addrs, copies) = match meta.key_copy_addrs(&o.bucket, &o.key, draining) {
+            Some(copies) => copies,
             None => (
                 stripe
                     .shards
@@ -994,23 +1008,6 @@ async fn shard_state(
         .map_err(|_| anyhow::anyhow!("unknown state {s}"))
 }
 
-/// The addresses of `bucket/key`'s home OSDs, but `draining`'s.
-fn home_addrs(
-    meta: &Arc<MetaService>,
-    bucket: &str,
-    key: &str,
-    draining: &[u8; 16],
-) -> Vec<String> {
-    meta.object_home(bucket, key)
-        .map(|h| h.osd_ids)
-        .unwrap_or_default()
-        .iter()
-        .filter(|id| id.as_slice() != draining.as_slice())
-        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
-        .filter_map(|id| meta.osd_address_by_id(&id))
-        .collect()
-}
-
 /// Whether every ObjectMeta copy naming `mv`'s shard is stale: a copy that
 /// missed a later write or delete of its key (its OSD was down) still
 /// names the shards that write freed. Nothing can rebuild them, and no
@@ -1027,14 +1024,11 @@ async fn settle_stale(
         return Ok(false);
     }
     for o in &mv.objects {
-        // Where the key's copies are: its home, or, for a key deleted since
-        // (a delete removes its home), the OSDs the stale copy itself names,
-        // which hold the delete's tombstones.
-        let (others, copies) = match meta.object_home(&o.bucket, &o.key) {
-            Some(home) => (
-                home_addrs(meta, &o.bucket, &o.key, draining),
-                home.osd_ids.len(),
-            ),
+        // Where the key's copies are: its placement group's acting set, or,
+        // for a key placed otherwise (before level 7), the OSDs the stale
+        // copy itself names, which hold any delete's tombstones.
+        let (others, copies) = match meta.key_copy_addrs(&o.bucket, &o.key, draining) {
+            Some(copies) => copies,
             None => {
                 let Some(stale) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await? else {
                     continue; // gone from that copy since: nothing to settle
@@ -1164,83 +1158,6 @@ async fn read_copies(
     ))
 }
 
-/// Give `bucket/key`'s positions on the evacuated OSD to OSDs in service
-/// (B26): the newest metadata copy, read from the rest of its home, is
-/// written to each, and the home moves to them. For an object with no
-/// shard there (inline ones, above all), this is the only thing that
-/// puts its copy back. `Ok(false)`: its shard there moves first, and the
-/// home with it.
-async fn move_home(
-    meta: &Arc<MetaService>,
-    draining: &[u8; 16],
-    bucket: &str,
-    key: &str,
-    home: &[Vec<u8>],
-) -> anyhow::Result<bool> {
-    let others: Vec<String> = home
-        .iter()
-        .filter(|id| id.as_slice() != draining.as_slice())
-        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
-        .filter_map(|id| meta.osd_address_by_id(&id))
-        .collect();
-    let object = newest_copy(&others, home.len(), bucket, key).await?;
-    let positions: Vec<u32> = home
-        .iter()
-        .enumerate()
-        .filter(|(_, id)| id.as_slice() == draining.as_slice())
-        .filter_map(|(p, _)| u32::try_from(p).ok())
-        .collect();
-    if let Some(o) = &object
-        && o.stripes.first().is_some_and(|s| {
-            s.shards
-                .iter()
-                .any(|l| l.node_id == draining.as_slice() && positions.contains(&l.position))
-        })
-    {
-        return Ok(false);
-    }
-    let seed: [u8; 16] = object
-        .as_ref()
-        .and_then(|o| <[u8; 16]>::try_from(o.object_id.as_slice()).ok())
-        .unwrap_or_else(|| {
-            let h = xxhash_rust::xxh64::xxh64(format!("{bucket}/{key}").as_bytes(), 0);
-            let mut s = [0u8; 16];
-            s[..8].copy_from_slice(&h.to_le_bytes());
-            s[8..].copy_from_slice(&h.rotate_left(32).to_le_bytes());
-            s
-        });
-    let mut taken: Vec<[u8; 16]> = home
-        .iter()
-        .filter_map(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
-        .collect();
-    let mut moves = Vec::new();
-    for position in positions {
-        let target = meta
-            .pick_drain_target(&seed, position, &taken)
-            .ok_or_else(|| anyhow::anyhow!("no OSD in service outside its home to move it to"))?;
-        taken.push(target);
-        moves.push((position, draining.to_vec(), target.to_vec()));
-    }
-    if let Some(mut o) = object {
-        let targets: Vec<String> = moves
-            .iter()
-            .filter_map(|(_, _, t)| <[u8; 16]>::try_from(t.as_slice()).ok())
-            .filter_map(|t| meta.osd_address_by_id(&t))
-            .collect();
-        let mut extra: Vec<&str> = targets.iter().map(String::as_str).collect();
-        if o.usage_owner == draining.as_slice() {
-            o.usage_owner.clone_from(&moves[0].2);
-            // Every copy changes: they all record the owner.
-            extra.extend(others.iter().map(String::as_str));
-        }
-        fanout_put_object_meta(meta, &o, &targets[0], &extra).await?;
-    }
-    meta.move_object_home(bucket, key, &moves)
-        .await
-        .map_err(|e| anyhow::anyhow!("home: {e}"))?;
-    Ok(true)
-}
-
 async fn get_object_meta(
     addr: &str,
     bucket: &str,
@@ -1312,6 +1229,7 @@ async fn write_shard(
             ec_m: 0,
             // Restores redundancy: may use the space kept from client writes.
             use_reserve: true,
+            pg: None,
         }),
     )
     .await

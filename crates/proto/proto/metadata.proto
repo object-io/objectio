@@ -662,12 +662,9 @@ message CreateObjectRequest {
     // (per-object CRUSH); the listing entry has no PG then.
     uint32 pg_id = 9;
     string pool = 10;
-    // The OSDs the gateway wrote the object's ObjectMeta to, by position
-    // (its GetPlacement nodes). Meta records them as the key's home, and
-    // GetPlacement returns the home for the key from then on, so the
-    // metadata is found where it was written whatever joins or leaves the
-    // cluster. Empty leaves the home as it is.
-    repeated bytes home_osd_ids = 11;
+    // 11 was the key's home: a key's copies are its placement group's
+    // acting set (B31).
+    reserved 11;
     // A conditional PUT (If-Match / If-None-Match): the listing entry, the
     // key's current object as Raft knows it, must be in this state when
     // this write commits, or it is refused (FAILED_PRECONDITION with the
@@ -675,12 +672,6 @@ message CreateObjectRequest {
     // with no object). "*" or an ETag; empty = no condition.
     string if_match = 12;
     string if_none_match = 13;
-}
-
-// Where a key's ObjectMeta lives: the OSDs it was written to, by position.
-// Kept while the key may have versions on them, past its listing entry.
-message ObjectHome {
-    repeated bytes osd_ids = 1;
 }
 
 // An object acknowledged short of shards (B29): recorded in the Raft
@@ -742,9 +733,7 @@ message DeleteObjectRequest {
     string bucket = 1;
     string key = 2;
     string version_id = 3;      // Optional: delete specific version
-    // The key is gone for good (an unversioned bucket's DELETE): forget its
-    // home too. Never for a rollback, which may leave an older object there.
-    bool forget_home = 4;
+    reserved 4;
 }
 
 message DeleteObjectResponse {
@@ -853,7 +842,10 @@ message GetPlacementResponse {
     // gateway detect a mid-flight PG migration and retry from
     // GetPlacement rather than writing against a stale tuple.
     uint32 pg_id = 11;
-    uint64 pg_version = 12;
+    // The epoch of the PG's acting set this placement is (B31): sent with
+    // every write, refused by an OSD that knows a newer one. 0: placed
+    // without a placement group (a key written before format level 7).
+    uint64 pg_epoch = 12;
     string pool = 13;               // Pool this PG lives in.
 
     // Effective dedup policy for this bucket — bucket, then tenant, then
@@ -1161,6 +1153,15 @@ message RegisterOsdResponse {
     // FSID guard. Empty on pre-3.1 meta nodes; OSDs treat that as
     // "leave existing superblock alone".
     bytes cluster_uuid = 3;
+    // Every placement group's epoch (B31): the OSD refuses a request placed
+    // under an older one, including for PGs it is no longer a member of.
+    repeated PgEpoch pg_epochs = 4;
+}
+
+message PgEpoch {
+    string pool = 1;
+    uint32 pg_id = 2;
+    uint64 epoch = 3;
 }
 
 // Operator-declared state for an OSD. Serialised as a string so adding
@@ -2499,27 +2500,35 @@ message PoolConfig {
     string tier = 16;
 }
 
-// One placement group — a fixed k+m-tuple of OSDs that a set of
-// objects is routed to via jump-hash(object_id) mod pg_count. The
-// balancer mutates osd_ids over time to keep counts flat and failure
-// domains respected; during a move `migrating_to_osd_ids` is
-// non-empty and the data path writes to the new set while reads
-// still work off the old set until the migration commits.
+// One placement group (B31, objectio-docs core/pg-recovery.md). A key maps
+// to its PG by jump-hash(xxh64("{bucket}/{key}"), pg_count); its copies are
+// the PG's acting set. Every change of `acting` is one Raft commit that
+// raises `epoch`, made before any write uses it; OSDs refuse a request
+// placed under an older epoch.
 message PlacementGroup {
     string pool = 1;
     uint32 pg_id = 2;
-    // k+m OSD node_ids, position-ordered (index 0 = first data shard).
-    repeated bytes osd_ids = 3;
-    // CAS version — bumped on every transition. Used by MultiCas to
-    // detect concurrent balancer activity.
-    uint64 version = 4;
+    // Where the PG's objects are and where writes go: one OSD per
+    // position (index 0 = first data shard).
+    repeated bytes acting = 3;
+    // Raised with every change of `acting`.
+    uint64 epoch = 4;
     uint64 updated_at = 5;
-    // Non-empty while a migration is in flight. Cleared on commit.
-    repeated bytes migrating_to_osd_ids = 6;
-    uint64 migration_started_at = 7;
-    // Soft progress indicator — objects still to copy during the
-    // current migration. Reset to 0 on commit.
-    uint32 pending_moves_count = 8;
+    reserved 6, 7, 8;
+    // Where the balancer wants the PG. Acting follows it only once the
+    // data is copied (recovery, a later phase); until then the two differ.
+    repeated bytes up = 9;
+    // Positions whose acting member stands in for one that couldn't take
+    // writes, and doesn't yet hold the PG's existing objects' metadata.
+    repeated PgFill filling = 10;
+}
+
+message PgFill {
+    uint32 position = 1;
+    // The member it stands in for.
+    bytes from = 2;
+    // The epoch that made the change.
+    uint64 epoch = 3;
 }
 
 message GetPlacementGroupRequest {
@@ -2532,12 +2541,14 @@ message GetPlacementGroupResponse {
 }
 message ListPlacementGroupsRequest {
     string pool = 1;
-    uint32 start_after_pg_id = 2;     // 0 = from the start
+    // The first PG to list (0, the default, lists from the start). It was
+    // `start_after`, exclusive, so PG 0 could never be listed.
+    uint32 start_at_pg_id = 2;
     uint32 max_results = 3;           // 0 = default 1000
 }
 message ListPlacementGroupsResponse {
     repeated PlacementGroup pgs = 1;
-    uint32 next_pg_id = 2;            // 0 = end of list
+    uint32 next_pg_id = 2;            // the next page's start_at; 0 = end of list
 }
 
 message CreatePoolRequest { PoolConfig pool = 1; }

@@ -897,7 +897,7 @@ pub enum PoolCmd {
     PlacementGroups {
         name: String,
         #[arg(long)]
-        start_after: Option<u32>,
+        start_at: Option<u32>,
         #[arg(long)]
         max: Option<u32>,
     },

@@ -172,7 +172,7 @@ pub(crate) async fn delete_version(
         }
     };
 
-    let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid).await;
+    let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid, None).await;
     let (ok, of) = (deleted.ok, deleted.of);
     if ok < deleted.quorum {
         return S3Error::xml_response(
@@ -285,9 +285,9 @@ async fn try_sync_listing(
                     user_metadata: c.user_metadata.clone(),
                     stripes: c.stripes.clone(),
                     object_id: c.object_id.clone(),
+                    // Meta names the key's placement group (B31).
                     pg_id: 0,
                     pool: String::new(),
-                    home_osd_ids: home_of(nodes),
                     ..Default::default()
                 })
                 .await
@@ -297,7 +297,6 @@ async fn try_sync_listing(
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await
                 .map(drop),
@@ -415,9 +414,6 @@ pub(crate) async fn delete_object_to_the_end(
         Err(resp) => return resp,
     };
     let versioning_enabled = versioning == Some(VersioningState::VersioningEnabled);
-    // Known never to have had versions, so nothing of the key outlives
-    // this delete and its home can go. Not when the state is unknown.
-    let never_versioned = versioning == Some(VersioningState::VersioningDisabled);
 
     // Conditional delete (If-Match, x-amz-if-match-last-modified-time,
     // x-amz-if-match-size): on the version named, or else the key's object:
@@ -540,7 +536,6 @@ pub(crate) async fn delete_object_to_the_end(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await;
         }
@@ -617,7 +612,6 @@ pub(crate) async fn delete_object_to_the_end(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await;
         }
@@ -642,7 +636,16 @@ pub(crate) async fn delete_object_to_the_end(
     // the version read would leak the ones the removed copy named. Only
     // once every replica has let it go, and only what no replica still has
     // as current: a racing write can leave it on some.
-    let deleted = delete_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await;
+    let pg = crate::osd_pool::pg_ref(&placement);
+    let deleted = delete_meta_from_all(
+        &state.osd_pool,
+        &placement.nodes,
+        &bucket,
+        &key,
+        "",
+        pg.as_ref(),
+    )
+    .await;
     if deleted.ok < deleted.quorum {
         sync_listing(&state, &placement.nodes, &bucket, &key).await;
         return S3Error::xml_response(
@@ -697,7 +700,6 @@ pub(crate) async fn delete_object_to_the_end(
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: String::new(),
-                forget_home: never_versioned,
             })
             .await
         {

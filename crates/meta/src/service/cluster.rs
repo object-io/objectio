@@ -135,6 +135,23 @@ impl MetaService {
         }
     }
 
+    /// Apply a committed pool row (key: the pool's name) to the cache.
+    pub(super) fn apply_pool_event(&self, key: &str, new_value: Option<&[u8]>) {
+        use prost::Message;
+        let mut map = self.pools.write();
+        match new_value {
+            Some(bytes) => match PoolConfig::decode(bytes) {
+                Ok(pool) => {
+                    map.insert(key.to_string(), pool);
+                }
+                Err(e) => warn!("apply: decode PoolConfig('{key}') failed: {e}"),
+            },
+            None => {
+                map.remove(key);
+            }
+        }
+    }
+
     /// Inverse of `objectio_meta_store::MetaStore::pg_key`. Returns
     /// (pool, pg_id) from "{pool}\0{pg_id:010}".
     pub(super) fn parse_pg_key(key: &str) -> Option<(String, u32)> {
@@ -173,36 +190,21 @@ impl MetaService {
         ),
         Status,
     > {
-        use objectio_common::FailureDomain;
         use objectio_placement::CopysetPool;
 
-        let copy_count = match pool.ec_type() {
-            ErasureType::ErasureMds => (pool.ec_k + pool.ec_m) as usize,
-            ErasureType::ErasureLrc => {
-                (pool.ec_k + pool.ec_local_parity + pool.ec_global_parity) as usize
-            }
-            ErasureType::ErasureReplication => pool.replication_count as usize,
-        };
+        let copy_count = super::pgs::copy_count(pool);
         if copy_count == 0 {
             return Err(Status::invalid_argument(
                 "pool has zero shards per PG — check ec_k / ec_m / replication_count",
             ));
         }
 
-        let fd_level = match pool.failure_domain.as_str() {
-            "host" | "" => FailureDomain::Host,
-            "node" => FailureDomain::Node,
-            "rack" => FailureDomain::Rack,
-            "datacenter" => FailureDomain::Datacenter,
-            "zone" => FailureDomain::Zone,
-            "region" => FailureDomain::Region,
-            "disk" => FailureDomain::Disk,
-            other => {
-                return Err(Status::invalid_argument(format!(
-                    "pool.failure_domain '{other}' not recognised"
-                )));
-            }
-        };
+        let fd_level = super::pgs::fd_level(&pool.failure_domain).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "pool.failure_domain '{}' not recognised",
+                pool.failure_domain
+            ))
+        })?;
 
         let topology = self.topology.read().clone();
         // Seed = topology.version × pg_count so concurrent pool creates
@@ -235,16 +237,32 @@ impl MetaService {
         let now = Self::current_timestamp();
         let mut pgs: Vec<PlacementGroup> = Vec::with_capacity(pool.pg_count as usize);
         for pg_id in 0..pool.pg_count {
+            // One made before (a pre-allocation cut short) is kept as it is.
+            if self.placement_group(&pool.name, pg_id).is_some() {
+                continue;
+            }
             let cs = &cs_pool.sets[pg_id as usize % cs_pool.sets.len()];
+            let mut members: Vec<Vec<u8>> = cs.osds.iter().map(|n| n.as_bytes().to_vec()).collect();
+            // Positions in an order of the PG's own. With as many failure
+            // domains as copies there is a single copyset, and every PG
+            // had the same order: the same OSDs held every object's parity
+            // and every read went to the others. The order changes nothing
+            // about how the copies are spread.
+            {
+                use rand::SeedableRng;
+                use rand::seq::SliceRandom;
+                let seed =
+                    xxhash_rust::xxh64::xxh64(format!("{}/{pg_id}", pool.name).as_bytes(), 0);
+                members.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+            }
             pgs.push(PlacementGroup {
                 pool: pool.name.clone(),
                 pg_id,
-                osd_ids: cs.osds.iter().map(|n| n.as_bytes().to_vec()).collect(),
-                version: 1,
+                acting: members.clone(),
+                up: members,
+                epoch: 1,
                 updated_at: now,
-                migrating_to_osd_ids: Vec::new(),
-                migration_started_at: 0,
-                pending_moves_count: 0,
+                filling: Vec::new(),
             });
         }
 
@@ -292,11 +310,14 @@ impl MetaService {
         info!(
             "pool '{}' pre-allocated {} PGs (copy_count={}, fd={}, pool.size={})",
             pool.name,
-            pool.pg_count,
+            pgs.len(),
             copy_count,
             fd_level,
             cs_pool.sets.len(),
         );
+        if super::pgs::pg_placement() {
+            self.push_pg_epochs(&pgs, &[]).await;
+        }
         Ok(())
     }
 
@@ -678,180 +699,6 @@ impl MetaService {
         self.store.as_ref()?.read_named(HEAL_TABLE, key)
     }
 
-    /// The OSDs `bucket/key`'s ObjectMeta was written to, by position, if
-    /// it has been written.
-    pub(crate) fn object_home(&self, bucket: &str, key: &str) -> Option<ObjectHome> {
-        let bytes = self
-            .store
-            .as_ref()?
-            .read_object_home(&format!("{bucket}/{key}"))?;
-        ObjectHome::decode(bytes.as_slice())
-            .inspect_err(|e| warn!("decode ObjectHome({bucket}/{key}) failed: {e}"))
-            .ok()
-    }
-
-    /// Keys whose home has `node` at some position (an OSD lost for good,
-    /// B26): at most `limit` as (bucket, key, home OSD ids), and how many
-    /// there are in all.
-    pub(crate) fn homes_holding(&self, node: &[u8; 16], limit: usize) -> (Vec<KeyHome>, usize) {
-        let Some(store) = self.store.as_ref() else {
-            return (Vec::new(), 0);
-        };
-        let (found, total) = store.object_homes_holding(node, limit, |bytes| {
-            ObjectHome::decode(bytes).ok().map(|h| h.osd_ids)
-        });
-        let found = found
-            .into_iter()
-            .filter_map(|(k, ids)| {
-                let (bucket, key) = k.split_once('/')?;
-                Some((bucket.to_string(), key.to_string(), ids))
-            })
-            .collect();
-        (found, total)
-    }
-
-    /// Put `nodes` (a computed placement) at the key's home: each position
-    /// on the OSD the key's ObjectMeta was written to, so it is read where
-    /// it is, whatever joined or left the cluster since. A home OSD that
-    /// is no longer active gives its position to the first computed OSD
-    /// not already in the set, as the computed placement would have.
-    /// Replace every position of a placement-group placement whose OSD
-    /// can't take a write — not registered (a lost OSD, forgotten), not
-    /// `In`, not up, or with no address — by an OSD that can and isn't in
-    /// the placement already: one in a failure domain (at the pool's
-    /// level) the placement doesn't use yet if there is one, chosen by
-    /// `key_hash` so every caller picks the same. A position no OSD can
-    /// stand in for is left as it is.
-    pub(super) fn stand_in_for_unusable(
-        &self,
-        nodes: &mut [NodePlacement],
-        failure_domain: &str,
-        key_hash: u64,
-    ) {
-        use objectio_common::FailureDomain;
-        let level = match failure_domain {
-            "node" => FailureDomain::Node,
-            "rack" => FailureDomain::Rack,
-            "datacenter" => FailureDomain::Datacenter,
-            "zone" => FailureDomain::Zone,
-            "region" => FailureDomain::Region,
-            "disk" => FailureDomain::Disk,
-            _ => FailureDomain::Host,
-        };
-        let topology = self.topology.read();
-        let osd_nodes = self.osd_nodes.read();
-        let usable = |id: &[u8]| -> Option<&OsdNode> {
-            let id = <[u8; 16]>::try_from(id).ok()?;
-            let node = osd_nodes.iter().find(|n| n.node_id == id)?;
-            let up = topology
-                .get_node(NodeId::from_bytes(id))
-                .is_some_and(|t| t.status == NodeStatus::Active);
-            (up && node.admin_state == objectio_common::OsdAdminState::In
-                && !node.address.is_empty())
-            .then_some(node)
-        };
-        if nodes.iter().all(|n| usable(&n.node_id).is_some()) {
-            return;
-        }
-        let domain_of = |id: &[u8]| -> Option<String> {
-            let id = <[u8; 16]>::try_from(id).ok()?;
-            topology
-                .get_node(NodeId::from_bytes(id))
-                .map(|t| t.failure_domain.at_level(level).to_string())
-        };
-        for i in 0..nodes.len() {
-            if usable(&nodes[i].node_id).is_some() {
-                continue;
-            }
-            let taken: Vec<Vec<u8>> = nodes.iter().map(|n| n.node_id.clone()).collect();
-            let used_domains: std::collections::HashSet<String> = nodes
-                .iter()
-                .filter(|n| usable(&n.node_id).is_some())
-                .filter_map(|n| domain_of(&n.node_id))
-                .collect();
-            let spare = topology
-                .active_nodes()
-                .map(|t| t.id.as_bytes().to_vec())
-                .filter(|id| !taken.contains(id))
-                .filter_map(|id| usable(&id).map(|n| (id, n)))
-                .min_by_key(|(id, _)| {
-                    let shared = domain_of(id).is_some_and(|d| used_domains.contains(&d));
-                    let mut seed = key_hash.to_le_bytes().to_vec();
-                    seed.extend_from_slice(&(i as u64).to_le_bytes());
-                    seed.extend_from_slice(id);
-                    (shared, xxhash_rust::xxh64::xxh64(&seed, 0))
-                });
-            let Some((id, node)) = spare else {
-                continue;
-            };
-            let slot = &mut nodes[i];
-            slot.node_id = id;
-            slot.node_address = node.address.clone();
-            slot.disk_id = node
-                .disk_ids
-                .first()
-                .map_or_else(|| vec![0u8; 16], |d| d.to_vec());
-            slot.te_segment = node.te_segment.clone();
-        }
-    }
-
-    pub(super) fn place_at_home(&self, nodes: &mut [NodePlacement], home: &ObjectHome) {
-        if home.osd_ids.len() != nodes.len() {
-            // The pool's protection changed since, so positions no longer
-            // line up.
-            warn!(
-                "object home has {} OSDs, placement {}: using the computed placement",
-                home.osd_ids.len(),
-                nodes.len()
-            );
-            return;
-        }
-        let topology = self.topology.read();
-        let osd_nodes = self.osd_nodes.read();
-        let usable: Vec<Option<&OsdNode>> = home
-            .osd_ids
-            .iter()
-            .map(|id| {
-                let id = <[u8; 16]>::try_from(id.as_slice()).ok()?;
-                topology
-                    .active_nodes()
-                    .any(|n| *n.id.as_bytes() == id)
-                    .then(|| osd_nodes.iter().find(|n| n.node_id == id))
-                    .flatten()
-            })
-            .collect();
-        let mut spares: std::collections::VecDeque<NodePlacement> = nodes
-            .iter()
-            .filter(|n| {
-                !usable
-                    .iter()
-                    .flatten()
-                    .any(|h| h.node_id.as_slice() == n.node_id.as_slice())
-            })
-            .cloned()
-            .collect();
-        for (slot, home_node) in nodes.iter_mut().zip(usable) {
-            let (node_id, node_address, disk_id, te_segment) = match home_node {
-                Some(n) => (
-                    n.node_id.to_vec(),
-                    n.address.clone(),
-                    n.disk_ids
-                        .first()
-                        .map_or_else(|| vec![0u8; 16], |d| d.to_vec()),
-                    n.te_segment.clone(),
-                ),
-                None => match spares.pop_front() {
-                    Some(s) => (s.node_id, s.node_address, s.disk_id, s.te_segment),
-                    None => continue,
-                },
-            };
-            slot.node_id = node_id;
-            slot.node_address = node_address;
-            slot.disk_id = disk_id;
-            slot.te_segment = te_segment;
-        }
-    }
-
     /// Where to move a shard of a stripe whose shards are on `holders`
     /// (B20, backfill): an active OSD holding none of them, picked by the
     /// highest hash of the object and the OSD, so moves spread over the
@@ -877,64 +724,6 @@ impl MetaService {
                 seed.extend_from_slice(id);
                 xxhash_rust::xxh64::xxh64(&seed, 0)
             })
-    }
-
-    /// Move positions of `bucket/key`'s home from one OSD to another (B20):
-    /// `(position, from, to)`, each only if the home still has `from`
-    /// there. A later write of the key is then placed where its shards now
-    /// are, not doubled up again.
-    pub(crate) async fn move_object_home(
-        &self,
-        bucket: &str,
-        key: &str,
-        moves: &[(u32, Vec<u8>, Vec<u8>)],
-    ) -> Result<(), String> {
-        let home_key = format!("{bucket}/{key}");
-        let Some(store) = self.store.as_ref() else {
-            return Ok(());
-        };
-        let Some(current) = store.read_object_home(&home_key) else {
-            return Ok(()); // never written with a home: nothing pins it
-        };
-        let mut home = ObjectHome::decode(current.as_slice()).map_err(|e| e.to_string())?;
-        let mut changed = false;
-        for (position, from, to) in moves {
-            if let Some(slot) = home.osd_ids.get_mut(*position as usize)
-                && slot == from
-            {
-                slot.clone_from(to);
-                changed = true;
-            }
-        }
-        if !changed {
-            return Ok(());
-        }
-        let new = home.encode_to_vec();
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let cmd = MetaCommand::MultiCas {
-                ops: vec![CasOp {
-                    table: CasTable::Named("object_homes".into()),
-                    key: home_key,
-                    expected: Some(current),
-                    new_value: Some(new),
-                }],
-                requested_by: "backfill".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => Ok(()),
-                    MetaResponse::MultiCasConflict { .. } => {
-                        Err("the key's home changed meanwhile".into())
-                    }
-                    other => Err(format!("unexpected raft response: {other:?}")),
-                },
-                Err(e) => Err(e.to_string()),
-            }
-        } else {
-            store.put_object_home(&home_key, &new);
-            Ok(())
-        }
     }
 
     /// Placement computed from the topology (or the bucket's pool's
@@ -969,14 +758,17 @@ impl MetaService {
             objectio_common::ObjectId::from_uuid(Uuid::from_bytes(bytes))
         };
 
-        // Resolve pool for this bucket — use pool-specific EC config if available
-        let pool_name = {
-            let buckets = self.buckets.read();
-            buckets
-                .get(&req.bucket)
-                .map(|b| b.pool.clone())
-                .unwrap_or_default()
-        };
+        // The bucket's pool: its own, or (from level 7) the default pool.
+        let pool_name = self.bucket_pool_name(&req.bucket);
+        let pg_placement = super::pgs::pg_placement();
+        // Written before placement groups: stays where CRUSH put it.
+        let legacy = pg_placement && self.key_is_legacy(&req.bucket, &req.key);
+        let pool_known = self.pools.read().contains_key(&pool_name);
+        if pg_placement && !legacy && !pool_known {
+            return Err(Status::unavailable(format!(
+                "pool '{pool_name}' has no placement groups yet (made once enough OSDs are up); retry"
+            )));
+        }
         let (pool_ec, pool_pg_count) = if !pool_name.is_empty() {
             self.pools
                 .read()
@@ -1071,120 +863,118 @@ impl MetaService {
             }
         };
 
-        // Placement-group fast path. When the bucket's pool has a
-        // non-zero pg_count we route object_id -> pg_id via jump
-        // consistent hash and read the PG's committed osd_ids in one
-        // in-memory lookup. Falls through to CRUSH2 if the PG row is
-        // missing (pre-allocation still in progress on a fresh pool)
-        // or if the PG's shard count disagrees with the current EC
-        // config (topology mid-reconfigure).
-        if pool_pg_count > 0 && !pool_name.is_empty() {
-            let key_str = format!("{}/{}", req.bucket, req.key);
-            let key_hash = xxhash_rust::xxh64::xxh64(key_str.as_bytes(), 0);
-            let pg_id =
-                objectio_placement::jump_consistent_hash(key_hash, pool_pg_count as i32) as u32;
-            if let Some(pg) = self.placement_group(&pool_name, pg_id) {
-                let expected_shards = match ec_type {
-                    ErasureType::ErasureMds => ec_k as usize + ec_global_parity as usize,
-                    ErasureType::ErasureLrc => {
-                        ec_k as usize + ec_local_parity as usize + ec_global_parity as usize
-                    }
-                    ErasureType::ErasureReplication => replication_count as usize,
-                };
-                if pg.osd_ids.len() == expected_shards && expected_shards > 0 {
-                    let nodes_snap = self.osd_nodes.read();
-                    let mut placements: Vec<NodePlacement> = pg
-                        .osd_ids
-                        .iter()
-                        .enumerate()
-                        .map(|(pos, osd_bytes)| {
-                            let node = nodes_snap
-                                .iter()
-                                .find(|n| n.node_id.as_slice() == osd_bytes.as_slice());
-                            let (node_address, disk_id) = match node {
-                                Some(n) => (
-                                    n.address.clone(),
-                                    n.disk_ids
-                                        .first()
-                                        .map(|d| d.to_vec())
-                                        .unwrap_or_else(|| vec![0u8; 16]),
-                                ),
-                                None => (String::new(), vec![0u8; 16]),
-                            };
-                            let te_segment = node.map(|n| n.te_segment.clone()).unwrap_or_default();
-                            let shard_type = pg_position_shard_type(
-                                ec_type,
-                                pos,
-                                ec_k as usize,
-                                ec_local_parity as usize,
-                                local_group_size as usize,
-                            );
-                            let local_group = pg_position_local_group(
-                                ec_type,
-                                pos,
-                                ec_k as usize,
-                                ec_local_parity as usize,
-                                local_group_size as usize,
-                            );
-                            NodePlacement {
-                                position: pos as u32,
-                                node_id: osd_bytes.clone(),
-                                node_address,
-                                disk_id,
-                                shard_type: shard_type.into(),
-                                local_group,
-                                te_segment,
-                            }
-                        })
-                        .collect();
-                    drop(nodes_snap);
-                    // A member that can't take a write (lost and forgotten,
-                    // set out, down) is stood in for, as CRUSH placement
-                    // skips it: a PG keeps its members until the balancer
-                    // moves it, which a lost OSD never makes it do.
-                    let failure_domain = self
-                        .pools
-                        .read()
-                        .get(&pool_name)
-                        .map(|p| p.failure_domain.clone())
-                        .unwrap_or_default();
-                    self.stand_in_for_unusable(&mut placements, &failure_domain, key_hash);
-                    debug!(
-                        "PG placement for {}/{}: pool={}, pg_id={}, {} shards",
-                        req.bucket,
-                        req.key,
-                        pool_name,
-                        pg_id,
-                        placements.len()
-                    );
-                    return Ok(Response::new(self.with_dedup(
-                        &req.bucket,
-                        GetPlacementResponse {
-                            storage_class: req.storage_class.clone(),
-                            ec_k,
-                            ec_m: ec_local_parity + ec_global_parity,
-                            nodes: placements,
-                            ec_type: ec_type.into(),
-                            ec_local_parity,
-                            ec_global_parity,
-                            local_group_size,
-                            replication_count,
-                            pg_id,
-                            pg_version: pg.version,
-                            pool: pool_name.clone(),
-                            dedup_mode: 0,
-                            dedup_domain: String::new(),
-                        },
-                    )));
+        // Through the key's placement group: its acting set, committed with
+        // an epoch before any write used it (level 7), which every write
+        // carries and OSDs check.
+        if pool_pg_count > 0 && !pool_name.is_empty() && !legacy {
+            let pg_id = super::pgs::pg_of_key(&req.bucket, &req.key, pool_pg_count);
+            let expected_shards = match ec_type {
+                ErasureType::ErasureMds => ec_k as usize + ec_global_parity as usize,
+                ErasureType::ErasureLrc => {
+                    ec_k as usize + ec_local_parity as usize + ec_global_parity as usize
                 }
-                warn!(
-                    "PG {}/{}: osd_ids={} doesn't match expected shards={}; falling back to CRUSH",
+                ErasureType::ErasureReplication => replication_count as usize,
+            };
+            let pg = self
+                .placement_group(&pool_name, pg_id)
+                .filter(|pg| pg.acting.len() == expected_shards && expected_shards > 0);
+            let pg = match pg {
+                Some(pg) => Some(self.with_usable_acting(pg).await),
+                None => None,
+            };
+            if let Some(pg) = pg {
+                let nodes_snap = self.osd_nodes.read();
+                let placements: Vec<NodePlacement> = pg
+                    .acting
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, osd_bytes)| {
+                        let node = nodes_snap
+                            .iter()
+                            .find(|n| n.node_id.as_slice() == osd_bytes.as_slice());
+                        // A member set out (or draining) that nothing could
+                        // stand in for is placed with no address: nothing
+                        // new goes to it, the write lands on the others and
+                        // is recorded short, as Ceph writes an undersized
+                        // PG. Repair fills the position once it has a home.
+                        let (node_address, disk_id) = match node {
+                            Some(n) => (
+                                if n.admin_state == objectio_common::OsdAdminState::In {
+                                    n.address.clone()
+                                } else {
+                                    String::new()
+                                },
+                                n.disk_ids
+                                    .first()
+                                    .map(|d| d.to_vec())
+                                    .unwrap_or_else(|| vec![0u8; 16]),
+                            ),
+                            None => (String::new(), vec![0u8; 16]),
+                        };
+                        let te_segment = node.map(|n| n.te_segment.clone()).unwrap_or_default();
+                        let shard_type = pg_position_shard_type(
+                            ec_type,
+                            pos,
+                            ec_k as usize,
+                            ec_local_parity as usize,
+                            local_group_size as usize,
+                        );
+                        let local_group = pg_position_local_group(
+                            ec_type,
+                            pos,
+                            ec_k as usize,
+                            ec_local_parity as usize,
+                            local_group_size as usize,
+                        );
+                        NodePlacement {
+                            position: pos as u32,
+                            node_id: osd_bytes.clone(),
+                            node_address,
+                            disk_id,
+                            shard_type: shard_type.into(),
+                            local_group,
+                            te_segment,
+                        }
+                    })
+                    .collect();
+                drop(nodes_snap);
+                debug!(
+                    "PG placement for {}/{}: pool={}, pg_id={}, epoch {}, {} shards",
+                    req.bucket,
+                    req.key,
                     pool_name,
                     pg_id,
-                    pg.osd_ids.len(),
-                    expected_shards
+                    pg.epoch,
+                    placements.len()
                 );
+                return Ok(Response::new(self.with_dedup(
+                    &req.bucket,
+                    GetPlacementResponse {
+                        storage_class: req.storage_class.clone(),
+                        ec_k,
+                        ec_m: ec_local_parity + ec_global_parity,
+                        nodes: placements,
+                        ec_type: ec_type.into(),
+                        ec_local_parity,
+                        ec_global_parity,
+                        local_group_size,
+                        replication_count,
+                        pg_id,
+                        // Below level 7 an acting set is not committed
+                        // before use, and OSDs don't check.
+                        pg_epoch: if pg_placement { pg.epoch } else { 0 },
+                        pool: pool_name.clone(),
+                        dedup_mode: 0,
+                        dedup_domain: String::new(),
+                    },
+                )));
             }
+            if pg_placement {
+                return Err(Status::unavailable(format!(
+                    "placement group {pool_name}/{pg_id} is not ready; retry"
+                )));
+            }
+            warn!("PG {pool_name}/{pg_id} missing or of the wrong size; falling back to CRUSH");
         }
 
         // Use CRUSH 2.0 for placement
@@ -1258,11 +1048,10 @@ impl MetaService {
                 ec_global_parity,
                 local_group_size,
                 replication_count,
-                // Filled by Phase 3 once the PG lookup replaces
-                // per-object CRUSH. Leaving zeros keeps pre-migration
-                // clients safe (gateway treats 0 as legacy).
+                // Placed without a placement group: a key written before
+                // level 7, or a pool made before it without PGs.
                 pg_id: 0,
-                pg_version: 0,
+                pg_epoch: 0,
                 pool: String::new(),
                 dedup_mode: 0,
                 dedup_domain: String::new(),
@@ -1495,6 +1284,10 @@ impl MetaService {
             success: true,
             topology_version,
             cluster_uuid,
+            // Every PG's epoch, members or not: an OSD dropped from a PG
+            // while it was down must still refuse writes placed under the
+            // epoch it was a member in.
+            pg_epochs: self.pg_epochs(),
         }))
     }
 
@@ -1862,6 +1655,27 @@ impl MetaService {
                 pool.name
             )));
         }
+        let mut pool = pool;
+        // From level 7 every pool places through placement groups (B31): a
+        // pool made without a count gets the default, and one that names no
+        // failure domain spreads over the widest level with enough domains.
+        if super::pgs::pg_placement() {
+            if pool.pg_count == 0 {
+                pool.pg_count = super::pgs::DEFAULT_PG_COUNT;
+            }
+            if pool.failure_domain.is_empty() {
+                let copies = super::pgs::copy_count(&pool);
+                pool.failure_domain = self
+                    .widest_feasible_domain(copies)
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "pool '{}' needs {copies} OSDs in service to spread its copies over",
+                            pool.name
+                        ))
+                    })?
+                    .to_string();
+            }
+        }
         // A pool with placement groups is refused up front when the
         // topology can't spread a PG's copies across failure domains: it
         // used to be created anyway, with no PGs, a warning in meta's log,
@@ -1875,7 +1689,6 @@ impl MetaService {
                 ))
             })?;
         }
-        let mut pool = pool;
         pool.created_at = Self::current_timestamp();
         pool.updated_at = pool.created_at;
         let bytes = pool.encode_to_vec();
@@ -2109,17 +1922,13 @@ impl MetaService {
         let map = self.placement_groups.read();
         let mut pgs: Vec<PlacementGroup> = map
             .iter()
-            .filter(|((p, id), _)| p == &req.pool && *id > req.start_after_pg_id)
+            .filter(|((p, id), _)| p == &req.pool && *id >= req.start_at_pg_id)
             .map(|(_, v)| v.clone())
             .collect();
         pgs.sort_by_key(|p| p.pg_id);
-        let truncated = pgs.len() > max;
+        // The first PG not listed starts the next page.
+        let next_pg_id = pgs.get(max).map_or(0, |p| p.pg_id);
         pgs.truncate(max);
-        let next_pg_id = if truncated {
-            pgs.last().map(|p| p.pg_id).unwrap_or(0)
-        } else {
-            0
-        };
         Ok(Response::new(ListPlacementGroupsResponse {
             pgs,
             next_pg_id,
@@ -2382,6 +2191,3 @@ impl MetaService {
         }))
     }
 }
-
-/// A key whose home has a given OSD: (bucket, key, the home's OSD ids).
-pub(crate) type KeyHome = (String, String, Vec<Vec<u8>>);

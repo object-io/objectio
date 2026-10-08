@@ -370,7 +370,10 @@ fn owner(o: &ObjectMeta) -> Option<&[u8]> {
 
 /// A page of the ObjectMetas an OSD holds, and the cursor for the next one
 /// (empty after the last page).
-async fn list_page(address: &str, cursor: &str) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
+pub(crate) async fn list_page(
+    address: &str,
+    cursor: &str,
+) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
     let mut client = StorageServiceClient::new(open_channel(address).await?)
         .max_decoding_message_size(100 * 1024 * 1024);
     let resp = tokio::time::timeout(
@@ -1059,23 +1062,6 @@ async fn spread(
     })
     .await?;
 
-    // The key's home: by position, as stripe 0 is placed.
-    let home_moves: Vec<(u32, Vec<u8>, Vec<u8>)> = moved
-        .iter()
-        .filter(|(id, ..)| Some(*id) == object.stripes.first().map(|s| s.stripe_id))
-        .map(|(_, old, new, _)| (old.position, old.node_id.clone(), new.node_id.clone()))
-        .collect();
-    if let Err(e) = meta
-        .move_object_home(&object.bucket, &object.key, &home_moves)
-        .await
-    {
-        // The shards moved; a later write of the key may double up again.
-        warn!(
-            "backfill: {}/{}: home not moved: {e}",
-            object.bucket, object.key
-        );
-    }
-
     let due = std::time::Instant::now() + MOVED_GRACE;
     let mut queue = MOVED
         .lock()
@@ -1194,6 +1180,7 @@ async fn write_shard(
             rdma: None,
             // Restores redundancy: may use the space kept from client writes.
             use_reserve: true,
+            pg: None,
         }),
     )
     .await??
@@ -1294,6 +1281,7 @@ async fn update_locations(
             replication_update: false,
             replication_set: std::collections::HashMap::new(),
             shard: None,
+            pg: None,
         };
         let result = async {
             let mut client = StorageServiceClient::new(open_channel(&addr).await?);
@@ -1334,6 +1322,9 @@ async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<O
 
 /// Meta's listing entry for `object`.
 async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()> {
+    // Restored only when a read quorum of its placement found it current
+    // (`restore_listing`): from level 7 that is its placement group.
+    let (pg_id, pool) = meta.listing_pg(&object.bucket, &object.key);
     MetadataService::create_object(
         meta.as_ref(),
         tonic::Request::new(CreateObjectRequest {
@@ -1345,10 +1336,8 @@ async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()
             user_metadata: object.user_metadata.clone(),
             stripes: object.stripes.clone(),
             object_id: object.object_id.clone(),
-            pg_id: 0,
-            pool: String::new(),
-            // Its home, if it has one, is where it was found.
-            home_osd_ids: Vec::new(),
+            pg_id,
+            pool,
             ..Default::default()
         }),
     )
@@ -1450,7 +1439,6 @@ async fn restore_listing(
                     bucket: object.bucket.clone(),
                     key: object.key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 }),
             )
             .await

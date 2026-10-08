@@ -438,6 +438,16 @@ impl S3Error {
     pub fn for_osd_error(e: &crate::osd_pool::OsdPoolError, what: &str) -> Response {
         use crate::osd_pool::OsdPoolError as E;
         match e {
+            E::StaleEpoch(_) => {
+                let mut resp = Self::xml_response(
+                    "ServiceUnavailable",
+                    &format!("{what}: {e}"),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                );
+                resp.extensions_mut()
+                    .insert(crate::osd_pool::StalePlacement);
+                resp
+            }
             E::Full(_) => Self::storage_full(),
             E::ConnectionFailed(_) | E::NoNodesAvailable | E::NodeNotFound(_) | E::ClockSkew(_) => {
                 Self::xml_response(

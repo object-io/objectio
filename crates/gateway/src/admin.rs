@@ -55,15 +55,16 @@ fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        failure_domain: v["failure_domain"].as_str().unwrap_or("rack").to_string(),
+        // Unnamed: meta spreads the copies over the widest failure-domain
+        // level with enough domains in service (B31).
+        failure_domain: v["failure_domain"].as_str().unwrap_or_default().to_string(),
         quota_bytes: v["quota_bytes"].as_u64().unwrap_or_default(),
         description: v["description"].as_str().unwrap_or_default().to_string(),
         enabled: v["enabled"].as_bool().unwrap_or(true),
         created_at: 0,
         updated_at: 0,
-        // Placement-group sizing. 0 places each object directly (CRUSH,
-        // no placement groups), the default; for PG-based placement pass
-        // "pg_count": 256 (or higher) on pool creation.
+        // Placement groups, fixed for the pool's life; 0 takes meta's
+        // default (256).
         pg_count: v["pg_count"].as_u64().unwrap_or_default() as u32,
         tier: v["tier"].as_str().unwrap_or_default().to_string(),
     }
@@ -886,9 +887,10 @@ pub async fn admin_get_pool(
     }
 }
 
-/// `GET /_admin/pools/{name}/placement-groups[?start_after=N&max=1000]`
-/// — paginated listing of a pool's placement groups with their OSD
-/// assignments and current version. Feeds the console's PG view.
+/// `GET /_admin/pools/{name}/placement-groups[?start_at=N&max=1000]`
+/// — paginated listing of a pool's placement groups: epoch, acting and up
+/// sets, stand-ins being filled (B31). `next_pg_id` starts the next page.
+/// Feeds the console's PG view.
 pub async fn admin_list_pool_placement_groups(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -901,8 +903,8 @@ pub async fn admin_list_pool_placement_groups(
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
-    let start_after: u32 = params
-        .get("start_after")
+    let start_at: u32 = params
+        .get("start_at")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let max_results: u32 = params
@@ -914,7 +916,7 @@ pub async fn admin_list_pool_placement_groups(
     match client
         .list_placement_groups(ListPlacementGroupsRequest {
             pool: name,
-            start_after_pg_id: start_after,
+            start_at_pg_id: start_at,
             max_results,
         })
         .await
@@ -928,14 +930,15 @@ pub async fn admin_list_pool_placement_groups(
                     serde_json::json!({
                         "pool": pg.pool,
                         "pg_id": pg.pg_id,
-                        "osd_ids": pg.osd_ids.iter().map(hex::encode).collect::<Vec<_>>(),
-                        "version": pg.version,
+                        "epoch": pg.epoch,
+                        "acting": pg.acting.iter().map(hex::encode).collect::<Vec<_>>(),
+                        "up": pg.up.iter().map(hex::encode).collect::<Vec<_>>(),
+                        "filling": pg.filling.iter().map(|f| serde_json::json!({
+                            "position": f.position,
+                            "from": hex::encode(&f.from),
+                            "epoch": f.epoch,
+                        })).collect::<Vec<_>>(),
                         "updated_at": pg.updated_at,
-                        "migrating_to_osd_ids": pg
-                            .migrating_to_osd_ids
-                            .iter()
-                            .map(hex::encode)
-                            .collect::<Vec<_>>(),
                     })
                 })
                 .collect();

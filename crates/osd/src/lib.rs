@@ -4,6 +4,7 @@
 //! in-process by `bin/aio`.
 
 pub mod discovery;
+pub mod pg_epochs;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod service;
@@ -742,6 +743,13 @@ async fn register_with_meta(
         .map_err(|e| format!("Failed to register OSD: {}", e))?;
 
     let resp = response.into_inner();
+
+    // Every placement group's epoch (B31): requests placed under an older
+    // one are refused from now on.
+    osd_service.pg_epochs().set_meta_endpoint(meta_endpoint);
+    for e in &resp.pg_epochs {
+        osd_service.pg_epochs().learn(&e.pool, e.pg_id, e.epoch);
+    }
 
     // Stamp the cluster_uuid into each disk's superblock. Empty
     // response means meta is pre-3.1 or a follower that couldn't

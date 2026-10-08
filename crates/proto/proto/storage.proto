@@ -67,6 +67,10 @@ service StorageService {
     // or found corrupt by the scrubber or a read. Asked by Meta's repairer.
     rpc CheckShards(CheckShardsRequest) returns (CheckShardsResponse);
 
+    // The epochs of placement groups, from meta after a commit that
+    // changes one (B31): a request placed under an older epoch is refused.
+    rpc SetPgEpochs(SetPgEpochsRequest) returns (SetPgEpochsResponse);
+
     // Dedup dry-run: record chunk fingerprints this OSD is primary for and
     // say which it had already seen; and forget them all, to start a new
     // measurement window.
@@ -114,7 +118,24 @@ message WriteShardRequest {
     // A write that restores redundancy (repair, drain, backfill): it may
     // use the space an OSD keeps back from client writes (`--full-ratio`).
     bool use_reserve = 7;
+    // The placement group and epoch the gateway placed this write under
+    // (B31). Unset for meta's own writes (repair, drain), which are
+    // directed at an OSD, not placed.
+    PgRef pg = 8;
 }
+
+// A placement group and the epoch of its acting set (B31). An OSD refuses
+// a request with an older epoch than it knows for the PG: StaleEpoch.
+message PgRef {
+    string pool = 1;
+    uint32 pg_id = 2;
+    uint64 epoch = 3;
+}
+
+message SetPgEpochsRequest {
+    repeated PgRef epochs = 1;
+}
+message SetPgEpochsResponse {}
 
 // Memory in another process that a shard moves through over Mooncake
 // Transfer Engine (RDMA, or TCP in development). The OSD always initiates:
@@ -347,6 +368,8 @@ message PutObjectMetaRequest {
     // written with the metadata in one log batch, one flush. Sent only once
     // the cluster is finalized at format level 5.
     SmallShard shard = 11;
+    // See WriteShardRequest.pg.
+    PgRef pg = 12;
 }
 
 message PutObjectMetaResponse {
@@ -405,6 +428,8 @@ message DeleteObjectMetaRequest {
     // shards it has, and newest on a read, it would be unreadable.
     // `version_id` and `stamp` are ignored.
     bytes withdraw_object_id = 5;
+    // See WriteShardRequest.pg.
+    PgRef pg = 6;
 }
 
 message DeleteObjectMetaResponse {

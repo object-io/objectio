@@ -1418,6 +1418,7 @@ pub async fn run(
                 post(test_hooks::rewrite_shard),
             )
             .route("/_admin/test/lose-reply", post(test_hooks::lose_reply))
+            .route("/_admin/test/hold-placed", post(test_hooks::hold_placed))
     } else {
         admin_routes
     };

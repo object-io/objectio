@@ -42,6 +42,8 @@ use objectio_proto::storage::{
     ReadShardResponse,
     ResetChunkNotesRequest,
     ResetChunkNotesResponse,
+    SetPgEpochsRequest,
+    SetPgEpochsResponse,
     WriteShardRequest,
     WriteShardResponse,
     health_check_response::Status as HealthStatus,
@@ -233,6 +235,9 @@ pub struct OsdService {
     /// every shard arrives and leaves as gRPC bytes.
     #[cfg(feature = "rdma")]
     rdma: std::sync::OnceLock<crate::rdma::RdmaStaging>,
+    /// Placement groups' epochs (B31): a request placed under an older one
+    /// than known is refused.
+    pg_epochs: crate::pg_epochs::PgEpochs,
 }
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
@@ -336,6 +341,7 @@ impl OsdService {
             safety: SafetyCache::default(),
             metrics_renderer: std::sync::OnceLock::new(),
             scrub: ScrubStats::default(),
+            pg_epochs: crate::pg_epochs::PgEpochs::default(),
             #[cfg(feature = "rdma")]
             rdma: std::sync::OnceLock::new(),
         })
@@ -351,6 +357,11 @@ impl OsdService {
     #[must_use]
     /// Shards forgotten when this OSD opened its store, their disk having
     /// come back blank (replaced): reported to Meta at registration.
+    /// The placement-group epochs this OSD holds requests to (B31).
+    pub fn pg_epochs(&self) -> &crate::pg_epochs::PgEpochs {
+        &self.pg_epochs
+    }
+
     pub fn shards_dropped_at_open(&self) -> u64 {
         self.shards.dropped_at_open()
     }
@@ -932,6 +943,16 @@ fn for_listing(mut object: ObjectMeta) -> ObjectMeta {
 
 #[tonic::async_trait]
 impl StorageService for OsdService {
+    async fn set_pg_epochs(
+        &self,
+        request: Request<SetPgEpochsRequest>,
+    ) -> Result<Response<SetPgEpochsResponse>, Status> {
+        for e in request.into_inner().epochs {
+            self.pg_epochs.learn(&e.pool, e.pg_id, e.epoch);
+        }
+        Ok(Response::new(SetPgEpochsResponse {}))
+    }
+
     async fn check_shards(
         &self,
         request: Request<CheckShardsRequest>,
@@ -1057,6 +1078,7 @@ impl StorageService for OsdService {
     ) -> Result<Response<WriteShardResponse>, Status> {
         let start = Instant::now();
         let req = request.into_inner();
+        self.pg_epochs.check(req.pg.as_ref()).await?;
         let shard_id = req.shard_id.ok_or_else(|| {
             self.grpc_metrics
                 .write_shard
@@ -1438,6 +1460,7 @@ impl StorageService for OsdService {
         &self,
         request: Request<PutObjectMetaRequest>,
     ) -> Result<Response<PutObjectMetaResponse>, Status> {
+        self.pg_epochs.check(request.get_ref().pg.as_ref()).await?;
         // The store write syncs the WAL: off the runtime worker, so a
         // sync stalls nothing else and concurrent writes share it.
         blocking(|| {
@@ -1679,6 +1702,7 @@ impl StorageService for OsdService {
         &self,
         request: Request<DeleteObjectMetaRequest>,
     ) -> Result<Response<DeleteObjectMetaResponse>, Status> {
+        self.pg_epochs.check(request.get_ref().pg.as_ref()).await?;
         // The store write syncs the WAL: off the runtime worker, so a
         // sync stalls nothing else and concurrent writes share it.
         blocking(|| {
@@ -2317,6 +2341,7 @@ mod grpc_write_tests {
             }),
             rdma: None,
             use_reserve: false,
+            pg: None,
         }
     }
 

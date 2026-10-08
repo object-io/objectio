@@ -393,7 +393,6 @@ pub(crate) async fn copy_by_reference(
         object_id: new_id.clone(),
         pg_id: dest_placement.pg_id,
         pool: dest_placement.pool.clone(),
-        home_osd_ids: home_of(&dest_placement.nodes),
         ..Default::default()
     };
     let new_object = referenced_object_ids(&object_meta);

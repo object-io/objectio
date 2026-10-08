@@ -129,11 +129,6 @@ pub const KMS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("kms_key
 // next bucket. Value: prost-encoded ObjectListingEntry.
 pub const OBJECT_LISTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("object_listings");
 
-// Object homes: the OSDs a key's ObjectMeta was written to. GetPlacement
-// returns them for the key, so placement computed from a topology that has
-// changed since never hides an object. Key: "{bucket}/{key}".
-// Value: prost-encoded ObjectHome. Written by CasTable::Named("object_homes").
-pub const OBJECT_HOMES: TableDefinition<&str, &[u8]> = TableDefinition::new("object_homes");
 /// Objects acknowledged short of shards (B29): "{bucket}/{key}" ->
 /// prost-encoded `DegradedObject`.
 pub const DEGRADED_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("degraded_objects");

@@ -506,7 +506,8 @@ pub async fn pack_objects(
             let id = pack_id.clone();
             async move {
                 let position = u32::try_from(i).unwrap_or(u32::MAX);
-                let r = write_shard_to_osd(&pool, node, &id, 0, position, shard, k, m, None).await;
+                let r = write_shard_to_osd(&pool, node, &id, 0, position, shard, k, m, None, None)
+                    .await;
                 (position, r, node)
             }
         });

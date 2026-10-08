@@ -45,6 +45,27 @@ impl MetaService {
             .map(|s| s.node_id.clone())
             .unwrap_or_default();
         let now = Self::current_timestamp();
+        let listing_key = format!("{}\0{}\0", req.bucket, req.key);
+        // Idempotent overwrite: PUT on an existing key replaces. Read
+        // current (if any) so the MultiCas doesn't spuriously fail.
+        let expected_bytes = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_object_listing(&listing_key));
+        // The placement group the key is placed through (B31): as the
+        // gateway placed it, or, for a listing re-synced without one, the
+        // key's own; a key written before level 7 keeps none.
+        let (pg_id, pool) = if !req.pool.is_empty() || !super::pgs::pg_placement() {
+            (req.pg_id, req.pool.clone())
+        } else if expected_bytes
+            .as_deref()
+            .and_then(|b| ObjectListingEntry::decode(b).ok())
+            .is_some_and(|e| e.pool.is_empty())
+        {
+            (0, String::new())
+        } else {
+            self.listing_pg(&req.bucket, &req.key)
+        };
         let entry = ObjectListingEntry {
             bucket: req.bucket.clone(),
             key: req.key.clone(),
@@ -62,19 +83,11 @@ impl MetaService {
             // pg_id set, ListObjects + GET can resolve osd_ids via a
             // single PG lookup; without, we fall back to the legacy
             // per-object CRUSH path.
-            pg_id: req.pg_id,
-            pool: req.pool.clone(),
+            pg_id,
+            pool,
             object_id: req.object_id.clone(),
         };
-        let listing_key = format!("{}\0{}\0", req.bucket, req.key);
         let new_bytes = entry.encode_to_vec();
-
-        // Idempotent overwrite: PUT on an existing key replaces. Read
-        // current (if any) so the MultiCas doesn't spuriously fail.
-        let expected_bytes = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read_object_listing(&listing_key));
 
         // A conditional write is decided here, against the entry the
         // MultiCas below expects: a write that changes it meanwhile makes
@@ -110,28 +123,17 @@ impl MetaService {
             }
         }
 
-        // The key's home, recorded with its listing when it moved (or is
-        // new): where the gateway just wrote its ObjectMeta.
-        let home_key = format!("{}/{}", req.bucket, req.key);
-        let current_home = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read_object_home(&home_key));
-        let new_home = (!req.home_osd_ids.is_empty())
-            .then(|| {
-                ObjectHome {
-                    osd_ids: req.home_osd_ids.clone(),
-                }
-                .encode_to_vec()
-            })
-            .filter(|h| current_home.as_ref() != Some(h));
+        let record_key = format!("{}/{}", req.bucket, req.key);
 
         // Written short of shards: recorded in the same command (B29), so
         // repair takes it at once and no crash loses it. A write of the key
         // replaces the record of the object it replaces. Listing the same
         // object again (a listing re-synced after its write was refused)
         // leaves its record: that makes no shard whole.
-        let current_degraded = self.store.as_ref().and_then(|s| s.read_degraded(&home_key));
+        let current_degraded = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read_degraded(&record_key));
         let new_degraded = degraded_record(&req, now);
         let current_degraded = current_degraded.filter(|c| {
             new_degraded.is_some()
@@ -150,17 +152,9 @@ impl MetaService {
             if current_degraded.is_some() || new_degraded.is_some() {
                 ops.push(CasOp {
                     table: CasTable::Named("degraded_objects".into()),
-                    key: home_key.clone(),
+                    key: record_key.clone(),
                     expected: current_degraded,
                     new_value: new_degraded,
-                });
-            }
-            if let Some(home) = new_home {
-                ops.push(CasOp {
-                    table: CasTable::Named("object_homes".into()),
-                    key: home_key,
-                    expected: current_home,
-                    new_value: Some(home),
                 });
             }
             let cmd = MetaCommand::MultiCas {
@@ -191,9 +185,6 @@ impl MetaService {
             }
         } else if let Some(store) = &self.store {
             store.put_object_listing(&listing_key, &entry.encode_to_vec());
-            if let Some(home) = new_home {
-                store.put_object_home(&home_key, &home);
-            }
         }
 
         Ok(Response::new(CreateObjectResponse { object: None }))
@@ -209,15 +200,7 @@ impl MetaService {
             .store
             .as_ref()
             .and_then(|s| s.read_object_listing(&listing_key));
-        let home_key = format!("{}/{}", req.bucket, req.key);
-        let home = if req.forget_home {
-            self.store
-                .as_ref()
-                .and_then(|s| s.read_object_home(&home_key))
-        } else {
-            None
-        };
-        if expected_bytes.is_none() && home.is_none() {
+        if expected_bytes.is_none() {
             // Nothing to remove — return success idempotently.
             return Ok(Response::new(DeleteObjectResponse {
                 success: true,
@@ -227,23 +210,12 @@ impl MetaService {
 
         if let Some(raft) = self.raft_handle() {
             use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let mut ops = Vec::with_capacity(2);
-            if expected_bytes.is_some() {
-                ops.push(CasOp {
-                    table: CasTable::ObjectListings,
-                    key: listing_key,
-                    expected: expected_bytes,
-                    new_value: None,
-                });
-            }
-            if home.is_some() {
-                ops.push(CasOp {
-                    table: CasTable::Named("object_homes".into()),
-                    key: home_key,
-                    expected: home,
-                    new_value: None,
-                });
-            }
+            let ops = vec![CasOp {
+                table: CasTable::ObjectListings,
+                key: listing_key,
+                expected: expected_bytes,
+                new_value: None,
+            }];
             let cmd = MetaCommand::MultiCas {
                 ops,
                 requested_by: "delete-object".into(),
@@ -265,9 +237,6 @@ impl MetaService {
             // Legacy non-raft path: direct redb delete.
             store
                 .delete_object_listing(&format!("{}\0{}\0{}", req.bucket, req.key, req.version_id));
-            if home.is_some() {
-                store.delete_object_home(&home_key);
-            }
         }
 
         Ok(Response::new(DeleteObjectResponse {
@@ -360,12 +329,7 @@ impl MetaService {
         &self,
         request: Request<GetPlacementRequest>,
     ) -> Result<Response<GetPlacementResponse>, Status> {
-        let home = self.object_home(&request.get_ref().bucket, &request.get_ref().key);
-        let mut response = self.computed_placement(request).await?;
-        if let Some(home) = home {
-            self.place_at_home(&mut response.get_mut().nodes, &home);
-        }
-        Ok(response)
+        self.computed_placement(request).await
     }
 
     /// Everything a PUT asks before its data moves, in one call (B21): the

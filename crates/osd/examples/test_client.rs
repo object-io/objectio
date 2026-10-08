@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sha256: vec![],
             }),
             use_reserve: false,
+            pg: None,
         })
         .await?;
 

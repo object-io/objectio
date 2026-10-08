@@ -4,15 +4,17 @@
 //! every placement group against a cost function. When a PG is
 //! overloaded on one of its OSDs relative to the ideal target, or
 //! an OSD is underloaded, the balancer picks a better copyset from
-//! the precomputed pool and commits the new `osd_ids` via MultiCas.
+//! the precomputed pool and commits it as the PG's `up` set via MultiCas.
 //!
 //! # What a move moves
 //!
-//! Moves commit **directly** — `osd_ids = new_set`, `version += 1` — and
-//! copy no data. That places *new* keys only: a key already written keeps
-//! its home (the OSDs its ObjectMeta was written to, recorded by meta), and
-//! GetPlacement returns that, so a move never hides an object. Its shards
-//! stay where its stripes say they are. `migrating_to_osd_ids` is unused.
+//! Nothing, yet (B31 phase 1). A PG's `acting` set is where its objects
+//! are and where writes go; it changes only with an epoch, and only once
+//! the data is where the new set says (recovery, a later phase). Moving
+//! `acting` without copying would hide every object the PG holds: a key's
+//! copies are its PG's acting set, with no per-key record of where else
+//! they might be. So the balancer plans: it writes `up`, which recovery will
+//! follow. Below format level 7 it does not run at all.
 //!
 //! # Tuning knobs (config keys, all optional)
 //!
@@ -161,6 +163,9 @@ async fn sweep_once(meta: &Arc<MetaService>, tuning: &Tuning) -> anyhow::Result<
         debug!("balancer: paused via balancer/paused config");
         return Ok(());
     }
+    if !crate::service::pgs::pg_placement() {
+        return Ok(()); // see "What a move moves"
+    }
 
     let topology = meta.topology_snapshot();
     let active_osds: usize = topology.active_nodes().count();
@@ -248,11 +253,17 @@ fn per_tick_cap(active_osds: usize, override_value: usize) -> usize {
 /// treating a malformed id as an empty OSD would make the PG look colder than
 /// it is and pull work toward a disk that does not exist.
 fn pg_osd_counts(pg: &PlacementGroup, osd_counts: &HashMap<[u8; 16], usize>) -> Vec<usize> {
-    pg.osd_ids
+    members(pg)
         .iter()
         .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
         .map(|arr| *osd_counts.get(&arr).unwrap_or(&0))
         .collect()
+}
+
+/// Where the balancer wants the PG: its `up` set, which starts as its
+/// acting set (and is empty in a PG made before level 7).
+fn members(pg: &PlacementGroup) -> &[Vec<u8>] {
+    if pg.up.is_empty() { &pg.acting } else { &pg.up }
 }
 
 /// A PG's cost: how far its hottest OSD is above the ideal share. Sorted on,
@@ -311,7 +322,7 @@ async fn evaluate_pool(
     // instead of over-moving onto the same OSD.
     let mut osd_counts: HashMap<[u8; 16], usize> = HashMap::new();
     for pg in &pgs {
-        for osd in &pg.osd_ids {
+        for osd in members(pg) {
             if let Ok(arr) = <[u8; 16]>::try_from(osd.as_slice()) {
                 *osd_counts.entry(arr).or_insert(0) += 1;
             }
@@ -372,8 +383,7 @@ async fn evaluate_pool(
             break;
         }
 
-        let current_load: f64 = pg
-            .osd_ids
+        let current_load: f64 = members(&pg)
             .iter()
             .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
             .map(|arr| *osd_counts.get(&arr).unwrap_or(&0) as f64)
@@ -410,11 +420,10 @@ async fn evaluate_pool(
             continue;
         }
 
-        // Commit the move — greenfield so we rewrite osd_ids in place.
+        // The plan: `up` only. The epoch is acting's, and acting stays.
         let old_bytes = pg.encode_to_vec();
         let new_pg = PlacementGroup {
-            osd_ids: cs.osds.iter().map(|n| n.as_bytes().to_vec()).collect(),
-            version: pg.version.wrapping_add(1),
+            up: cs.osds.iter().map(|n| n.as_bytes().to_vec()).collect(),
             updated_at: now_unix(),
             ..pg.clone()
         };
@@ -423,12 +432,12 @@ async fn evaluate_pool(
         match commit_pg(meta, &pg, old_bytes, new_bytes).await {
             Ok(()) => {
                 info!(
-                    "balancer: moved pool={} pg_id={} cost={:.2} load {}→{} v{}→v{}",
-                    pool.name, pg.pg_id, cost, current_load, best_cost, pg.version, new_pg.version
+                    "balancer: planned pool={} pg_id={} cost={:.2} load {}→{}",
+                    pool.name, pg.pg_id, cost, current_load, best_cost
                 );
                 // Update in-memory osd_counts so the next PG in this
                 // tick sees the post-commit state.
-                for osd in &pg.osd_ids {
+                for osd in members(&pg) {
                     if let Ok(arr) = <[u8; 16]>::try_from(osd.as_slice())
                         && let Some(c) = osd_counts.get_mut(&arr)
                     {
@@ -537,8 +546,8 @@ mod tests {
     fn pg(osd_ids: &[[u8; 16]]) -> PlacementGroup {
         PlacementGroup {
             pg_id: 1,
-            osd_ids: osd_ids.iter().map(|id| id.to_vec()).collect(),
-            version: 1,
+            acting: osd_ids.iter().map(|id| id.to_vec()).collect(),
+            epoch: 1,
             ..Default::default()
         }
     }
@@ -610,7 +619,7 @@ mod tests {
         let mut counts = HashMap::new();
         counts.insert(osd(1), 7);
         let mut bad = pg(&[osd(1)]);
-        bad.osd_ids.push(vec![0u8; 4]);
+        bad.acting.push(vec![0u8; 4]);
         assert_eq!(pg_osd_counts(&bad, &counts), vec![7]);
     }
 

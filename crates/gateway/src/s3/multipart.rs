@@ -658,6 +658,9 @@ pub(crate) async fn upload_part_internal(
                         1,    // ec_k=1 for replication
                         0,    // ec_m=0 for replication
                         None, // Replicated stripes go over gRPC.
+                        // A part is placed by its upload, not fenced (B31
+                        // phase 1): its object's metadata is, at completion.
+                        None,
                     )
                     .await;
                     (pos, result, placement_node)
@@ -828,6 +831,9 @@ pub(crate) async fn upload_part_internal(
                         ec_k,
                         ec_m,
                         None, // Multipart parts go over gRPC (for now).
+                        // A part is placed by its upload, not fenced (B31
+                        // phase 1): its object's metadata is, at completion.
+                        None,
                     )
                     .await;
                     (pos, result, placement_node)
