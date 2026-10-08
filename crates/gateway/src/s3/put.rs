@@ -1144,6 +1144,8 @@ async fn put_object_placed(
             required_level: 0,
             stamp: 0, // stamped when stored
             update_stamp: 0,
+            pg_pool: placement.pool.clone(),
+            pg_id: placement.pg_id,
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -1632,6 +1634,8 @@ async fn put_object_placed(
         required_level: 0,
         stamp: 0, // stamped when stored
         update_stamp: 0,
+        pg_pool: placement.pool.clone(),
+        pg_id: placement.pg_id,
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.

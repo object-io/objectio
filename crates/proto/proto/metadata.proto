@@ -468,6 +468,12 @@ message ObjectMeta {
     // only between copies of one object (same stamp and object id), so an
     // update never outranks a newer object. 0 = never updated.
     uint64 update_stamp = 30;
+    // The placement group the key is placed through (B31): set by the
+    // gateway when it writes the object, kept by every copy and update. An
+    // OSD indexes its copies by it, so one PG's contents are one prefix
+    // scan. Empty pool: a key placed per key (written before level 7).
+    string pg_pool = 31;
+    uint32 pg_id = 32;
 }
 
 // A full-object checksum, as S3 reports it.
@@ -2549,6 +2555,8 @@ message GetPlacementGroupRequest {
 message GetPlacementGroupResponse {
     PlacementGroup pg = 1;
     bool found = 2;
+    // What peering last found (B31 phase 2); unset if it hasn't run yet.
+    PgState state = 3;
 }
 message ListPlacementGroupsRequest {
     string pool = 1;
@@ -2560,6 +2568,57 @@ message ListPlacementGroupsRequest {
 message ListPlacementGroupsResponse {
     repeated PlacementGroup pgs = 1;
     uint32 next_pg_id = 2;            // the next page's start_at; 0 = end of list
+    // What peering last found for each PG listed that it has run on.
+    repeated PgState states = 3;
+}
+
+// What peering found of a placement group (B31 phase 2, objectio-docs
+// core/pg-recovery.md): computed by the leader from its members' summaries
+// and, when they differ, their listings; nothing is acted on yet. Kept in
+// the Raft table `pg_state`, keyed "{pool}\0{pg_id:010}", written when it
+// changes.
+message PgState {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // Clean, Degraded, Undersized, Incomplete or Down (most severe first:
+    // Down, Incomplete, Undersized, Degraded, Clean).
+    string state = 3;
+    // The PG's epoch when this was computed.
+    uint64 epoch = 4;
+    // Current objects (and tombstones) in the authoritative view.
+    uint64 objects = 5;
+    uint64 tombstones = 6;
+    // Objects some acting member lacks something of (its metadata copy,
+    // an up-to-date copy, or its shard).
+    uint64 objects_degraded = 7;
+    // Objects with fewer than k complete copies among the members that
+    // answered: unreadable if nothing else comes back.
+    uint64 objects_unfound = 8;
+    // (member, object) pairs: no metadata copy; an older one; shards
+    // the member should hold at its position and doesn't.
+    uint64 copies_missing = 9;
+    uint64 copies_stale = 10;
+    uint64 shards_missing = 11;
+    // Acting members that didn't answer.
+    uint32 members_down = 12;
+    // Acting != up (the balancer wants it elsewhere; recovery moves it).
+    bool remapped = 13;
+    // Whether the members agreed by summary alone (no listing needed).
+    bool by_summary = 14;
+    string last_error = 15;
+    // When the PG entered this state, and when this was computed (Unix s).
+    uint64 since = 16;
+    uint64 computed_at = 17;
+    repeated PgMemberState members = 18;
+}
+
+message PgMemberState {
+    bytes node_id = 1;
+    uint32 position = 2;
+    bool answered = 3;
+    uint64 copies_missing = 4;
+    uint64 copies_stale = 5;
+    uint64 shards_missing = 6;
 }
 
 message CreatePoolRequest { PoolConfig pool = 1; }

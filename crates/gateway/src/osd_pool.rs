@@ -1203,6 +1203,14 @@ pub async fn put_object_meta_with(
     // of the OSDs holding this ObjectMeta.
     let mut object_meta = object_meta;
     object_meta.usage_owner.clone_from(&targets[0].node_id);
+    // The placement group the key is placed through, kept by every copy
+    // and update: the OSDs index their copies by it (B31 phase 2).
+    if object_meta.pg_pool.is_empty()
+        && let Some(pg) = pg.filter(|p| !p.pool.is_empty())
+    {
+        object_meta.pg_pool.clone_from(&pg.pool);
+        object_meta.pg_id = pg.pg_id;
+    }
     // Every copy gets the same stamp, above any this one was read at: the
     // order the copies keep (core/object-metadata-quorum.md).
     //

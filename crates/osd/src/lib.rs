@@ -5,6 +5,7 @@
 
 pub mod discovery;
 pub mod pg_epochs;
+pub mod pg_index;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod service;

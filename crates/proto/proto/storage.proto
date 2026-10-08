@@ -71,6 +71,11 @@ service StorageService {
     // changes one (B31): a request placed under an older epoch is refused.
     rpc SetPgEpochs(SetPgEpochsRequest) returns (SetPgEpochsResponse);
 
+    // Peering (B31 phase 2): this OSD's summary of what it holds of a
+    // placement group, and the entries themselves, a page at a time.
+    rpc GetPgInfo(GetPgInfoRequest) returns (GetPgInfoResponse);
+    rpc ListPg(ListPgRequest) returns (ListPgResponse);
+
     // Dedup dry-run: record chunk fingerprints this OSD is primary for and
     // say which it had already seen; and forget them all, to start a new
     // measurement window.
@@ -136,6 +141,67 @@ message SetPgEpochsRequest {
     repeated PgRef epochs = 1;
 }
 message SetPgEpochsResponse {}
+
+// What an OSD holds of one placement group: one entry per key, its current
+// object or, when it has none, the tombstone of its last delete. Kept with
+// every write, in the same atomic write (B31 phase 2).
+message PgSummary {
+    uint64 objects = 1;
+    uint64 tombstones = 2;
+    // The highest stamp of any entry.
+    uint64 max_stamp = 3;
+    // XOR of a 128-bit hash of each entry (key, kind, write order):
+    // independent of order, so two copies holding the same entries have
+    // the same digest. Big-endian.
+    bytes digest = 4;
+    // Over current objects: their stripes; positions no shard location
+    // names; positions whose location names this OSD.
+    uint64 stripes = 5;
+    uint64 positions_short = 6;
+    uint64 named_here = 7;
+}
+
+// One key of a placement group on an OSD.
+message PgEntry {
+    string bucket = 1;
+    string key = 2;
+    bool tombstone = 3;
+    // The write order: (stamp, object id, update stamp); a tombstone has
+    // only its stamp.
+    uint64 stamp = 4;
+    bytes object_id = 5;
+    uint64 update_stamp = 6;
+    uint32 stripes = 7;
+    uint32 positions_short = 8;
+    uint32 named_here = 9;
+    // Of the positions named here, how many this OSD holds intact (ListPg
+    // only).
+    uint32 held_here = 10;
+    // Shards a read needs (the object's k; 1 for one held whole).
+    uint32 needed = 11;
+}
+
+message GetPgInfoRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message GetPgInfoResponse {
+    PgSummary summary = 1;
+}
+
+message ListPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // "{bucket}\0{key}" of the last entry of the previous page; empty: from
+    // the start.
+    string after = 3;
+    uint32 limit = 4;   // 0: 1000
+}
+message ListPgResponse {
+    repeated PgEntry entries = 1;
+    // For the next page; empty after the last.
+    string next = 2;
+}
 
 // Memory in another process that a shard moves through over Mooncake
 // Transfer Engine (RDMA, or TCP in development). The OSD always initiates:

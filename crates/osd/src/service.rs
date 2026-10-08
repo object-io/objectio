@@ -19,6 +19,8 @@ use objectio_proto::storage::{
     FindObjectsReferencingNodeResponse,
     GetObjectMetaRequest,
     GetObjectMetaResponse,
+    GetPgInfoRequest,
+    GetPgInfoResponse,
     GetShardMetaRequest,
     GetShardMetaResponse,
     GetStatusRequest,
@@ -30,6 +32,8 @@ use objectio_proto::storage::{
     ListObjectsMetaChunk,
     ListObjectsMetaRequest,
     ListObjectsMetaResponse,
+    ListPgRequest,
+    ListPgResponse,
     ListShardsRequest,
     ListShardsResponse,
     NoteChunksRequest,
@@ -238,6 +242,9 @@ pub struct OsdService {
     /// Placement groups' epochs (B31): a request placed under an older one
     /// than known is refused.
     pg_epochs: crate::pg_epochs::PgEpochs,
+    /// The same store as `meta_store`, indexed by placement group (B31
+    /// phase 2): what peering asks of this OSD.
+    pg_index: Arc<crate::pg_index::PgIndexed>,
 }
 
 type MetricsRenderer = Box<dyn Fn() -> String + Send + Sync>;
@@ -309,6 +316,13 @@ impl OsdService {
         let meta_dir = meta_config.data_dir.clone();
         let meta_store = objectio_storage::metadata::open(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
+        // Every write goes through the placement-group index (B31 phase 2),
+        // the shard store's included.
+        let pg_index = Arc::new(
+            crate::pg_index::PgIndexed::open(meta_store, node_id)
+                .map_err(|e| format!("Failed to index metadata by placement group: {e}"))?,
+        );
+        let meta_store: Arc<dyn MetaIndex> = Arc::clone(&pg_index) as Arc<dyn MetaIndex>;
 
         info!(
             "OSD initialized with {} disks, metadata at {:?}",
@@ -342,6 +356,7 @@ impl OsdService {
             metrics_renderer: std::sync::OnceLock::new(),
             scrub: ScrubStats::default(),
             pg_epochs: crate::pg_epochs::PgEpochs::default(),
+            pg_index,
             #[cfg(feature = "rdma")]
             rdma: std::sync::OnceLock::new(),
         })
@@ -601,6 +616,44 @@ impl OsdService {
         }
     }
 
+    /// Of the shard positions `bucket/key`'s current object (if it is still
+    /// `object_id`) names on this OSD, how many it holds intact.
+    fn held_here(&self, bucket: &str, key: &str, object_id: &[u8]) -> u32 {
+        let Some(o) = self
+            .stored_meta(&MetadataKey::object_meta(bucket, key))
+            .filter(|o| o.object_id == object_id)
+        else {
+            return 0;
+        };
+        let mut held = 0u32;
+        for stripe in &o.stripes {
+            let mut mine: Vec<u32> = stripe
+                .shards
+                .iter()
+                .filter(|l| l.node_id.as_slice() == self.node_id.as_slice())
+                .map(|l| l.position)
+                .collect();
+            mine.sort_unstable();
+            mine.dedup();
+            let shard_object = if stripe.object_id.is_empty() {
+                o.object_id.clone()
+            } else {
+                stripe.object_id.clone()
+            };
+            for position in mine {
+                let id = objectio_proto::storage::ShardId {
+                    object_id: shard_object.clone(),
+                    stripe_id: stripe.stripe_id,
+                    position,
+                };
+                if self.shards.state(&id) == objectio_proto::storage::ShardState::Ok {
+                    held += 1;
+                }
+            }
+        }
+        held
+    }
+
     /// Decoded ObjectMeta currently stored under `key`, if any.
     fn stored_meta(&self, key: &MetadataKey) -> Option<ObjectMeta> {
         self.meta_store
@@ -741,11 +794,12 @@ impl OsdService {
     fn tombstone(&self, bucket: &str, key: &str, version_id: &str) -> u64 {
         self.meta_store
             .get(&MetadataKey::tombstone(bucket, key, version_id))
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map_or(0, u64::from_be_bytes)
+            .map_or(0, |v| crate::pg_index::tombstone_stamp(&v))
     }
 
-    /// Record a delete's stamp (only ever raised).
+    /// Record a delete's stamp (only ever raised), with the placement group
+    /// of its key when known (`pg`, else the one it recorded before), so a
+    /// key left with only its tombstone stays indexed under its PG.
     #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns
     fn put_tombstone(
         &self,
@@ -753,14 +807,21 @@ impl OsdService {
         key: &str,
         version_id: &str,
         stamp: u64,
+        pg: Option<crate::pg_index::PgId>,
     ) -> Result<(), Status> {
-        if self.tombstone(bucket, key, version_id) >= stamp {
+        let at = MetadataKey::tombstone(bucket, key, version_id);
+        let old = self.meta_store.get(&at);
+        if old.as_deref().map_or(0, crate::pg_index::tombstone_stamp) >= stamp {
             return Ok(());
         }
+        let pg = pg.or_else(|| old.as_deref().and_then(crate::pg_index::tombstone_pg));
         self.meta_store
             .put(
-                MetadataKey::tombstone(bucket, key, version_id),
-                stamp.to_be_bytes().to_vec(),
+                at,
+                crate::pg_index::tombstone_value(
+                    stamp,
+                    pg.as_ref().map(|(pool, id)| (pool.as_str(), *id)),
+                ),
             )
             .map(drop)
             .map_err(|e| Status::internal(format!("failed to record the delete: {e}")))
@@ -951,6 +1012,43 @@ impl StorageService for OsdService {
             self.pg_epochs.learn(&e.pool, e.pg_id, e.epoch);
         }
         Ok(Response::new(SetPgEpochsResponse {}))
+    }
+
+    async fn get_pg_info(
+        &self,
+        request: Request<GetPgInfoRequest>,
+    ) -> Result<Response<GetPgInfoResponse>, Status> {
+        let r = request.into_inner();
+        let summary = self.pg_index.summary(&(r.pool, r.pg_id));
+        Ok(Response::new(GetPgInfoResponse {
+            summary: Some(summary.to_proto()),
+        }))
+    }
+
+    async fn list_pg(
+        &self,
+        request: Request<ListPgRequest>,
+    ) -> Result<Response<ListPgResponse>, Status> {
+        let r = request.into_inner();
+        let limit = if r.limit == 0 {
+            1000
+        } else {
+            r.limit.min(10_000)
+        } as usize;
+        // Reads the store and asks the shard store of each entry: off the
+        // runtime worker.
+        Ok(blocking(|| {
+            let (mut entries, next) =
+                self.pg_index
+                    .list(&(r.pool.clone(), r.pg_id), &r.after, limit);
+            for e in entries
+                .iter_mut()
+                .filter(|e| !e.tombstone && e.named_here > 0)
+            {
+                e.held_here = self.held_here(&e.bucket, &e.key, &e.object_id);
+            }
+            Response::new(ListPgResponse { entries, next })
+        }))
     }
 
     async fn check_shards(
@@ -1466,9 +1564,17 @@ impl StorageService for OsdService {
         blocking(|| {
             let req = request.into_inner();
 
-            let object = req
+            let mut object = req
                 .object
                 .ok_or_else(|| Status::invalid_argument("missing object"))?;
+            // The placement group the write was placed under, for an object
+            // that doesn't record one yet: kept with it, and indexed by it.
+            if object.pg_pool.is_empty()
+                && let Some(pg) = req.pg.as_ref().filter(|p| !p.pool.is_empty())
+            {
+                object.pg_pool.clone_from(&pg.pool);
+                object.pg_id = pg.pg_id;
+            }
 
             // Serialize ObjectMeta to bytes using protobuf
             let value = object.encode_to_vec();
@@ -1738,7 +1844,19 @@ impl StorageService for OsdService {
             // The tombstone goes first: a copy that crashed after it but
             // before the removal still answers "deleted" (newer stamp).
             if req.stamp != 0 {
-                self.put_tombstone(&req.bucket, &req.key, &req.version_id, req.stamp)?;
+                // The key's placement group: as the request was placed, else
+                // as its current object records it.
+                let pg = req
+                    .pg
+                    .as_ref()
+                    .filter(|p| !p.pool.is_empty())
+                    .map(|p| (p.pool.clone(), p.pg_id))
+                    .or_else(|| {
+                        self.stored_meta(&MetadataKey::object_meta(&req.bucket, &req.key))
+                            .filter(|o| !o.pg_pool.is_empty())
+                            .map(|o| (o.pg_pool, o.pg_id))
+                    });
+                self.put_tombstone(&req.bucket, &req.key, &req.version_id, req.stamp, pg)?;
             }
 
             let removed;

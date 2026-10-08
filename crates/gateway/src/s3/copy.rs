@@ -362,6 +362,8 @@ pub(crate) async fn copy_by_reference(
         bucket: dest_bucket.to_string(),
         key: dest_key.to_string(),
         object_id: new_id.clone(),
+        pg_pool: dest_placement.pool.clone(),
+        pg_id: dest_placement.pg_id,
         size: source.size,
         content_type: content_type.clone(),
         etag: source.etag.clone(),
