@@ -1224,14 +1224,21 @@ impl MetaService {
             evicted_ids
         };
 
-        // Also drop the stale node_ids from the CRUSH topology so listings
-        // and placement see a clean view.
-        if !evicted_ids.is_empty() || !lost.is_empty() {
+        // Drop the drained entries from the CRUSH topology so listings and
+        // placement see a clean view. A lost OSD stays in it, Out (which
+        // placement skips), as its stored entry puts it on every node: it
+        // was removed here, and stayed removed on this node whenever the
+        // apply of its entry ran first, so this node's listings lost it
+        // while it was still being evacuated, and differed from the
+        // followers'.
+        if !evicted_ids.is_empty() {
             let mut topology = self.topology.write();
-            for id in evicted_ids.iter().chain(lost.iter().map(|n| &n.node_id)) {
-                let stale = NodeId::from_bytes(*id);
-                topology.remove_node(stale);
+            for id in &evicted_ids {
+                topology.remove_node(NodeId::from_bytes(*id));
             }
+        }
+        for n in &lost {
+            self.refresh_topology_node(n);
         }
 
         // Add (or refresh) THIS OSD in the topology. Without this, a
