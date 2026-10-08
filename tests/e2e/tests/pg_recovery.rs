@@ -461,3 +461,46 @@ fn draining_an_osd_empties_it_through_its_pgs() {
     }
     all_read(&ha, "drain", &bodies);
 }
+
+/// How fast a backfill goes (not a test of anything): one PG of 400
+/// objects of 256 KiB, a member's drive lost, the time until the PG is
+/// clean. `cargo test -p objectio-e2e --test pg_recovery -- --ignored
+/// --nocapture backfill_throughput`.
+#[test]
+#[ignore = "a measurement"]
+fn backfill_throughput() {
+    let mut ha = cluster(1, 7);
+    one_pg_bucket(&ha, "speed");
+    let client = &ha.clients[0];
+    let body = payload(256 * 1024, 1);
+    for i in 0..400 {
+        client
+            .request("PUT", &format!("/speed/k{i}"), &body)
+            .expect(200);
+    }
+    let ids = node_ids(&ha, 7);
+    let member = pgs(&ha, "one")[&0]["acting"][2]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lost = ids.iter().position(|id| *id == member).unwrap();
+    ha.stop_osd(lost);
+    ha.lose_osd_drive(lost);
+    ha.start_osd(lost, None);
+    // From the stand-in committed (the PG filling) to clean.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while pgs(&ha, "one")[&0]["filling"]
+        .as_array()
+        .is_none_or(Vec::is_empty)
+    {
+        assert!(Instant::now() < deadline, "never filling");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let started = Instant::now();
+    await_clean(&ha, "one", 600);
+    let took = started.elapsed();
+    println!(
+        "backfill: 400 objects of 256 KiB in {took:?}: {:.1} objects/s",
+        400.0 / took.as_secs_f64()
+    );
+}
