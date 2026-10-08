@@ -536,11 +536,6 @@ async fn cas_single_delete(
     }
 }
 
-/// Pools may be made with LRC or replication (`--allow-unrepaired-schemes`):
-/// not released, since repair rebuilds MDS stripes only (B10).
-pub static ALLOW_UNREPAIRED_SCHEMES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Classify a shard slot's role under MDS/LRC/Replication layouts the
 /// PG-allocation path uses. For MDS and Replication the layout is
 /// [data... parity...]; for LRC it is [data... local_parities...

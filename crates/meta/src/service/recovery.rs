@@ -32,9 +32,12 @@
 //! fewer than k shards anywhere is recorded unfound, and not tried again
 //! until a member comes back.
 //!
-//! MDS erasure coding only (phase 3a): replicated and LRC stripes are left
-//! as they are (B10; phase 3b). Versions other than the current object are
-//! not recovered yet. A stray's copies (a member a PG no longer has) of the
+//! Every protection scheme (phase 3b): an MDS stripe's missing shards are
+//! rebuilt from k others; a replicated stripe's missing copy is copied
+//! from an intact one; an LRC stripe's missing shard is rebuilt from its
+//! local group (the group's other data and its local parity, kept in one
+//! failure domain by the pool's rule) when the group has them, and from
+//! the whole stripe only when it doesn't. A stray's copies (a member a PG no longer has) of the
 //! PG's objects are withdrawn once the PG is filled; its shards stay
 //! allocated (a leak, not a loss) until the OSD is purged.
 
@@ -126,6 +129,11 @@ static OBJECTS: AtomicU64 = AtomicU64::new(0);
 static SHARDS: AtomicU64 = AtomicU64::new(0);
 static COPIES: AtomicU64 = AtomicU64::new(0);
 static REMAPS: AtomicU64 = AtomicU64::new(0);
+static LRC_LOCAL: AtomicU64 = AtomicU64::new(0);
+static LRC_GLOBAL: AtomicU64 = AtomicU64::new(0);
+static LRC_LOCAL_READS: AtomicU64 = AtomicU64::new(0);
+static LRC_GLOBAL_READS: AtomicU64 = AtomicU64::new(0);
+static REPLICAS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether recovery is working `pool/pg` on this leader (peering leaves it).
 pub(crate) fn is_busy(id: &(String, u32)) -> bool {
@@ -212,11 +220,44 @@ pub fn render_metrics(out: &mut String) {
             "Placement groups moved to their up set",
             &REMAPS,
         ),
+        (
+            "objectio_meta_pg_replica_copies_total",
+            "Replicated copies recovery made from an intact one",
+            &REPLICAS,
+        ),
     ] {
         let _ = writeln!(
             out,
             "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}",
             v.load(Ordering::Relaxed)
+        );
+    }
+    render_lrc(out);
+}
+
+/// Rebuilds of LRC shards and the shards they read, by kind: from the
+/// shard's local group, or from the whole stripe.
+fn render_lrc(out: &mut String) {
+    use std::fmt::Write as _;
+    for (name, help, local, global) in [
+        (
+            "objectio_meta_pg_lrc_rebuilds_total",
+            "LRC shards recovery rebuilt, from their local group or the whole stripe",
+            &LRC_LOCAL,
+            &LRC_GLOBAL,
+        ),
+        (
+            "objectio_meta_pg_lrc_shards_read_total",
+            "Shards LRC rebuilds read, inside the local group or across the stripe",
+            &LRC_LOCAL_READS,
+            &LRC_GLOBAL_READS,
+        ),
+    ] {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} counter\n{name}{{kind=\"local\"}} {}\n{name}{{kind=\"global\"}} {}",
+            local.load(Ordering::Relaxed),
+            global.load(Ordering::Relaxed)
         );
     }
 }
@@ -331,11 +372,37 @@ fn remap_positions(meta: &MetaService, pg: &PlacementGroup) -> Vec<usize> {
         .collect()
 }
 
-/// Whether a stripe is one recovery rebuilds (phase 3a): MDS erasure
-/// coding with parity, the object's own (not a pack's slice).
+/// Whether a stripe is one recovery rebuilds: the object's own (not a
+/// pack's slice), with redundancy to rebuild from: MDS or LRC parity, or
+/// more than one replicated copy (`ec_k` 1, `ec_m` the copies but one).
 fn recoverable(stripe: &StripeMeta) -> bool {
+    stripe.pack_id.is_empty() && stripe.ec_k > 0 && stripe.ec_m > 0
+}
+
+/// The positions an LRC shard is rebuilt from inside its local group: the
+/// group's other data shards and its local parity (positions are data
+/// `0..k`, then one local parity per group, then the global parities). None
+/// for a global parity, or a stripe that isn't LRC with local groups.
+fn lrc_local_set(stripe: &StripeMeta, position: usize) -> Option<Vec<usize>> {
     let ec = ErasureType::try_from(stripe.ec_type).unwrap_or(ErasureType::ErasureMds);
-    ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0 && stripe.pack_id.is_empty()
+    let (k, l) = (stripe.ec_k as usize, stripe.ec_local_parity as usize);
+    if ec != ErasureType::ErasureLrc || l == 0 || k % l != 0 {
+        return None;
+    }
+    let size = k / l;
+    let group = if position < k {
+        position / size
+    } else if position < k + l {
+        position - k
+    } else {
+        return None;
+    };
+    let mut set: Vec<usize> = (group * size..(group + 1) * size)
+        .chain(std::iter::once(k + group))
+        .filter(|&p| p != position)
+        .collect();
+    set.sort_unstable();
+    Some(set)
 }
 
 /// The id a stripe's shards are stored under: its own, else its object's.
@@ -1390,6 +1457,269 @@ impl MetaService {
         missing: &[usize],
         in_place: &[u32],
     ) -> Result<HashMap<u32, Vec<u8>>, RebuildError> {
+        match ErasureType::try_from(stripe.ec_type).unwrap_or(ErasureType::ErasureMds) {
+            ErasureType::ErasureReplication => {
+                self.copy_replica(stripe, id, located, have, missing, in_place)
+                    .await
+            }
+            ErasureType::ErasureLrc => {
+                self.rebuild_lrc(stripe, id, located, have, missing, in_place)
+                    .await
+            }
+            ErasureType::ErasureMds => {
+                self.rebuild_mds(stripe, id, located, have, missing, in_place)
+                    .await
+            }
+        }
+    }
+
+    /// A replicated stripe's missing copies: one intact copy (its checksum
+    /// the one recorded), read from a member holding it in place first,
+    /// given to every position that lacks it.
+    async fn copy_replica(
+        &self,
+        stripe: &StripeMeta,
+        id: &[u8],
+        located: &HashMap<u32, ShardLocation>,
+        have: &HashMap<u32, Vec<u8>>,
+        missing: &[usize],
+        in_place: &[u32],
+    ) -> Result<HashMap<u32, Vec<u8>>, RebuildError> {
+        let mut copy = have
+            .iter()
+            .find(|(p, _)| !missing.contains(&(**p as usize)))
+            .map(|(_, b)| b.clone());
+        if copy.is_none() {
+            let mut candidates: Vec<u32> = in_place.to_vec();
+            candidates.extend(located.keys().copied().filter(|p| !in_place.contains(p)));
+            candidates.retain(|p| !missing.contains(&(*p as usize)));
+            for position in candidates {
+                let Some(loc) = located.get(&position) else {
+                    continue;
+                };
+                let Some(address) = self.node_addr(&loc.node_id) else {
+                    continue;
+                };
+                if let Ok(b) =
+                    read_shard(&address, id, stripe.stripe_id, position, loc.crc32c).await
+                {
+                    copy = Some(b);
+                    break;
+                }
+            }
+        }
+        let Some(copy) = copy else {
+            return Err(RebuildError::TooFew(0));
+        };
+        let crc = crc32c::crc32c(&copy);
+        let mut out = HashMap::new();
+        for &p in missing {
+            if let Some(recorded) = located.get(&(p as u32)).and_then(|l| l.crc32c)
+                && recorded != crc
+            {
+                return Err(RebuildError::Other(format!(
+                    "position {p}: its copy is not the one its object records"
+                )));
+            }
+            REPLICAS.fetch_add(1, Ordering::Relaxed);
+            out.insert(p as u32, copy.clone());
+        }
+        Ok(out)
+    }
+
+    /// An LRC stripe's missing positions. Each one whose local group (its
+    /// other data and local parity) is whole and readable is rebuilt from
+    /// those alone, reads that stay in the group's failure domain; the
+    /// rest from the whole stripe: its data decoded from what is left, then
+    /// encoded again for any parity among them.
+    async fn rebuild_lrc(
+        &self,
+        stripe: &StripeMeta,
+        id: &[u8],
+        located: &HashMap<u32, ShardLocation>,
+        have: &HashMap<u32, Vec<u8>>,
+        missing: &[usize],
+        in_place: &[u32],
+    ) -> Result<HashMap<u32, Vec<u8>>, RebuildError> {
+        use objectio_erasure::backend::{
+            ErasureBackend, LrcBackend, LrcConfig, RustSimdLrcBackend,
+        };
+        let (k, l, g) = (
+            stripe.ec_k as usize,
+            stripe.ec_local_parity as usize,
+            stripe.ec_global_parity as usize,
+        );
+        let total = k + l + g;
+        let backend = RustSimdLrcBackend::new(LrcConfig::new(k as u8, l as u8, g as u8))
+            .map_err(|e| RebuildError::Other(format!("codec: {e}")))?;
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
+        for (p, b) in have {
+            let p = *p as usize;
+            if p < total && !missing.contains(&p) {
+                shards[p] = Some(b.clone());
+            }
+        }
+        let mut out: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut global: Vec<usize> = Vec::new();
+
+        // From its local group, each that can be.
+        for &p in missing {
+            let local = lrc_local_set(stripe, p).filter(|set| {
+                set.iter().all(|q| {
+                    !missing.contains(q)
+                        && (shards[*q].is_some() || located.contains_key(&(*q as u32)))
+                })
+            });
+            let Some(set) = local else {
+                global.push(p);
+                continue;
+            };
+            let mut whole = true;
+            let mut from: Vec<String> = Vec::new();
+            for &q in &set {
+                if shards[q].is_some() {
+                    continue;
+                }
+                let loc = &located[&(q as u32)];
+                let Some(address) = self.node_addr(&loc.node_id) else {
+                    whole = false;
+                    break;
+                };
+                match read_shard(&address, id, stripe.stripe_id, q as u32, loc.crc32c).await {
+                    Ok(b) => {
+                        shards[q] = Some(b);
+                        from.push(hex::encode(&loc.node_id));
+                    }
+                    Err(_) => {
+                        whole = false;
+                        break;
+                    }
+                }
+            }
+            if !whole {
+                global.push(p);
+                continue;
+            }
+            let size = set
+                .iter()
+                .find_map(|q| shards[*q].as_ref().map(Vec::len))
+                .unwrap_or(0);
+            let refs: Vec<Option<&[u8]>> = shards.iter().map(|s| s.as_deref()).collect();
+            match backend.decode_local(&refs, size, p) {
+                Ok(Some(b)) => {
+                    LRC_LOCAL.fetch_add(1, Ordering::Relaxed);
+                    LRC_LOCAL_READS.fetch_add(set.len() as u64, Ordering::Relaxed);
+                    debug!(
+                        "recovery: LRC {} stripe {} position {p} rebuilt from its local group \
+                         {set:?} (read from {from:?})",
+                        hex::encode(id),
+                        stripe.stripe_id
+                    );
+                    out.insert(p as u32, b);
+                }
+                _ => global.push(p),
+            }
+        }
+
+        if !global.is_empty() {
+            // Everything else that is there, read.
+            let mut reads = 0u64;
+            let mut candidates: Vec<u32> = in_place.to_vec();
+            candidates.extend(located.keys().copied().filter(|p| !in_place.contains(p)));
+            for position in candidates {
+                let q = position as usize;
+                if q >= total || missing.contains(&q) || shards[q].is_some() {
+                    continue;
+                }
+                let loc = &located[&position];
+                let Some(address) = self.node_addr(&loc.node_id) else {
+                    continue;
+                };
+                if let Ok(b) =
+                    read_shard(&address, id, stripe.stripe_id, position, loc.crc32c).await
+                {
+                    shards[q] = Some(b);
+                    reads += 1;
+                }
+            }
+            let present = shards.iter().filter(|s| s.is_some()).count();
+            if present < k {
+                return Err(RebuildError::TooFew(
+                    u32::try_from(present).unwrap_or(u32::MAX),
+                ));
+            }
+            let size = shards
+                .iter()
+                .find_map(|s| s.as_ref().map(Vec::len))
+                .ok_or(RebuildError::TooFew(0))?;
+            // The data, whole: each data shard lost decoded, one at a time
+            // (the backend's decode returns the ones it rebuilt locally
+            // ahead of the global ones, so a batch would lose their order).
+            let lost_data: Vec<usize> = (0..k).filter(|q| shards[*q].is_none()).collect();
+            let mut decoded: Vec<(usize, Vec<u8>)> = Vec::new();
+            {
+                let refs: Vec<Option<&[u8]>> = shards.iter().map(|s| s.as_deref()).collect();
+                for &q in &lost_data {
+                    let b = backend
+                        .decode(&refs, size, &[q])
+                        .map_err(|e| RebuildError::Other(format!("decode: {e}")))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            RebuildError::Other(format!("decode gave nothing for {q}"))
+                        })?;
+                    decoded.push((q, b));
+                }
+            }
+            for (q, b) in decoded {
+                shards[q] = Some(b);
+            }
+            let data: Vec<&[u8]> = shards[..k]
+                .iter()
+                .map(|s| s.as_deref().unwrap_or_default())
+                .collect();
+            let encoded = backend
+                .encode(&data, size)
+                .map_err(|e| RebuildError::Other(format!("encode: {e}")))?;
+            for &p in &global {
+                let b = encoded
+                    .get(p)
+                    .cloned()
+                    .ok_or_else(|| RebuildError::Other(format!("no shard {p} in the stripe")))?;
+                out.insert(p as u32, b);
+            }
+            LRC_GLOBAL.fetch_add(global.len() as u64, Ordering::Relaxed);
+            LRC_GLOBAL_READS.fetch_add(reads, Ordering::Relaxed);
+            debug!(
+                "recovery: LRC {} stripe {} positions {global:?} rebuilt from the whole stripe \
+                 ({reads} read)",
+                hex::encode(id),
+                stripe.stripe_id
+            );
+        }
+        // Each the shard as first written.
+        for (p, bytes) in &out {
+            if let Some(recorded) = located.get(p).and_then(|l| l.crc32c)
+                && crc32c::crc32c(bytes) != recorded
+            {
+                return Err(RebuildError::Other(format!(
+                    "position {p} rebuilt differs from the shard its object records"
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// An MDS stripe's missing positions, from k good shards.
+    async fn rebuild_mds(
+        &self,
+        stripe: &StripeMeta,
+        id: &[u8],
+        located: &HashMap<u32, ShardLocation>,
+        have: &HashMap<u32, Vec<u8>>,
+        missing: &[usize],
+        in_place: &[u32],
+    ) -> Result<HashMap<u32, Vec<u8>>, RebuildError> {
         let (k, m) = (stripe.ec_k as usize, stripe.ec_m as usize);
         let mut survivors: Vec<Option<Vec<u8>>> = vec![None; k + m];
         let mut count = 0;
@@ -1822,21 +2152,110 @@ mod tests {
     }
 
     #[test]
-    fn only_mds_stripes_of_the_objects_own_are_recovered() {
+    fn every_scheme_with_redundancy_is_recovered_a_packs_slice_is_not() {
         let mds = StripeMeta {
             ec_k: 4,
             ec_m: 2,
             ..StripeMeta::default()
         };
         assert!(recoverable(&mds));
+        assert!(recoverable(&StripeMeta {
+            ec_type: ErasureType::ErasureReplication as i32,
+            ec_k: 1,
+            ec_m: 2,
+            ..mds.clone()
+        }));
+        assert!(recoverable(&StripeMeta {
+            ec_type: ErasureType::ErasureLrc as i32,
+            ec_k: 4,
+            ec_m: 3,
+            ec_local_parity: 2,
+            ec_global_parity: 1,
+            ..mds.clone()
+        }));
         assert!(!recoverable(&StripeMeta {
             pack_id: vec![1],
             ..mds.clone()
         }));
+        // One copy: nothing to rebuild it from.
         assert!(!recoverable(&StripeMeta {
-            ec_type: ErasureType::ErasureLrc as i32,
+            ec_type: ErasureType::ErasureReplication as i32,
+            ec_k: 1,
+            ec_m: 0,
             ..mds.clone()
         }));
         assert!(!recoverable(&StripeMeta { ec_m: 0, ..mds }));
+    }
+
+    #[test]
+    fn an_lrc_shard_is_rebuilt_from_its_own_group_a_global_parity_from_none() {
+        // LRC 4+2+1: groups {0,1} with local parity 4, {2,3} with 5; 6 global.
+        let lrc = StripeMeta {
+            ec_type: ErasureType::ErasureLrc as i32,
+            ec_k: 4,
+            ec_m: 3,
+            ec_local_parity: 2,
+            ec_global_parity: 1,
+            local_group_size: 2,
+            ..StripeMeta::default()
+        };
+        assert_eq!(lrc_local_set(&lrc, 0), Some(vec![1, 4]));
+        assert_eq!(lrc_local_set(&lrc, 3), Some(vec![2, 5]));
+        assert_eq!(lrc_local_set(&lrc, 4), Some(vec![0, 1]));
+        assert_eq!(lrc_local_set(&lrc, 5), Some(vec![2, 3]));
+        assert_eq!(lrc_local_set(&lrc, 6), None);
+        let mds = StripeMeta {
+            ec_k: 4,
+            ec_m: 2,
+            ..StripeMeta::default()
+        };
+        assert_eq!(lrc_local_set(&mds, 0), None);
+    }
+
+    /// The codec does what the rebuild relies on: a shard from its group
+    /// alone, and the stripe's parities encoded again from its data.
+    #[test]
+    fn local_and_global_lrc_rebuilds_give_back_the_shards_written() {
+        use objectio_erasure::backend::{
+            ErasureBackend, LrcBackend, LrcConfig, RustSimdLrcBackend,
+        };
+        let backend = RustSimdLrcBackend::new(LrcConfig::new(4, 2, 1)).unwrap();
+        let size = 64;
+        let data: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| (0..size).map(|b| (b as u8).wrapping_mul(7) ^ i).collect())
+            .collect();
+        let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+        let all = backend.encode(&refs, size).unwrap();
+        assert_eq!(all.len(), 7);
+
+        // Position 1 from 0 and 4 only.
+        let mut shards: Vec<Option<&[u8]>> = vec![None; 7];
+        shards[0] = Some(&all[0]);
+        shards[4] = Some(&all[4]);
+        assert_eq!(
+            backend.decode_local(&shards, size, 1).unwrap().as_deref(),
+            Some(all[1].as_slice())
+        );
+
+        // A data shard and its group's local parity lost: no local rebuild,
+        // so the data is decoded with the global parity, and the stripe
+        // encoded again gives the local parity back too.
+        let mut shards: Vec<Option<&[u8]>> = all.iter().map(|s| Some(s.as_slice())).collect();
+        shards[0] = None;
+        shards[4] = None;
+        assert_eq!(backend.decode_local(&shards, size, 0).unwrap(), None);
+        let d0 = backend.decode(&shards, size, &[0]).unwrap().remove(0);
+        assert_eq!(d0, all[0]);
+        let again = backend
+            .encode(&[d0.as_slice(), &all[1], &all[2], &all[3]], size)
+            .unwrap();
+        assert_eq!(again, all);
+
+        // Both of a group's data lost is past this code: 2 data and the 1
+        // global parity are short of the 4 a decode needs.
+        let mut shards: Vec<Option<&[u8]>> = all.iter().map(|s| Some(s.as_slice())).collect();
+        shards[0] = None;
+        shards[1] = None;
+        assert!(backend.decode(&shards, size, &[0]).is_err());
     }
 }

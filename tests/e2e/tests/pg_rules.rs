@@ -272,8 +272,7 @@ fn a_stand_in_never_breaks_the_rule() {
 #[test]
 fn an_lrc_pool_keeps_each_local_group_in_a_rack() {
     let racks = ["A", "A", "A", "A", "B", "B", "B", "B", "C", "C"];
-    // LRC isn't released (no repair yet, B10): made for its placement only.
-    let ha = HaCluster::start_with_racks(1, &racks, 1, &["--allow-unrepaired-schemes"]);
+    let ha = HaCluster::start_with_osd_racks(1, &racks, 1);
     let _ = ha.await_leader(Duration::from_secs(30));
     let c = &ha.clients[0];
     make_pool(

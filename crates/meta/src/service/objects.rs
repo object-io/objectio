@@ -487,17 +487,13 @@ impl MetaService {
 /// with fewer shards than its stripes have positions: erasure-coded stripes
 /// of its own (a slice of a pack is the pack's to repair).
 fn degraded_record(req: &CreateObjectRequest, now: u64) -> Option<Vec<u8>> {
-    use objectio_proto::metadata::{DegradedObject, DegradedStripe, ErasureType};
+    use objectio_proto::metadata::{DegradedObject, DegradedStripe};
     let stripes: Vec<DegradedStripe> = req
         .stripes
         .iter()
-        .filter(|s| {
-            ErasureType::try_from(s.ec_type).unwrap_or(ErasureType::ErasureMds)
-                == ErasureType::ErasureMds
-                && s.ec_k > 0
-                && s.ec_m > 0
-                && s.pack_id.is_empty()
-        })
+        // Every scheme with positions to spare: MDS and LRC parity, or
+        // replicated copies (`ec_k` 1, `ec_m` the copies but one).
+        .filter(|s| s.ec_k > 0 && s.ec_m > 0 && s.pack_id.is_empty())
         .filter_map(|s| {
             let total = s.ec_k + s.ec_m;
             let mut present: Vec<u32> = s

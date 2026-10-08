@@ -720,8 +720,11 @@ pub(crate) async fn upload_part_internal(
 
             all_stripes.push(StripeMeta {
                 stripe_id: stripe_idx as u64,
+                // A copy per position: the width is every copy (one to
+                // read, the rest to spare), so recovery and the PG index
+                // see a stripe short of a copy as they do an EC one.
                 ec_k: 1,
-                ec_m: 0,
+                ec_m: u32::try_from(total_replicas.saturating_sub(1)).unwrap_or(0),
                 shards: locs,
                 ec_type: ErasureType::ErasureReplication.into(),
                 ec_local_parity: 0,
