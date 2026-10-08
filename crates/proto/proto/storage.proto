@@ -179,6 +179,8 @@ message PgEntry {
     uint32 held_here = 10;
     // Shards a read needs (the object's k; 1 for one held whole).
     uint32 needed = 11;
+    // The object's size in bytes: what recovery has left to move.
+    uint64 size = 12;
 }
 
 message GetPgInfoRequest {

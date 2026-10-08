@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use objectio_common::Result;
-use objectio_proto::metadata::ObjectMeta;
+use objectio_proto::metadata::{ObjectMeta, StripeMeta};
 use objectio_proto::storage::{PgEntry, PgSummary};
 use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataOp};
 use parking_lot::Mutex;
@@ -185,11 +185,18 @@ fn derive(
     })
 }
 
+/// The stripes of `o` that are its own: not a packed object's slice of a
+/// pack, whose shards are the pack's (recorded in meta) and listed nowhere
+/// in the object's metadata.
+pub(crate) fn own_stripes(o: &ObjectMeta) -> impl Iterator<Item = &StripeMeta> {
+    o.stripes.iter().filter(|s| s.pack_id.is_empty())
+}
+
 /// The entry of a current object.
 fn object_entry(node_id: &[u8; 16], bucket: &str, key: &str, o: &ObjectMeta) -> PgEntry {
     let mut short = 0u32;
     let mut here = 0u32;
-    for stripe in &o.stripes {
+    for stripe in own_stripes(o) {
         let total = stripe.ec_k + stripe.ec_m;
         let mut listed: Vec<u32> = stripe.shards.iter().map(|s| s.position).collect();
         listed.sort_unstable();
@@ -212,11 +219,12 @@ fn object_entry(node_id: &[u8; 16], bucket: &str, key: &str, o: &ObjectMeta) -> 
         stamp: o.stamp,
         object_id: o.object_id.clone(),
         update_stamp: o.update_stamp,
-        stripes: u32::try_from(o.stripes.len()).unwrap_or(u32::MAX),
+        stripes: u32::try_from(own_stripes(o).count()).unwrap_or(u32::MAX),
         positions_short: short,
         named_here: here,
         held_here: 0,
         needed: o.stripes.first().map_or(1, |s| s.ec_k.max(1)),
+        size: o.size,
     }
 }
 
@@ -899,5 +907,24 @@ mod tests {
         put(&ix, &o);
         assert_eq!(ix.pg_count(), 0);
         assert_eq!(ix.unindexed(), 1);
+    }
+
+    /// A packed object's stripe is its slice of a pack, whose shards the
+    /// pack's record in meta lists: it names none itself, and isn't counted
+    /// as short of them (which kept every PG holding one degraded).
+    #[test]
+    fn a_packed_objects_slice_is_not_counted_as_shards_missing() {
+        let mut o = object("k", 5, 1, true);
+        o.stripes = vec![StripeMeta {
+            stripe_id: 0,
+            ec_k: 4,
+            ec_m: 2,
+            pack_id: vec![9; 16],
+            slice_length: 100,
+            ..StripeMeta::default()
+        }];
+        let e = object_entry(&ME, "b", "k", &o);
+        assert_eq!((e.stripes, e.positions_short, e.named_here), (0, 0, 0));
+        assert_eq!(e.size, o.size);
     }
 }

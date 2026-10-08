@@ -626,7 +626,7 @@ impl OsdService {
             return 0;
         };
         let mut held = 0u32;
-        for stripe in &o.stripes {
+        for stripe in crate::pg_index::own_stripes(&o) {
             let mut mine: Vec<u32> = stripe
                 .shards
                 .iter()
