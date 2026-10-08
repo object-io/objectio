@@ -566,6 +566,38 @@ fn a_write_short_of_shards_is_repaired_from_its_record() {
     }
 }
 
+/// Soak run 16: objects written while an OSD was down, that OSD their
+/// owner (the first of their placement), and no gateway healing their
+/// metadata copies. Repair read the object from the owner's copy alone,
+/// found none, called it gone, and the degraded records waited forever.
+/// They are repaired from a quorum of copies, the owner's copy written
+/// back, and every object survives two more OSDs down.
+#[test]
+fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/owner", &[]).status, 200);
+    ha.stop_osd(0);
+    let c = &ha.clients[0];
+    let bodies: Vec<Vec<u8>> = (0..24u8).map(|i| payload(300_000, 90 + i)).collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/owner/k{i}"), b).status, 200);
+    }
+    ha.start_osd(0, None);
+    // Rounds of the degraded worker (every 5 s).
+    std::thread::sleep(Duration::from_secs(30));
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/owner/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
+}
+
 /// B29: an evacuation that meets an object with fewer than k shards left
 /// records it as lost and finishes, rather than wait on it forever; but
 /// never while a holder of the rest is only down (it may have its shard).

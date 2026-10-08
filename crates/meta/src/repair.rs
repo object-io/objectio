@@ -1255,7 +1255,11 @@ async fn update_locations(
     object: &ObjectMeta,
     edit: impl FnOnce(&mut ObjectMeta) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let Some(mut fresh) = get_object_meta(owner_addr, object).await? else {
+    // The object as a read takes it, from a quorum of its copies. Read
+    // from the owner's copy alone, an object whose owner missed its write
+    // (down while it was written, its heal not yet done) was "gone" to
+    // every repair of it, and its record waited forever (soak run 16).
+    let Some(mut fresh) = quorum_current(meta, object).await? else {
         return Err(anyhow::anyhow!("object is gone"));
     };
     if fresh.object_id != object.object_id {
@@ -1287,8 +1291,10 @@ async fn update_locations(
             object: Some(fresh.clone()),
             versioning_enabled: false,
             expected_object_id: fresh.object_id.clone(),
-            // An object deleted since it was read must not come back.
-            require_existing: true,
+            // A copy that missed the write gets it: a quorum holds it. A
+            // copy that took a delete since keeps it: its tombstone refuses
+            // an object stamped before it, so nothing deleted comes back.
+            require_existing: false,
             version_only: false,
             keep_newer_current: false,
             replication_update: false,
@@ -1313,23 +1319,6 @@ async fn update_locations(
     } else {
         Err(anyhow::anyhow!("could not update the owner's ObjectMeta"))
     }
-}
-
-async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<Option<ObjectMeta>> {
-    let mut client = StorageServiceClient::new(open_channel(address).await?)
-        .max_decoding_message_size(100 * 1024 * 1024);
-    let resp = tokio::time::timeout(
-        RPC_TIMEOUT,
-        client.get_object_meta(GetObjectMetaRequest {
-            bucket: object.bucket.clone(),
-            key: object.key.clone(),
-            version_id: String::new(),
-            with_small_shard: false,
-        }),
-    )
-    .await??
-    .into_inner();
-    Ok(resp.object.filter(|_| resp.found))
 }
 
 /// Meta's listing entry for `object`.
