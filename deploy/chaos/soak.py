@@ -260,11 +260,64 @@ def pg_health():
     return None
 
 
-# A placement group out of Clean this long while every OSD was up fails the
-# run: recovery is stuck, or too slow (B31's alarm, objectio-docs
-# core/pg-recovery.md). The time a fault had an OSD down doesn't count.
-NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", os.environ.get("DEGRADED_MAX_SECS", "3600")))
+# The run fails on recovery that is stuck, not on recovery that is slow: a
+# placement group out of Clean whose objects degraded haven't fallen below
+# their lowest since it left Clean for STALL_MAX_SECS, while every OSD was
+# up (B31, objectio-docs core/pg-recovery.md). How fast it gets back to
+# Clean is B24's to measure on real disks; here it is logged, and only a
+# ceiling (NOT_CLEAN_MAX_SECS) fails the run. The time a fault had an OSD
+# down doesn't count. Run 18's drive-lost took 61 minutes on the VMs'
+# shared disks (67-94% iowait), every group progressing.
+STALL_MAX_SECS = int(os.environ.get("STALL_MAX_SECS", "1800"))
+NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", "10800"))
 last_osd_down = [time.monotonic()]
+# pg id -> (lowest objects degraded since it left Clean, when it got there)
+pg_low = {}
+all_clean_since = [None]  # when every PG was last seen out of Clean: None = all Clean
+
+
+def pg_watch():
+    """Every minute: each placement group's progress, and the run failed
+    when one is stuck (above). Logs how long the pool took to get back to
+    all Clean."""
+    while not stop.wait(60):
+        if not POOL:
+            continue
+        try:
+            status, body = chaos.admin("GET", f"/_admin/pools/{POOL}/placement-groups", retry_for=30)
+            pgs = json.loads(body)["pgs"] if status == 200 else None
+        except Exception:  # noqa: BLE001 — a poll that fails is retried next minute
+            pgs = None
+        if not pgs:
+            continue
+        now = time.monotonic()
+        if any((p.get("state") or {}).get("members_down", 0) > 0 for p in pgs):
+            last_osd_down[0] = now
+        all_up_for = now - last_osd_down[0]
+        out = [p for p in pgs if (p.get("state") or {}).get("state") != "Clean"]
+        if out and all_clean_since[0] is None:
+            all_clean_since[0] = now
+        if not out and all_clean_since[0] is not None:
+            say(f"pgs: all {len(pgs)} Clean again after {int(now - all_clean_since[0])} s")
+            all_clean_since[0] = None
+        for p in pgs:
+            st, pid = p.get("state") or {}, p["pg_id"]
+            if st.get("state") == "Clean":
+                pg_low.pop(pid, None)
+                continue
+            degraded = st.get("objects_degraded", 0)
+            low = pg_low.get(pid)
+            if low is None or degraded < low[0]:
+                pg_low[pid] = (degraded, now)
+                continue
+            stalled = now - low[1]
+            if stalled > STALL_MAX_SECS and all_up_for > STALL_MAX_SECS:
+                say(f"pg {POOL}/{pid}: {st.get('state')}, {degraded} degraded, no progress "
+                    f"for {int(stalled)} s: {json.dumps({k: v for k, v in st.items() if k != 'members'})[:600]}")
+                print(f"✗ placement group {POOL}/{pid} made no progress for {int(stalled)} s "
+                      f"with every OSD up for {int(all_up_for)} s", flush=True)
+                OPLOG.flush()
+                os._exit(1)
 
 
 def progress():
@@ -479,6 +532,7 @@ def main():
     threads = [threading.Thread(target=writer, args=(n,), daemon=True) for n in range(WRITERS)]
     threads += [threading.Thread(target=fill_control, daemon=True),
                 threading.Thread(target=progress, daemon=True),
+                threading.Thread(target=pg_watch, daemon=True),
                 threading.Thread(target=verifier, daemon=True)]
     for t in threads:
         t.start()

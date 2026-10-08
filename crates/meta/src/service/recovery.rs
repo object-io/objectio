@@ -95,10 +95,6 @@ type PgId = (String, u32);
 /// A member's entries of a PG, by (bucket, key).
 type Listing = HashMap<(String, String), PgEntry>;
 
-/// A PG's epoch, members down and objects degraded, as recovery last left
-/// it unable to change anything more.
-type StuckAt = (u64, u32, u64);
-
 /// Wakes the next look before the tick: a PG's recovery finished.
 static NEXT: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -115,12 +111,6 @@ static REBUILDS: LazyLock<parking_lot::Mutex<HashMap<Vec<u8>, Arc<tokio::sync::S
 
 /// What each PG recovering has left: objects, bytes.
 static LEFT: LazyLock<parking_lot::Mutex<HashMap<PgId, (u64, u64)>>> =
-    LazyLock::new(Default::default);
-
-/// PGs whose last recovery could change nothing more (what is left is
-/// unfound, or on a member that is down), with their epoch, members down
-/// and objects degraded then: not tried again until one of them changes.
-static STUCK: LazyLock<parking_lot::Mutex<HashMap<PgId, StuckAt>>> =
     LazyLock::new(Default::default);
 
 /// PGs whose last recovery pass got nowhere (a member it needed didn't
@@ -491,7 +481,6 @@ pub fn spawn(meta: Arc<MetaService>) {
             if meta.is_raft_leader() {
                 meta.recovery_round().await;
             } else {
-                STUCK.lock().clear();
                 BACKOFF.lock().clear();
             }
         }
@@ -627,16 +616,6 @@ impl MetaService {
                 && matches!(s.state.as_str(), "Degraded" | "Undersized")
         });
         if !(moving || resume || degraded) {
-            return None;
-        }
-        // The last pass could change nothing more, and nothing has changed
-        // since.
-        let id = (pg.pool.clone(), pg.pg_id);
-        if !moving
-            && state.is_some_and(|s| {
-                STUCK.lock().get(&id) == Some(&(pg.epoch, s.members_down, s.objects_degraded))
-            })
-        {
             return None;
         }
         let spare = state.map_or(i64::MAX, |s| s.min_spare);
@@ -880,26 +859,17 @@ impl MetaService {
             return;
         };
         let mut state = self.peer(&now, &pool, false).await;
-        // Nothing more to change now: left until something does. "Members
-        // down" as the plan saw them: one that didn't answer then but does
-        // now (back meanwhile) makes the next look differ, so it is tried
-        // again; counted as the peer now sees them, it would wait forever.
-        let down_at_plan =
-            u32::try_from(plan.members.iter().filter(|m| m.is_none()).count()).unwrap_or(u32::MAX);
-        // Got somewhere (wrote something, or it is clean): the next pass may
-        // go at once. Otherwise it waits, longer each time.
-        if wrote || state.state == "Clean" {
+        // Got somewhere (wrote something with nothing left unfound, or it
+        // is clean): the next pass may go at once. Otherwise it waits,
+        // longer each time, up to BACKOFF_MAX: what is left may be unfound
+        // until a member comes back, or an object changing under it, and a
+        // later pass finds out which. Never held until its counts change:
+        // the same count can be another object, or the same one now
+        // recoverable (soak run 18, a PG left 1 degraded for 40 minutes).
+        if state.state == "Clean" || (wrote && unfound.is_empty()) {
             BACKOFF.lock().remove(&id);
         } else {
             no_progress(&id, now.epoch, state.members_down);
-        }
-        if (!unfound.is_empty() || !wrote) && failed.is_none() && state.state != "Clean" {
-            STUCK.lock().insert(
-                id.clone(),
-                (now.epoch, down_at_plan, state.objects_degraded),
-            );
-        } else {
-            STUCK.lock().remove(&id);
         }
         if !unfound.is_empty() {
             unfound.truncate(UNFOUND_KEPT);
