@@ -378,8 +378,10 @@ pub(crate) fn merge(
         } else {
             m.objects += 1;
             let mut complete = 0usize;
+            let mut unknown = 0usize;
             for (i, member) in acting.iter().enumerate() {
                 let Some(entries) = member else {
+                    unknown += 1;
                     continue; // didn't answer: unknown
                 };
                 match entries.get(*k) {
@@ -414,7 +416,12 @@ pub(crate) fn merge(
             } else {
                 auth.needed.max(1) as usize
             };
-            if complete < needed {
+            // Unfound: too few complete copies even if every member that
+            // didn't answer holds one. A member slow to answer (soak run 20:
+            // a busy OSD timing out) doesn't make a PG's objects unfound;
+            // its spare (below) counts it out, so recovery still ranks
+            // the PG as short.
+            if complete + unknown < needed {
                 m.objects_unfound += 1;
             }
             let spare = i64::try_from(complete).unwrap_or(i64::MAX)
@@ -1252,6 +1259,11 @@ mod tests {
             (m.copies_missing, m.objects_degraded, m.objects_unfound),
             (0, 0, 0)
         );
+        // One complete copy and one member silent: not unfound (it may hold
+        // the second), though its spare counts it out.
+        let m = merge(&[Some(&a), None, Some(&short)], &[]);
+        assert_eq!((m.objects_degraded, m.objects_unfound), (1, 0));
+        assert_eq!(m.min_spare, Some(-1));
     }
 
     #[test]
