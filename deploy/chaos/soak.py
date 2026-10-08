@@ -233,9 +233,19 @@ def incusd_mb():
     return max(sizes) // 1024 if sizes else None
 
 
-def degraded():
-    """(objects short of shards, age of the oldest in seconds), from a
-    gateway's metrics (meta's, polled by the gateway); None before B29."""
+PG_GAUGES = {
+    "objectio_meta_pgs_not_clean": "not_clean",
+    "objectio_meta_pg_not_clean_oldest_seconds": "oldest",
+    "objectio_meta_osds_down": "osds_down",
+    "objectio_meta_pg_objects_unfound": "unfound",
+    "objectio_meta_lost_objects": "lost",
+}
+
+
+def pg_health():
+    """Placement groups not Clean, how long the one longest so has been,
+    OSDs down, objects unfound and lost (B31), from a gateway's metrics
+    (meta's, polled by the gateway); None if no gateway answers with them."""
     for url in GW:
         status, body = http("GET", f"{url}/metrics", timeout=10)
         if status != 200:
@@ -243,14 +253,18 @@ def degraded():
         got = {}
         for line in body.decode(errors="replace").splitlines():
             name = line.split("{")[0].split(" ")[0]
-            if name in ("objectio_meta_degraded_objects", "objectio_meta_degraded_oldest_seconds"):
-                got[name] = max(got.get(name, 0.0), float(line.rsplit(" ", 1)[1]))
-        if len(got) == 2:
-            return int(got["objectio_meta_degraded_objects"]), int(got["objectio_meta_degraded_oldest_seconds"])
+            if name in PG_GAUGES:
+                got[PG_GAUGES[name]] = max(got.get(PG_GAUGES[name], 0), int(float(line.rsplit(" ", 1)[1])))
+        if len(got) == len(PG_GAUGES):
+            return got
     return None
 
 
-DEGRADED_MAX_SECS = int(os.environ.get("DEGRADED_MAX_SECS", "3600"))
+# A placement group out of Clean this long while every OSD was up fails the
+# run: recovery is stuck, or too slow (B31's alarm, objectio-docs
+# core/pg-recovery.md). The time a fault had an OSD down doesn't count.
+NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", os.environ.get("DEGRADED_MAX_SECS", "3600")))
+last_osd_down = [time.monotonic()]
 
 
 def progress():
@@ -263,11 +277,21 @@ def progress():
                     # The harness drives everything through incusd, which
                     # leaked to 16 GB and locked up once (2026-10-06).
                     "incusd_mb": incusd_mb(),
-                    "degraded": degraded()}
+                    "pgs": pg_health()}
         print(json.dumps(line), flush=True)
-        d = line["degraded"]
-        if d and d[1] > DEGRADED_MAX_SECS:
-            print(f"✗ an object has been short of shards for {d[1]} s ({d[0]} degraded)", flush=True)
+        h = line["pgs"]
+        if h is None:
+            continue
+        if h["osds_down"] > 0:
+            last_osd_down[0] = time.monotonic()
+        all_up_for = time.monotonic() - last_osd_down[0]
+        if h["oldest"] > NOT_CLEAN_MAX_SECS and all_up_for > NOT_CLEAN_MAX_SECS:
+            print(f"✗ a placement group has been out of Clean for {h['oldest']} s with every OSD up "
+                  f"for {int(all_up_for)} s ({h['not_clean']} not Clean)", flush=True)
+            OPLOG.flush()
+            os._exit(1)
+        if h["lost"] > 0:
+            print(f"✗ {h['lost']} objects recorded lost", flush=True)
             OPLOG.flush()
             os._exit(1)
 
