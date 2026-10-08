@@ -381,6 +381,12 @@ impl HaCluster {
         self.add_gateway_with_args(bins, &[])
     }
 
+    /// Restart gateway `i` with `args` in place of the ones it had.
+    pub fn restart_gateway_with_args(&mut self, i: usize, args: &[&str]) {
+        self.gateways[i].args = args.iter().map(ToString::to_string).collect();
+        self.restart_gateway(i, None);
+    }
+
     /// [`Self::add_gateway`], the gateway started with `args` too.
     pub fn add_gateway_with_args(&mut self, bins: Option<&Path>, args: &[&str]) -> usize {
         self.gateways.push(Gateway {
