@@ -618,11 +618,13 @@ impl OsdService {
 
     /// Of the shard positions `bucket/key`'s current object (if it is still
     /// `object_id`) names on this OSD, how many it holds intact.
-    fn held_here(&self, bucket: &str, key: &str, object_id: &[u8]) -> u32 {
-        let Some(o) = self
-            .stored_meta(&MetadataKey::object_meta(bucket, key))
-            .filter(|o| o.object_id == object_id)
-        else {
+    fn held_here(&self, bucket: &str, key: &str, version_id: &str, object_id: &[u8]) -> u32 {
+        let at = if version_id.is_empty() {
+            MetadataKey::object_meta(bucket, key)
+        } else {
+            MetadataKey::object_version(bucket, key, version_id)
+        };
+        let Some(o) = self.stored_meta(&at).filter(|o| o.object_id == object_id) else {
             return 0;
         };
         let mut held = 0u32;
@@ -1045,7 +1047,7 @@ impl StorageService for OsdService {
                 .iter_mut()
                 .filter(|e| !e.tombstone && e.named_here > 0)
             {
-                e.held_here = self.held_here(&e.bucket, &e.key, &e.object_id);
+                e.held_here = self.held_here(&e.bucket, &e.key, &e.version_id, &e.object_id);
             }
             Response::new(ListPgResponse { entries, next })
         }))
@@ -1603,17 +1605,21 @@ impl StorageService for OsdService {
                 && old
                     .as_ref()
                     .is_some_and(|c| version_age(c) > version_age(&object));
-            if (req.version_only || older_replica) && !object.version_id.is_empty() {
-                let version_key =
-                    MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
+            // `version_only` is the version's own entry, whatever its id:
+            // the version written while versioning was off (its object has
+            // no id) is kept under `null`. A write of it used to fall
+            // through to the current object, which it may no longer be.
+            if req.version_only || (older_replica && !object.version_id.is_empty()) {
+                let entry = version_entry_id(&object.version_id).to_string();
+                let version_key = MetadataKey::object_version(&req.bucket, &req.key, &entry);
                 let prev = self.stored_meta(&version_key);
                 if supersedes(prev.as_ref(), &object)
-                    || self.deleted_since(&req.bucket, &req.key, &object.version_id, &object)
+                    || self.deleted_since(&req.bucket, &req.key, &entry, &object)
                 {
                     let held = prev.as_ref().map_or(0, |p| p.stamp).max(self.tombstone(
                         &req.bucket,
                         &req.key,
-                        &object.version_id,
+                        &entry,
                     ));
                     return Ok(Self::superseded(held));
                 }
@@ -1625,8 +1631,8 @@ impl StorageService for OsdService {
                     )
                 {
                     return Err(Status::failed_precondition(format!(
-                        "{}/{} version {} is no longer the object this write was built from",
-                        req.bucket, req.key, object.version_id
+                        "{}/{} version {entry} is no longer the object this write was built from",
+                        req.bucket, req.key
                     )));
                 }
                 match req.shard {

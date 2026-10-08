@@ -54,7 +54,7 @@ use objectio_proto::storage::{
     WriteShardRequest, storage_service_client::StorageServiceClient,
 };
 
-use super::peering::{list_of, needs, order};
+use super::peering::{list_of, needs, order, split_entry_name};
 use super::pgs::{pg_placement, set_filling};
 
 /// How often the leader looks for placement groups to recover.
@@ -318,6 +318,9 @@ impl Drop for Busy {
 struct Work {
     bucket: String,
     key: String,
+    /// A version's entry: its id (`null` for the version written while
+    /// versioning was off); empty for the key's own.
+    version_id: String,
     /// The newest entry any member or stray holds.
     newest: PgEntry,
     /// Addresses of the OSDs holding that entry.
@@ -633,7 +636,7 @@ impl MetaService {
             .work
             .iter()
             .filter(|w| w.spare > 0)
-            .filter(|w| cursor.is_empty() || cursor_key(&w.bucket, &w.key) > cursor)
+            .filter(|w| cursor.is_empty() || w.cursor() > cursor)
             .cloned()
             .collect();
         ordered.sort_by(|a, b| (&a.bucket, &a.key).cmp(&(&b.bucket, &b.key)));
@@ -693,11 +696,14 @@ impl MetaService {
                     Outcome::Done => {
                         recovered += 1;
                         OBJECTS.fetch_add(1, Ordering::Relaxed);
-                        self.forget_degraded_key(&w.bucket, &w.key).await;
+                        // The key's record (B29) is of its current object.
+                        if w.version_id.is_empty() {
+                            self.forget_degraded_key(&w.bucket, &w.key).await;
+                        }
                     }
                     Outcome::Partial | Outcome::Changed => {}
                     Outcome::Unfound(stripe_id, good, needed) => {
-                        let name = format!("{}/{}", w.bucket, w.key);
+                        let name = w.name();
                         lost.push((
                             name.clone(),
                             objectio_proto::metadata::LostObject {
@@ -713,8 +719,8 @@ impl MetaService {
                     }
                     Outcome::Failed(e) => {
                         chunk_failed = true;
-                        debug!("pg {}/{}: {}/{}: {e}", pg.pool, pg.pg_id, w.bucket, w.key);
-                        failed.get_or_insert(format!("{}/{}: {e}", w.bucket, w.key));
+                        debug!("pg {}/{}: {}: {e}", pg.pool, pg.pg_id, w.name());
+                        failed.get_or_insert(format!("{}: {e}", w.name()));
                     }
                 }
             }
@@ -723,7 +729,7 @@ impl MetaService {
                 && cursor_moves
                 && let Some(last) = chunk.last()
             {
-                cursor = cursor_key(&last.bucket, &last.key);
+                cursor = last.cursor();
             }
             LEFT.lock().insert(id.clone(), (left as u64, left_bytes));
             self.note_recovery(&pg, |s| {
@@ -977,7 +983,9 @@ impl MetaService {
         };
         for (address, entries) in &strays {
             for (k, e) in entries {
-                if !e.tombstone {
+                // A stray's copy of the key's current object (its versions'
+                // copies are left: a withdrawal is of the current object).
+                if !e.tombstone && e.version_id.is_empty() {
                     plan.strays.push((
                         address.clone(),
                         k.0.clone(),
@@ -987,7 +995,8 @@ impl MetaService {
                 }
             }
         }
-        for ((bucket, key), (n, holders)) in newest {
+        for ((bucket, name), (n, holders)) in newest {
+            let key = name.clone();
             let mut behind = Vec::new();
             let mut complete = 0usize;
             let mut short = n.positions_short > 0;
@@ -1021,9 +1030,11 @@ impl MetaService {
             } else {
                 n.needed.max(1) as usize
             };
+            let (real_key, version_id) = split_entry_name(&name);
             plan.work.push(Work {
                 bucket,
-                key,
+                key: real_key.to_string(),
+                version_id: version_id.to_string(),
                 spare: i64::try_from(complete).unwrap_or(i64::MAX)
                     - i64::try_from(needed).unwrap_or(i64::MAX),
                 newest: n,
@@ -1031,8 +1042,7 @@ impl MetaService {
                 behind,
             });
         }
-        plan.work
-            .sort_by(|a, b| (a.spare, &a.bucket, &a.key).cmp(&(b.spare, &b.bucket, &b.key)));
+        plan.work.sort_by_cached_key(|w| (w.spare, w.cursor()));
         Ok(plan)
     }
 
@@ -1099,7 +1109,7 @@ impl MetaService {
                 let request = DeleteObjectMetaRequest {
                     bucket: w.bucket.clone(),
                     key: w.key.clone(),
-                    version_id: String::new(),
+                    version_id: w.version_id.clone(),
                     stamp: w.newest.stamp,
                     withdraw_object_id: Vec::new(),
                     pg: Some(pg_ref.clone()),
@@ -1121,7 +1131,7 @@ impl MetaService {
         // The newest copy, whole, from a member that holds it.
         let mut object = None;
         for holder in &w.holders {
-            match whole_copy(holder, &w.bucket, &w.key).await {
+            match whole_copy(holder, &w.bucket, &w.key, &w.version_id).await {
                 Ok(Some(o)) => {
                     let listed = (
                         w.newest.stamp,
@@ -1138,7 +1148,7 @@ impl MetaService {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => debug!("recovery: {}/{} from {holder}: {e}", w.bucket, w.key),
+                Err(e) => debug!("recovery: {} from {holder}: {e}", w.name()),
             }
         }
         let Some(mut object) = object else {
@@ -1337,7 +1347,9 @@ impl MetaService {
                 // the object gets it and one that moved on keeps its own.
                 expected_object_id: Vec::new(),
                 require_existing: false,
-                version_only: false,
+                // A version: its own entry alone, current or not (the
+                // key's own entry recovers the current object).
+                version_only: !w.version_id.is_empty(),
                 keep_newer_current: false,
                 replication_update: false,
                 replication_set: HashMap::new(),
@@ -1904,14 +1916,34 @@ enum RebuildError {
     Other(String),
 }
 
-/// The cursor position of `bucket/key`.
-fn cursor_key(bucket: &str, key: &str) -> String {
-    format!("{bucket}\0{key}")
+impl Work {
+    /// Its place in the PG's order: the key, then each of its versions.
+    fn cursor(&self) -> String {
+        if self.version_id.is_empty() {
+            format!("{}\0{}", self.bucket, self.key)
+        } else {
+            format!("{}\0{}\0{}", self.bucket, self.key, self.version_id)
+        }
+    }
+
+    /// `bucket/key`, and `?versionId=` for a version's.
+    fn name(&self) -> String {
+        if self.version_id.is_empty() {
+            format!("{}/{}", self.bucket, self.key)
+        } else {
+            format!("{}/{}?versionId={}", self.bucket, self.key, self.version_id)
+        }
+    }
 }
 
-/// `bucket/key`'s current ObjectMeta on the OSD at `address`, as stored
-/// (an inline object's bytes included).
-async fn whole_copy(address: &str, bucket: &str, key: &str) -> anyhow::Result<Option<ObjectMeta>> {
+/// `bucket/key`'s current ObjectMeta (or version `version_id`'s) on the OSD
+/// at `address`, as stored (an inline object's bytes included).
+async fn whole_copy(
+    address: &str,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> anyhow::Result<Option<ObjectMeta>> {
     let channel = crate::drain_observer::open_channel(address).await?;
     let r = tokio::time::timeout(
         RPC_TIMEOUT,
@@ -1920,7 +1952,7 @@ async fn whole_copy(address: &str, bucket: &str, key: &str) -> anyhow::Result<Op
             .get_object_meta(GetObjectMetaRequest {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
-                version_id: String::new(),
+                version_id: version_id.to_string(),
                 with_small_shard: false,
             }),
     )

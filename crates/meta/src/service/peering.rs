@@ -728,6 +728,22 @@ pub(crate) async fn info_of(address: &str, pool: &str, pg_id: u32) -> Result<PgS
     Ok(r.into_inner().summary.unwrap_or_default())
 }
 
+/// What a listing keys an entry by, beside its bucket: its key, then for a
+/// version's entry `\0{version_id}` (keys can't hold a NUL), so each version
+/// is merged and recovered as an entry of its own.
+pub(crate) fn entry_name(e: &PgEntry) -> String {
+    if e.version_id.is_empty() {
+        e.key.clone()
+    } else {
+        format!("{}\0{}", e.key, e.version_id)
+    }
+}
+
+/// The key and version id an [`entry_name`] stands for.
+pub(crate) fn split_entry_name(name: &str) -> (&str, &str) {
+    name.split_once('\0').unwrap_or((name, ""))
+}
+
 /// Every entry OSD `address` holds of `pool/pg_id`.
 pub(crate) async fn list_of(
     address: &str,
@@ -755,7 +771,7 @@ pub(crate) async fn list_of(
         .map_err(|e| e.message().to_string())?
         .into_inner();
         for e in r.entries {
-            out.insert((e.bucket.clone(), e.key.clone()), e);
+            out.insert((e.bucket.clone(), entry_name(&e)), e);
         }
         if r.next.is_empty() {
             return Ok(out);

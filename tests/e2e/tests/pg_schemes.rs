@@ -3,7 +3,8 @@
 //! back from an intact one; an LRC pool's lost shard is rebuilt from its
 //! local group, inside the group's rack, and from the whole stripe only
 //! when the group can't. A multipart upload's parts are placed in its
-//! object's placement group, so completing it copies nothing.
+//! object's placement group, so completing it copies nothing. A
+//! versioned key's older versions are recovered as its current object is.
 //!
 //! Repair's walk is off (an hour) in all of them: what is rebuilt, recovery
 //! rebuilt.
@@ -394,4 +395,64 @@ fn a_multipart_objects_parts_are_already_in_its_placement_group() {
 /// How many objects, as the metrics count them.
 fn count(bodies: &[(String, Vec<u8>)]) -> f64 {
     f64::from(u32::try_from(bodies.len()).unwrap())
+}
+
+/// A versioned bucket in a pool of one placement group: three versions of
+/// each key, then a member's drive lost for good. Every version, not only
+/// the current, is rebuilt on the OSD standing in, so with two of the
+/// original members down every version still reads back by its id.
+/// (Recovering the current objects alone, the older versions are left with
+/// three of the four shards a read needs.)
+#[test]
+fn every_version_is_recovered_not_only_the_current() {
+    let mut ha = HaCluster::start_with_meta_args(1, 7, 1, &["--repair-interval-secs", "3600"]);
+    eager(&ha);
+    pool_and_bucket(
+        &ha,
+        json!({"name": "one", "ec_type": 0, "ec_k": 4, "ec_m": 2, "pg_count": 1,
+            "failure_domain": "osd", "enabled": true}),
+        "vers",
+    );
+    let c = &ha.clients[0];
+    c.request(
+        "PUT",
+        "/vers?versioning",
+        b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+    )
+    .expect(200);
+    let mut versions: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for k in 0..4u8 {
+        for n in 0..3u8 {
+            let key = format!("k{k}");
+            let body = payload(if n == 1 { 20_000 } else { 300_000 }, k * 10 + n);
+            let r = c.request("PUT", &format!("/vers/{key}"), &body);
+            assert_eq!(r.status, 200, "{key}: {}", r.text());
+            let id = r.header("x-amz-version-id").expect("a version id");
+            versions.push((key, id, body));
+        }
+    }
+    let ids = node_ids(&ha, 7);
+    let acting: Vec<String> = pgs(&ha, "one")[&0]["acting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect();
+    let lost = ids.iter().position(|id| *id == acting[0]).unwrap();
+
+    lose_drives(&mut ha, &[lost], &ids);
+    await_clean(&ha, "one", 180);
+
+    // Two original members down: four shards left of every version, the
+    // stand-in's among them.
+    let ids = node_ids(&ha, 7);
+    for m in &acting[1..3] {
+        let i = ids.iter().position(|id| id == m).unwrap();
+        ha.stop_osd(i);
+    }
+    for (key, id, body) in &versions {
+        let got = ha.clients[0].request("GET", &format!("/vers/{key}?versionId={id}"), &[]);
+        assert_eq!(got.status, 200, "{key} version {id}: {}", got.text());
+        assert_eq!(&got.bytes, body, "{key} version {id}");
+    }
 }

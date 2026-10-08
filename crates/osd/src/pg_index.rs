@@ -8,11 +8,14 @@
 //! PG: `pg/{pool}\0{pg_id:u32be}{bucket}\0{key}` → the key's current object
 //! (its write order, how many stripes and shard positions it has, and how
 //! many of those name this OSD) or, when it has none, the tombstone of its
-//! last delete. One PG's contents are then one prefix scan.
+//! last delete; and, for a versioned key, one more per version,
+//! `…{bucket}\0{key}\0{version_id}` → the version (`v…`) or the tombstone
+//! of its delete. One PG's contents are then one prefix scan.
 //!
 //! The index is a layer over the metadata store, not a change to the
-//! writers: every write that touches a key's current entry (`m…`) or its
-//! tombstone (`t…\0`) has the key's index entry put or deleted in the same
+//! writers: every write that touches a key's current entry (`m…`), a
+//! version (`v…`) or their tombstones (`t…`) has that index entry put or
+//! deleted in the same
 //! atomic write, under a lock on the key, so the two never disagree, a
 //! crash included. Each PG's summary (counts, and an order-independent
 //! digest of its entries) is kept in memory, changed by each write's delta
@@ -62,6 +65,35 @@ pub fn entry_key(pool: &str, pg: u32, bucket: &str, key: &str) -> MetadataKey {
     MetadataKey::from_bytes(k)
 }
 
+/// The index key of version `version_id` of `bucket/key` in placement
+/// group `pool/pg`.
+#[must_use]
+pub fn version_key(pool: &str, pg: u32, bucket: &str, key: &str, version_id: &str) -> MetadataKey {
+    let mut k = entry_key(pool, pg, bucket, key).0;
+    k.push(0);
+    k.extend_from_slice(version_id.as_bytes());
+    MetadataKey::from_bytes(k)
+}
+
+/// The index key of entry `e` (a key's, or one of its versions') in `pg`.
+fn key_of(pg: &PgId, e: &PgEntry) -> MetadataKey {
+    if e.version_id.is_empty() {
+        entry_key(&pg.0, pg.1, &e.bucket, &e.key)
+    } else {
+        version_key(&pg.0, pg.1, &e.bucket, &e.key, &e.version_id)
+    }
+}
+
+/// An entry's place in its PG's order: what ListPg's cursor names.
+#[must_use]
+pub fn cursor_of(e: &PgEntry) -> String {
+    if e.version_id.is_empty() {
+        format!("{}\0{}", e.bucket, e.key)
+    } else {
+        format!("{}\0{}\0{}", e.bucket, e.key, e.version_id)
+    }
+}
+
 /// The prefix of every entry of placement group `pool/pg`.
 #[must_use]
 pub fn pg_prefix(pool: &str, pg: u32) -> MetadataKey {
@@ -73,8 +105,9 @@ pub fn pg_prefix(pool: &str, pg: u32) -> MetadataKey {
     MetadataKey::from_bytes(k)
 }
 
-/// `(pool, pg, bucket, key)` of an index key.
-fn parse_entry_key(k: &[u8]) -> Option<(String, u32, String, String)> {
+/// `(pool, pg, bucket, key, version_id)` of an index key (the version empty
+/// for a key's own entry).
+fn parse_entry_key(k: &[u8]) -> Option<(String, u32, String, String, String)> {
     let rest = k.strip_prefix(PREFIX)?;
     let nul = rest.iter().position(|&b| b == 0)?;
     let pool = std::str::from_utf8(&rest[..nul]).ok()?.to_string();
@@ -83,8 +116,18 @@ fn parse_entry_key(k: &[u8]) -> Option<(String, u32, String, String)> {
     let rest = &rest[4..];
     let nul = rest.iter().position(|&b| b == 0)?;
     let bucket = std::str::from_utf8(&rest[..nul]).ok()?.to_string();
-    let key = std::str::from_utf8(&rest[nul + 1..]).ok()?.to_string();
-    Some((pool, pg, bucket, key))
+    let rest = &rest[nul + 1..];
+    let (key, version) = match rest.iter().position(|&b| b == 0) {
+        Some(n) => (&rest[..n], &rest[n + 1..]),
+        None => (rest, &rest[rest.len()..]),
+    };
+    Some((
+        pool,
+        pg,
+        bucket,
+        std::str::from_utf8(key).ok()?.to_string(),
+        std::str::from_utf8(version).ok()?.to_string(),
+    ))
 }
 
 /// The value of a tombstone: the delete's stamp, then (when known) the
@@ -116,26 +159,50 @@ pub fn tombstone_pg(v: &[u8]) -> Option<PgId> {
     (!pool.is_empty()).then(|| (pool.to_string(), id))
 }
 
-/// `(bucket, key)` whose index entry a write of `k` may change: its current
-/// object (`m…`) or the tombstone of its last delete (`t…\0`, no version).
-fn touched(k: &MetadataKey) -> Option<(String, String)> {
+/// `(bucket, key, version)` whose index entry a write of `k` may change: the
+/// key's own (its current object `m…`, or the tombstone of its last delete
+/// `t…\0`), or one of its versions' (`v…`, or `t…\0{version_id}`).
+fn touched(k: &MetadataKey) -> Option<(String, String, Option<String>)> {
     match k.as_bytes().first() {
-        Some(b'm') => k.parse_object_meta(),
+        Some(b'm') => k.parse_object_meta().map(|(b, k)| (b, k, None)),
+        Some(b'v') => k.parse_object_version().map(|(b, k, v)| (b, k, Some(v))),
         Some(b't') => {
             let rest = &k.as_bytes()[1..];
             let nul = rest.iter().position(|&b| b == 0)?;
             let after = &rest[nul + 1..];
             let nul2 = after.iter().position(|&b| b == 0)?;
-            if nul2 + 1 != after.len() {
-                return None; // a version's tombstone
-            }
+            let version = std::str::from_utf8(&after[nul2 + 1..]).ok()?;
             Some((
                 std::str::from_utf8(&rest[..nul]).ok()?.to_string(),
                 std::str::from_utf8(&after[..nul2]).ok()?.to_string(),
+                (!version.is_empty()).then(|| version.to_string()),
             ))
         }
         _ => None,
     }
+}
+
+/// The object (`m…`, or the version `v…`) and tombstone keys of a key's
+/// entry, or of one of its versions'.
+fn sources(bucket: &str, key: &str, version: Option<&str>) -> (MetadataKey, MetadataKey) {
+    match version {
+        None => (
+            MetadataKey::object_meta(bucket, key),
+            MetadataKey::tombstone(bucket, key, ""),
+        ),
+        Some(v) => (
+            MetadataKey::object_version(bucket, key, v),
+            MetadataKey::tombstone(bucket, key, v),
+        ),
+    }
+}
+
+/// `ix` as a version's entry (`version` set), or as it is.
+fn as_version(mut ix: Indexed, version: Option<&str>) -> Indexed {
+    if let Some(v) = version {
+        ix.entry.version_id = v.to_string();
+    }
+    ix
 }
 
 /// A key's entry and the placement group it is under.
@@ -225,6 +292,7 @@ fn object_entry(node_id: &[u8; 16], bucket: &str, key: &str, o: &ObjectMeta) -> 
         held_here: 0,
         needed: o.stripes.first().map_or(1, |s| s.ec_k.max(1)),
         size: o.size,
+        version_id: String::new(),
     }
 }
 
@@ -241,6 +309,10 @@ pub fn entry_hash(e: &PgEntry) -> u128 {
     b.extend_from_slice(&e.stamp.to_be_bytes());
     b.extend_from_slice(&e.object_id);
     b.extend_from_slice(&e.update_stamp.to_be_bytes());
+    if !e.version_id.is_empty() {
+        b.push(0);
+        b.extend_from_slice(e.version_id.as_bytes());
+    }
     let hi = xxhash_rust::xxh64::xxh64(&b, 0);
     let lo = xxhash_rust::xxh64::xxh64(&b, 0x9e37_79b9_7f4a_7c15);
     (u128::from(hi) << 64) | u128::from(lo)
@@ -369,15 +441,39 @@ impl PgIndexed {
                 self.inner.write(std::mem::take(&mut batch))?;
             }
         }
-        for (k, v) in self.inner.iter_prefix(&MetadataKey::from_bytes(vec![b't'])) {
-            let Some((bucket, key)) = touched(&k) else {
+        // Versions.
+        let mut seen_v: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for (k, v) in self.inner.iter_prefix(&MetadataKey::from_bytes(vec![b'v'])) {
+            let Some((bucket, key, version)) = k.parse_object_version() else {
                 continue;
             };
-            if seen_m.contains(&(bucket.clone(), key.clone())) {
+            let t = self
+                .inner
+                .get(&MetadataKey::tombstone(&bucket, &key, &version));
+            if let Some(ix) = derive(&self.node_id, &bucket, &key, Some(&v), t.as_deref(), None) {
+                batch.push(put_entry(&as_version(ix, Some(&version))));
+                n += 1;
+            }
+            seen_v.insert((bucket, key, version));
+            if batch.len() >= BUILD_BATCH {
+                self.inner.write(std::mem::take(&mut batch))?;
+            }
+        }
+        // Tombstones with nothing left beside them.
+        for (k, v) in self.inner.iter_prefix(&MetadataKey::from_bytes(vec![b't'])) {
+            let Some((bucket, key, version)) = touched(&k) else {
+                continue;
+            };
+            let seen = match &version {
+                None => seen_m.contains(&(bucket.clone(), key.clone())),
+                Some(ver) => seen_v.contains(&(bucket.clone(), key.clone(), ver.clone())),
+            };
+            if seen {
                 continue;
             }
             if let Some(ix) = derive(&self.node_id, &bucket, &key, None, Some(&v), None) {
-                batch.push(put_entry(&ix));
+                batch.push(put_entry(&as_version(ix, version.as_deref())));
                 n += 1;
             }
             if batch.len() >= BUILD_BATCH {
@@ -395,7 +491,7 @@ impl PgIndexed {
             .inner
             .iter_prefix(&MetadataKey::from_bytes(PREFIX.to_vec()))
         {
-            let Some((pool, pg, bucket, key)) = parse_entry_key(k.as_bytes()) else {
+            let Some((pool, pg, bucket, key, version)) = parse_entry_key(k.as_bytes()) else {
                 continue;
             };
             let Ok(mut e) = PgEntry::decode(v.as_slice()) else {
@@ -403,6 +499,7 @@ impl PgIndexed {
             };
             e.bucket = bucket;
             e.key = key;
+            e.version_id = version;
             sums.entry((pool, pg)).or_default().add(&e);
         }
         *self.summaries.lock() = sums;
@@ -414,9 +511,10 @@ impl PgIndexed {
         self.summaries.lock().get(pg).cloned().unwrap_or_default()
     }
 
-    /// Up to `limit` of `pg`'s entries, in key order, after `after`
-    /// (`"{bucket}\0{key}"`; empty from the start), and the cursor of the
-    /// next page (empty after the last).
+    /// Up to `limit` of `pg`'s entries, in key order (a key's own entry,
+    /// then its versions'), after `after` ([`cursor_of`] an entry; empty
+    /// from the start), and the cursor of the next page (empty after the
+    /// last).
     #[must_use]
     pub fn list(&self, pg: &PgId, after: &str, limit: usize) -> (Vec<PgEntry>, String) {
         let prefix = pg_prefix(&pg.0, pg.1);
@@ -433,19 +531,18 @@ impl PgIndexed {
                     more = true;
                     return false;
                 }
-                if let (Some((_, _, bucket, key)), Ok(mut e)) =
+                if let (Some((_, _, bucket, key, version)), Ok(mut e)) =
                     (parse_entry_key(k), PgEntry::decode(v))
                 {
                     e.bucket = bucket;
                     e.key = key;
+                    e.version_id = version;
                     out.push(e);
                 }
                 true
             });
         let next = if more {
-            out.last()
-                .map(|e| format!("{}\0{}", e.bucket, e.key))
-                .unwrap_or_default()
+            out.last().map(cursor_of).unwrap_or_default()
         } else {
             String::new()
         };
@@ -475,10 +572,11 @@ fn put_entry(ix: &Indexed) -> MetadataOp {
     let stored = PgEntry {
         bucket: String::new(),
         key: String::new(),
+        version_id: String::new(),
         ..ix.entry.clone()
     };
     MetadataOp::Put {
-        key: entry_key(&ix.pg.0, ix.pg.1, &ix.entry.bucket, &ix.entry.key),
+        key: key_of(&ix.pg, &ix.entry),
         value: stored.encode_to_vec(),
     }
 }
@@ -511,7 +609,7 @@ impl MetaIndex for PgIndexed {
         let mut flat = Vec::with_capacity(ops.len());
         flatten(ops, &mut flat);
         let ops = flat;
-        let mut keys: Vec<(String, String)> = Vec::new();
+        let mut keys: Vec<(String, String, Option<String>)> = Vec::new();
         for op in &ops {
             if let Some(bk) = op_key(op).and_then(touched)
                 && !keys.contains(&bk)
@@ -522,16 +620,16 @@ impl MetaIndex for PgIndexed {
         if keys.is_empty() {
             return self.inner.write(ops);
         }
-        let mut locks: Vec<usize> = keys.iter().map(|(b, k)| Self::lock_of(b, k)).collect();
+        let mut locks: Vec<usize> = keys.iter().map(|(b, k, _)| Self::lock_of(b, k)).collect();
         locks.sort_unstable();
         locks.dedup();
         let _held: Vec<_> = locks.iter().map(|i| self.locks[*i].lock()).collect();
 
         let mut index_ops = Vec::new();
         let mut deltas: Vec<(Option<Indexed>, Option<Indexed>)> = Vec::new();
-        for (bucket, key) in &keys {
-            let mk = MetadataKey::object_meta(bucket, key);
-            let tk = MetadataKey::tombstone(bucket, key, "");
+        for (bucket, key, version) in &keys {
+            let version = version.as_deref();
+            let (mk, tk) = sources(bucket, key, version);
             let m0 = self.inner.get(&mk);
             let t0 = self.inner.get(&tk);
             let (mut m1, mut t1) = (m0.clone(), t0.clone());
@@ -551,7 +649,8 @@ impl MetaIndex for PgIndexed {
                 m0.as_deref(),
                 t0.as_deref(),
                 None,
-            );
+            )
+            .map(|ix| as_version(ix, version));
             let after = derive(
                 &self.node_id,
                 bucket,
@@ -559,8 +658,9 @@ impl MetaIndex for PgIndexed {
                 m1.as_deref(),
                 t1.as_deref(),
                 before.as_ref().map(|b| &b.pg),
-            );
-            if after.is_none() && m1.is_some() {
+            )
+            .map(|ix| as_version(ix, version));
+            if after.is_none() && m1.is_some() && version.is_none() {
                 self.unindexed.fetch_add(1, Ordering::Relaxed);
             }
             if before == after {
@@ -570,7 +670,7 @@ impl MetaIndex for PgIndexed {
                 && after.as_ref().is_none_or(|a| a.pg != b.pg)
             {
                 index_ops.push(MetadataOp::Delete {
-                    key: entry_key(&b.pg.0, b.pg.1, bucket, key),
+                    key: key_of(&b.pg, &b.entry),
                 });
             }
             if let Some(a) = &after {
@@ -785,6 +885,114 @@ mod tests {
         let ix = open(d.path());
         let s = ix.summary(&pg);
         assert_eq!((s.objects, s.tombstones), (10, 1));
+    }
+
+    /// A versioned key: its own entry (the current object), then one entry
+    /// per version, each with its id, in that order; a version's delete
+    /// leaves its tombstone entry in place of the version's.
+    #[test]
+    fn each_version_is_an_entry_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let ix = open(d.path());
+        let pg = ("p".to_string(), 5);
+        let v1 = ObjectMeta {
+            version_id: "v1".into(),
+            ..object("k", 10, 5, true)
+        };
+        let v2 = ObjectMeta {
+            version_id: "v2".into(),
+            ..object("k", 11, 5, true)
+        };
+        // As a versioned PUT stores them: the version entries, and the
+        // newest also as the current object.
+        for v in [&v1, &v2] {
+            ix.put(
+                MetadataKey::object_version("b", "k", &v.version_id),
+                v.encode_to_vec(),
+            )
+            .unwrap();
+        }
+        put(&ix, &v2);
+        let (entries, next) = ix.list(&pg, "", 10);
+        assert!(next.is_empty());
+        let names: Vec<(String, String, bool)> = entries
+            .iter()
+            .map(|e| (e.key.clone(), e.version_id.clone(), e.tombstone))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("k".to_string(), String::new(), false),
+                ("k".to_string(), "v1".to_string(), false),
+                ("k".to_string(), "v2".to_string(), false),
+            ]
+        );
+        assert_eq!(entries[1].object_id, v1.object_id);
+        assert_eq!(ix.summary(&pg).objects, 3);
+
+        // v1 deleted: its entry is now the delete.
+        ix.write(vec![
+            MetadataOp::Delete {
+                key: MetadataKey::object_version("b", "k", "v1"),
+            },
+            MetadataOp::Put {
+                key: MetadataKey::tombstone("b", "k", "v1"),
+                value: tombstone_value(12, Some(("p", 5))),
+            },
+        ])
+        .unwrap();
+        let (entries, _) = ix.list(&pg, "", 10);
+        let v1e = entries.iter().find(|e| e.version_id == "v1").unwrap();
+        assert!(v1e.tombstone);
+        assert_eq!(v1e.stamp, 12);
+        let s = ix.summary(&pg);
+        assert_eq!((s.objects, s.tombstones), (2, 1));
+
+        // Paged one at a time, every entry once, versions included.
+        let mut after = String::new();
+        let mut seen = Vec::new();
+        loop {
+            let (page, next) = ix.list(&pg, &after, 1);
+            seen.extend(page.into_iter().map(|e| e.version_id));
+            if next.is_empty() {
+                break;
+            }
+            after = next;
+        }
+        assert_eq!(seen, ["", "v1", "v2"]);
+    }
+
+    #[test]
+    fn a_stores_versions_are_indexed_when_it_is_opened() {
+        let d = tempfile::tempdir().unwrap();
+        let pg = ("p".to_string(), 6);
+        {
+            let inner =
+                objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(d.path()))
+                    .unwrap();
+            let v1 = ObjectMeta {
+                version_id: "v1".into(),
+                ..object("k", 10, 6, true)
+            };
+            inner
+                .put(
+                    MetadataKey::object_version("b", "k", "v1"),
+                    v1.encode_to_vec(),
+                )
+                .unwrap();
+            inner
+                .put(
+                    MetadataKey::tombstone("b", "k", "v0"),
+                    tombstone_value(9, Some(("p", 6))),
+                )
+                .unwrap();
+        }
+        let ix = open(d.path());
+        let s = ix.summary(&pg);
+        assert_eq!((s.objects, s.tombstones), (1, 1));
+        let (entries, _) = ix.list(&pg, "", 10);
+        let versions: Vec<&str> = entries.iter().map(|e| e.version_id.as_str()).collect();
+        assert_eq!(versions, ["v0", "v1"]);
     }
 
     #[test]

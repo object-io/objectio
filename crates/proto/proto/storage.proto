@@ -181,6 +181,10 @@ message PgEntry {
     uint32 needed = 11;
     // The object's size in bytes: what recovery has left to move.
     uint64 size = 12;
+    // A version of a versioned key: its id (`null` for the version written
+    // while versioning was off); empty for the key's current object or
+    // delete. Each version is an entry of its own.
+    string version_id = 13;
 }
 
 message GetPgInfoRequest {
@@ -194,8 +198,8 @@ message GetPgInfoResponse {
 message ListPgRequest {
     string pool = 1;
     uint32 pg_id = 2;
-    // "{bucket}\0{key}" of the last entry of the previous page; empty: from
-    // the start.
+    // "{bucket}\0{key}" (then "\0{version_id}" for a version's entry) of
+    // the last entry of the previous page; empty: from the start.
     string after = 3;
     uint32 limit = 4;   // 0: 1000
 }
