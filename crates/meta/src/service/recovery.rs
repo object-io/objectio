@@ -144,11 +144,12 @@ const AGED_SECS: u64 = 900;
 /// waited forever behind them, so its evacuation never ended (soak run 20:
 /// 256 empty PGs waited 90 minutes and counting).
 fn rank(spare: i64, degraded: bool, since: u64, now: u64) -> (i64, u8, u64) {
-    let spare = if since > 0 && now.saturating_sub(since) >= AGED_SECS {
-        i64::MIN
-    } else {
-        spare
-    };
+    // Aged: by waiting time alone. Ranked as recovery before a move too,
+    // the moves still waited behind every degraded PG (soak run 22: 147
+    // default-pool PGs with only their fill to finish, 40 minutes on).
+    if since > 0 && now.saturating_sub(since) >= AGED_SECS {
+        return (i64::MIN, 0, since);
+    }
     (spare, u8::from(!degraded), since)
 }
 
@@ -2337,6 +2338,10 @@ mod backoff_tests {
         let older = rank(1, false, now - AGED_SECS - 600, now);
         assert!(aged < short);
         assert!(older < aged);
+        // Among aged PGs, a move that waited longer goes before recovery.
+        let aged_recovery = rank(-3, true, now - AGED_SECS - 60, now);
+        let older_move = rank(2, false, now - AGED_SECS - 300, now);
+        assert!(older_move < aged_recovery);
         // No time recorded: not aged.
         assert_eq!(rank(2, true, 0, now), (2, 0, 0));
     }
