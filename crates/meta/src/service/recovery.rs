@@ -44,7 +44,7 @@
 use super::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use objectio_proto::metadata::{PgState, ShardLocation, StripeMeta};
@@ -129,6 +129,25 @@ struct Backoff {
     members_down: u32,
 }
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// PGs holding an object recorded as written with nothing to spare (B29: a
+/// refused write kept on exactly k shards), with the newest such record
+/// (Unix s), as of the last look. Such a PG goes before every other, and a
+/// pass at work gives its reservation up for it (see [`YIELD_AFTER`]).
+static AT_RISK: LazyLock<parking_lot::Mutex<HashMap<PgId, u64>>> =
+    LazyLock::new(Default::default);
+
+/// At the last look, a PG at risk could not reserve its OSDs.
+static AT_RISK_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// A pass that has run this long stops at its next chunk, its cursor kept,
+/// when a PG at risk is waiting for its OSDs, or its own PG got such a
+/// record after it was planned: the PG is planned again, the new object
+/// first. A pass worked its plan to the end before, however long: after a
+/// replaced disk, one PG's pass ran over 20 minutes while a write refused
+/// meanwhile and kept on exactly k shards waited, and the drive lost next
+/// took it below k (B2 soak run 22).
+const YIELD_AFTER: Duration = Duration::from_secs(10);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// The wait before the next pass after `n` in a row that got nowhere.
@@ -137,18 +156,22 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const AGED_SECS: u64 = 900;
 
 /// The order PGs are recovered in (lowest first): fewest copies to spare,
-/// recovery before a move, longest waiting. One that has waited
-/// [`AGED_SECS`] goes first: with writes going on, PGs that keep falling
+/// recovery before a move, longest waiting. One holding an object recorded
+/// with nothing to spare ([`AT_RISK`]) goes first of all, then one that
+/// has waited [`AGED_SECS`]: with writes going on, PGs that keep falling
 /// back to one or two objects short (spare -1) otherwise always come
 /// first, and a lost drive's PGs left with only their fill to finish
 /// waited forever behind them, so its evacuation never ended (soak run 20:
 /// 256 empty PGs waited 90 minutes and counting).
-fn rank(spare: i64, degraded: bool, since: u64, now: u64) -> (i64, u8, u64) {
+fn rank(spare: i64, degraded: bool, at_risk: bool, since: u64, now: u64) -> (i64, u8, u64) {
+    if at_risk {
+        return (i64::MIN, 0, since);
+    }
     // Aged: by waiting time alone. Ranked as recovery before a move too,
     // the moves still waited behind every degraded PG (soak run 22: 147
     // default-pool PGs with only their fill to finish, 40 minutes on).
     if since > 0 && now.saturating_sub(since) >= AGED_SECS {
-        return (i64::MIN, 0, since);
+        return (i64::MIN + 1, 0, since);
     }
     (spare, u8::from(!degraded), since)
 }
@@ -542,9 +565,8 @@ impl MetaService {
         }
         let at_once = self.config_parsed("pg/recover_at_once", PGS_AT_ONCE).max(1);
         let busy = BUSY.lock().len();
-        if busy >= at_once {
-            return;
-        }
+        let at_risk = self.at_risk_pgs();
+        *AT_RISK.lock() = at_risk.clone();
         let now = Self::current_timestamp();
         let pools: HashMap<String, PoolConfig> = self
             .pools_snapshot()
@@ -560,27 +582,39 @@ impl MetaService {
                 if is_busy(&id) {
                     continue;
                 }
-                if let Some(rank) = self.recovery_need(&pg, states.get(&pg.pg_id), now) {
+                let risk = at_risk.contains_key(&id);
+                if let Some(rank) = self.recovery_need(&pg, states.get(&pg.pg_id), risk, now) {
                     due.push((rank, pg));
                 }
             }
         }
         due.sort_by_key(|(rank, pg)| (*rank, pg.pool.clone(), pg.pg_id));
+        let waiting = |due: &[((i64, u8, u64), PlacementGroup)]| {
+            due.iter()
+                .any(|(_, pg)| at_risk.contains_key(&(pg.pool.clone(), pg.pg_id)))
+        };
+        if busy >= at_once {
+            AT_RISK_WAITING.store(waiting(&due), Ordering::Relaxed);
+            return;
+        }
         // In that order, those that can reserve every OSD they need; one
         // that can't waits for a later look, the rest go on.
         let limit = self
             .config_parsed("pg/backfills_per_osd", BACKFILLS_PER_OSD)
             .max(1);
         let mut started = 0;
-        for (_, pg) in due {
+        let mut left_waiting = Vec::new();
+        for (rank, pg) in due {
             if busy + started >= at_once {
-                break;
+                left_waiting.push((rank, pg));
+                continue;
             }
             let Some(pool) = pools.get(&pg.pool).cloned() else {
                 continue;
             };
             let Some(reservation) = reserve(&self.recovery_osds(&pg), limit) else {
                 REFUSED.fetch_add(1, Ordering::Relaxed);
+                left_waiting.push((rank, pg));
                 continue;
             };
             let id = (pg.pool.clone(), pg.pg_id);
@@ -596,6 +630,35 @@ impl MetaService {
                 NEXT.notify_one();
             });
         }
+        AT_RISK_WAITING.store(waiting(&left_waiting), Ordering::Relaxed);
+    }
+
+    /// The PGs holding an object recorded as written with nothing to spare
+    /// (B29), each with its newest such record (Unix s).
+    fn at_risk_pgs(&self) -> HashMap<PgId, u64> {
+        let mut out: HashMap<PgId, u64> = HashMap::new();
+        // Fewest to spare first: the rest have some.
+        for (key, record, _) in self.degraded_objects() {
+            let spare = record
+                .stripes
+                .iter()
+                .map(|s| i64::from(s.present) - i64::from(s.needed))
+                .min()
+                .unwrap_or(i64::MAX);
+            if spare > 0 {
+                break;
+            }
+            let Some((bucket, k)) = key.split_once('/') else {
+                continue;
+            };
+            if self.key_pg(bucket, k).is_none() {
+                continue;
+            }
+            let (pg_id, pool) = self.listing_pg(bucket, k);
+            let newest = out.entry((pool, pg_id)).or_insert(0);
+            *newest = (*newest).max(record.recorded_at);
+        }
+        out
     }
 
     /// The OSDs recovering `pg` reads from or writes to: its acting members,
@@ -619,6 +682,7 @@ impl MetaService {
         &self,
         pg: &PlacementGroup,
         state: Option<&PgState>,
+        at_risk: bool,
         now: u64,
     ) -> Option<(i64, u8, u64)> {
         let moving = !pg.filling.is_empty() || !remap_positions(self, pg).is_empty();
@@ -657,11 +721,17 @@ impl MetaService {
                 && s.objects_degraded > 0
                 && matches!(s.state.as_str(), "Degraded" | "Undersized")
         });
-        if !(moving || resume || degraded) {
+        if !(moving || resume || degraded || at_risk) {
             return None;
         }
         let spare = state.map_or(i64::MAX, |s| s.min_spare);
-        Some(rank(spare, degraded, state.map_or(0, |s| s.since), now))
+        Some(rank(
+            spare,
+            degraded,
+            at_risk,
+            state.map_or(0, |s| s.since),
+            now,
+        ))
     }
 
     /// Whether `w`'s newest copy, as the plan listed it, has been replaced
@@ -753,6 +823,8 @@ impl MetaService {
             .unwrap_or_default();
         let mut recovered = held.as_ref().map_or(0, |h| h.recovered);
 
+        let started = std::time::Instant::now();
+        let planned_at = Self::current_timestamp();
         let plan = match self.recovery_plan(&pg, &pool).await {
             Ok(plan) => plan,
             Err(e) => {
@@ -811,7 +883,18 @@ impl MetaService {
             .chain(ordered.chunks(CHUNK).map(|c| (true, c.to_vec())))
             .collect();
         let mut cursor_moves = true;
+        let mut yielded = false;
         for (moves_cursor, chunk) in chunks {
+            if started.elapsed() >= YIELD_AFTER && left < total {
+                let own = AT_RISK.lock().get(&id).is_some_and(|&t| t >= planned_at);
+                // Its own objects with none to spare are done by now unless
+                // they can't be: the ordered rest can wait for another PG's.
+                let other = moves_cursor && AT_RISK_WAITING.load(Ordering::Relaxed);
+                if own || other {
+                    yielded = true;
+                    break;
+                }
+            }
             if !self.is_raft_leader()
                 || self
                     .placement_group(&pg.pool, pg.pg_id)
@@ -889,6 +972,23 @@ impl MetaService {
         }
         drop(reservation);
         let wrote = SHARDS.load(Ordering::Relaxed) + COPIES.load(Ordering::Relaxed) > wrote_before;
+        if total > 0 {
+            info!(
+                "pg {}/{} (epoch {}): {working} pass ended after {} s: {} of {total} objects \
+                 worked, {} unfound{}",
+                pg.pool,
+                pg.pg_id,
+                pg.epoch,
+                started.elapsed().as_secs(),
+                total - left,
+                unfound.len(),
+                if yielded {
+                    "; stopped for an object with nothing to spare"
+                } else {
+                    ""
+                }
+            );
+        }
 
         // Every object done, every member filled reachable: the stand-ins
         // are filled, and the members they were filled from are strays.
@@ -923,7 +1023,8 @@ impl MetaService {
                 unfound[0]
             );
         }
-        if failed.is_none() && (unfound.is_empty() || settled) && filling && fillers_up {
+        if !yielded && failed.is_none() && (unfound.is_empty() || settled) && filling && fillers_up
+        {
             self.finish_filling(&pg, &plan).await;
         }
         if !unfound.is_empty() {
@@ -948,7 +1049,7 @@ impl MetaService {
         // later pass finds out which. Never held until its counts change:
         // the same count can be another object, or the same one now
         // recoverable (soak run 18, a PG left 1 degraded for 40 minutes).
-        if state.state == "Clean" || (wrote && unfound.is_empty()) {
+        if state.state == "Clean" || (wrote && (unfound.is_empty() || yielded)) {
             BACKOFF.lock().remove(&id);
         } else {
             no_progress(&id, now.epoch, state.members_down);
@@ -965,9 +1066,10 @@ impl MetaService {
         if state.state != "Clean" {
             state.recovered = recovered;
             // After a failure, resume from the cursor next time (it stopped
-            // before the first chunk that failed); the pass having finished,
-            // start from the beginning.
-            state.cursor = if failed.is_some() {
+            // before the first chunk that failed), as after a pass that
+            // stopped for a PG at risk; the pass having finished, start
+            // from the beginning.
+            state.cursor = if failed.is_some() || yielded {
                 cursor.clone()
             } else {
                 String::new()
@@ -2330,20 +2432,31 @@ mod backoff_tests {
     fn a_pg_that_has_waited_long_goes_first_oldest_first() {
         let now = 10_000;
         // Fresh: fewest to spare first, recovery before a move.
-        let short = rank(-1, true, now - 60, now);
-        let moving = rank(1, false, now - 120, now);
+        let short = rank(-1, true, false, now - 60, now);
+        let moving = rank(1, false, false, now - 120, now);
         assert!(short < moving);
         // Waited 15 minutes: ahead of the short one, and of one waiting less.
-        let aged = rank(1, false, now - AGED_SECS, now);
-        let older = rank(1, false, now - AGED_SECS - 600, now);
+        let aged = rank(1, false, false, now - AGED_SECS, now);
+        let older = rank(1, false, false, now - AGED_SECS - 600, now);
         assert!(aged < short);
         assert!(older < aged);
         // Among aged PGs, a move that waited longer goes before recovery.
-        let aged_recovery = rank(-3, true, now - AGED_SECS - 60, now);
-        let older_move = rank(2, false, now - AGED_SECS - 300, now);
+        let aged_recovery = rank(-3, true, false, now - AGED_SECS - 60, now);
+        let older_move = rank(2, false, false, now - AGED_SECS - 300, now);
         assert!(older_move < aged_recovery);
         // No time recorded: not aged.
-        assert_eq!(rank(2, true, 0, now), (2, 0, 0));
+        assert_eq!(rank(2, true, false, 0, now), (2, 0, 0));
+    }
+
+    #[test]
+    fn a_pg_holding_an_object_with_nothing_to_spare_goes_before_every_other() {
+        let now = 10_000;
+        let at_risk = rank(3, true, true, now - 5, now);
+        // Before one waiting an hour, and one with more missing.
+        assert!(at_risk < rank(1, false, false, now - 3600, now));
+        assert!(at_risk < rank(-2, true, false, now - 60, now));
+        // Among PGs at risk, the one waiting longest first.
+        assert!(rank(0, true, true, now - 600, now) < at_risk);
     }
 
     #[test]

@@ -23,6 +23,15 @@ pub const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// Per-connection window: room for many shards in flight from one gateway.
 pub const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
 
+/// Streams a client may reset before the server accepts them, per
+/// connection, before the server drops the connection (h2's guard against
+/// a reset flood; its default is 20). A gateway or meta that gives up on
+/// calls to a busy OSD resets each: at 20, every OSD dropped connections
+/// during a rebuild, failing every call on them, meta's recovery writes
+/// among them (B2 soak run 22: 36 on the OSD being rebuilt in 20 minutes).
+/// Callers are the cluster's own services, over mTLS when it is on.
+pub const PENDING_RESETS: usize = 1024;
+
 /// mTLS between the services (A8a), every gRPC hop: gateway, meta, OSD
 /// and block gateway, and the CLI's block commands. With these set, a
 /// server accepts only clients presenting a certificate the CA signed, and
@@ -114,7 +123,8 @@ pub fn endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
 pub fn server() -> Server {
     let builder = Server::builder()
         .initial_stream_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONNECTION_WINDOW);
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .http2_max_pending_accept_reset_streams(Some(PENDING_RESETS));
     match TLS.get() {
         Some(tls) => builder
             .tls_config(tls.server.clone())
