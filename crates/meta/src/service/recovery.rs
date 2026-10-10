@@ -134,8 +134,7 @@ const BACKOFF_BASE: Duration = Duration::from_secs(2);
 /// refused write kept on exactly k shards), with the newest such record
 /// (Unix s), as of the last look. Such a PG goes before every other, and a
 /// pass at work gives its reservation up for it (see [`YIELD_AFTER`]).
-static AT_RISK: LazyLock<parking_lot::Mutex<HashMap<PgId, u64>>> =
-    LazyLock::new(Default::default);
+static AT_RISK: LazyLock<parking_lot::Mutex<HashMap<PgId, u64>>> = LazyLock::new(Default::default);
 
 /// At the last look, a PG at risk could not reserve its OSDs.
 static AT_RISK_WAITING: AtomicBool = AtomicBool::new(false);
@@ -174,6 +173,30 @@ fn rank(spare: i64, degraded: bool, at_risk: bool, since: u64, now: u64) -> (i64
         return (i64::MIN + 1, 0, since);
     }
     (spare, u8::from(!degraded), since)
+}
+
+/// Of the degraded records `(name, recorded_at)`, `"{bucket}/{key}"`, those
+/// of a key `in_pg` that a plan listed at `planned_at` doesn't show with
+/// nothing to spare. Only records made before the listing: one made since
+/// may be of a write the listing missed.
+fn spent_records<'a>(
+    records: impl Iterator<Item = (&'a str, u64)>,
+    work: &[Work],
+    in_pg: impl Fn(&str, &str) -> bool,
+    planned_at: u64,
+) -> Vec<&'a str> {
+    let short: HashSet<(&str, &str)> = work
+        .iter()
+        .filter(|w| w.spare <= 0 && w.version_id.is_empty())
+        .map(|w| (w.bucket.as_str(), w.key.as_str()))
+        .collect();
+    records
+        .filter(|&(_, recorded_at)| recorded_at < planned_at)
+        .filter_map(|(name, _)| {
+            let (bucket, key) = name.split_once('/')?;
+            (in_pg(bucket, key) && !short.contains(&(bucket, key))).then_some(name)
+        })
+        .collect()
 }
 
 fn backoff_after(n: u32) -> Duration {
@@ -834,6 +857,13 @@ impl MetaService {
                 return;
             }
         };
+
+        // Every member answered: the listing is the whole truth about the
+        // PG's keys, and the records it shows are no longer at risk are
+        // spent.
+        if plan.members.iter().all(Option::is_some) {
+            self.forget_spent_records(&pg, &plan, planned_at).await;
+        }
 
         // What there is to do: objects with none to spare first, whatever
         // the cursor says; then the rest in key order, after the cursor.
@@ -2129,6 +2159,61 @@ impl MetaService {
         }
     }
 
+    /// Forget the degraded records (B29) of `pg`'s keys that `plan`, listed
+    /// from every member after they were made, shows with a copy to spare:
+    /// whole, short of one with others to spare, overwritten or deleted.
+    /// Recovery forgets a record only once it makes that key whole, and
+    /// peering once it finds the PG Clean; a record of a key that needed
+    /// neither held its PG at risk for as long as faults kept it out of
+    /// Clean, every other pass gave way to it, and a PG behind them with
+    /// overwrites one copy short waited 70 minutes, until a disk pulled
+    /// and a drive lost took one below k (soak run 23: 2,184 records, the
+    /// oldest 105 minutes old).
+    async fn forget_spent_records(&self, pg: &PlacementGroup, plan: &Plan, planned_at: u64) {
+        use futures::StreamExt;
+        let records = self.degraded_objects();
+        let in_pg = |bucket: &str, key: &str| {
+            self.key_pg(bucket, key).is_some()
+                && self.listing_pg(bucket, key) == (pg.pg_id, pg.pool.clone())
+        };
+        let spent = spent_records(
+            records
+                .iter()
+                .map(|(name, r, _)| (name.as_str(), r.recorded_at)),
+            &plan.work,
+            in_pg,
+            planned_at,
+        );
+        if spent.is_empty() {
+            return;
+        }
+        let spent: HashSet<&str> = spent.into_iter().collect();
+        let spent: Vec<(String, Vec<u8>)> = records
+            .iter()
+            .filter(|(name, _, _)| spent.contains(name.as_str()))
+            .map(|(name, _, bytes)| (name.clone(), bytes.clone()))
+            .collect();
+        let forgotten = futures::stream::iter(spent)
+            .map(|(name, expected)| async move {
+                match self.forget_degraded(&name, expected).await {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        debug!("recovery: degraded record of {name}: {e}");
+                        0
+                    }
+                }
+            })
+            .buffer_unordered(OBJECTS_AT_ONCE)
+            .fold(0usize, |n, one| async move { n + one })
+            .await;
+        if forgotten > 0 {
+            info!(
+                "pg {}/{} (epoch {}): {forgotten} degraded records spent",
+                pg.pool, pg.pg_id, pg.epoch
+            );
+        }
+    }
+
     /// Forget `bucket/key`'s degraded record (B29), if it has one: its
     /// object is whole.
     async fn forget_degraded_key(&self, bucket: &str, key: &str) {
@@ -2457,6 +2542,45 @@ mod backoff_tests {
         assert!(at_risk < rank(-2, true, false, now - 60, now));
         // Among PGs at risk, the one waiting longest first.
         assert!(rank(0, true, true, now - 600, now) < at_risk);
+    }
+
+    #[test]
+    fn a_full_listing_spends_the_records_of_keys_it_shows_with_a_copy_to_spare() {
+        let work = |key: &str, version_id: &str, spare: i64| Work {
+            bucket: "b".into(),
+            key: key.into(),
+            version_id: version_id.into(),
+            newest: PgEntry::default(),
+            holders: Vec::new(),
+            behind: Vec::new(),
+            spare,
+        };
+        let plan = [
+            work("short", "", 0),
+            work("below", "", -1),
+            work("one-to-spare", "", 1),
+            work("old-version-short", "v1", 0),
+        ];
+        let records = [
+            ("b/short", 10),
+            ("b/below", 10),
+            ("b/one-to-spare", 10),
+            ("b/old-version-short", 10),
+            ("b/whole-or-gone", 10),
+            ("b/since-the-listing", 100),
+            ("b/another-pg", 10),
+            ("no-slash", 10),
+        ];
+        let spent = spent_records(
+            records.iter().copied(),
+            &plan,
+            |_, key| key != "another-pg",
+            100,
+        );
+        assert_eq!(
+            spent,
+            ["b/one-to-spare", "b/old-version-short", "b/whole-or-gone"]
+        );
     }
 
     #[test]
