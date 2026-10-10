@@ -622,6 +622,7 @@ fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
         assert_eq!(c.request("PUT", &format!("/owner/k{i}"), b).status, 200);
     }
     ha.start_osd(0, None);
+    ha.await_seen_short(24, 60);
     // Until every one of them is repaired: no degraded record left, and
     // (keys in placement groups mark their PG rather than keep a record)
     // every PG Clean.

@@ -403,6 +403,7 @@ fn a_write_short_of_shards_is_recovered_in_seconds() {
     let bodies = write(&ha, "short", "k", 12);
     ha.start_osd(4, None);
     let started = Instant::now();
+    ha.await_seen_short(12, 30);
     await_clean(&ha, "default", 60);
     let took = started.elapsed();
     assert!(took < Duration::from_secs(45), "took {took:?}");

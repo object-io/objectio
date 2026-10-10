@@ -450,6 +450,35 @@ impl HaCluster {
             .expect("blank disk");
     }
 
+    /// Wait until meta has seen that writes made short of a shard (an OSD
+    /// down) are short: a degraded record, a PG not Clean, or, if both
+    /// came and went between looks, `objects` objects recovered. Then a
+    /// wait for Clean means repaired. Without it, such a wait right after
+    /// the OSD is back can end at once: a PG is marked for peering at its
+    /// next look, and reads Clean until then.
+    ///
+    /// # Panics
+    /// If none of those shows within `secs`.
+    pub fn await_seen_short(&self, objects: u32, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self
+            .meta_metric("objectio_meta_degraded_objects")
+            .unwrap_or(0.0)
+            == 0.0
+            && self
+                .meta_metric("objectio_meta_pgs_not_clean")
+                .unwrap_or(0.0)
+                == 0.0
+            && self
+                .meta_metric("objectio_meta_pg_recovered_objects_total")
+                .unwrap_or(0.0)
+                < f64::from(objects)
+        {
+            assert!(Instant::now() < deadline, "never seen short after {secs} s");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// The directory OSD `i` keeps its state under (its metadata index
     /// among it), beside its disk file.
     #[must_use]
