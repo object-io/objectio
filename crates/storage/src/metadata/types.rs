@@ -7,7 +7,8 @@ use std::cmp::Ordering;
 ///
 /// Keys are designed for efficient prefix scanning: `m` (an object's
 /// current version), `v` (its versions), and the OSD's own prefixes
-/// (`osd_loc:` for shard locations, `dedup_note:`).
+/// (`osd_loc:` for shard locations, `osd_small:` for small shards' bytes,
+/// `dedup_note:`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MetadataKey(pub Vec<u8>);
 
