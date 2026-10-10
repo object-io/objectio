@@ -504,3 +504,96 @@ fn backfill_throughput() {
         400.0 / took.as_secs_f64()
     );
 }
+
+/// Degraded records (B29) of keys a full listing shows with a copy to
+/// spare are spent, even while their PG can't get back to Clean. Recovery
+/// forgot a record only once it made its key whole, and the repairer only
+/// once peering found the PG Clean: in a PG kept out of Clean, the records
+/// of keys that needed neither stayed for good, held their PG at risk, and
+/// passes elsewhere gave way to it (soak run 23: 2,184 records, the oldest
+/// 105 minutes old, and a PG starved for 70 minutes).
+///
+/// One PG, an OSD down: `u` is written a shard short, and three keys are
+/// written short and deleted. Two of `u`'s shards are then stored wrong,
+/// so once the OSD is back `u` can't be rebuilt (unfound), and the PG
+/// stays Degraded with every member answering. Within a minute of the
+/// pass that finds `u` unfound, the records are spent.
+#[test]
+fn a_full_listing_spends_degraded_records_while_the_pg_stays_unclean() {
+    let mut ha = cluster(1, 6);
+    one_pg_bucket(&ha, "spent");
+    // Six OSDs, 4+2: the PG is on all of them. Down: its last position's.
+    let ids = node_ids(&ha, 6);
+    let last = pgs(&ha, "one")[&0]["acting"][5]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let down = ids.iter().position(|id| *id == last).unwrap();
+    ha.clients[0]
+        .request("PUT", "/spent/whole", &payload(300_000, 1))
+        .expect(200);
+    ha.stop_osd(down);
+
+    let c = &ha.clients[0];
+    c.request("PUT", "/spent/u", &payload(300_000, 2))
+        .expect(200);
+    for i in 0..3 {
+        let key = format!("/spent/gone{i}");
+        c.request("PUT", &key, &payload(300_000, 3 + i)).expect(200);
+        c.request("DELETE", &key, &[]).expect(204);
+    }
+    // Two of `u`'s five shards wrong: three good, a read needs four.
+    for position in [0, 1] {
+        c.json(
+            "POST",
+            "/_admin/test/rewrite-shard",
+            json!({"bucket": "spent", "key": "u", "position": position}),
+        )
+        .expect_ok();
+    }
+    let records = |ha: &HaCluster| ha.meta_metric("objectio_meta_degraded_objects");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while records(&ha) != Some(4.0) {
+        assert!(
+            Instant::now() < deadline,
+            "the short writes were never recorded: {:?}",
+            records(&ha)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    ha.start_osd(down, None);
+    // A pass with every member answering tries `u`, and finds it unfound.
+    let unfound = |ha: &HaCluster| {
+        pgs(ha, "one")[&0]["state"]["recovery"]["unfound_keys"]
+            .to_string()
+            .contains("spent/u")
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !unfound(&ha) {
+        assert!(
+            Instant::now() < deadline,
+            "recovery never found u unfound: {}",
+            pgs(&ha, "one")[&0]
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // That pass listed every member first: the deleted keys' records are
+    // spent, and `u`'s (a copy to spare as listed; at most it is kept, if
+    // a pass saw it below k first). Counted by the repairer every 5 s; on
+    // the old code they stay as long as the PG stays out of Clean.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let pg = pgs(&ha, "one")[&0].clone();
+        assert_ne!(pg["state"]["state"], "Clean", "{pg}");
+        let left = records(&ha).unwrap_or(f64::MAX);
+        if left <= 1.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{left} degraded records outlived full listings of their PG: {pg}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
