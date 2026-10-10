@@ -450,6 +450,19 @@ impl HaCluster {
             .expect("blank disk");
     }
 
+    /// The directory OSD `i` keeps its state under (its metadata index
+    /// among it), beside its disk file.
+    #[must_use]
+    pub fn osd_dir(&self, i: usize) -> &Path {
+        &self.osds[i].state
+    }
+
+    /// The process id of OSD `i`, while it runs.
+    #[must_use]
+    pub fn osd_pid(&self, i: usize) -> Option<u32> {
+        self.osds[i].child.as_ref().map(Child::id)
+    }
+
     /// The gRPC address of OSD `i`.
     #[must_use]
     pub fn osd_endpoint(&self, i: usize) -> String {
