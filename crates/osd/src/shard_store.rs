@@ -898,10 +898,9 @@ impl BlockStore {
         //   of the shards the index remembers on it. They are forgotten, so
         //   they are reported missing and rebuilt rather than reported
         //   present and failing every read.
-        // - Each disk's allocation bitmap is reconciled against the index,
-        //   the source of truth for what is on the platter: a disk formatted
-        //   before the allocator was wired up has an all-zero bitmap under a
-        //   full data region, and would hand out block 0 over live shards.
+        // - Each disk's blocks that the index points at are marked used: a
+        //   disk opens with every block free (the index is the only record
+        //   of what is on it), and would hand out block 0 over live shards.
         let mut lost = Vec::new();
         let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
         let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
@@ -960,9 +959,6 @@ impl BlockStore {
         }
         info!("Shard index: {} shards", index.count());
         for (idx, disk) in disks.iter().enumerate() {
-            if let Err(e) = disk.persist_allocator() {
-                warn!("Could not persist allocation bitmap for disk {idx}: {e}");
-            }
             info!(
                 "Disk {idx}: {} of {} bytes used across {} indexed shards",
                 disk.used_space(),
@@ -1052,8 +1048,8 @@ impl BlockStore {
     }
 
     /// Return a shard's blocks to the pool. The index entry must already be
-    /// gone, so a crash in between leaks a block rather than handing a live
-    /// shard's block to the next write.
+    /// gone: freed first, a block could go to the next write while the
+    /// index still points at it.
     fn free_location(&self, loc: &ShardLocation) {
         if loc.disk_idx >= self.disks.len() {
             return;
@@ -1062,19 +1058,11 @@ impl BlockStore {
         // `size` is the shard's payload length, so the extent's length is
         // derivable — which is why nothing had to be added to the index.
         let blocks = disk.blocks_for_len(loc.size as usize);
-        match disk.free_extent(loc.block_num, blocks) {
-            Ok(()) => {
-                if let Err(e) = disk.persist_allocator() {
-                    warn!(
-                        "Freed block {} on disk {} but could not persist the bitmap: {e}",
-                        loc.block_num, loc.disk_idx
-                    );
-                }
-            }
-            Err(e) => warn!(
+        if let Err(e) = disk.free_extent(loc.block_num, blocks) {
+            warn!(
                 "Could not free block {} on disk {}: {e}",
                 loc.block_num, loc.disk_idx
-            ),
+            );
         }
     }
 
@@ -1733,6 +1721,9 @@ pub(crate) mod conformance {
         assert_eq!(store.state(&id(3, 2)), ShardState::Missing);
         let capacity: u64 = store.disks().iter().map(|d| d.capacity).sum();
         assert_eq!(capacity - free(&*store), used, "space not as it was");
+        // A write after it takes free blocks, not the ones held.
+        put(&*store, &id(3, 3), &data(6, 200_000)).await;
+        assert_eq!(store.read(&id(3, 0)).await.unwrap().0, big);
     }
 
     async fn a_delete_frees_and_forgets(engine: &Engine) {

@@ -37,16 +37,10 @@ pub struct DiskManager {
     superblock: RwLock<Superblock>,
     /// Next block sequence number
     sequence: AtomicU64,
-    /// Which data blocks are in use.
-    ///
-    /// The on-disk format has always reserved a region for this (see
-    /// `Superblock::bitmap_offset`), and `BlockBitmap` has always known how
-    /// to allocate and free against it — the two were simply never
-    /// connected. Until they were, the OSD allocated with a bare
-    /// incrementing counter: it never bounded itself against
-    /// `total_blocks`, so a full disk surfaced as a write past the end of
-    /// the device, and it could never reuse a block, so deleting an object
-    /// freed nothing.
+    /// Which data blocks are in use, in memory only. The OSD marks the
+    /// blocks its shard index holds at every start (`BlockStore::new`), so
+    /// nothing is written when a block is freed or taken: a crash loses
+    /// only what no index entry points at, which is free.
     allocator: BlockBitmap,
     /// Statistics
     stats: DiskStats,
@@ -79,7 +73,8 @@ impl DiskManager {
         let superblock = Superblock::new(size, actual_block_size)?;
         write_superblock(&file, &superblock)?;
 
-        // Initialize bitmap region (all zeros = all free)
+        // The bitmap region zeroed (all free): this release never reads it,
+        // the one before reads it and marks its index over it (a rollback).
         let bitmap_size = superblock.bitmap_size as usize;
         let bitmap_buf = AlignedBuffer::new(bitmap_size);
         file.write_at(superblock.bitmap_offset, bitmap_buf.as_slice())?;
@@ -106,13 +101,12 @@ impl DiskManager {
 
         let superblock = read_superblock(&file, &path_buf)?;
 
-        // Load the allocation bitmap from its reserved region. A disk
-        // written before the allocator was wired up has an all-zero bitmap
-        // even though its blocks are occupied; the OSD repairs that on
-        // startup by replaying its shard index through `mark_block_used`.
-        let mut bitmap_buf = AlignedBuffer::new(superblock.bitmap_size as usize);
-        file.read_at(superblock.bitmap_offset, bitmap_buf.as_mut_slice())?;
-        let allocator = BlockBitmap::from_bytes(bitmap_buf.as_slice(), superblock.total_blocks);
+        // Every block free until the owner marks the ones it holds: the
+        // shard index is the record of what is on the disk. The bitmap
+        // region the format reserves is no longer read or written. Kept
+        // there, it was rewritten whole and synced on every free (488 KB
+        // per delete on a 16 GB disk, 300 MB on 10 TB).
+        let allocator = BlockBitmap::new(superblock.total_blocks);
 
         let disk_io = best_available(&path_buf, false, true)?;
         Ok(Self {
@@ -235,8 +229,8 @@ impl DiskManager {
         self.allocator.free_extent(&Extent::new(start, count))
     }
 
-    /// Mark `count` blocks starting at `start` used, for startup
-    /// reconciliation. Idempotent, like [`Self::mark_block_used`].
+    /// Mark `count` blocks starting at `start` used: the owner, at startup,
+    /// for what it holds. Idempotent, like [`Self::mark_block_used`].
     pub fn mark_extent_used(&self, start: u64, count: u64) -> Result<()> {
         for i in 0..count {
             self.allocator.mark_used(start + i)?;
@@ -254,11 +248,8 @@ impl DiskManager {
         self.allocator.free(block_num)
     }
 
-    /// Mark a block used without allocating it.
-    ///
-    /// Only for startup reconciliation: a disk written before the allocator
-    /// existed has occupied blocks and an empty bitmap, so the OSD replays
-    /// its shard index through this to make the two agree. Idempotent — a
+    /// Mark a block used without allocating it: the owner, at startup, for
+    /// what it holds (a disk opens with every block free). Idempotent: a
     /// block already marked is left alone rather than double-counted.
     pub fn mark_block_used(&self, block_num: u64) -> Result<()> {
         self.allocator.mark_used(block_num)
@@ -267,23 +258,6 @@ impl DiskManager {
     /// Whether a block is currently allocated.
     pub fn is_block_allocated(&self, block_num: u64) -> bool {
         self.allocator.is_allocated(block_num)
-    }
-
-    /// Write the allocation bitmap back to its reserved region. The
-    /// superblock is left alone: rewriting it on every delete risked tearing
-    /// it in a power cut, and the free count is read from the bitmap anyway
-    /// (`superblock.free_blocks` is as of the superblock's last write).
-    pub fn persist_allocator(&self) -> Result<()> {
-        let (offset, size) = {
-            let sb = self.superblock.read();
-            (sb.bitmap_offset, sb.bitmap_size)
-        };
-        let bytes = self.allocator.to_bytes();
-        let mut buf = AlignedBuffer::new(size as usize);
-        buf.copy_from(&bytes);
-        self.file.write_at(offset, buf.as_slice())?;
-        self.file.sync()?;
-        Ok(())
     }
 
     /// Get block size
@@ -738,30 +712,6 @@ mod tests {
         assert!(crate::layout::Superblock::from_bytes(&buf).is_ok());
     }
 
-    /// Persisting the bitmap (every delete) no longer rewrites the
-    /// superblock.
-    #[test]
-    fn persisting_the_bitmap_leaves_the_superblock_alone() {
-        use std::io::Read;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("disk.raw");
-        let disk = super::DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
-        let read = || {
-            let mut buf = vec![0u8; 4096];
-            std::fs::File::open(&path)
-                .unwrap()
-                .read_exact(&mut buf)
-                .unwrap();
-            buf
-        };
-        let before = read();
-        let start = disk.allocate_extent(3).unwrap();
-        disk.persist_allocator().unwrap();
-        disk.free_extent(start, 3).unwrap();
-        disk.persist_allocator().unwrap();
-        assert_eq!(read(), before);
-    }
-
     #[test]
     fn allocation_and_reclaim_move_the_reported_usage() {
         // The whole point. Before this, used_space was derived from a
@@ -787,27 +737,37 @@ mod tests {
         assert_eq!(disk.allocate_block().unwrap(), a);
     }
 
+    /// Nothing about which blocks are in use is kept on the disk: a remount
+    /// starts with every block free, and the owner marks what it holds.
     #[test]
-    fn the_bitmap_survives_a_remount() {
+    fn a_remount_starts_with_every_block_free_and_writes_nothing_on_a_free() {
+        use std::io::Read;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.raw");
-
+        let read = || {
+            let mut buf = Vec::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_to_end(&mut buf)
+                .unwrap();
+            buf
+        };
         let taken = {
             let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
+            let before = read();
             let blocks: Vec<u64> = (0..5).map(|_| disk.allocate_block().unwrap()).collect();
             disk.free_block(blocks[1]).unwrap();
-            disk.persist_allocator().unwrap();
+            assert!(
+                read() == before,
+                "taking or freeing a block wrote to the disk"
+            );
             blocks
         };
-
         let disk = DiskManager::open(&path).unwrap();
+        assert_eq!(disk.used_space(), 0);
+        disk.mark_block_used(taken[0]).unwrap();
         assert!(disk.is_block_allocated(taken[0]));
-        assert!(
-            !disk.is_block_allocated(taken[1]),
-            "a freed block came back allocated"
-        );
-        assert!(disk.is_block_allocated(taken[4]));
-        assert_eq!(disk.used_space(), 4 * u64::from(disk.block_size()));
+        assert_ne!(disk.allocate_block().unwrap(), taken[0]);
     }
 
     #[test]
@@ -832,10 +792,10 @@ mod tests {
     }
 
     #[test]
-    fn mark_block_used_reconciles_a_disk_whose_bitmap_predates_the_allocator() {
-        // A disk formatted before the allocator was wired up has occupied
-        // blocks and an all-zero bitmap. Without this replay the OSD would
-        // hand out block 0 on restart and overwrite a live shard.
+    fn a_block_marked_used_is_never_handed_out() {
+        // A disk opens with every block free: without the owner's marks
+        // the OSD would hand out block 0 on restart and overwrite a live
+        // shard.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.raw");
         let disk = DiskManager::init(&path, MIN_TEST_DISK, None).unwrap();
