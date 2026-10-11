@@ -108,6 +108,9 @@ fn refine_operation(op: S3Operation, query: Option<&str>, copy: bool) -> S3Opera
         S3Operation::DeleteObject if multipart => S3Operation::AbortMultipartUpload,
         S3Operation::DeleteObject if names_subresource(query) => S3Operation::DeleteObjectConfig,
         S3Operation::InitiateMultipartUpload if multipart => S3Operation::CompleteMultipartUpload,
+        S3Operation::InitiateMultipartUpload if has_query_flag(query, "select") => {
+            S3Operation::SelectObjectContent
+        }
         S3Operation::ListObjects if has_query_flag(query, "uploads") => {
             S3Operation::ListMultipartUploads
         }
@@ -341,6 +344,10 @@ mod tests {
         assert_eq!(
             op(post, "/b/k?uploadId=u", false),
             "CompleteMultipartUpload"
+        );
+        assert_eq!(
+            op(post, "/b/k?select&select-type=2", false),
+            "SelectObjectContent"
         );
         assert_eq!(op(post, "/b?delete", false), "DeleteObjects");
         assert_eq!(op(post, "/b", false), "PostObject");
