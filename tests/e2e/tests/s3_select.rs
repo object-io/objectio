@@ -235,18 +235,37 @@ fn json_documents_and_lines() {
         "{\"id\":1,\"n\":\"x\",\"_3\":\"a\"}\n{\"id\":2,\"n\":\"y\"}\n"
     );
 
-    // RGW's form: the path's array is the records, `_1` the record.
+    // As in AWS, a path ending on the array gives it as one record; `[*]`
+    // reads its elements. `_1` is the record (RGW's name for it).
+    let r = select(
+        &c,
+        "/sel/doc.json",
+        &request("select count(*) from s3object[*].rows", doc_in, CSV_OUT, ""),
+    );
+    assert_eq!(records(&r), "1\n");
     let r = select(
         &c,
         "/sel/doc.json",
         &request(
-            "select count(*), sum(_1.id), max(_1.id) from s3object[*].rows",
+            "select count(*), sum(_1.id), max(_1.id) from s3object[*].rows[*]",
             doc_in,
             CSV_OUT,
             "",
         ),
     );
     assert_eq!(records(&r), "3,6,3\n");
+    // In LIKE, brackets are themselves.
+    let r = select(
+        &c,
+        "/sel/doc.json",
+        &request(
+            "select count(*) from s3object[*].rows[*] r where r.who.name like '[x-y]'",
+            doc_in,
+            CSV_OUT,
+            "",
+        ),
+    );
+    assert_eq!(records(&r), "0\n");
 
     let lines = "{\"a\": 1, \"b\": \"x\"}\n{\"a\": 2}\n\n{\"a\": 3, \"b\": \"z\"}\n";
     c.request("PUT", "/sel/lines.json", lines.as_bytes())

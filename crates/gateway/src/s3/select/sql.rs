@@ -11,10 +11,12 @@
 //! `a = b = true` is `(a = b) = true`); LIKE, BETWEEN, IN; `||`; `+ -`;
 //! `* / %`; unary `-`.
 //!
-//! Besides AWS's dialect it takes what ceph's s3-tests write for RGW: `"..."`
-//! where no column has that name is a string (see `bind`), `FROM stdin`
-//! names the object, `INT(x)` and `FLOAT(x)` cast, and a select-list alias
-//! can be used in other items and in WHERE.
+//! Besides AWS's dialect it takes what ceph's s3-tests write for RGW, where
+//! AWS would refuse the text or leave it undefined: `"..."` where no column
+//! has that name is a string (see `bind`), `FROM stdin` names the object,
+//! `INT(x)` and `FLOAT(x)` cast, and a select-list alias can be used in
+//! other items and in WHERE. Where RGW gives a valid AWS statement another
+//! meaning (`[a-z]` in LIKE, a FROM path ending on an array), AWS's holds.
 
 use super::datetime::DatePart;
 use super::error::{SelectError, SelectResult};

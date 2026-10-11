@@ -570,29 +570,21 @@ fn compare_op(op: BinOp, a: &Value, b: &Value) -> Value {
 }
 
 /// SQL LIKE: `%` any run, `_` one character; `escape` makes the next one
-/// literal. As RGW, `[...]` is one character of a set (`[a-z]`, `[xyz]`,
-/// `[^0-9]`); a `[` without its `]` is itself.
+/// literal. Everything else is itself, `[` and `]` included, as in AWS (RGW
+/// reads `[a-z]` as a set).
 pub fn like(text: &str, pattern: &str, escape: Option<char>) -> SelectResult<bool> {
-    #[derive(Clone, PartialEq)]
+    #[derive(Clone, Copy, PartialEq)]
     enum P {
         Any,
         One,
         Ch(char),
-        /// Ranges, and whether the set is negated.
-        Set(Vec<(char, char)>, bool),
     }
     let mut pat = Vec::new();
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        i += 1;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
         if Some(c) == escape {
-            match chars.get(i) {
-                Some(&n) => {
-                    pat.push(P::Ch(n));
-                    i += 1;
-                }
+            match chars.next() {
+                Some(n) => pat.push(P::Ch(n)),
                 None => {
                     return Err(err(
                         "EvaluatorLikePatternInvalidEscapeSequence",
@@ -606,53 +598,26 @@ pub fn like(text: &str, pattern: &str, escape: Option<char>) -> SelectResult<boo
             }
         } else if c == '_' {
             pat.push(P::One);
-        } else if c == '['
-            && let Some(close) = chars[i..].iter().skip(1).position(|&x| x == ']')
-        {
-            // The first character may be `]` itself; `close` counts from
-            // the one after it.
-            let body = &chars[i..=i + close];
-            i += close + 2;
-            let (negated, body) = match body.first() {
-                Some('^' | '!') if body.len() > 1 => (true, &body[1..]),
-                _ => (false, body),
-            };
-            let mut ranges = Vec::new();
-            let mut j = 0;
-            while j < body.len() {
-                if j + 2 < body.len() && body[j + 1] == '-' {
-                    ranges.push((body[j], body[j + 2]));
-                    j += 3;
-                } else {
-                    ranges.push((body[j], body[j]));
-                    j += 1;
-                }
-            }
-            pat.push(P::Set(ranges, negated));
         } else {
             pat.push(P::Ch(c));
         }
     }
-    let one = |p: &P, ch: char| match p {
-        P::One => true,
-        P::Ch(c) => *c == ch,
-        P::Set(ranges, negated) => {
-            ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&ch)) != *negated
-        }
-        P::Any => false,
-    };
     // Greedy match with one backtrack point per `%`: linear in practice.
     let t: Vec<char> = text.chars().collect();
     let (mut ti, mut pi) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ti < t.len() {
         match pat.get(pi) {
-            Some(P::Any) => {
-                star = Some((pi, ti));
+            Some(P::One) => {
+                ti += 1;
                 pi += 1;
             }
-            Some(p) if one(p, t[ti]) => {
+            Some(P::Ch(c)) if *c == t[ti] => {
                 ti += 1;
+                pi += 1;
+            }
+            Some(P::Any) => {
+                star = Some((pi, ti));
                 pi += 1;
             }
             _ => match star {
@@ -1431,14 +1396,10 @@ mod tests {
         assert!(like("xx_ar", "%_ar", None).unwrap());
         assert!(like("", "%", None).unwrap());
         assert!(like("mississippi", "%iss%ppi", None).unwrap());
-        // RGW's sets.
-        assert!(like("vwxyz", "%y[y-z]", None).unwrap());
-        assert!(!like("vwxya", "%y[y-z]", None).unwrap());
-        assert!(like("a]", "a[]]", None).unwrap());
-        assert!(like("b7", "b[^a-z]", None).unwrap());
-        assert!(!like("bc", "b[^a-z]", None).unwrap());
-        assert!(like("[x", "[x", None).unwrap());
-        assert!(like("[x]", "![x]", Some('!')).unwrap());
+        // Brackets are themselves, as in AWS (RGW reads `[y-z]` as a set).
+        assert!(!like("vwxyz", "%y[y-z]", None).unwrap());
+        assert!(like("xy[y-z]", "%y[y-z]", None).unwrap());
+        assert!(like("[x]", "[_]", None).unwrap());
         assert_eq!(
             like("a", "a!", Some('!')).unwrap_err().code,
             "EvaluatorLikePatternInvalidEscapeSequence"

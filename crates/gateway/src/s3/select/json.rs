@@ -7,9 +7,9 @@
 //! each at most 1 MB of input. So `FROM S3Object[*].rows[*]` over a
 //! document of millions of rows holds one row at a time.
 //!
-//! A FROM path ending on a key whose value is an array reads the array's
-//! elements as the records (`S3Object[*].rows` as `S3Object[*].rows[*]`),
-//! as RGW does; AWS would give the one array as the record.
+//! As in AWS, a FROM path ending on an array gives the array as one record
+//! (`S3Object[*].rows`); `[*]` reads its elements (`S3Object[*].rows[*]`).
+//! RGW reads the elements in both cases.
 
 use super::csv::{MAX_RECORD, too_long};
 use super::error::{SelectError, SelectResult, from_io};
@@ -101,12 +101,11 @@ impl<R: BufRead> JsonReader<R> {
         path: &[Step],
         f: &mut dyn FnMut(Value) -> SelectResult<Flow>,
     ) -> SelectResult<()> {
-        let unnest = matches!(path.last(), Some(Step::Key { .. } | Step::AllValues));
         while self.skip_ws()?.is_some() {
             if self.last.is_some_and(|l| self.offset > l) {
                 return Ok(());
             }
-            if !self.walk(path, unnest, 0, f)? {
+            if !self.walk(path, 0, f)? {
                 return Ok(());
             }
         }
@@ -116,7 +115,6 @@ impl<R: BufRead> JsonReader<R> {
     fn walk(
         &mut self,
         steps: &[Step],
-        unnest: bool,
         depth: usize,
         f: &mut dyn FnMut(Value) -> SelectResult<Flow>,
     ) -> SelectResult<Flow> {
@@ -130,23 +128,6 @@ impl<R: BufRead> JsonReader<R> {
             ));
         };
         let Some(step) = steps.first() else {
-            if unnest && c == b'[' {
-                self.bump();
-                if self.skip_ws()? == Some(b']') {
-                    self.bump();
-                    return Ok(true);
-                }
-                loop {
-                    let start = self.offset;
-                    let v = self.value(start, depth + 1)?;
-                    if !f(v)? {
-                        return Ok(false);
-                    }
-                    if !self.after_element(b']')? {
-                        return Ok(true);
-                    }
-                }
-            }
             let start = self.offset;
             let v = self.value(start, depth)?;
             return f(v);
@@ -169,7 +150,7 @@ impl<R: BufRead> JsonReader<R> {
                     let key = String::from_utf8(key).map_err(|_| not_utf8())?;
                     self.expect(b':')?;
                     if matches!(step, Step::AllValues) || step.matches(&key) {
-                        if !self.walk(rest, unnest, depth + 1, f)? {
+                        if !self.walk(rest, depth + 1, f)? {
                             return Ok(false);
                         }
                     } else {
@@ -193,7 +174,7 @@ impl<R: BufRead> JsonReader<R> {
                         _ => true,
                     };
                     if hit {
-                        if !self.walk(rest, unnest, depth + 1, f)? {
+                        if !self.walk(rest, depth + 1, f)? {
                             return Ok(false);
                         }
                     } else {
@@ -531,8 +512,13 @@ mod tests {
     fn a_path_reads_only_what_it_reaches() {
         let data =
             r#"{"skip": {"deep": [1, {"x": "}"}]}, "root": [{"c1": 1}, {"c1": 2}], "after": 1}"#;
+        // As in AWS: the array is one record; `[*]` reads its elements.
         assert_eq!(
             records(data, "s3object[*].root").unwrap(),
+            [r#"[{"c1":1},{"c1":2}]"#]
+        );
+        assert_eq!(
+            records(data, "s3object[*].root[*]").unwrap(),
             [r#"{"c1":1}"#, r#"{"c1":2}"#]
         );
         assert_eq!(records(data, "s3object[*].root[*].c1").unwrap(), ["1", "2"]);
@@ -548,7 +534,7 @@ mod tests {
         assert!(records(data, "s3object[*].nothing").unwrap().is_empty());
         assert_eq!(
             records(data, "s3object[*].skip.*").unwrap(),
-            ["1", r#"{"x":"}"}"#]
+            [r#"[1,{"x":"}"}]"#]
         );
     }
 
@@ -591,6 +577,6 @@ mod tests {
             records(&data, "s3object").unwrap_err().code,
             "OverMaxRecordSize"
         );
-        assert_eq!(records(&data, "s3object[*].small").unwrap(), ["1"]);
+        assert_eq!(records(&data, "s3object[*].small").unwrap(), ["[1]"]);
     }
 }
