@@ -57,7 +57,7 @@ Each failure's category and note come from `known-failures.csv`:
 
 | Category | Meaning |
 |---|---|
-| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, policies across tenants, S3 Select, torrents, RGW extensions |
+| `not-implemented-by-design` | left out on purpose: ACL grants, SigV2, policies across tenants, torrents, RGW extensions |
 | `aws-compatible-already` | ObjectIO does what AWS does; the test expects RGW's behaviour |
 | `test-environment` | can't pass on this setup |
 | `gap` | a feature we lack and could add |
