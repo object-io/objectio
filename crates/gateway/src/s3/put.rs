@@ -413,6 +413,11 @@ pub(crate) async fn commit_new(
             sent,
             &new_object,
             versioning_enabled,
+            Copies {
+                nodes,
+                bucket: &bucket,
+                key: &key,
+            },
             &what,
         );
         if let Err(e) = outcome {
@@ -447,6 +452,11 @@ pub(crate) async fn commit_new(
         sent,
         &new_object,
         versioning_enabled,
+        Copies {
+            nodes,
+            bucket: &bucket,
+            key: &key,
+        },
         &what,
     );
     match committed {
@@ -535,6 +545,55 @@ pub(crate) fn spawn_reclaim(
     });
 }
 
+/// Where a key's copies are: what an overwrite's freeing reads again when
+/// its copies disagreed.
+#[derive(Clone, Copy)]
+pub(crate) struct Copies<'a> {
+    pub nodes: &'a [objectio_proto::metadata::NodePlacement],
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
+/// Free what an overwrite displaced: at once when its copies agree, else
+/// what no copy holds once a racing write has settled
+/// ([`reclaimable_after_overwrite`]).
+pub(crate) fn spawn_overwrite_reclaim(
+    state: &Arc<AppState>,
+    displaced: &[Displaced],
+    keep: &std::collections::HashSet<Vec<u8>>,
+    at: Copies<'_>,
+    what: String,
+) {
+    let freed = reclaimable_after_overwrite(displaced, keep);
+    spawn_reclaim(state, freed.now, Reclaim::Overwrite, what.clone());
+    if freed.unsettled.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let (nodes, bucket, key) = (at.nodes.to_vec(), at.bucket.to_string(), at.key.to_string());
+    let keep = keep.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(crate::osd_pool::RESTAMP_SETTLE).await;
+        let mut meta = state.meta_client.clone();
+        let failed = crate::osd_pool::reclaim_unsettled(
+            &state.osd_pool,
+            &mut meta,
+            &nodes,
+            &bucket,
+            &key,
+            freed.unsettled,
+            &keep,
+        )
+        .await;
+        if failed > 0 {
+            warn!("{what}: {failed} shard deletes failed (overwrite); retried in the background");
+        }
+    });
+}
+
 /// The shards a write is about to send, freed if it is abandoned before
 /// its metadata commit.
 pub(crate) fn pending_shards(state: &Arc<AppState>, what: String) -> PendingShards {
@@ -551,6 +610,7 @@ pub(crate) fn settle_commit(
     sent: Vec<ShardTarget>,
     new_object: &std::collections::HashSet<Vec<u8>>,
     versioning_enabled: bool,
+    at: Copies<'_>,
     what: &str,
 ) {
     match outcome {
@@ -559,12 +619,9 @@ pub(crate) fn settle_commit(
         Ok(displaced) if !displaced.is_empty() && displaced.iter().all(|d| d.superseded) => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
         }
-        Ok(displaced) if !versioning_enabled => spawn_reclaim(
-            state,
-            reclaimable_after_overwrite(displaced, new_object),
-            Reclaim::Overwrite,
-            what.to_string(),
-        ),
+        Ok(displaced) if !versioning_enabled => {
+            spawn_overwrite_reclaim(state, displaced, new_object, at, what.to_string());
+        }
         Ok(_) => {}
         Err(e) if e.unapplied => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());

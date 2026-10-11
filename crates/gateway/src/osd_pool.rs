@@ -2084,6 +2084,24 @@ pub struct MetaDeleted {
     pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
 }
 
+impl MetaDeleted {
+    /// Every copy that carried the delete out removed the same object.
+    /// Otherwise it may have raced a write: the write, superseded by the
+    /// tombstone on some copies, is stamped again and written over it
+    /// everywhere, and its object, which other copies reported removed, is
+    /// current again; its shards are freed only once that has settled
+    /// ([`RESTAMP_SETTLE`]). A copy that missed an earlier write, or a
+    /// blank one being filled, disagrees the same way with no race.
+    #[must_use]
+    pub fn agreed(&self) -> bool {
+        self.removed.len() >= self.ok
+            && self
+                .removed
+                .windows(2)
+                .all(|w| w[0].object_id == w[1].object_id)
+    }
+}
+
 /// Delete the current object (`version_id` empty) or one version of
 /// `bucket/key` from every replica. For a version, each OSD makes the
 /// newest remaining one current if it was, under the key's lock.
@@ -2411,23 +2429,46 @@ pub struct Displaced {
     pub missed: bool,
 }
 
-/// Shards of the object an overwrite displaced, if it is safe to free them.
+/// What an overwrite let go of, by what its copies answered.
+#[derive(Debug, Default, PartialEq)]
+pub struct Overwritten {
+    /// Every copy that answered displaced the same object: its shards,
+    /// freed at once.
+    pub now: Vec<ShardTarget>,
+    /// The copies disagreed: each object any of them displaced, freed once
+    /// [`RESTAMP_SETTLE`] has passed if no copy holds it then
+    /// ([`reclaim_unsettled`]).
+    pub unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+}
+
+/// How long a write can go on being stamped again and resent after a copy
+/// first took it: [`MAX_RESTAMPS`] rounds, each a connect (3 s) and an
+/// answer (10 s) at most, so about a minute; twice that.
+pub const RESTAMP_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The shards of the object an overwrite displaced, if it is safe to free
+/// them now; else what to check again later.
 ///
-/// Only when every replica that answered displaced the same object, and
-/// none still keeps it as a version. Each OSD applies writes to a key one
-/// at a time, but two concurrent PUTs can reach the replicas in different
-/// orders: then one replica reports the other PUT's object as replaced
-/// while another still holds it as current. Agreement across the answers
-/// rules that out — if all of them replaced X with this write, none of
-/// them holds X any more — and costs only a leaked object in the rare
-/// split case.
+/// At once only when every copy that answered displaced the same object,
+/// and none still keeps it as a version. Two PUTs racing can reach the
+/// copies in different orders: then one copy reports the other PUT's
+/// object as replaced while that PUT, superseded elsewhere, is stamped
+/// again and written over this one everywhere. Its object, current again,
+/// must not lose its shards. Agreement across the answers rules that out:
+/// if all of them held X until this write, X's own write is done.
 ///
-/// A replica that didn't answer is passed over (the write made its quorum
-/// for these to be asked of): it may still hold X, but X is older than
-/// this write, which a quorum holds, so X is never read again; recovery
-/// replaces it there later. Waiting for every replica leaked every object
-/// overwritten while an OSD was down (soak run 26), its replacement drive
-/// then having nothing of them for recovery to free.
+/// The copies also disagree with no race: a copy that missed an earlier
+/// write still has the object before it, and a blank one (a lost drive's
+/// replacement, being filled) has nothing. Each object any copy displaced
+/// is then checked again once a racing write can no longer be resent, and
+/// freed if no copy holds it. Freeing nothing leaked every object
+/// overwritten while a lost drive's replacement was filled (soak run 27).
+///
+/// A copy that didn't answer is passed over (the write made its quorum for
+/// these to be asked of): it may still hold X, but X is older than this
+/// write, which a quorum holds, so X is never read again; recovery
+/// replaces it there later. Waiting for every copy leaked every object
+/// overwritten while an OSD was down (soak run 26).
 ///
 /// `keep` is what the new object refers to; nothing in it is freed, which
 /// covers a metadata-only rewrite of the same object.
@@ -2435,30 +2476,83 @@ pub struct Displaced {
 pub fn reclaimable_after_overwrite(
     replies: &[Displaced],
     keep: &std::collections::HashSet<Vec<u8>>,
-) -> Vec<ShardTarget> {
+) -> Overwritten {
     let replies: Vec<&Displaced> = replies.iter().filter(|d| !d.missed).collect();
-    let Some(first) = replies.first().and_then(|d| d.replaced.as_ref()) else {
-        return Vec::new();
-    };
-    let unanimous = replies.iter().all(|d| {
-        !d.version_kept
-            && d.replaced
-                .as_ref()
-                .is_some_and(|r| r.object_id == first.object_id)
-    });
-    if !unanimous || first.object_id.is_empty() || keep.contains(&first.object_id) {
-        return Vec::new();
+    if replies.iter().any(|d| d.version_kept) {
+        return Overwritten::default();
     }
-    // Replicas can disagree on where a shard is while a migration is
-    // refreshing them; deleting at every location any of them names is
-    // harmless where the shard is not.
-    let mut seen = std::collections::HashSet::new();
-    replies
+    let displaced: Vec<&objectio_proto::metadata::ObjectMeta> = replies
         .iter()
         .filter_map(|d| d.replaced.as_ref())
+        .filter(|o| !o.object_id.is_empty() && !keep.contains(&o.object_id))
+        .collect();
+    let Some(first) = displaced.first() else {
+        return Overwritten::default();
+    };
+    let unanimous = replies.iter().all(|d| {
+        d.replaced
+            .as_ref()
+            .is_some_and(|r| r.object_id == first.object_id)
+    });
+    if !unanimous {
+        let mut unsettled: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
+        for o in displaced {
+            if !unsettled.contains(o) {
+                unsettled.push(o.clone());
+            }
+        }
+        return Overwritten {
+            now: Vec::new(),
+            unsettled,
+        };
+    }
+    Overwritten {
+        now: targets_of(displaced.into_iter(), keep),
+        unsettled: Vec::new(),
+    }
+}
+
+/// Every shard `objects` name, less what `keep` refers to. Copies can
+/// disagree on where a shard is while a migration is refreshing them;
+/// deleting at every location any of them names is harmless where the
+/// shard is not.
+fn targets_of<'a>(
+    objects: impl Iterator<Item = &'a objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<ShardTarget> {
+    let mut seen = std::collections::HashSet::new();
+    objects
         .flat_map(stripe_targets_of)
         .filter(|t| !keep.contains(&t.object_id) && seen.insert(t.clone()))
         .collect()
+}
+
+/// Free those of an overwrite's `unsettled` objects no copy of
+/// `bucket/key` holds, once [`RESTAMP_SETTLE`] has passed: a write racing
+/// the overwrite has been resent by then, if it was going to be, and holds
+/// its object current again. A copy that can't be read is passed over, as
+/// the overwrite passed over one it missed. Returns how many shards were
+/// not freed at the first try.
+pub async fn reclaim_unsettled(
+    pool: &Arc<OsdPool>,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> usize {
+    let asked = unsettled.len();
+    let gone = unreferenced(pool, placements, bucket, key, unsettled, Unread::PassOver).await;
+    debug!(
+        "{bucket}/{key}: {} of {asked} objects an overwrite's copies disagreed on are held nowhere",
+        gone.len()
+    );
+    let targets = targets_of(gone.iter(), keep);
+    if targets.is_empty() {
+        return 0;
+    }
+    reclaim_shards(pool, meta, targets, Reclaim::Overwrite).await
 }
 
 /// Release each target's stripe on its owner's behalf, and return the
@@ -2934,7 +3028,8 @@ mod reclaim_tests {
         let old = object(1, vec![stripe(1, 0, 10, 6)]);
         let new = object(2, vec![stripe(2, 0, 10, 6)]);
         let got = reclaimable_after_overwrite(&[replaced(&old), replaced(&old)], &keep(&new));
-        assert_eq!(got, stripe_targets(&old.stripes));
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert!(got.unsettled.is_empty());
     }
 
     /// A replica down for the write may still hold the old object, but it
@@ -2951,30 +3046,81 @@ mod reclaim_tests {
             &[missed.clone(), replaced(&old), replaced(&old)],
             &keep(&new),
         );
-        assert_eq!(got, stripe_targets(&old.stripes));
-        assert!(reclaimable_after_overwrite(&[missed], &keep(&new)).is_empty());
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert_eq!(
+            reclaimable_after_overwrite(&[missed], &keep(&new)),
+            Overwritten::default()
+        );
+    }
+
+    /// A lost drive's replacement, not yet filled, held nothing; a copy
+    /// that missed an earlier write held the object before. Not a race
+    /// to tell apart from one: everything displaced is checked again
+    /// later, nothing freed at once (soak run 27).
+    #[test]
+    fn a_blank_or_stale_copy_leaves_the_old_object_to_be_checked_again() {
+        let older = object(1, vec![stripe(1, 0, 10, 6)]);
+        let old = object(2, vec![stripe(2, 0, 10, 6)]);
+        let new = object(3, vec![stripe(3, 0, 10, 6)]);
+        let got = reclaimable_after_overwrite(
+            &[Displaced::default(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![old.clone()]);
+        let got = reclaimable_after_overwrite(
+            &[replaced(&older), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![older, old]);
+    }
+
+    /// A delete frees at once only what every copy that carried it out
+    /// removed alike: one that removed nothing, or another object, may be
+    /// a write racing it.
+    #[test]
+    fn a_delete_agrees_only_when_every_copy_removed_the_same_object() {
+        let x = object(1, vec![stripe(1, 0, 10, 2)]);
+        let b = object(2, vec![stripe(2, 0, 10, 2)]);
+        let deleted = |ok: usize, removed: Vec<ObjectMeta>| MetaDeleted {
+            ok,
+            of: 3,
+            quorum: 2,
+            removed,
+        };
+        assert!(deleted(3, vec![x.clone(), x.clone(), x.clone()]).agreed());
+        assert!(deleted(2, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), b, x]).agreed());
     }
 
     #[test]
     fn a_new_key_frees_nothing() {
         let new = object(2, vec![]);
-        assert!(reclaimable_after_overwrite(&[Displaced::default()], &keep(&new)).is_empty());
-        assert!(reclaimable_after_overwrite(&[], &keep(&new)).is_empty());
+        for replies in [&[Displaced::default()][..], &[]] {
+            assert_eq!(
+                reclaimable_after_overwrite(replies, &keep(&new)),
+                Overwritten::default()
+            );
+        }
     }
 
     /// Two PUTs that reached the replicas in different orders: each sees the
-    /// other's object as replaced on some replica, while another replica
-    /// still holds it. Neither may free anything.
+    /// other's object as replaced on some replica, while the other, stamped
+    /// again, may still be written over it. Neither frees anything at once;
+    /// what no copy holds once that has settled goes then.
     #[test]
-    fn replicas_that_disagree_free_nothing() {
+    fn replicas_that_disagree_free_nothing_at_once() {
         let a = object(1, vec![stripe(1, 0, 10, 2)]);
         let b = object(2, vec![stripe(2, 0, 10, 2)]);
         let x = object(3, vec![stripe(3, 0, 10, 2)]);
-        assert!(reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a)).is_empty());
-        assert!(
-            reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a))
-                .is_empty()
-        );
+        let got = reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![x, b.clone()]);
+        let got = reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![b]);
     }
 
     #[test]
@@ -2987,14 +3133,20 @@ mod reclaim_tests {
             superseded: false,
             missed: false,
         };
-        assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)),
+            Overwritten::default()
+        );
     }
 
     /// Retention, legal hold and shard migration rewrite the same object.
     #[test]
     fn rewriting_the_same_object_frees_nothing() {
         let o = object(1, vec![stripe(1, 0, 10, 2)]);
-        assert!(reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)).is_empty());
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)),
+            Overwritten::default()
+        );
     }
 
     /// Nothing the new object still refers to is freed, whatever the old
@@ -3003,7 +3155,7 @@ mod reclaim_tests {
     fn stripes_the_new_object_shares_are_kept() {
         let old = object(1, vec![stripe(7, 0, 10, 2), stripe(8, 0, 20, 2)]);
         let new = object(2, vec![stripe(8, 0, 20, 2)]);
-        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new));
+        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new)).now;
         assert!(got.iter().all(|t| t.object_id == vec![7; 16]));
         assert_eq!(got.len(), 2);
     }
@@ -3017,7 +3169,8 @@ mod reclaim_tests {
         let got = reclaimable_after_overwrite(
             &[replaced(&here), replaced(&moved)],
             &keep(&object(2, vec![])),
-        );
+        )
+        .now;
         let nodes: HashSet<u8> = got.iter().map(|t| t.node_id[0]).collect();
         assert_eq!(nodes, HashSet::from([10, 11, 40, 41]));
     }

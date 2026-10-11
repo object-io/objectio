@@ -429,6 +429,11 @@ pub(crate) async fn copy_by_reference(
                 Vec::new(),
                 &new_object,
                 versioning_enabled,
+                crate::s3::put::Copies {
+                    nodes: &dest_placement.nodes,
+                    bucket: dest_bucket,
+                    key: dest_key,
+                },
                 &what,
             );
             // A copy onto itself replaced an object that used the same

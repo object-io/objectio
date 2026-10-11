@@ -139,6 +139,42 @@ impl DeleteCondition {
     }
 }
 
+/// Free what an unversioned delete removed, less what a copy still holds
+/// as current (a write racing the delete). A copy that can't be read is
+/// passed over (`Unread::PassOver`): the bucket has never had versioning.
+async fn free_removed(
+    state: &Arc<AppState>,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    removed: Vec<objectio_proto::metadata::ObjectMeta>,
+) {
+    let mut meta = state.meta_client.clone();
+    for gone in unreferenced(
+        &state.osd_pool,
+        nodes,
+        bucket,
+        key,
+        removed,
+        Unread::PassOver,
+    )
+    .await
+    {
+        let failed = reclaim_shards(
+            &state.osd_pool,
+            &mut meta,
+            stripe_targets_of(&gone),
+            Reclaim::Delete,
+        )
+        .await;
+        if failed > 0 {
+            // Leaked blocks if they keep failing, not lost data: the object
+            // is gone either way.
+            warn!("{bucket}/{key}: {failed} shard deletes failed; retried in the background");
+        }
+    }
+}
+
 /// DELETE `?versionId=`: remove that version for good. Each OSD replica,
 /// under the key's lock, also makes the newest remaining version current if
 /// this one was; the listing then follows whatever is current.
@@ -597,14 +633,16 @@ pub(crate) async fn delete_object_to_the_end(
                 return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
             }
         };
-        // A null version it replaced: its shards, once every replica agrees.
-        spawn_reclaim(
+        // A null version it replaced: its shards, as an overwrite's.
+        crate::s3::put::spawn_overwrite_reclaim(
             &state,
-            crate::osd_pool::reclaimable_after_overwrite(
-                &displaced,
-                &std::collections::HashSet::new(),
-            ),
-            Reclaim::Overwrite,
+            &displaced,
+            &std::collections::HashSet::new(),
+            crate::s3::put::Copies {
+                nodes: &placement.nodes,
+                bucket: &bucket,
+                key: &key,
+            },
             format!("{bucket}/{key} null version under a delete marker"),
         );
         {
@@ -642,6 +680,9 @@ pub(crate) async fn delete_object_to_the_end(
     // read still has as current: a racing write can leave it on some. The
     // bucket has never had versioning (a marker went in above otherwise),
     // so a replica the delete missed is passed over (`Unread::PassOver`).
+    // When the replicas removed different objects, a racing write may yet
+    // be stamped again and written over the delete: what it removed is
+    // freed once that has settled (`MetaDeleted::agreed`).
     let pg = crate::osd_pool::pg_ref(&placement);
     let deleted = delete_meta_from_all(
         &state.osd_pool,
@@ -663,28 +704,19 @@ pub(crate) async fn delete_object_to_the_end(
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
-    for gone in unreferenced(
-        &state.osd_pool,
-        &placement.nodes,
-        &bucket,
-        &key,
-        deleted.removed,
-        Unread::PassOver,
-    )
-    .await
-    {
-        let failed = reclaim_shards(
-            &state.osd_pool,
-            &mut meta_client,
-            stripe_targets_of(&gone),
-            Reclaim::Delete,
-        )
-        .await;
-        if failed > 0 {
-            // Leaked blocks if they keep failing, not lost data: the object
-            // is gone either way.
-            warn!("{bucket}/{key}: {failed} shard deletes failed; retried in the background");
-        }
+    if deleted.agreed() {
+        free_removed(&state, &placement.nodes, &bucket, &key, deleted.removed).await;
+    } else {
+        let (state, nodes, bucket, key) = (
+            Arc::clone(&state),
+            placement.nodes.clone(),
+            bucket.clone(),
+            key.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::osd_pool::RESTAMP_SETTLE).await;
+            free_removed(&state, &nodes, &bucket, &key, deleted.removed).await;
+        });
     }
 
     // Unregister from Meta's listing index. If meta can't take it now (an

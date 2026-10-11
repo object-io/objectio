@@ -355,3 +355,131 @@ fn a_refused_delete_that_reached_some_copies_is_healed() {
         "its space was never freed"
     );
 }
+
+/// Soak run 27's leak, as it ran: a drive lost under load. (What leaked
+/// was overwritten while the blank replacement was filled: its copy, which
+/// held nothing, disagreed with the others on what the overwrite replaced.) Writes,
+/// overwrites and deletes go on while the OSD is down and while its blank
+/// replacement is filled; once it is, everything is deleted, and every
+/// byte must come back. Each group of keys has its own size, so what is
+/// left says which group left it.
+#[test]
+fn everything_written_around_a_lost_drive_is_freed_when_deleted() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    assert_eq!(
+        ha.clients[0].request("DELETE", "/quorum/probe", &[]).status,
+        204
+    );
+    let empty = ha.clients[0].await_total_used_bytes(0);
+    // Group g's keys are g-<i>, 200 KB + 8 KB × g.
+    let size = |g: usize| 200_000 + 8_192 * g;
+    let put = |ha: &HaCluster, g: usize, i: usize, seed: u8| {
+        let r = ha.clients[0].request("PUT", &format!("/quorum/{g}-{i}"), &payload(size(g), seed));
+        assert_eq!(r.status, 200, "PUT {g}-{i}: {}", r.text());
+    };
+    let delete = |ha: &HaCluster, g: usize, i: usize| {
+        let r = ha.clients[0].request("DELETE", &format!("/quorum/{g}-{i}"), &[]);
+        assert_eq!(r.status, 204, "DELETE {g}-{i}: {}", r.text());
+    };
+    // 1: overwritten while down; 2: deleted while down; 3: overwritten
+    // while filled; 4: deleted while filled; 5: left alone. 6: written
+    // while down; 7: written while filled.
+    for g in 1..=5 {
+        for i in 0..8 {
+            put(&ha, g, i, 1);
+        }
+    }
+    let ids = node_ids(&ha);
+
+    ha.stop_osd(2);
+    await_writable(&ha.clients[0]);
+    for i in 0..8 {
+        put(&ha, 1, i, 2);
+        delete(&ha, 2, i);
+        put(&ha, 6, i, 1);
+    }
+    ha.lose_osd_drive(2);
+    ha.start_osd(2, None);
+    for i in 0..8 {
+        put(&ha, 3, i, 2);
+        delete(&ha, 4, i);
+        put(&ha, 7, i, 1);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let now = node_ids(&ha);
+        if ids.iter().filter(|i| now.contains(i)).count() == 5 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lost OSD never evacuated: nodes {now:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    std::thread::sleep(Duration::from_secs(10));
+
+    for g in [1, 3, 5, 6, 7] {
+        for i in 0..8 {
+            delete(&ha, g, i);
+        }
+    }
+    // What copies disagreed on is checked again after the gateway's
+    // restamp settle (2 min).
+    let deadline = std::time::Instant::now() + Duration::from_secs(200);
+    let used = loop {
+        let used = ha.clients[0].await_total_used_bytes(empty);
+        if used == empty || std::time::Instant::now() > deadline {
+            break used;
+        }
+    };
+    let left = shards(&ha);
+    let held: Vec<_> = (0..8).map(|i| copies(&ha, &format!("3-{i}"))).collect();
+    assert_eq!(
+        used, empty,
+        "space left behind; shards by OSD (object, position, size): {left:?}; \
+         group 3's copies: {held:?}"
+    );
+}
+
+/// Every OSD's shards: (object id prefix, position, size).
+fn shards(ha: &HaCluster) -> Vec<Vec<(String, u32, u32)>> {
+    use objectio_proto::storage::ListShardsRequest;
+    use objectio_proto::storage::storage_service_client::StorageServiceClient;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    (0..6)
+        .map(|i| {
+            let address = ha.osd_endpoint(i).trim_start_matches("http://").to_string();
+            rt.block_on(async {
+                let Ok(channel) = objectio_e2e::tls::channel(&address).await else {
+                    return Vec::new();
+                };
+                let Ok(r) = StorageServiceClient::new(channel)
+                    .list_shards(ListShardsRequest {
+                        object_id: Vec::new(),
+                        limit: 100_000,
+                        continuation_token: Vec::new(),
+                    })
+                    .await
+                else {
+                    return Vec::new();
+                };
+                r.into_inner()
+                    .shards
+                    .into_iter()
+                    .filter_map(|s| {
+                        let id = s.shard_id?;
+                        Some((
+                            hex::encode(&id.object_id[..8.min(id.object_id.len())]),
+                            id.position,
+                            s.size,
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .collect()
+}
