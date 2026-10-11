@@ -2543,6 +2543,7 @@ dependencies = [
  "objectio-proto",
  "parquet",
  "rcgen",
+ "redb",
  "reqwest",
  "ring",
  "serde_json",

@@ -15,10 +15,21 @@
 //! (the commit index openraft last gave), each replaced whole through a
 //! temporary file and a rename.
 //!
-//! Opening reads every segment and checks every record. A torn record at
-//! the end of the last segment (a crash during an append, which was never
+//! A segment is sealed when the next one starts: an index of its records,
+//! `<first index, 20 digits>.idx`, is written beside it (each record's
+//! length and term, the segment's length, a checksum over all of it). It is
+//! a shortcut only: written without a sync, and one that is missing, damaged
+//! or describes another length is ignored and the segment read instead.
+//!
+//! Opening reads the last segment whole and checks every record; a sealed
+//! segment with a valid index is not read (its records are checked when
+//! they are read, as every record is), one without is read and checked and
+//! its index written. So an open reads at most one segment and the indexes,
+//! however long the log (B25: the reopen time bound). A torn record at the
+//! end of the last segment (a crash during an append, which was never
 //! acknowledged) is cut off; any other damage, or a gap in the indexes,
-//! fails the open with its position: a record is never skipped.
+//! fails the open (or the read) with its position: a record is never
+//! skipped.
 //!
 //! The log knows indexes and terms, not openraft: entries are opaque bytes
 //! here, encoded by the caller.
@@ -41,6 +52,13 @@ const MAX_ENTRY: u32 = 256 << 20;
 
 const PURGED: &str = "purged";
 const COMMITTED: &str = "committed";
+
+/// A sealed segment's index: `magic | segment length u64 | first index u64
+/// | first offset u64 | count u64 | (len u32, term u64) × count | crc32c
+/// u32`, little-endian, the checksum over everything before it.
+const INDEX_MAGIC: &[u8; 8] = b"OBIOIDX1";
+const INDEX_HEADER: usize = 8 + 8 + 8 + 8 + 8;
+const INDEX_RECORD: usize = 4 + 8;
 
 /// Why the log couldn't be opened or written.
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +122,79 @@ fn segment_name(first: u64) -> String {
     format!("{first:020}.log")
 }
 
+fn index_name(first: u64) -> String {
+    format!("{first:020}.idx")
+}
+
+/// The index of a sealed segment `seg_len` long whose records from
+/// `first_index` on are `records` (the last ones in it).
+fn encode_index(seg_len: u64, first_index: u64, records: &[Pos]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(INDEX_HEADER + records.len() * INDEX_RECORD + 4);
+    b.extend_from_slice(INDEX_MAGIC);
+    b.extend_from_slice(&seg_len.to_le_bytes());
+    b.extend_from_slice(&first_index.to_le_bytes());
+    b.extend_from_slice(&records.first().map_or(0, |p| p.offset).to_le_bytes());
+    b.extend_from_slice(&(records.len() as u64).to_le_bytes());
+    for p in records {
+        b.extend_from_slice(&p.len.to_le_bytes());
+        b.extend_from_slice(&p.term.to_le_bytes());
+    }
+    let crc = crc32c::crc32c(&b);
+    b.extend_from_slice(&crc.to_le_bytes());
+    b
+}
+
+/// The first index and the positions (in segment `segment`) an index
+/// describes, if it is whole, and its records run exactly to the end of a
+/// segment `seg_len` long. Anything else: `None`, and the segment is read.
+fn decode_index(b: &[u8], segment: usize, seg_len: u64) -> Option<(u64, Vec<Pos>)> {
+    let body_len = b.len().checked_sub(4)?;
+    let (body, crc) = b.split_at(body_len);
+    if body.len() < INDEX_HEADER || body[..8] != INDEX_MAGIC[..] {
+        return None;
+    }
+    let crc: [u8; 4] = crc.try_into().ok()?;
+    if crc32c::crc32c(body) != u32::from_le_bytes(crc) {
+        return None;
+    }
+    let u64_at = |at: usize| u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+    if u64_at(8) != seg_len {
+        return None;
+    }
+    let first_index = u64_at(16);
+    let mut offset = u64_at(24);
+    let count = usize::try_from(u64_at(32)).ok()?;
+    if body.len() != INDEX_HEADER + count.checked_mul(INDEX_RECORD)? {
+        return None;
+    }
+    let mut positions = Vec::with_capacity(count);
+    for r in body[INDEX_HEADER..].chunks_exact(INDEX_RECORD) {
+        let len = u32::from_le_bytes(r[0..4].try_into().unwrap());
+        let term = u64::from_le_bytes(r[4..12].try_into().unwrap());
+        if len > MAX_ENTRY {
+            return None;
+        }
+        positions.push(Pos {
+            segment,
+            offset,
+            len,
+            term,
+        });
+        offset = offset.checked_add(HEADER as u64 + u64::from(len))?;
+    }
+    (count > 0 && offset == seg_len).then_some((first_index, positions))
+}
+
+/// Remove segment `first`'s index, if it has one; whether it had.
+fn remove_index(dir: &Path, first: u64) -> Result<bool, LogError> {
+    let path = dir.join(index_name(first));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err(&path)(e)),
+    }
+}
+
 fn checksum(index: u64, term: u64, entry: &[u8]) -> u32 {
     let crc = crc32c::crc32c(&index.to_le_bytes());
     let crc = crc32c::crc32c_append(crc, &term.to_le_bytes());
@@ -151,8 +242,9 @@ impl RaftLog {
         Ok(log)
     }
 
-    /// Read one segment's records into `positions`, checking each. On the
-    /// last segment a torn record at the end is cut off.
+    /// Read one segment's records into `positions`, checking each, or, for
+    /// a sealed segment, take them from its index if it has a valid one. On
+    /// the last segment a torn record at the end is cut off.
     fn load_segment(&mut self, first: u64, last: bool) -> Result<(), LogError> {
         let path = self.dir.join(segment_name(first));
         let file = OpenOptions::new()
@@ -161,9 +253,34 @@ impl RaftLog {
             .open(&path)
             .map_err(io_err(&path))?;
         let file_len = file.metadata().map_err(io_err(&path))?.len();
+        let segment = self.segments.len();
+        if !last
+            && let Some((first_index, positions)) = fs::read(self.dir.join(index_name(first)))
+                .ok()
+                .and_then(|b| decode_index(&b, segment, file_len))
+        {
+            // It must carry on from the segments before it, as a read one
+            // must; if it doesn't, the segment is read and that decides.
+            let follows = match self.next_index() {
+                Some(next) => first_index == next,
+                None => first_index >= first,
+            };
+            if follows {
+                if self.positions.is_empty() {
+                    self.first = first_index;
+                }
+                self.positions.extend(positions);
+                self.segments.push(Segment {
+                    first,
+                    path,
+                    file,
+                    len: file_len,
+                });
+                return Ok(());
+            }
+        }
         let mut data = Vec::with_capacity(usize::try_from(file_len).unwrap_or(0));
         (&file).read_to_end(&mut data).map_err(io_err(&path))?;
-        let segment = self.segments.len();
         let mut expect = first;
         if let Some(next) = self.next_index()
             && first != next
@@ -252,7 +369,39 @@ impl RaftLog {
             file,
             len,
         });
+        if !last {
+            // Read whole and checked: the next open needn't.
+            self.write_index(segment);
+        }
         Ok(())
+    }
+
+    /// Write the index of sealed segment `segment`, whose records are the
+    /// last ones in `positions`. Best effort, unsynced: an open that finds
+    /// it missing or damaged reads the segment instead.
+    fn write_index(&self, segment: usize) {
+        let held = self
+            .positions
+            .iter()
+            .rev()
+            .take_while(|p| p.segment == segment)
+            .count();
+        if held == 0 {
+            return;
+        }
+        let skip = self.positions.len() - held;
+        let records: Vec<Pos> = self.positions.iter().skip(skip).copied().collect();
+        let first_index = self.first + skip as u64;
+        let seg = &self.segments[segment];
+        let bytes = encode_index(seg.len, first_index, &records);
+        let path = self.dir.join(index_name(seg.first));
+        let tmp = self.dir.join(format!("{}.tmp", index_name(seg.first)));
+        if let Err(e) = fs::write(&tmp, &bytes).and_then(|()| fs::rename(&tmp, &path)) {
+            tracing::warn!(
+                "raft log {}: no index written ({e}); the next open reads the segment",
+                path.display()
+            );
+        }
     }
 
     /// Whether `dir` holds a log: a segment or a purge record.
@@ -343,6 +492,11 @@ impl RaftLog {
             .last()
             .is_none_or(|s| s.len >= SEGMENT_BYTES || self.positions.is_empty() && s.len > 0)
         {
+            // The last segment is sealed: its index first (it holds
+            // nothing after a purge of everything, and gets none then).
+            if let Some(sealed) = self.segments.len().checked_sub(1) {
+                self.write_index(sealed);
+            }
             self.start_segment(first_new)?;
             new_segment = true;
         }
@@ -391,6 +545,9 @@ impl RaftLog {
     }
 
     fn start_segment(&mut self, first: u64) -> Result<(), LogError> {
+        // An index left by an earlier segment of the same name describes
+        // other records.
+        remove_index(&self.dir, first)?;
         let path = self.dir.join(segment_name(first));
         let file = OpenOptions::new()
             .read(true)
@@ -423,9 +580,13 @@ impl RaftLog {
         let mut removed = false;
         while self.segments.len() > p.segment + 1 {
             let seg = self.segments.pop().expect("checked");
+            remove_index(&self.dir, seg.first)?;
             fs::remove_file(&seg.path).map_err(io_err(&seg.path))?;
             removed = true;
         }
+        // The segment cut is the last again, unsealed: its index goes, and
+        // durably (below), so it can't describe what is appended next.
+        removed |= remove_index(&self.dir, self.segments[p.segment].first)?;
         let seg = &mut self.segments[p.segment];
         if p.offset == 0 && seg.first == index {
             let seg = self.segments.pop().expect("checked");
@@ -464,6 +625,7 @@ impl RaftLog {
             if !whole {
                 break;
             }
+            remove_index(&self.dir, seg.first)?;
             fs::remove_file(&seg.path).map_err(io_err(&seg.path))?;
             self.segments.remove(0);
             for p in &mut self.positions {
@@ -569,6 +731,7 @@ impl RaftLog {
     /// I/O.
     pub fn clear(&mut self) -> Result<(), LogError> {
         for seg in self.segments.drain(..) {
+            remove_index(&self.dir, seg.first)?;
             fs::remove_file(&seg.path).map_err(io_err(&seg.path))?;
         }
         for name in [PURGED, COMMITTED] {
@@ -724,6 +887,91 @@ mod tests {
         drop(log);
         let log = RaftLog::open(dir.path()).unwrap();
         assert_eq!(log.term_of(2), Some(2));
+    }
+
+    /// Records big enough that three fill a segment: 1..=3 in the first,
+    /// the rest in the next.
+    fn big(index: u64, term: u64) -> (u64, u64, Vec<u8>) {
+        let fill = u8::try_from(index % 251).unwrap();
+        (index, term, vec![fill; (SEGMENT_BYTES / 3) as usize])
+    }
+
+    #[test]
+    fn a_sealed_segment_opens_from_its_index_and_is_checked_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        for i in 1..=5 {
+            log.append(&[big(i, 1)]).unwrap();
+        }
+        assert_eq!(log.segments.len(), 2);
+        let sealed = log.segments[0].path.clone();
+        drop(log);
+        assert!(dir.path().join(index_name(1)).exists(), "sealed, no index");
+        assert!(!dir.path().join(index_name(4)).exists(), "the last is open");
+
+        // Damage inside record 2: the open doesn't read the sealed segment…
+        let mut data = fs::read(&sealed).unwrap();
+        let record2 = HEADER + (SEGMENT_BYTES / 3) as usize;
+        data[record2 + HEADER + 10] ^= 0xff;
+        fs::write(&sealed, &data).unwrap();
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 5)));
+        assert_eq!(log.term_of(3), Some(1));
+        // …a read of the record finds it; the others read back.
+        let err = log.read(2, 3).expect_err("refused");
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert_eq!(log.read(3, 6).unwrap().len(), 3);
+        drop(log);
+
+        // Without its index the segment is read, and the open finds it.
+        fs::remove_file(dir.path().join(index_name(1))).unwrap();
+        let err = RaftLog::open(dir.path()).err().expect("refused");
+        assert!(err.to_string().contains("checksum"), "{err}");
+    }
+
+    #[test]
+    fn a_damaged_index_is_ignored_and_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        for i in 1..=4 {
+            log.append(&[big(i, 1)]).unwrap();
+        }
+        drop(log);
+        let index = dir.path().join(index_name(1));
+        let mut bytes = fs::read(&index).unwrap();
+        bytes[INDEX_HEADER + 2] ^= 0xff;
+        fs::write(&index, &bytes).unwrap();
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 4)));
+        assert_eq!(log.read(1, 5).unwrap().len(), 4);
+        let len = log.segments[0].len;
+        drop(log);
+        // Read whole at that open, the segment has a valid index again.
+        let (first, positions) = decode_index(&fs::read(&index).unwrap(), 0, len).unwrap();
+        assert_eq!((first, positions.len()), (1, 3));
+        // An index of another length (the segment since cut) is ignored.
+        assert!(decode_index(&fs::read(&index).unwrap(), 0, len - 1).is_none());
+    }
+
+    #[test]
+    fn a_truncate_into_a_sealed_segment_drops_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        for i in 1..=5 {
+            log.append(&[big(i, 1)]).unwrap();
+        }
+        log.truncate_from(2).unwrap();
+        assert_eq!(log.range(), Some((1, 1)));
+        assert!(!dir.path().join(index_name(1)).exists());
+        for i in 2..=4 {
+            log.append(&[big(i, 2)]).unwrap();
+        }
+        drop(log);
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 4)));
+        assert_eq!(log.term_of(2), Some(2));
+        assert_eq!(log.term_of(4), Some(2));
+        assert_eq!(log.read(1, 5).unwrap().len(), 4);
     }
 
     #[test]

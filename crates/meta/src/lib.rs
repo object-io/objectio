@@ -192,6 +192,8 @@ pub async fn run(
     args: Args,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
+    // From here to serving is what a node costs after a crash (B25).
+    let process_started = std::time::Instant::now();
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Metadata Service");
 
@@ -422,6 +424,16 @@ pub async fn run(
 
     // Start gRPC server with metadata, block, and Raft RPC services.
     let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id);
+    objectio_meta_store::commit_metrics::ready(process_started.elapsed());
+    info!(
+        "Serving {:.2} s after start (the database opened {})",
+        process_started.elapsed().as_secs_f64(),
+        if objectio_meta_store::commit_metrics::open_repaired() {
+            "after walking the whole file"
+        } else {
+            "without a walk"
+        }
+    );
     objectio_proto::transport::server()
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(
             &op_metrics::RPC_METRICS,
