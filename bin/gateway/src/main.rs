@@ -11,8 +11,11 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    objectio_gateway::runtime()?.block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
     let args = objectio_gateway::Args::parse();
 
     tracing_subscriber::registry()
