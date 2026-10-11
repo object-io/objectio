@@ -265,9 +265,9 @@ fn classify_object(method: &Method, bucket: String, key: String, query: &str) ->
             }
         }
         // `?uploads` initiates and `?uploadId` completes a multipart upload;
-        // both write the object. `?grep` reads it.
+        // both write the object. `?grep` and `?select` (S3 Select) read it.
         Method::POST => {
-            if has(query, "grep") {
+            if has(query, "grep") || has(query, "select") {
                 "s3:GetObject"
             } else {
                 "s3:PutObject"
@@ -1278,6 +1278,14 @@ mod tests {
         assert_eq!(action, "s3:GetObject");
         assert_eq!(bucket, "b");
         assert_eq!(key.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn s3_select_reads_the_object() {
+        let (action, bucket, key) = check_of(Method::POST, "/b/data.csv", "select&select-type=2");
+        assert_eq!(action, "s3:GetObject");
+        assert_eq!(bucket, "b");
+        assert_eq!(key.as_deref(), Some("data.csv"));
     }
 
     #[test]

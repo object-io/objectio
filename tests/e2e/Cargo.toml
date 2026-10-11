@@ -24,6 +24,13 @@ objectio-common = { workspace = true }
 ring = { workspace = true }
 # A CA and a node certificate for mTLS between the services (src/tls.rs).
 rcgen = "0.13"
+# S3 Select (tests/s3_select.rs): Parquet, GZIP and BZIP2 objects to query,
+# and the event stream's CRCs. The same features as the gateway's parquet,
+# so the build is shared.
+parquet = { version = "60", default-features = false, features = ["snap", "brotli", "flate2-zlib-rs", "lz4", "zstd", "simdutf8"] }
+flate2 = "1"
+bzip2 = "0.6"
+crc32fast = "1.4"
 
 [lints]
 workspace = true

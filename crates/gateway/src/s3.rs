@@ -98,6 +98,7 @@ mod listing;
 mod lock;
 mod multipart;
 mod put;
+mod select;
 mod sse;
 mod tagging;
 mod types;
@@ -302,7 +303,8 @@ fn add_metadata_headers(
 /// S3 sub-resources this gateway doesn't implement. Without this a request
 /// naming one fell through to the plain request: `GET /b?website` answered
 /// with the bucket's listing, `PUT /b?notification` tried to create the bucket.
-const UNSUPPORTED_SUBRESOURCES: [&str; 11] = [
+/// (`?select` is implemented for `POST` on an object only: S3 Select.)
+const UNSUPPORTED_SUBRESOURCES: [&str; 10] = [
     "website",
     "notification",
     "inventory",
@@ -312,7 +314,6 @@ const UNSUPPORTED_SUBRESOURCES: [&str; 11] = [
     "accelerate",
     "requestPayment",
     "restore",
-    "select",
     "torrent",
 ];
 
@@ -327,18 +328,22 @@ pub async fn unsupported_subresource_layer(
     {
         return refused;
     }
+    let on_object = request
+        .uri()
+        .path()
+        .trim_start_matches('/')
+        .split_once('/')
+        .is_some_and(|(_, key)| !key.is_empty());
     let named = request.uri().query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let name = pair.split('=').next().unwrap_or_default();
             // Logging is a bucket's (`crate::bucket_logging`), not an object's.
-            let object_logging = name == "logging"
-                && request
-                    .uri()
-                    .path()
-                    .trim_start_matches('/')
-                    .split_once('/')
-                    .is_some_and(|(_, key)| !key.is_empty());
-            (UNSUPPORTED_SUBRESOURCES.contains(&name) || object_logging).then(|| name.to_string())
+            let object_logging = name == "logging" && on_object;
+            // S3 Select is a POST to an object.
+            let misplaced_select =
+                name == "select" && !(on_object && request.method() == Method::POST);
+            (UNSUPPORTED_SUBRESOURCES.contains(&name) || object_logging || misplaced_select)
+                .then(|| name.to_string())
         })
     });
     match named {
@@ -438,6 +443,7 @@ pub async fn health_check() -> Response {
 /// POST /{bucket}/{key}?uploads - Initiate multipart upload
 /// POST /{bucket}/{key}?uploadId=X - Complete multipart upload
 /// POST /{bucket}/{key}?grep - Gateway-side regex grep; streams NDJSON
+/// POST /{bucket}/{key}?select&select-type=2 - SelectObjectContent (S3 Select)
 pub async fn post_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -454,10 +460,12 @@ pub async fn post_object(
         complete_multipart_upload_internal(state, bucket, key, upload_id, body, &headers).await
     } else if params.grep.is_some() {
         grep_object_internal(state, bucket, key, auth, headers, body).await
+    } else if params.select.is_some() {
+        select::select_object_content_internal(state, bucket, key, headers, body).await
     } else {
         S3Error::xml_response(
             "InvalidRequest",
-            "POST request must include ?uploads, ?uploadId, or ?grep parameter",
+            "POST request must include ?uploads, ?uploadId, ?select or ?grep parameter",
             StatusCode::BAD_REQUEST,
         )
     }
