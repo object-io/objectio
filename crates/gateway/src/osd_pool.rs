@@ -1091,10 +1091,27 @@ pub struct MetaWriteError {
 #[derive(Debug, Clone)]
 pub struct Withdrawal {
     pub copies: Vec<NodePlacement>,
+    /// Every copy of the key: what its listing follows once this is
+    /// decided.
+    pub targets: Vec<NodePlacement>,
     pub bucket: String,
     pub key: String,
     pub object_id: Vec<u8>,
     pub version_id: String,
+    /// Set when the copies whose answer to the write was lost could hold
+    /// it on k with those that took it: they are asked first, and it is
+    /// withdrawn only if they don't.
+    pub undecided: Option<Undecided>,
+}
+
+/// A refused small write held by fewer than k copies that said so, and
+/// perhaps by others whose answer was lost: what deciding it needs.
+#[derive(Debug, Clone)]
+pub struct Undecided {
+    holds: Vec<bool>,
+    unsure: Vec<bool>,
+    shards: HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    object_meta: objectio_proto::metadata::ObjectMeta,
 }
 
 impl std::fmt::Display for MetaWriteError {
@@ -1276,7 +1293,8 @@ pub async fn put_object_meta_with(
                             OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
                             false,
                         )
-                    })?
+                    })?;
+                let resp = crate::test_hooks::maybe_lost("put_object_meta", resp)
                     .map_err(|e| {
                         error!(
                             "Failed to put object metadata to OSD {}: {}",
@@ -1432,6 +1450,13 @@ pub async fn put_object_meta_with(
 /// it. Soak run 10 found the first case left as it was: a refused PUT,
 /// current on four copies with no shard to spare, lost to the next drive.
 ///
+/// A copy whose answer was lost may hold it too. Soak run 25 found a
+/// small overwrite during a partition taken by all six copies, three of
+/// whose answers were lost: counted on three, it was withdrawn from all
+/// six, and the object it had replaced on each went with it. So when the
+/// copies that didn't answer could make k, they are asked first
+/// ([`withdraw_later`]), and it is withdrawn only if fewer than k hold it.
+///
 /// Returns whether no copy holds it any longer (the caller may then free
 /// its shards). Copies that didn't answer the withdrawal go in
 /// `withdrawing`.
@@ -1459,13 +1484,36 @@ async fn settle_short_small_write(
         return false;
     }
 
-    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
     let suspects: Vec<NodePlacement> = targets
         .iter()
         .zip(holds.iter().zip(may_hold))
         .filter(|(_, (h, m))| **h || **m)
         .map(|(t, _)| t.clone())
         .collect();
+    let unsure = may_hold.iter().filter(|&&m| m).count();
+    if held + unsure >= k {
+        warn!(
+            "{bucket}/{key}: refused on {held} copies (k = {k}); {unsure} more may hold it: \
+             asked before it is withdrawn"
+        );
+        *withdrawing = Some(Withdrawal {
+            copies: suspects,
+            targets: targets.to_vec(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            object_id: object_meta.object_id.clone(),
+            version_id: object_meta.version_id.clone(),
+            undecided: Some(Undecided {
+                holds: holds.to_vec(),
+                unsure: may_hold.to_vec(),
+                shards: shards.clone(),
+                object_meta: object_meta.clone(),
+            }),
+        });
+        return false;
+    }
+
+    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
     let left = withdraw_from(pool, suspects, bucket, key, &object_meta.object_id).await;
     if left.is_empty() {
         // A copy that took it lost what it replaced: the others have that.
@@ -1476,24 +1524,34 @@ async fn settle_short_small_write(
     // ([`withdraw_later`]). Until then its shards stay (a leak, not a loss).
     *withdrawing = Some(Withdrawal {
         copies: left,
+        targets: targets.to_vec(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         object_id: object_meta.object_id.clone(),
         version_id: object_meta.version_id.clone(),
+        undecided: None,
     });
     false
 }
 
 /// Keep withdrawing `w` from the copies that didn't answer, for ten
-/// minutes; true once none can hold it (its shards may then go).
+/// minutes; true once none can hold it (its shards may then go). An
+/// undecided write is first kept if k copies turn out to hold it.
 pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
     let Withdrawal {
         mut copies,
+        targets,
         bucket,
         key,
         object_id,
         version_id,
+        undecided,
     } = w;
+    if let Some(u) = undecided
+        && kept_if_held(pool, &targets, u, &bucket, &key).await
+    {
+        return false;
+    }
     let mut wait = std::time::Duration::from_secs(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     while !copies.is_empty() && std::time::Instant::now() < deadline {
@@ -1510,6 +1568,127 @@ pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
         copies.len()
     );
     false
+}
+
+/// Ask the copies whose answer to a refused small write was lost whether
+/// they hold it, for ten minutes. True when k copies do: it is kept, healed
+/// and repaired to full redundancy, as a write refused on k copies is.
+/// False when fewer than k can, or when some still can't be asked after
+/// ten minutes (a copy that long gone is rebuilt from the others): it is
+/// then withdrawn.
+async fn kept_if_held(
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    u: Undecided,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let Undecided {
+        mut holds,
+        mut unsure,
+        shards,
+        object_meta,
+    } = u;
+    let k = object_meta.stripes.first().map_or(0, |s| s.ec_k as usize);
+    let mut wait = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let asks = targets
+            .iter()
+            .zip(&unsure)
+            .enumerate()
+            .filter(|(_, (_, u))| **u)
+            .map(|(i, (p, _))| {
+                let object_meta = &object_meta;
+                async move { (i, copy_holds(pool, p, bucket, key, object_meta).await) }
+            });
+        for (i, answer) in futures::future::join_all(asks).await {
+            if let Some(h) = answer {
+                unsure[i] = false;
+                holds[i] = h;
+            }
+        }
+        let held = holds.iter().filter(|&&h| h).count();
+        let left = unsure.iter().filter(|&&u| u).count();
+        if held >= k {
+            warn!(
+                "{bucket}/{key}: refused, but on {held} copies (k = {k}) once asked: kept, \
+                 healed and repaired to full redundancy"
+            );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            report_missing_small_shards(pool, targets, &holds, &shards, bucket, key, &object_meta)
+                .await;
+            return true;
+        }
+        if held + left < k {
+            warn!("{bucket}/{key}: refused on {held} copies (k = {k}) once asked: withdrawn");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "{bucket}/{key}: refused on {held} copies (k = {k}); {left} could not be asked \
+                 in 10 minutes: withdrawn"
+            );
+            return false;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Whether copy `p` holds `object` of `bucket/key`, current or as its
+/// version; `None` when it can't be asked.
+async fn copy_holds(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> Option<bool> {
+    let is_it = |o: Option<objectio_proto::metadata::ObjectMeta>| {
+        o.is_some_and(|o| o.object_id == object.object_id)
+    };
+    if is_it(copy_entry(pool, p, bucket, key, "").await?) {
+        return Some(true);
+    }
+    if object.version_id.is_empty() {
+        return Some(false);
+    }
+    // A newer write may have made it a version since.
+    Some(is_it(
+        copy_entry(pool, p, bucket, key, &object.version_id).await?,
+    ))
+}
+
+/// What copy `p` holds of `bucket/key` (`version_id`, or the current entry
+/// when empty); `None` when it can't be asked.
+async fn copy_entry(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Option<Option<objectio_proto::metadata::ObjectMeta>> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    let mut client = pool.get_client_for_placement(p).await.ok()?;
+    let req = GetObjectMetaRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version_id.to_string(),
+        with_small_shard: false,
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pool.watched(&p.node_address, client.get_object_meta(req)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            Some(if inner.found { inner.object } else { None })
+        }
+        _ => None,
+    }
 }
 
 /// Withdraw object `object_id` of `bucket/key` from `copies`; returns the

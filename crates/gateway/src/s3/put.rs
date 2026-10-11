@@ -569,15 +569,23 @@ pub(crate) fn settle_commit(
         Err(e) if e.unapplied => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
         }
-        // A refused small write some copies didn't answer the withdrawal
-        // of: its shards go once they have.
+        // A refused small write not yet withdrawn from every copy that may
+        // hold it (or not yet known to be held by k): its shards go once
+        // it is withdrawn.
         Err(MetaWriteError {
             withdrawing: Some(w),
             ..
         }) => {
             let (state, w, what) = (Arc::clone(state), w.clone(), what.to_string());
             tokio::spawn(async move {
-                if crate::osd_pool::withdraw_later(&state.osd_pool, w).await {
+                let (targets, bucket, key) = (w.targets.clone(), w.bucket.clone(), w.key.clone());
+                let withdrawn = crate::osd_pool::withdraw_later(&state.osd_pool, w).await;
+                // Decided after the PUT's own listing update, which found
+                // it still on some copies: the listing follows what they
+                // hold now. (Peering keeps an entry no copy backs, as
+                // unfound.)
+                sync_listing(&state, &targets, &bucket, &key).await;
+                if withdrawn {
                     spawn_reclaim(&state, sent, Reclaim::FailedWrite, what);
                 }
             });

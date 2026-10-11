@@ -898,16 +898,73 @@ fn a_small_write_refused_below_k_copies_is_withdrawn() {
     ha.start_osd(3, None);
     ha.start_osd(4, None);
     ha.start_osd(5, None);
-    // Past the gateway's fail-fast window, and a heal round.
-    std::thread::sleep(Duration::from_secs(15));
+    // The stopped copies' answers may count as lost, not as refusals: the
+    // write is then withdrawn once they say they don't hold it, and the
+    // listing follows at the next heal round.
     let c = &ha.clients[0];
-    let got = c.request("GET", "/short/new", &[]);
-    assert_eq!(got.status, 404, "{}", got.text());
-    let got = c.request("GET", "/short/old", &[]);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let new = c.request("GET", "/short/new", &[]);
+        let got = c.request("GET", "/short/old", &[]);
+        let list = c.request("GET", "/short?list-type=2", &[]).text();
+        if new.status == 404
+            && got.status == 200
+            && got.bytes == old
+            && !list.contains("<Key>new</Key>")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new: {} {}; old: {} {}; {list}",
+            new.status,
+            new.text(),
+            got.status,
+            if got.bytes == old {
+                "the old object"
+            } else {
+                "the refused overwrite"
+            }
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// A small overwrite every copy took, three of whose answers were lost (a
+/// partition cutting the gateway off as they came back): counted on three
+/// copies, fewer than k. Soak run 25 found such a write withdrawn from all
+/// six, and the object it had replaced on each gone with it: the key read
+/// as never written. The copies that didn't answer are asked first; it is
+/// on all six, so it is kept.
+#[test]
+fn a_small_write_whose_answers_were_lost_is_kept_when_k_copies_hold_it() {
+    use objectio_e2e::ha::HaCluster;
+    let ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/short", &[]).status, 200);
+    let old = payload(40_000, 81);
+    assert_eq!(c.request("PUT", "/short/k", &old).status, 200);
+
+    for _ in 0..3 {
+        c.json(
+            "POST",
+            "/_admin/test/lose-reply",
+            json!({ "call": "put_object_meta" }),
+        )
+        .expect_ok();
+    }
+    let new = payload(50_000, 82);
+    let put = c.request("PUT", "/short/k", &new);
+    assert_ne!(put.status, 200, "acknowledged on three answers of six");
+
+    // Past the gateway's fail-fast window, and a round of asking.
+    std::thread::sleep(Duration::from_secs(15));
+    let got = c.request("GET", "/short/k", &[]);
     assert_eq!(got.status, 200, "{}", got.text());
-    assert_eq!(got.bytes, old, "the refused overwrite won");
+    assert_eq!(got.bytes, new, "the overwrite every copy took");
     let list = c.request("GET", "/short?list-type=2", &[]).text();
-    assert!(!list.contains("<Key>new</Key>"), "{list}");
+    assert!(list.contains("<Key>k</Key>"), "{list}");
 }
 
 /// A lost OSD in a pool with placement groups: a PG keeps its members

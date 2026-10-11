@@ -102,7 +102,8 @@ pub async fn rewrite_shard(
     }
 }
 
-/// Calls to meta whose next answer is lost on purpose, by name.
+/// Calls to meta (or, for `put_object_meta`, to an OSD) whose next answer
+/// is lost on purpose, by name.
 static LOSE_REPLY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 #[derive(serde::Deserialize)]
@@ -112,7 +113,9 @@ pub struct LoseReply {
 
 /// `POST /_admin/test/lose-reply`: the next answer meta gives to `call`
 /// (applied there) is taken as lost, as a leader change or a timeout loses
-/// one: the gateway sees UNAVAILABLE for a call meta did apply.
+/// one: the gateway sees UNAVAILABLE for a call meta did apply. For
+/// `put_object_meta`, the next answer of one OSD copy; asked n times, n
+/// copies'.
 pub async fn lose_reply(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
