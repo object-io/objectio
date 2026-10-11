@@ -237,9 +237,10 @@ test_s3::test_sse_s3_default_post_object_authenticated_request,not-implemented-b
 test_s3::test_versioned_object_acl,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
 test_s3::test_versioned_object_acl_no_version_specified,aws-compatible-already,Owner DisplayName is the canonical user id; test expects RGW display name (AWS stopped returning DisplayName in 2025)
 test_s3control::test_account_public_access_block,test-environment,needs <account>.host virtual-host DNS; S3 Control API not implemented
-test_s3select::test_count_json_operation,aws-compatible-already,JSON OutputSerialization writes {"_1":1} as AWS does; the test reads the output as a bare number (RGW)
+test_s3select::test_count_json_operation,aws-compatible-already,JSON OutputSerialization writes {"_1":1} as AWS does; the test reads the output as a bare number and counts FROM s3object[*].root as its elements (RGW; AWS: the array is one record)
 test_s3select::test_csv_parser,aws-compatible-already,an empty CSV field is an empty value as in AWS; the test expects RGW's "null" (and RGW's quotes in the middle of a field)
-test_s3select::test_json_column_sum_min_max,aws-compatible-already,JSON OutputSerialization writes {"_1":0} as AWS does; the test reads the output as a bare number (RGW)
+test_s3select::test_json_column_sum_min_max,aws-compatible-already,JSON OutputSerialization writes {"_1":...} as AWS does; the test reads the output as a bare number and reads FROM s3object[*].root as its elements (RGW; AWS: the array is one record)
+test_s3select::test_like_expressions,aws-compatible-already,LIKE treats [ and ] as themselves as AWS does; the test expects RGW's [y-z] character sets
 test_s3select::test_schema_definition,aws-compatible-already,a column missing from the header is MissingHeaders as in AWS; the test expects RGW's ProcessingTimeError and its wording
 test_sns::test_account_topic,not-implemented-by-design,"SNS (topics, notifications)"
 test_sns::test_account_topic_publish,not-implemented-by-design,"SNS (topics, notifications)"
