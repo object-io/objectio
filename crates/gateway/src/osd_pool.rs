@@ -2186,19 +2186,38 @@ pub async fn delete_meta_from_all(
     out
 }
 
+/// What [`unreferenced`] makes of a replica it can't read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// It keeps everything: it may hold a removed object as a version, or
+    /// as current where the delete didn't make its quorum.
+    KeepAll,
+    /// It is passed over: the delete made its quorum, in a bucket that has
+    /// never had versioning. The delete is stamped above everything it
+    /// removed and a read hears from a quorum, so an object it removed is
+    /// never read again, whatever a replica that missed it still holds;
+    /// recovery takes it off that replica later. Keeping everything leaked
+    /// every object deleted while an OSD was down: most of 2.6 GB in soak
+    /// run 26, deleted while a lost drive's replacement was filled, which
+    /// then had nothing of them for recovery to free. (An overwrite passes
+    /// over a replica it missed the same way: [`reclaimable_after_overwrite`].)
+    PassOver,
+}
+
 /// Of the objects a delete removed, those no replica still has as its
 /// current object: what may be freed. A write racing the delete can leave
 /// an object current on some replicas (they saw the write after the
-/// delete); freeing it would leave them naming shards that are gone. Any
-/// replica that can't be read keeps everything: a leak, never a loss. An
-/// object gone from every replica can't come back: an update of one
-/// requires it to exist, and a PUT always writes a new one.
+/// delete); freeing it would leave them naming shards that are gone. A
+/// replica that can't be read keeps everything or is passed over, as
+/// `unread` says. An object gone from every replica can't come back: an
+/// update of one requires it to exist, and a PUT always writes a new one.
 pub async fn unreferenced(
     pool: &OsdPool,
     placements: &[NodePlacement],
     bucket: &str,
     key: &str,
     removed: Vec<objectio_proto::metadata::ObjectMeta>,
+    unread: Unread,
 ) -> Vec<objectio_proto::metadata::ObjectMeta> {
     let mut distinct: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
     for o in removed {
@@ -2224,6 +2243,10 @@ pub async fn unreferenced(
                     held.insert(o.object_id);
                 }
                 Ok(None) => {}
+                Err(e) if unread == Unread::PassOver => {
+                    debug!("{bucket}/{key}: a replica can't be read after the delete ({e})");
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         "{bucket}/{key}: a replica can't be read after the delete ({e}); \
@@ -2390,13 +2413,21 @@ pub struct Displaced {
 
 /// Shards of the object an overwrite displaced, if it is safe to free them.
 ///
-/// Only when every replica displaced the same object, and none still keeps
-/// it as a version. Each OSD applies writes to a key one at a time, but two
-/// concurrent PUTs can reach the replicas in different orders: then one
-/// replica reports the other PUT's object as replaced while another still
-/// holds it as current. Agreement across every replica rules that out — if
-/// all of them replaced X with this write, none of them holds X any more —
-/// and costs only a leaked object in the rare split case.
+/// Only when every replica that answered displaced the same object, and
+/// none still keeps it as a version. Each OSD applies writes to a key one
+/// at a time, but two concurrent PUTs can reach the replicas in different
+/// orders: then one replica reports the other PUT's object as replaced
+/// while another still holds it as current. Agreement across the answers
+/// rules that out — if all of them replaced X with this write, none of
+/// them holds X any more — and costs only a leaked object in the rare
+/// split case.
+///
+/// A replica that didn't answer is passed over (the write made its quorum
+/// for these to be asked of): it may still hold X, but X is older than
+/// this write, which a quorum holds, so X is never read again; recovery
+/// replaces it there later. Waiting for every replica leaked every object
+/// overwritten while an OSD was down (soak run 26), its replacement drive
+/// then having nothing of them for recovery to free.
 ///
 /// `keep` is what the new object refers to; nothing in it is freed, which
 /// covers a metadata-only rewrite of the same object.
@@ -2405,6 +2436,7 @@ pub fn reclaimable_after_overwrite(
     replies: &[Displaced],
     keep: &std::collections::HashSet<Vec<u8>>,
 ) -> Vec<ShardTarget> {
+    let replies: Vec<&Displaced> = replies.iter().filter(|d| !d.missed).collect();
     let Some(first) = replies.first().and_then(|d| d.replaced.as_ref()) else {
         return Vec::new();
     };
@@ -2557,68 +2589,163 @@ impl Drop for PendingShards {
 /// How many shards [`reclaim_shards`] deletes at once.
 const RECLAIM_CONCURRENCY: usize = 64;
 
+/// How long shards that could not be freed (an OSD down, meta electing a
+/// leader) are tried again before their blocks are left allocated: longer
+/// than an OSD takes to restart, or its host to reboot. Soak run 26 left
+/// every shard whose delete met an OSD powered off allocated for good.
+const RECLAIM_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first wait before trying again; doubled each time, to a minute.
+const RECLAIM_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Delete `targets` from the OSDs holding them, and count the outcome.
 ///
 /// Best-effort by design: a shard that cannot be deleted now is a leaked
-/// block, not a correctness problem, so this never fails the caller. An OSD
-/// that does not hold a shard answers `success: false`, which is not a
-/// failure — deleting is idempotent under retry. Returns how many deletes
-/// failed.
+/// block, not a correctness problem, so this never fails the caller. What
+/// fails is tried again in the background for [`RECLAIM_RETRY_FOR`], and
+/// counted as failed only then. An OSD that does not hold a shard answers
+/// `success: false`, which is not a failure — deleting is idempotent under
+/// retry, and so is releasing (a release names its referrer). Returns how
+/// many shards were not freed at the first try.
 pub async fn reclaim_shards(
-    pool: &OsdPool,
+    pool: &Arc<OsdPool>,
     meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
     targets: Vec<ShardTarget>,
     reason: Reclaim,
 ) -> usize {
+    let left = reclaim_round(
+        pool,
+        meta,
+        Unfreed {
+            release: targets,
+            delete: Vec::new(),
+        },
+        reason,
+    )
+    .await;
+    let failed = left.len();
+    if failed > 0 {
+        tokio::spawn(retry_reclaim(
+            Arc::clone(pool),
+            meta.clone(),
+            left,
+            reason,
+            RECLAIM_RETRY_FIRST,
+            RECLAIM_RETRY_FOR,
+        ));
+    }
+    failed
+}
+
+/// Shards not freed yet: those whose stripes are still to be released
+/// (meta didn't answer), and those released whose delete failed.
+#[derive(Debug, Default)]
+struct Unfreed {
+    release: Vec<ShardTarget>,
+    delete: Vec<ShardTarget>,
+}
+
+impl Unfreed {
+    fn len(&self) -> usize {
+        self.release.len() + self.delete.len()
+    }
+}
+
+/// Try `left` again, waiting `first` and then twice as long each time (to
+/// a minute), until it is all freed or `retry_for` is up; what is left
+/// then is counted as failed, its blocks allocated.
+async fn retry_reclaim(
+    pool: Arc<OsdPool>,
+    mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    mut left: Unfreed,
+    reason: Reclaim,
+    first: std::time::Duration,
+    retry_for: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + retry_for;
+    let mut wait = first;
+    loop {
+        tokio::time::sleep(wait).await;
+        let before = left.len();
+        left = reclaim_round(&pool, &mut meta, left, reason).await;
+        if left.len() == 0 {
+            debug!(
+                "reclaim ({}): {before} shards freed on a retry",
+                reason.label()
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "reclaim ({}): {} shards still not freed after {} s; their blocks stay allocated",
+                reason.label(),
+                left.len(),
+                retry_for.as_secs()
+            );
+            crate::gateway_metrics::record_reclaim(reason.label(), 0, left.len() as u64);
+            return;
+        }
+        wait = (wait * 2).clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        );
+    }
+}
+
+/// One try at freeing `left`: release what is still to be released (only
+/// stripes no other object references may go), then delete what was
+/// released. Returns what is still not freed.
+async fn reclaim_round(
+    pool: &OsdPool,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    left: Unfreed,
+    reason: Reclaim,
+) -> Unfreed {
     use futures::StreamExt;
     use objectio_proto::storage::{DeleteShardRequest, ShardId};
 
-    if targets.is_empty() {
-        return 0;
-    }
-
-    // Only stripes no other object still references may go. Asked of meta
-    // once per releasing object; if meta cannot answer, nothing is deleted
-    // — a leak can be reclaimed later, deleted shared data cannot.
-    let total = targets.len();
-    let targets = match freeable(meta, &targets).await {
-        Ok((free, packs)) => {
-            let mut freed: Vec<ShardTarget> = targets
-                .into_iter()
-                .filter(|t| {
+    let mut out = Unfreed::default();
+    let mut delete = left.delete;
+    // Asked of meta once per releasing object; if meta cannot answer,
+    // nothing is deleted — a leak can be reclaimed later, deleted shared
+    // data cannot.
+    if !left.release.is_empty() {
+        match freeable(meta, &left.release).await {
+            Ok((free, packs)) => {
+                delete.extend(left.release.into_iter().filter(|t| {
                     !t.is_pack_marker() && free.contains(&(t.owner.clone(), t.object_id.clone()))
-                })
-                .collect();
-            // A pack its last object let go: meta dropped its record in
-            // the same commit, so its shards are nobody's.
-            for mut pack in packs {
-                pack.pack_id.clear();
-                freed.extend(stripe_targets(std::slice::from_ref(&pack)));
+                }));
+                // A pack its last object let go: meta dropped its record in
+                // the same commit, so its shards are nobody's.
+                for mut pack in packs {
+                    pack.pack_id.clear();
+                    delete.extend(stripe_targets(std::slice::from_ref(&pack)));
+                }
             }
-            freed
+            Err(e) => {
+                warn!(
+                    "reclaim: cannot ask meta which stripes are still shared, keeping them for now: {e}"
+                );
+                out.release = left.release;
+            }
         }
-        Err(e) => {
-            warn!("reclaim: cannot ask meta which stripes are still shared, keeping them: {e}");
-            crate::gateway_metrics::record_reclaim(reason.label(), 0, total as u64);
-            return total;
-        }
-    };
-    if targets.is_empty() {
-        return 0;
+    }
+    if delete.is_empty() {
+        return out;
     }
 
     // One client per OSD: connected already, at an address the caller gave,
     // or — after a restart, or for a node outside this request's placement —
     // at the address meta has registered for it, asked once.
     let mut clients: HashMap<Vec<u8>, StorageServiceClient<Channel>> = HashMap::new();
-    let mut addresses: HashMap<Vec<u8>, String> = targets
+    let mut addresses: HashMap<Vec<u8>, String> = delete
         .iter()
         .filter(|t| !t.address.is_empty())
         .map(|t| (t.node_id.clone(), t.address.clone()))
         .collect();
     let mut asked_meta = false;
     let node_ids: std::collections::HashSet<Vec<u8>> =
-        targets.iter().map(|t| t.node_id.clone()).collect();
+        delete.iter().map(|t| t.node_id.clone()).collect();
     for node_id in node_ids {
         if let Ok(client) = pool.get_client(&node_id).await {
             clients.insert(node_id, client);
@@ -2652,27 +2779,31 @@ pub async fn reclaim_shards(
         }
     }
 
-    let results: Vec<Result<bool, OsdPoolError>> = futures::stream::iter(targets)
+    let results: Vec<(ShardTarget, Result<bool, OsdPoolError>)> = futures::stream::iter(delete)
         .map(|t| {
             let client = clients.get(&t.node_id).cloned();
             async move {
-                let mut client =
-                    client.ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
-                let req = DeleteShardRequest {
-                    shard_id: Some(ShardId {
-                        object_id: t.object_id,
-                        stripe_id: t.stripe_id,
-                        position: t.position,
-                    }),
-                };
-                let resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    client.delete_shard(req),
-                )
-                .await
-                .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
-                .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-                Ok(resp.into_inner().success)
+                let result = async {
+                    let mut client = client
+                        .ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
+                    let req = DeleteShardRequest {
+                        shard_id: Some(ShardId {
+                            object_id: t.object_id.clone(),
+                            stripe_id: t.stripe_id,
+                            position: t.position,
+                        }),
+                    };
+                    let resp = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.delete_shard(req),
+                    )
+                    .await
+                    .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                    .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    Ok(resp.into_inner().success)
+                }
+                .await;
+                (t, result)
             }
         })
         .buffer_unordered(RECLAIM_CONCURRENCY)
@@ -2680,19 +2811,18 @@ pub async fn reclaim_shards(
         .await;
 
     let mut reclaimed = 0u64;
-    let mut failed = 0usize;
-    for r in results {
+    for (t, r) in results {
         match r {
             Ok(true) => reclaimed += 1,
             Ok(false) => {}
             Err(e) => {
-                failed += 1;
-                warn!("reclaim ({}): delete_shard failed: {e}", reason.label());
+                debug!("reclaim ({}): delete_shard failed: {e}", reason.label());
+                out.delete.push(t);
             }
         }
     }
-    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
-    failed
+    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, 0);
+    out
 }
 
 #[cfg(test)]
@@ -2807,6 +2937,24 @@ mod reclaim_tests {
         assert_eq!(got, stripe_targets(&old.stripes));
     }
 
+    /// A replica down for the write may still hold the old object, but it
+    /// is never read again: the answers that agree free it.
+    #[test]
+    fn a_replica_that_missed_the_overwrite_holds_nothing_up() {
+        let old = object(1, vec![stripe(1, 0, 10, 6)]);
+        let new = object(2, vec![stripe(2, 0, 10, 6)]);
+        let missed = Displaced {
+            missed: true,
+            ..Displaced::default()
+        };
+        let got = reclaimable_after_overwrite(
+            &[missed.clone(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert_eq!(got, stripe_targets(&old.stripes));
+        assert!(reclaimable_after_overwrite(&[missed], &keep(&new)).is_empty());
+    }
+
     #[test]
     fn a_new_key_frees_nothing() {
         let new = object(2, vec![]);
@@ -2912,11 +3060,13 @@ mod reclaim_tests {
         assert!(freed.lock().unwrap().is_empty());
     }
 
-    /// Reclaim against an OSD that cannot be reached counts a failure and
-    /// returns, rather than failing whatever triggered it.
+    /// Reclaim that can't get through (meta, or the OSD, unreachable)
+    /// returns at once with how much it didn't free, rather than failing
+    /// whatever triggered it. That is tried again, and counted as failed
+    /// once the retries are up.
     #[tokio::test]
-    async fn an_unreachable_osd_is_counted_not_fatal() {
-        let pool = OsdPool::new();
+    async fn what_cannot_be_freed_is_retried_then_counted() {
+        let pool = Arc::new(OsdPool::new());
         let meta = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let mut meta =
             objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta);
@@ -2928,8 +3078,16 @@ mod reclaim_tests {
             position: 0,
             owner: vec![5; 16],
         };
-        let failed = reclaim_shards(&pool, &mut meta, vec![target], Reclaim::FailedWrite).await;
+        let failed =
+            reclaim_shards(&pool, &mut meta, vec![target.clone()], Reclaim::FailedWrite).await;
         assert_eq!(failed, 1);
+
+        let left = Unfreed {
+            release: Vec::new(),
+            delete: vec![target],
+        };
+        let zero = std::time::Duration::ZERO;
+        retry_reclaim(pool, meta, left, Reclaim::FailedWrite, zero, zero).await;
         assert!(
             crate::gateway_metrics::render()
                 .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")

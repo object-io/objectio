@@ -194,7 +194,7 @@ pub(crate) async fn delete_version(
     } else {
         // What the replicas removed (a packing switch may have rewritten
         // the version since it was read), and only what none still has.
-        for gone in unreferenced(pool, nodes, bucket, key, deleted.removed).await {
+        for gone in unreferenced(pool, nodes, bucket, key, deleted.removed, Unread::KeepAll).await {
             let failed = reclaim_shards(
                 pool,
                 &mut state.meta_client.clone(),
@@ -204,7 +204,7 @@ pub(crate) async fn delete_version(
             .await;
             if failed > 0 {
                 warn!(
-                    "{bucket}/{key} version {vid}: {failed} shard deletes failed; those blocks stay allocated"
+                    "{bucket}/{key} version {vid}: {failed} shard deletes failed; retried in the background"
                 );
             }
         }
@@ -638,8 +638,10 @@ pub(crate) async fn delete_object_to_the_end(
     // the object can change in between (a PUT replacing it, a packing
     // switch or a tagging update rewriting it), and freeing the stripes of
     // the version read would leak the ones the removed copy named. Only
-    // once every replica has let it go, and only what no replica still has
-    // as current: a racing write can leave it on some.
+    // once the delete made its quorum, and only what no replica that can be
+    // read still has as current: a racing write can leave it on some. The
+    // bucket has never had versioning (a marker went in above otherwise),
+    // so a replica the delete missed is passed over (`Unread::PassOver`).
     let pg = crate::osd_pool::pg_ref(&placement);
     let deleted = delete_meta_from_all(
         &state.osd_pool,
@@ -661,35 +663,27 @@ pub(crate) async fn delete_object_to_the_end(
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
-    if deleted.ok < deleted.of {
-        warn!(
-            "{bucket}/{key}: {} of {} replicas deleted it; its blocks stay allocated",
-            deleted.ok, deleted.of
-        );
-    } else {
-        for gone in unreferenced(
+    for gone in unreferenced(
+        &state.osd_pool,
+        &placement.nodes,
+        &bucket,
+        &key,
+        deleted.removed,
+        Unread::PassOver,
+    )
+    .await
+    {
+        let failed = reclaim_shards(
             &state.osd_pool,
-            &placement.nodes,
-            &bucket,
-            &key,
-            deleted.removed,
+            &mut meta_client,
+            stripe_targets_of(&gone),
+            Reclaim::Delete,
         )
-        .await
-        {
-            let failed = reclaim_shards(
-                &state.osd_pool,
-                &mut meta_client,
-                stripe_targets_of(&gone),
-                Reclaim::Delete,
-            )
-            .await;
-            if failed > 0 {
-                // Leaked blocks, not lost data — the object is gone either way.
-                warn!(
-                    "{}/{}: {} shard deletes failed; those blocks stay allocated",
-                    bucket, key, failed
-                );
-            }
+        .await;
+        if failed > 0 {
+            // Leaked blocks if they keep failing, not lost data: the object
+            // is gone either way.
+            warn!("{bucket}/{key}: {failed} shard deletes failed; retried in the background");
         }
     }
 

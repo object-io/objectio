@@ -526,7 +526,7 @@ pub(crate) fn spawn_reclaim(
         let failed = reclaim_shards(&state.osd_pool, &mut meta, targets, reason).await;
         if failed > 0 {
             warn!(
-                "{what}: {failed} of {total} shard deletes failed ({}); those blocks stay allocated",
+                "{what}: {failed} of {total} shard deletes failed ({}); retried in the background",
                 reason.label()
             );
         } else {

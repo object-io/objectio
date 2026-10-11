@@ -5,10 +5,10 @@
 const MAX_SHARD_SIZE: usize = 4 * 1024 * 1024 - 4096; // ~4MB per shard
 
 use crate::osd_pool::{
-    Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget, delete_meta_from_all,
-    get_object_meta_from_any, get_object_version_meta_from_any, put_object_meta_to_all,
-    read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite, referenced_object_ids,
-    stripe_targets, stripe_targets_of, unreferenced, write_shard_to_osd,
+    Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget, Unread,
+    delete_meta_from_all, get_object_meta_from_any, get_object_version_meta_from_any,
+    put_object_meta_to_all, read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite,
+    referenced_object_ids, stripe_targets, stripe_targets_of, unreferenced, write_shard_to_osd,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{

@@ -143,9 +143,10 @@ fn a_deleted_object_does_not_come_back_with_a_stale_copy() {
 }
 
 /// Healing (core/object-metadata-quorum.md): an overwrite and a delete made
-/// with one OSD down can't free what they replaced (a copy still names it);
-/// once the OSD is back the healer brings its copy up to date and frees it,
-/// so with everything deleted the space is all back.
+/// with one OSD down leave its copy naming what they replaced; once the OSD
+/// is back its copy is brought up to date, and with everything deleted the
+/// space is all back (what they replaced was freed on the other OSDs at
+/// once, and on this one by the retries or by recovery).
 #[test]
 fn healing_brings_a_returning_copy_up_to_date_and_frees_space() {
     let mut ha = HaCluster::start(1, 6, 1);
@@ -193,6 +194,76 @@ fn healing_brings_a_returning_copy_up_to_date_and_frees_space() {
         used, empty,
         "space left behind after healing and deleting everything"
     );
+}
+
+/// An overwrite and a delete made with one OSD down free what they
+/// replaced at once, rather than when that OSD is brought up to date: it
+/// may come back on a new drive, which never held it, so nothing would.
+/// Soak run 26 leaked 2.6 GB so, everything deleted or overwritten while
+/// a lost drive's replacement was being filled.
+#[test]
+fn what_an_overwrite_and_a_delete_replace_with_a_drive_lost_is_freed() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    assert_eq!(
+        ha.clients[0].request("DELETE", "/quorum/probe", &[]).status,
+        204
+    );
+    let empty = ha.clients[0].await_total_used_bytes(0);
+    for k in ["a", "d"] {
+        let r = ha.clients[0].request("PUT", &format!("/quorum/{k}"), &payload(300_000, 1));
+        assert_eq!(r.status, 200, "{}", r.text());
+    }
+    let ids = node_ids(&ha);
+
+    ha.stop_osd(2);
+    let c = &ha.clients[0];
+    assert_eq!(
+        c.request("PUT", "/quorum/a", &payload(300_000, 2)).status,
+        200
+    );
+    assert_eq!(c.request("DELETE", "/quorum/d", &[]).status, 204);
+    ha.lose_osd_drive(2);
+    ha.start_osd(2, None);
+    let c = &ha.clients[0];
+
+    // The new drive filled and the lost one's entry gone (its last used
+    // bytes would count otherwise).
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let now = node_ids(&ha);
+        if agree(&ha, "a") && agree(&ha, "d") && ids.iter().filter(|i| now.contains(i)).count() == 5
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never recovered: a {:?}, d {:?}, nodes {now:?}",
+            copies(&ha, "a"),
+            copies(&ha, "d")
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(c.request("GET", "/quorum/a", &[]).bytes == payload(300_000, 2));
+
+    assert_eq!(c.request("DELETE", "/quorum/a", &[]).status, 204);
+    let used = c.await_total_used_bytes(empty);
+    assert_eq!(
+        used, empty,
+        "space left behind by what was replaced while the drive was lost"
+    );
+}
+
+/// The OSDs' node ids, as `/_admin/nodes` lists them.
+fn node_ids(ha: &HaCluster) -> Vec<String> {
+    ha.clients[0].request("GET", "/_admin/nodes", &[]).json()["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["node_id"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// Each OSD's copy of `quorum/key`: its object id, or None.
