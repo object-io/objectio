@@ -274,10 +274,29 @@ impl MetadataWal {
 
     /// Open an existing WAL file
     pub fn open(path: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
+        Self::open_replaying(path, config, u64::MAX, |_| Ok(()))
+    }
+
+    /// Open an existing WAL file, replaying its entries from `from_lsn` in
+    /// the pass that finds where it ends: a start reads the log once, not
+    /// once to find its end and again to replay it (a 64 MiB log was read
+    /// twice on every OSD start).
+    pub fn open_replaying<F>(
+        path: impl AsRef<Path>,
+        config: WalConfig,
+        from_lsn: u64,
+        mut callback: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(MetadataEntry) -> Result<()>,
+    {
         let path = path.as_ref().to_path_buf();
 
-        // First, scan to find the last LSN
-        let (last_lsn, file_size) = Self::scan_wal(&path)?;
+        // The last LSN and where the last whole record ends, the entries
+        // from `from_lsn` replayed on the way.
+        let (last_lsn, file_size) = Self::scan_wal(&path, from_lsn, |lsn, op| {
+            entries_of(lsn, op, &mut callback)
+        })?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -320,11 +339,15 @@ impl MetadataWal {
         })
     }
 
-    /// Scan the WAL for its last LSN and where its last whole record ends.
+    /// Scan the WAL for its last LSN and where its last whole record ends,
+    /// calling `callback` for each operation from `from_lsn`.
     ///
     /// Anything after that — a record torn by a crash mid-append, or bytes
     /// that are not a record — is not part of the log.
-    fn scan_wal(path: &Path) -> Result<(u64, u64)> {
+    fn scan_wal<F>(path: &Path, from_lsn: u64, mut callback: F) -> Result<(u64, u64)>
+    where
+        F: FnMut(u64, MetadataOp) -> Result<()>,
+    {
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -337,6 +360,9 @@ impl MetadataWal {
         let mut records = Records::new(file);
         let mut last_lsn = 0u64;
         for record in &mut records {
+            if record.lsn >= from_lsn {
+                callback(record.lsn, decode(path, &record)?)?;
+            }
             last_lsn = record.lsn;
         }
         Ok((last_lsn, records.end))
@@ -469,15 +495,7 @@ impl MetadataWal {
         // OSD acknowledged, so the replay stops instead.
         for record in Records::new(file) {
             if record.lsn >= from_lsn {
-                let op = MetadataOp::from_bytes(&record.data).ok_or_else(|| {
-                    Error::Storage(format!(
-                        "metadata log {}: record {} is intact but doesn't decode (written by a \
-                         newer release?); refusing to start rather than drop it",
-                        self.path.display(),
-                        record.lsn
-                    ))
-                })?;
-                callback(record.lsn, op)?;
+                callback(record.lsn, decode(&self.path, &record)?)?;
             }
             last_lsn = record.lsn;
         }
@@ -490,32 +508,7 @@ impl MetadataWal {
     where
         F: FnMut(MetadataEntry) -> Result<()>,
     {
-        self.replay(from_lsn, |lsn, op| {
-            match op {
-                MetadataOp::Put { key, value } => {
-                    callback(MetadataEntry::new(key, value, lsn))?;
-                }
-                MetadataOp::Delete { key } => {
-                    callback(MetadataEntry::tombstone(key, lsn))?;
-                }
-                MetadataOp::Batch { ops } => {
-                    for sub_op in ops {
-                        match sub_op {
-                            MetadataOp::Put { key, value } => {
-                                callback(MetadataEntry::new(key, value, lsn))?;
-                            }
-                            MetadataOp::Delete { key } => {
-                                callback(MetadataEntry::tombstone(key, lsn))?;
-                            }
-                            MetadataOp::Batch { .. } => {
-                                // Nested batches not supported
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
+        self.replay(from_lsn, |lsn, op| entries_of(lsn, op, &mut callback))
     }
 
     /// Where the log ends now (see [`WalMark`]).
@@ -624,6 +617,47 @@ impl MetadataWal {
     /// Get the path of the WAL file
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// A whole, checksummed record that doesn't decode is not a torn write: a
+/// newer release wrote it, or the decoder broke. Skipping it would silently
+/// drop a change this OSD acknowledged, so the replay stops instead.
+fn decode(path: &Path, record: &WalRecord) -> Result<MetadataOp> {
+    MetadataOp::from_bytes(&record.data).ok_or_else(|| {
+        Error::Storage(format!(
+            "metadata log {}: record {} is intact but doesn't decode (written by a \
+             newer release?); refusing to start rather than drop it",
+            path.display(),
+            record.lsn
+        ))
+    })
+}
+
+/// The entries `op` (logged at `lsn`) makes, each given to `callback`.
+fn entries_of<F>(lsn: u64, op: MetadataOp, callback: &mut F) -> Result<()>
+where
+    F: FnMut(MetadataEntry) -> Result<()>,
+{
+    match op {
+        MetadataOp::Put { key, value } => callback(MetadataEntry::new(key, value, lsn)),
+        MetadataOp::Delete { key } => callback(MetadataEntry::tombstone(key, lsn)),
+        MetadataOp::Batch { ops } => {
+            for sub_op in ops {
+                match sub_op {
+                    MetadataOp::Put { key, value } => {
+                        callback(MetadataEntry::new(key, value, lsn))?;
+                    }
+                    MetadataOp::Delete { key } => {
+                        callback(MetadataEntry::tombstone(key, lsn))?;
+                    }
+                    MetadataOp::Batch { .. } => {
+                        // Nested batches not supported
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -822,6 +856,41 @@ mod group_commit_tests {
             key: MetadataKey::block(n),
             value: vec![0u8; 128],
         }
+    }
+
+    /// Opening replays from the LSN asked, in the pass that finds the log's
+    /// end: the entries a replay after opening gives, and appends go on
+    /// after the last record.
+    #[test]
+    fn opening_replays_what_a_replay_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.wal");
+        {
+            let wal = wal(&dir);
+            for n in 1..=10 {
+                wal.append(&op(n)).unwrap();
+            }
+            wal.append(&MetadataOp::Delete {
+                key: MetadataKey::block(3),
+            })
+            .unwrap();
+        }
+        let summary = |e: &MetadataEntry| (e.key.clone(), e.deleted, e.lsn);
+        let mut opened = Vec::new();
+        let wal = MetadataWal::open_replaying(&path, WalConfig::default(), 5, |e| {
+            opened.push(summary(&e));
+            Ok(())
+        })
+        .unwrap();
+        let mut replayed = Vec::new();
+        wal.iter_entries(5, |e| {
+            replayed.push(summary(&e));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(opened, replayed);
+        assert_eq!(opened.len(), 7);
+        assert_eq!(wal.append(&op(11)).unwrap(), 12);
     }
 
     /// Every appended record must survive a reopen.
