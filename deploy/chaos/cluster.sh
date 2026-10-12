@@ -96,9 +96,13 @@ up() {
     done
 
     # Logs for a whole soak: the default journal keeps about five hours of
-    # a busy node, and soak run 9 needed ones from before that.
+    # a busy node, and soak run 9 needed ones from before that. rsyslog
+    # would keep a second, uncompressed copy in /var/log/syslog: a gateway
+    # under faults writes ~300 MB/h of it, which fills the 12 GiB root
+    # (and meta's and the OSD's metadata with it) within a day.
     for i in $(seq 1 "$N"); do
         incus exec "chaos-$i" -- sh -c 'mkdir -p /etc/systemd/journald.conf.d && printf "[Journal]\nSystemMaxUse=3G\n" > /etc/systemd/journald.conf.d/objectio.conf && systemctl restart systemd-journald'
+        incus exec "chaos-$i" -- sh -c 'systemctl disable --now rsyslog.service syslog.socket >/dev/null 2>&1; rm -f /var/log/syslog*'
     done
 
     declare -A IP
