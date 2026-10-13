@@ -568,6 +568,24 @@ pub struct Args {
     pub tls: objectio_proto::transport::TlsArgs,
 }
 
+/// Each worker thread's stack. A request's handler is polled on a worker,
+/// and an S3 handler's future nests deep (a versioned copy: read, encode,
+/// commit, heal); tokio's 2 MiB default overflowed on one in a debug
+/// aarch64 build, which aborts the whole process.
+pub const WORKER_STACK_BYTES: usize = 8 << 20;
+
+/// The runtime a process serving the gateway runs on: tokio's
+/// multi-threaded one, its workers given [`WORKER_STACK_BYTES`].
+///
+/// # Errors
+/// When the runtime can't be built (threads can't be started).
+pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+}
+
 /// Run the gateway until `shutdown` resolves. Caller owns the tracing
 /// subscriber and the Ctrl-C wiring; we trust args already parsed.
 pub async fn run(

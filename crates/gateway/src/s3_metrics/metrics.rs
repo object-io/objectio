@@ -144,6 +144,8 @@ pub enum S3Operation {
     DeleteObjectConfig,
     /// POST to a bucket other than `?delete` (browser form upload).
     PostObject,
+    /// `POST /{bucket}/{key}?select`: S3 Select.
+    SelectObjectContent,
 }
 
 impl S3Operation {
@@ -175,6 +177,7 @@ impl S3Operation {
             S3Operation::PutObjectConfig => "PutObjectConfig",
             S3Operation::DeleteObjectConfig => "DeleteObjectConfig",
             S3Operation::PostObject => "PostObject",
+            S3Operation::SelectObjectContent => "SelectObjectContent",
         }
     }
 }

@@ -258,6 +258,9 @@ pub struct PostObjectParams {
     /// [`grep::GrepEvent`] per line. The query-string value is ignored
     /// — presence alone is the signal.
     pub(crate) grep: Option<String>,
+    /// If present, SelectObjectContent (S3 Select); `select-type=2`
+    /// comes with it.
+    pub(crate) select: Option<String>,
 }
 
 /// Query parameters for DELETE object operations (handles both delete and abort)

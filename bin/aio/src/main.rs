@@ -561,8 +561,12 @@ async fn bootstrap_raft(port: u16) -> Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// The gateway's runtime: its request handlers need its workers' stacks.
+fn main() -> Result<()> {
+    objectio_gateway::runtime()?.block_on(serve())
+}
+
+async fn serve() -> Result<()> {
     let args = Args::parse();
     // Once for the process: every service run below shares it.
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
