@@ -146,6 +146,14 @@ impl MetadataService for MetaService {
         Self::abort_multipart_upload(self, request).await
     }
 
+    #[allow(clippy::result_large_err)]
+    async fn settle_multipart_upload(
+        &self,
+        request: Request<SettleMultipartUploadRequest>,
+    ) -> Result<Response<SettleMultipartUploadResponse>, Status> {
+        Self::settle_multipart_upload(self, request).await
+    }
+
     async fn list_multipart_uploads(
         &self,
         request: Request<ListMultipartUploadsRequest>,
@@ -599,6 +607,17 @@ impl MetadataService for MetaService {
         request: Request<GetPlacementGroupRequest>,
     ) -> Result<Response<GetPlacementGroupResponse>, Status> {
         Self::get_placement_group(self, request).await
+    }
+
+    async fn request_pg_scrub(
+        &self,
+        request: Request<objectio_proto::metadata::RequestPgScrubRequest>,
+    ) -> Result<Response<objectio_proto::metadata::RequestPgScrubResponse>, Status> {
+        let r = request.into_inner();
+        self.request_pg_scrub(&r.pool, r.pg_id).await?;
+        Ok(Response::new(
+            objectio_proto::metadata::RequestPgScrubResponse {},
+        ))
     }
 
     async fn list_placement_groups(

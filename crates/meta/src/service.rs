@@ -12,6 +12,10 @@ mod kms;
 mod multipart;
 mod objects;
 mod packs;
+pub(crate) mod peering;
+pub(crate) mod pgs;
+pub(crate) mod recovery;
+pub(crate) mod scrub;
 mod tenants;
 mod unity;
 mod upgrade;
@@ -271,11 +275,12 @@ use objectio_proto::metadata::{
     ListingNode,
     MultipartUpload,
     NodePlacement,
-    ObjectHome,
     ObjectListingEntry,
     ObjectLockConfiguration,
     ObjectMeta,
     PartMeta,
+    PgEpoch,
+    PgFill,
     PlacementGroup,
     PolicyObject,
     PoolConfig,
@@ -306,6 +311,8 @@ use objectio_proto::metadata::{
     SetConfigResponse,
     SetOsdAdminStateRequest,
     SetOsdAdminStateResponse,
+    SettleMultipartUploadRequest,
+    SettleMultipartUploadResponse,
     ShardType,
     TenantConfig,
     // Unity Catalog types
@@ -1027,6 +1034,10 @@ impl MetaService {
                         CasTable::PlacementGroups => {
                             svc.apply_placement_group_event(&key, new_value.as_deref());
                         }
+                        // Every node, not only the one that took the call: a
+                        // follower knew a pool only after a restart, and a
+                        // leader elected meanwhile placed none of its keys.
+                        CasTable::Pools => svc.apply_pool_event(&key, new_value.as_deref()),
                         CasTable::Config => {
                             svc.apply_config_event(&key, new_value.as_deref());
                         }
@@ -2677,7 +2688,8 @@ mod multipart_reclaim_tests {
     use super::MetaService;
     use objectio_proto::metadata::{
         AbortMultipartUploadRequest, CompleteMultipartUploadRequest, CreateBucketRequest,
-        CreateMultipartUploadRequest, PartInfo, RegisterPartRequest, StripeMeta,
+        CreateMultipartUploadRequest, PartInfo, RegisterPartRequest, SettleMultipartUploadRequest,
+        StripeMeta,
     };
     use tonic::Request;
 
@@ -2756,6 +2768,7 @@ mod multipart_reclaim_tests {
                     etag: format!("\"{:032x}\"", 2),
                     size: 0,
                 }],
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -2778,6 +2791,123 @@ mod multipart_reclaim_tests {
             Err(tonic::Code::NotFound),
             "abort of a completed upload"
         );
+    }
+
+    fn two_phase(id: &str, parts: &[u32]) -> CompleteMultipartUploadRequest {
+        // Recorded only at the level every node reads it.
+        objectio_common::version::set_active_level(
+            objectio_common::version::COMPLETED_UPLOADS_LEVEL,
+        );
+        CompleteMultipartUploadRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: id.into(),
+            parts: parts
+                .iter()
+                .map(|n| PartInfo {
+                    part_number: *n,
+                    etag: format!("\"{n:032x}\""),
+                    size: 0,
+                })
+                .collect(),
+            version_id: "v1".into(),
+            settle_after_commit: true,
+        }
+    }
+
+    async fn settle(svc: &MetaService, id: &str, object_id: Vec<u8>, committed: bool) -> bool {
+        svc.settle_multipart_upload(Request::new(SettleMultipartUploadRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: id.into(),
+            object_id,
+            committed,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .settled
+    }
+
+    async fn abort(svc: &MetaService, id: &str) -> Result<Vec<u8>, tonic::Code> {
+        svc.abort_multipart_upload(Request::new(AbortMultipartUploadRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            upload_id: id.into(),
+        }))
+        .await
+        .map(|r| ids(&r.into_inner().stripes))
+        .map_err(|e| e.code())
+    }
+
+    /// A two-phase completion keeps the upload until it is settled: sent
+    /// again it makes the same object, nothing can abort it or change its
+    /// parts meanwhile, and "not stored" gives the upload back as it was.
+    #[tokio::test]
+    async fn a_completion_not_stored_gives_the_upload_back() {
+        let svc = MetaService::new();
+        let id = upload(&svc).await;
+        for part in [1, 2, 3] {
+            register(&svc, &id, part, u8::try_from(part).unwrap()).await;
+        }
+        let first = svc
+            .complete_multipart_upload(Request::new(two_phase(&id, &[1, 2])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.settling);
+        assert_eq!(ids(&first.unused_stripes), [3]);
+        let object = first.object.unwrap();
+        assert_eq!(object.version_id, "v1");
+        assert_eq!(ids(&object.stripes), [1, 2]);
+
+        let again = svc
+            .complete_multipart_upload(Request::new(two_phase(&id, &[1, 2])))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again.object.unwrap().object_id, object.object_id);
+        assert!(again.unused_stripes.is_empty());
+
+        assert_eq!(abort(&svc, &id).await, Err(tonic::Code::FailedPrecondition));
+        let reupload = svc
+            .register_part(Request::new(RegisterPartRequest {
+                bucket: "b".into(),
+                key: "k".into(),
+                upload_id: id.clone(),
+                part_number: 1,
+                etag: format!("\"{:032x}\"", 9),
+                size: 5 * 1024 * 1024,
+                stripes: vec![stripe(9)],
+                checksum: None,
+            }))
+            .await;
+        assert_eq!(
+            reupload.map(drop).map_err(|e| e.code()),
+            Err(tonic::Code::FailedPrecondition)
+        );
+
+        // Another completion's settle changes nothing.
+        assert!(!settle(&svc, &id, vec![0; 16], false).await);
+        assert!(settle(&svc, &id, object.object_id.clone(), false).await);
+        // Open again: its parts (the ones the completion used) are there.
+        assert_eq!(abort(&svc, &id).await, Ok(vec![1, 2]));
+    }
+
+    #[tokio::test]
+    async fn a_completion_stored_takes_the_upload() {
+        let svc = MetaService::new();
+        let id = upload(&svc).await;
+        register(&svc, &id, 1, 1).await;
+        let object = svc
+            .complete_multipart_upload(Request::new(two_phase(&id, &[1])))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert!(settle(&svc, &id, object.object_id, true).await);
+        assert_eq!(abort(&svc, &id).await, Err(tonic::Code::NotFound));
     }
 
     #[tokio::test]

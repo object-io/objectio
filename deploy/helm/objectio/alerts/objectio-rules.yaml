@@ -39,6 +39,52 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: Corrupt shards found and not rebuilt within an hour
+      # Placement groups (B31): their state as the leader's peering finds
+      # it; `obioctl pg list --state <S>` names them, `obioctl pg get` says
+      # why.
+      - alert: ObjectIOPgDown
+        expr: max(objectio_meta_pgs{state="Down"}) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Placement groups have fewer members answering than a read needs; their objects can't be read or written
+      - alert: ObjectIOPgIncomplete
+        expr: max(objectio_meta_pgs{state="Incomplete"}) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Placement groups have fewer than a read quorum of members answering; nothing is rebuilt until they answer or are declared lost
+      - alert: ObjectIOObjectsUnfound
+        expr: max(objectio_meta_pg_objects_unfound) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: Objects have fewer complete shards than a read needs among the members that answer
+      - alert: ObjectIOObjectsLost
+        expr: max(objectio_meta_lost_objects) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Objects were recorded lost (fewer than k shards anywhere, the rest gone with a member lost for good)
+      - alert: ObjectIOPgNotCleanWithOsdsUp
+        # Recovery is stuck, or too slow: a PG out of Clean for an hour
+        # while every OSD in service is up.
+        expr: max(objectio_meta_pg_not_clean_oldest_seconds) > 3600 and max(objectio_meta_osds_down) == 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: A placement group has been out of Clean for over an hour with every OSD up
+      - alert: ObjectIOPgUndersized
+        expr: max(objectio_meta_pgs{state="Undersized"}) > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: Placement groups have a position no OSD can stand in for within the pool's rule; add OSDs or bring the member back
+      - alert: ObjectIOPgScrubStale
+        # Twice the scrub cycle (scrub/every_seconds, 7 days).
+        expr: max(objectio_meta_scrub_oldest_seconds) > 14 * 86400
+        labels: {severity: warning}
+        annotations:
+          summary: A placement group has not been scrubbed in two weeks
 
   - name: objectio-metadata
     rules:

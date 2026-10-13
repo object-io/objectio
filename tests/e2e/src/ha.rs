@@ -18,6 +18,7 @@ struct Meta {
     id: u64,
     grpc: u16,
     admin: u16,
+    metrics: u16,
     dir: PathBuf,
     /// Where its binary comes from: `None` for this build, or a directory
     /// holding another release's (rolling-upgrade tests).
@@ -70,6 +71,12 @@ pub struct HaCluster {
     /// rolling upgrade) runs plain, also once its nodes run this build: a
     /// cluster can't run half on TLS.
     tls: bool,
+    /// Each OSD on a host of its own (`h0`, `h1`, …) rather than all on
+    /// one: what a pool with placement groups needs to spread over them.
+    osd_hosts: bool,
+    /// The rack of each OSD, by index, when given: for pools spread over
+    /// racks (B31 phase 1b).
+    osd_racks: Vec<String>,
 }
 
 impl Drop for HaCluster {
@@ -139,7 +146,7 @@ impl HaCluster {
     /// release's), or from this build when `None`.
     #[must_use]
     pub fn start_from(bins: Option<&Path>, metas: usize, osds: usize, gateways: usize) -> Self {
-        Self::start_with(bins, metas, osds, gateways, &[])
+        Self::start_with(bins, metas, osds, gateways, &[], false)
     }
 
     /// As [`Self::start`], every meta node also given `meta_args`.
@@ -150,7 +157,42 @@ impl HaCluster {
         gateways: usize,
         meta_args: &[&str],
     ) -> Self {
-        Self::start_with(None, metas, osds, gateways, meta_args)
+        Self::start_with(None, metas, osds, gateways, meta_args, false)
+    }
+
+    /// As [`Self::start`], each OSD on a host of its own, so a pool's
+    /// placement groups can spread over them (one host can't hold k + m
+    /// failure domains).
+    #[must_use]
+    pub fn start_with_osd_hosts(metas: usize, osds: usize, gateways: usize) -> Self {
+        Self::start_with(None, metas, osds, gateways, &[], true)
+    }
+
+    /// As [`Self::start_with_osd_hosts`], OSD `i` also in rack `racks[i]`
+    /// (one OSD per entry): for pools whose copies are spread over racks.
+    #[must_use]
+    pub fn start_with_osd_racks(metas: usize, racks: &[&str], gateways: usize) -> Self {
+        Self::start_with_racks(metas, racks, gateways, &[])
+    }
+
+    /// As [`Self::start_with_osd_racks`], every meta node also given
+    /// `meta_args`.
+    #[must_use]
+    pub fn start_with_racks(
+        metas: usize,
+        racks: &[&str],
+        gateways: usize,
+        meta_args: &[&str],
+    ) -> Self {
+        Self::start_inner(
+            None,
+            metas,
+            racks.len(),
+            gateways,
+            meta_args,
+            true,
+            racks.iter().map(ToString::to_string).collect(),
+        )
     }
 
     fn start_with(
@@ -159,6 +201,27 @@ impl HaCluster {
         osds: usize,
         gateways: usize,
         meta_args: &[&str],
+        osd_hosts: bool,
+    ) -> Self {
+        Self::start_inner(
+            bins,
+            metas,
+            osds,
+            gateways,
+            meta_args,
+            osd_hosts,
+            Vec::new(),
+        )
+    }
+
+    fn start_inner(
+        bins: Option<&Path>,
+        metas: usize,
+        osds: usize,
+        gateways: usize,
+        meta_args: &[&str],
+        osd_hosts: bool,
+        osd_racks: Vec<String>,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
@@ -167,6 +230,7 @@ impl HaCluster {
                     id: i as u64,
                     grpc: free_port(),
                     admin: free_port(),
+                    metrics: free_port(),
                     dir: dir.path().join(format!("meta{i}")),
                     bins: Mutex::new(bins.map(Path::to_path_buf)),
                     child: Mutex::new(None),
@@ -180,6 +244,8 @@ impl HaCluster {
             secret_key: String::new(),
             meta_args: meta_args.iter().map(ToString::to_string).collect(),
             tls: bins.is_none(),
+            osd_hosts,
+            osd_racks,
         };
         for i in 0..metas {
             // A port it lost to another process: new ones, before any peer
@@ -235,10 +301,25 @@ impl HaCluster {
     /// Start OSD `i` from `bins` (see [`Self::start_from`]).
     fn spawn_osd(&mut self, i: usize, bins: Option<&Path>) {
         let endpoints = self.meta_endpoints();
+        let osd_hosts = self.osd_hosts;
+        let rack = self
+            .osd_racks
+            .get(i)
+            .map(|r| format!("rack = \"{r}\"\n"))
+            .unwrap_or_default();
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
         if self.tls {
             crate::tls::apply(&mut cmd);
+        }
+        if osd_hosts {
+            let config = o.state.join("osd.toml");
+            std::fs::write(
+                &config,
+                format!("[osd.failure_domain]\nhost = \"h{i}\"\n{rack}"),
+            )
+            .expect("osd config");
+            cmd.arg("--config").arg(&config);
         }
         let child = cmd
             .args([
@@ -296,10 +377,35 @@ impl HaCluster {
         await_child_listening(gateway.child.as_mut().unwrap(), &[port])
     }
 
+    /// The highest value of meta metric `name` (no labels) across the
+    /// running meta nodes: the leader's, for a gauge only it sets.
+    pub fn meta_metric(&self, name: &str) -> Option<f64> {
+        self.metas
+            .iter()
+            .filter(|m| m.running())
+            .filter_map(|m| {
+                let text = http()
+                    .get(format!("http://127.0.0.1:{}/metrics", m.metrics))
+                    .send()
+                    .ok()?
+                    .text()
+                    .ok()?;
+                text.lines()
+                    .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+            })
+            .reduce(f64::max)
+    }
+
     /// Start one more gateway, from `bins`, with a signed client of it in
     /// `clients`. Returns its index.
     pub fn add_gateway(&mut self, bins: Option<&Path>) -> usize {
         self.add_gateway_with_args(bins, &[])
+    }
+
+    /// Restart gateway `i` with `args` in place of the ones it had.
+    pub fn restart_gateway_with_args(&mut self, i: usize, args: &[&str]) {
+        self.gateways[i].args = args.iter().map(ToString::to_string).collect();
+        self.restart_gateway(i, None);
     }
 
     /// [`Self::add_gateway`], the gateway started with `args` too.
@@ -342,6 +448,48 @@ impl HaCluster {
         std::fs::File::create(&o.disk)
             .and_then(|f| f.set_len(2 << 30))
             .expect("blank disk");
+    }
+
+    /// Wait until meta has seen that writes made short of a shard (an OSD
+    /// down) are short: a degraded record, a PG not Clean, or, if both
+    /// came and went between looks, `objects` objects recovered. Then a
+    /// wait for Clean means repaired. Without it, such a wait right after
+    /// the OSD is back can end at once: a PG is marked for peering at its
+    /// next look, and reads Clean until then.
+    ///
+    /// # Panics
+    /// If none of those shows within `secs`.
+    pub fn await_seen_short(&self, objects: u32, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while self
+            .meta_metric("objectio_meta_degraded_objects")
+            .unwrap_or(0.0)
+            == 0.0
+            && self
+                .meta_metric("objectio_meta_pgs_not_clean")
+                .unwrap_or(0.0)
+                == 0.0
+            && self
+                .meta_metric("objectio_meta_pg_recovered_objects_total")
+                .unwrap_or(0.0)
+                < f64::from(objects)
+        {
+            assert!(Instant::now() < deadline, "never seen short after {secs} s");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The directory OSD `i` keeps its state under (its metadata index
+    /// among it), beside its disk file.
+    #[must_use]
+    pub fn osd_dir(&self, i: usize) -> &Path {
+        &self.osds[i].state
+    }
+
+    /// The process id of OSD `i`, while it runs.
+    #[must_use]
+    pub fn osd_pid(&self, i: usize) -> Option<u32> {
+        self.osds[i].child.as_ref().map(Child::id)
     }
 
     /// The gRPC address of OSD `i`.
@@ -433,7 +581,7 @@ impl HaCluster {
                 "--data-dir",
                 &m.dir.display().to_string(),
                 "--metrics-port",
-                "0",
+                &m.metrics.to_string(),
                 "--admin-port",
                 &m.admin.to_string(),
                 "--ec-k",
@@ -617,6 +765,7 @@ impl HaCluster {
             id: new_id,
             grpc: free_port(),
             admin: free_port(),
+            metrics: free_port(),
             dir: self.dir.path().join(format!("meta{new_id}")),
             bins: Mutex::new(None),
             child: Mutex::new(None),
@@ -649,7 +798,8 @@ impl HaCluster {
 
     /// Wait until every OSD is known to the cluster (placement works).
     fn await_osds(&self, osds: usize) {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // Generous: clusters of ten OSDs start alongside other tests'.
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let r = self.clients[0].request("GET", "/_admin/nodes", &[]);
             let online = r
@@ -658,6 +808,7 @@ impl HaCluster {
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, Vec::len);
             if r.status == 200 && online >= osds {
+                self.await_default_pool();
                 return;
             }
             assert!(
@@ -665,6 +816,20 @@ impl HaCluster {
                 "only {online} of {osds} OSDs registered"
             );
             std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// Wait until the default pool's placement groups are made (B31): until
+    /// then a PUT is answered 503. A cluster on a release before placement
+    /// groups has none: given up on after a while.
+    pub fn await_default_pool(&self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            let r = self.clients[0].request("GET", "/_admin/pools/default/placement-groups", &[]);
+            if r.status == 200 && r.json()["pgs"].as_array().is_some_and(|p| !p.is_empty()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

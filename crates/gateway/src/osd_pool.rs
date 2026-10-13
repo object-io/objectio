@@ -38,6 +38,40 @@ pub enum OsdPoolError {
     /// This gateway's clock is too far from meta's to stamp a write.
     #[error("{0}")]
     ClockSkew(String),
+
+    /// The OSD knows a newer epoch of the placement group than the write
+    /// was placed under (B31): it was refused, and is placed again.
+    #[error("{0}")]
+    StaleEpoch(String),
+}
+
+/// Marks a response to a request refused because an OSD knew a newer
+/// epoch of its placement group than it was placed under (B31): nothing
+/// was stored, and the request can be placed again and retried.
+#[derive(Clone, Copy, Debug)]
+pub struct StalePlacement;
+
+/// Whether `status` is an OSD refusing a request placed under an older
+/// epoch of its placement group than it knows (B31).
+#[must_use]
+pub fn is_stale_epoch(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(objectio_proto::STALE_EPOCH_HEADER)
+        .is_some()
+}
+
+/// The placement group and epoch a placement is, for the requests that
+/// write by it (B31). None for one made without a placement group.
+#[must_use]
+pub fn pg_ref(
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+) -> Option<objectio_proto::storage::PgRef> {
+    (placement.pg_epoch > 0).then(|| objectio_proto::storage::PgRef {
+        pool: placement.pool.clone(),
+        pg_id: placement.pg_id,
+        epoch: placement.pg_epoch,
+    })
 }
 
 /// Node identifier (16-byte UUID)
@@ -608,6 +642,12 @@ impl OsdPoolError {
     pub const fn is_full(&self) -> bool {
         matches!(self, Self::Full(_))
     }
+
+    /// Whether this is an OSD refusing a write placed under an old epoch.
+    #[must_use]
+    pub const fn is_stale_epoch(&self) -> bool {
+        matches!(self, Self::StaleEpoch(_))
+    }
 }
 
 impl From<ShardCallError> for OsdPoolError {
@@ -617,6 +657,9 @@ impl From<ShardCallError> for OsdPoolError {
             ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
             ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
                 Self::Full(s.message().to_string())
+            }
+            ShardCallError::Status(s) if is_stale_epoch(&s) => {
+                Self::StaleEpoch(s.message().to_string())
             }
             ShardCallError::Status(s) => Self::ConnectionFailed(s.to_string()),
         }
@@ -752,6 +795,7 @@ pub async fn write_shard_to_osd(
     ec_k: u32,
     ec_m: u32,
     rdma: Option<RdmaSource<'_>>,
+    pg: Option<&objectio_proto::storage::PgRef>,
 ) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
     use objectio_proto::storage::{Checksum, RdmaBuffer, ShardId, WriteShardRequest};
 
@@ -781,6 +825,7 @@ pub async fn write_shard_to_osd(
                         len: data.len() as u64,
                     }),
                     use_reserve: false,
+                    pg: pg.cloned(),
                 };
                 match call_write_shard(pool, placement, request).await {
                     Ok(location) => {
@@ -816,6 +861,7 @@ pub async fn write_shard_to_osd(
         data,
         rdma: None,
         use_reserve: false,
+        pg: pg.cloned(),
     };
     let location = call_write_shard(pool, placement, request)
         .await
@@ -1045,10 +1091,27 @@ pub struct MetaWriteError {
 #[derive(Debug, Clone)]
 pub struct Withdrawal {
     pub copies: Vec<NodePlacement>,
+    /// Every copy of the key: what its listing follows once this is
+    /// decided.
+    pub targets: Vec<NodePlacement>,
     pub bucket: String,
     pub key: String,
     pub object_id: Vec<u8>,
     pub version_id: String,
+    /// Set when the copies whose answer to the write was lost could hold
+    /// it on k with those that took it: they are asked first, and it is
+    /// withdrawn only if they don't.
+    pub undecided: Option<Undecided>,
+}
+
+/// A refused small write held by fewer than k copies that said so, and
+/// perhaps by others whose answer was lost: what deciding it needs.
+#[derive(Debug, Clone)]
+pub struct Undecided {
+    holds: Vec<bool>,
+    unsure: Vec<bool>,
+    shards: HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    object_meta: objectio_proto::metadata::ObjectMeta,
 }
 
 impl std::fmt::Display for MetaWriteError {
@@ -1111,6 +1174,8 @@ pub struct MetaWrite<'a> {
     pub small_shards: Option<&'a HashMap<Vec<u8>, objectio_proto::storage::SmallShard>>,
     /// The fewest copies the write needs, if more than the metadata quorum.
     pub min_copies: usize,
+    /// The placement group and epoch the write was placed under (B31).
+    pub pg: Option<&'a objectio_proto::storage::PgRef>,
 }
 
 /// As [`put_object_meta_to_all`], with every option the OSD takes.
@@ -1130,6 +1195,7 @@ pub async fn put_object_meta_with(
         keep_newer_current,
         small_shards,
         min_copies,
+        pg,
     } = write;
 
     let targets = unique_node_placements(placements);
@@ -1154,6 +1220,14 @@ pub async fn put_object_meta_with(
     // of the OSDs holding this ObjectMeta.
     let mut object_meta = object_meta;
     object_meta.usage_owner.clone_from(&targets[0].node_id);
+    // The placement group the key is placed through, kept by every copy
+    // and update: the OSDs index their copies by it (B31 phase 2).
+    if object_meta.pg_pool.is_empty()
+        && let Some(pg) = pg.filter(|p| !p.pool.is_empty())
+    {
+        object_meta.pg_pool.clone_from(&pg.pool);
+        object_meta.pg_id = pg.pg_id;
+    }
     // Every copy gets the same stamp, above any this one was read at: the
     // order the copies keep (core/object-metadata-quorum.md).
     //
@@ -1201,6 +1275,7 @@ pub async fn put_object_meta_with(
                 object: Some(object_meta.clone()),
                 versioning_enabled,
                 expected_object_id: expected_object_id.to_vec(),
+                pg: pg.cloned(),
             };
             let p = placement.clone();
             // The bool on an error: this replica certainly did not apply it.
@@ -1218,7 +1293,8 @@ pub async fn put_object_meta_with(
                             OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
                             false,
                         )
-                    })?
+                    })?;
+                let resp = crate::test_hooks::maybe_lost("put_object_meta", resp)
                     .map_err(|e| {
                         error!(
                             "Failed to put object metadata to OSD {}: {}",
@@ -1231,6 +1307,9 @@ pub async fn put_object_meta_with(
                             e.code(),
                             tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
                         );
+                        if is_stale_epoch(&e) {
+                            return (OsdPoolError::StaleEpoch(e.message().to_string()), true);
+                        }
                         (OsdPoolError::ConnectionFailed(e.to_string()), refused)
                     })?
                     .into_inner();
@@ -1371,6 +1450,13 @@ pub async fn put_object_meta_with(
 /// it. Soak run 10 found the first case left as it was: a refused PUT,
 /// current on four copies with no shard to spare, lost to the next drive.
 ///
+/// A copy whose answer was lost may hold it too. Soak run 25 found a
+/// small overwrite during a partition taken by all six copies, three of
+/// whose answers were lost: counted on three, it was withdrawn from all
+/// six, and the object it had replaced on each went with it. So when the
+/// copies that didn't answer could make k, they are asked first
+/// ([`withdraw_later`]), and it is withdrawn only if fewer than k hold it.
+///
 /// Returns whether no copy holds it any longer (the caller may then free
 /// its shards). Copies that didn't answer the withdrawal go in
 /// `withdrawing`.
@@ -1398,13 +1484,36 @@ async fn settle_short_small_write(
         return false;
     }
 
-    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
     let suspects: Vec<NodePlacement> = targets
         .iter()
         .zip(holds.iter().zip(may_hold))
         .filter(|(_, (h, m))| **h || **m)
         .map(|(t, _)| t.clone())
         .collect();
+    let unsure = may_hold.iter().filter(|&&m| m).count();
+    if held + unsure >= k {
+        warn!(
+            "{bucket}/{key}: refused on {held} copies (k = {k}); {unsure} more may hold it: \
+             asked before it is withdrawn"
+        );
+        *withdrawing = Some(Withdrawal {
+            copies: suspects,
+            targets: targets.to_vec(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            object_id: object_meta.object_id.clone(),
+            version_id: object_meta.version_id.clone(),
+            undecided: Some(Undecided {
+                holds: holds.to_vec(),
+                unsure: may_hold.to_vec(),
+                shards: shards.clone(),
+                object_meta: object_meta.clone(),
+            }),
+        });
+        return false;
+    }
+
+    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
     let left = withdraw_from(pool, suspects, bucket, key, &object_meta.object_id).await;
     if left.is_empty() {
         // A copy that took it lost what it replaced: the others have that.
@@ -1415,24 +1524,34 @@ async fn settle_short_small_write(
     // ([`withdraw_later`]). Until then its shards stay (a leak, not a loss).
     *withdrawing = Some(Withdrawal {
         copies: left,
+        targets: targets.to_vec(),
         bucket: bucket.to_string(),
         key: key.to_string(),
         object_id: object_meta.object_id.clone(),
         version_id: object_meta.version_id.clone(),
+        undecided: None,
     });
     false
 }
 
 /// Keep withdrawing `w` from the copies that didn't answer, for ten
-/// minutes; true once none can hold it (its shards may then go).
+/// minutes; true once none can hold it (its shards may then go). An
+/// undecided write is first kept if k copies turn out to hold it.
 pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
     let Withdrawal {
         mut copies,
+        targets,
         bucket,
         key,
         object_id,
         version_id,
+        undecided,
     } = w;
+    if let Some(u) = undecided
+        && kept_if_held(pool, &targets, u, &bucket, &key).await
+    {
+        return false;
+    }
     let mut wait = std::time::Duration::from_secs(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     while !copies.is_empty() && std::time::Instant::now() < deadline {
@@ -1449,6 +1568,127 @@ pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
         copies.len()
     );
     false
+}
+
+/// Ask the copies whose answer to a refused small write was lost whether
+/// they hold it, for ten minutes. True when k copies do: it is kept, healed
+/// and repaired to full redundancy, as a write refused on k copies is.
+/// False when fewer than k can, or when some still can't be asked after
+/// ten minutes (a copy that long gone is rebuilt from the others): it is
+/// then withdrawn.
+async fn kept_if_held(
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    u: Undecided,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let Undecided {
+        mut holds,
+        mut unsure,
+        shards,
+        object_meta,
+    } = u;
+    let k = object_meta.stripes.first().map_or(0, |s| s.ec_k as usize);
+    let mut wait = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let asks = targets
+            .iter()
+            .zip(&unsure)
+            .enumerate()
+            .filter(|(_, (_, u))| **u)
+            .map(|(i, (p, _))| {
+                let object_meta = &object_meta;
+                async move { (i, copy_holds(pool, p, bucket, key, object_meta).await) }
+            });
+        for (i, answer) in futures::future::join_all(asks).await {
+            if let Some(h) = answer {
+                unsure[i] = false;
+                holds[i] = h;
+            }
+        }
+        let held = holds.iter().filter(|&&h| h).count();
+        let left = unsure.iter().filter(|&&u| u).count();
+        if held >= k {
+            warn!(
+                "{bucket}/{key}: refused, but on {held} copies (k = {k}) once asked: kept, \
+                 healed and repaired to full redundancy"
+            );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            report_missing_small_shards(pool, targets, &holds, &shards, bucket, key, &object_meta)
+                .await;
+            return true;
+        }
+        if held + left < k {
+            warn!("{bucket}/{key}: refused on {held} copies (k = {k}) once asked: withdrawn");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "{bucket}/{key}: refused on {held} copies (k = {k}); {left} could not be asked \
+                 in 10 minutes: withdrawn"
+            );
+            return false;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Whether copy `p` holds `object` of `bucket/key`, current or as its
+/// version; `None` when it can't be asked.
+async fn copy_holds(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> Option<bool> {
+    let is_it = |o: Option<objectio_proto::metadata::ObjectMeta>| {
+        o.is_some_and(|o| o.object_id == object.object_id)
+    };
+    if is_it(copy_entry(pool, p, bucket, key, "").await?) {
+        return Some(true);
+    }
+    if object.version_id.is_empty() {
+        return Some(false);
+    }
+    // A newer write may have made it a version since.
+    Some(is_it(
+        copy_entry(pool, p, bucket, key, &object.version_id).await?,
+    ))
+}
+
+/// What copy `p` holds of `bucket/key` (`version_id`, or the current entry
+/// when empty); `None` when it can't be asked.
+async fn copy_entry(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Option<Option<objectio_proto::metadata::ObjectMeta>> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    let mut client = pool.get_client_for_placement(p).await.ok()?;
+    let req = GetObjectMetaRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version_id.to_string(),
+        with_small_shard: false,
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pool.watched(&p.node_address, client.get_object_meta(req)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            Some(if inner.found { inner.object } else { None })
+        }
+        _ => None,
+    }
 }
 
 /// Withdraw object `object_id` of `bucket/key` from `copies`; returns the
@@ -1844,6 +2084,24 @@ pub struct MetaDeleted {
     pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
 }
 
+impl MetaDeleted {
+    /// Every copy that carried the delete out removed the same object.
+    /// Otherwise it may have raced a write: the write, superseded by the
+    /// tombstone on some copies, is stamped again and written over it
+    /// everywhere, and its object, which other copies reported removed, is
+    /// current again; its shards are freed only once that has settled
+    /// ([`RESTAMP_SETTLE`]). A copy that missed an earlier write, or a
+    /// blank one being filled, disagrees the same way with no race.
+    #[must_use]
+    pub fn agreed(&self) -> bool {
+        self.removed.len() >= self.ok
+            && self
+                .removed
+                .windows(2)
+                .all(|w| w[0].object_id == w[1].object_id)
+    }
+}
+
 /// Delete the current object (`version_id` empty) or one version of
 /// `bucket/key` from every replica. For a version, each OSD makes the
 /// newest remaining one current if it was, under the key's lock.
@@ -1853,6 +2111,7 @@ pub async fn delete_meta_from_all(
     bucket: &str,
     key: &str,
     version_id: &str,
+    pg: Option<&objectio_proto::storage::PgRef>,
 ) -> MetaDeleted {
     use objectio_proto::storage::DeleteObjectMetaRequest;
 
@@ -1880,6 +2139,7 @@ pub async fn delete_meta_from_all(
                 key: key.to_string(),
                 version_id: version_id.to_string(),
                 stamp,
+                pg: pg.cloned(),
                 ..Default::default()
             });
             let resp = tokio::time::timeout(
@@ -1932,25 +2192,50 @@ pub async fn delete_meta_from_all(
             Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
         }
     }
-    if out.ok >= out.quorum && out.ok < out.of {
+    // Left on some copies, the copies are brought to agree: a delete that
+    // made its quorum, and one refused short of it, which may take effect
+    // all the same (its copies hold the newest stamp). Not healed, the
+    // refused one left the copies disagreeing for good: the object came
+    // back whenever the copies that took the delete were down, and its
+    // shards were never freed.
+    if out.ok > 0 && out.ok < out.of {
         pool.queue_heal(bucket, key, version_id).await;
     }
     out
 }
 
+/// What [`unreferenced`] makes of a replica it can't read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// It keeps everything: it may hold a removed object as a version, or
+    /// as current where the delete didn't make its quorum.
+    KeepAll,
+    /// It is passed over: the delete made its quorum, in a bucket that has
+    /// never had versioning. The delete is stamped above everything it
+    /// removed and a read hears from a quorum, so an object it removed is
+    /// never read again, whatever a replica that missed it still holds;
+    /// recovery takes it off that replica later. Keeping everything leaked
+    /// every object deleted while an OSD was down: most of 2.6 GB in soak
+    /// run 26, deleted while a lost drive's replacement was filled, which
+    /// then had nothing of them for recovery to free. (An overwrite passes
+    /// over a replica it missed the same way: [`reclaimable_after_overwrite`].)
+    PassOver,
+}
+
 /// Of the objects a delete removed, those no replica still has as its
 /// current object: what may be freed. A write racing the delete can leave
 /// an object current on some replicas (they saw the write after the
-/// delete); freeing it would leave them naming shards that are gone. Any
-/// replica that can't be read keeps everything: a leak, never a loss. An
-/// object gone from every replica can't come back: an update of one
-/// requires it to exist, and a PUT always writes a new one.
+/// delete); freeing it would leave them naming shards that are gone. A
+/// replica that can't be read keeps everything or is passed over, as
+/// `unread` says. An object gone from every replica can't come back: an
+/// update of one requires it to exist, and a PUT always writes a new one.
 pub async fn unreferenced(
     pool: &OsdPool,
     placements: &[NodePlacement],
     bucket: &str,
     key: &str,
     removed: Vec<objectio_proto::metadata::ObjectMeta>,
+    unread: Unread,
 ) -> Vec<objectio_proto::metadata::ObjectMeta> {
     let mut distinct: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
     for o in removed {
@@ -1976,6 +2261,10 @@ pub async fn unreferenced(
                     held.insert(o.object_id);
                 }
                 Ok(None) => {}
+                Err(e) if unread == Unread::PassOver => {
+                    debug!("{bucket}/{key}: a replica can't be read after the delete ({e})");
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         "{bucket}/{key}: a replica can't be read after the delete ({e}); \
@@ -2140,15 +2429,46 @@ pub struct Displaced {
     pub missed: bool,
 }
 
-/// Shards of the object an overwrite displaced, if it is safe to free them.
+/// What an overwrite let go of, by what its copies answered.
+#[derive(Debug, Default, PartialEq)]
+pub struct Overwritten {
+    /// Every copy that answered displaced the same object: its shards,
+    /// freed at once.
+    pub now: Vec<ShardTarget>,
+    /// The copies disagreed: each object any of them displaced, freed once
+    /// [`RESTAMP_SETTLE`] has passed if no copy holds it then
+    /// ([`reclaim_unsettled`]).
+    pub unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+}
+
+/// How long a write can go on being stamped again and resent after a copy
+/// first took it: [`MAX_RESTAMPS`] rounds, each a connect (3 s) and an
+/// answer (10 s) at most, so about a minute; twice that.
+pub const RESTAMP_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The shards of the object an overwrite displaced, if it is safe to free
+/// them now; else what to check again later.
 ///
-/// Only when every replica displaced the same object, and none still keeps
-/// it as a version. Each OSD applies writes to a key one at a time, but two
-/// concurrent PUTs can reach the replicas in different orders: then one
-/// replica reports the other PUT's object as replaced while another still
-/// holds it as current. Agreement across every replica rules that out — if
-/// all of them replaced X with this write, none of them holds X any more —
-/// and costs only a leaked object in the rare split case.
+/// At once only when every copy that answered displaced the same object,
+/// and none still keeps it as a version. Two PUTs racing can reach the
+/// copies in different orders: then one copy reports the other PUT's
+/// object as replaced while that PUT, superseded elsewhere, is stamped
+/// again and written over this one everywhere. Its object, current again,
+/// must not lose its shards. Agreement across the answers rules that out:
+/// if all of them held X until this write, X's own write is done.
+///
+/// The copies also disagree with no race: a copy that missed an earlier
+/// write still has the object before it, and a blank one (a lost drive's
+/// replacement, being filled) has nothing. Each object any copy displaced
+/// is then checked again once a racing write can no longer be resent, and
+/// freed if no copy holds it. Freeing nothing leaked every object
+/// overwritten while a lost drive's replacement was filled (soak run 27).
+///
+/// A copy that didn't answer is passed over (the write made its quorum for
+/// these to be asked of): it may still hold X, but X is older than this
+/// write, which a quorum holds, so X is never read again; recovery
+/// replaces it there later. Waiting for every copy leaked every object
+/// overwritten while an OSD was down (soak run 26).
 ///
 /// `keep` is what the new object refers to; nothing in it is freed, which
 /// covers a metadata-only rewrite of the same object.
@@ -2156,29 +2476,83 @@ pub struct Displaced {
 pub fn reclaimable_after_overwrite(
     replies: &[Displaced],
     keep: &std::collections::HashSet<Vec<u8>>,
-) -> Vec<ShardTarget> {
-    let Some(first) = replies.first().and_then(|d| d.replaced.as_ref()) else {
-        return Vec::new();
-    };
-    let unanimous = replies.iter().all(|d| {
-        !d.version_kept
-            && d.replaced
-                .as_ref()
-                .is_some_and(|r| r.object_id == first.object_id)
-    });
-    if !unanimous || first.object_id.is_empty() || keep.contains(&first.object_id) {
-        return Vec::new();
+) -> Overwritten {
+    let replies: Vec<&Displaced> = replies.iter().filter(|d| !d.missed).collect();
+    if replies.iter().any(|d| d.version_kept) {
+        return Overwritten::default();
     }
-    // Replicas can disagree on where a shard is while a migration is
-    // refreshing them; deleting at every location any of them names is
-    // harmless where the shard is not.
-    let mut seen = std::collections::HashSet::new();
-    replies
+    let displaced: Vec<&objectio_proto::metadata::ObjectMeta> = replies
         .iter()
         .filter_map(|d| d.replaced.as_ref())
+        .filter(|o| !o.object_id.is_empty() && !keep.contains(&o.object_id))
+        .collect();
+    let Some(first) = displaced.first() else {
+        return Overwritten::default();
+    };
+    let unanimous = replies.iter().all(|d| {
+        d.replaced
+            .as_ref()
+            .is_some_and(|r| r.object_id == first.object_id)
+    });
+    if !unanimous {
+        let mut unsettled: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
+        for o in displaced {
+            if !unsettled.contains(o) {
+                unsettled.push(o.clone());
+            }
+        }
+        return Overwritten {
+            now: Vec::new(),
+            unsettled,
+        };
+    }
+    Overwritten {
+        now: targets_of(displaced.into_iter(), keep),
+        unsettled: Vec::new(),
+    }
+}
+
+/// Every shard `objects` name, less what `keep` refers to. Copies can
+/// disagree on where a shard is while a migration is refreshing them;
+/// deleting at every location any of them names is harmless where the
+/// shard is not.
+fn targets_of<'a>(
+    objects: impl Iterator<Item = &'a objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<ShardTarget> {
+    let mut seen = std::collections::HashSet::new();
+    objects
         .flat_map(stripe_targets_of)
         .filter(|t| !keep.contains(&t.object_id) && seen.insert(t.clone()))
         .collect()
+}
+
+/// Free those of an overwrite's `unsettled` objects no copy of
+/// `bucket/key` holds, once [`RESTAMP_SETTLE`] has passed: a write racing
+/// the overwrite has been resent by then, if it was going to be, and holds
+/// its object current again. A copy that can't be read is passed over, as
+/// the overwrite passed over one it missed. Returns how many shards were
+/// not freed at the first try.
+pub async fn reclaim_unsettled(
+    pool: &Arc<OsdPool>,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> usize {
+    let asked = unsettled.len();
+    let gone = unreferenced(pool, placements, bucket, key, unsettled, Unread::PassOver).await;
+    debug!(
+        "{bucket}/{key}: {} of {asked} objects an overwrite's copies disagreed on are held nowhere",
+        gone.len()
+    );
+    let targets = targets_of(gone.iter(), keep);
+    if targets.is_empty() {
+        return 0;
+    }
+    reclaim_shards(pool, meta, targets, Reclaim::Overwrite).await
 }
 
 /// Release each target's stripe on its owner's behalf, and return the
@@ -2309,68 +2683,163 @@ impl Drop for PendingShards {
 /// How many shards [`reclaim_shards`] deletes at once.
 const RECLAIM_CONCURRENCY: usize = 64;
 
+/// How long shards that could not be freed (an OSD down, meta electing a
+/// leader) are tried again before their blocks are left allocated: longer
+/// than an OSD takes to restart, or its host to reboot. Soak run 26 left
+/// every shard whose delete met an OSD powered off allocated for good.
+const RECLAIM_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first wait before trying again; doubled each time, to a minute.
+const RECLAIM_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Delete `targets` from the OSDs holding them, and count the outcome.
 ///
 /// Best-effort by design: a shard that cannot be deleted now is a leaked
-/// block, not a correctness problem, so this never fails the caller. An OSD
-/// that does not hold a shard answers `success: false`, which is not a
-/// failure — deleting is idempotent under retry. Returns how many deletes
-/// failed.
+/// block, not a correctness problem, so this never fails the caller. What
+/// fails is tried again in the background for [`RECLAIM_RETRY_FOR`], and
+/// counted as failed only then. An OSD that does not hold a shard answers
+/// `success: false`, which is not a failure — deleting is idempotent under
+/// retry, and so is releasing (a release names its referrer). Returns how
+/// many shards were not freed at the first try.
 pub async fn reclaim_shards(
-    pool: &OsdPool,
+    pool: &Arc<OsdPool>,
     meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
     targets: Vec<ShardTarget>,
     reason: Reclaim,
 ) -> usize {
+    let left = reclaim_round(
+        pool,
+        meta,
+        Unfreed {
+            release: targets,
+            delete: Vec::new(),
+        },
+        reason,
+    )
+    .await;
+    let failed = left.len();
+    if failed > 0 {
+        tokio::spawn(retry_reclaim(
+            Arc::clone(pool),
+            meta.clone(),
+            left,
+            reason,
+            RECLAIM_RETRY_FIRST,
+            RECLAIM_RETRY_FOR,
+        ));
+    }
+    failed
+}
+
+/// Shards not freed yet: those whose stripes are still to be released
+/// (meta didn't answer), and those released whose delete failed.
+#[derive(Debug, Default)]
+struct Unfreed {
+    release: Vec<ShardTarget>,
+    delete: Vec<ShardTarget>,
+}
+
+impl Unfreed {
+    fn len(&self) -> usize {
+        self.release.len() + self.delete.len()
+    }
+}
+
+/// Try `left` again, waiting `first` and then twice as long each time (to
+/// a minute), until it is all freed or `retry_for` is up; what is left
+/// then is counted as failed, its blocks allocated.
+async fn retry_reclaim(
+    pool: Arc<OsdPool>,
+    mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    mut left: Unfreed,
+    reason: Reclaim,
+    first: std::time::Duration,
+    retry_for: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + retry_for;
+    let mut wait = first;
+    loop {
+        tokio::time::sleep(wait).await;
+        let before = left.len();
+        left = reclaim_round(&pool, &mut meta, left, reason).await;
+        if left.len() == 0 {
+            debug!(
+                "reclaim ({}): {before} shards freed on a retry",
+                reason.label()
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "reclaim ({}): {} shards still not freed after {} s; their blocks stay allocated",
+                reason.label(),
+                left.len(),
+                retry_for.as_secs()
+            );
+            crate::gateway_metrics::record_reclaim(reason.label(), 0, left.len() as u64);
+            return;
+        }
+        wait = (wait * 2).clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        );
+    }
+}
+
+/// One try at freeing `left`: release what is still to be released (only
+/// stripes no other object references may go), then delete what was
+/// released. Returns what is still not freed.
+async fn reclaim_round(
+    pool: &OsdPool,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    left: Unfreed,
+    reason: Reclaim,
+) -> Unfreed {
     use futures::StreamExt;
     use objectio_proto::storage::{DeleteShardRequest, ShardId};
 
-    if targets.is_empty() {
-        return 0;
-    }
-
-    // Only stripes no other object still references may go. Asked of meta
-    // once per releasing object; if meta cannot answer, nothing is deleted
-    // — a leak can be reclaimed later, deleted shared data cannot.
-    let total = targets.len();
-    let targets = match freeable(meta, &targets).await {
-        Ok((free, packs)) => {
-            let mut freed: Vec<ShardTarget> = targets
-                .into_iter()
-                .filter(|t| {
+    let mut out = Unfreed::default();
+    let mut delete = left.delete;
+    // Asked of meta once per releasing object; if meta cannot answer,
+    // nothing is deleted — a leak can be reclaimed later, deleted shared
+    // data cannot.
+    if !left.release.is_empty() {
+        match freeable(meta, &left.release).await {
+            Ok((free, packs)) => {
+                delete.extend(left.release.into_iter().filter(|t| {
                     !t.is_pack_marker() && free.contains(&(t.owner.clone(), t.object_id.clone()))
-                })
-                .collect();
-            // A pack its last object let go: meta dropped its record in
-            // the same commit, so its shards are nobody's.
-            for mut pack in packs {
-                pack.pack_id.clear();
-                freed.extend(stripe_targets(std::slice::from_ref(&pack)));
+                }));
+                // A pack its last object let go: meta dropped its record in
+                // the same commit, so its shards are nobody's.
+                for mut pack in packs {
+                    pack.pack_id.clear();
+                    delete.extend(stripe_targets(std::slice::from_ref(&pack)));
+                }
             }
-            freed
+            Err(e) => {
+                warn!(
+                    "reclaim: cannot ask meta which stripes are still shared, keeping them for now: {e}"
+                );
+                out.release = left.release;
+            }
         }
-        Err(e) => {
-            warn!("reclaim: cannot ask meta which stripes are still shared, keeping them: {e}");
-            crate::gateway_metrics::record_reclaim(reason.label(), 0, total as u64);
-            return total;
-        }
-    };
-    if targets.is_empty() {
-        return 0;
+    }
+    if delete.is_empty() {
+        return out;
     }
 
     // One client per OSD: connected already, at an address the caller gave,
     // or — after a restart, or for a node outside this request's placement —
     // at the address meta has registered for it, asked once.
     let mut clients: HashMap<Vec<u8>, StorageServiceClient<Channel>> = HashMap::new();
-    let mut addresses: HashMap<Vec<u8>, String> = targets
+    let mut addresses: HashMap<Vec<u8>, String> = delete
         .iter()
         .filter(|t| !t.address.is_empty())
         .map(|t| (t.node_id.clone(), t.address.clone()))
         .collect();
     let mut asked_meta = false;
     let node_ids: std::collections::HashSet<Vec<u8>> =
-        targets.iter().map(|t| t.node_id.clone()).collect();
+        delete.iter().map(|t| t.node_id.clone()).collect();
     for node_id in node_ids {
         if let Ok(client) = pool.get_client(&node_id).await {
             clients.insert(node_id, client);
@@ -2404,27 +2873,31 @@ pub async fn reclaim_shards(
         }
     }
 
-    let results: Vec<Result<bool, OsdPoolError>> = futures::stream::iter(targets)
+    let results: Vec<(ShardTarget, Result<bool, OsdPoolError>)> = futures::stream::iter(delete)
         .map(|t| {
             let client = clients.get(&t.node_id).cloned();
             async move {
-                let mut client =
-                    client.ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
-                let req = DeleteShardRequest {
-                    shard_id: Some(ShardId {
-                        object_id: t.object_id,
-                        stripe_id: t.stripe_id,
-                        position: t.position,
-                    }),
-                };
-                let resp = tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    client.delete_shard(req),
-                )
-                .await
-                .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
-                .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
-                Ok(resp.into_inner().success)
+                let result = async {
+                    let mut client = client
+                        .ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
+                    let req = DeleteShardRequest {
+                        shard_id: Some(ShardId {
+                            object_id: t.object_id.clone(),
+                            stripe_id: t.stripe_id,
+                            position: t.position,
+                        }),
+                    };
+                    let resp = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.delete_shard(req),
+                    )
+                    .await
+                    .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                    .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    Ok(resp.into_inner().success)
+                }
+                .await;
+                (t, result)
             }
         })
         .buffer_unordered(RECLAIM_CONCURRENCY)
@@ -2432,19 +2905,18 @@ pub async fn reclaim_shards(
         .await;
 
     let mut reclaimed = 0u64;
-    let mut failed = 0usize;
-    for r in results {
+    for (t, r) in results {
         match r {
             Ok(true) => reclaimed += 1,
             Ok(false) => {}
             Err(e) => {
-                failed += 1;
-                warn!("reclaim ({}): delete_shard failed: {e}", reason.label());
+                debug!("reclaim ({}): delete_shard failed: {e}", reason.label());
+                out.delete.push(t);
             }
         }
     }
-    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, failed as u64);
-    failed
+    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, 0);
+    out
 }
 
 #[cfg(test)]
@@ -2556,29 +3028,99 @@ mod reclaim_tests {
         let old = object(1, vec![stripe(1, 0, 10, 6)]);
         let new = object(2, vec![stripe(2, 0, 10, 6)]);
         let got = reclaimable_after_overwrite(&[replaced(&old), replaced(&old)], &keep(&new));
-        assert_eq!(got, stripe_targets(&old.stripes));
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert!(got.unsettled.is_empty());
+    }
+
+    /// A replica down for the write may still hold the old object, but it
+    /// is never read again: the answers that agree free it.
+    #[test]
+    fn a_replica_that_missed_the_overwrite_holds_nothing_up() {
+        let old = object(1, vec![stripe(1, 0, 10, 6)]);
+        let new = object(2, vec![stripe(2, 0, 10, 6)]);
+        let missed = Displaced {
+            missed: true,
+            ..Displaced::default()
+        };
+        let got = reclaimable_after_overwrite(
+            &[missed.clone(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert_eq!(
+            reclaimable_after_overwrite(&[missed], &keep(&new)),
+            Overwritten::default()
+        );
+    }
+
+    /// A lost drive's replacement, not yet filled, held nothing; a copy
+    /// that missed an earlier write held the object before. Not a race
+    /// to tell apart from one: everything displaced is checked again
+    /// later, nothing freed at once (soak run 27).
+    #[test]
+    fn a_blank_or_stale_copy_leaves_the_old_object_to_be_checked_again() {
+        let older = object(1, vec![stripe(1, 0, 10, 6)]);
+        let old = object(2, vec![stripe(2, 0, 10, 6)]);
+        let new = object(3, vec![stripe(3, 0, 10, 6)]);
+        let got = reclaimable_after_overwrite(
+            &[Displaced::default(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![old.clone()]);
+        let got = reclaimable_after_overwrite(
+            &[replaced(&older), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![older, old]);
+    }
+
+    /// A delete frees at once only what every copy that carried it out
+    /// removed alike: one that removed nothing, or another object, may be
+    /// a write racing it.
+    #[test]
+    fn a_delete_agrees_only_when_every_copy_removed_the_same_object() {
+        let x = object(1, vec![stripe(1, 0, 10, 2)]);
+        let b = object(2, vec![stripe(2, 0, 10, 2)]);
+        let deleted = |ok: usize, removed: Vec<ObjectMeta>| MetaDeleted {
+            ok,
+            of: 3,
+            quorum: 2,
+            removed,
+        };
+        assert!(deleted(3, vec![x.clone(), x.clone(), x.clone()]).agreed());
+        assert!(deleted(2, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), b, x]).agreed());
     }
 
     #[test]
     fn a_new_key_frees_nothing() {
         let new = object(2, vec![]);
-        assert!(reclaimable_after_overwrite(&[Displaced::default()], &keep(&new)).is_empty());
-        assert!(reclaimable_after_overwrite(&[], &keep(&new)).is_empty());
+        for replies in [&[Displaced::default()][..], &[]] {
+            assert_eq!(
+                reclaimable_after_overwrite(replies, &keep(&new)),
+                Overwritten::default()
+            );
+        }
     }
 
     /// Two PUTs that reached the replicas in different orders: each sees the
-    /// other's object as replaced on some replica, while another replica
-    /// still holds it. Neither may free anything.
+    /// other's object as replaced on some replica, while the other, stamped
+    /// again, may still be written over it. Neither frees anything at once;
+    /// what no copy holds once that has settled goes then.
     #[test]
-    fn replicas_that_disagree_free_nothing() {
+    fn replicas_that_disagree_free_nothing_at_once() {
         let a = object(1, vec![stripe(1, 0, 10, 2)]);
         let b = object(2, vec![stripe(2, 0, 10, 2)]);
         let x = object(3, vec![stripe(3, 0, 10, 2)]);
-        assert!(reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a)).is_empty());
-        assert!(
-            reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a))
-                .is_empty()
-        );
+        let got = reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![x, b.clone()]);
+        let got = reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![b]);
     }
 
     #[test]
@@ -2591,14 +3133,20 @@ mod reclaim_tests {
             superseded: false,
             missed: false,
         };
-        assert!(reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)).is_empty());
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)),
+            Overwritten::default()
+        );
     }
 
     /// Retention, legal hold and shard migration rewrite the same object.
     #[test]
     fn rewriting_the_same_object_frees_nothing() {
         let o = object(1, vec![stripe(1, 0, 10, 2)]);
-        assert!(reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)).is_empty());
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)),
+            Overwritten::default()
+        );
     }
 
     /// Nothing the new object still refers to is freed, whatever the old
@@ -2607,7 +3155,7 @@ mod reclaim_tests {
     fn stripes_the_new_object_shares_are_kept() {
         let old = object(1, vec![stripe(7, 0, 10, 2), stripe(8, 0, 20, 2)]);
         let new = object(2, vec![stripe(8, 0, 20, 2)]);
-        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new));
+        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new)).now;
         assert!(got.iter().all(|t| t.object_id == vec![7; 16]));
         assert_eq!(got.len(), 2);
     }
@@ -2621,7 +3169,8 @@ mod reclaim_tests {
         let got = reclaimable_after_overwrite(
             &[replaced(&here), replaced(&moved)],
             &keep(&object(2, vec![])),
-        );
+        )
+        .now;
         let nodes: HashSet<u8> = got.iter().map(|t| t.node_id[0]).collect();
         assert_eq!(nodes, HashSet::from([10, 11, 40, 41]));
     }
@@ -2664,11 +3213,13 @@ mod reclaim_tests {
         assert!(freed.lock().unwrap().is_empty());
     }
 
-    /// Reclaim against an OSD that cannot be reached counts a failure and
-    /// returns, rather than failing whatever triggered it.
+    /// Reclaim that can't get through (meta, or the OSD, unreachable)
+    /// returns at once with how much it didn't free, rather than failing
+    /// whatever triggered it. That is tried again, and counted as failed
+    /// once the retries are up.
     #[tokio::test]
-    async fn an_unreachable_osd_is_counted_not_fatal() {
-        let pool = OsdPool::new();
+    async fn what_cannot_be_freed_is_retried_then_counted() {
+        let pool = Arc::new(OsdPool::new());
         let meta = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let mut meta =
             objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta);
@@ -2680,8 +3231,16 @@ mod reclaim_tests {
             position: 0,
             owner: vec![5; 16],
         };
-        let failed = reclaim_shards(&pool, &mut meta, vec![target], Reclaim::FailedWrite).await;
+        let failed =
+            reclaim_shards(&pool, &mut meta, vec![target.clone()], Reclaim::FailedWrite).await;
         assert_eq!(failed, 1);
+
+        let left = Unfreed {
+            release: Vec::new(),
+            delete: vec![target],
+        };
+        let zero = std::time::Duration::ZERO;
+        retry_reclaim(pool, meta, left, Reclaim::FailedWrite, zero, zero).await;
         assert!(
             crate::gateway_metrics::render()
                 .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")

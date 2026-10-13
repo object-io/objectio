@@ -125,3 +125,59 @@ fn a_copy_keeps_the_source_metadata_unless_told_to_replace_it() {
     );
     assert_eq!(replaced.header("x-amz-meta-owner").as_deref(), Some("bo"));
 }
+
+/// A copy whose metadata reached some copies but not a quorum is refused
+/// (503), yet may still become the object: a read that hears from those
+/// copies finds it, and healing brings the rest in line. Its hold on the
+/// source's stripes must then stay. It was let go on any failure, so
+/// deleting the source freed the shards the copy, readable, pointed at.
+#[test]
+fn a_refused_copy_that_lands_keeps_its_data() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(std::time::Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/half", &[]).status, 200);
+    let payload: Vec<u8> = (0..(1024 * 1024_u32)).map(|i| (i % 251) as u8).collect();
+    c.request("PUT", "/half/source", &payload).expect(200);
+
+    // Three of six OSDs down: the copy's metadata reaches three copies,
+    // short of the four a write needs.
+    for i in 3..6 {
+        ha.stop_osd(i);
+    }
+    let c = &ha.clients[0];
+    let refused = c.request_with_headers(
+        "PUT",
+        "/half/copy",
+        &[],
+        &[("x-amz-copy-source", "/half/source")],
+    );
+    assert!(
+        refused.status >= 500,
+        "{} {}",
+        refused.status,
+        refused.text()
+    );
+    for i in 3..6 {
+        ha.start_osd(i, None);
+    }
+    let c = &ha.clients[0];
+    // The three copies that took it hold the newest stamp: it is the key's
+    // object now, refused or not.
+    let landed = c.request("GET", "/half/copy", &[]);
+    assert_eq!(landed.status, 200, "{}", landed.text());
+    assert_eq!(landed.bytes, payload);
+
+    c.request("DELETE", "/half/source", &[]).expect(204);
+    // Shards are freed in the background after a delete's answer.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let after = c.request("GET", "/half/copy", &[]);
+    assert_eq!(
+        after.status,
+        200,
+        "the copy lost its data: {}",
+        after.text()
+    );
+    assert_eq!(after.bytes, payload);
+}

@@ -30,7 +30,7 @@ use std::time::Instant;
 use objectio_common::version::SMALL_SHARD_MAX;
 use objectio_proto::storage::{ShardId, ShardState, SmallShard};
 use objectio_storage::DiskManager;
-use objectio_storage::metadata::{MetaIndex, MetadataKey};
+use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataOp};
 use parking_lot::RwLock;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
@@ -140,6 +140,11 @@ pub trait ShardStore: Send + Sync {
     /// Shards found corrupt since start, by a read or a scrub.
     fn corrupt_found(&self) -> u64;
 
+    /// Shards this store forgot when it opened, because the device that
+    /// held them came back blank (replaced, or wiped): Meta is told, so
+    /// repair rebuilds them now rather than when its walk gets there.
+    fn dropped_at_open(&self) -> u64;
+
     /// Each device's space, shards and I/O counts.
     fn disks(&self) -> Vec<DiskReport>;
 
@@ -212,9 +217,12 @@ pub(crate) struct ShardLocation {
     pub(crate) size: u32,
     pub(crate) crc32c: u32,
     pub(crate) created_at: u64,
-    /// A small shard's bytes, kept in its record rather than in a disk block
-    /// (B21: written, with its object's metadata, in one log flush);
-    /// `disk_idx` is then [`SMALL_DISK`].
+    /// A small shard's bytes, kept in the metadata index rather than in a
+    /// disk block (B21: written, with its object's metadata, in one log
+    /// flush); `disk_idx` is then [`SMALL_DISK`]. They are under their own
+    /// key ([`small_data_key`]), not in the location record: empty here
+    /// when only the record was read ([`ShardIndex::get`]), filled by
+    /// [`ShardIndex::get_whole`].
     pub(crate) small: Option<Vec<u8>>,
 }
 
@@ -234,12 +242,11 @@ struct ShardLocationRecord {
     crc32c: u32,
     #[prost(uint64, tag = "5")]
     created_at: u64,
-    /// A small shard's bytes (B21), with `disk_idx` `u32::MAX`.
-    #[prost(bytes = "vec", tag = "6")]
-    small: Vec<u8>,
 }
 
 impl ShardLocation {
+    /// The location record: without a small shard's bytes, which are
+    /// stored apart ([`location_ops`]).
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         prost::Message::encode_to_vec(&ShardLocationRecord {
             disk_idx: u32::try_from(self.disk_idx).unwrap_or(u32::MAX),
@@ -247,13 +254,13 @@ impl ShardLocation {
             size: self.size,
             crc32c: self.crc32c,
             created_at: self.created_at,
-            small: self.small.clone().unwrap_or_default(),
         })
     }
 
+    /// The location a record holds; a small shard's bytes empty.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, prost::DecodeError> {
         let r = <ShardLocationRecord as prost::Message>::decode(bytes)?;
-        let small = (r.disk_idx == u32::MAX).then_some(r.small);
+        let small = (r.disk_idx == u32::MAX).then(Vec::new);
         Ok(Self {
             disk_idx: if small.is_some() {
                 SMALL_DISK
@@ -283,39 +290,81 @@ pub(crate) fn shard_loc_meta_key(shard_key: &str) -> MetadataKey {
     MetadataKey::from_bytes(bytes)
 }
 
-/// Persist a ShardLocation so a restart can rebuild the in-memory
-/// index. Called on every successful WriteShard.
+/// Prefix of a small shard's bytes (B21), apart from its location record:
+/// in the record, the startup pass over every location read every small
+/// shard's bytes too, and an OSD holding 115,000 of them took five minutes
+/// to start (B2 soak run 24).
+const SMALL_DATA_PREFIX: &[u8] = b"osd_small:";
+
+/// The key small shard `shard_key`'s bytes are kept under.
+fn small_data_key(shard_key: &str) -> MetadataKey {
+    let mut bytes = Vec::with_capacity(SMALL_DATA_PREFIX.len() + shard_key.len());
+    bytes.extend_from_slice(SMALL_DATA_PREFIX);
+    bytes.extend_from_slice(shard_key.as_bytes());
+    MetadataKey::from_bytes(bytes)
+}
+
+/// The writes that record `loc` for `shard_key`, replacing `old`: its
+/// location, and a small shard's bytes (or the removal of `old`'s).
+fn location_ops(
+    shard_key: &str,
+    loc: &ShardLocation,
+    old: Option<&ShardLocation>,
+) -> Vec<MetadataOp> {
+    let mut ops = vec![MetadataOp::Put {
+        key: shard_loc_meta_key(shard_key),
+        value: loc.to_bytes(),
+    }];
+    if let Some(data) = &loc.small {
+        ops.push(MetadataOp::Put {
+            key: small_data_key(shard_key),
+            value: data.clone(),
+        });
+    } else if old.is_some_and(|o| o.small.is_some()) {
+        ops.push(MetadataOp::Delete {
+            key: small_data_key(shard_key),
+        });
+    }
+    ops
+}
+
+/// Persist a ShardLocation, replacing `old`, so a restart can rebuild
+/// the in-memory index. Called on every successful WriteShard.
 pub(crate) fn persist_shard_location(
     meta_store: &dyn MetaIndex,
     shard_key: &str,
     loc: &ShardLocation,
+    old: Option<&ShardLocation>,
 ) -> std::result::Result<(), String> {
     #[cfg(test)]
     if location_records_fail() {
         return Err("injected: the metadata log is unwritable".into());
     }
-    let key = shard_loc_meta_key(shard_key);
-    let value = loc.to_bytes();
     meta_store
-        .put(key, value)
-        .map(|_| ())
+        .write(location_ops(shard_key, loc, old))
         .map_err(|e| e.to_string())
 }
 
-/// Remove a persisted ShardLocation (delete_shard path).
+/// Remove a persisted ShardLocation, `old` (delete_shard path), with a
+/// small shard's bytes.
 fn forget_shard_location(
     meta_store: &dyn MetaIndex,
     shard_key: &str,
+    old: &ShardLocation,
 ) -> std::result::Result<(), String> {
     #[cfg(test)]
     if location_records_fail() {
         return Err("injected: the metadata log is unwritable".into());
     }
-    let key = shard_loc_meta_key(shard_key);
-    meta_store
-        .delete(&key)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut ops = vec![MetadataOp::Delete {
+        key: shard_loc_meta_key(shard_key),
+    }];
+    if old.small.is_some() {
+        ops.push(MetadataOp::Delete {
+            key: small_data_key(shard_key),
+        });
+    }
+    meta_store.write(ops).map_err(|e| e.to_string())
 }
 
 /// Where each shard on this OSD is: its persisted `SHARD_LOC` entry, read
@@ -354,6 +403,8 @@ impl ShardIndex {
         self.stripes[i].lock()
     }
 
+    /// `key`'s location, as its record holds it: a small shard's bytes
+    /// empty.
     fn get(&self, key: &str) -> Option<ShardLocation> {
         let v = self.store.get(&shard_loc_meta_key(key))?;
         ShardLocation::from_bytes(&v)
@@ -361,8 +412,23 @@ impl ShardIndex {
             .ok()
     }
 
+    /// `key`'s location with a small shard's bytes.
+    fn get_whole(&self, key: &str) -> Option<ShardLocation> {
+        let mut loc = self.get(key)?;
+        self.fill(key, &mut loc);
+        Some(loc)
+    }
+
+    /// Read a small shard's bytes into `loc`, its record. Missing ones stay
+    /// empty: they fail the shard's checksum, so it reads as corrupt.
+    fn fill(&self, key: &str, loc: &mut ShardLocation) {
+        if let Some(data) = loc.small.as_mut() {
+            *data = self.store.get(&small_data_key(key)).unwrap_or_default();
+        }
+    }
+
     fn contains(&self, key: &str) -> bool {
-        self.get(key).is_some()
+        self.store.get(&shard_loc_meta_key(key)).is_some()
     }
 
     fn counter(&self, l: &ShardLocation) -> Option<&AtomicU64> {
@@ -386,7 +452,7 @@ impl ShardIndex {
     fn record(&self, key: &str, loc: &ShardLocation) -> Result<Option<ShardLocation>, String> {
         let _key = self.lock(key);
         let old = self.get(key);
-        persist_shard_location(&*self.store, key, loc)?;
+        persist_shard_location(&*self.store, key, loc, old.as_ref())?;
         self.counted(old.as_ref(), Some(loc));
         Ok(old)
     }
@@ -398,7 +464,7 @@ impl ShardIndex {
         &self,
         key: &str,
         loc: &ShardLocation,
-        mut extra: Vec<(MetadataKey, Vec<u8>)>,
+        extra: Vec<(MetadataKey, Vec<u8>)>,
     ) -> Result<Option<ShardLocation>, String> {
         let _key = self.lock(key);
         let old = self.get(key);
@@ -406,9 +472,13 @@ impl ShardIndex {
         if location_records_fail() {
             return Err("injected: the metadata log is unwritable".into());
         }
-        extra.push((shard_loc_meta_key(key), loc.to_bytes()));
+        let mut ops: Vec<MetadataOp> = extra
+            .into_iter()
+            .map(|(key, value)| MetadataOp::Put { key, value })
+            .collect();
+        ops.extend(location_ops(key, loc, old.as_ref()));
         self.store
-            .batch_put(extra)
+            .write(ops)
             .map_err(|e| format!("record shard {key} with its metadata: {e}"))?;
         self.counted(old.as_ref(), Some(loc));
         Ok(old)
@@ -421,7 +491,7 @@ impl ShardIndex {
         let Some(old) = self.get(key) else {
             return Ok(None);
         };
-        forget_shard_location(&*self.store, key)?;
+        forget_shard_location(&*self.store, key, &old)?;
         self.counted(Some(&old), None);
         Ok(Some(old))
     }
@@ -799,6 +869,8 @@ pub struct BlockStore {
     corrupt: RwLock<HashSet<String>>,
     /// Shards found corrupt since start.
     corrupt_found: AtomicU64,
+    /// Shards forgotten at open: their disk came back formatted.
+    dropped_at_open: u64,
     /// Whether the metadata store's filesystem has room for small shards.
     meta_space: MetaSpace,
 }
@@ -826,10 +898,9 @@ impl BlockStore {
         //   of the shards the index remembers on it. They are forgotten, so
         //   they are reported missing and rebuilt rather than reported
         //   present and failing every read.
-        // - Each disk's allocation bitmap is reconciled against the index,
-        //   the source of truth for what is on the platter: a disk formatted
-        //   before the allocator was wired up has an all-zero bitmap under a
-        //   full data region, and would hand out block 0 over live shards.
+        // - Each disk's blocks that the index points at are marked used: a
+        //   disk opens with every block free (the index is the only record
+        //   of what is on it), and would hand out block 0 over live shards.
         let mut lost = Vec::new();
         let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
         let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
@@ -888,9 +959,6 @@ impl BlockStore {
         }
         info!("Shard index: {} shards", index.count());
         for (idx, disk) in disks.iter().enumerate() {
-            if let Err(e) = disk.persist_allocator() {
-                warn!("Could not persist allocation bitmap for disk {idx}: {e}");
-            }
             info!(
                 "Disk {idx}: {} of {} bytes used across {} indexed shards",
                 disk.used_space(),
@@ -906,6 +974,7 @@ impl BlockStore {
             next_disk: RwLock::new(0),
             corrupt: RwLock::new(HashSet::new()),
             corrupt_found: AtomicU64::new(0),
+            dropped_at_open: lost.len() as u64,
             meta_space: MetaSpace::new(meta_dir),
         }
     }
@@ -979,8 +1048,8 @@ impl BlockStore {
     }
 
     /// Return a shard's blocks to the pool. The index entry must already be
-    /// gone, so a crash in between leaks a block rather than handing a live
-    /// shard's block to the next write.
+    /// gone: freed first, a block could go to the next write while the
+    /// index still points at it.
     fn free_location(&self, loc: &ShardLocation) {
         if loc.disk_idx >= self.disks.len() {
             return;
@@ -989,19 +1058,11 @@ impl BlockStore {
         // `size` is the shard's payload length, so the extent's length is
         // derivable — which is why nothing had to be added to the index.
         let blocks = disk.blocks_for_len(loc.size as usize);
-        match disk.free_extent(loc.block_num, blocks) {
-            Ok(()) => {
-                if let Err(e) = disk.persist_allocator() {
-                    warn!(
-                        "Freed block {} on disk {} but could not persist the bitmap: {e}",
-                        loc.block_num, loc.disk_idx
-                    );
-                }
-            }
-            Err(e) => warn!(
+        if let Err(e) = disk.free_extent(loc.block_num, blocks) {
+            warn!(
                 "Could not free block {} on disk {}: {e}",
                 loc.block_num, loc.disk_idx
-            ),
+            );
         }
     }
 
@@ -1157,7 +1218,7 @@ impl ShardStore for BlockStore {
         }
         self.corrupt.write().remove(&key);
 
-        info!(
+        debug!(
             "Wrote shard: disk={}, block={}, size={}, crc32c={:08x}",
             disk_idx,
             block_num,
@@ -1220,11 +1281,11 @@ impl ShardStore for BlockStore {
         let key = key_of(id);
         let location = self
             .index
-            .get(&key)
+            .get_whole(&key)
             .ok_or_else(|| Status::not_found("shard not found"))?;
 
         let data = if let Some(small) = location.small.clone() {
-            // Kept in its record (B21): checked against the checksum
+            // Kept in the index (B21): checked against the checksum
             // recorded with it, as a block's own checks would.
             if crc32c::crc32c(&small) != location.crc32c {
                 self.mark_corrupt_at(&key, location.block_num);
@@ -1250,7 +1311,7 @@ impl ShardStore for BlockStore {
 
     fn small_shard(&self, id: &ShardId) -> Option<SmallShard> {
         let key = key_of(id);
-        let loc = self.index.get(&key)?;
+        let loc = self.index.get_whole(&key)?;
         let data = loc.small?;
         if crc32c::crc32c(&data) != loc.crc32c {
             self.mark_corrupt_at(&key, loc.block_num);
@@ -1377,7 +1438,8 @@ impl ShardStore for BlockStore {
             let page = self.index.page(after.as_deref(), 1024);
             let Some((last, _)) = page.last() else { break };
             after = Some(last.clone());
-            for (key, loc) in page {
+            for (key, mut loc) in page {
+                self.index.fill(&key, &mut loc);
                 if let Some(data) = &loc.small {
                     if crc32c::crc32c(data) != loc.crc32c {
                         self.mark_corrupt_at(&key, loc.block_num);
@@ -1420,6 +1482,10 @@ impl ShardStore for BlockStore {
 
     fn corrupt_found(&self) -> u64 {
         self.corrupt_found.load(Ordering::Relaxed)
+    }
+
+    fn dropped_at_open(&self) -> u64 {
+        self.dropped_at_open
     }
 
     fn disks(&self) -> Vec<DiskReport> {
@@ -1514,14 +1580,14 @@ pub(crate) fn rot_block(
     f.write_all(&[byte[0] ^ 0xff]).unwrap();
 }
 
-/// Tests: replace the bytes of small shard `key`'s record with `rot` of
+/// Tests: replace the bytes of small shard `key` in the index with `rot` of
 /// them, the way rot in the index would.
 #[cfg(test)]
 pub(crate) fn rot_small(meta: &dyn MetaIndex, id: &ShardId, rot: impl FnOnce(&mut Vec<u8>)) {
     let key = key_of(id);
-    let mut loc = ShardLocation::from_bytes(&meta.get(&shard_loc_meta_key(&key)).unwrap()).unwrap();
-    rot(loc.small.as_mut().expect("a small shard"));
-    persist_shard_location(meta, &key, &loc).unwrap();
+    let mut data = meta.get(&small_data_key(&key)).expect("a small shard");
+    rot(&mut data);
+    meta.put(small_data_key(&key), data).unwrap();
 }
 
 /// The contract as tests, for any implementation: each takes an [`Engine`]
@@ -1655,6 +1721,9 @@ pub(crate) mod conformance {
         assert_eq!(store.state(&id(3, 2)), ShardState::Missing);
         let capacity: u64 = store.disks().iter().map(|d| d.capacity).sum();
         assert_eq!(capacity - free(&*store), used, "space not as it was");
+        // A write after it takes free blocks, not the ones held.
+        put(&*store, &id(3, 3), &data(6, 200_000)).await;
+        assert_eq!(store.read(&id(3, 0)).await.unwrap().0, big);
     }
 
     async fn a_delete_frees_and_forgets(engine: &Engine) {
@@ -1872,6 +1941,57 @@ mod tests {
         .await;
     }
 
+    /// A small shard's bytes are kept apart from its location record, so
+    /// the startup pass over every record reads none of them, and they go
+    /// with the record: replaced by a disk block's shard, or deleted.
+    #[tokio::test]
+    async fn a_small_shard_s_bytes_are_kept_apart_from_its_record_and_go_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = |object: u8| ShardId {
+            object_id: vec![object; 16],
+            stripe_id: 0,
+            position: 0,
+        };
+        let small = |id: &ShardId, data: &[u8]| SmallShard {
+            shard_id: Some(id.clone()),
+            crc32c: crc32c::crc32c(data),
+            data: data.to_vec(),
+        };
+        let bytes = vec![7u8; 5_000];
+        {
+            let (store, meta) = open(dir.path());
+            for o in [1, 2, 3] {
+                store
+                    .write_with_metadata(small(&shard(o), &bytes), Vec::new())
+                    .unwrap();
+            }
+            let key = key_of(&shard(1));
+            let record = meta.get(&shard_loc_meta_key(&key)).unwrap();
+            assert!(record.len() < 64, "the record holds the bytes");
+            assert_eq!(meta.get(&small_data_key(&key)), Some(bytes.clone()));
+
+            // Replaced by a shard in a disk block: the bytes go.
+            let big = vec![9u8; 100_000];
+            store
+                .write(&shard(1), &big, crc32c::crc32c(&big), false)
+                .await
+                .unwrap();
+            assert_eq!(meta.get(&small_data_key(&key)), None);
+            assert_eq!(store.read(&shard(1)).await.unwrap().0, big);
+
+            // Deleted: record and bytes go.
+            let key = key_of(&shard(2));
+            assert!(store.delete(&shard(2)).unwrap());
+            assert_eq!(meta.get(&shard_loc_meta_key(&key)), None);
+            assert_eq!(meta.get(&small_data_key(&key)), None);
+        }
+        // Found again after a restart, bytes and all.
+        let (store, _meta) = open(dir.path());
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.read(&shard(3)).await.unwrap().0, bytes);
+        assert_eq!(store.small_shard(&shard(3)).unwrap().data, bytes);
+    }
+
     /// A shard key gives back the shard it was made from, and nothing else
     /// reads as one.
     #[test]
@@ -1983,7 +2103,7 @@ mod tests {
             (shard_key(&[2u8; 16], 3, 4), loc(1, 7)),
         ];
         for (key, l) in &written {
-            persist_shard_location(&s, key, l).expect("persist");
+            persist_shard_location(&s, key, l, None).expect("persist");
         }
 
         let rebuilt = load_persisted_shard_index(&s);
@@ -2006,10 +2126,10 @@ mod tests {
         let (_dir, s) = store();
         let keep = shard_key(&[1u8; 16], 0, 0);
         let drop = shard_key(&[1u8; 16], 0, 1);
-        persist_shard_location(&s, &keep, &loc(0, 1)).unwrap();
-        persist_shard_location(&s, &drop, &loc(0, 2)).unwrap();
+        persist_shard_location(&s, &keep, &loc(0, 1), None).unwrap();
+        persist_shard_location(&s, &drop, &loc(0, 2), None).unwrap();
 
-        forget_shard_location(&s, &drop).expect("forget");
+        forget_shard_location(&s, &drop, &loc(0, 2)).expect("forget");
 
         let rebuilt = load_persisted_shard_index(&s);
         assert!(rebuilt.contains_key(&keep));
@@ -2029,7 +2149,7 @@ mod tests {
     fn keys_belonging_to_another_family_are_not_read_as_shard_locations() {
         let (_dir, s) = store();
         let mine = shard_key(&[1u8; 16], 0, 0);
-        persist_shard_location(&s, &mine, &loc(0, 1)).unwrap();
+        persist_shard_location(&s, &mine, &loc(0, 1), None).unwrap();
 
         for foreign in [&b"s:some-shard-meta"[..], b"osd_other:thing", b"zzz"] {
             s.put(MetadataKey::from_bytes(foreign.to_vec()), vec![1, 2, 3])
@@ -2055,7 +2175,7 @@ mod tests {
         let (_dir, s) = store();
         for i in 0..3u8 {
             let k = shard_key(&[i; 16], 0, 0);
-            persist_shard_location(&s, &k, &loc(0, u64::from(i))).unwrap();
+            persist_shard_location(&s, &k, &loc(0, u64::from(i)), None).unwrap();
         }
         s.put(shard_loc_meta_key("deadbeef:0:0"), b"not a record".to_vec())
             .expect("put corrupt entry");

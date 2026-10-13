@@ -28,7 +28,10 @@ fn a_replaced_disk_is_rebuilt_at_this_rate() {
     let _ = ha.await_leader(Duration::from_secs(30));
     let c = &ha.clients[0];
     assert_eq!(c.request("PUT", "/thru", &[]).status, 200);
-    let body = vec![7u8; 16 * 1024];
+    // Above the small-shard limit: shards in disk blocks. (16 KiB objects
+    // keep their shards with their metadata, which a lost disk doesn't
+    // take: nothing was rebuilt, and this waited out its 30 minutes.)
+    let body = vec![7u8; 300 * 1024];
     for i in 0..objects {
         assert_eq!(c.request("PUT", &format!("/thru/k{i}"), &body).status, 200);
     }

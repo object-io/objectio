@@ -36,6 +36,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 toml = "0.8"
 gethostname = "0.5"
+xxhash-rust = { workspace = true }
 sys-info = "0.9"
 
 [features]

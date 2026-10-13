@@ -139,6 +139,42 @@ impl DeleteCondition {
     }
 }
 
+/// Free what an unversioned delete removed, less what a copy still holds
+/// as current (a write racing the delete). A copy that can't be read is
+/// passed over (`Unread::PassOver`): the bucket has never had versioning.
+async fn free_removed(
+    state: &Arc<AppState>,
+    nodes: &[objectio_proto::metadata::NodePlacement],
+    bucket: &str,
+    key: &str,
+    removed: Vec<objectio_proto::metadata::ObjectMeta>,
+) {
+    let mut meta = state.meta_client.clone();
+    for gone in unreferenced(
+        &state.osd_pool,
+        nodes,
+        bucket,
+        key,
+        removed,
+        Unread::PassOver,
+    )
+    .await
+    {
+        let failed = reclaim_shards(
+            &state.osd_pool,
+            &mut meta,
+            stripe_targets_of(&gone),
+            Reclaim::Delete,
+        )
+        .await;
+        if failed > 0 {
+            // Leaked blocks if they keep failing, not lost data: the object
+            // is gone either way.
+            warn!("{bucket}/{key}: {failed} shard deletes failed; retried in the background");
+        }
+    }
+}
+
 /// DELETE `?versionId=`: remove that version for good. Each OSD replica,
 /// under the key's lock, also makes the newest remaining version current if
 /// this one was; the listing then follows whatever is current.
@@ -172,7 +208,7 @@ pub(crate) async fn delete_version(
         }
     };
 
-    let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid).await;
+    let deleted = delete_meta_from_all(pool, nodes, bucket, key, vid, None).await;
     let (ok, of) = (deleted.ok, deleted.of);
     if ok < deleted.quorum {
         return S3Error::xml_response(
@@ -194,7 +230,7 @@ pub(crate) async fn delete_version(
     } else {
         // What the replicas removed (a packing switch may have rewritten
         // the version since it was read), and only what none still has.
-        for gone in unreferenced(pool, nodes, bucket, key, deleted.removed).await {
+        for gone in unreferenced(pool, nodes, bucket, key, deleted.removed, Unread::KeepAll).await {
             let failed = reclaim_shards(
                 pool,
                 &mut state.meta_client.clone(),
@@ -204,7 +240,7 @@ pub(crate) async fn delete_version(
             .await;
             if failed > 0 {
                 warn!(
-                    "{bucket}/{key} version {vid}: {failed} shard deletes failed; those blocks stay allocated"
+                    "{bucket}/{key} version {vid}: {failed} shard deletes failed; retried in the background"
                 );
             }
         }
@@ -285,9 +321,9 @@ async fn try_sync_listing(
                     user_metadata: c.user_metadata.clone(),
                     stripes: c.stripes.clone(),
                     object_id: c.object_id.clone(),
+                    // Meta names the key's placement group (B31).
                     pg_id: 0,
                     pool: String::new(),
-                    home_osd_ids: home_of(nodes),
                     ..Default::default()
                 })
                 .await
@@ -297,7 +333,6 @@ async fn try_sync_listing(
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await
                 .map(drop),
@@ -415,9 +450,6 @@ pub(crate) async fn delete_object_to_the_end(
         Err(resp) => return resp,
     };
     let versioning_enabled = versioning == Some(VersioningState::VersioningEnabled);
-    // Known never to have had versions, so nothing of the key outlives
-    // this delete and its home can go. Not when the state is unknown.
-    let never_versioned = versioning == Some(VersioningState::VersioningDisabled);
 
     // Conditional delete (If-Match, x-amz-if-match-last-modified-time,
     // x-amz-if-match-size): on the version named, or else the key's object:
@@ -489,6 +521,8 @@ pub(crate) async fn delete_object_to_the_end(
             bucket: bucket.clone(),
             key: key.clone(),
             object_id: Uuid::now_v7().as_bytes().to_vec(),
+            pg_pool: placement.pool.clone(),
+            pg_id: placement.pg_id,
             size: 0,
             etag: String::new(),
             content_type: String::new(),
@@ -540,7 +574,6 @@ pub(crate) async fn delete_object_to_the_end(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await;
         }
@@ -575,6 +608,8 @@ pub(crate) async fn delete_object_to_the_end(
             bucket: bucket.clone(),
             key: key.clone(),
             object_id: Uuid::now_v7().as_bytes().to_vec(),
+            pg_pool: placement.pool.clone(),
+            pg_id: placement.pg_id,
             created_at: now,
             modified_at: now,
             version_id: String::new(),
@@ -598,14 +633,16 @@ pub(crate) async fn delete_object_to_the_end(
                 return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
             }
         };
-        // A null version it replaced: its shards, once every replica agrees.
-        spawn_reclaim(
+        // A null version it replaced: its shards, as an overwrite's.
+        crate::s3::put::spawn_overwrite_reclaim(
             &state,
-            crate::osd_pool::reclaimable_after_overwrite(
-                &displaced,
-                &std::collections::HashSet::new(),
-            ),
-            Reclaim::Overwrite,
+            &displaced,
+            &std::collections::HashSet::new(),
+            crate::s3::put::Copies {
+                nodes: &placement.nodes,
+                bucket: &bucket,
+                key: &key,
+            },
             format!("{bucket}/{key} null version under a delete marker"),
         );
         {
@@ -617,7 +654,6 @@ pub(crate) async fn delete_object_to_the_end(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 })
                 .await;
         }
@@ -640,9 +676,23 @@ pub(crate) async fn delete_object_to_the_end(
     // the object can change in between (a PUT replacing it, a packing
     // switch or a tagging update rewriting it), and freeing the stripes of
     // the version read would leak the ones the removed copy named. Only
-    // once every replica has let it go, and only what no replica still has
-    // as current: a racing write can leave it on some.
-    let deleted = delete_meta_from_all(&state.osd_pool, &placement.nodes, &bucket, &key, "").await;
+    // once the delete made its quorum, and only what no replica that can be
+    // read still has as current: a racing write can leave it on some. The
+    // bucket has never had versioning (a marker went in above otherwise),
+    // so a replica the delete missed is passed over (`Unread::PassOver`).
+    // When the replicas removed different objects, a racing write may yet
+    // be stamped again and written over the delete: what it removed is
+    // freed once that has settled (`MetaDeleted::agreed`).
+    let pg = crate::osd_pool::pg_ref(&placement);
+    let deleted = delete_meta_from_all(
+        &state.osd_pool,
+        &placement.nodes,
+        &bucket,
+        &key,
+        "",
+        pg.as_ref(),
+    )
+    .await;
     if deleted.ok < deleted.quorum {
         sync_listing(&state, &placement.nodes, &bucket, &key).await;
         return S3Error::xml_response(
@@ -654,36 +704,19 @@ pub(crate) async fn delete_object_to_the_end(
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
-    if deleted.ok < deleted.of {
-        warn!(
-            "{bucket}/{key}: {} of {} replicas deleted it; its blocks stay allocated",
-            deleted.ok, deleted.of
-        );
+    if deleted.agreed() {
+        free_removed(&state, &placement.nodes, &bucket, &key, deleted.removed).await;
     } else {
-        for gone in unreferenced(
-            &state.osd_pool,
-            &placement.nodes,
-            &bucket,
-            &key,
-            deleted.removed,
-        )
-        .await
-        {
-            let failed = reclaim_shards(
-                &state.osd_pool,
-                &mut meta_client,
-                stripe_targets_of(&gone),
-                Reclaim::Delete,
-            )
-            .await;
-            if failed > 0 {
-                // Leaked blocks, not lost data — the object is gone either way.
-                warn!(
-                    "{}/{}: {} shard deletes failed; those blocks stay allocated",
-                    bucket, key, failed
-                );
-            }
-        }
+        let (state, nodes, bucket, key) = (
+            Arc::clone(&state),
+            placement.nodes.clone(),
+            bucket.clone(),
+            key.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(crate::osd_pool::RESTAMP_SETTLE).await;
+            free_removed(&state, &nodes, &bucket, &key, deleted.removed).await;
+        });
     }
 
     // Unregister from Meta's listing index. If meta can't take it now (an
@@ -697,7 +730,6 @@ pub(crate) async fn delete_object_to_the_end(
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: String::new(),
-                forget_home: never_versioned,
             })
             .await
         {
@@ -706,7 +738,7 @@ pub(crate) async fn delete_object_to_the_end(
         }
     }
 
-    info!("Deleted object: {}/{}", bucket, key);
+    debug!("Deleted object: {}/{}", bucket, key);
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())

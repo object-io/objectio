@@ -362,6 +362,8 @@ pub(crate) async fn copy_by_reference(
         bucket: dest_bucket.to_string(),
         key: dest_key.to_string(),
         object_id: new_id.clone(),
+        pg_pool: dest_placement.pool.clone(),
+        pg_id: dest_placement.pg_id,
         size: source.size,
         content_type: content_type.clone(),
         etag: source.etag.clone(),
@@ -393,12 +395,10 @@ pub(crate) async fn copy_by_reference(
         object_id: new_id.clone(),
         pg_id: dest_placement.pg_id,
         pool: dest_placement.pool.clone(),
-        home_osd_ids: home_of(&dest_placement.nodes),
         ..Default::default()
     };
     let new_object = referenced_object_ids(&object_meta);
     let mut listing_client = state.meta_client.clone();
-    let mut unlist_client = state.meta_client.clone();
     let committed = commit_object(
         put_object_meta_to_all(
             &state.osd_pool,
@@ -410,16 +410,12 @@ pub(crate) async fn copy_by_reference(
             &[],
         ),
         async { listing_client.create_object(listing_req).await.map(drop) },
+        // The listing follows whatever is current on the OSDs: the object
+        // this copy would have replaced, or the copy if it landed anyway.
+        // Unlisting the key, as this did, hid an object a failed copy
+        // onto it left in place (the PUT path learnt the same).
         || async {
-            use objectio_proto::metadata::DeleteObjectRequest as MetaDelReq;
-            let _ = unlist_client
-                .delete_object(MetaDelReq {
-                    bucket: dest_bucket.to_string(),
-                    key: dest_key.to_string(),
-                    version_id: String::new(),
-                    forget_home: false,
-                })
-                .await;
+            crate::s3::sync_listing(state, &dest_placement.nodes, dest_bucket, dest_key).await;
         },
     )
     .await;
@@ -433,6 +429,11 @@ pub(crate) async fn copy_by_reference(
                 Vec::new(),
                 &new_object,
                 versioning_enabled,
+                crate::s3::put::Copies {
+                    nodes: &dest_placement.nodes,
+                    bucket: dest_bucket,
+                    key: dest_key,
+                },
                 &what,
             );
             // A copy onto itself replaced an object that used the same
@@ -453,7 +454,15 @@ pub(crate) async fn copy_by_reference(
         }
         Err(e) => {
             error!("CopyObject by reference: failed to store {what}: {e}");
-            back_out(state, what);
+            // Only a copy no OSD took lets go of the source's stripes. One
+            // that reached some copies may still become the object (a read
+            // finds it, healing spreads it); letting go, the source's
+            // delete then freed shards it pointed at.
+            if e.unapplied {
+                back_out(state, what);
+            } else {
+                warn!("{what}: the copy may have been stored; its hold on the stripes stays");
+            }
             return Some(S3Error::for_osd_error(
                 &e.error,
                 "Failed to store object metadata",

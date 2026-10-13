@@ -43,6 +43,7 @@ pub async fn run(cmd: Command, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         Command::Node { action } => cluster::node(action, ctx).await,
         Command::Osd { action } => cluster::osd(action, ctx).await,
         Command::Pool { action } => cluster::pool(action, ctx).await,
+        Command::Pg { action } => cluster::pg(action, ctx).await,
         Command::Kms { action } => cluster::kms(action, ctx).await,
         Command::Warehouse { action } => cluster::warehouse(action, ctx).await,
         Command::Config { action } => cluster::config(action, ctx).await,

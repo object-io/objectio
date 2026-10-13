@@ -93,10 +93,105 @@ pub async fn rewrite_shard(
         stripe.ec_k,
         stripe.ec_m,
         None,
+        None,
     )
     .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => fail(e.to_string()),
     }
+}
+
+/// Calls to meta (or, for `put_object_meta`, to an OSD) whose next answer
+/// is lost on purpose, by name.
+static LOSE_REPLY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(serde::Deserialize)]
+pub struct LoseReply {
+    call: String,
+}
+
+/// `POST /_admin/test/lose-reply`: the next answer meta gives to `call`
+/// (applied there) is taken as lost, as a leader change or a timeout loses
+/// one: the gateway sees UNAVAILABLE for a call meta did apply. For
+/// `put_object_meta`, the next answer of one OSD copy; asked n times, n
+/// copies'.
+pub async fn lose_reply(
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<LoseReply>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    LOSE_REPLY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(req.call);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `answer`, unless a test asked for the next answer to `call` to be lost
+/// (only ever with `--test-hooks`).
+#[allow(clippy::result_large_err)] // tonic's own error type, passed through
+pub fn maybe_lost<T>(call: &str, answer: Result<T, tonic::Status>) -> Result<T, tonic::Status> {
+    let mut lose = LOSE_REPLY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match lose.iter().position(|c| c == call) {
+        Some(i) if answer.is_ok() => {
+            lose.remove(i);
+            Err(tonic::Status::unavailable(format!(
+                "{call}: answer lost (test hook)"
+            )))
+        }
+        _ => answer,
+    }
+}
+
+/// PUTs to hold, by "bucket/key", after they are placed: how long.
+static HOLD_PLACED: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[derive(serde::Deserialize)]
+pub struct HoldPlaced {
+    bucket: String,
+    key: String,
+    millis: u64,
+}
+
+/// `POST /_admin/test/hold-placed`: the next PUT of `bucket/key` waits
+/// `millis` between being placed and writing anything, so a test can change
+/// the placement group's acting set meanwhile (B31): the write is then
+/// placed under an epoch that is no longer current.
+pub async fn hold_placed(
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<HoldPlaced>,
+) -> Response {
+    let caller = crate::admin::extract_caller(&auth, &headers);
+    if !crate::admin::is_system_admin(&caller) {
+        return (StatusCode::FORBIDDEN, "system admin only").into_response();
+    }
+    HOLD_PLACED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((format!("{}/{}", req.bucket, req.key), req.millis));
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Wait, if a test asked the next PUT of `bucket/key` to (only ever with
+/// `--test-hooks`).
+pub async fn held_after_placement(bucket: &str, key: &str) {
+    let millis = {
+        let mut held = HOLD_PLACED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name = format!("{bucket}/{key}");
+        let Some(i) = held.iter().position(|(k, _)| *k == name) else {
+            return;
+        };
+        held.remove(i).1
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }

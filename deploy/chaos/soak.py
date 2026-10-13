@@ -47,6 +47,7 @@ SAMPLE = int(os.environ.get("SAMPLE", "20000"))
 GONE = "-"  # the outcome "no object"
 # A bucket of its own: keys left by an earlier run would read as wrong.
 BUCKET = os.environ.get("SOAK_BUCKET", f"soak-{int(time.time())}")
+POOL = os.environ.get("SOAK_POOL", "")
 chaos.BUCKET = BUCKET  # for chaos's redundancy check
 OPLOG = open(os.environ.get("OPLOG", "soak-ops.log"), "a", buffering=1)  # noqa: SIM115
 
@@ -232,9 +233,19 @@ def incusd_mb():
     return max(sizes) // 1024 if sizes else None
 
 
-def degraded():
-    """(objects short of shards, age of the oldest in seconds), from a
-    gateway's metrics (meta's, polled by the gateway); None before B29."""
+PG_GAUGES = {
+    "objectio_meta_pgs_not_clean": "not_clean",
+    "objectio_meta_pg_not_clean_oldest_seconds": "oldest",
+    "objectio_meta_osds_down": "osds_down",
+    "objectio_meta_pg_objects_unfound": "unfound",
+    "objectio_meta_lost_objects": "lost",
+}
+
+
+def pg_health():
+    """Placement groups not Clean, how long the one longest so has been,
+    OSDs down, objects unfound and lost (B31), from a gateway's metrics
+    (meta's, polled by the gateway); None if no gateway answers with them."""
     for url in GW:
         status, body = http("GET", f"{url}/metrics", timeout=10)
         if status != 200:
@@ -242,14 +253,90 @@ def degraded():
         got = {}
         for line in body.decode(errors="replace").splitlines():
             name = line.split("{")[0].split(" ")[0]
-            if name in ("objectio_meta_degraded_objects", "objectio_meta_degraded_oldest_seconds"):
-                got[name] = max(got.get(name, 0.0), float(line.rsplit(" ", 1)[1]))
-        if len(got) == 2:
-            return int(got["objectio_meta_degraded_objects"]), int(got["objectio_meta_degraded_oldest_seconds"])
+            if name in PG_GAUGES:
+                got[PG_GAUGES[name]] = max(got.get(PG_GAUGES[name], 0), int(float(line.rsplit(" ", 1)[1])))
+        if len(got) == len(PG_GAUGES):
+            return got
     return None
 
 
-DEGRADED_MAX_SECS = int(os.environ.get("DEGRADED_MAX_SECS", "3600"))
+# The run fails on recovery that is stuck, not on recovery that is slow:
+# the pool's placement groups out of Clean while, for STALL_MAX_SECS with
+# every OSD up, neither their objects degraded fell below their lowest nor
+# meta's count of objects recovered moved (B31, objectio-docs
+# core/pg-recovery.md). A PG's own counts only change when its pass ends,
+# and a pass can take an hour on these disks. Per
+# pool, not per PG: a lost drive's replacement is in every PG of the lab's
+# 6 hosts, so its PGs backfill a few at a time and the rest queue (run
+# 19). How fast it gets back to Clean is B24's to measure on real disks;
+# here it is logged, and only a ceiling (NOT_CLEAN_MAX_SECS) fails the
+# run. Run 18's drive-lost took 61 minutes on the VMs' shared disks.
+STALL_MAX_SECS = int(os.environ.get("STALL_MAX_SECS", "1800"))
+NOT_CLEAN_MAX_SECS = int(os.environ.get("NOT_CLEAN_MAX_SECS", "10800"))
+last_osd_down = [time.monotonic()]
+# (lowest objects degraded, objects recovered, when either last moved), since
+# the pool last was all Clean
+pool_mark = [None]
+all_clean_since = [None]  # when the pool last left all Clean: None = all Clean
+
+
+def recovered_total():
+    """Meta's objectio_meta_pg_recovered_objects_total, through a gateway;
+    None if no gateway answers with it."""
+    for url in GW:
+        status, body = http("GET", f"{url}/metrics", timeout=10)
+        if status != 200:
+            continue
+        for line in body.decode(errors="replace").splitlines():
+            if line.startswith("objectio_meta_pg_recovered_objects_total"):
+                return int(float(line.rsplit(" ", 1)[1]))
+    return None
+
+
+def pg_watch():
+    """Every minute: the pool's recovery progress, and the run failed when
+    it is stuck (above). Logs how long the pool took to get back to all
+    Clean."""
+    while not stop.wait(60):
+        if not POOL:
+            continue
+        try:
+            status, body = chaos.admin("GET", f"/_admin/pools/{POOL}/placement-groups", retry_for=30)
+            pgs = json.loads(body)["pgs"] if status == 200 else None
+        except Exception:  # noqa: BLE001 — a poll that fails is retried next minute
+            pgs = None
+        if not pgs:
+            continue
+        now = time.monotonic()
+        states = [p.get("state") or {} for p in pgs]
+        out = [s for s in states if s.get("state") != "Clean"]
+        if not out:
+            if all_clean_since[0] is not None:
+                say(f"pgs: all {len(pgs)} Clean again after {int(now - all_clean_since[0])} s")
+            all_clean_since[0] = None
+            pool_mark[0] = None
+            continue
+        if all_clean_since[0] is None:
+            all_clean_since[0] = now
+        degraded = sum(s.get("objects_degraded", 0) for s in out)
+        # A counter on the leader: any change is progress (a new leader
+        # starts it again).
+        recovered = recovered_total()
+        mark = pool_mark[0]
+        if mark is None or degraded < mark[0] or recovered != mark[1]:
+            low = degraded if mark is None else min(degraded, mark[0])
+            pool_mark[0] = (low, recovered, now)
+            continue
+        stalled = now - mark[2]
+        all_up_for = now - last_osd_down[0]
+        if stalled > STALL_MAX_SECS and all_up_for > STALL_MAX_SECS:
+            worst = max(out, key=lambda s: s.get("objects_degraded", 0))
+            say(f"pool {POOL}: {len(out)} PGs out of Clean, {degraded} objects degraded; e.g. "
+                f"{json.dumps({k: v for k, v in worst.items() if k != 'members'})[:600]}")
+            print(f"✗ pool {POOL}'s recovery made no progress for {int(stalled)} s "
+                  f"with every OSD up for {int(all_up_for)} s", flush=True)
+            OPLOG.flush()
+            os._exit(1)
 
 
 def progress():
@@ -262,11 +349,21 @@ def progress():
                     # The harness drives everything through incusd, which
                     # leaked to 16 GB and locked up once (2026-10-06).
                     "incusd_mb": incusd_mb(),
-                    "degraded": degraded()}
+                    "pgs": pg_health()}
         print(json.dumps(line), flush=True)
-        d = line["degraded"]
-        if d and d[1] > DEGRADED_MAX_SECS:
-            print(f"✗ an object has been short of shards for {d[1]} s ({d[0]} degraded)", flush=True)
+        h = line["pgs"]
+        if h is None:
+            continue
+        if h["osds_down"] > 0:
+            last_osd_down[0] = time.monotonic()
+        all_up_for = time.monotonic() - last_osd_down[0]
+        if h["oldest"] > NOT_CLEAN_MAX_SECS and all_up_for > NOT_CLEAN_MAX_SECS:
+            print(f"✗ a placement group has been out of Clean for {h['oldest']} s with every OSD up "
+                  f"for {int(all_up_for)} s ({h['not_clean']} not Clean)", flush=True)
+            OPLOG.flush()
+            os._exit(1)
+        if h["lost"] > 0:
+            print(f"✗ {h['lost']} objects recorded lost", flush=True)
             OPLOG.flush()
             os._exit(1)
 
@@ -433,7 +530,20 @@ def await_no_leak(baseline):
 def main():
     say(f"soak: {HOURS} h, a fault every {FAULT_EVERY / 60:.0f} min, {WRITERS} writers; "
         f"cluster {chaos.IP}")
-    while http("PUT", f"{GW[0]}/{BUCKET}")[0] not in (200, 409):
+    # SOAK_POOL: the bucket goes in a pool of its own that places through
+    # placement groups (4+2, 32 PGs, one shard per host), the layout the
+    # docs recommend; without it, the default pool (CRUSH, no PGs). The
+    # PG path went untested here, and a lost OSD stayed in its PGs.
+    headers = {}
+    if POOL:
+        status, reply = chaos.admin("POST", "/_admin/pools", {
+            "name": POOL, "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 32, "failure_domain": "host", "enabled": True})
+        if status not in (200, 201, 409):
+            fail(f"pool {POOL}: {status} {reply[:300]!r}")
+        headers = {"x-objectio-pool": POOL}
+        say(f"bucket {BUCKET} in pool {POOL} (placement groups)")
+    while http("PUT", f"{GW[0]}/{BUCKET}", headers=headers)[0] not in (200, 409):
         time.sleep(2)
     chaos.await_metas_healthy()
     chaos.await_osds_online(6)
@@ -441,6 +551,7 @@ def main():
     threads = [threading.Thread(target=writer, args=(n,), daemon=True) for n in range(WRITERS)]
     threads += [threading.Thread(target=fill_control, daemon=True),
                 threading.Thread(target=progress, daemon=True),
+                threading.Thread(target=pg_watch, daemon=True),
                 threading.Thread(target=verifier, daemon=True)]
     for t in threads:
         t.start()

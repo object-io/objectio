@@ -557,12 +557,15 @@ pub(crate) async fn upload_part_internal(
         (None, None) => None,
     };
 
-    // Get placement for this part (using a unique key for the part)
-    let part_key = format!("__mpu/{}/part{:05}", upload_id, part_number);
+    // Placed where the object will be: its key's placement group, each
+    // shard on the acting member at its position. Placed by a key of its
+    // own (`__mpu/{upload}/part{n}`), as parts were, they landed in another
+    // PG, and recovery copied every completed object's parts into the
+    // object's PG (B31): one more copy of every multipart upload.
     let placement = match meta_client
         .get_placement(GetPlacementRequest {
             bucket: bucket.clone(),
-            key: part_key.clone(),
+            key: key.clone(),
             size: part_size,
             storage_class: "STANDARD".to_string(),
         })
@@ -658,6 +661,9 @@ pub(crate) async fn upload_part_internal(
                         1,    // ec_k=1 for replication
                         0,    // ec_m=0 for replication
                         None, // Replicated stripes go over gRPC.
+                        // A part is placed by its upload, not fenced (B31
+                        // phase 1): its object's metadata is, at completion.
+                        None,
                     )
                     .await;
                     (pos, result, placement_node)
@@ -717,8 +723,11 @@ pub(crate) async fn upload_part_internal(
 
             all_stripes.push(StripeMeta {
                 stripe_id: stripe_idx as u64,
+                // A copy per position: the width is every copy (one to
+                // read, the rest to spare), so recovery and the PG index
+                // see a stripe short of a copy as they do an EC one.
                 ec_k: 1,
-                ec_m: 0,
+                ec_m: u32::try_from(total_replicas.saturating_sub(1)).unwrap_or(0),
                 shards: locs,
                 ec_type: ErasureType::ErasureReplication.into(),
                 ec_local_parity: 0,
@@ -828,6 +837,9 @@ pub(crate) async fn upload_part_internal(
                         ec_k,
                         ec_m,
                         None, // Multipart parts go over gRPC (for now).
+                        // A part is placed by its upload, not fenced (B31
+                        // phase 1): its object's metadata is, at completion.
+                        None,
                     )
                     .await;
                     (pos, result, placement_node)
@@ -1146,16 +1158,57 @@ pub(crate) async fn complete_multipart_upload_internal(
         }
     }
 
-    // Complete the multipart upload via metadata service
-    match meta_client
+    // Where the object goes, and whether it is a version: read before the
+    // completion, while failing leaves the upload as it was. (Read after
+    // it, a failure here left the client no upload to complete again.)
+    let placement = match meta_client
+        .get_placement(GetPlacementRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            size: 0,
+            storage_class: "STANDARD".to_string(),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            error!("Failed to get placement for {bucket}/{key}: {e}");
+            return meta_failure(&e, "Failed to get placement");
+        }
+    };
+    // With versioning on, an object this replaces is kept (the OSDs also
+    // say so per replica); otherwise it is freed. Not knowing, keep what
+    // this replaces: a leak at worst, where guessing "unversioned" would
+    // free a version.
+    let versioning_enabled = bucket_versioning(&mut meta_client, &bucket)
+        .await
+        .map_or(true, |v| v == VersioningState::VersioningEnabled);
+    let version_id = if versioning_enabled {
+        new_version_id()
+    } else {
+        String::new()
+    };
+
+    // Complete the multipart upload via metadata service: two-phase, so
+    // the upload stays (being completed) until the object is stored, and
+    // a completion that fails to store it can be sent again.
+    let completed = meta_client
         .complete_multipart_upload(ProtoCompleteMultipartUploadRequest {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
             parts,
+            version_id: version_id.clone(),
+            // Two-phase once every node reads the mark (format level 6);
+            // before that, as the release before: the upload goes at once.
+            settle_after_commit: objectio_common::version::allows(
+                objectio_common::version::COMPLETED_UPLOADS_LEVEL,
+            ),
         })
-        .await
-    {
+        .await;
+    // A lost answer, for --test-hooks (as a leader change or timeout loses
+    // one): the completion stays, being completed, for the retry.
+    match crate::test_hooks::maybe_lost("complete_multipart_upload", completed) {
         Ok(response) => {
             let resp = response.into_inner();
             // Parts left out of the object went with the upload.
@@ -1193,35 +1246,13 @@ pub(crate) async fn complete_multipart_upload_internal(
                     );
                 }
 
-                // Store the final object metadata on primary OSD
-                let placement = match meta_client
-                    .get_placement(GetPlacementRequest {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        size: object.size,
-                        storage_class: "STANDARD".to_string(),
-                    })
-                    .await
-                {
-                    Ok(resp) => resp.into_inner(),
-                    Err(e) => {
-                        error!("Failed to get placement for completed object: {}", e);
-                        return meta_failure(&e, "Failed to get placement");
-                    }
-                };
-
-                // With versioning on, an object this replaces is kept (the
-                // OSDs also say so per replica); otherwise it is freed.
-                // Not knowing, keep what this replaces: a leak at worst,
-                // where guessing "unversioned" would free a version. The
-                // upload is already gone from meta, so it is not refused.
-                let versioning_enabled = bucket_versioning(&mut meta_client, &bucket)
-                    .await
-                    .map_or(true, |v| v == VersioningState::VersioningEnabled);
-                // A new version, as a single-part PUT makes — or a replica's,
-                // which keeps its source's version id and ETag.
-                if versioning_enabled {
-                    object.version_id = new_version_id();
+                // A new version, as a single-part PUT makes: meta keeps the
+                // one asked for with the completion, so one sent again
+                // makes the same version (a meta of the release before
+                // returns none). Or a replica's, which keeps its source's
+                // version id and ETag.
+                if object.version_id.is_empty() {
+                    object.version_id.clone_from(&version_id);
                 }
                 if let Some(v) = object
                     .user_metadata
@@ -1275,21 +1306,56 @@ pub(crate) async fn complete_multipart_upload_internal(
                     object.checksum = Some(c.clone());
                     object.part_checksums = part_checksums;
                 }
-                // Listed with its ObjectMeta, as a single-part PUT is. On
-                // failure the parts belong to nothing: meta has already
-                // dropped the upload, and commit_put frees them.
-                if let Err(resp) = commit_put(
+                // Listed with its ObjectMeta, as a single-part PUT is. The
+                // parts are never freed here: stored, they are the object;
+                // certainly not stored, the upload is open again and they
+                // are its parts; maybe stored, it stays being completed and
+                // the completion sent again stores the same object.
+                //
+                // Not settling (meta dropped the upload at once, below the
+                // level): the parts belong to nothing on a failure that
+                // stored nothing, and commit_put frees them, as before.
+                let sent = if resp.settling {
+                    Vec::new()
+                } else {
+                    stripe_targets(&object.stripes)
+                };
+                let committed = commit_put_outcome(
                     &state,
                     &placement,
                     object.clone(),
                     versioning_enabled,
-                    stripe_targets(&object.stripes),
+                    sent,
                     &condition,
                     None,
                 )
-                .await
-                {
-                    return resp;
+                .await;
+                match committed {
+                    Ok(()) if resp.settling => {
+                        settle_upload(&state, &bucket, &key, &upload_id, &object.object_id, true)
+                            .await;
+                    }
+                    Ok(()) => {}
+                    Err(refused) if !resp.settling => return refused.response,
+                    Err(refused) => {
+                        if refused.not_stored {
+                            settle_upload(
+                                &state,
+                                &bucket,
+                                &key,
+                                &upload_id,
+                                &object.object_id,
+                                false,
+                            )
+                            .await;
+                        } else {
+                            warn!(
+                                "{bucket}/{key} upload {upload_id}: the object may have been \
+                                 stored; the upload stays being completed for a retry"
+                            );
+                        }
+                        return refused.response;
+                    }
                 }
 
                 let cx = ChecksumXml::of(object.checksum.as_ref(), true);
@@ -1391,6 +1457,138 @@ pub(crate) async fn complete_multipart_upload_internal(
             }
         }
     }
+}
+
+/// Settle a two-phase completion in meta: its object `stored`, or certainly
+/// not. Retried for a while in the background when meta can't take it now;
+/// until then the upload stays being completed, which a completion sent
+/// again or an abort resolves.
+pub(crate) async fn settle_upload(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    object_id: &[u8],
+    stored: bool,
+) {
+    let req = SettleMultipartUploadRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+        object_id: object_id.to_vec(),
+        committed: stored,
+    };
+    let first = state
+        .meta_client
+        .clone()
+        .settle_multipart_upload(req.clone())
+        .await;
+    match first {
+        Ok(_) => return,
+        // A meta of the release before: it dropped the upload already.
+        Err(e) if e.code() == tonic::Code::Unimplemented => return,
+        Err(e) => warn!("{bucket}/{key} upload {upload_id}: not settled yet ({e}); retrying"),
+    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let mut wait = std::time::Duration::from_millis(500);
+        for _ in 0..8 {
+            tokio::time::sleep(wait).await;
+            if state
+                .meta_client
+                .clone()
+                .settle_multipart_upload(req.clone())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            wait = (wait * 2).min(std::time::Duration::from_secs(30));
+        }
+        warn!(
+            "{}/{} upload {}: still not settled; left being completed",
+            req.bucket, req.key, req.upload_id
+        );
+    });
+}
+
+/// How long a completion is left to finish before an abort decides it: by
+/// then its gateway has stored the object and settled, or is gone, and a
+/// copy the commit reached has been healed (a maybe-stored object is
+/// either current by now or never will be).
+const COMPLETING_GRACE_SECS: u64 = 600;
+
+/// Abort `upload_id`: dropped in meta, its parts' stripes returned for the
+/// caller to free. One being completed is decided first: if its object was
+/// stored the upload is gone (NotFound, as for any completed upload); if
+/// not, it is opened again and aborted; if too recent to tell, Unavailable.
+pub(crate) async fn abort_upload(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<Vec<objectio_proto::metadata::StripeMeta>, tonic::Status> {
+    let mut client = state.meta_client.clone();
+    let abort = || AbortMultipartUploadRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+    };
+    match client.abort_multipart_upload(abort()).await {
+        Ok(resp) => return Ok(resp.into_inner().stripes),
+        Err(e) if e.code() != tonic::Code::FailedPrecondition => return Err(e),
+        Err(_) => {}
+    }
+    let upload = client
+        .get_multipart_upload(GetMultipartUploadRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    if !upload.found {
+        return Err(tonic::Status::not_found("multipart upload not found"));
+    }
+    if !upload.completing_object_id.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if now.saturating_sub(upload.completing_since) < COMPLETING_GRACE_SECS {
+            return Err(tonic::Status::unavailable(
+                "the upload is being completed; retry later",
+            ));
+        }
+        let Ok(nodes) = get_placement_nodes_for_object(state, bucket, key).await else {
+            return Err(tonic::Status::unavailable("no placement for the key"));
+        };
+        let pool = &state.osd_pool;
+        let read = if upload.completing_version_id.is_empty() {
+            get_object_meta_from_any(pool, &nodes, bucket, key).await
+        } else {
+            find_version(pool, &nodes, bucket, key, &upload.completing_version_id).await
+        };
+        let stored = match read {
+            Ok(found) => found.is_some_and(|o| o.object_id == upload.completing_object_id),
+            Err(e) => return Err(tonic::Status::unavailable(format!("reading the key: {e}"))),
+        };
+        settle_upload(
+            state,
+            bucket,
+            key,
+            upload_id,
+            &upload.completing_object_id,
+            stored,
+        )
+        .await;
+        if stored {
+            return Err(tonic::Status::not_found("the upload was completed"));
+        }
+    }
+    client
+        .abort_multipart_upload(abort())
+        .await
+        .map(|resp| resp.into_inner().stripes)
 }
 
 /// The composite checksum of an object made of `numbers`' parts, when they
@@ -1632,22 +1830,15 @@ pub(crate) async fn abort_multipart_upload_internal(
     // sent the deletes to the *object key's* placement, but parts are placed
     // by their own keys: with more OSDs than a stripe spans, part shards on
     // OSDs outside the key's placement were never deleted.
-    match client
-        .abort_multipart_upload(AbortMultipartUploadRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
-        })
-        .await
-    {
-        Ok(resp) => {
+    match abort_upload(&state, &bucket, &key, &upload_id).await {
+        Ok(stripes) => {
             // Best effort, like the object path: a shard that cannot be
             // deleted is a leaked block, not a failed abort. Awaited, as a
             // DELETE is, so the space is free when the client hears back.
             let failed = reclaim_shards(
                 &state.osd_pool,
                 &mut client,
-                stripe_targets(&resp.into_inner().stripes),
+                stripe_targets(&stripes),
                 Reclaim::Abort,
             )
             .await;

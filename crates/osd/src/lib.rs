@@ -4,6 +4,8 @@
 //! in-process by `bin/aio`.
 
 pub mod discovery;
+pub mod pg_epochs;
+pub mod pg_index;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod service;
@@ -514,13 +516,19 @@ pub async fn run(
         warn!("could not write {}: {e}", addr_file.display());
     }
 
-    // Log failure domain configuration
-    let failure_domain = config.osd.failure_domain.clone();
+    // The host defaults to this machine's name, as Ceph's does. Left
+    // empty, every OSD of a cluster set up without a host in its config
+    // was one failure domain: nothing spread across machines, and a pool
+    // with placement groups could not be made ("have 1 failure domain").
+    let mut failure_domain = config.osd.failure_domain.clone();
+    if failure_domain.host.is_empty() {
+        failure_domain.host = gethostname::gethostname().to_string_lossy().into_owned();
+    }
     let node_name = config.osd.node_name.clone();
     let weight = config.osd.weight;
     info!(
-        "Failure domain: region={}, datacenter={}, rack={}",
-        failure_domain.region, failure_domain.datacenter, failure_domain.rack
+        "Failure domain: region={}, datacenter={}, rack={}, host={}",
+        failure_domain.region, failure_domain.datacenter, failure_domain.rack, failure_domain.host
     );
 
     // Register with metadata service
@@ -730,11 +738,19 @@ async fn register_with_meta(
             weight,
             disk_capacity_bytes: disk_capacity_bytes.to_vec(),
             te_segment: osd_service.te_segment(),
+            shards_dropped: osd_service.shards_dropped_at_open(),
         })
         .await
         .map_err(|e| format!("Failed to register OSD: {}", e))?;
 
     let resp = response.into_inner();
+
+    // Every placement group's epoch (B31): requests placed under an older
+    // one are refused from now on.
+    osd_service.pg_epochs().set_meta_endpoint(meta_endpoint);
+    for e in &resp.pg_epochs {
+        osd_service.pg_epochs().learn(&e.pool, e.pg_id, e.epoch);
+    }
 
     // Stamp the cluster_uuid into each disk's superblock. Empty
     // response means meta is pre-3.1 or a follower that couldn't

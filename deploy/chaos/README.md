@@ -41,3 +41,26 @@ stopped and every object sampled still reads back.
 `FAULTS=meta-kill,partition` runs a subset; `HOLD` (60) sets how long a
 fault lasts. Needs `sudo -n incus` and an Ubuntu 24.04 VM image (`IMAGE`,
 default `images:ubuntu/24.04`).
+
+## Soak
+
+`soak.py` (roadmap B2) runs the same faults in turn, plus drive-lost (an
+OSD's drive and its metadata gone for good, the OSD back on a new one
+and the old one evacuated), for `SOAK_HOURS` (48), one every
+`FAULT_EVERY` minutes (20). Twelve writers fill the cluster past the
+OSDs' full ratio and delete it back down, over and over. Its docstring
+lists the invariants. `SOAK_POOL=<name>` puts the bucket in a pool that
+places through placement groups.
+
+A fix to something a soak found goes through the quick soak first. It
+runs the same faults, closer together and on less data, so a
+drive-lost evacuation takes minutes, not an hour. That shows in two or
+three hours what a 48 h soak would show in six to twenty:
+
+```bash
+SOAK_HOURS=3 FAULT_EVERY=5 FULL_HIGH=0.3 FULL_LOW=0.1 \
+  STALL_MAX_SECS=900 NOT_CLEAN_MAX_SECS=3600 python3 deploy/chaos/soak.py
+```
+
+It never reaches the full ratio, so it doesn't test running full, and
+restarts are fast on so little data. Only the 48 h soak passes B2.

@@ -41,6 +41,11 @@ impl metadata::ObjectMeta {
     }
 }
 
+/// The gRPC metadata an OSD sets on a request it refuses as placed under
+/// an older epoch than it knows for the placement group (B31): the epoch
+/// it knows. The gateway takes it as "place again".
+pub const STALE_EPOCH_HEADER: &str = "x-objectio-pg-epoch";
+
 /// Cluster service (node and disk management)
 pub mod cluster {
     tonic::include_proto!("objectio.cluster");

@@ -729,22 +729,88 @@ export const rebalance = {
 // Placement groups
 // ---------------------------------------------------------------------
 
+/** One acting member's part, as peering last found it. */
+export interface PgMemberState {
+  node_id: string;
+  position: number;
+  answered: boolean;
+  copies_missing: number;
+  copies_stale: number;
+  shards_missing: number;
+}
+
+/** What peering (B31) last found of a placement group, and recovery's
+ * progress through it. */
+export interface PgState {
+  state: string;
+  epoch: number;
+  objects: number;
+  tombstones: number;
+  objects_degraded: number;
+  objects_unfound: number;
+  copies_missing: number;
+  copies_stale: number;
+  shards_missing: number;
+  members_down: number;
+  remapped: boolean;
+  by_summary: boolean;
+  last_error: string;
+  since: number;
+  computed_at: number;
+  min_spare: number;
+  recovery: {
+    cursor: string;
+    cursor_epoch: number;
+    recovered: number;
+    remaining: number;
+    bytes_remaining: number;
+    reserved_on: string[];
+    unfound_keys: string[];
+    retry_at: number;
+  };
+  members: PgMemberState[];
+}
+
+/** A placement group's scrub (B31 phase 4). */
+export interface PgScrub {
+  running: boolean;
+  requested: boolean;
+  epoch: number;
+  started_at: number;
+  last_complete: number;
+  members_done: string[];
+  cursors: Record<string, string>;
+  bytes: number;
+  shards: number;
+  bad: number;
+}
+
 export interface PlacementGroup {
   pool: string;
   pg_id: number;
-  osd_ids: string[]; // hex-encoded 16-byte UUIDs
-  version: number;
+  epoch: number;
+  /** Where its objects are and writes go, by position (hex node ids). */
+  acting: string[];
+  /** Where the balancer wants it; differs from acting while it moves. */
+  up: string[];
+  /** Stand-ins being filled, and the member each replaces. */
+  filling: { position: number; from: string; epoch: number }[];
   updated_at: number;
-  migrating_to_osd_ids: string[];
+  state: PgState | null;
+  scrub: PgScrub | null;
 }
 
 export const placementGroups = {
   list: (
     pool: string,
-    opts?: { start_after?: number; max?: number },
-  ): Promise<{ pgs: PlacementGroup[]; next_pg_id: number }> => {
+    opts?: { start_at?: number; max?: number },
+  ): Promise<{
+    pgs: PlacementGroup[];
+    by_state: Record<string, number>;
+    next_pg_id: number;
+  }> => {
     const q = new URLSearchParams();
-    if (opts?.start_after) q.set("start_after", String(opts.start_after));
+    if (opts?.start_at) q.set("start_at", String(opts.start_at));
     if (opts?.max) q.set("max", String(opts.max));
     const suffix = q.toString() ? `?${q}` : "";
     return request(
@@ -752,4 +818,14 @@ export const placementGroups = {
       `/_admin/pools/${encodeURIComponent(pool)}/placement-groups${suffix}`,
     );
   },
+  get: (pool: string, pgId: number): Promise<PlacementGroup> =>
+    request(
+      "GET",
+      `/_admin/pools/${encodeURIComponent(pool)}/placement-groups/${pgId}`,
+    ),
+  scrub: (pool: string, pgId: number): Promise<{ requested: boolean }> =>
+    request(
+      "POST",
+      `/_admin/pools/${encodeURIComponent(pool)}/placement-groups/${pgId}/scrub`,
+    ),
 };

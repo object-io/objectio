@@ -1098,13 +1098,8 @@ async fn abort_uploads(
                 {
                     continue;
                 }
-                let aborted = client
-                    .abort_multipart_upload(objectio_proto::metadata::AbortMultipartUploadRequest {
-                        bucket: bucket.to_string(),
-                        key: upload.key.clone(),
-                        upload_id: upload.upload_id.clone(),
-                    })
-                    .await;
+                let aborted =
+                    crate::s3::abort_upload(state, bucket, &upload.key, &upload.upload_id).await;
                 crate::gateway_metrics::record_lifecycle("abort_upload", aborted.is_ok());
                 let status = if aborted.is_ok() { 204 } else { 500 };
                 if let Ok(aborted) = aborted {
@@ -1113,7 +1108,7 @@ async fn abort_uploads(
                     crate::osd_pool::reclaim_shards(
                         &state.osd_pool,
                         &mut client,
-                        crate::osd_pool::stripe_targets(&aborted.into_inner().stripes),
+                        crate::osd_pool::stripe_targets(&aborted),
                         crate::osd_pool::Reclaim::Abort,
                     )
                     .await;

@@ -84,10 +84,12 @@ fn a_lost_disk_is_rebuilt_so_objects_survive_two_more_losses() {
     let bodies = put_objects(&c, "lost");
 
     c.restart_with_lost_disk(0);
+    // Rebuilt by its placement groups' recovery (B31 phase 3a), which the
+    // OSD's report of shards dropped at start sets off.
     await_metric(
         &c,
-        "objectio_meta_repair_shards_rebuilt_total",
-        &["reason=\"missing\""],
+        "objectio_meta_pg_recovered_shards_total",
+        &[],
         OBJECTS as u64,
         Duration::from_secs(120),
     );
@@ -237,16 +239,13 @@ fn rot(path: &std::path::Path, needle: &[u8]) -> bool {
     false
 }
 
-/// Rot nobody reads is found by the scrubber and rebuilt in place, and the
-/// object reads back correctly throughout.
+/// Rot nobody reads is found by its placement group's scrub (B31 phase 4),
+/// which reads every member's shards back and checks them, and rebuilt by
+/// the PG's recovery; the object reads back correctly throughout. The
+/// OSDs' own scrubber is off: the PG scrub finds it by itself.
 #[test]
 fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
-    let c = Cluster::start_with_ec_and_args(
-        6,
-        4,
-        2,
-        &["--repair-interval-secs", "1", "--scrub-interval-secs", "1"],
-    );
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--scrub-interval-secs", "0"]);
     c.json("POST", "/_admin/buckets", json!({"name": "rot"}))
         .expect_ok();
     let body = payload(400_000, 0x5a);
@@ -257,10 +256,39 @@ fn a_rotted_shard_is_found_by_the_scrubber_and_rebuilt() {
     let rotted = (0..6).any(|i| rot(&c.osd_disk(i), needle));
     assert!(rotted, "shard bytes not found on any disk");
 
+    // The PG holding it (the only one with an object) scrubbed now.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let pg = loop {
+        let pgs = c
+            .request("GET", "/_admin/pools/default/placement-groups", &[])
+            .json();
+        if let Some(id) = pgs["pgs"].as_array().and_then(|a| {
+            a.iter()
+                .find(|p| p["state"]["objects"].as_u64().unwrap_or(0) > 0)
+                .and_then(|p| p["pg_id"].as_u64())
+        }) {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "no PG holds the object: {pgs}");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let r = c.request(
+        "POST",
+        &format!("/_admin/pools/default/placement-groups/{pg}/scrub"),
+        &[],
+    );
+    assert_eq!(r.status, 202, "{}", r.text());
     await_metric(
         &c,
-        "objectio_meta_repair_shards_rebuilt_total",
+        "objectio_meta_scrub_shards_bad_total",
         &["reason=\"corrupt\""],
+        1,
+        Duration::from_secs(120),
+    );
+    await_metric(
+        &c,
+        "objectio_meta_pg_recovered_shards_total",
+        &[],
         1,
         Duration::from_secs(120),
     );
@@ -294,12 +322,15 @@ fn shard_count(c: &Cluster, index: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// Backfill (B20): objects written while an OSD is out have two shards on
-/// one of the other five; once it is back in, the repairer moves one of
-/// them to it, so every OSD holds one shard of each object again and the
-/// objects survive any two losses.
+/// An OSD set out with no other to stand in for it (six OSDs, 4+2): its
+/// placement groups are undersized, and objects written meanwhile go to the
+/// other five, one shard each, short one and recorded so (B31): nothing is
+/// put on the OSD that is out, and nothing doubles up on another (it did,
+/// before placement groups: two shards of every such object on one OSD,
+/// spread again by repair later). Once the OSD is back in, repair puts the
+/// missing shard there, and the objects survive any two losses.
 #[test]
-fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
+fn objects_written_while_an_osd_is_out_get_their_missing_shard_when_it_is_back() {
     let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--repair-interval-secs", "1"]);
     let out = osd_id(&c, 0);
     let set = |state: &str| {
@@ -311,30 +342,35 @@ fn shards_doubled_up_while_an_osd_was_out_are_spread_when_it_is_back() {
         .expect_ok();
     };
     set("out");
-    let bodies = put_objects(&c, "spread");
+    let bodies = put_objects(&c, "undersized");
     let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
-    let hot = counts
-        .iter()
-        .position(|n| *n > OBJECTS as u64)
-        .unwrap_or_else(|| panic!("nothing doubled up with an OSD out: {counts:?}"));
+    assert_eq!(
+        counts[0], 0,
+        "a shard went to the OSD that is out: {counts:?}"
+    );
+    assert!(
+        counts.iter().all(|n| *n <= OBJECTS as u64),
+        "shards doubled up: {counts:?}"
+    );
 
     set("in");
-    // Moved, and the old copies deleted after their grace.
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         let counts: Vec<u64> = (0..6).map(|i| shard_count(&c, i)).collect();
         if counts.iter().all(|n| *n == OBJECTS as u64) {
             break;
         }
-        assert!(Instant::now() < deadline, "shards never spread: {counts:?}");
+        assert!(
+            Instant::now() < deadline,
+            "the missing shards never came: {counts:?}"
+        );
         std::thread::sleep(Duration::from_secs(1));
     }
-    assert!(metric(&c, "objectio_meta_repair_shards_moved_total", &[]) >= OBJECTS as u64);
-    assert_readable(&c, "spread", &bodies, "after the shards were spread");
+    assert_readable(&c, "undersized", &bodies, "once the OSD was back");
 
-    // The OSD that held two of each, and one more.
-    c.restart_with_lost_disks(&[hot, (hot + 1) % 6]);
-    assert_readable(&c, "spread", &bodies, "with two disks lost");
+    // The OSD that was out, and one more.
+    c.restart_with_lost_disks(&[0, 1]);
+    assert_readable(&c, "undersized", &bodies, "with two disks lost");
 }
 
 /// B26, as a drive is replaced in production: the OSD's drive dies with
@@ -566,6 +602,54 @@ fn a_write_short_of_shards_is_repaired_from_its_record() {
     }
 }
 
+/// Soak run 16: objects written while an OSD was down, that OSD their
+/// owner (the first of their placement), and no gateway healing their
+/// metadata copies. Repair read the object from the owner's copy alone,
+/// found none, called it gone, and the degraded records waited forever.
+/// They are repaired from a quorum of copies, the owner's copy written
+/// back, and every object survives two more OSDs down.
+#[test]
+fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/owner", &[]).status, 200);
+    ha.stop_osd(0);
+    let c = &ha.clients[0];
+    let bodies: Vec<Vec<u8>> = (0..24u8).map(|i| payload(300_000, 90 + i)).collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/owner/k{i}"), b).status, 200);
+    }
+    ha.start_osd(0, None);
+    ha.await_seen_short(24, 60);
+    // Until every one of them is repaired: no degraded record left, and
+    // (keys in placement groups mark their PG rather than keep a record)
+    // every PG Clean.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let repaired = |ha: &HaCluster| {
+        ha.meta_metric("objectio_meta_degraded_objects") == Some(0.0)
+            && ha.meta_metric("objectio_meta_pgs_not_clean") == Some(0.0)
+    };
+    while !repaired(&ha) {
+        assert!(
+            Instant::now() < deadline,
+            "still degraded after 120 s: {:?} records, {:?} PGs not Clean",
+            ha.meta_metric("objectio_meta_degraded_objects"),
+            ha.meta_metric("objectio_meta_pgs_not_clean")
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/owner/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
+}
+
 /// B29: an evacuation that meets an object with fewer than k shards left
 /// records it as lost and finishes, rather than wait on it forever; but
 /// never while a holder of the rest is only down (it may have its shard).
@@ -688,7 +772,15 @@ fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
     let got = c.request("GET", "/heal/k", &[]);
     assert_eq!(got.status, 200, "{}", got.text());
     assert_eq!(got.bytes, body);
-    std::thread::sleep(Duration::from_secs(15));
+    // Until its placement group's recovery has rebuilt it.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ha
+        .meta_metric("objectio_meta_pg_recovered_shards_total")
+        .is_none_or(|n| n < 0.5)
+    {
+        assert!(Instant::now() < deadline, "never rebuilt");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     // Two other OSDs down: it reads only if position 0 is back.
     for i in (0..6).filter(|&i| i != holder).take(2) {
@@ -806,14 +898,221 @@ fn a_small_write_refused_below_k_copies_is_withdrawn() {
     ha.start_osd(3, None);
     ha.start_osd(4, None);
     ha.start_osd(5, None);
-    // Past the gateway's fail-fast window, and a heal round.
-    std::thread::sleep(Duration::from_secs(15));
+    // The stopped copies' answers may count as lost, not as refusals: the
+    // write is then withdrawn once they say they don't hold it, and the
+    // listing follows at the next heal round.
     let c = &ha.clients[0];
-    let got = c.request("GET", "/short/new", &[]);
-    assert_eq!(got.status, 404, "{}", got.text());
-    let got = c.request("GET", "/short/old", &[]);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let new = c.request("GET", "/short/new", &[]);
+        let got = c.request("GET", "/short/old", &[]);
+        let list = c.request("GET", "/short?list-type=2", &[]).text();
+        if new.status == 404
+            && got.status == 200
+            && got.bytes == old
+            && !list.contains("<Key>new</Key>")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new: {} {}; old: {} {}; {list}",
+            new.status,
+            new.text(),
+            got.status,
+            if got.bytes == old {
+                "the old object"
+            } else {
+                "the refused overwrite"
+            }
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// A small overwrite every copy took, three of whose answers were lost (a
+/// partition cutting the gateway off as they came back): counted on three
+/// copies, fewer than k. Soak run 25 found such a write withdrawn from all
+/// six, and the object it had replaced on each gone with it: the key read
+/// as never written. The copies that didn't answer are asked first; it is
+/// on all six, so it is kept.
+#[test]
+fn a_small_write_whose_answers_were_lost_is_kept_when_k_copies_hold_it() {
+    use objectio_e2e::ha::HaCluster;
+    let ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/short", &[]).status, 200);
+    let old = payload(40_000, 81);
+    assert_eq!(c.request("PUT", "/short/k", &old).status, 200);
+
+    for _ in 0..3 {
+        c.json(
+            "POST",
+            "/_admin/test/lose-reply",
+            json!({ "call": "put_object_meta" }),
+        )
+        .expect_ok();
+    }
+    let new = payload(50_000, 82);
+    let put = c.request("PUT", "/short/k", &new);
+    assert_ne!(put.status, 200, "acknowledged on three answers of six");
+
+    // Past the gateway's fail-fast window, and a round of asking.
+    std::thread::sleep(Duration::from_secs(15));
+    let got = c.request("GET", "/short/k", &[]);
     assert_eq!(got.status, 200, "{}", got.text());
-    assert_eq!(got.bytes, old, "the refused overwrite won");
+    assert_eq!(got.bytes, new, "the overwrite every copy took");
     let list = c.request("GET", "/short?list-type=2", &[]).text();
-    assert!(!list.contains("<Key>new</Key>"), "{list}");
+    assert!(list.contains("<Key>k</Key>"), "{list}");
+}
+
+/// A lost OSD in a pool with placement groups: a PG keeps its members
+/// until the balancer moves it, and a lost one never makes it, so the PG
+/// still named the lost OSD (set out, its address taken by the drive that
+/// replaced it, then forgotten). Placement handed it out with no address:
+/// a gateway that had it cached wrote to the replacement under its name,
+/// one started since wrote five shards of six, every new object in the
+/// pool a shard short, and repair had nowhere to put the sixth. Placement
+/// now stands another OSD in for it, during the evacuation and after.
+#[test]
+fn a_pg_pool_places_around_a_lost_osd() {
+    use objectio_e2e::ha::HaCluster;
+    let mut ha = HaCluster::start_with_osd_hosts(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "pgp", "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 8, "failure_domain": "host", "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    let pgs = c
+        .request("GET", "/_admin/pools/pgp/placement-groups", &[])
+        .json();
+    // Pre-allocated: the pool places through its PGs.
+    assert!(
+        pgs["pgs"].as_array().is_some_and(|p| !p.is_empty()),
+        "{pgs}"
+    );
+    c.request_with_headers("PUT", "/pgpool", &[], &[("x-objectio-pool", "pgp")])
+        .expect(200);
+
+    let ids = |c: &Cluster| -> Vec<(String, String)> {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| {
+                (
+                    n["node_id"].as_str().unwrap_or_default().to_string(),
+                    n["address"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let endpoint = ha.osd_endpoint(5);
+    let old = ids(c)
+        .into_iter()
+        .find(|(_, a)| *a == endpoint)
+        .map(|(id, _)| id)
+        .expect("OSD 5 registered");
+    ha.stop_osd(5);
+    ha.lose_osd_drive(5);
+    ha.start_osd(5, None);
+    // A gateway with nothing cached of the lost OSD.
+    ha.restart_gateway(0, None);
+    let mut bodies: Vec<(String, Vec<u8>)> = Vec::new();
+    let put = |c: &Cluster, bodies: &mut Vec<(String, Vec<u8>)>, name: String, seed: u8| {
+        let body = payload(300_000, seed);
+        let r = c.request("PUT", &format!("/pgpool/{name}"), &body);
+        assert_eq!(r.status, 200, "{name}: {}", r.text());
+        bodies.push((name, body));
+    };
+    // While the lost OSD is out and being evacuated...
+    let c = &ha.clients[0];
+    for i in 0..10u8 {
+        put(c, &mut bodies, format!("during-{i}"), i);
+    }
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while ids(&ha.clients[0]).iter().any(|(id, _)| *id == old) {
+        assert!(
+            Instant::now() < deadline,
+            "the lost OSD was never evacuated"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // ...and once it is forgotten.
+    ha.restart_gateway(0, None);
+    let c = &ha.clients[0];
+    for i in 0..10u8 {
+        put(c, &mut bodies, format!("after-{i}"), 100 + i);
+    }
+    // Every one on six OSDs: it survives two more down.
+    ha.stop_osd(0);
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    for (name, body) in &bodies {
+        let got = c.request("GET", &format!("/pgpool/{name}"), &[]);
+        assert_eq!(got.status, 200, "{name}: {}", got.text());
+        assert_eq!(&got.bytes, body, "{name}");
+    }
+}
+
+/// A disk replaced under the same OSD (the documented replacement, and the
+/// soak's disk-pull fault): the OSD forgets the shards the old disk held
+/// and tells Meta, whose repair walk starts at once. It used to wait until
+/// next due, an hour by default, with every object it held a shard short
+/// all that time (and after it, until the walk reached it).
+#[test]
+fn a_replaced_disk_is_rebuilt_without_waiting_for_the_walk() {
+    use objectio_e2e::ha::HaCluster;
+    // The walk's default interval: an hour.
+    let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    assert_eq!(c.request("PUT", "/replaced", &[]).status, 200);
+    let bodies: Vec<Vec<u8>> = (0..20u8).map(|i| payload(300_000, 60 + i)).collect();
+    for (i, b) in bodies.iter().enumerate() {
+        assert_eq!(c.request("PUT", &format!("/replaced/k{i}"), b).status, 200);
+    }
+    let endpoint = ha.osd_endpoint(2);
+    let shards_on_2 = |c: &Cluster| -> u64 {
+        c.request("GET", "/_admin/nodes", &[]).json()["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["address"].as_str() == Some(endpoint.as_str()))
+            .and_then(|n| n["shard_count"].as_u64())
+            .unwrap_or(0)
+    };
+
+    // The disk pulled and a blank one put in; the OSD's identity and
+    // metadata (its state directory) stay.
+    ha.stop_osd(2);
+    std::fs::remove_file(ha.osd_disk(2)).unwrap();
+    ha.start_osd(2, None);
+
+    // Rebuilt in place: one shard of each object on it again.
+    let c = &ha.clients[0];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while shards_on_2(c) < bodies.len() as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "OSD 2 holds {} shards of {} two minutes after its disk was replaced",
+            shards_on_2(c),
+            bodies.len()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    // Two other OSDs down: every object still has four.
+    ha.stop_osd(4);
+    ha.stop_osd(5);
+    let c = &ha.clients[0];
+    for (i, b) in bodies.iter().enumerate() {
+        let got = c.request("GET", &format!("/replaced/k{i}"), &[]);
+        assert_eq!(got.status, 200, "k{i}: {}", got.text());
+        assert_eq!(&got.bytes, b, "k{i}");
+    }
 }

@@ -351,10 +351,14 @@ impl ErasureBackend for RustSimdLrcBackend {
             return Ok(reconstructed);
         }
 
-        // Fall back to global RS recovery for remaining shards
-        // Use all data + local parity as effective data for RS
-        let effective_k = k + l;
-        let available = shards[..effective_k].iter().filter(|s| s.is_some()).count();
+        // Fall back to global RS recovery for remaining shards: the RS code
+        // is over the data and the global parity, so it needs k of those
+        // (local parities don't count: they took part only in their group).
+        let available = shards[..k]
+            .iter()
+            .chain(shards.iter().skip(k + l).take(g))
+            .filter(|s| s.is_some())
+            .count();
 
         if available < k {
             return Err(ErasureError::InsufficientShards {
@@ -376,11 +380,14 @@ impl ErasureBackend for RustSimdLrcBackend {
             }
         }
 
-        // Add global parity shards
+        // Add global parity shards: the RS code's recovery shards, numbered
+        // from 0. (Added as original shards at `i - l`, as this did, the
+        // decoder refused every one: an index past the data shards. No
+        // global rebuild ever worked.)
         for (i, shard) in shards.iter().enumerate().skip(k + l).take(g) {
             if let Some(data) = shard {
                 decoder
-                    .add_original_shard(i - l, data) // Adjust index for decoder
+                    .add_recovery_shard(i - k - l, data)
                     .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
             }
         }
@@ -710,6 +717,33 @@ mod tests {
         let recovered = backend.decode_local(&shard_refs, 1024, 1).unwrap();
         assert!(recovered.is_some());
         assert_eq!(recovered.unwrap(), data[1]);
+    }
+
+    /// Data shards past their group's help come back through the global
+    /// parity: two of group 0 (with its local parity) lost in LRC 6+2+2.
+    /// The global parity was handed to the decoder as data shards, which it
+    /// refused, so no global decode ever worked.
+    #[test]
+    fn test_lrc_global_recovery() {
+        let backend = RustSimdLrcBackend::new(LrcConfig::new(6, 2, 2)).unwrap();
+        let data: Vec<Vec<u8>> = (0..6u8)
+            .map(|i| {
+                (0..1024u32)
+                    .map(|b| (b as u8) ^ i.wrapping_mul(31))
+                    .collect()
+            })
+            .collect();
+        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
+        let all_shards = backend.encode(&data_refs, 1024).unwrap();
+
+        let mut shard_refs: Vec<Option<&[u8]>> =
+            all_shards.iter().map(|s| Some(s.as_slice())).collect();
+        shard_refs[0] = None;
+        shard_refs[1] = None;
+        shard_refs[6] = None; // group 0's local parity
+        assert_eq!(backend.decode_local(&shard_refs, 1024, 0).unwrap(), None);
+        let recovered = backend.decode(&shard_refs, 1024, &[0, 1]).unwrap();
+        assert_eq!(recovered, vec![data[0].clone(), data[1].clone()]);
     }
 
     #[test]

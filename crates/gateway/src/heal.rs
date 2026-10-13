@@ -28,7 +28,7 @@ use objectio_proto::storage::{
 };
 use tracing::{debug, info, warn};
 
-use crate::osd_pool::{Reclaim, reclaim_shards, stripe_targets_of, unreferenced};
+use crate::osd_pool::{Reclaim, Unread, reclaim_shards, stripe_targets_of, unreferenced};
 use crate::s3::AppState;
 
 /// Entries taken per pass.
@@ -135,7 +135,15 @@ async fn heal_key(state: &Arc<AppState>, entry: &HealEntry) -> bool {
     }
 
     // Free what the copies let go of, once none of them still has it.
-    let gone = unreferenced(&state.osd_pool, &copies, bucket, key, freed).await;
+    let gone = unreferenced(
+        &state.osd_pool,
+        &copies,
+        bucket,
+        key,
+        freed,
+        Unread::KeepAll,
+    )
+    .await;
     for object in gone {
         reclaim_shards(
             &state.osd_pool,

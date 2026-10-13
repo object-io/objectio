@@ -152,12 +152,43 @@ pub(crate) fn condition_refused(code: &str) -> Response {
 pub(crate) async fn commit_put(
     state: &Arc<AppState>,
     placement: &objectio_proto::metadata::GetPlacementResponse,
-    mut object_meta: ObjectMeta,
+    object_meta: ObjectMeta,
     versioning_enabled: bool,
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
     small: Option<&SmallShards>,
 ) -> Result<(), Response> {
+    commit_put_outcome(
+        state,
+        placement,
+        object_meta,
+        versioning_enabled,
+        sent,
+        condition,
+        small,
+    )
+    .await
+    .map_err(|refused| refused.response)
+}
+
+/// A commit that didn't succeed: the answer for the client, and whether the
+/// object is certainly not stored (no copy took it) rather than maybe.
+pub(crate) struct CommitRefused {
+    pub(crate) response: Response,
+    pub(crate) not_stored: bool,
+}
+
+/// [`commit_put`], saying on a failure whether the object may still have
+/// been stored: a multipart completion keeps its upload for a retry then.
+pub(crate) async fn commit_put_outcome(
+    state: &Arc<AppState>,
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+    mut object_meta: ObjectMeta,
+    versioning_enabled: bool,
+    sent: Vec<ShardTarget>,
+    condition: &PutCondition,
+    small: Option<&SmallShards>,
+) -> Result<(), CommitRefused> {
     if !object_meta.replica_of.is_empty() {
         return commit_replica(state, placement, object_meta, sent, small).await;
     }
@@ -191,8 +222,9 @@ pub(crate) async fn commit_replica(
     object_meta: ObjectMeta,
     sent: Vec<ShardTarget>,
     small: Option<&SmallShards>,
-) -> Result<(), Response> {
+) -> Result<(), CommitRefused> {
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
+    let pg = crate::osd_pool::pg_ref(placement);
     let written = crate::osd_pool::put_object_meta_with(
         &state.osd_pool,
         &placement.nodes,
@@ -205,6 +237,7 @@ pub(crate) async fn commit_replica(
             // A small replica's shards go with its metadata too (B21).
             small_shards: small.map(|s| &s.shards),
             min_copies: small.map_or(0, |s| s.quorum),
+            pg: pg.as_ref(),
             ..Default::default()
         },
     )
@@ -216,12 +249,64 @@ pub(crate) async fn commit_replica(
             if e.unapplied {
                 spawn_reclaim(state, sent, Reclaim::FailedWrite, format!("{bucket}/{key}"));
             }
-            Err(S3Error::xml_response(
-                "ServiceUnavailable",
-                &format!("storing the replica: {}", e.error),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ))
+            Err(CommitRefused {
+                response: S3Error::xml_response(
+                    "ServiceUnavailable",
+                    &format!("storing the replica: {}", e.error),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+                not_stored: e.unapplied,
+            })
         }
+    }
+}
+
+/// How long a conditional commit whose answer is lost is sent again.
+const CONDITIONAL_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a failed call to meta may have been applied: its answer lost to
+/// a leader change, a timeout or a dropped connection, not a refusal.
+const fn is_ambiguous(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::Internal
+    )
+}
+
+/// Commit a conditional PUT's listing entry: meta decides the condition.
+/// An answer lost (the write applied or not) is sent again until meta
+/// decides. Meta takes the same write sent twice as applied once (it knows
+/// its entry by object id); refused by its own entry, the PUT failed, freed
+/// its shards and left the listing naming an object no GET finds, refusing
+/// every If-None-Match after.
+async fn create_conditional(
+    state: &Arc<AppState>,
+    req: objectio_proto::metadata::CreateObjectRequest,
+) -> Result<(), tonic::Status> {
+    let deadline = std::time::Instant::now() + CONDITIONAL_SETTLE;
+    let mut wait = std::time::Duration::from_millis(250);
+    let mut answer = crate::test_hooks::maybe_lost(
+        "create_object",
+        state.meta_client.clone().create_object(req.clone()).await,
+    );
+    loop {
+        match answer {
+            Ok(_) => return Ok(()),
+            Err(s) if is_ambiguous(s.code()) && std::time::Instant::now() < deadline => {
+                debug!(
+                    "{}/{}: conditional commit undecided ({s}); sending it again",
+                    req.bucket, req.key
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(4));
+            }
+            Err(s) => return Err(s),
+        }
+        answer = state.meta_client.clone().create_object(req.clone()).await;
     }
 }
 
@@ -234,13 +319,15 @@ pub(crate) async fn commit_new(
     sent: Vec<ShardTarget>,
     condition: &PutCondition,
     small: Option<&SmallShards>,
-) -> Result<(), Response> {
+) -> Result<(), CommitRefused> {
     // Small shards travel with the metadata (B21): each copy is a shard
     // too, so the write needs the shard quorum (k + 1) as well.
+    let pg = crate::osd_pool::pg_ref(placement);
     let write = crate::osd_pool::MetaWrite {
         versioning_enabled,
         small_shards: small.map(|s| &s.shards),
         min_copies: small.map_or(0, |s| s.quorum),
+        pg: pg.as_ref(),
         ..Default::default()
     };
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
@@ -257,31 +344,58 @@ pub(crate) async fn commit_new(
         object_id: object_meta.object_id.clone(),
         pg_id: placement.pg_id,
         pool: placement.pool.clone(),
-        home_osd_ids: home_of(nodes),
         if_match: condition.if_match.clone().unwrap_or_default(),
         if_none_match: condition.if_none_match.clone().unwrap_or_default(),
     };
     let new_object = referenced_object_ids(&object_meta);
     let failed = |e: &crate::osd_pool::MetaWriteError| {
         error!("Failed to store object metadata on OSDs: {e}");
-        S3Error::for_osd_error(&e.error, "Failed to store object metadata")
+        CommitRefused {
+            response: S3Error::for_osd_error(&e.error, "Failed to store object metadata"),
+            not_stored: e.unapplied,
+        }
     };
 
     if condition.is_set() {
-        if let Err(s) = state.meta_client.clone().create_object(listing_req).await {
+        if let Err(s) = create_conditional(state, listing_req).await {
+            if is_ambiguous(s.code()) {
+                // Meta may have taken it, its answer lost every time: the
+                // listing may name an object no copy holds. Healing puts
+                // the listing back to what the copies hold; the shards stay
+                // (a leak) rather than be freed under a listed object.
+                warn!(
+                    "{what}: conditional commit undecided ({s}); keeping its shards, healing the key"
+                );
+                state.osd_pool.queue_heal(&bucket, &key, "").await;
+                // Maybe stored: meta may hold the entry. A multipart
+                // completion stays being completed, and sent again commits
+                // the same object, which meta then takes as applied.
+                return Err(CommitRefused {
+                    response: S3Error::xml_response(
+                        "ServiceUnavailable",
+                        &format!("could not commit the object: {}", s.message()),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ),
+                    not_stored: false,
+                });
+            }
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what);
-            return Err(match s.code() {
-                tonic::Code::FailedPrecondition => condition_refused(s.message()),
-                tonic::Code::NotFound => S3Error::xml_response(
-                    "NoSuchBucket",
-                    "The specified bucket does not exist",
-                    StatusCode::NOT_FOUND,
-                ),
-                _ => S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!("could not commit the object: {}", s.message()),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                ),
+            // Refused before any copy was written: certainly not stored.
+            return Err(CommitRefused {
+                response: match s.code() {
+                    tonic::Code::FailedPrecondition => condition_refused(s.message()),
+                    tonic::Code::NotFound => S3Error::xml_response(
+                        "NoSuchBucket",
+                        "The specified bucket does not exist",
+                        StatusCode::NOT_FOUND,
+                    ),
+                    _ => S3Error::xml_response(
+                        "ServiceUnavailable",
+                        &format!("could not commit the object: {}", s.message()),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ),
+                },
+                not_stored: true,
             });
         }
         let outcome = crate::osd_pool::put_object_meta_with(
@@ -299,6 +413,11 @@ pub(crate) async fn commit_new(
             sent,
             &new_object,
             versioning_enabled,
+            Copies {
+                nodes,
+                bucket: &bucket,
+                key: &key,
+            },
             &what,
         );
         if let Err(e) = outcome {
@@ -333,6 +452,11 @@ pub(crate) async fn commit_new(
         sent,
         &new_object,
         versioning_enabled,
+        Copies {
+            nodes,
+            bucket: &bucket,
+            key: &key,
+        },
         &what,
     );
     match committed {
@@ -412,11 +536,60 @@ pub(crate) fn spawn_reclaim(
         let failed = reclaim_shards(&state.osd_pool, &mut meta, targets, reason).await;
         if failed > 0 {
             warn!(
-                "{what}: {failed} of {total} shard deletes failed ({}); those blocks stay allocated",
+                "{what}: {failed} of {total} shard deletes failed ({}); retried in the background",
                 reason.label()
             );
         } else {
             debug!("{what}: freed {total} shards ({})", reason.label());
+        }
+    });
+}
+
+/// Where a key's copies are: what an overwrite's freeing reads again when
+/// its copies disagreed.
+#[derive(Clone, Copy)]
+pub(crate) struct Copies<'a> {
+    pub nodes: &'a [objectio_proto::metadata::NodePlacement],
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
+/// Free what an overwrite displaced: at once when its copies agree, else
+/// what no copy holds once a racing write has settled
+/// ([`reclaimable_after_overwrite`]).
+pub(crate) fn spawn_overwrite_reclaim(
+    state: &Arc<AppState>,
+    displaced: &[Displaced],
+    keep: &std::collections::HashSet<Vec<u8>>,
+    at: Copies<'_>,
+    what: String,
+) {
+    let freed = reclaimable_after_overwrite(displaced, keep);
+    spawn_reclaim(state, freed.now, Reclaim::Overwrite, what.clone());
+    if freed.unsettled.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let state = Arc::clone(state);
+    let (nodes, bucket, key) = (at.nodes.to_vec(), at.bucket.to_string(), at.key.to_string());
+    let keep = keep.clone();
+    runtime.spawn(async move {
+        tokio::time::sleep(crate::osd_pool::RESTAMP_SETTLE).await;
+        let mut meta = state.meta_client.clone();
+        let failed = crate::osd_pool::reclaim_unsettled(
+            &state.osd_pool,
+            &mut meta,
+            &nodes,
+            &bucket,
+            &key,
+            freed.unsettled,
+            &keep,
+        )
+        .await;
+        if failed > 0 {
+            warn!("{what}: {failed} shard deletes failed (overwrite); retried in the background");
         }
     });
 }
@@ -437,6 +610,7 @@ pub(crate) fn settle_commit(
     sent: Vec<ShardTarget>,
     new_object: &std::collections::HashSet<Vec<u8>>,
     versioning_enabled: bool,
+    at: Copies<'_>,
     what: &str,
 ) {
     match outcome {
@@ -445,25 +619,30 @@ pub(crate) fn settle_commit(
         Ok(displaced) if !displaced.is_empty() && displaced.iter().all(|d| d.superseded) => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
         }
-        Ok(displaced) if !versioning_enabled => spawn_reclaim(
-            state,
-            reclaimable_after_overwrite(displaced, new_object),
-            Reclaim::Overwrite,
-            what.to_string(),
-        ),
+        Ok(displaced) if !versioning_enabled => {
+            spawn_overwrite_reclaim(state, displaced, new_object, at, what.to_string());
+        }
         Ok(_) => {}
         Err(e) if e.unapplied => {
             spawn_reclaim(state, sent, Reclaim::FailedWrite, what.to_string());
         }
-        // A refused small write some copies didn't answer the withdrawal
-        // of: its shards go once they have.
+        // A refused small write not yet withdrawn from every copy that may
+        // hold it (or not yet known to be held by k): its shards go once
+        // it is withdrawn.
         Err(MetaWriteError {
             withdrawing: Some(w),
             ..
         }) => {
             let (state, w, what) = (Arc::clone(state), w.clone(), what.to_string());
             tokio::spawn(async move {
-                if crate::osd_pool::withdraw_later(&state.osd_pool, w).await {
+                let (targets, bucket, key) = (w.targets.clone(), w.bucket.clone(), w.key.clone());
+                let withdrawn = crate::osd_pool::withdraw_later(&state.osd_pool, w).await;
+                // Decided after the PUT's own listing update, which found
+                // it still on some copies: the listing follows what they
+                // hold now. (Peering keeps an entry no copy backs, as
+                // unfound.)
+                sync_listing(&state, &targets, &bucket, &key).await;
+                if withdrawn {
                     spawn_reclaim(&state, sent, Reclaim::FailedWrite, what);
                 }
             });
@@ -476,9 +655,58 @@ pub(crate) fn settle_commit(
     }
 }
 
+/// The 503 for a stripe whose writes OSDs refused as placed under an old
+/// epoch of its placement group (B31): marked, so the PUT is placed again.
+fn stale_placement(stripe: usize) -> Response {
+    let mut resp = S3Error::xml_response(
+        "ServiceUnavailable",
+        &format!(
+            "stripe {stripe}: the placement group's acting set changed while it was written; retry"
+        ),
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    resp.extensions_mut()
+        .insert(crate::osd_pool::StalePlacement);
+    resp
+}
+
+/// PUT, placed again once when an OSD refused it as placed under an older
+/// epoch of its placement group than it knows (B31): the acting set changed
+/// between placing and writing, and nothing was stored. The client never
+/// sees that.
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let first = put_object_placed(
+        Arc::clone(&state),
+        bucket.clone(),
+        key.clone(),
+        auth.clone(),
+        headers.clone(),
+        body.clone(),
+    )
+    .await;
+    if first
+        .extensions()
+        .get::<crate::osd_pool::StalePlacement>()
+        .is_none()
+    {
+        return first;
+    }
+    crate::gateway_metrics::record_stale_placement();
+    crate::placement_cache::forget(&bucket, &key);
+    tracing::info!("{bucket}/{key}: placed under an old epoch; placed again");
+    put_object_placed(state, bucket, key, auth, headers, body).await
+}
+
+async fn put_object_placed(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
     body: Bytes,
@@ -743,6 +971,10 @@ pub async fn put_object(
             return meta_failure(&e, "Failed to get placement");
         }
     };
+    crate::test_hooks::held_after_placement(&bucket, &key).await;
+    // Every write below names the placement group and epoch it was placed
+    // under (B31): an OSD that knows a newer one refuses it.
+    let pg = crate::osd_pool::pg_ref(&placement);
     phases.mark("meta_lookup");
 
     // If-Match / If-None-Match: refused now if the current object already
@@ -819,6 +1051,7 @@ pub async fn put_object(
                 let shard_data = stripe_data.clone();
                 let pos = i as u32;
                 let s_idx = stripe_idx as u64;
+                let pg = pg.clone();
                 pending.sent(&placement_node, &obj_id, s_idx, pos);
 
                 write_futures.push(async move {
@@ -832,6 +1065,7 @@ pub async fn put_object(
                         1,    // ec_k=1 for replication (full data)
                         0,    // ec_m=0 for replication (no parity)
                         None, // Replicated stripes go over gRPC.
+                        pg.as_ref(),
                     )
                     .await;
                     (pos, result, placement_node)
@@ -844,6 +1078,7 @@ pub async fn put_object(
             let mut shard_locs = Vec::with_capacity(total_replicas);
 
             let mut full = false;
+            let mut stale = false;
             for (pos, result, placement_node) in results {
                 match result {
                     Ok((location, crc32c)) => {
@@ -864,6 +1099,7 @@ pub async fn put_object(
                     }
                     Err(e) => {
                         full |= e.is_full();
+                        stale |= e.is_stale_epoch();
                         warn!(
                             "Failed to write stripe {} replica {} to {}: {}",
                             stripe_idx, pos, placement_node.node_address, e
@@ -883,6 +1119,9 @@ pub async fn put_object(
                 if full {
                     return S3Error::storage_full();
                 }
+                if stale {
+                    return stale_placement(stripe_idx);
+                }
                 return S3Error::xml_response(
                     "ServiceUnavailable",
                     &format!(
@@ -898,8 +1137,11 @@ pub async fn put_object(
 
             all_stripes.push(StripeMeta {
                 stripe_id: stripe_idx as u64,
+                // A copy per position: the width is every copy (one to
+                // read, the rest to spare), so recovery and the PG index
+                // see a stripe short of a copy as they do an EC one.
                 ec_k: 1,
-                ec_m: 0,
+                ec_m: u32::try_from(total_replicas.saturating_sub(1)).unwrap_or(0),
                 shards: shard_locs,
                 ec_type: ErasureType::ErasureReplication.into(),
                 ec_local_parity: 0,
@@ -970,6 +1212,8 @@ pub async fn put_object(
             required_level: 0,
             stamp: 0, // stamped when stored
             update_stamp: 0,
+            pg_pool: placement.pool.clone(),
+            pg_id: placement.pg_id,
         };
 
         // Listed as well: this path used to write only the ObjectMeta, so a
@@ -1004,7 +1248,7 @@ pub async fn put_object(
             &body,
             sse_algorithm != SseAlgorithm::SseNone,
         );
-        info!(
+        debug!(
             "Created object (replication): {}/{}, size={}, stripes={}, replicas_written={}",
             bucket, key, original_size, num_stripes, total_success,
         );
@@ -1279,6 +1523,7 @@ pub async fn put_object(
             let shard_data = shard.clone();
             let pos = i as u32;
             let s_idx = stripe_idx as u64;
+            let pg = pg.clone();
             pending.sent(&placement_node, &obj_id, s_idx, pos);
             let rdma = state.rdma.clone();
             let shard_addr = rdma_base.map(|base| base + (i * shard_data.len()) as u64);
@@ -1305,6 +1550,7 @@ pub async fn put_object(
                     ec_k,
                     ec_m,
                     source,
+                    pg.as_ref(),
                 )
                 .await;
                 (pos, result, placement_node)
@@ -1318,6 +1564,7 @@ pub async fn put_object(
         let mut shard_locs = Vec::with_capacity(total_shards);
 
         let mut full = false;
+        let mut stale = false;
         for (pos, result, placement_node) in results {
             match result {
                 Ok((location, crc32c)) => {
@@ -1339,6 +1586,7 @@ pub async fn put_object(
                 }
                 Err(e) => {
                     full |= e.is_full();
+                    stale |= e.is_stale_epoch();
                     warn!(
                         "Failed to write stripe {} shard {} to {}: {}",
                         stripe_idx, pos, placement_node.node_address, e
@@ -1358,6 +1606,9 @@ pub async fn put_object(
             );
             if full {
                 return S3Error::storage_full();
+            }
+            if stale {
+                return stale_placement(stripe_idx);
             }
             return S3Error::xml_response(
                 "ServiceUnavailable",
@@ -1451,6 +1702,8 @@ pub async fn put_object(
         required_level: 0,
         stamp: 0, // stamped when stored
         update_stamp: 0,
+        pg_pool: placement.pool.clone(),
+        pg_id: placement.pg_id,
     };
 
     // What lifecycle filters on, for x-amz-expiration once it's stored.
@@ -1483,7 +1736,7 @@ pub async fn put_object(
         &body,
         sse_algorithm != SseAlgorithm::SseNone,
     );
-    info!(
+    debug!(
         "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
         bucket,
         key,

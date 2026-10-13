@@ -10,7 +10,7 @@ fn pool(c: &Cluster, name: &str) {
     let r = c.json(
         "POST",
         "/_admin/pools",
-        json!({"name": name, "ec_type": 2, "replication_count": 3, "enabled": true}),
+        json!({"name": name, "ec_type": 0, "ec_k": 2, "ec_m": 1, "enabled": true}),
     );
     assert!(r.status < 300, "create pool {name}: {}", r.text());
 }
@@ -42,7 +42,8 @@ fn create_in(c: &Cluster, keys: Option<(&str, &str)>, bucket: &str, pool: &str) 
 
 #[test]
 fn a_bucket_lives_in_the_pool_it_was_created_in() {
-    let c = Cluster::start();
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
     pool(&c, "rep3");
     create_in(&c, None, "in-pool", "rep3").expect(200);
     create_in(&c, None, "no-pool", "").expect(200);
@@ -71,7 +72,8 @@ fn a_bucket_lives_in_the_pool_it_was_created_in() {
 
 #[test]
 fn a_tenant_uses_its_default_pool_and_only_the_pools_it_is_allowed() {
-    let c = Cluster::start();
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
     pool(&c, "gold");
     pool(&c, "silver");
     c.json(
@@ -127,4 +129,62 @@ fn a_tenant_uses_its_default_pool_and_only_the_pools_it_is_allowed() {
     let r = c.request("DELETE", "/_admin/pools/gold", &[]);
     assert_eq!(r.status, 400, "{}", r.text());
     assert!(r.text().contains("acme"), "{}", r.text());
+}
+
+/// A pool with placement groups on a topology that can't spread a PG's
+/// copies across hosts (here every OSD is on one) is refused, and not
+/// made: it used to be created with no PGs, and its objects placed some
+/// other way, with only a warning in meta's log.
+#[test]
+fn a_pool_whose_pgs_cannot_be_spread_is_refused() {
+    // A pool's copies are on distinct OSDs: three for a 3-way replica pool.
+    let c = Cluster::start_with_osds(3);
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "pgp", "ec_type": 0, "ec_k": 4, "ec_m": 2,
+            "pg_count": 8, "failure_domain": "host", "enabled": true}),
+    );
+    assert!((400..500).contains(&r.status), "{}: {}", r.status, r.text());
+    assert!(r.text().contains("placement groups"), "{}", r.text());
+    let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+    assert!(!pools.to_string().contains("\"pgp\""), "{pools}");
+}
+
+/// A pool made without a PG count gets one sized from the OSDs in service,
+/// about `pg/members_per_osd` members on each (B24: a lost drive's PGs are
+/// rebuilt onto as many drives as it held members of), a power of two, at
+/// least 256.
+#[test]
+fn a_pool_made_without_a_count_is_sized_from_its_drives() {
+    let c = Cluster::start_with_osds(3);
+    pool(&c, "small");
+    // 3 OSDs, 3 copies: 100 members a drive is 100 PGs, below the floor.
+    let pg_count = |name: &str| {
+        let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+        pools
+            .as_array()
+            .or_else(|| pools["pools"].as_array())
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .map_or_else(
+                || panic!("no pool {name}: {pools}"),
+                |p| p["pg_count"].as_u64().unwrap_or_default(),
+            )
+    };
+    assert_eq!(pg_count("small"), 256);
+    // 1000 members a drive: 3 * 1000 / 3 = 1000 PGs, rounded up to 1024.
+    let r = c.json("PUT", "/_admin/config/pg/members_per_osd", json!(1000));
+    assert!(r.status < 300, "{}", r.text());
+    pool(&c, "wide");
+    assert_eq!(pg_count("wide"), 1024);
+    // A count given is kept.
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "given", "ec_type": 0, "ec_k": 2, "ec_m": 1, "pg_count": 16, "enabled": true}),
+    );
+    assert!(r.status < 300, "{}", r.text());
+    assert_eq!(pg_count("given"), 16);
 }

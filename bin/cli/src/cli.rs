@@ -153,6 +153,11 @@ pub enum Command {
         #[command(subcommand)]
         action: PoolCmd,
     },
+    /// Placement groups and what peering last found of them (system admin)
+    Pg {
+        #[command(subcommand)]
+        action: PgCmd,
+    },
     /// Key management (SSE-KMS)
     Kms {
         #[command(subcommand)]
@@ -880,6 +885,16 @@ pub enum PoolCmd {
         /// Placement groups (fixed at creation; 0 = per-object placement)
         #[arg(long)]
         pg_count: Option<u32>,
+        /// Domains (at --failure-domain) each placement group's copies are
+        /// spread over; with --per-domain, e.g. 4+2 over 3 racks, 2 per rack
+        #[arg(long)]
+        spread_domains: Option<u32>,
+        /// Most copies of a placement group in one domain (default 1)
+        #[arg(long)]
+        per_domain: Option<u32>,
+        /// LRC: each local group in a domain of its own
+        #[arg(long)]
+        lrc_groups_per_domain: bool,
         #[arg(long)]
         disabled: bool,
     },
@@ -897,9 +912,38 @@ pub enum PoolCmd {
     PlacementGroups {
         name: String,
         #[arg(long)]
-        start_after: Option<u32>,
+        start_at: Option<u32>,
         #[arg(long)]
         max: Option<u32>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PgCmd {
+    /// Every placement group of a pool, its state and what its members
+    /// lack (GET /_admin/pools/{pool}/placement-groups, every page)
+    List {
+        #[arg(long, default_value = "default")]
+        pool: String,
+        /// Only placement groups in this state (Clean, Degraded,
+        /// Undersized, Incomplete, Down)
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// One placement group, with each member's part and its scrub
+    /// (GET /_admin/pools/{pool}/placement-groups/{pg_id})
+    Get {
+        pg_id: u32,
+        #[arg(long, default_value = "default")]
+        pool: String,
+    },
+    /// Scrub a placement group now, before any merely due: every member
+    /// reads back its shards and checks them
+    /// (POST /_admin/pools/{pool}/placement-groups/{pg_id}/scrub)
+    Scrub {
+        pg_id: u32,
+        #[arg(long, default_value = "default")]
+        pool: String,
     },
 }
 

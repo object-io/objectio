@@ -58,9 +58,6 @@ pub struct MetaStore {
     db: Arc<Database>,
 }
 
-/// A key ("{bucket}/{key}") and its home's OSD ids.
-pub type HomeRow = (String, Vec<Vec<u8>>);
-
 /// Make sure a redb database file exists at `path`, created whole: redb
 /// writes a new file's header and first pages in place, so a process killed
 /// while creating one (a restart a moment after a first start) left a file
@@ -518,16 +515,6 @@ impl MetaStore {
         }
     }
 
-    /// The home of a key ("{bucket}/{key}"): prost-encoded `ObjectHome`.
-    pub fn read_object_home(&self, key: &str) -> Option<Vec<u8>> {
-        let read_txn = self.db.begin_read().ok()?;
-        let table = match read_txn.open_table(tables::OBJECT_HOMES) {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
-        table.get(key).ok()?.map(|v| v.value().to_vec())
-    }
-
     /// A key's degraded-object record (B29), prost-encoded `DegradedObject`.
     pub fn read_degraded(&self, key: &str) -> Option<Vec<u8>> {
         let read_txn = self.db.begin_read().ok()?;
@@ -573,53 +560,6 @@ impl MetaStore {
         iter.filter_map(Result::ok)
             .map(|(k, v)| (k.value().to_string(), v.value().to_vec()))
             .collect()
-    }
-
-    /// Keys ("{bucket}/{key}") whose home has `node` at some position, and
-    /// their homes: at most `limit` of them, and how many there are in all.
-    /// `decode` gives a home's OSD ids. One pass over the table, nothing
-    /// else kept.
-    pub fn object_homes_holding(
-        &self,
-        node: &[u8],
-        limit: usize,
-        decode: impl Fn(&[u8]) -> Option<Vec<Vec<u8>>>,
-    ) -> (Vec<HomeRow>, usize) {
-        let mut found = Vec::new();
-        let mut total = 0;
-        let Ok(read_txn) = self.db.begin_read() else {
-            return (found, total);
-        };
-        let Ok(table) = read_txn.open_table(tables::OBJECT_HOMES) else {
-            return (found, total);
-        };
-        let Ok(iter) = table.iter() else {
-            return (found, total);
-        };
-        for (k, v) in iter.filter_map(Result::ok) {
-            let Some(ids) = decode(v.value()) else {
-                continue;
-            };
-            if ids.iter().any(|id| id.as_slice() == node) {
-                total += 1;
-                if found.len() < limit {
-                    found.push((k.value().to_string(), ids));
-                }
-            }
-        }
-        (found, total)
-    }
-
-    pub fn put_object_home(&self, key: &str, bytes: &[u8]) {
-        if let Err(e) = self.put_bytes(tables::OBJECT_HOMES, key, bytes) {
-            error!("Failed to persist object home '{key}': {e}");
-        }
-    }
-
-    pub fn delete_object_home(&self, key: &str) {
-        if let Err(e) = self.delete_key(tables::OBJECT_HOMES, key) {
-            error!("Failed to delete object home '{key}': {e}");
-        }
     }
 
     pub fn put_object_listing(&self, key: &str, bytes: &[u8]) {

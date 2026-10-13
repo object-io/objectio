@@ -38,6 +38,14 @@
 //! Out of scope here: replicated and LRC stripes, shards on OSDs that do
 //! not answer (they may be rebooting; drain handles OSDs that are gone),
 //! and version entries other than the current one.
+//!
+//! From format level 7 a key placed through a placement group is its
+//! PG's (B31): scrubbed there (`service/scrub.rs`), rebuilt by its
+//! recovery (`service/recovery.rs`), its listing entry kept by its listing
+//! peering, and a degraded record of it marks its PG. What the walk still
+//! checks and rebuilds: block chunks and packs (recorded in meta's own
+//! tables, in no PG), and keys written before placement groups (the
+//! rolling upgrade's: gone in the release after).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -119,7 +127,10 @@ pub fn spawn(meta: Arc<MetaService>, interval: Duration) {
     let degraded = Arc::clone(&meta);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = WALK_NOW.notified() => {}
+            }
             if meta.is_raft_leader() {
                 pass(&meta).await;
             }
@@ -264,7 +275,17 @@ pub async fn pass(meta: &Arc<MetaService>) {
                 .into_iter()
                 .filter(|o| owner(o) == Some(node_id.as_slice()))
                 .collect();
-            audit(meta, Source::Osd(&address), &owned, &mut moves).await;
+            // A key placed through a placement group is its PG's: scrubbed
+            // there (`service/scrub.rs`), rebuilt by its recovery, and its
+            // listing entry kept by its listing peering (B31 phase 4). The
+            // walk audits keys written before placement groups only, the
+            // rolling upgrade's (`core/upgrade-path.md`): delete this and
+            // what serves it in the release after.
+            let others: Vec<ObjectMeta> = owned
+                .into_iter()
+                .filter(|o| meta.key_pg(&o.bucket, &o.key).is_none())
+                .collect();
+            audit(meta, Source::Osd(&address), &others, &mut moves).await;
             if next.is_empty() {
                 break;
             }
@@ -367,7 +388,10 @@ fn owner(o: &ObjectMeta) -> Option<&[u8]> {
 
 /// A page of the ObjectMetas an OSD holds, and the cursor for the next one
 /// (empty after the last page).
-async fn list_page(address: &str, cursor: &str) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
+pub(crate) async fn list_page(
+    address: &str,
+    cursor: &str,
+) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
     let mut client = StorageServiceClient::new(open_channel(address).await?)
         .max_decoding_message_size(100 * 1024 * 1024);
     let resp = tokio::time::timeout(
@@ -607,6 +631,16 @@ async fn audit(
     healthy
 }
 
+/// Wakes the walk before it is due: an OSD came back without the shards
+/// it held (a replaced disk). Called on the leader, which serves every
+/// registration; calls while a pass runs start one more after it.
+static WALK_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Start a repair walk now, rather than when next due.
+pub(crate) fn walk_now() {
+    WALK_NOW.notify_one();
+}
+
 /// How often the objects recorded short of shards are worked (B29).
 const DEGRADED_EVERY: Duration = Duration::from_secs(5);
 
@@ -639,6 +673,31 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
             .unwrap_or(0),
         Ordering::Relaxed,
     );
+
+    // A key placed through a placement group is its PG's recovery's (B31
+    // phase 3a): its record marks the PG for peering, which recovery acts
+    // on, and goes once the object is whole (recovery forgets it) or the PG
+    // has been found clean since it was made.
+    let (in_pgs, records): (Vec<_>, Vec<_>) = records.into_iter().partition(|(key, _, _)| {
+        key.split_once('/')
+            .is_some_and(|(b, k)| meta.key_pg(b, k).is_some())
+    });
+    for (key, record, bytes) in in_pgs {
+        let Some((bucket, k)) = key.split_once('/') else {
+            continue;
+        };
+        let (pg_id, pool) = meta.listing_pg(bucket, k);
+        let clean_since = meta
+            .pg_state(&pool, pg_id)
+            .is_some_and(|s| s.state == "Clean" && s.computed_at > record.recorded_at);
+        if clean_since {
+            if let Err(e) = meta.forget_degraded(&key, bytes).await {
+                debug!("repair: degraded {key}: {e}");
+            }
+        } else {
+            meta.mark_key_dirty(bucket, k);
+        }
+    }
 
     let started = std::time::Instant::now();
     let todo = due(&mut DEFERRED.lock(), records, started);
@@ -1046,23 +1105,6 @@ async fn spread(
     })
     .await?;
 
-    // The key's home: by position, as stripe 0 is placed.
-    let home_moves: Vec<(u32, Vec<u8>, Vec<u8>)> = moved
-        .iter()
-        .filter(|(id, ..)| Some(*id) == object.stripes.first().map(|s| s.stripe_id))
-        .map(|(_, old, new, _)| (old.position, old.node_id.clone(), new.node_id.clone()))
-        .collect();
-    if let Err(e) = meta
-        .move_object_home(&object.bucket, &object.key, &home_moves)
-        .await
-    {
-        // The shards moved; a later write of the key may double up again.
-        warn!(
-            "backfill: {}/{}: home not moved: {e}",
-            object.bucket, object.key
-        );
-    }
-
     let due = std::time::Instant::now() + MOVED_GRACE;
     let mut queue = MOVED
         .lock()
@@ -1181,6 +1223,7 @@ async fn write_shard(
             rdma: None,
             // Restores redundancy: may use the space kept from client writes.
             use_reserve: true,
+            pg: None,
         }),
     )
     .await??
@@ -1242,7 +1285,11 @@ async fn update_locations(
     object: &ObjectMeta,
     edit: impl FnOnce(&mut ObjectMeta) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let Some(mut fresh) = get_object_meta(owner_addr, object).await? else {
+    // The object as a read takes it, from a quorum of its copies. Read
+    // from the owner's copy alone, an object whose owner missed its write
+    // (down while it was written, its heal not yet done) was "gone" to
+    // every repair of it, and its record waited forever (soak run 16).
+    let Some(mut fresh) = quorum_current(meta, object).await? else {
         return Err(anyhow::anyhow!("object is gone"));
     };
     if fresh.object_id != object.object_id {
@@ -1274,13 +1321,16 @@ async fn update_locations(
             object: Some(fresh.clone()),
             versioning_enabled: false,
             expected_object_id: fresh.object_id.clone(),
-            // An object deleted since it was read must not come back.
-            require_existing: true,
+            // A copy that missed the write gets it: a quorum holds it. A
+            // copy that took a delete since keeps it: its tombstone refuses
+            // an object stamped before it, so nothing deleted comes back.
+            require_existing: false,
             version_only: false,
             keep_newer_current: false,
             replication_update: false,
             replication_set: std::collections::HashMap::new(),
             shard: None,
+            pg: None,
         };
         let result = async {
             let mut client = StorageServiceClient::new(open_channel(&addr).await?);
@@ -1302,25 +1352,11 @@ async fn update_locations(
     }
 }
 
-async fn get_object_meta(address: &str, object: &ObjectMeta) -> anyhow::Result<Option<ObjectMeta>> {
-    let mut client = StorageServiceClient::new(open_channel(address).await?)
-        .max_decoding_message_size(100 * 1024 * 1024);
-    let resp = tokio::time::timeout(
-        RPC_TIMEOUT,
-        client.get_object_meta(GetObjectMetaRequest {
-            bucket: object.bucket.clone(),
-            key: object.key.clone(),
-            version_id: String::new(),
-            with_small_shard: false,
-        }),
-    )
-    .await??
-    .into_inner();
-    Ok(resp.object.filter(|_| resp.found))
-}
-
 /// Meta's listing entry for `object`.
 async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()> {
+    // Restored only when a read quorum of its placement found it current
+    // (`restore_listing`): from level 7 that is its placement group.
+    let (pg_id, pool) = meta.listing_pg(&object.bucket, &object.key);
     MetadataService::create_object(
         meta.as_ref(),
         tonic::Request::new(CreateObjectRequest {
@@ -1332,10 +1368,8 @@ async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()
             user_metadata: object.user_metadata.clone(),
             stripes: object.stripes.clone(),
             object_id: object.object_id.clone(),
-            pg_id: 0,
-            pool: String::new(),
-            // Its home, if it has one, is where it was found.
-            home_osd_ids: Vec::new(),
+            pg_id,
+            pool,
             ..Default::default()
         }),
     )
@@ -1437,7 +1471,6 @@ async fn restore_listing(
                     bucket: object.bucket.clone(),
                     key: object.key.clone(),
                     version_id: String::new(),
-                    forget_home: false,
                 }),
             )
             .await

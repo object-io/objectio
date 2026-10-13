@@ -67,6 +67,20 @@ service StorageService {
     // or found corrupt by the scrubber or a read. Asked by Meta's repairer.
     rpc CheckShards(CheckShardsRequest) returns (CheckShardsResponse);
 
+    // The epochs of placement groups, from meta after a commit that
+    // changes one (B31): a request placed under an older epoch is refused.
+    rpc SetPgEpochs(SetPgEpochsRequest) returns (SetPgEpochsResponse);
+
+    // Peering (B31 phase 2): this OSD's summary of what it holds of a
+    // placement group, and the entries themselves, a page at a time.
+    rpc GetPgInfo(GetPgInfoRequest) returns (GetPgInfoResponse);
+    rpc ListPg(ListPgRequest) returns (ListPgResponse);
+
+    // Scrub (B31 phase 4): read back the shards this OSD holds of a
+    // placement group's objects, a page at a time from `after`, checking
+    // each against its checksum; a shard that fails is marked corrupt.
+    rpc ScrubPg(ScrubPgRequest) returns (ScrubPgResponse);
+
     // Dedup dry-run: record chunk fingerprints this OSD is primary for and
     // say which it had already seen; and forget them all, to start a new
     // measurement window.
@@ -114,6 +128,119 @@ message WriteShardRequest {
     // A write that restores redundancy (repair, drain, backfill): it may
     // use the space an OSD keeps back from client writes (`--full-ratio`).
     bool use_reserve = 7;
+    // The placement group and epoch the gateway placed this write under
+    // (B31). Unset for meta's own writes (repair, drain), which are
+    // directed at an OSD, not placed.
+    PgRef pg = 8;
+}
+
+// A placement group and the epoch of its acting set (B31). An OSD refuses
+// a request with an older epoch than it knows for the PG: StaleEpoch.
+message PgRef {
+    string pool = 1;
+    uint32 pg_id = 2;
+    uint64 epoch = 3;
+}
+
+message SetPgEpochsRequest {
+    repeated PgRef epochs = 1;
+}
+message SetPgEpochsResponse {}
+
+// What an OSD holds of one placement group: one entry per key, its current
+// object or, when it has none, the tombstone of its last delete. Kept with
+// every write, in the same atomic write (B31 phase 2).
+message PgSummary {
+    uint64 objects = 1;
+    uint64 tombstones = 2;
+    // The highest stamp of any entry.
+    uint64 max_stamp = 3;
+    // XOR of a 128-bit hash of each entry (key, kind, write order):
+    // independent of order, so two copies holding the same entries have
+    // the same digest. Big-endian.
+    bytes digest = 4;
+    // Over current objects: their stripes; positions no shard location
+    // names; positions whose location names this OSD.
+    uint64 stripes = 5;
+    uint64 positions_short = 6;
+    uint64 named_here = 7;
+}
+
+// One key of a placement group on an OSD.
+message PgEntry {
+    string bucket = 1;
+    string key = 2;
+    bool tombstone = 3;
+    // The write order: (stamp, object id, update stamp); a tombstone has
+    // only its stamp.
+    uint64 stamp = 4;
+    bytes object_id = 5;
+    uint64 update_stamp = 6;
+    uint32 stripes = 7;
+    uint32 positions_short = 8;
+    uint32 named_here = 9;
+    // Of the positions named here, how many this OSD holds intact (ListPg
+    // only).
+    uint32 held_here = 10;
+    // Shards a read needs (the object's k; 1 for one held whole).
+    uint32 needed = 11;
+    // The object's size in bytes: what recovery has left to move.
+    uint64 size = 12;
+    // A version of a versioned key: its id (`null` for the version written
+    // while versioning was off); empty for the key's current object or
+    // delete. Each version is an entry of its own.
+    string version_id = 13;
+}
+
+message ScrubPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // As ListPg's: the last entry of the previous page; empty: from the start.
+    string after = 3;
+    // Stop once this many shard bytes were read (0: no limit), or this
+    // many entries were looked at (0: 1000).
+    uint64 max_bytes = 4;
+    uint32 max_entries = 5;
+}
+message ScrubPgResponse {
+    // For the next page; empty after the last.
+    string next = 1;
+    uint32 entries = 2;
+    uint32 shards = 3;
+    uint64 bytes = 4;
+    repeated ScrubBadShard bad = 5;
+}
+// A shard an object's metadata copy here names on this OSD that it doesn't
+// hold (`corrupt` false), or holds and fails its checksum.
+message ScrubBadShard {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;
+    uint64 stripe_id = 4;
+    uint32 position = 5;
+    bool corrupt = 6;
+}
+
+message GetPgInfoRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message GetPgInfoResponse {
+    PgSummary summary = 1;
+}
+
+message ListPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // "{bucket}\0{key}" (then "\0{version_id}" for a version's entry) of
+    // the last entry of the previous page; empty: from the start.
+    string after = 3;
+    uint32 limit = 4;   // 0: 1000
+}
+message ListPgResponse {
+    repeated PgEntry entries = 1;
+    // For the next page; empty after the last.
+    string next = 2;
 }
 
 // Memory in another process that a shard moves through over Mooncake
@@ -347,6 +474,8 @@ message PutObjectMetaRequest {
     // written with the metadata in one log batch, one flush. Sent only once
     // the cluster is finalized at format level 5.
     SmallShard shard = 11;
+    // See WriteShardRequest.pg.
+    PgRef pg = 12;
 }
 
 message PutObjectMetaResponse {
@@ -405,6 +534,8 @@ message DeleteObjectMetaRequest {
     // shards it has, and newest on a read, it would be unreadable.
     // `version_id` and `stamp` are ignored.
     bytes withdraw_object_id = 5;
+    // See WriteShardRequest.pg.
+    PgRef pg = 6;
 }
 
 message DeleteObjectMetaResponse {

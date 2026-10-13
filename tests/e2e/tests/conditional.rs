@@ -116,3 +116,40 @@ fn replicated_objects_are_listed() {
     assert!(listing.contains("<Key>large</Key>"), "{listing}");
     assert!(listing.contains("<Key>small</Key>"), "{listing}");
 }
+
+/// A conditional PUT whose commit meta applied but whose answer was lost
+/// (a leader change, a timeout: here a test hook) still succeeds: the
+/// gateway sends it again and meta knows its own entry. It used to fail
+/// with 503 and free its shards while the listing named it: the object
+/// was listed, unreadable, and every If-None-Match after it was refused.
+#[test]
+fn a_conditional_put_whose_answer_was_lost_is_committed_once() {
+    let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--test-hooks"]);
+    bucket(&c, "lost");
+    c.json(
+        "POST",
+        "/_admin/test/lose-reply",
+        json!({ "call": "create_object" }),
+    )
+    .expect_ok();
+    let body = vec![7u8; 50_000];
+    let first = c.request_with_headers("PUT", "/lost/k", &body, &[("if-none-match", "*")]);
+    // What a client does with a 503: send it again.
+    if first.status != 200 {
+        let again = c.request_with_headers("PUT", "/lost/k", &body, &[("if-none-match", "*")]);
+        assert_eq!(
+            again.status,
+            200,
+            "first {}: {}; again: {}",
+            first.status,
+            first.text(),
+            again.text()
+        );
+    }
+    let got = c.request("GET", "/lost/k", &[]);
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.bytes, body);
+    // And it is the key's one object: a second create is refused.
+    let second = c.request_with_headers("PUT", "/lost/k", b"other", &[("if-none-match", "*")]);
+    assert_eq!(second.status, 412, "{}", second.text());
+}

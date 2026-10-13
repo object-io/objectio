@@ -55,17 +55,22 @@ fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
                     .collect()
             })
             .unwrap_or_default(),
-        failure_domain: v["failure_domain"].as_str().unwrap_or("rack").to_string(),
+        // Unnamed: meta spreads the copies over the widest failure-domain
+        // level with enough domains in service (B31).
+        failure_domain: v["failure_domain"].as_str().unwrap_or_default().to_string(),
         quota_bytes: v["quota_bytes"].as_u64().unwrap_or_default(),
         description: v["description"].as_str().unwrap_or_default().to_string(),
         enabled: v["enabled"].as_bool().unwrap_or(true),
         created_at: 0,
         updated_at: 0,
-        // Placement-group sizing. 0 places each object directly (CRUSH,
-        // no placement groups), the default; for PG-based placement pass
-        // "pg_count": 256 (or higher) on pool creation.
+        // Placement groups, fixed for the pool's life; 0 takes meta's
+        // default (256).
         pg_count: v["pg_count"].as_u64().unwrap_or_default() as u32,
         tier: v["tier"].as_str().unwrap_or_default().to_string(),
+        // The placement rule (B31 phase 1b); 0 and 0: one copy per domain.
+        spread_domains: v["spread_domains"].as_u64().unwrap_or_default() as u32,
+        per_domain: v["per_domain"].as_u64().unwrap_or_default() as u32,
+        lrc_groups_per_domain: v["lrc_groups_per_domain"].as_bool().unwrap_or_default(),
     }
 }
 
@@ -141,6 +146,9 @@ fn pool_to_json(p: &PoolConfig) -> serde_json::Value {
         "updated_at": p.updated_at,
         "pg_count": p.pg_count,
         "tier": p.tier,
+        "spread_domains": p.spread_domains,
+        "per_domain": p.per_domain,
+        "lrc_groups_per_domain": p.lrc_groups_per_domain,
     })
 }
 
@@ -886,9 +894,159 @@ pub async fn admin_get_pool(
     }
 }
 
-/// `GET /_admin/pools/{name}/placement-groups[?start_after=N&max=1000]`
-/// — paginated listing of a pool's placement groups with their OSD
-/// assignments and current version. Feeds the console's PG view.
+/// What peering last found of a placement group (B31 phase 2), as JSON;
+/// null if it hasn't run on it yet.
+fn pg_state_json(s: Option<&objectio_proto::metadata::PgState>) -> serde_json::Value {
+    let Some(s) = s else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "state": s.state,
+        "epoch": s.epoch,
+        "objects": s.objects,
+        "tombstones": s.tombstones,
+        "objects_degraded": s.objects_degraded,
+        "objects_unfound": s.objects_unfound,
+        "copies_missing": s.copies_missing,
+        "copies_stale": s.copies_stale,
+        "shards_missing": s.shards_missing,
+        "members_down": s.members_down,
+        "remapped": s.remapped,
+        "by_summary": s.by_summary,
+        "last_error": s.last_error,
+        "since": s.since,
+        "computed_at": s.computed_at,
+        "min_spare": s.min_spare,
+        "recovery": {
+            "cursor": s.cursor.replace('\0', "/"),
+            "cursor_epoch": s.cursor_epoch,
+            "recovered": s.recovered,
+            "remaining": s.remaining,
+            "bytes_remaining": s.bytes_remaining,
+            "reserved_on": s.reserved_on.iter().map(hex::encode).collect::<Vec<_>>(),
+            "unfound_keys": s.unfound_keys,
+            "retry_at": s.retry_at,
+        },
+        "members": s.members.iter().map(|m| serde_json::json!({
+            "node_id": hex::encode(&m.node_id),
+            "position": m.position,
+            "answered": m.answered,
+            "copies_missing": m.copies_missing,
+            "copies_stale": m.copies_stale,
+            "shards_missing": m.shards_missing,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A placement group's scrub (B31 phase 4), as JSON; null if none has run.
+fn pg_scrub_json(s: Option<&objectio_proto::metadata::PgScrub>) -> serde_json::Value {
+    let Some(s) = s else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "running": s.started_at > 0,
+        "requested": s.requested,
+        "epoch": s.epoch,
+        "started_at": s.started_at,
+        "last_complete": s.last_complete,
+        "members_done": s.done,
+        "cursors": s.cursors.iter()
+            .map(|(m, c)| (m.clone(), serde_json::Value::String(c.replace('\0', "/"))))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+        "bytes": s.bytes,
+        "shards": s.shards,
+        "bad": s.bad,
+    })
+}
+
+/// A placement group as JSON: epoch, acting and up sets, stand-ins being
+/// filled, what peering last found, and its scrub.
+fn pg_json(
+    pg: &objectio_proto::metadata::PlacementGroup,
+    state: Option<&objectio_proto::metadata::PgState>,
+    scrub: Option<&objectio_proto::metadata::PgScrub>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pool": pg.pool,
+        "pg_id": pg.pg_id,
+        "epoch": pg.epoch,
+        "acting": pg.acting.iter().map(hex::encode).collect::<Vec<_>>(),
+        "up": pg.up.iter().map(hex::encode).collect::<Vec<_>>(),
+        "filling": pg.filling.iter().map(|f| serde_json::json!({
+            "position": f.position,
+            "from": hex::encode(&f.from),
+            "epoch": f.epoch,
+        })).collect::<Vec<_>>(),
+        "updated_at": pg.updated_at,
+        "state": pg_state_json(state),
+        "scrub": pg_scrub_json(scrub),
+    })
+}
+
+/// `GET /_admin/pools/{name}/placement-groups/{pg_id}` — one placement
+/// group and what peering last found of it (B31).
+pub async fn admin_get_pool_placement_group(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((name, pg_id)): Path<(String, u32)>,
+) -> Response {
+    use objectio_proto::metadata::GetPlacementGroupRequest;
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    match state
+        .meta_client
+        .clone()
+        .get_placement_group(GetPlacementGroupRequest { pool: name, pg_id })
+        .await
+    {
+        Ok(resp) => {
+            let r = resp.into_inner();
+            match r.pg.filter(|_| r.found) {
+                Some(pg) => Json(pg_json(&pg, r.state.as_ref(), r.scrub.as_ref())).into_response(),
+                None => (StatusCode::NOT_FOUND, "Placement group not found").into_response(),
+            }
+        }
+        Err(e) => meta_failure(&e),
+    }
+}
+
+/// `POST /_admin/pools/{name}/placement-groups/{pg_id}/scrub` — scrub the
+/// placement group before any merely due (B31 phase 4).
+pub async fn admin_scrub_pool_placement_group(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Path((name, pg_id)): Path<(String, u32)>,
+) -> Response {
+    use objectio_proto::metadata::RequestPgScrubRequest;
+    if let Some(deny) = require_system_admin(&auth, &headers) {
+        return deny;
+    }
+    match state
+        .meta_client
+        .clone()
+        .request_pg_scrub(RequestPgScrubRequest { pool: name, pg_id })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"requested": true})),
+        )
+            .into_response(),
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, e.message().to_string()).into_response()
+        }
+        Err(e) => meta_failure(&e),
+    }
+}
+
+/// `GET /_admin/pools/{name}/placement-groups[?start_at=N&max=1000]`
+/// — paginated listing of a pool's placement groups: epoch, acting and up
+/// sets, stand-ins being filled, what peering last found (B31), and how
+/// many of the listed PGs are in each state. `next_pg_id` starts the next
+/// page. Feeds the console's PG view.
 pub async fn admin_list_pool_placement_groups(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -901,8 +1059,8 @@ pub async fn admin_list_pool_placement_groups(
     if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
-    let start_after: u32 = params
-        .get("start_after")
+    let start_at: u32 = params
+        .get("start_at")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let max_results: u32 = params
@@ -914,33 +1072,39 @@ pub async fn admin_list_pool_placement_groups(
     match client
         .list_placement_groups(ListPlacementGroupsRequest {
             pool: name,
-            start_after_pg_id: start_after,
+            start_at_pg_id: start_at,
             max_results,
         })
         .await
     {
         Ok(resp) => {
             let r = resp.into_inner();
+            let states: std::collections::HashMap<u32, &objectio_proto::metadata::PgState> =
+                r.states.iter().map(|s| (s.pg_id, s)).collect();
+            let scrubs: std::collections::HashMap<u32, &objectio_proto::metadata::PgScrub> =
+                r.scrubs.iter().map(|s| (s.pg_id, s)).collect();
+            let mut by_state: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for pg in &r.pgs {
+                let st = states
+                    .get(&pg.pg_id)
+                    .map_or_else(|| "Unknown".to_string(), |s| s.state.clone());
+                *by_state.entry(st).or_default() += 1;
+            }
             let pgs: Vec<serde_json::Value> = r
                 .pgs
                 .iter()
                 .map(|pg| {
-                    serde_json::json!({
-                        "pool": pg.pool,
-                        "pg_id": pg.pg_id,
-                        "osd_ids": pg.osd_ids.iter().map(hex::encode).collect::<Vec<_>>(),
-                        "version": pg.version,
-                        "updated_at": pg.updated_at,
-                        "migrating_to_osd_ids": pg
-                            .migrating_to_osd_ids
-                            .iter()
-                            .map(hex::encode)
-                            .collect::<Vec<_>>(),
-                    })
+                    pg_json(
+                        pg,
+                        states.get(&pg.pg_id).copied(),
+                        scrubs.get(&pg.pg_id).copied(),
+                    )
                 })
                 .collect();
             Json(serde_json::json!({
                 "pgs": pgs,
+                "by_state": by_state,
                 "next_pg_id": r.next_pg_id,
             }))
             .into_response()
@@ -2365,7 +2529,11 @@ pub async fn admin_set_osd_state(
             // FailedPrecondition from meta means Raft isn't the leader
             // or is not initialised; surface as 503 so the console can
             // retry rather than treating it as a permanent error.
-            let code = if e.code() == tonic::Code::FailedPrecondition {
+            // Unavailable too (soak run 21: setting an OSD out during a
+            // meta election timed out, was answered 500, and wasn't retried).
+            let code = if e.code() == tonic::Code::FailedPrecondition
+                || crate::s3::S3Error::is_unavailable(&e)
+            {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -2643,7 +2811,11 @@ async fn admin_rebalance_set_paused(
     match meta.set_config(req).await {
         Ok(_) => Json(serde_json::json!({ "paused": paused })).into_response(),
         Err(e) => {
-            let code = if e.code() == tonic::Code::FailedPrecondition {
+            // Unavailable too (soak run 21: setting an OSD out during a
+            // meta election timed out, was answered 500, and wasn't retried).
+            let code = if e.code() == tonic::Code::FailedPrecondition
+                || crate::s3::S3Error::is_unavailable(&e)
+            {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -2935,7 +3107,16 @@ pub async fn admin_validate_placement(
         }
     };
 
-    let shard_count = u64::from(pool.ec_k) + u64::from(pool.ec_m);
+    // Domains the pool's placement rule uses (B31 phase 1b): as many as
+    // copies at one per domain, fewer with more per domain. (Meta checks
+    // the rest of the rule, hosts inside each domain included, when the
+    // pool is made.)
+    let copies = u64::from(pool.ec_k) + u64::from(pool.ec_m);
+    let shard_count = if pool.spread_domains > 0 {
+        u64::from(pool.spread_domains)
+    } else {
+        copies.div_ceil(u64::from(pool.per_domain.max(1)))
+    };
     let level = pool.failure_domain.as_str();
 
     // Fetch nodes and count distinct domain keys at the pool's level.
@@ -2981,7 +3162,9 @@ pub async fn admin_validate_placement(
         "available_count": available,
         "satisfiable": satisfiable,
         "reason": if satisfiable {
-            format!("{} distinct {}s available for {} shards", available, level, shard_count)
+            format!(
+                "{available} distinct {level}s available; the pool's {copies} copies need {shard_count}"
+            )
         } else {
             format!(
                 "Pool needs {} distinct {}s but topology has only {}. Add more {}s or relax the pool's failure_domain.",
@@ -3077,6 +3260,7 @@ fn status_response(e: &tonic::Status) -> Response {
         tonic::Code::FailedPrecondition | tonic::Code::Unavailable => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, e.message().to_string()).into_response()
@@ -3280,6 +3464,7 @@ fn grpc_error(e: &tonic::Status) -> Response {
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,
+        _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, e.message())
