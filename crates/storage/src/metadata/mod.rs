@@ -53,7 +53,7 @@ mod store;
 mod types;
 mod wal;
 
-pub use index::{MetaIndex, PrefixIter, iter_prefix, open};
-pub use store::{MetaEngine, MetadataStore, MetadataStoreConfig};
+pub use index::{MetaIndex, MetaSnapshot, PrefixIter, iter_prefix, open};
+pub use store::{MetaEngine, MetadataStore, MetadataStoreConfig, StoreSnapshot};
 pub use types::{MetadataEntry, MetadataKey, MetadataOp};
 pub use wal::{MetadataWal, WalSyncStats};

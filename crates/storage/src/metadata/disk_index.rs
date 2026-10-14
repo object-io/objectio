@@ -307,6 +307,39 @@ impl DiskIndex {
         }
     }
 
+    /// The entries in `[from, below)` as they are now, for reading while
+    /// writes go on: the file through a read transaction (redb keeps what
+    /// it sees until the snapshot is dropped, so keep it briefly: pages
+    /// rewritten meanwhile can't be reused), the memtables' share of the
+    /// range copied. Taken with the memtables locked, so no change is half
+    /// in.
+    ///
+    /// # Errors
+    /// The file could not be read.
+    pub fn snapshot(&self, from: &[u8], below: &[u8]) -> Result<Snapshot> {
+        let range = (Bound::Included(from), Bound::Excluded(below));
+        let t = self.tables.write();
+        let mut mem: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        for table in t.frozen.iter().chain(std::iter::once(&t.active)) {
+            mem.extend(
+                table
+                    .map
+                    .read()
+                    .range::<[u8], _>(range)
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+        }
+        let tx = self.db.begin_read().map_err(storage_err("snapshot"))?;
+        let entries = tx.open_table(ENTRIES).map_err(storage_err("snapshot"))?;
+        drop(t);
+        Ok(Snapshot {
+            entries,
+            mem,
+            from: from.to_vec(),
+            below: below.to_vec(),
+        })
+    }
+
     /// Every entry under `prefix`, collected: for prefixes known to be small.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(MetadataKey, Vec<u8>)>> {
         let mut out = Vec::new();
@@ -396,6 +429,62 @@ impl DiskIndex {
     /// Whether a checkpoint's frozen memtable is still waiting to go in.
     pub fn has_frozen(&self) -> bool {
         self.tables.read().frozen.is_some()
+    }
+}
+
+/// [`DiskIndex::snapshot`]: the range as a read transaction saw the file,
+/// and as the memtables held it.
+pub struct Snapshot {
+    entries: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    from: Vec<u8>,
+    below: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Call `f` on each entry of the range in key order, until it returns
+    /// false.
+    ///
+    /// # Errors
+    /// The file could not be read.
+    pub fn for_each(&self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
+        let mut file = self
+            .entries
+            .range::<&[u8]>((
+                Bound::Included(self.from.as_slice()),
+                Bound::Excluded(self.below.as_slice()),
+            ))
+            .map_err(storage_err("scan"))?
+            .map_while(|r| r.ok())
+            .peekable();
+        let mut mem = self.mem.iter().peekable();
+        loop {
+            let take_mem = match (file.peek(), mem.peek()) {
+                (None, None) => return Ok(()),
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (Some((fk, _)), Some((mk, _))) => mk.as_slice() <= fk.value(),
+            };
+            if take_mem {
+                let (k, v) = mem.next().expect("peeked");
+                if file
+                    .peek()
+                    .is_some_and(|(fk, _)| fk.value() == k.as_slice())
+                {
+                    file.next();
+                }
+                if let Some(v) = v
+                    && !f(k, v)
+                {
+                    return Ok(());
+                }
+            } else {
+                let (k, v) = file.next().expect("peeked");
+                if !f(k.value(), v.value()) {
+                    return Ok(());
+                }
+            }
+        }
     }
 }
 
@@ -539,6 +628,61 @@ mod tests {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         assert_eq!(scan(Some(&after)), rest);
+    }
+
+    #[test]
+    fn a_snapshot_sees_its_range_as_it_was_through_checkpoints() {
+        let dir = tempdir().unwrap();
+        let idx = open(dir.path());
+        let k = |i: u32| format!("k{i:04}").into_bytes();
+        for i in 0..300 {
+            idx.put(k(i), b"file".to_vec());
+        }
+        assert!(idx.freeze());
+        idx.flush_frozen(1).unwrap();
+        for i in 100..200 {
+            idx.put(k(i), b"frozen".to_vec());
+        }
+        assert!(idx.freeze());
+        for i in 150..250 {
+            idx.put(k(i), b"active".to_vec());
+        }
+        idx.delete(k(10));
+        idx.put(b"j".to_vec(), b"outside".to_vec());
+        idx.put(b"l".to_vec(), b"outside".to_vec());
+        let snap = idx.snapshot(b"k", b"l").unwrap();
+        let expect = |i: u32| -> Option<&[u8]> {
+            match i {
+                10 => None,
+                150..250 => Some(b"active"),
+                100..150 => Some(b"frozen"),
+                _ => Some(b"file"),
+            }
+        };
+
+        // After it: writes, deletes, and both checkpoints taken into the file.
+        for i in 0..300 {
+            if i % 2 == 0 {
+                idx.put(k(i), b"later".to_vec());
+            } else {
+                idx.delete(k(i));
+            }
+        }
+        idx.put(k(400), b"later".to_vec());
+        idx.flush_frozen(2).unwrap();
+        assert!(idx.freeze());
+        idx.flush_frozen(3).unwrap();
+
+        let mut got = Vec::new();
+        snap.for_each(|k, v| {
+            got.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        let want: Vec<_> = (0..300)
+            .filter_map(|i| expect(i).map(|v| (k(i), v.to_vec())))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

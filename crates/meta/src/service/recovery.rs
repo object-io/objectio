@@ -1177,7 +1177,10 @@ impl MetaService {
                 let channel = crate::drain_observer::open_channel(&address).await?;
                 let r = tokio::time::timeout(
                     RPC_TIMEOUT,
-                    StorageServiceClient::new(channel).get_status(GetStatusRequest::default()),
+                    StorageServiceClient::new(channel).get_status(GetStatusRequest {
+                        answer_while_counting: true,
+                        ..Default::default()
+                    }),
                 )
                 .await??
                 .into_inner();

@@ -2378,7 +2378,10 @@ pub async fn admin_list_nodes(
         let status = match connect_osd(addr).await {
             Ok(mut client) => {
                 match client
-                    .get_status(objectio_proto::storage::GetStatusRequest::default())
+                    .get_status(objectio_proto::storage::GetStatusRequest {
+                        answer_while_counting: true,
+                        ..Default::default()
+                    })
                     .await
                 {
                     Ok(resp) => {
@@ -2655,7 +2658,10 @@ pub async fn admin_reboot_osd(
     let osd_addr = addr;
     let pod_name = match connect_osd(&osd_addr).await {
         Ok(mut client) => match client
-            .get_status(objectio_proto::storage::GetStatusRequest::default())
+            .get_status(objectio_proto::storage::GetStatusRequest {
+                answer_while_counting: true,
+                ..Default::default()
+            })
             .await
         {
             Ok(r) => r.into_inner().pod_name,

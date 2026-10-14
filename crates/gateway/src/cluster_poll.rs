@@ -135,9 +135,12 @@ async fn connect(addr: &str) -> Result<StorageServiceClient<tonic::transport::Ch
 async fn poll_osd(addr: String, node_id: Vec<u8>, up: Vec<Vec<u8>>) -> OsdPoll {
     let (status, metrics) = match timed(connect(&addr)).await {
         Some(mut c) => {
-            let status = timed(c.get_status(GetStatusRequest { up_nodes: up }))
-                .await
-                .map(tonic::Response::into_inner);
+            let status = timed(c.get_status(GetStatusRequest {
+                up_nodes: up,
+                answer_while_counting: true,
+            }))
+            .await
+            .map(tonic::Response::into_inner);
             let metrics = timed(c.get_metrics(GetMetricsRequest {}))
                 .await
                 .map(tonic::Response::into_inner);
@@ -211,9 +214,10 @@ async fn poll_once(
     let mut safety_missing = 0;
     let mut osd_metrics = Vec::new();
     let mut nodes = Vec::with_capacity(polls.len());
+    let mut uncounted = false;
     for p in polls {
         if let Some(st) = &p.status {
-            last_usage.insert(p.capacity.node_id.clone(), usage_of(st));
+            uncounted |= !record_usage(last_usage, &p.capacity.node_id, st);
             if let Some(s) = &st.safety {
                 let t = safety.get_or_insert_with(ObjectSafety::default);
                 t.objects_checked += s.objects_checked;
@@ -234,7 +238,9 @@ async fn poll_once(
     }
     last_usage.retain(|id, _| nodes.iter().any(|n| &n.node_id == id));
 
-    if let Some(report) = crate::build_usage_report(meta.clone(), &nodes, last_usage).await {
+    if uncounted {
+        tracing::debug!("usage report held: an OSD is still counting its usage after a start");
+    } else if let Some(report) = crate::build_usage_report(meta.clone(), &nodes, last_usage).await {
         crate::quota::on_report(&report, gathered_at);
         s3_metrics().set_usage(report);
     }
@@ -248,6 +254,22 @@ async fn poll_once(
         s.drains = drains.map(|r| r.into_inner().drains).unwrap_or_default();
         s.rebalance = rebalance.map(tonic::Response::into_inner);
     }
+    true
+}
+
+/// Keep OSD `node_id`'s usage from `st`. An OSD still counting its usage
+/// after a start keeps the usage it last reported; false if it has none
+/// yet: no report is made then, and quotas keep the previous one, since a
+/// sum without it would admit writes past a quota.
+fn record_usage(
+    last_usage: &mut HashMap<String, Vec<OsdBucketUsage>>,
+    node_id: &str,
+    st: &GetStatusResponse,
+) -> bool {
+    if st.usage_counting {
+        return last_usage.contains_key(node_id);
+    }
+    last_usage.insert(node_id.to_string(), usage_of(st));
     true
 }
 
@@ -555,7 +577,12 @@ async fn reachable_osds(mut meta: MetaClient) -> Option<(usize, usize)> {
         let expected = n.node_id;
         let probe = async {
             let mut c = connect(&endpoint).await.ok()?;
-            c.get_status(GetStatusRequest::default()).await.ok()
+            c.get_status(GetStatusRequest {
+                answer_while_counting: true,
+                ..Default::default()
+            })
+            .await
+            .ok()
         };
         tokio::time::timeout(Duration::from_secs(3), probe)
             .await
@@ -653,4 +680,36 @@ pub async fn ready_handler() -> axum::response::Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objectio_proto::storage::BucketUsage;
+
+    #[test]
+    fn an_osd_counting_its_usage_keeps_the_last_or_holds_the_report() {
+        let mut last = HashMap::new();
+        let counted = |objects| GetStatusResponse {
+            bucket_usage: vec![BucketUsage {
+                bucket: "b".into(),
+                objects,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let counting = GetStatusResponse {
+            usage_counting: true,
+            ..Default::default()
+        };
+        // Started while counting, never counted before: no report.
+        assert!(!record_usage(&mut last, "osd1", &counting));
+        assert!(last.is_empty());
+        assert!(record_usage(&mut last, "osd1", &counted(7)));
+        // Restarted: counting again; the last count stands.
+        assert!(record_usage(&mut last, "osd1", &counting));
+        assert_eq!(last["osd1"][0].objects, 7);
+        assert!(record_usage(&mut last, "osd1", &counted(9)));
+        assert_eq!(last["osd1"][0].objects, 9);
+    }
 }

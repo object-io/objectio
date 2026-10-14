@@ -3,6 +3,7 @@
 //! `src/main.rs` is a thin entrypoint. `run()` is also consumed
 //! in-process by `bin/aio`.
 
+pub(crate) mod count;
 pub mod discovery;
 pub mod pg_epochs;
 pub mod pg_index;

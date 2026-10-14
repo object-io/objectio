@@ -91,6 +91,15 @@ fn fatal(e: &Error) -> ! {
     std::process::abort()
 }
 
+/// [`MetadataStore::snapshot`].
+pub struct StoreSnapshot(super::disk_index::Snapshot);
+
+impl super::index::MetaSnapshot for StoreSnapshot {
+    fn scan(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.0.for_each(f).unwrap_or_else(|e| fatal(&e));
+    }
+}
+
 /// Unified metadata store for OSD
 pub struct MetadataStore {
     wal: Arc<MetadataWal>,
@@ -359,6 +368,17 @@ impl MetadataStore {
         self.index
             .scan_prefix(&prefix.0)
             .unwrap_or_else(|e| fatal(&e))
+    }
+
+    /// The index as it is now ([`MetaIndex::snapshot`]).
+    ///
+    /// [`MetaIndex::snapshot`]: super::MetaIndex::snapshot
+    pub fn snapshot(&self, from: &[u8], below: &[u8]) -> StoreSnapshot {
+        StoreSnapshot(
+            self.index
+                .snapshot(from, below)
+                .unwrap_or_else(|e| fatal(&e)),
+        )
     }
 
     /// Call `f` on each entry under `prefix` in key order, from after

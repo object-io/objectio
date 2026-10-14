@@ -194,7 +194,10 @@ async fn probe(address: &str) -> bool {
     let mut client = StorageServiceClient::new(channel);
     tokio::time::timeout(
         PROBE_TIMEOUT,
-        client.get_status(GetStatusRequest::default()),
+        client.get_status(GetStatusRequest {
+            answer_while_counting: true,
+            ..Default::default()
+        }),
     )
     .await
     .is_ok_and(|r| r.is_ok())
