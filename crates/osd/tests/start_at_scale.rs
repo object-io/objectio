@@ -84,9 +84,18 @@ fn data(n: u64, generation: u64, len: u64) -> Vec<u8> {
     (0..len).map(|i| (i ^ n ^ generation) as u8).collect()
 }
 
-/// A stamp later than every earlier write of object `n`.
+/// A stamp later than every earlier write of object `n` (`n` below 2^24).
 fn stamp(n: u64, generation: u64) -> u64 {
-    1_000 + n + generation * 100_000_000_000
+    (generation << 24) + n
+}
+
+/// This run's first generation: later than any earlier run's.
+fn run_generation() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        << 8
 }
 
 /// The metadata copy of object `n`: one 4+2 stripe over six OSDs, its
@@ -112,7 +121,7 @@ fn object_meta(n: u64, generation: u64, size: u64, owner: &[u8]) -> ObjectMeta {
         etag: format!("{:032x}", u128::from(n) * 0x1234_5678_9abc_def1),
         content_type: "application/octet-stream".into(),
         created_at: 1_760_000_000 + n,
-        modified_at: 1_760_000_000 + n + generation,
+        modified_at: 1_760_000_000 + n,
         stamp: stamp(n, generation),
         stripes: vec![StripeMeta {
             stripe_id: 0,
@@ -227,6 +236,35 @@ async fn check(osd: &OsdService, n: u64, generation: Option<u64>) {
         crc32c::crc32c(&data(n, generation, len)),
         "object {n}'s shard"
     );
+}
+
+/// The generation object `n` was written at, from its id.
+fn generation_of(n: u64, id: &[u8]) -> Option<u64> {
+    let high = u64::from_le_bytes(id.get(8..16)?.try_into().ok()?);
+    let x = high ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x.is_multiple_of(0x51).then_some(x / 0x51)
+}
+
+/// The first object from `n` on that is there (an earlier run may have
+/// deleted some), read back as stored, whatever its generation.
+async fn first_found(osd: &OsdService, mut n: u64) -> u64 {
+    loop {
+        let got = osd
+            .get_object_meta(Request::new(GetObjectMetaRequest {
+                bucket: "bench".into(),
+                key: key(n),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if let Some(o) = got.object.filter(|_| got.found) {
+            let generation = generation_of(n, &o.object_id).expect("one of this test's ids");
+            check(osd, n, Some(generation)).await;
+            return n;
+        }
+        n += 1;
+    }
 }
 
 fn open(dir: &Path) -> OsdService {
@@ -412,11 +450,13 @@ async fn an_osd_of_many_shards_serves_in_seconds_after_a_power_cut() {
                     started.elapsed()
                 })
             };
-            check(&osd, have / 2, Some(0)).await;
+            first_found(&osd, have / 2).await;
             let first_read = started.elapsed();
-            // A block write, of a new key below the writers' ones.
+            // A block write, of a key below the writers' new ones (a
+            // generation no earlier run wrote).
             let first = (have + 1..).find(|&n| !small(n)).unwrap();
-            put(&osd, first, 1, &owner).await;
+            let first_generation = run_generation();
+            put(&osd, first, first_generation, &owner).await;
             let first_write = started.elapsed();
             let read = read_bytes() - read0;
             println!(
@@ -435,7 +475,10 @@ async fn an_osd_of_many_shards_serves_in_seconds_after_a_power_cut() {
 
             // While it counts: new objects, overwrites of grown ones (into
             // this OSD's usage), deletes. Each writer owns its keys.
-            let written = Arc::new(parking_lot::Mutex::new(HashMap::from([(first, Some(1))])));
+            let written = Arc::new(parking_lot::Mutex::new(HashMap::from([(
+                first,
+                Some(first_generation),
+            )])));
             let ops = Arc::new(AtomicU64::new(0));
             let writers: Vec<_> = (0..WRITERS)
                 .map(|w| {
@@ -447,7 +490,7 @@ async fn an_osd_of_many_shards_serves_in_seconds_after_a_power_cut() {
                     );
                     tokio::spawn(async move {
                         let mut r = 0x2545_f491_4f6c_dd1d_u64 ^ (w * 0x9e37);
-                        let mut generation = 1;
+                        let mut generation = first_generation;
                         while counting(&osd).await {
                             r ^= r << 13;
                             r ^= r >> 7;
