@@ -55,12 +55,35 @@ places through placement groups.
 A fix to something a soak found goes through the quick soak first. It
 runs the same faults, closer together and on less data, so a
 drive-lost evacuation takes minutes, not an hour. That shows in two or
-three hours what a 48 h soak would show in six to twenty:
-
-```bash
-SOAK_HOURS=3 FAULT_EVERY=5 FULL_HIGH=0.3 FULL_LOW=0.1 \
-  STALL_MAX_SECS=900 NOT_CLEAN_MAX_SECS=3600 python3 deploy/chaos/soak.py
-```
+three hours what a 48 h soak would show in six to twenty.
 
 It never reaches the full ratio, so it doesn't test running full, and
 restarts are fast on so little data. Only the 48 h soak passes B2.
+
+### Running one
+
+`run-soak.sh` runs a soak on the lab host and records it: it checks out
+the commit in a clone of its own, builds it, brings the cluster up on it,
+runs `soak.py`, and writes a summary.
+
+```bash
+nohup deploy/chaos/run-soak.sh --quick origin/my-fix > /dev/null 2>&1 &   # 3 h
+nohup deploy/chaos/run-soak.sh origin/main > /dev/null 2>&1 &              # 48 h
+```
+
+- `<ref>` is any commit, tag or branch at origin. `--harness-ref REF` takes
+  `cluster.sh`, `soak.py` and `chaos.py` from another commit, to soak an
+  older one with today's harness.
+- `soak.py`'s variables pass through (`SOAK_POOL=pgsoak`, `SOAK_HOURS=12`).
+  `--quick` sets the quick profile (`SOAK_HOURS=3 FAULT_EVERY=5
+  FULL_HIGH=0.3 FULL_LOW=0.1 STALL_MAX_SECS=900 NOT_CLEAN_MAX_SECS=3600`),
+  except what is already set.
+- A soak already running is stopped first.
+- Everything goes under `$SOAK_HOME` (`/data/soak`):
+  - `repo/`: a clone of its own, never a worktree of a development
+    checkout. A branch force-pushed under a worktree leaves its files as
+    they were, and a run builds the old tree (run 15 did).
+  - `runs/<n>/`: `build.log`, `cluster-up.log`, `soak.log`, `ops.log` and
+    `summary.json` (commit, profile, faults by kind, the leak check, the
+    verdict).
+  - `runs.tsv`: one line per run.
