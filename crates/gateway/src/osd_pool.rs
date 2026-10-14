@@ -320,6 +320,22 @@ impl OsdPool {
         });
     }
 
+    /// A call to the OSD at `address` failed with `e`: fail the OSD fast if
+    /// it could not be reached; if the gateway's own side closed the
+    /// connection ([`closed_by_us`]), dial it afresh for the next call
+    /// rather than have that one fail too (tonic hands the closed
+    /// connection's error to the first call after it).
+    pub fn call_failed(&self, address: &str, e: &tonic::Status) {
+        if is_transport_failure(e) {
+            self.mark_unreachable(address);
+        } else if closed_by_us(e) {
+            self.stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(address.to_string());
+        }
+    }
+
     /// Await `call`, an RPC to the OSD at `address`. One still running after
     /// [`SUSPECT_AFTER`] makes the gateway check, in the background, whether
     /// the OSD still accepts a connection, and fail it fast if not.
@@ -601,9 +617,10 @@ pub struct RdmaSource<'a> {
 
 /// Whether `e` says the OSD could not be reached (as opposed to an answer
 /// from it): unavailable, or a connection that dropped, which tonic reports
-/// as Unknown "transport error".
+/// as Unknown "transport error". Not a connection the gateway's side closed
+/// itself ([`closed_by_us`]): the OSD is up.
 fn is_transport_failure(e: &tonic::Status) -> bool {
-    e.code() == tonic::Code::Unavailable || connection_broke(e)
+    (e.code() == tonic::Code::Unavailable || connection_broke(e)) && !closed_by_us(e)
 }
 
 /// The connection failed under the call, whatever tonic made of it: a
@@ -627,6 +644,26 @@ pub fn connection_broke(e: &tonic::Status) -> bool {
             | tonic::Code::PermissionDenied
             | tonic::Code::Unauthenticated
     ) && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
+}
+
+/// Whether the gateway's own HTTP/2 side closed the connection under the
+/// call: h2 does once more than 1024 answers arrived for calls it had
+/// cancelled and forgotten (a cancelled call is remembered 1 s, and only the
+/// last 50), counted over the connection's life and never reset. A call
+/// cancelled while its answer is on the way is one: thousands a second at
+/// the quorum of every metadata read, before those were let finish. The
+/// OSD is fine; the call can be made again on a new connection.
+pub fn closed_by_us(e: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        if let Some(h2) = s.downcast_ref::<h2::Error>() {
+            return h2.is_go_away()
+                && h2.is_library()
+                && h2.reason() == Some(h2::Reason::ENHANCE_YOUR_CALM);
+        }
+        source = s.source();
+    }
+    false
 }
 
 /// A shard call that did not succeed.
@@ -655,6 +692,11 @@ impl From<ShardCallError> for OsdPoolError {
         match e {
             ShardCallError::Connect(e) => e,
             ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
+            // The connection, not the disk: ResourceExhausted is also what
+            // tonic makes of a connection h2 closed (ENHANCE_YOUR_CALM).
+            ShardCallError::Status(s) if connection_broke(&s) => {
+                Self::ConnectionFailed(s.to_string())
+            }
             ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
                 Self::Full(s.message().to_string())
             }
@@ -676,7 +718,9 @@ fn rdma_failure(
 ) -> crate::rdma::Fallback {
     use crate::rdma::Fallback;
     let reason = match e {
-        ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
+        ShardCallError::Status(s)
+            if s.code() == tonic::Code::ResourceExhausted && !connection_broke(s) =>
+        {
             return Fallback::OsdBusy;
         }
         ShardCallError::Status(s) if s.code() == tonic::Code::DataLoss => Fallback::Checksum,
@@ -720,9 +764,7 @@ async fn call_write_shard(
         })?
         .map_err(|e| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
-            if is_transport_failure(&e) {
-                pool.mark_unreachable(&placement.node_address);
-            }
+            pool.call_failed(&placement.node_address, &e);
             error!(
                 "Failed to write shard to OSD {}: {}",
                 placement.node_address, e
@@ -736,8 +778,23 @@ async fn call_write_shard(
     })
 }
 
-/// One ReadShard call, with the gateway's timeout and error accounting.
+/// One ReadShard call, with the gateway's timeout and error accounting;
+/// made once more on a new connection if the gateway's side closed the one
+/// it was on ([`closed_by_us`]).
 async fn call_read_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::ReadShardRequest,
+) -> Result<objectio_proto::storage::ReadShardResponse, ShardCallError> {
+    match read_shard_once(pool, placement, request.clone()).await {
+        Err(ShardCallError::Status(e)) if closed_by_us(&e) => {
+            read_shard_once(pool, placement, request).await
+        }
+        r => r,
+    }
+}
+
+async fn read_shard_once(
     pool: &OsdPool,
     placement: &NodePlacement,
     request: objectio_proto::storage::ReadShardRequest,
@@ -764,9 +821,7 @@ async fn call_read_shard(
         })?
         .map_err(|e| {
             crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
-            if is_transport_failure(&e) {
-                pool.mark_unreachable(&placement.node_address);
-            }
+            pool.call_failed(&placement.node_address, &e);
             warn!(
                 "Failed to read shard from OSD {}: {}",
                 placement.node_address, e
@@ -1300,9 +1355,7 @@ pub async fn put_object_meta_with(
                             "Failed to put object metadata to OSD {}: {}",
                             p.node_address, e
                         );
-                        if is_transport_failure(&e) {
-                            pool.mark_unreachable(&p.node_address);
-                        }
+                        pool.call_failed(&p.node_address, &e);
                         let refused = matches!(
                             e.code(),
                             tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
@@ -1879,46 +1932,62 @@ async fn read_object_meta(
             version_id: version_id.to_string(),
             with_small_shard,
         };
-        let mut client = pool
-            .get_client_for_placement(placement)
-            .await
-            .map_err(|e| {
-                warn!(
-                    "get_object_meta: connect failed to {}: {}",
-                    placement.node_address, e
-                );
-                e
-            })?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            pool.watched(&placement.node_address, client.get_object_meta(req)),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                let inner = resp.into_inner();
-                Ok((
-                    if inner.found { inner.object } else { None },
-                    inner.tombstone_stamp,
-                    inner.small_shard,
-                ))
-            }
-            Ok(Err(e)) => {
-                warn!(
-                    "get_object_meta from {} failed: {}",
-                    placement.node_address, e
-                );
-                if is_transport_failure(&e) {
-                    pool.mark_unreachable(&placement.node_address);
+        let mut again = true;
+        loop {
+            let mut client = pool
+                .get_client_for_placement(placement)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        "get_object_meta: connect failed to {}: {}",
+                        placement.node_address, e
+                    );
+                    e
+                })?;
+            // In a task of its own, so a copy that answers after the
+            // quorum did is let finish, not cancelled: an answer to a
+            // cancelled call counts towards h2 closing the connection
+            // ([`closed_by_us`]), and these were thousands a second.
+            let req = req.clone();
+            let call = tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.get_object_meta(req),
+                )
+                .await
+            });
+            return match pool.watched(&placement.node_address, call).await {
+                Ok(Ok(Ok(resp))) => {
+                    let inner = resp.into_inner();
+                    Ok((
+                        if inner.found { inner.object } else { None },
+                        inner.tombstone_stamp,
+                        inner.small_shard,
+                    ))
                 }
-                Err(OsdPoolError::ConnectionFailed(e.to_string()))
-            }
-            Err(_) => {
-                warn!("get_object_meta timeout from {}", placement.node_address);
-                Err(OsdPoolError::ConnectionFailed(
-                    "get_object_meta timeout".to_string(),
-                ))
-            }
+                Ok(Ok(Err(e))) => {
+                    warn!(
+                        "get_object_meta from {} failed: {}",
+                        placement.node_address, e
+                    );
+                    pool.call_failed(&placement.node_address, &e);
+                    if again && closed_by_us(&e) {
+                        again = false;
+                        continue;
+                    }
+                    Err(OsdPoolError::ConnectionFailed(e.to_string()))
+                }
+                Ok(Err(_)) => {
+                    warn!("get_object_meta timeout from {}", placement.node_address);
+                    Err(OsdPoolError::ConnectionFailed(
+                        "get_object_meta timeout".to_string(),
+                    ))
+                }
+                Err(e) => Err(OsdPoolError::ConnectionFailed(format!(
+                    "get_object_meta from {}: {e}",
+                    placement.node_address
+                ))),
+            };
         }
     });
     // Answers as they come. Any read quorum of them holds the newest
@@ -2149,9 +2218,7 @@ pub async fn delete_meta_from_all(
             .await
             .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
             .map_err(|e| {
-                if is_transport_failure(&e) {
-                    pool.mark_unreachable(&p.node_address);
-                }
+                pool.call_failed(&p.node_address, &e);
                 OsdPoolError::ConnectionFailed(e.to_string())
             })?
             .into_inner();
@@ -3437,6 +3504,246 @@ mod tests {
     #[test]
     fn a_response_without_a_checksum_is_taken_as_is() {
         assert!(matches_checksum(None, b"anything"));
+    }
+
+    use objectio_proto::metadata::{NodePlacement, ObjectMeta};
+    use objectio_proto::storage::{GetObjectMetaRequest, GetObjectMetaResponse};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    /// An OSD that answers GetObjectMeta only, with the object, after its
+    /// delay (plus N ms for a key `slow-N`), counting the calls it finished.
+    #[derive(Clone)]
+    struct MetaOsd {
+        delay: Duration,
+        finished: Arc<AtomicUsize>,
+    }
+
+    impl tonic::server::NamedService for MetaOsd {
+        const NAME: &'static str = "objectio.storage.StorageService";
+    }
+
+    impl tower::Service<http::Request<tonic::body::BoxBody>> for MetaOsd {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            assert_eq!(
+                req.uri().path(),
+                "/objectio.storage.StorageService/GetObjectMeta"
+            );
+            let osd = self.clone();
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.unary(osd, req).await)
+            })
+        }
+    }
+
+    impl tonic::server::UnaryService<GetObjectMetaRequest> for MetaOsd {
+        type Response = GetObjectMetaResponse;
+        type Future = futures::future::BoxFuture<
+            'static,
+            Result<tonic::Response<GetObjectMetaResponse>, tonic::Status>,
+        >;
+
+        fn call(&mut self, req: tonic::Request<GetObjectMetaRequest>) -> Self::Future {
+            let osd = self.clone();
+            Box::pin(async move {
+                let req = req.into_inner();
+                let extra = req
+                    .key
+                    .strip_prefix("slow-")
+                    .map_or(0, |ms| ms.parse().unwrap());
+                tokio::time::sleep(osd.delay + Duration::from_millis(extra)).await;
+                osd.finished.fetch_add(1, SeqCst);
+                Ok(tonic::Response::new(GetObjectMetaResponse {
+                    found: true,
+                    object: Some(ObjectMeta {
+                        bucket: req.bucket,
+                        key: req.key,
+                        stamp: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+            })
+        }
+    }
+
+    async fn serve(osd: MetaOsd) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(osd)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        addr
+    }
+
+    /// A link to `to` that holds what the client sends for `delay` and
+    /// passes the answers straight back: every call the client cancels
+    /// sooner than that is answered after it was cancelled.
+    async fn slow_link(to: std::net::SocketAddr, delay: Duration) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(to).await else {
+                    continue;
+                };
+                let (mut client_rx, mut client_tx) = client.into_split();
+                let (mut server_rx, mut server_tx) = server.into_split();
+                tokio::spawn(async move { tokio::io::copy(&mut server_rx, &mut client_tx).await });
+                let (held, mut due) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n @ 1..) = client_rx.read(&mut buf).await {
+                        let _ = held.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some((at, bytes)) = due.recv().await {
+                        tokio::time::sleep_until(at).await;
+                        if server_tx.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn placement(n: u8, addr: std::net::SocketAddr) -> NodePlacement {
+        NodePlacement {
+            node_id: vec![n; 16],
+            node_address: format!("http://{addr}"),
+            ..Default::default()
+        }
+    }
+
+    /// A metadata read answered by a quorum lets the slower copies' calls
+    /// finish rather than cancel them: thousands of cancelled calls a
+    /// second, answered all the same, made h2 close the connection (see
+    /// `closed_by_us`).
+    #[tokio::test]
+    async fn a_meta_read_lets_the_slower_copies_finish() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let osd = |ms| MetaOsd {
+            delay: Duration::from_millis(ms),
+            finished: Arc::clone(&finished),
+        };
+        let placements = vec![
+            placement(1, serve(osd(0)).await),
+            placement(2, serve(osd(0)).await),
+            placement(3, serve(osd(500)).await),
+        ];
+        let pool = super::OsdPool::new();
+        let started = Instant::now();
+        let object = super::get_object_meta_from_any(&pool, &placements, "b", "k")
+            .await
+            .unwrap();
+        assert_eq!(object.unwrap().key, "k");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "waited for the slow copy"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while finished.load(SeqCst) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the slow copy's call was cancelled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// h2 closes a connection once more than 1024 answers came for calls it
+    /// had cancelled and forgotten, over the connection's life, failing
+    /// every call in flight on it. That is this side's doing: the OSD is not
+    /// failed fast, a shard write cut off is not taken for a full disk, and
+    /// a read in flight is asked again on a new connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_closed_by_our_side_is_not_the_osd_down() {
+        let osd = serve(MetaOsd {
+            delay: Duration::ZERO,
+            finished: Arc::default(),
+        })
+        .await;
+        let link = slow_link(osd, Duration::from_millis(500)).await;
+        let placements = vec![placement(1, link)];
+        let pool = Arc::new(super::OsdPool::new());
+        let client = pool.get_client_for_placement(&placements[0]).await.unwrap();
+        let ask = |key: &str| GetObjectMetaRequest {
+            bucket: "b".into(),
+            key: key.into(),
+            ..Default::default()
+        };
+
+        // Waves of calls cancelled before their answers come, until h2
+        // closes the connection: how many open a stream in time (rather
+        // than being cancelled while still queued in tonic's buffer)
+        // depends on the machine's speed, and h2's count carries over.
+        // Each wave has in flight a call as it is, and a read, slow
+        // enough to still be waiting when the wave's answers come.
+        let mut closed = None;
+        for _ in 0..30 {
+            let call = tokio::spawn({
+                let mut client = client.clone();
+                let req = ask("slow-1500");
+                async move { client.get_object_meta(req).await }
+            });
+            let read = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                let placements = placements.clone();
+                async move {
+                    super::get_object_meta_from_any(&pool, &placements, "b", "slow-1500").await
+                }
+            });
+            let cancelled: Vec<_> = (0..1100)
+                .map(|_| {
+                    let mut client = client.clone();
+                    let req = ask("k");
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            client.get_object_meta(req),
+                        )
+                        .await;
+                    })
+                })
+                .collect();
+            for c in cancelled {
+                c.await.unwrap();
+            }
+            let object = read.await.unwrap().expect("the read was not asked again");
+            assert_eq!(object.unwrap().key, "slow-1500");
+            if let Err(e) = call.await.unwrap() {
+                closed = Some(e);
+                break;
+            }
+        }
+        let e = closed.expect("h2 no longer closes the connection");
+        assert!(super::closed_by_us(&e), "{e:?}");
+        assert!(super::connection_broke(&e), "{e:?}");
+        assert!(!super::is_transport_failure(&e), "{e:?}");
+        assert!(
+            !super::OsdPoolError::from(super::ShardCallError::Status(e)).is_full(),
+            "taken for a full disk"
+        );
+        assert!(!pool.is_unreachable(&placements[0].node_address));
     }
 }
 
