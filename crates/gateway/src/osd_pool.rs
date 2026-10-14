@@ -3692,39 +3692,50 @@ mod tests {
             ..Default::default()
         };
 
-        // In flight when the connection is closed: a call as it is, and a
-        // read.
-        let call = tokio::spawn({
-            let mut client = client.clone();
-            let req = ask("slow-300");
-            async move { client.get_object_meta(req).await }
-        });
-        let read = tokio::spawn({
-            let pool = Arc::clone(&pool);
-            let placements = placements.clone();
-            async move { super::get_object_meta_from_any(&pool, &placements, "b", "slow-300").await }
-        });
-        let cancelled: Vec<_> = (0..1100)
-            .map(|_| {
+        // Waves of calls cancelled before their answers come, until h2
+        // closes the connection: how many open a stream in time (rather
+        // than being cancelled while still queued in tonic's buffer)
+        // depends on the machine's speed, and h2's count carries over.
+        // Each wave has in flight a call as it is, and a read, slow
+        // enough to still be waiting when the wave's answers come.
+        let mut closed = None;
+        for _ in 0..30 {
+            let call = tokio::spawn({
                 let mut client = client.clone();
-                let req = ask("k");
-                tokio::spawn(async move {
-                    let _ = tokio::time::timeout(
-                        Duration::from_millis(100),
-                        client.get_object_meta(req),
-                    )
-                    .await;
+                let req = ask("slow-1500");
+                async move { client.get_object_meta(req).await }
+            });
+            let read = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                let placements = placements.clone();
+                async move {
+                    super::get_object_meta_from_any(&pool, &placements, "b", "slow-1500").await
+                }
+            });
+            let cancelled: Vec<_> = (0..1100)
+                .map(|_| {
+                    let mut client = client.clone();
+                    let req = ask("k");
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            client.get_object_meta(req),
+                        )
+                        .await;
+                    })
                 })
-            })
-            .collect();
-        for c in cancelled {
-            c.await.unwrap();
+                .collect();
+            for c in cancelled {
+                c.await.unwrap();
+            }
+            let object = read.await.unwrap().expect("the read was not asked again");
+            assert_eq!(object.unwrap().key, "slow-1500");
+            if let Err(e) = call.await.unwrap() {
+                closed = Some(e);
+                break;
+            }
         }
-
-        let e = call
-            .await
-            .unwrap()
-            .expect_err("h2 no longer closes the connection");
+        let e = closed.expect("h2 no longer closes the connection");
         assert!(super::closed_by_us(&e), "{e:?}");
         assert!(super::connection_broke(&e), "{e:?}");
         assert!(!super::is_transport_failure(&e), "{e:?}");
@@ -3732,8 +3743,6 @@ mod tests {
             !super::OsdPoolError::from(super::ShardCallError::Status(e)).is_full(),
             "taken for a full disk"
         );
-        let object = read.await.unwrap().expect("the read was not asked again");
-        assert_eq!(object.unwrap().key, "slow-300");
         assert!(!pool.is_unreachable(&placements[0].node_address));
     }
 }
