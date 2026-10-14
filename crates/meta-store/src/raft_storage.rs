@@ -20,8 +20,9 @@
 //! A log append returns once it is synced, and a vote once its durable
 //! commit is. Applying commits without a flush ([`Commit::Applied`]); a
 //! checkpoint ([`MetaRaftStorage::checkpoint`]) makes it durable every
-//! second and before a snapshot is built. A crash rolls the state machine
-//! back to the last checkpoint, `last_applied` with it, and the entries
+//! `--raft-checkpoint-ms` (200 ms) and before a snapshot is built. A crash
+//! rolls the state machine back to the last checkpoint, `last_applied`
+//! with it, and the entries
 //! after it are applied again from the log. Every durable commit saves
 //! redb's allocator state, so the database never needs a full repair.
 //!
@@ -137,7 +138,14 @@ impl MetaRaftStorage {
         // A node that has moved its log keeps it in files from then on (a
         // crash part way through the move moves it again).
         let log = if RaftLog::exists(log_dir) {
+            let started = std::time::Instant::now();
             let mut files = RaftLog::open(log_dir).map_err(read_err)?;
+            crate::commit_metrics::log_opened(started.elapsed());
+            tracing::info!(
+                "Raft log opened in {:.2} s: entries {:?}",
+                started.elapsed().as_secs_f64(),
+                files.range()
+            );
             move_log_from_redb(&db, &mut files)?;
             LogStore::Files(files)
         } else {
@@ -186,8 +194,9 @@ impl MetaRaftStorage {
 
     /// Make every entry applied so far durable, if any was applied since
     /// the last checkpoint: one durable commit that writes nothing else
-    /// (and the commit index, beside the log). Run every second, before a
-    /// snapshot is built and before the log is purged, and at shutdown.
+    /// (and the commit index, beside the log). Run every
+    /// `--raft-checkpoint-ms`, before a snapshot is built and before the log
+    /// is purged, and at shutdown.
     /// Returns whether it committed.
     ///
     /// # Errors

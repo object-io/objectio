@@ -81,6 +81,26 @@ pub fn opened(repaired: bool, elapsed: std::time::Duration) {
     );
 }
 
+/// How long opening the Raft log took at start (B25: one segment read, the
+/// sealed ones' indexes), and how long from the start of the process until
+/// meta served.
+static LOG_OPEN_MILLIS: AtomicU64 = AtomicU64::new(0);
+static READY_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+fn millis(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Record how long the Raft log took to open.
+pub fn log_opened(elapsed: std::time::Duration) {
+    LOG_OPEN_MILLIS.store(millis(elapsed), Ordering::Relaxed);
+}
+
+/// Record how long meta took from its start to serving.
+pub fn ready(elapsed: std::time::Duration) {
+    READY_MILLIS.store(millis(elapsed), Ordering::Relaxed);
+}
+
 /// Append the commit-latency family to `out`.
 pub fn render(out: &mut String) {
     COMMIT_SECONDS.render(
@@ -119,6 +139,20 @@ pub fn render(out: &mut String) {
              # TYPE objectio_meta_open_repair gauge\nobjectio_meta_open_repair {repaired}\n\
              # HELP objectio_meta_open_seconds Time to open the metadata database at start\n\
              # TYPE objectio_meta_open_seconds gauge\nobjectio_meta_open_seconds {open_s}\n"
+        ),
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let (log_s, ready_s) = (
+        LOG_OPEN_MILLIS.load(Ordering::Relaxed) as f64 / 1000.0,
+        READY_MILLIS.load(Ordering::Relaxed) as f64 / 1000.0,
+    );
+    let _ = std::fmt::Write::write_fmt(
+        out,
+        format_args!(
+            "# HELP objectio_meta_raft_log_open_seconds Time to open the Raft log at start\n\
+             # TYPE objectio_meta_raft_log_open_seconds gauge\nobjectio_meta_raft_log_open_seconds {log_s}\n\
+             # HELP objectio_meta_ready_seconds Time from the start of the process until meta served (B25: within 30 s after a crash)\n\
+             # TYPE objectio_meta_ready_seconds gauge\nobjectio_meta_ready_seconds {ready_s}\n"
         ),
     );
 }

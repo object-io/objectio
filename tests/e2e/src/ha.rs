@@ -607,6 +607,12 @@ impl HaCluster {
         await_child_listening(slot.as_mut().unwrap(), &[m.grpc, m.admin])
     }
 
+    /// Meta node `i`'s data directory (`meta.redb`, `raft-log/`, …).
+    #[must_use]
+    pub fn meta_dir(&self, i: usize) -> &Path {
+        &self.metas[i].dir
+    }
+
     /// Kill meta node `i` outright.
     pub fn kill_meta(&self, i: usize) {
         let child = self.metas[i].child.lock().unwrap().take();

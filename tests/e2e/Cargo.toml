@@ -32,5 +32,10 @@ flate2 = "1"
 bzip2 = "0.6"
 crc32fast = "1.4"
 
+[dev-dependencies]
+# meta_reopen grows a stopped meta node's database to a size worth timing a
+# crash at (B25): through S3 it would take hours.
+redb = { workspace = true }
+
 [lints]
 workspace = true
