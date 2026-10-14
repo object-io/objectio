@@ -645,7 +645,7 @@ pub(crate) async fn get_object_version_once(
             }
             Err(e) => {
                 error!("Failed to get placement: {}", e);
-                return meta_failure(&e, "Failed to get placement");
+                return crate::s3::placement_failure(&state, &bucket, &e).await;
             }
         }
     };
