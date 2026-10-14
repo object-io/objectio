@@ -139,6 +139,12 @@ verdict = next((l for l in reversed(lines) if l[:1] in "✓✗"), "")
 faults = [m.group(1) for l in lines
           if (m := re.match(r"▶ \S+ after ([a-z-]+) \(\d+\): \d+ keys read as expected", l))]
 leak = next((m.group(0) for l in reversed(lines) if (m := re.search(r"\b(no )?leak: .*", l))), "")
+# Each service's highest resident memory over the run, in MB (B33).
+rss = {}
+for l in lines:
+    if l.startswith("{") and '"rss_mb"' in l:
+        for svc, mbs in (json.loads(l).get("rss_mb") or {}).items():
+            rss[svc] = max([rss.get(svc, 0)] + [m for m in mbs if m is not None])
 e = os.environ
 print(json.dumps({
     "run": int(e["RUN"]), "ref": e["REF"], "commit": e["COMMIT"], "subject": e["SUBJECT"],
@@ -146,7 +152,7 @@ print(json.dumps({
     "started": e["STARTED"], "ended": e["ENDED"], "exit": int(e["STATUS"]),
     "passed": verdict.startswith("✓") and e["STATUS"] == "0",
     "faults": len(faults), "by_fault": {f: faults.count(f) for f in sorted(set(faults))},
-    "leak": leak, "verdict": verdict,
+    "leak": leak, "rss_peak_mb": rss, "verdict": verdict,
 }, ensure_ascii=False, indent=1))
 EOF
 [ -s "$home/runs.tsv" ] ||

@@ -565,5 +565,36 @@ def main():
     print(f"✓ chaos: {len(acked)} acknowledged writes intact through every fault", flush=True)
 
 
+# --- memory (B33) ----------------------------------------------------------
+
+# Where each service answers its own /metrics: a VM has 3 GiB, and a
+# service that leaks shows here long before the kernel kills it.
+SERVICES = {"meta": (METAS, 9101), "osd": (VMS, 9201), "gateway": (GATEWAYS, 9000)}
+
+
+def rss_mb(url):
+    """A service's resident memory in MB, from its /metrics; None if it
+    doesn't answer. A gateway's also carries the OSDs' it polls, labelled:
+    its own line has no labels; an OSD's only line is labelled."""
+    status, body = http("GET", f"{url}/metrics", timeout=10)
+    if status != 200:
+        return None
+    labelled = None
+    for line in body.decode(errors="replace").splitlines():
+        if line.startswith("process_resident_memory_bytes "):
+            return int(float(line.rsplit(" ", 1)[1])) >> 20
+        if labelled is None and line.startswith("process_resident_memory_bytes{"):
+            labelled = int(float(line.rsplit(" ", 1)[1])) >> 20
+    return labelled
+
+
+def memory():
+    """Each service's resident memory in MB, a VM at a time, in VM order:
+    {"meta": [..3], "osd": [..6], "gateway": [..2]}; None for one that
+    doesn't answer."""
+    return {svc: [rss_mb(f"http://{IP[vm]}:{port}") for vm in vms]
+            for svc, (vms, port) in SERVICES.items()}
+
+
 if __name__ == "__main__":
     main()

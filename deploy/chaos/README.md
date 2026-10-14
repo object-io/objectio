@@ -83,7 +83,7 @@ nohup deploy/chaos/run-soak.sh origin/main > /dev/null 2>&1 &              # 48 
   - `repo/`: a clone of its own, never a worktree of a development
     checkout. A branch force-pushed under a worktree leaves its files as
     they were, and a run builds the old tree (run 15 did).
-  - `runs/<n>/`: `build.log`, `cluster-up.log`, `soak.log`, `ops.log` and
-    `summary.json` (commit, profile, faults by kind, the leak check, the
-    verdict).
+  - `runs/<n>/`: `build.log`, `cluster-up.log`, `soak.log`, `ops.log`,
+    and `summary.json` (commit, profile, faults by kind, the leak check,
+    each service's peak resident memory, the verdict).
   - `runs.tsv`: one line per run.
