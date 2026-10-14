@@ -21,7 +21,8 @@ Invariants:
     falls back to what it used before the run, within LEAK_SLACK bytes.
 
 Standard library only. Exits 1 on the first broken invariant. Prints a
-JSON progress line every 5 minutes.
+JSON progress line every 5 minutes, with each service's resident memory
+(rss_mb).
 """
 
 import hashlib
@@ -349,7 +350,8 @@ def progress():
                     # The harness drives everything through incusd, which
                     # leaked to 16 GB and locked up once (2026-10-06).
                     "incusd_mb": incusd_mb(),
-                    "pgs": pg_health()}
+                    "pgs": pg_health(),
+                    "rss_mb": chaos.memory()}
         print(json.dumps(line), flush=True)
         h = line["pgs"]
         if h is None:
