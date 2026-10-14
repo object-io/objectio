@@ -134,25 +134,30 @@ impl MetadataStore {
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| Error::Storage(format!("failed to create data dir: {}", e)))?;
         let wal_path = config.data_dir.join("metadata.wal");
-        let wal = Arc::new(if wal_path.exists() {
-            MetadataWal::open(&wal_path, config.wal.clone())?
-        } else {
-            MetadataWal::create(&wal_path, config.wal.clone())?
-        });
         let index = Arc::new(DiskIndex::open(
             &config.data_dir.join("index.redb"),
             config.cache_bytes,
         )?);
         let checkpoint_lsn = index.checkpoint_lsn()?;
-        wal.advance_past(checkpoint_lsn);
 
+        // Replayed in the pass that opens the log: it is read once.
         info!("Replaying WAL from LSN {}", checkpoint_lsn + 1);
         let mut replayed = 0u64;
-        wal.iter_entries(checkpoint_lsn + 1, |entry| {
-            index.apply_entry(entry);
-            replayed += 1;
-            Ok(())
-        })?;
+        let wal = Arc::new(if wal_path.exists() {
+            MetadataWal::open_replaying(
+                &wal_path,
+                config.wal.clone(),
+                checkpoint_lsn + 1,
+                |entry| {
+                    index.apply_entry(entry);
+                    replayed += 1;
+                    Ok(())
+                },
+            )?
+        } else {
+            MetadataWal::create(&wal_path, config.wal.clone())?
+        });
+        wal.advance_past(checkpoint_lsn);
         info!("Replayed {replayed} WAL entries");
 
         let store = Self::with(wal, index, config);
