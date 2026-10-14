@@ -410,7 +410,10 @@ async fn query_shard_count(address: &str) -> anyhow::Result<u64> {
     let mut client = StorageServiceClient::new(channel);
     let resp = tokio::time::timeout(
         PER_OSD_TIMEOUT,
-        client.get_status(GetStatusRequest::default()),
+        client.get_status(GetStatusRequest {
+            answer_while_counting: true,
+            ..Default::default()
+        }),
     )
     .await
     .map_err(|_| anyhow::anyhow!("get_status timeout"))??;

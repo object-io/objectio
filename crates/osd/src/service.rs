@@ -230,7 +230,9 @@ pub struct OsdService {
     /// gRPC metrics collector
     grpc_metrics: Arc<GrpcMetrics>,
     /// Per-bucket usage of the objects this OSD is primary for
-    usage: UsageTracker,
+    usage: Arc<UsageTracker>,
+    /// True once bucket usage is counted after the start (B32).
+    usage_counted: tokio::sync::watch::Receiver<bool>,
     /// The last count of objects at risk, for `GetStatus` (B28: it was a
     /// scan of every ObjectMeta on every poll, from every gateway).
     safety: SafetyCache,
@@ -322,10 +324,17 @@ impl OsdService {
         // Every write goes through the placement-group index (B31 phase 2),
         // the shard store's included.
         let pg_index = Arc::new(
-            crate::pg_index::PgIndexed::open(meta_store, node_id)
+            crate::pg_index::PgIndexed::open_to_count(meta_store, node_id)
                 .map_err(|e| format!("Failed to index metadata by placement group: {e}"))?,
         );
         let meta_store: Arc<dyn MetaIndex> = Arc::clone(&pg_index) as Arc<dyn MetaIndex>;
+        // PG summaries and bucket usage are counted after the OSD serves,
+        // from the index as it is now, before any write (objectio-docs
+        // `core/osd-start.md`); writes meanwhile are kept aside and folded
+        // in.
+        let usage = Arc::new(UsageTracker::new(node_id));
+        usage.start_counting();
+        let snapshot = meta_store.snapshot();
 
         info!(
             "OSD initialized with {} disks, metadata at {:?}",
@@ -333,20 +342,11 @@ impl OsdService {
             data_dir
         );
 
+        // Every block a shard holds is marked used before the OSD serves:
+        // nothing is allocated over a live shard.
         let shards: Arc<dyn ShardStore> =
             Arc::new(BlockStore::new(disks, Arc::clone(&meta_store), meta_dir));
-        let usage = UsageTracker::new(node_id);
-        let started = Instant::now();
-        usage.rebuild(
-            meta_store
-                .iter_prefix(&MetadataKey::all_object_meta_prefix())
-                .chain(meta_store.iter_prefix(&MetadataKey::from_bytes(vec![b'v']))),
-        );
-        info!(
-            "Rebuilt usage for {} buckets in {:?}",
-            usage.snapshot().len(),
-            started.elapsed()
-        );
+        let usage_counted = count_after_start(&pg_index, &usage, snapshot);
 
         Ok(Self {
             node_id,
@@ -355,6 +355,7 @@ impl OsdService {
             start_time: Instant::now(),
             grpc_metrics: Arc::new(GrpcMetrics::default()),
             usage,
+            usage_counted,
             safety: SafetyCache::default(),
             metrics_renderer: std::sync::OnceLock::new(),
             scrub: ScrubStats::default(),
@@ -1082,6 +1083,11 @@ impl StorageService for OsdService {
         request: Request<GetPgInfoRequest>,
     ) -> Result<Response<GetPgInfoResponse>, Status> {
         let r = request.into_inner();
+        if self.pg_index.counting() {
+            return Err(Status::unavailable(
+                "counting placement-group summaries after a start",
+            ));
+        }
         let summary = self.pg_index.summary(&(r.pool, r.pg_id));
         Ok(Response::new(GetPgInfoResponse {
             summary: Some(summary.to_proto()),
@@ -1581,7 +1587,13 @@ impl StorageService for OsdService {
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let mut up_nodes = request.into_inner().up_nodes;
+        let r = request.into_inner();
+        if !r.answer_while_counting {
+            // A caller from before `usage_counting`: it would take what has
+            // been counted so far as this OSD's usage.
+            let _ = self.usage_counted.clone().wait_for(|done| *done).await;
+        }
+        let mut up_nodes = r.up_nodes;
         let safety = if up_nodes.is_empty() {
             None
         } else {
@@ -1612,6 +1624,7 @@ impl StorageService for OsdService {
 
         let shard_count = self.shards.count();
         let uptime = self.start_time.elapsed().as_secs();
+        let usage_counting = self.usage.counting();
 
         // Gather host/environment info
         let kubernetes_node = std::env::var("NODE_NAME").unwrap_or_default();
@@ -1649,7 +1662,12 @@ impl StorageService for OsdService {
             cpu_cores,
             memory_bytes,
             version: env!("CARGO_PKG_VERSION").to_string(),
-            bucket_usage: self.usage.snapshot(),
+            bucket_usage: if usage_counting {
+                Vec::new()
+            } else {
+                self.usage.snapshot()
+            },
+            usage_counting,
             safety,
         }))
     }
@@ -2488,6 +2506,61 @@ fn version_entry_id(version_id: &str) -> &str {
     }
 }
 
+/// Count PG summaries and bucket usage from `snapshot` in the background,
+/// beside each other; without a snapshot (an engine that can't keep one),
+/// count now, from the index, before the OSD serves. The receiver turns
+/// true once usage is counted.
+fn count_after_start(
+    pg_index: &Arc<crate::pg_index::PgIndexed>,
+    usage: &Arc<UsageTracker>,
+    snapshot: Option<Arc<dyn objectio_storage::metadata::MetaSnapshot>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    let (done, counted) = tokio::sync::watch::channel(false);
+    let count = {
+        let (pg_index, usage) = (Arc::clone(pg_index), Arc::clone(usage));
+        move |snapshot: &dyn objectio_storage::metadata::MetaSnapshot| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let started = Instant::now();
+                    pg_index.count(Some(snapshot));
+                    info!(
+                        "Counted the summaries of {} placement groups in {:?}",
+                        pg_index.pg_count(),
+                        started.elapsed()
+                    );
+                });
+                let started = Instant::now();
+                usage.count(snapshot);
+                info!(
+                    "Counted the usage of {} buckets in {:?}",
+                    usage.snapshot().len(),
+                    started.elapsed()
+                );
+                let _ = done.send(true);
+            });
+        }
+    };
+    match snapshot {
+        Some(snapshot) => {
+            std::thread::Builder::new()
+                .name("osd-count".into())
+                .spawn(move || count(&*snapshot))
+                .expect("spawn the count after start");
+        }
+        None => count(&Live(Arc::clone(pg_index) as Arc<dyn MetaIndex>)),
+    }
+    counted
+}
+
+/// The index itself, read as a snapshot: only while nothing writes.
+struct Live(Arc<dyn MetaIndex>);
+
+impl objectio_storage::metadata::MetaSnapshot for Live {
+    fn scan(&self, prefix: &MetadataKey, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.0.for_each_prefix(prefix, None, f);
+    }
+}
+
 #[cfg(test)]
 mod grpc_write_tests {
     //! Shards sent as bytes in the WriteShard message.
@@ -3136,7 +3209,10 @@ mod integrity_tests {
         let (_dir, osd) = osd();
         let up = |ids: &[u8]| ids.iter().map(|i| vec![*i; 16]).collect::<Vec<_>>();
         let ask = |nodes: Vec<Vec<u8>>| {
-            osd.get_status(Request::new(GetStatusRequest { up_nodes: nodes }))
+            osd.get_status(Request::new(GetStatusRequest {
+                up_nodes: nodes,
+                ..Default::default()
+            }))
         };
         for _ in 0..5 {
             ask(up(&[1, 2, 3])).await.unwrap();

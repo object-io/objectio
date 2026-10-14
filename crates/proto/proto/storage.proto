@@ -334,6 +334,11 @@ message GetStatusRequest {
     // OSDs the caller currently sees as up. When non-empty, the OSD checks
     // the objects it owns against it and fills `safety`. Empty = skip.
     repeated bytes up_nodes = 1;
+    // Answer at once while the OSD is still counting its bucket usage after
+    // a start (objectio-docs `core/osd-start.md`), with no usage and
+    // `usage_counting` set. Unset (a caller from before), the answer waits
+    // until the count is done, so a partial count is never taken as usage.
+    bool answer_while_counting = 2;
 }
 
 message GetStatusResponse {
@@ -361,6 +366,9 @@ message GetStatusResponse {
     // judged against GetStatusRequest.up_nodes. Absent when up_nodes was
     // empty.
     ObjectSafety safety = 16;
+    // The OSD is still counting its bucket usage after a start:
+    // `bucket_usage` is empty and is not this OSD's usage.
+    bool usage_counting = 17;
 }
 
 // Nested counts: every unreadable object is also at risk, every at-risk

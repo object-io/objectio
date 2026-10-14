@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use objectio_common::Result;
 use objectio_proto::metadata::{ObjectMeta, StripeMeta};
 use objectio_proto::storage::{PgEntry, PgSummary};
-use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataOp};
+use objectio_storage::metadata::{MetaIndex, MetaSnapshot, MetadataKey, MetadataOp};
 use parking_lot::Mutex;
 use prost::Message;
 use tracing::info;
@@ -363,6 +363,19 @@ impl Summary {
         self.objects == 0 && self.tombstones == 0
     }
 
+    /// Fold in the entries `added` and taken out (`removed`) since this
+    /// summary was counted.
+    fn merge(&mut self, added: &Self, removed: &Self) {
+        self.objects = (self.objects + added.objects).saturating_sub(removed.objects);
+        self.tombstones = (self.tombstones + added.tombstones).saturating_sub(removed.tombstones);
+        self.stripes = (self.stripes + added.stripes).saturating_sub(removed.stripes);
+        self.positions_short =
+            (self.positions_short + added.positions_short).saturating_sub(removed.positions_short);
+        self.named_here = (self.named_here + added.named_here).saturating_sub(removed.named_here);
+        self.max_stamp = self.max_stamp.max(added.max_stamp).max(removed.max_stamp);
+        self.digest ^= added.digest ^ removed.digest;
+    }
+
     #[must_use]
     pub fn to_proto(&self) -> PgSummary {
         PgSummary {
@@ -377,13 +390,23 @@ impl Summary {
     }
 }
 
+/// Every PG's summary. While an OSD that has started counts its entries
+/// from a snapshot (objectio-docs `core/osd-start.md`), writes go to the
+/// changes since the snapshot instead, folded in when the count is done.
+#[derive(Default)]
+struct Summaries {
+    live: HashMap<PgId, Summary>,
+    /// While counting: the entries writes put in and took out, per PG.
+    counting: Option<(HashMap<PgId, Summary>, HashMap<PgId, Summary>)>,
+}
+
 /// The metadata store, with its keys indexed by placement group. See the
 /// module documentation.
 pub struct PgIndexed {
     inner: Arc<dyn MetaIndex>,
     node_id: [u8; 16],
     locks: Vec<Mutex<()>>,
-    summaries: Mutex<HashMap<PgId, Summary>>,
+    summaries: Mutex<Summaries>,
     /// Writes of a current object whose PG isn't known (not indexed).
     unindexed: AtomicU64,
 }
@@ -397,11 +420,27 @@ impl PgIndexed {
     /// # Errors
     /// The index could not be written.
     pub fn open(inner: Arc<dyn MetaIndex>, node_id: [u8; 16]) -> Result<Self> {
+        let me = Self::open_to_count(inner, node_id)?;
+        me.count(None);
+        Ok(me)
+    }
+
+    /// [`Self::open`], with the summaries not yet counted: until
+    /// [`Self::count`] has run, [`Self::counting`] is true and writes are
+    /// kept aside, to be folded into the count. Call [`Self::count`] once,
+    /// with a snapshot taken before any write.
+    ///
+    /// # Errors
+    /// The index could not be written.
+    pub fn open_to_count(inner: Arc<dyn MetaIndex>, node_id: [u8; 16]) -> Result<Self> {
         let me = Self {
             inner,
             node_id,
             locks: (0..LOCKS).map(|_| Mutex::new(())).collect(),
-            summaries: Mutex::new(HashMap::new()),
+            summaries: Mutex::new(Summaries {
+                live: HashMap::new(),
+                counting: Some(Default::default()),
+            }),
             unindexed: AtomicU64::new(0),
         };
         let built = MetadataKey::from_bytes(BUILT.to_vec());
@@ -414,7 +453,6 @@ impl PgIndexed {
                 started.elapsed()
             );
         }
-        me.load();
         Ok(me)
     }
 
@@ -484,31 +522,61 @@ impl PgIndexed {
         Ok(n)
     }
 
-    /// Every PG's summary, from the index.
-    fn load(&self) {
+    /// Count every PG's summary from `snapshot` (the index itself if
+    /// `None`: only while nothing writes), fold in the writes made since,
+    /// and end counting.
+    pub fn count(&self, snapshot: Option<&dyn MetaSnapshot>) {
         let mut sums: HashMap<PgId, Summary> = HashMap::new();
-        for (k, v) in self
-            .inner
-            .iter_prefix(&MetadataKey::from_bytes(PREFIX.to_vec()))
-        {
-            let Some((pool, pg, bucket, key, version)) = parse_entry_key(k.as_bytes()) else {
-                continue;
-            };
-            let Ok(mut e) = PgEntry::decode(v.as_slice()) else {
-                continue;
-            };
-            e.bucket = bucket;
-            e.key = key;
-            e.version_id = version;
-            sums.entry((pool, pg)).or_default().add(&e);
+        let mut add = |k: &[u8], v: &[u8]| {
+            if let (Some((pool, pg, bucket, key, version)), Ok(mut e)) =
+                (parse_entry_key(k), PgEntry::decode(v))
+            {
+                e.bucket = bucket;
+                e.key = key;
+                e.version_id = version;
+                sums.entry((pool, pg)).or_default().add(&e);
+            }
+            true
+        };
+        let prefix = MetadataKey::from_bytes(PREFIX.to_vec());
+        match snapshot {
+            Some(snap) => snap.scan(&prefix, &mut add),
+            None => self.inner.for_each_prefix(&prefix, None, &mut add),
         }
-        *self.summaries.lock() = sums;
+        let mut s = self.summaries.lock();
+        if let Some((added, removed)) = s.counting.take() {
+            let pgs: std::collections::HashSet<&PgId> =
+                added.keys().chain(removed.keys()).collect();
+            let none = Summary::default();
+            for pg in pgs {
+                let sum = sums.entry(pg.clone()).or_default();
+                sum.merge(
+                    added.get(pg).unwrap_or(&none),
+                    removed.get(pg).unwrap_or(&none),
+                );
+                if sum.is_empty() {
+                    sums.remove(pg);
+                }
+            }
+        }
+        s.live = sums;
+    }
+
+    /// Whether the summaries are still being counted ([`Self::open_to_count`]).
+    #[must_use]
+    pub fn counting(&self) -> bool {
+        self.summaries.lock().counting.is_some()
     }
 
     /// Placement group `pg`'s summary on this OSD (empty if it holds none).
     #[must_use]
     pub fn summary(&self, pg: &PgId) -> Summary {
-        self.summaries.lock().get(pg).cloned().unwrap_or_default()
+        self.summaries
+            .lock()
+            .live
+            .get(pg)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Up to `limit` of `pg`'s entries, in key order (a key's own entry,
@@ -558,7 +626,7 @@ impl PgIndexed {
     /// The placement groups this OSD holds entries of, and how many.
     #[must_use]
     pub fn pg_count(&self) -> usize {
-        self.summaries.lock().len()
+        self.summaries.lock().live.len()
     }
 
     fn lock_of(bucket: &str, key: &str) -> usize {
@@ -681,7 +749,20 @@ impl MetaIndex for PgIndexed {
         let mut ops = ops;
         ops.extend(index_ops);
         self.inner.write(ops)?;
-        let mut sums = self.summaries.lock();
+        let mut s = self.summaries.lock();
+        let s = &mut *s;
+        if let Some((added, removed)) = &mut s.counting {
+            for (before, after) in deltas {
+                if let Some(b) = before {
+                    removed.entry(b.pg).or_default().add(&b.entry);
+                }
+                if let Some(a) = after {
+                    added.entry(a.pg).or_default().add(&a.entry);
+                }
+            }
+            return Ok(());
+        }
+        let sums = &mut s.live;
         for (before, after) in deltas {
             if let Some(b) = before
                 && let Some(s) = sums.get_mut(&b.pg)
@@ -705,6 +786,10 @@ impl MetaIndex for PgIndexed {
         f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
     ) {
         self.inner.for_each_prefix(prefix, after, f);
+    }
+
+    fn snapshot(&self) -> Option<Arc<dyn MetaSnapshot>> {
+        self.inner.snapshot()
     }
 
     fn len(&self) -> u64 {
@@ -859,6 +944,83 @@ mod tests {
         assert_eq!(ix.summary(&pg), before);
         assert_eq!(before.objects, 49);
         assert_eq!(before.named_here, 25); // even keys name this OSD; k7 is odd
+    }
+
+    #[test]
+    fn summaries_counted_from_a_snapshot_beside_writes_equal_a_full_count() {
+        // objectio-docs `core/osd-start.md`: the start's count walks a
+        // snapshot while writes go on; with the writes made meanwhile folded
+        // in, each PG's summary must be what counting everything gives.
+        let d = tempfile::tempdir().unwrap();
+        let inner =
+            objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(d.path())).unwrap();
+        {
+            let ix = PgIndexed::open(Arc::clone(&inner), ME).unwrap();
+            for i in 0..400 {
+                put(
+                    &ix,
+                    &object(&format!("k{i}"), 100 + i, (i % 5) as u32, i % 3 != 0),
+                );
+            }
+            for i in (0..400).step_by(7) {
+                delete(&ix, &format!("k{i}"), 1_000 + i, (i % 5) as u32);
+            }
+        }
+        let ix = Arc::new(PgIndexed::open_to_count(Arc::clone(&inner), ME).unwrap());
+        let snap = ix.snapshot().unwrap();
+        assert!(ix.counting());
+
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let writer = {
+            let (ix, started) = (Arc::clone(&ix), Arc::clone(&started));
+            std::thread::spawn(move || {
+                let mut r = 0x2545_f491_4f6c_dd1du64;
+                for n in 0..2_000u64 {
+                    if n == 200 {
+                        started.wait();
+                    }
+                    r ^= r << 13;
+                    r ^= r >> 7;
+                    r ^= r << 17;
+                    let i = r % 600;
+                    let pg = ((r >> 20) % 6) as u32;
+                    let stamp = 10_000 + n;
+                    match (r >> 40) % 4 {
+                        0 => delete(&ix, &format!("k{i}"), stamp, pg),
+                        // An overwrite, possibly into another PG.
+                        _ => put(
+                            &ix,
+                            &object(&format!("k{i}"), stamp, pg, r.is_multiple_of(2)),
+                        ),
+                    }
+                }
+            })
+        };
+        started.wait();
+        ix.count(Some(&*snap));
+        assert!(!ix.counting());
+        writer.join().unwrap();
+
+        let full = PgIndexed::open(Arc::clone(&inner), ME).unwrap();
+        for pg in 0..6 {
+            let pg = ("p".to_string(), pg);
+            let (got, want) = (ix.summary(&pg), full.summary(&pg));
+            // The highest stamp is the highest written: it stays when that
+            // entry leaves, where a count from scratch no longer sees it.
+            assert!(got.max_stamp >= want.max_stamp, "{pg:?}");
+            assert_eq!(
+                Summary {
+                    max_stamp: 0,
+                    ..got
+                },
+                Summary {
+                    max_stamp: 0,
+                    ..want
+                },
+                "{pg:?}"
+            );
+        }
+        assert!(full.summary(&("p".to_string(), 0)).objects > 0);
     }
 
     #[test]
