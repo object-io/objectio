@@ -26,6 +26,9 @@ fn storage_err<E: Into<redb::Error>>(what: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::Storage(format!("metadata index: {what}: {}", e.into()))
 }
 
+/// An entry of a memtable: its key and value, `None` for a delete.
+type Change = (Vec<u8>, Option<Vec<u8>>);
+
 /// Changes not yet in the file; `None` is a delete.
 #[derive(Default)]
 struct Memtable {
@@ -40,15 +43,97 @@ impl Memtable {
         self.bytes.fetch_add(size, Ordering::Relaxed);
     }
 
-    /// The entries under `prefix` after `after`, as they are now.
-    fn range(&self, prefix: &[u8], after: Option<&[u8]>) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    /// Up to `limit` of the entries under `prefix` after `after`, as they
+    /// are now; and whether they are all of them.
+    fn range(&self, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> (Vec<Change>, bool) {
         let start = after.map_or(Bound::Included(prefix), Bound::Excluded);
-        self.map
-            .read()
+        let map = self.map.read();
+        let mut range = map
             .range::<[u8], _>((start, Bound::Unbounded))
-            .take_while(|(k, _)| k.starts_with(prefix))
+            .take_while(|(k, _)| k.starts_with(prefix));
+        let out: Vec<_> = range
+            .by_ref()
+            .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+        let all = out.len() < limit || range.next().is_none();
+        (out, all)
+    }
+}
+
+/// The memtables' entries under a prefix, in key order, the active one's
+/// over the frozen one's, copied a window at a time. A scan reads them
+/// beside the file; copying the whole range up front cost each call the
+/// memtables' share of everything after its start, so a large prefix read
+/// a page per call (`iter_prefix`) cost pages × memtable: 16 s to read the
+/// object metadata of an OSD of a million shards at start, with the WAL's
+/// tail in the memtable.
+struct Overlay<'a> {
+    /// Frozen first, then active: a later one's entry replaces an earlier's.
+    tables: Vec<Arc<Memtable>>,
+    prefix: &'a [u8],
+    /// Where the next window starts (after this key).
+    after: Option<Vec<u8>>,
+    window: std::vec::IntoIter<Change>,
+    /// Every entry has been in a window.
+    done: bool,
+}
+
+impl<'a> Overlay<'a> {
+    const WINDOW: usize = 1024;
+
+    fn new(tables: Vec<Arc<Memtable>>, prefix: &'a [u8], after: Option<&[u8]>) -> Self {
+        Self {
+            tables,
+            prefix,
+            after: after.map(<[u8]>::to_vec),
+            window: Vec::new().into_iter(),
+            done: false,
+        }
+    }
+
+    /// The next window: each memtable's next entries, up to the first key
+    /// past which one of them was cut short (each holds all of its own
+    /// entries up to there).
+    fn fill(&mut self) {
+        let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        let mut upto: Option<Vec<u8>> = None;
+        for t in &self.tables {
+            let (entries, all) = t.range(self.prefix, self.after.as_deref(), Self::WINDOW);
+            if !all
+                && let Some((last, _)) = entries.last()
+                && upto.as_ref().is_none_or(|u| last < u)
+            {
+                upto = Some(last.clone());
+            }
+            merged.extend(entries);
+        }
+        if let Some(upto) = &upto {
+            // Keep the keys through `upto`; the rest come in a later window.
+            let mut later = merged.split_off(upto);
+            if let Some(v) = later.remove(upto) {
+                merged.insert(upto.clone(), v);
+            }
+        }
+        self.done = upto.is_none();
+        self.after = upto;
+        self.window = merged.into_iter().collect::<Vec<_>>().into_iter();
+    }
+}
+
+impl Iterator for Overlay<'_> {
+    type Item = Change;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(e) = self.window.next() {
+                return Some(e);
+            }
+            if self.done {
+                return None;
+            }
+            self.fill();
+        }
     }
 }
 
@@ -171,7 +256,8 @@ impl DiskIndex {
 
     /// Call `f` on each entry under `prefix`, in key order, starting after
     /// `after` (or at the prefix), until `f` returns false. Memory stays at
-    /// the memtables' share of the range, whatever the size of the range.
+    /// a window of the memtables ([`Overlay`]), whatever the size of the
+    /// range.
     pub fn for_each_prefix(
         &self,
         prefix: &[u8],
@@ -179,11 +265,7 @@ impl DiskIndex {
         mut f: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<()> {
         let (active, frozen) = self.memtables();
-        let mut overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        if let Some(frozen) = &frozen {
-            overlay.extend(frozen.range(prefix, after));
-        }
-        overlay.extend(active.range(prefix, after));
+        let overlay = Overlay::new(frozen.into_iter().chain([active]).collect(), prefix, after);
 
         let tx = self.db.begin_read().map_err(storage_err("scan"))?;
         let entries = tx.open_table(ENTRIES).map_err(storage_err("scan"))?;
@@ -401,6 +483,62 @@ mod tests {
             first,
             vec![b"k000".to_vec(), b"k001".to_vec(), b"k002".to_vec()]
         );
+    }
+
+    #[test]
+    fn scans_across_many_memtable_windows_match_a_model() {
+        // File, frozen and active memtables each hold several windows of
+        // one prefix, interleaved, with deletes and replacements in each.
+        let dir = tempdir().unwrap();
+        let idx = open(dir.path());
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let k = |i: u32| format!("k{i:06}").into_bytes();
+        let n = 5 * Overlay::WINDOW as u32;
+        for i in (0..n).filter(|i| i % 3 == 0) {
+            idx.put(k(i), b"file".to_vec());
+            model.insert(k(i), b"file".to_vec());
+        }
+        assert!(idx.freeze());
+        idx.flush_frozen(1).unwrap();
+        for i in (0..n).filter(|i| i % 3 == 1 || i % 7 == 0) {
+            if i % 5 == 0 {
+                idx.delete(k(i));
+                model.remove(&k(i));
+            } else {
+                idx.put(k(i), b"frozen".to_vec());
+                model.insert(k(i), b"frozen".to_vec());
+            }
+        }
+        assert!(idx.freeze());
+        // The active memtable: few keys early in the prefix, many late.
+        for i in (0..n).filter(|i| (i % 3 == 2 && *i > n / 2) || i % 11 == 0) {
+            if i % 4 == 0 {
+                idx.delete(k(i));
+                model.remove(&k(i));
+            } else {
+                idx.put(k(i), b"active".to_vec());
+                model.insert(k(i), b"active".to_vec());
+            }
+        }
+        idx.put(b"l".to_vec(), vec![1]);
+
+        let scan = |after: Option<&[u8]>| {
+            let mut out = Vec::new();
+            idx.for_each_prefix(b"k", after, |k, v| {
+                out.push((k.to_vec(), v.to_vec()));
+                true
+            })
+            .unwrap();
+            out
+        };
+        let all: Vec<_> = model.clone().into_iter().collect();
+        assert_eq!(scan(None), all);
+        let after = k(n / 3);
+        let rest: Vec<_> = model
+            .range::<Vec<u8>, _>((Bound::Excluded(after.clone()), Bound::Unbounded))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(scan(Some(&after)), rest);
     }
 
     #[test]
