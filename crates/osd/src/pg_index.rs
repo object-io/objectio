@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use objectio_common::Result;
 use objectio_proto::metadata::{ObjectMeta, StripeMeta};
@@ -421,7 +421,7 @@ impl PgIndexed {
     /// The index could not be written.
     pub fn open(inner: Arc<dyn MetaIndex>, node_id: [u8; 16]) -> Result<Self> {
         let me = Self::open_to_count(inner, node_id)?;
-        me.count(None);
+        me.count(None, &AtomicBool::new(false));
         Ok(me)
     }
 
@@ -524,8 +524,9 @@ impl PgIndexed {
 
     /// Count every PG's summary from `snapshot` (the index itself if
     /// `None`: only while nothing writes), fold in the writes made since,
-    /// and end counting.
-    pub fn count(&self, snapshot: Option<&dyn MetaSnapshot>) {
+    /// and end counting. Set `stop` to give up (the OSD is going away):
+    /// it then stays counting.
+    pub fn count(&self, snapshot: Option<&dyn MetaSnapshot>, stop: &AtomicBool) {
         let mut sums: HashMap<PgId, Summary> = HashMap::new();
         let mut add = |k: &[u8], v: &[u8]| {
             if let (Some((pool, pg, bucket, key, version)), Ok(mut e)) =
@@ -536,12 +537,15 @@ impl PgIndexed {
                 e.version_id = version;
                 sums.entry((pool, pg)).or_default().add(&e);
             }
-            true
+            !stop.load(Ordering::Relaxed)
         };
         let prefix = MetadataKey::from_bytes(PREFIX.to_vec());
         match snapshot {
             Some(snap) => snap.scan(&prefix, &mut add),
             None => self.inner.for_each_prefix(&prefix, None, &mut add),
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
         let mut s = self.summaries.lock();
         if let Some((added, removed)) = s.counting.take() {
@@ -997,7 +1001,7 @@ mod tests {
             })
         };
         started.wait();
-        ix.count(Some(&*snap));
+        ix.count(Some(&*snap), &AtomicBool::new(false));
         assert!(!ix.counting());
         writer.join().unwrap();
 

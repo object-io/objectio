@@ -233,6 +233,9 @@ pub struct OsdService {
     usage: Arc<UsageTracker>,
     /// True once bucket usage is counted after the start (B32).
     usage_counted: tokio::sync::watch::Receiver<bool>,
+    /// The count after the start; stopped and waited for when the OSD is
+    /// dropped, so the store is closed with it.
+    _counter: Counter,
     /// The last count of objects at risk, for `GetStatus` (B28: it was a
     /// scan of every ObjectMeta on every poll, from every gateway).
     safety: SafetyCache,
@@ -346,7 +349,7 @@ impl OsdService {
         // nothing is allocated over a live shard.
         let shards: Arc<dyn ShardStore> =
             Arc::new(BlockStore::new(disks, Arc::clone(&meta_store), meta_dir));
-        let usage_counted = count_after_start(&pg_index, &usage, snapshot);
+        let (usage_counted, counter) = count_after_start(&pg_index, &usage, snapshot);
 
         Ok(Self {
             node_id,
@@ -356,6 +359,7 @@ impl OsdService {
             grpc_metrics: Arc::new(GrpcMetrics::default()),
             usage,
             usage_counted,
+            _counter: counter,
             safety: SafetyCache::default(),
             metrics_renderer: std::sync::OnceLock::new(),
             scrub: ScrubStats::default(),
@@ -2514,15 +2518,19 @@ fn count_after_start(
     pg_index: &Arc<crate::pg_index::PgIndexed>,
     usage: &Arc<UsageTracker>,
     snapshot: Option<Arc<dyn objectio_storage::metadata::MetaSnapshot>>,
-) -> tokio::sync::watch::Receiver<bool> {
+) -> (tokio::sync::watch::Receiver<bool>, Counter) {
     let (done, counted) = tokio::sync::watch::channel(false);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let count = {
-        let (pg_index, usage) = (Arc::clone(pg_index), Arc::clone(usage));
+        let (pg_index, usage, stop) = (Arc::clone(pg_index), Arc::clone(usage), Arc::clone(&stop));
         move |snapshot: &dyn objectio_storage::metadata::MetaSnapshot| {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let started = Instant::now();
-                    pg_index.count(Some(snapshot));
+                    pg_index.count(Some(snapshot), &stop);
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     info!(
                         "Counted the summaries of {} placement groups in {:?}",
                         pg_index.pg_count(),
@@ -2530,7 +2538,10 @@ fn count_after_start(
                     );
                 });
                 let started = Instant::now();
-                usage.count(snapshot);
+                usage.count(snapshot, &stop);
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 info!(
                     "Counted the usage of {} buckets in {:?}",
                     usage.snapshot().len(),
@@ -2540,16 +2551,35 @@ fn count_after_start(
             });
         }
     };
-    match snapshot {
-        Some(snapshot) => {
+    let thread = match snapshot {
+        Some(snapshot) => Some(
             std::thread::Builder::new()
                 .name("osd-count".into())
                 .spawn(move || count(&*snapshot))
-                .expect("spawn the count after start");
+                .expect("spawn the count after start"),
+        ),
+        None => {
+            count(&Live(Arc::clone(pg_index) as Arc<dyn MetaIndex>));
+            None
         }
-        None => count(&Live(Arc::clone(pg_index) as Arc<dyn MetaIndex>)),
+    };
+    (counted, Counter { stop, thread })
+}
+
+/// The count after the start. Dropped with the OSD: it stops and is waited
+/// for, so nothing holds the store (and its file lock) once the OSD is gone.
+struct Counter {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
-    counted
 }
 
 /// The index itself, read as a snapshot: only while nothing writes.
@@ -2693,6 +2723,44 @@ mod grpc_write_tests {
             dir.path().join("state"),
         )
         .unwrap()
+    }
+
+    /// The count after a start holds the metadata store while it runs: an
+    /// OSD dropped meanwhile stops it and waits, so the store is closed and
+    /// the OSD opens again at once (CI: "Database already open").
+    #[tokio::test]
+    async fn an_osd_dropped_while_it_counts_opens_again_at_once() {
+        let (dir, osd) = osd();
+        let o = objectio_proto::metadata::ObjectMeta {
+            size: 1,
+            stripes: vec![objectio_proto::metadata::StripeMeta::default()],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for batch in 0..10 {
+            osd.meta_store
+                .batch_put(
+                    (0..10_000)
+                        .map(|i| {
+                            (
+                                MetadataKey::object_meta("b", &format!("k{batch}-{i}")),
+                                o.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+                .unwrap();
+        }
+        drop(osd);
+        for _ in 0..3 {
+            let osd = reopen(&dir);
+            assert!(osd.usage.counting(), "counted before the reopen returned");
+            drop(osd);
+        }
+        let osd = reopen(&dir);
+        while osd.usage.counting() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// An acknowledgement means the shard survives a restart, so a shard

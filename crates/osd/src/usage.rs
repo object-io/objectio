@@ -20,6 +20,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Which of the two ObjectMeta key spaces an entry lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,8 +346,9 @@ impl UsageTracker {
     }
 
     /// Count every bucket from `snapshot`, taken when counting started,
-    /// fold in the writes made since, and end counting.
-    pub fn count(&self, snapshot: &dyn MetaSnapshot) {
+    /// fold in the writes made since, and end counting. Set `stop` to give
+    /// up (the OSD is going away): it then stays counting.
+    pub fn count(&self, snapshot: &dyn MetaSnapshot, stop: &AtomicBool) {
         let mut fresh: HashMap<String, Counters> = HashMap::new();
         for prefix in [
             MetadataKey::all_object_meta_prefix(),
@@ -354,8 +356,11 @@ impl UsageTracker {
         ] {
             snapshot.scan(&prefix, &mut |k, v| {
                 self.count_entry(&mut fresh, k, v);
-                true
+                !stop.load(Ordering::Relaxed)
             });
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
         }
         let mut b = self.buckets.write();
         if let Some((added, removed)) = b.counting.take() {
@@ -793,7 +798,7 @@ mod tests {
                 })
             };
             started.wait();
-            t.count(&*snap);
+            t.count(&*snap, &AtomicBool::new(false));
             assert!(!t.counting());
             writer.join().unwrap();
         });
