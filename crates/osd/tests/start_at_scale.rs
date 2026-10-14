@@ -427,8 +427,9 @@ async fn an_osd_of_many_shards_serves_in_seconds_after_a_power_cut() {
             }
             std::fs::write(&count, want.to_string()).unwrap();
             println!(
-                "grew to {want} shards in {:.0?}; exiting without a clean shutdown",
-                started.elapsed()
+                "grew to {want} shards in {:.0?}; exiting without a clean shutdown; {}",
+                started.elapsed(),
+                peak_rss()
             );
             // As a power cut would leave it: no drop, no checkpoint.
             std::process::exit(0);
