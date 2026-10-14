@@ -95,10 +95,8 @@ fn fatal(e: &Error) -> ! {
 pub struct StoreSnapshot(super::disk_index::Snapshot);
 
 impl super::index::MetaSnapshot for StoreSnapshot {
-    fn scan(&self, prefix: &MetadataKey, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
-        self.0
-            .for_each_prefix(&prefix.0, f)
-            .unwrap_or_else(|e| fatal(&e));
+    fn scan(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.0.for_each(f).unwrap_or_else(|e| fatal(&e));
     }
 }
 
@@ -375,8 +373,12 @@ impl MetadataStore {
     /// The index as it is now ([`MetaIndex::snapshot`]).
     ///
     /// [`MetaIndex::snapshot`]: super::MetaIndex::snapshot
-    pub fn snapshot(&self) -> StoreSnapshot {
-        StoreSnapshot(self.index.snapshot().unwrap_or_else(|e| fatal(&e)))
+    pub fn snapshot(&self, from: &[u8], below: &[u8]) -> StoreSnapshot {
+        StoreSnapshot(
+            self.index
+                .snapshot(from, below)
+                .unwrap_or_else(|e| fatal(&e)),
+        )
     }
 
     /// Call `f` on each entry under `prefix` in key order, from after

@@ -307,35 +307,37 @@ impl DiskIndex {
         }
     }
 
-    /// The index as it is now, for reading while writes go on: the file
-    /// through a read transaction (redb keeps what it sees), the memtables
-    /// copied. Taken with the memtables locked, so no change is half in.
+    /// The entries in `[from, below)` as they are now, for reading while
+    /// writes go on: the file through a read transaction (redb keeps what
+    /// it sees until the snapshot is dropped, so keep it briefly: pages
+    /// rewritten meanwhile can't be reused), the memtables' share of the
+    /// range copied. Taken with the memtables locked, so no change is half
+    /// in.
     ///
     /// # Errors
     /// The file could not be read.
-    pub fn snapshot(&self) -> Result<Snapshot> {
+    pub fn snapshot(&self, from: &[u8], below: &[u8]) -> Result<Snapshot> {
+        let range = (Bound::Included(from), Bound::Excluded(below));
         let t = self.tables.write();
         let mut mem: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        if let Some(frozen) = &t.frozen {
+        for table in t.frozen.iter().chain(std::iter::once(&t.active)) {
             mem.extend(
-                frozen
+                table
                     .map
                     .read()
-                    .iter()
+                    .range::<[u8], _>(range)
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
-        mem.extend(
-            t.active
-                .map
-                .read()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone())),
-        );
         let tx = self.db.begin_read().map_err(storage_err("snapshot"))?;
         let entries = tx.open_table(ENTRIES).map_err(storage_err("snapshot"))?;
         drop(t);
-        Ok(Snapshot { entries, mem })
+        Ok(Snapshot {
+            entries,
+            mem,
+            from: from.to_vec(),
+            below: below.to_vec(),
+        })
     }
 
     /// Every entry under `prefix`, collected: for prefixes known to be small.
@@ -430,36 +432,32 @@ impl DiskIndex {
     }
 }
 
-/// [`DiskIndex::snapshot`]: the file as a read transaction saw it, and the
-/// memtables as they were.
+/// [`DiskIndex::snapshot`]: the range as a read transaction saw the file,
+/// and as the memtables held it.
 pub struct Snapshot {
     entries: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
     mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    from: Vec<u8>,
+    below: Vec<u8>,
 }
 
 impl Snapshot {
-    /// Call `f` on each entry under `prefix` in key order, until it returns
+    /// Call `f` on each entry of the range in key order, until it returns
     /// false.
     ///
     /// # Errors
     /// The file could not be read.
-    pub fn for_each_prefix(
-        &self,
-        prefix: &[u8],
-        mut f: impl FnMut(&[u8], &[u8]) -> bool,
-    ) -> Result<()> {
+    pub fn for_each(&self, mut f: impl FnMut(&[u8], &[u8]) -> bool) -> Result<()> {
         let mut file = self
             .entries
-            .range::<&[u8]>((Bound::Included(prefix), Bound::Unbounded))
+            .range::<&[u8]>((
+                Bound::Included(self.from.as_slice()),
+                Bound::Excluded(self.below.as_slice()),
+            ))
             .map_err(storage_err("scan"))?
             .map_while(|r| r.ok())
-            .take_while(|(k, _)| k.value().starts_with(prefix))
             .peekable();
-        let mut mem = self
-            .mem
-            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-            .take_while(|(k, _)| k.starts_with(prefix))
-            .peekable();
+        let mut mem = self.mem.iter().peekable();
         loop {
             let take_mem = match (file.peek(), mem.peek()) {
                 (None, None) => return Ok(()),
@@ -633,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_sees_the_index_as_it_was_through_checkpoints() {
+    fn a_snapshot_sees_its_range_as_it_was_through_checkpoints() {
         let dir = tempdir().unwrap();
         let idx = open(dir.path());
         let k = |i: u32| format!("k{i:04}").into_bytes();
@@ -650,7 +648,9 @@ mod tests {
             idx.put(k(i), b"active".to_vec());
         }
         idx.delete(k(10));
-        let snap = idx.snapshot().unwrap();
+        idx.put(b"j".to_vec(), b"outside".to_vec());
+        idx.put(b"l".to_vec(), b"outside".to_vec());
+        let snap = idx.snapshot(b"k", b"l").unwrap();
         let expect = |i: u32| -> Option<&[u8]> {
             match i {
                 10 => None,
@@ -674,7 +674,7 @@ mod tests {
         idx.flush_frozen(3).unwrap();
 
         let mut got = Vec::new();
-        snap.for_each_prefix(b"k", |k, v| {
+        snap.for_each(|k, v| {
             got.push((k.to_vec(), v.to_vec()));
             true
         })

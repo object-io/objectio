@@ -25,12 +25,12 @@ use super::types::{MetadataKey, MetadataOp};
 
 /// The OSD's metadata key-value store. See the module documentation for
 /// what an implementation guarantees.
-/// [`MetaIndex::snapshot`]: the index as it was, for one reader to walk
-/// while writes go on.
+/// [`MetaIndex::snapshot`]: a range of the index as it was, for one reader
+/// to walk while writes go on.
 pub trait MetaSnapshot: Send + Sync {
-    /// Call `f` on each entry under `prefix` in key order, as it was when
+    /// Call `f` on each entry of the range in key order, as it was when
     /// the snapshot was taken, until `f` returns false.
-    fn scan(&self, prefix: &MetadataKey, f: &mut dyn FnMut(&[u8], &[u8]) -> bool);
+    fn scan(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> bool);
 }
 
 pub trait MetaIndex: Send + Sync {
@@ -55,10 +55,13 @@ pub trait MetaIndex: Send + Sync {
         f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
     );
 
-    /// The index as it is now, read later while writes go on (B32: an OSD
-    /// counts what it holds after it starts serving). `None` from an
-    /// engine that can't keep one for another thread.
-    fn snapshot(&self) -> Option<Arc<dyn MetaSnapshot>> {
+    /// The keys in `[from, below)` as they are now, read later while
+    /// writes go on (B32: an OSD counts what it holds after it starts
+    /// serving, a range at a time). Hold it briefly: the engine may keep
+    /// what it sees from being reclaimed. `None` from an engine that can't
+    /// keep one for another thread.
+    fn snapshot(&self, from: &[u8], below: &[u8]) -> Option<Arc<dyn MetaSnapshot>> {
+        let _ = (from, below);
         None
     }
 
@@ -207,8 +210,8 @@ impl MetaIndex for MetadataStore {
         Self::get(self, key)
     }
 
-    fn snapshot(&self) -> Option<Arc<dyn MetaSnapshot>> {
-        Some(Arc::new(Self::snapshot(self)))
+    fn snapshot(&self, from: &[u8], below: &[u8]) -> Option<Arc<dyn MetaSnapshot>> {
+        Some(Arc::new(Self::snapshot(self, from, below)))
     }
 
     fn write(&self, ops: Vec<MetadataOp>) -> Result<()> {

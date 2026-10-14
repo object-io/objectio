@@ -15,12 +15,12 @@
 
 use objectio_proto::metadata::ObjectMeta;
 use objectio_proto::storage::{BucketUsage, ObjectSafety};
-use objectio_storage::metadata::{MetaSnapshot, MetadataKey};
+use objectio_storage::metadata::{MetaIndex, MetaSnapshot, MetadataKey};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// Which of the two ObjectMeta key spaces an entry lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,14 +178,39 @@ fn worst_stripe(o: &ObjectMeta, up: &HashSet<Vec<u8>>) -> Option<StripeHealth> {
 /// rarely wait on each other.
 const KEY_LOCKS: usize = 256;
 
-/// Usage per bucket. While an OSD that has started counts it from a
-/// snapshot (objectio-docs `core/osd-start.md`), writes go to the changes
-/// since the snapshot instead, folded in when the count is done.
+/// Usage per bucket. While an OSD that has started counts it
+/// ([`crate::count`]), a write below the count's fence goes to the changes
+/// kept aside, folded in when the count is done.
 #[derive(Default)]
 struct Buckets {
     live: HashMap<String, Counters>,
-    /// While counting: what writes put in and took out, per bucket.
-    counting: Option<(HashMap<String, Counters>, HashMap<String, Counters>)>,
+    counting: Option<Counting>,
+}
+
+/// A count under way: what writes put in and took out below its fence,
+/// per bucket.
+#[derive(Default)]
+struct Counting {
+    added: HashMap<String, Counters>,
+    removed: HashMap<String, Counters>,
+    below: Vec<u8>,
+}
+
+impl crate::count::Fence for UsageTracker {
+    fn advance(
+        &self,
+        below: &[u8],
+        snapshot: &mut dyn FnMut() -> Option<std::sync::Arc<dyn MetaSnapshot>>,
+    ) -> Option<std::sync::Arc<dyn MetaSnapshot>> {
+        // Every write of an entry holds its key's lock from reading the old
+        // entry through `apply`.
+        let _all: Vec<_> = self.key_locks.iter().map(|l| l.lock()).collect();
+        let snap = snapshot();
+        if let Some(c) = &mut self.buckets.write().counting {
+            c.below = below.to_vec();
+        }
+        snap
+    }
 }
 
 pub struct UsageTracker {
@@ -254,13 +279,16 @@ impl UsageTracker {
         }
     }
 
-    /// Account for `old` being replaced by `new` under one key. Either may
-    /// be `None` (a create or a delete). Entries this OSD is not primary
-    /// for are ignored on both sides, so an object whose primary moved
-    /// away stops being counted here.
+    /// Account for `old` being replaced by `new` in `entry`, an entry of
+    /// `bucket` (its `m:` or `v:` key, as stored). Either may be `None` (a
+    /// create or a delete). Entries this OSD is not primary for are
+    /// ignored on both sides, so an object whose primary moved away stops
+    /// being counted here. Call it holding [`Self::lock_key`] from reading
+    /// the old entry through writing the new one.
     pub fn apply(
         &self,
         bucket: &str,
+        entry: &MetadataKey,
         kind: EntryKind,
         old: Option<&ObjectMeta>,
         new: Option<&ObjectMeta>,
@@ -274,17 +302,20 @@ impl UsageTracker {
 
         let mut b = self.buckets.write();
         let b = &mut *b;
-        if let Some((added, removed)) = &mut b.counting {
-            if let Some(o) = old {
+        if let Some(c) = &mut b.counting {
+            // Below the fence the count has read the entry as it was: the
+            // change is kept aside. Past it, a later chunk reads it as it is.
+            let below = entry.as_bytes() < c.below.as_slice();
+            if let Some(o) = old.filter(|_| below) {
                 Self::adjust(
-                    removed.entry(bucket.to_string()).or_default(),
+                    c.removed.entry(bucket.to_string()).or_default(),
                     kind,
                     o,
                     true,
                 );
             }
-            let a = added.entry(bucket.to_string()).or_default();
-            if let Some(o) = new {
+            let a = c.added.entry(bucket.to_string()).or_default();
+            if let Some(o) = new.filter(|_| below) {
                 Self::adjust(a, kind, o, true);
             }
             a.last_modified = a
@@ -342,37 +373,44 @@ impl UsageTracker {
     pub fn start_counting(&self) {
         let mut b = self.buckets.write();
         b.live.clear();
-        b.counting = Some(Default::default());
+        b.counting = Some(Counting::default());
     }
 
-    /// Count every bucket from `snapshot`, taken when counting started,
-    /// fold in the writes made since, and end counting. Set `stop` to give
-    /// up (the OSD is going away): it then stays counting.
-    pub fn count(&self, snapshot: &dyn MetaSnapshot, stop: &AtomicBool) {
+    /// Count every bucket from `index`, a chunk at a time while writes go
+    /// on ([`crate::count`]), fold in the writes made meanwhile, and end
+    /// counting. Set `stop` to give up (the OSD is going away): it then
+    /// stays counting.
+    pub fn count(&self, index: &dyn MetaIndex, stop: &AtomicBool) {
+        self.count_in_chunks(index, crate::count::CHUNK, stop);
+    }
+
+    fn count_in_chunks(&self, index: &dyn MetaIndex, chunk: usize, stop: &AtomicBool) {
         let mut fresh: HashMap<String, Counters> = HashMap::new();
-        for prefix in [
-            MetadataKey::all_object_meta_prefix(),
-            MetadataKey::from_bytes(vec![b'v']),
-        ] {
-            snapshot.scan(&prefix, &mut |k, v| {
-                self.count_entry(&mut fresh, k, v);
-                !stop.load(Ordering::Relaxed)
-            });
-        }
-        if stop.load(Ordering::Relaxed) {
+        let counted = crate::count::walk(
+            index,
+            &[
+                MetadataKey::all_object_meta_prefix(),
+                MetadataKey::from_bytes(vec![b'v']),
+            ],
+            chunk,
+            self,
+            stop,
+            &mut |k, v| self.count_entry(&mut fresh, k, v),
+        );
+        if !counted {
             return;
         }
         let mut b = self.buckets.write();
-        if let Some((added, removed)) = b.counting.take() {
+        if let Some(c) = b.counting.take() {
             let none = Counters::default();
-            let names: HashSet<&String> = added.keys().chain(removed.keys()).collect();
+            let names: HashSet<&String> = c.added.keys().chain(c.removed.keys()).collect();
             for name in names {
-                let c = fresh.entry(name.clone()).or_default();
-                c.merge(
-                    added.get(name).unwrap_or(&none),
-                    removed.get(name).unwrap_or(&none),
+                let n = fresh.entry(name.clone()).or_default();
+                n.merge(
+                    c.added.get(name).unwrap_or(&none),
+                    c.removed.get(name).unwrap_or(&none),
                 );
-                if c.is_empty() && c.last_modified == 0 {
+                if n.is_empty() && n.last_modified == 0 {
                     fresh.remove(name);
                 }
             }
@@ -532,9 +570,21 @@ mod tests {
     #[test]
     fn only_the_primary_counts_an_object() {
         let t = UsageTracker::new(ME);
-        t.apply("b", EntryKind::Current, None, Some(&obj(100, OTHER, "", 1)));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&obj(100, OTHER, "", 1)),
+        );
         assert!(t.snapshot().is_empty());
-        t.apply("b", EntryKind::Current, None, Some(&obj(100, ME, "", 1)));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&obj(100, ME, "", 1)),
+        );
         assert_eq!(only(&t).objects, 1);
     }
 
@@ -546,13 +596,25 @@ mod tests {
         let t = UsageTracker::new(ME);
         let mut o = obj(100, OTHER, "", 1);
         o.usage_owner = ME.to_vec();
-        t.apply("b", EntryKind::Current, None, Some(&o));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&o),
+        );
         assert_eq!(only(&t).objects, 1);
 
         let t = UsageTracker::new(ME);
         let mut o = obj(100, ME, "", 1);
         o.usage_owner = OTHER.to_vec();
-        t.apply("b", EntryKind::Current, None, Some(&o));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&o),
+        );
         assert!(t.snapshot().is_empty());
     }
 
@@ -561,8 +623,20 @@ mod tests {
         let t = UsageTracker::new(ME);
         let v1 = obj(100, ME, "", 1);
         let v2 = obj(40, ME, "", 2);
-        t.apply("b", EntryKind::Current, None, Some(&v1));
-        t.apply("b", EntryKind::Current, Some(&v1), Some(&v2));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&v1),
+        );
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            Some(&v1),
+            Some(&v2),
+        );
         let u = only(&t);
         assert_eq!((u.objects, u.logical_bytes, u.last_modified), (1, 40, 2));
     }
@@ -571,8 +645,20 @@ mod tests {
     fn delete_returns_counts_to_zero() {
         let t = UsageTracker::new(ME);
         let o = obj(100, ME, "", 1);
-        t.apply("b", EntryKind::Current, None, Some(&o));
-        t.apply("b", EntryKind::Current, Some(&o), None);
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&o),
+        );
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            Some(&o),
+            None,
+        );
         let u = only(&t);
         assert_eq!((u.objects, u.logical_bytes, u.stored_bytes), (0, 0, 0));
     }
@@ -586,8 +672,20 @@ mod tests {
         let a = obj(100, ME, "va", 1);
         let b = obj(40, ME, "vb", 2);
         for (old, new) in [(None, &a), (Some(&a), &b)] {
-            t.apply("b", EntryKind::Current, old, Some(new));
-            t.apply("b", EntryKind::Version, None, Some(new));
+            t.apply(
+                "b",
+                &MetadataKey::object_meta("b", "k"),
+                EntryKind::Current,
+                old,
+                Some(new),
+            );
+            t.apply(
+                "b",
+                &MetadataKey::object_meta("b", "k"),
+                EntryKind::Version,
+                None,
+                Some(new),
+            );
         }
         let u = only(&t);
         assert_eq!(u.objects, 1);
@@ -603,15 +701,33 @@ mod tests {
     fn delete_marker_makes_the_version_noncurrent() {
         let t = UsageTracker::new(ME);
         let a = obj(100, ME, "va", 1);
-        t.apply("b", EntryKind::Current, None, Some(&a));
-        t.apply("b", EntryKind::Version, None, Some(&a));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            None,
+            Some(&a),
+        );
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Version,
+            None,
+            Some(&a),
+        );
         let marker = ObjectMeta {
             is_delete_marker: true,
             version_id: "vm".into(),
             modified_at: 5,
             ..Default::default()
         };
-        t.apply("b", EntryKind::Current, Some(&a), Some(&marker));
+        t.apply(
+            "b",
+            &MetadataKey::object_meta("b", "k"),
+            EntryKind::Current,
+            Some(&a),
+            Some(&marker),
+        );
         let u = only(&t);
         assert_eq!((u.objects, u.noncurrent_versions), (0, 1));
         assert_eq!(u.noncurrent_bytes, 100);
@@ -726,56 +842,82 @@ mod tests {
 
         let t2 = UsageTracker::new(ME);
         for (old, new) in [(None, &a), (Some(&a), &b)] {
-            t2.apply("b", EntryKind::Current, old, Some(new));
-            t2.apply("b", EntryKind::Version, None, Some(new));
+            t2.apply(
+                "b",
+                &MetadataKey::object_meta("b", "k"),
+                EntryKind::Current,
+                old,
+                Some(new),
+            );
+            t2.apply(
+                "b",
+                &MetadataKey::object_meta("b", "k"),
+                EntryKind::Version,
+                None,
+                Some(new),
+            );
         }
         assert_eq!(rebuilt, only(&t2));
     }
 
     #[test]
-    fn usage_counted_from_a_snapshot_beside_writes_equals_a_full_count() {
+    fn usage_counted_beside_writes_equals_a_full_count() {
         // objectio-docs `core/osd-start.md`: as the OSD does it, each write
         // under its key's lock reads the old entry, writes the new one and
-        // applies the change, while the count walks a snapshot.
+        // applies the change, while the count walks the index a chunk at a
+        // time, current entries (`m`) and versions (`v`).
         use objectio_storage::metadata::MetadataStoreConfig;
         use std::sync::Arc;
         let d = tempfile::tempdir().unwrap();
         let ix =
             objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(d.path())).unwrap();
-        let write = |t: &UsageTracker, bucket: &str, i: u64, new: Option<ObjectMeta>| {
+        // `version`: a version's entry, rather than the key's current one.
+        let write = |t: &UsageTracker,
+                     bucket: &str,
+                     i: u64,
+                     version: Option<&str>,
+                     new: Option<ObjectMeta>| {
             let key = format!("k{i}");
-            let mk = MetadataKey::object_meta(bucket, &key);
+            let (mk, kind) = match version {
+                None => (MetadataKey::object_meta(bucket, &key), EntryKind::Current),
+                Some(v) => (
+                    MetadataKey::object_version(bucket, &key, v),
+                    EntryKind::Version,
+                ),
+            };
             let _l = t.lock_key(bucket, &key);
             let old = ix.get(&mk).and_then(|v| ObjectMeta::decode(&v[..]).ok());
             match &new {
-                Some(o) => ix.put(mk, o.encode_to_vec()).unwrap(),
+                Some(o) => ix.put(mk.clone(), o.encode_to_vec()).unwrap(),
                 None => ix.delete(&mk).unwrap(),
             }
-            t.apply(bucket, EntryKind::Current, old.as_ref(), new.as_ref());
+            t.apply(bucket, &mk, kind, old.as_ref(), new.as_ref());
         };
-        let object = |r: u64, n: u64| {
+        let object = |r: u64, n: u64, version: Option<&str>| {
             let mut o = obj(
                 r % 5_000,
                 if r.is_multiple_of(3) { OTHER } else { ME },
-                "",
+                version.unwrap_or(""),
                 n,
             );
-            o.is_delete_marker = r.is_multiple_of(11);
+            o.is_delete_marker = version.is_none() && r.is_multiple_of(11);
             o
         };
+        let versions = ["v1", "v2", "v3"];
         let before = UsageTracker::new(ME);
         for i in 0..300 {
+            let version = (i % 4 == 0).then(|| versions[(i % 3) as usize]);
             write(
                 &before,
                 ["a", "b"][(i % 2) as usize],
                 i,
-                Some(object(i * 7919, i)),
+                version,
+                Some(object(i * 7919, i, version)),
             );
         }
 
         let t = Arc::new(UsageTracker::new(ME));
         t.start_counting();
-        let snap = ix.snapshot().unwrap();
         assert!(t.counting());
         std::thread::scope(|s| {
             let started = Arc::new(std::sync::Barrier::new(2));
@@ -792,20 +934,39 @@ mod tests {
                         r ^= r >> 7;
                         r ^= r << 17;
                         let bucket = ["a", "b", "c"][(r % 3) as usize];
-                        let new = (!(r >> 32).is_multiple_of(4)).then(|| object(r >> 8, 1_000 + n));
-                        write(&t, bucket, (r >> 16) % 500, new);
+                        let version = (r >> 24)
+                            .is_multiple_of(3)
+                            .then(|| versions[((r >> 28) % 3) as usize]);
+                        let new = (!(r >> 32).is_multiple_of(4))
+                            .then(|| object(r >> 8, 1_000 + n, version));
+                        write(&t, bucket, (r >> 16) % 500, version, new);
                     }
                 })
             };
             started.wait();
-            t.count(&*snap, &AtomicBool::new(false));
+            // Chunks of 16: the count goes past many fences meanwhile.
+            t.count_in_chunks(&*ix, 16, &AtomicBool::new(false));
             assert!(!t.counting());
             writer.join().unwrap();
         });
 
         let full = UsageTracker::new(ME);
-        full.rebuild(ix.iter_prefix(&MetadataKey::all_object_meta_prefix()));
-        assert_eq!(t.snapshot(), full.snapshot());
+        full.rebuild(
+            ix.iter_prefix(&MetadataKey::all_object_meta_prefix())
+                .chain(ix.iter_prefix(&MetadataKey::from_bytes(vec![b'v']))),
+        );
+        // Last modified aside: a delete leaves it where it was, where a
+        // count from scratch sees only what is left.
+        let counts = |t: &UsageTracker| {
+            t.snapshot()
+                .into_iter()
+                .map(|u| BucketUsage {
+                    last_modified: 0,
+                    ..u
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(counts(&t), counts(&full));
         assert_eq!(full.snapshot().len(), 3);
     }
 }

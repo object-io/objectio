@@ -391,13 +391,21 @@ impl Summary {
 }
 
 /// Every PG's summary. While an OSD that has started counts its entries
-/// from a snapshot (objectio-docs `core/osd-start.md`), writes go to the
-/// changes since the snapshot instead, folded in when the count is done.
+/// ([`crate::count`]), a write below the count's fence goes to the changes
+/// kept aside, folded in when the count is done.
 #[derive(Default)]
 struct Summaries {
     live: HashMap<PgId, Summary>,
-    /// While counting: the entries writes put in and took out, per PG.
-    counting: Option<(HashMap<PgId, Summary>, HashMap<PgId, Summary>)>,
+    counting: Option<Counting>,
+}
+
+/// A count under way: the entries writes put in and took out below its
+/// fence, per PG.
+#[derive(Default)]
+struct Counting {
+    added: HashMap<PgId, Summary>,
+    removed: HashMap<PgId, Summary>,
+    below: Vec<u8>,
 }
 
 /// The metadata store, with its keys indexed by placement group. See the
@@ -421,14 +429,13 @@ impl PgIndexed {
     /// The index could not be written.
     pub fn open(inner: Arc<dyn MetaIndex>, node_id: [u8; 16]) -> Result<Self> {
         let me = Self::open_to_count(inner, node_id)?;
-        me.count(None, &AtomicBool::new(false));
+        me.count(&AtomicBool::new(false));
         Ok(me)
     }
 
     /// [`Self::open`], with the summaries not yet counted: until
     /// [`Self::count`] has run, [`Self::counting`] is true and writes are
-    /// kept aside, to be folded into the count. Call [`Self::count`] once,
-    /// with a snapshot taken before any write.
+    /// kept aside, to be folded into the count. Call [`Self::count`] once.
     ///
     /// # Errors
     /// The index could not be written.
@@ -522,41 +529,46 @@ impl PgIndexed {
         Ok(n)
     }
 
-    /// Count every PG's summary from `snapshot` (the index itself if
-    /// `None`: only while nothing writes), fold in the writes made since,
-    /// and end counting. Set `stop` to give up (the OSD is going away):
-    /// it then stays counting.
-    pub fn count(&self, snapshot: Option<&dyn MetaSnapshot>, stop: &AtomicBool) {
+    /// Count every PG's summary from the index, a chunk at a time while
+    /// writes go on ([`crate::count`]), fold in the writes made meanwhile,
+    /// and end counting. Set `stop` to give up (the OSD is going away): it
+    /// then stays counting.
+    pub fn count(&self, stop: &AtomicBool) {
+        self.count_in_chunks(crate::count::CHUNK, stop);
+    }
+
+    fn count_in_chunks(&self, chunk: usize, stop: &AtomicBool) {
         let mut sums: HashMap<PgId, Summary> = HashMap::new();
-        let mut add = |k: &[u8], v: &[u8]| {
-            if let (Some((pool, pg, bucket, key, version)), Ok(mut e)) =
-                (parse_entry_key(k), PgEntry::decode(v))
-            {
-                e.bucket = bucket;
-                e.key = key;
-                e.version_id = version;
-                sums.entry((pool, pg)).or_default().add(&e);
-            }
-            !stop.load(Ordering::Relaxed)
-        };
-        let prefix = MetadataKey::from_bytes(PREFIX.to_vec());
-        match snapshot {
-            Some(snap) => snap.scan(&prefix, &mut add),
-            None => self.inner.for_each_prefix(&prefix, None, &mut add),
-        }
-        if stop.load(Ordering::Relaxed) {
+        let counted = crate::count::walk(
+            &*self.inner,
+            &[MetadataKey::from_bytes(PREFIX.to_vec())],
+            chunk,
+            self,
+            stop,
+            &mut |k, v| {
+                if let (Some((pool, pg, bucket, key, version)), Ok(mut e)) =
+                    (parse_entry_key(k), PgEntry::decode(v))
+                {
+                    e.bucket = bucket;
+                    e.key = key;
+                    e.version_id = version;
+                    sums.entry((pool, pg)).or_default().add(&e);
+                }
+            },
+        );
+        if !counted {
             return;
         }
         let mut s = self.summaries.lock();
-        if let Some((added, removed)) = s.counting.take() {
+        if let Some(c) = s.counting.take() {
             let pgs: std::collections::HashSet<&PgId> =
-                added.keys().chain(removed.keys()).collect();
+                c.added.keys().chain(c.removed.keys()).collect();
             let none = Summary::default();
             for pg in pgs {
                 let sum = sums.entry(pg.clone()).or_default();
                 sum.merge(
-                    added.get(pg).unwrap_or(&none),
-                    removed.get(pg).unwrap_or(&none),
+                    c.added.get(pg).unwrap_or(&none),
+                    c.removed.get(pg).unwrap_or(&none),
                 );
                 if sum.is_empty() {
                     sums.remove(pg);
@@ -672,6 +684,23 @@ fn op_key(op: &MetadataOp) -> Option<&MetadataKey> {
     }
 }
 
+impl crate::count::Fence for PgIndexed {
+    fn advance(
+        &self,
+        below: &[u8],
+        snapshot: &mut dyn FnMut() -> Option<Arc<dyn MetaSnapshot>>,
+    ) -> Option<Arc<dyn MetaSnapshot>> {
+        // Every write of an entry holds its key's lock from reading the old
+        // entry through changing the summaries.
+        let _all: Vec<_> = self.locks.iter().map(|l| l.lock()).collect();
+        let snap = snapshot();
+        if let Some(c) = &mut self.summaries.lock().counting {
+            c.below = below.to_vec();
+        }
+        snap
+    }
+}
+
 impl MetaIndex for PgIndexed {
     fn get(&self, key: &MetadataKey) -> Option<Vec<u8>> {
         self.inner.get(key)
@@ -755,13 +784,19 @@ impl MetaIndex for PgIndexed {
         self.inner.write(ops)?;
         let mut s = self.summaries.lock();
         let s = &mut *s;
-        if let Some((added, removed)) = &mut s.counting {
+        if let Some(c) = &mut s.counting {
+            // Below the fence the count has read the entry as it was: the
+            // change is kept aside. Past it, a later chunk reads it as it is.
             for (before, after) in deltas {
-                if let Some(b) = before {
-                    removed.entry(b.pg).or_default().add(&b.entry);
+                if let Some(b) = before
+                    && key_of(&b.pg, &b.entry).as_bytes() < c.below.as_slice()
+                {
+                    c.removed.entry(b.pg).or_default().add(&b.entry);
                 }
-                if let Some(a) = after {
-                    added.entry(a.pg).or_default().add(&a.entry);
+                if let Some(a) = after
+                    && key_of(&a.pg, &a.entry).as_bytes() < c.below.as_slice()
+                {
+                    c.added.entry(a.pg).or_default().add(&a.entry);
                 }
             }
             return Ok(());
@@ -792,8 +827,8 @@ impl MetaIndex for PgIndexed {
         self.inner.for_each_prefix(prefix, after, f);
     }
 
-    fn snapshot(&self) -> Option<Arc<dyn MetaSnapshot>> {
-        self.inner.snapshot()
+    fn snapshot(&self, from: &[u8], below: &[u8]) -> Option<Arc<dyn MetaSnapshot>> {
+        self.inner.snapshot(from, below)
     }
 
     fn len(&self) -> u64 {
@@ -951,10 +986,11 @@ mod tests {
     }
 
     #[test]
-    fn summaries_counted_from_a_snapshot_beside_writes_equal_a_full_count() {
-        // objectio-docs `core/osd-start.md`: the start's count walks a
-        // snapshot while writes go on; with the writes made meanwhile folded
-        // in, each PG's summary must be what counting everything gives.
+    fn summaries_counted_beside_writes_equal_a_full_count() {
+        // objectio-docs `core/osd-start.md`: the start's count walks the
+        // index a chunk at a time while writes go on; with the writes made
+        // meanwhile folded in, each PG's summary must be what counting
+        // everything gives.
         let d = tempfile::tempdir().unwrap();
         let inner =
             objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(d.path())).unwrap();
@@ -971,7 +1007,6 @@ mod tests {
             }
         }
         let ix = Arc::new(PgIndexed::open_to_count(Arc::clone(&inner), ME).unwrap());
-        let snap = ix.snapshot().unwrap();
         assert!(ix.counting());
 
         let started = Arc::new(std::sync::Barrier::new(2));
@@ -1001,7 +1036,8 @@ mod tests {
             })
         };
         started.wait();
-        ix.count(Some(&*snap), &AtomicBool::new(false));
+        // Chunks of 16: the count goes past many fences while the writer runs.
+        ix.count_in_chunks(16, &AtomicBool::new(false));
         assert!(!ix.counting());
         writer.join().unwrap();
 

@@ -332,12 +332,10 @@ impl OsdService {
         );
         let meta_store: Arc<dyn MetaIndex> = Arc::clone(&pg_index) as Arc<dyn MetaIndex>;
         // PG summaries and bucket usage are counted after the OSD serves,
-        // from the index as it is now, before any write (objectio-docs
-        // `core/osd-start.md`); writes meanwhile are kept aside and folded
-        // in.
+        // a chunk of the index at a time while writes go on (objectio-docs
+        // `core/osd-start.md`).
         let usage = Arc::new(UsageTracker::new(node_id));
         usage.start_counting();
-        let snapshot = meta_store.snapshot();
 
         info!(
             "OSD initialized with {} disks, metadata at {:?}",
@@ -349,7 +347,7 @@ impl OsdService {
         // nothing is allocated over a live shard.
         let shards: Arc<dyn ShardStore> =
             Arc::new(BlockStore::new(disks, Arc::clone(&meta_store), meta_dir));
-        let (usage_counted, counter) = count_after_start(&pg_index, &usage, snapshot);
+        let (usage_counted, counter) = count_after_start(&pg_index, &usage, &meta_store);
 
         Ok(Self {
             node_id,
@@ -755,8 +753,8 @@ impl OsdService {
                 continue;
             };
             if version.object_id == object_id {
+                usage.push((key.clone(), EntryKind::Version, Some(version.clone()), None));
                 ops.push(MetadataOp::Delete { key });
-                usage.push((EntryKind::Version, Some(version.clone()), None));
                 removed = Some(version);
             } else {
                 versions.push(version);
@@ -767,6 +765,12 @@ impl OsdService {
             let newest = versions
                 .into_iter()
                 .max_by(|a, b| version_age(a).cmp(&version_age(b)));
+            usage.push((
+                current_key.clone(),
+                EntryKind::Current,
+                Some(c.clone()),
+                newest.clone(),
+            ));
             ops.push(match &newest {
                 Some(n) => MetadataOp::Put {
                     key: current_key,
@@ -774,7 +778,6 @@ impl OsdService {
                 },
                 None => MetadataOp::Delete { key: current_key },
             });
-            usage.push((EntryKind::Current, Some(c.clone()), newest.clone()));
             removed = Some(c.clone());
             now_current = newest;
         }
@@ -782,9 +785,9 @@ impl OsdService {
             self.meta_store
                 .write(ops)
                 .map_err(|e| Status::internal(format!("failed to withdraw the write: {e}")))?;
-            for (kind, before, after) in &usage {
+            for (entry, kind, before, after) in &usage {
                 self.usage
-                    .apply(bucket, *kind, before.as_ref(), after.as_ref());
+                    .apply(bucket, entry, *kind, before.as_ref(), after.as_ref());
             }
             info!(
                 "Withdrew {bucket}/{object_key} object {}",
@@ -838,11 +841,12 @@ impl OsdService {
                 stored.replication.insert(target.clone(), status.clone());
             }
             self.meta_store
-                .put(key, stored.encode_to_vec())
+                .put(key.clone(), stored.encode_to_vec())
                 .map_err(|e| {
                     Status::internal(format!("failed to store replication status: {e}"))
                 })?;
-            self.usage.apply(bucket, kind, Some(&before), Some(&stored));
+            self.usage
+                .apply(bucket, &key, kind, Some(&before), Some(&stored));
         }
         Ok(Response::new(PutObjectMetaResponse {
             success: true,
@@ -1765,15 +1769,18 @@ impl StorageService for OsdService {
                     // version entry, as a current one's is.
                     Some(shard) => self
                         .shards
-                        .write_with_metadata(shard, vec![(version_key, value)])?,
+                        .write_with_metadata(shard, vec![(version_key.clone(), value)])?,
                     None => {
-                        self.meta_store.put(version_key, value).map_err(|e| {
-                            Status::internal(format!("failed to store version entry: {e}"))
-                        })?;
+                        self.meta_store
+                            .put(version_key.clone(), value)
+                            .map_err(|e| {
+                                Status::internal(format!("failed to store version entry: {e}"))
+                            })?;
                     }
                 }
                 self.usage.apply(
                     &req.bucket,
+                    &version_key,
                     EntryKind::Version,
                     prev.as_ref(),
                     Some(&object),
@@ -1814,9 +1821,9 @@ impl StorageService for OsdService {
             }
             // Everything this write stores goes in one log batch: one flush,
             // all or nothing (B21). Usage follows once it is durable.
+            let mut usage: Vec<(MetadataKey, EntryKind, Option<ObjectMeta>, ObjectMeta)> =
+                vec![(key.clone(), EntryKind::Current, old.clone(), object.clone())];
             let mut writes: Vec<(MetadataKey, Vec<u8>)> = vec![(key, value.clone())];
-            let mut usage: Vec<(EntryKind, Option<ObjectMeta>, ObjectMeta)> =
-                vec![(EntryKind::Current, old.clone(), object.clone())];
 
             // The object this write replaces was stored while versioning was
             // off (the "null" version). With versioning on now, S3 keeps it as
@@ -1828,8 +1835,8 @@ impl StorageService for OsdService {
             {
                 let null_key = MetadataKey::object_version(&req.bucket, &req.key, NULL_VERSION);
                 let replaced = self.stored_meta(&null_key);
+                usage.push((null_key.clone(), EntryKind::Version, replaced, null.clone()));
                 writes.push((null_key, null.encode_to_vec()));
-                usage.push((EntryKind::Version, replaced, null.clone()));
             }
 
             // A versioned object's own version entry is the same object: an
@@ -1844,8 +1851,8 @@ impl StorageService for OsdService {
                 let version_key =
                     MetadataKey::object_version(&req.bucket, &req.key, &object.version_id);
                 let old = self.stored_meta(&version_key);
+                usage.push((version_key.clone(), EntryKind::Version, old, object.clone()));
                 writes.push((version_key, value));
-                usage.push((EntryKind::Version, old, object.clone()));
             }
 
             match req.shard {
@@ -1855,9 +1862,9 @@ impl StorageService for OsdService {
                     Status::internal(format!("failed to store object metadata: {e}"))
                 })?,
             }
-            for (kind, before, after) in &usage {
+            for (entry, kind, before, after) in &usage {
                 self.usage
-                    .apply(&req.bucket, *kind, before.as_ref(), Some(after));
+                    .apply(&req.bucket, entry, *kind, before.as_ref(), Some(after));
             }
 
             let timestamp = Self::current_timestamp();
@@ -2000,7 +2007,7 @@ impl StorageService for OsdService {
                     Status::internal(format!("failed to delete object metadata: {}", e))
                 })?;
                 self.usage
-                    .apply(&req.bucket, EntryKind::Current, old.as_ref(), None);
+                    .apply(&req.bucket, &key, EntryKind::Current, old.as_ref(), None);
                 debug!("Deleted object metadata: {}/{}", req.bucket, req.key);
             } else {
                 // Delete specific version entry
@@ -2011,8 +2018,13 @@ impl StorageService for OsdService {
                 self.meta_store.delete(&version_key).map_err(|e| {
                     Status::internal(format!("failed to delete version entry: {}", e))
                 })?;
-                self.usage
-                    .apply(&req.bucket, EntryKind::Version, old.as_ref(), None);
+                self.usage.apply(
+                    &req.bucket,
+                    &version_key,
+                    EntryKind::Version,
+                    old.as_ref(),
+                    None,
+                );
                 info!(
                     "Deleted version: {}/{} (version={})",
                     req.bucket, req.key, req.version_id
@@ -2033,7 +2045,7 @@ impl StorageService for OsdService {
                         .filter_map(|(_, v)| ObjectMeta::decode(&v[..]).ok())
                         .max_by(|a, b| version_age(a).cmp(&version_age(b)));
                     match &newest {
-                        Some(n) => self.meta_store.put(current_key, n.encode_to_vec()),
+                        Some(n) => self.meta_store.put(current_key.clone(), n.encode_to_vec()),
                         None => self.meta_store.delete(&current_key),
                     }
                     .map_err(|e| {
@@ -2041,6 +2053,7 @@ impl StorageService for OsdService {
                     })?;
                     self.usage.apply(
                         &req.bucket,
+                        &current_key,
                         EntryKind::Current,
                         current.as_ref(),
                         newest.as_ref(),
@@ -2510,58 +2523,60 @@ fn version_entry_id(version_id: &str) -> &str {
     }
 }
 
-/// Count PG summaries and bucket usage from `snapshot` in the background,
-/// beside each other; without a snapshot (an engine that can't keep one),
-/// count now, from the index, before the OSD serves. The receiver turns
-/// true once usage is counted.
+/// Count PG summaries and bucket usage in the background, beside each
+/// other, while the OSD serves; with an engine that keeps no snapshots,
+/// count now, before it serves. The receiver turns true once usage is
+/// counted.
 fn count_after_start(
     pg_index: &Arc<crate::pg_index::PgIndexed>,
     usage: &Arc<UsageTracker>,
-    snapshot: Option<Arc<dyn objectio_storage::metadata::MetaSnapshot>>,
+    index: &Arc<dyn MetaIndex>,
 ) -> (tokio::sync::watch::Receiver<bool>, Counter) {
     let (done, counted) = tokio::sync::watch::channel(false);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let count = {
-        let (pg_index, usage, stop) = (Arc::clone(pg_index), Arc::clone(usage), Arc::clone(&stop));
-        move |snapshot: &dyn objectio_storage::metadata::MetaSnapshot| {
+        let (pg_index, usage, index, stop) = (
+            Arc::clone(pg_index),
+            Arc::clone(usage),
+            Arc::clone(index),
+            Arc::clone(&stop),
+        );
+        move || {
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let started = Instant::now();
-                    pg_index.count(Some(snapshot), &stop);
-                    if stop.load(Ordering::Relaxed) {
-                        return;
+                    pg_index.count(&stop);
+                    if !pg_index.counting() {
+                        info!(
+                            "Counted the summaries of {} placement groups in {:?}",
+                            pg_index.pg_count(),
+                            started.elapsed()
+                        );
                     }
-                    info!(
-                        "Counted the summaries of {} placement groups in {:?}",
-                        pg_index.pg_count(),
-                        started.elapsed()
-                    );
                 });
                 let started = Instant::now();
-                usage.count(snapshot, &stop);
-                if stop.load(Ordering::Relaxed) {
-                    return;
+                usage.count(&*index, &stop);
+                if !usage.counting() {
+                    info!(
+                        "Counted the usage of {} buckets in {:?}",
+                        usage.snapshot().len(),
+                        started.elapsed()
+                    );
+                    let _ = done.send(true);
                 }
-                info!(
-                    "Counted the usage of {} buckets in {:?}",
-                    usage.snapshot().len(),
-                    started.elapsed()
-                );
-                let _ = done.send(true);
             });
         }
     };
-    let thread = match snapshot {
-        Some(snapshot) => Some(
+    let thread = if index.snapshot(b"", b"").is_some() {
+        Some(
             std::thread::Builder::new()
                 .name("osd-count".into())
-                .spawn(move || count(&*snapshot))
+                .spawn(count)
                 .expect("spawn the count after start"),
-        ),
-        None => {
-            count(&Live(Arc::clone(pg_index) as Arc<dyn MetaIndex>));
-            None
-        }
+        )
+    } else {
+        count();
+        None
     };
     (counted, Counter { stop, thread })
 }
@@ -2579,15 +2594,6 @@ impl Drop for Counter {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-    }
-}
-
-/// The index itself, read as a snapshot: only while nothing writes.
-struct Live(Arc<dyn MetaIndex>);
-
-impl objectio_storage::metadata::MetaSnapshot for Live {
-    fn scan(&self, prefix: &MetadataKey, f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
-        self.0.for_each_prefix(prefix, None, f);
     }
 }
 
