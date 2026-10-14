@@ -445,6 +445,86 @@ fn everything_written_around_a_lost_drive_is_freed_when_deleted() {
     );
 }
 
+/// Overwrites racing a replaced drive's fill: recovery copies an object
+/// onto the blank OSD while a client overwrites it, so recovery's write
+/// of the old object can come after the new one on every copy and be
+/// refused. What it wrote for the old object no copy names, and the
+/// overwrite frees only the shards it knew of: recovery frees it. (Here
+/// the overwrite's free, sent to the lost OSD's address, can reach the
+/// blank OSD at the same address and delete the shard first; on a real
+/// cluster it goes nowhere. Soak run 27's test leaked one in CI.) Every
+/// key reads its last write, whatever recovery freed, and once all are
+/// deleted every byte is back.
+#[test]
+fn overwrites_racing_a_drives_fill_leave_nothing_behind() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    assert_eq!(ha.clients[0].request("PUT", "/quorum", &[]).status, 200);
+    await_writable(&ha.clients[0]);
+    assert_eq!(
+        ha.clients[0].request("DELETE", "/quorum/probe", &[]).status,
+        204
+    );
+    let empty = ha.clients[0].await_total_used_bytes(0);
+    let put = |ha: &HaCluster, i: usize, seed: u8| {
+        let r = ha.clients[0].request("PUT", &format!("/quorum/r-{i}"), &payload(200_000, seed));
+        assert_eq!(r.status, 200, "PUT r-{i}: {}", r.text());
+    };
+    for i in 0..48 {
+        put(&ha, i, 1);
+    }
+    let ids = node_ids(&ha);
+    ha.stop_osd(2);
+    ha.lose_osd_drive(2);
+    ha.start_osd(2, None);
+    // Every key overwritten, round after round, until the blank OSD is
+    // filled and the lost one let go.
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    let mut round = 2u8;
+    loop {
+        for i in 0..48 {
+            put(&ha, i, round);
+        }
+        let now = node_ids(&ha);
+        if ids.iter().filter(|i| now.contains(i)).count() == 5 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lost OSD never evacuated: nodes {now:?}"
+        );
+        round = round.wrapping_add(1);
+    }
+    std::thread::sleep(Duration::from_secs(10));
+    for i in 0..48 {
+        let r = ha.clients[0].request("GET", &format!("/quorum/r-{i}"), &[]);
+        assert_eq!(r.status, 200, "GET r-{i}: {}", r.text());
+        assert!(
+            r.bytes == payload(200_000, round),
+            "r-{i}: not its last write"
+        );
+    }
+    for i in 0..48 {
+        let r = ha.clients[0].request("DELETE", &format!("/quorum/r-{i}"), &[]);
+        assert_eq!(r.status, 204, "DELETE r-{i}: {}", r.text());
+    }
+    // What copies disagreed on is checked again after the gateway's
+    // restamp settle (2 min).
+    let deadline = std::time::Instant::now() + Duration::from_secs(200);
+    let used = loop {
+        let used = ha.clients[0].await_total_used_bytes(empty);
+        if used == empty || std::time::Instant::now() > deadline {
+            break used;
+        }
+    };
+    assert_eq!(
+        used,
+        empty,
+        "space left behind; shards by OSD (object, position, size): {:?}",
+        shards(&ha)
+    );
+}
+
 /// Every OSD's shards: (object id prefix, position, size).
 fn shards(ha: &HaCluster) -> Vec<Vec<(String, u32, u32)>> {
     use objectio_proto::storage::ListShardsRequest;
