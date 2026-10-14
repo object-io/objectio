@@ -380,6 +380,24 @@ pub(crate) fn meta_failure(e: &tonic::Status, what: &str) -> Response {
     }
 }
 
+/// A key's placement refused (`e`): `NoSuchBucket` if the bucket doesn't
+/// exist, whatever stopped the placement, else as [`meta_failure`]. Meta
+/// places a key without looking at its bucket, and until the default pool
+/// is made (level 7) that is a 503, which a GET of a key in a bucket that
+/// was never made should not get.
+pub(crate) async fn placement_failure(
+    state: &AppState,
+    bucket: &str,
+    e: &tonic::Status,
+) -> Response {
+    if let Err(missing) = bucket_owner(state, bucket).await
+        && missing.status() == StatusCode::NOT_FOUND
+    {
+        return missing;
+    }
+    meta_failure(e, "Failed to get placement")
+}
+
 pub(crate) fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
     match key {
         Some(k) => format!("arn:obio:s3:::{}/{}", bucket, k),
@@ -525,7 +543,7 @@ pub(crate) async fn get_placement_nodes_for_object(
         }
         Err(e) => {
             error!("Failed to get placement: {}", e);
-            Err(meta_failure(&e, "Failed to get placement"))
+            Err(placement_failure(state, bucket, &e).await)
         }
     }
 }
