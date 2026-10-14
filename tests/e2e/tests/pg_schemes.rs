@@ -249,9 +249,15 @@ fn osd_has_meta(address: &str, bucket: &str, key: &str) -> bool {
 /// (positions 0, 1 and their local parity 4 in one rack; 2, 3 and 5 in
 /// another; the global parity 6 in a third). `which`: the positions whose
 /// OSDs are lost.
-fn lrc(which: &[usize]) -> (HaCluster, Vec<(String, Vec<u8>)>) {
+/// Keys and what was written to them.
+type Bodies = Vec<(String, Vec<u8>)>;
+
+/// An LRC 4+2+1 pool of one placement group, a group per rack, and
+/// twelve objects in it; with every OSD's id and the OSD index of each
+/// acting position.
+fn lrc_written() -> (HaCluster, Bodies, Vec<String>, Vec<usize>) {
     let racks = ["A", "A", "A", "A", "B", "B", "B", "B", "C", "C"];
-    let mut ha = HaCluster::start_with_racks(1, &racks, 1, &["--repair-interval-secs", "3600"]);
+    let ha = HaCluster::start_with_racks(1, &racks, 1, &["--repair-interval-secs", "3600"]);
     eager(&ha);
     pool_and_bucket(
         &ha,
@@ -260,7 +266,7 @@ fn lrc(which: &[usize]) -> (HaCluster, Vec<(String, Vec<u8>)>) {
             "pg_count": 1, "enabled": true}),
         "lrc",
     );
-    let bodies: Vec<(String, Vec<u8>)> = (0..12u8)
+    let bodies: Bodies = (0..12u8)
         .map(|i| {
             let key = format!("k{i}");
             let body = payload(300_000, 60 + i);
@@ -270,19 +276,36 @@ fn lrc(which: &[usize]) -> (HaCluster, Vec<(String, Vec<u8>)>) {
         })
         .collect();
     let ids = node_ids(&ha, racks.len());
-    let acting: Vec<String> = pgs(&ha, "lrc")[&0]["acting"]
+    let acting: Vec<usize> = pgs(&ha, "lrc")[&0]["acting"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| m.as_str().unwrap().to_string())
+        .map(|m| ids.iter().position(|id| id == m.as_str().unwrap()).unwrap())
         .collect();
-    let lost: Vec<usize> = which
-        .iter()
-        .map(|&p| ids.iter().position(|id| *id == acting[p]).unwrap())
-        .collect();
+    (ha, bodies, ids, acting)
+}
+
+/// [`lrc_written`], then the OSDs at acting positions `which` lost for
+/// good and their PG clean again.
+fn lrc(which: &[usize]) -> (HaCluster, Bodies) {
+    let (mut ha, bodies, ids, acting) = lrc_written();
+    let lost: Vec<usize> = which.iter().map(|&p| acting[p]).collect();
     lose_drives(&mut ha, &lost, &ids);
     await_clean(&ha, "lrc", 180);
     (ha, bodies)
+}
+
+/// A data shard and its group's local parity down (positions 0 and 4):
+/// the first four shards a read reaches, the other group's three and its
+/// local parity, are only three shards' worth, so the read goes on to
+/// the global parity and decodes from the data and global parity (a
+/// read that stopped at k failed: "insufficient shards: have 3, need 4").
+#[test]
+fn an_lrc_object_reads_with_a_data_shard_and_its_local_parity_down() {
+    let (mut ha, bodies, _, acting) = lrc_written();
+    ha.stop_osd(acting[0]);
+    ha.stop_osd(acting[4]);
+    all_read(&ha, "lrc", &bodies);
 }
 
 /// One data shard's OSD lost: every object's shard is rebuilt from the

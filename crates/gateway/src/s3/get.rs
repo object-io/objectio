@@ -1194,95 +1194,6 @@ pub(crate) async fn get_object_version_once(
         // replaced by the next-nearest position, so a degraded stripe still
         // ends up with k shards if k survive, and no more than k reads are
         // ever in flight.
-        let mut candidates = ranked_positions.into_iter();
-        let mut in_flight = futures::stream::FuturesUnordered::new();
-        loop {
-            while read_count + in_flight.len() < ec_k {
-                let Some((pos, dist)) = candidates.next() else {
-                    break;
-                };
-                if shards[pos as usize].is_some() {
-                    continue;
-                }
-                let Some(shard_loc) = shard_map.get(&pos) else {
-                    continue;
-                };
-                let node_addr = resolve_node_address(
-                    &mut node_address_map,
-                    &mut meta_client,
-                    &shard_loc.node_id,
-                )
-                .await;
-                let node_placement = objectio_proto::metadata::NodePlacement {
-                    te_segment: node_te_map
-                        .get(&shard_loc.node_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    position: shard_loc.position,
-                    node_id: shard_loc.node_id.clone(),
-                    node_address: node_addr,
-                    disk_id: shard_loc.disk_id.clone(),
-                    shard_type: shard_loc.shard_type,
-                    local_group: shard_loc.local_group,
-                };
-                let pool = &state.osd_pool;
-                let rdma = state.rdma.as_deref();
-                let stripe_id = stripe.stripe_id;
-                let expected_crc32c = shard_loc.crc32c;
-                in_flight.push(async move {
-                    let result = read_shard_from_osd(
-                        pool,
-                        &node_placement,
-                        ec_shard_object_id,
-                        stripe_id,
-                        pos,
-                        expected_crc32c,
-                        rdma,
-                    )
-                    .await;
-                    (pos, dist, result)
-                });
-            }
-
-            // Nothing in flight means k shards are in hand, or every
-            // position has been tried.
-            let Some((pos, dist, result)) = futures::StreamExt::next(&mut in_flight).await else {
-                break;
-            };
-            match result {
-                Ok(data) => {
-                    let bytes = data.len();
-                    debug!("Read shard {} ({} bytes, {})", pos, bytes, dist.as_str());
-                    // Record per-locality read traffic so operators can see
-                    // how much cross-zone/cross-dc bandwidth a typical
-                    // object read consumes (Phase 2.4).
-                    crate::s3_metrics::observe_locality_read_bytes(dist.as_str(), bytes as u64);
-                    shards[pos as usize] = Some(data);
-                    read_count += 1;
-                }
-                Err(e) => {
-                    warn!("Failed to read shard {}: {}", pos, e);
-                    unreadable.push(pos);
-                }
-            }
-        }
-
-        // Check if we have enough shards
-        if read_count < ec_k {
-            error!(
-                "Insufficient shards to reconstruct stripe {}: have {}, need {}",
-                stripe_idx, read_count, ec_k
-            );
-            return S3Error::xml_response(
-                "InternalError",
-                &format!(
-                    "Cannot read object: only {} shards available for stripe {}, need {}",
-                    read_count, stripe_idx, ec_k
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
-
         // Decode using erasure coding. Match the codec to how this stripe
         // was encoded — reading an LRC-written stripe with a plain MDS codec
         // produces wrong bytes (the decoder treats local parity shards as
@@ -1309,27 +1220,137 @@ pub(crate) async fn get_object_version_once(
             }
         };
 
-        if !unreadable.is_empty() && stripe_ec_type == ErasureType::ErasureMds {
-            crate::heal::report_degraded(
-                &state,
-                &bucket,
-                &key,
-                &object.object_id,
-                stripe.stripe_id,
-                &unreadable,
-                read_count,
-                stripe.ec_k,
-            );
-        }
-        let stripe_data = match codec.decode(&mut shards, stripe_data_size) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Failed to decode stripe {}: {}", stripe_idx, e);
+        let mut candidates = ranked_positions.into_iter();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        // Read the nearest k, then (an LRC stripe whose k don't decode)
+        // one more at a time.
+        let mut want = ec_k;
+        let mut had = 0;
+        let stripe_data = loop {
+            loop {
+                while read_count + in_flight.len() < want {
+                    let Some((pos, dist)) = candidates.next() else {
+                        break;
+                    };
+                    if shards[pos as usize].is_some() {
+                        continue;
+                    }
+                    let Some(shard_loc) = shard_map.get(&pos) else {
+                        continue;
+                    };
+                    let node_addr = resolve_node_address(
+                        &mut node_address_map,
+                        &mut meta_client,
+                        &shard_loc.node_id,
+                    )
+                    .await;
+                    let node_placement = objectio_proto::metadata::NodePlacement {
+                        te_segment: node_te_map
+                            .get(&shard_loc.node_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        position: shard_loc.position,
+                        node_id: shard_loc.node_id.clone(),
+                        node_address: node_addr,
+                        disk_id: shard_loc.disk_id.clone(),
+                        shard_type: shard_loc.shard_type,
+                        local_group: shard_loc.local_group,
+                    };
+                    let pool = &state.osd_pool;
+                    let rdma = state.rdma.as_deref();
+                    let stripe_id = stripe.stripe_id;
+                    let expected_crc32c = shard_loc.crc32c;
+                    in_flight.push(async move {
+                        let result = read_shard_from_osd(
+                            pool,
+                            &node_placement,
+                            ec_shard_object_id,
+                            stripe_id,
+                            pos,
+                            expected_crc32c,
+                            rdma,
+                        )
+                        .await;
+                        (pos, dist, result)
+                    });
+                }
+
+                // Nothing in flight means the shards wanted are in hand, or
+                // every position has been tried.
+                let Some((pos, dist, result)) = futures::StreamExt::next(&mut in_flight).await
+                else {
+                    break;
+                };
+                match result {
+                    Ok(data) => {
+                        let bytes = data.len();
+                        debug!("Read shard {} ({} bytes, {})", pos, bytes, dist.as_str());
+                        // Record per-locality read traffic so operators can see
+                        // how much cross-zone/cross-dc bandwidth a typical
+                        // object read consumes (Phase 2.4).
+                        crate::s3_metrics::observe_locality_read_bytes(dist.as_str(), bytes as u64);
+                        shards[pos as usize] = Some(data);
+                        read_count += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to read shard {}: {}", pos, e);
+                        unreadable.push(pos);
+                    }
+                }
+            }
+
+            // Check if we have enough shards
+            if read_count < ec_k {
+                error!(
+                    "Insufficient shards to reconstruct stripe {}: have {}, need {}",
+                    stripe_idx, read_count, ec_k
+                );
                 return S3Error::xml_response(
                     "InternalError",
-                    &format!("Erasure decoding failed for stripe {}: {}", stripe_idx, e),
+                    &format!(
+                        "Cannot read object: only {} shards available for stripe {}, need {}",
+                        read_count, stripe_idx, ec_k
+                    ),
                     StatusCode::INTERNAL_SERVER_ERROR,
                 );
+            }
+
+            if !unreadable.is_empty() && stripe_ec_type == ErasureType::ErasureMds {
+                crate::heal::report_degraded(
+                    &state,
+                    &bucket,
+                    &key,
+                    &object.object_id,
+                    stripe.stripe_id,
+                    &unreadable,
+                    read_count,
+                    stripe.ec_k,
+                );
+            }
+            match codec.decode(&mut shards, stripe_data_size) {
+                Ok(d) => break d,
+                // Not every k shards of an LRC stripe decode (a local parity
+                // with its whole group, say, adds nothing): read one more,
+                // while there are any.
+                Err(e)
+                    if stripe_ec_type == ErasureType::ErasureLrc
+                        && read_count > had
+                        && read_count < total_shards =>
+                {
+                    debug!(
+                        "stripe {stripe_idx}: {read_count} shards don't decode ({e}); reading one more"
+                    );
+                    had = read_count;
+                    want = read_count + 1;
+                }
+                Err(e) => {
+                    error!("Failed to decode stripe {}: {}", stripe_idx, e);
+                    return S3Error::xml_response(
+                        "InternalError",
+                        &format!("Erasure decoding failed for stripe {}: {}", stripe_idx, e),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
             }
         };
 
