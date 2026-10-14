@@ -421,6 +421,30 @@ impl MetaService {
         }
     }
 
+    /// Make the default pool at finalize (level 7) and wait until it and
+    /// every one of its placement groups are committed, so the first
+    /// write after finalize finds them: as long as making it may wait for
+    /// OSDs registered but not up ([`SETTLE`]), and a little more. Past
+    /// that, finalize answers anyway and the upkeep goes on making it.
+    pub(crate) async fn await_default_pool(&self) {
+        let deadline = std::time::Instant::now() + SETTLE + Duration::from_secs(10);
+        let mut ready_since = None;
+        loop {
+            self.ensure_default_pool(&mut ready_since).await;
+            let made = self.pools.read().get(DEFAULT_POOL).is_some_and(|pool| {
+                self.placement_groups_for_pool(DEFAULT_POOL).len() >= pool.pg_count as usize
+            });
+            if made {
+                return;
+            }
+            if std::time::Instant::now() >= deadline || !self.is_raft_leader() {
+                warn!("finalize: the default pool isn't made yet; writes wait for it");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// Whether OSD `id` can be an acting member: registered, `In`, with an
     /// address, and not down past the grace (`down_since`).
     fn acting_usable(

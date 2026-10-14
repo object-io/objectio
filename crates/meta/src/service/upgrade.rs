@@ -189,10 +189,10 @@ impl MetaService {
                         plan.active, plan.target
                     );
                     // New keys are placed through the default pool from
-                    // here (level 7): made now, not at the upkeep's next
-                    // round, so writes don't meet a pool not made yet.
-                    let mut ready_since = None;
-                    self.ensure_default_pool(&mut ready_since).await;
+                    // here (level 7): made before finalize answers, not at
+                    // the upkeep's next round, so writes don't meet a pool
+                    // not made yet.
+                    self.await_default_pool().await;
                     Ok(plan.target)
                 }
                 MetaResponse::MultiCasConflict { .. } => Err(Status::aborted(
