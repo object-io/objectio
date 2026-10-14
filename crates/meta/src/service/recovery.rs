@@ -790,6 +790,28 @@ impl MetaService {
         (answered > 0).then_some(!holds)
     }
 
+    /// Whether every copy at positions `to` answers and holds an object
+    /// other than `object_id` for `w`'s key, or none.
+    async fn held_nowhere(
+        &self,
+        members: &[Option<String>],
+        to: &BTreeSet<usize>,
+        w: &Work,
+        object_id: &[u8],
+    ) -> bool {
+        for &p in to {
+            let Some(address) = &members[p] else {
+                continue;
+            };
+            match key_state(address, &w.bucket, &w.key, &w.version_id).await {
+                Ok((Some(o), _)) if o.object_id == object_id => return false,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Recover one placement group, its OSDs reserved: move it to its up set
     /// if it is to move, plan, work every object, record progress, then
     /// peer it.
@@ -1613,7 +1635,7 @@ impl MetaService {
         };
         let mut displaced: Vec<ObjectMeta> = Vec::new();
         let (mut asked, mut newer) = (0, 0);
-        for p in to {
+        for &p in &to {
             let Some(address) = &members[p] else {
                 continue;
             };
@@ -1648,12 +1670,18 @@ impl MetaService {
                 Err(e) => outcome = Outcome::Failed(format!("metadata to {address}: {e}")),
             }
         }
-        if asked > 0 && newer == asked && !written_to.is_empty() {
+        if asked > 0
+            && newer == asked
+            && !written_to.is_empty()
+            && self.held_nowhere(members, &to, w, &object.object_id).await
+        {
             // Overwritten or deleted on every copy while it was recovered:
             // what recovery wrote for it no copy names, and the write that
             // replaced it freed only the shards it knew of (soak run 27's
             // test leaked one so). Freed now, through the registry, as a
-            // displaced object's shards are.
+            // displaced object's shards are. A newer stamp alone isn't
+            // enough: a write superseded by a racing one is stamped again,
+            // the same object, so every copy must answer and hold another.
             debug!(
                 "recovery: {} replaced on every copy while recovered; freeing the shards written for it",
                 w.name()
