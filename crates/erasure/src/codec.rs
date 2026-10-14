@@ -369,65 +369,52 @@ impl ErasureCodec {
                     .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?
             }
             CodecBackend::Lrc(backend) => {
-                // For LRC, try local recovery for single missing shards first
-                // We'll store recovered shards separately to avoid borrow issues
-                let mut recovered_shards: Vec<Option<Vec<u8>>> = vec![None; self.total_shards()];
-                let mut remaining_missing = missing_indices.clone();
-
-                // First pass: try local recovery
-                for &idx in &missing_indices {
-                    if idx < k {
-                        // Build shard refs including any previously recovered shards
-                        let shard_refs: Vec<Option<&[u8]>> = (0..self.total_shards())
-                            .map(|i| {
-                                if let Some(ref rec) = recovered_shards[i] {
-                                    Some(rec.as_slice())
-                                } else {
-                                    shards[i].as_ref().map(AsRef::as_ref)
-                                }
-                            })
-                            .collect();
-
-                        // Try local recovery for data shard
-                        if let Ok(Some(recovered)) =
-                            backend.decode_local(&shard_refs, shard_size, idx)
-                        {
-                            recovered_shards[idx] = Some(recovered);
-                            remaining_missing.retain(|&i| i != idx);
-                        }
+                // Data shards first from their own group (a member and the
+                // local parity), then the rest from the global code. Only
+                // data shards are recovered: the output needs no parity,
+                // and a missing local parity can't come from the global
+                // code (it asked for one and failed the whole decode).
+                let mut recovered: Vec<Option<Vec<u8>>> = vec![None; self.total_shards()];
+                for &idx in missing_indices.iter().filter(|&&i| i < k) {
+                    let refs: Vec<Option<&[u8]>> = (0..self.total_shards())
+                        .map(|i| {
+                            recovered[i]
+                                .as_deref()
+                                .or_else(|| shards[i].as_ref().map(AsRef::as_ref))
+                        })
+                        .collect();
+                    if let Ok(Some(shard)) = backend.decode_local(&refs, shard_size, idx) {
+                        recovered[idx] = Some(shard);
                     }
                 }
-
-                // Build final shard refs with recovered shards
-                let final_shard_refs: Vec<Option<&[u8]>> = (0..self.total_shards())
-                    .map(|i| {
-                        if let Some(ref rec) = recovered_shards[i] {
-                            Some(rec.as_slice())
-                        } else {
-                            shards[i].as_ref().map(AsRef::as_ref)
-                        }
-                    })
+                let still: Vec<usize> = (0..k)
+                    .filter(|&i| shards[i].is_none() && recovered[i].is_none())
                     .collect();
-
-                // If still have missing data shards, use global recovery
-                if remaining_missing.iter().any(|&i| i < k) {
-                    backend
-                        .decode(&final_shard_refs, shard_size, &remaining_missing)
-                        .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?
-                } else {
-                    // All data shards recovered, build result
-                    (0..self.total_shards())
+                if !still.is_empty() {
+                    let refs: Vec<Option<&[u8]>> = (0..self.total_shards())
                         .map(|i| {
-                            if let Some(rec) = recovered_shards[i].take() {
-                                rec
-                            } else if let Some(ref orig) = shards[i] {
-                                orig.as_ref().to_vec()
-                            } else {
-                                vec![0u8; shard_size]
-                            }
+                            recovered[i]
+                                .as_deref()
+                                .or_else(|| shards[i].as_ref().map(AsRef::as_ref))
                         })
-                        .collect()
+                        .collect();
+                    // The backend's shards come back in the order asked.
+                    let global = backend
+                        .decode(&refs, shard_size, &still)
+                        .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
+                    for (idx, shard) in still.into_iter().zip(global) {
+                        recovered[idx] = Some(shard);
+                    }
                 }
+                (0..k)
+                    .map(|i| {
+                        recovered[i].take().unwrap_or_else(|| {
+                            shards[i]
+                                .as_ref()
+                                .map_or_else(Vec::new, |s| s.as_ref().to_vec())
+                        })
+                    })
+                    .collect()
             }
         };
 
@@ -784,6 +771,39 @@ mod tests {
         let mut shard_opts: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
         let decoded = codec.decode(&mut shard_opts, data.len()).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// Every subset of an LRC(4,2,1) stripe's shards: a decode gives the
+    /// original data or an error, never other bytes; and it succeeds
+    /// whenever its two steps can: a group's one missing data shard from
+    /// the group, then k of the data and global parity for the rest. (Two
+    /// data shards of one group, from its local parity and the global one
+    /// together, are not solved.)
+    #[test]
+    fn lrc_decodes_every_subset_that_determines_the_data() {
+        let codec = ErasureCodec::new(ErasureConfig::lrc(4, 2, 1)).unwrap();
+        let data: Vec<u8> = (0..4000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let shards = codec.encode(&data).unwrap();
+        let n = shards.len();
+        for mask in 0u32..(1 << n) {
+            let have = |i: usize| mask & (1 << i) != 0;
+            let mut slots: Vec<Option<Vec<u8>>> =
+                (0..n).map(|i| have(i).then(|| shards[i].clone())).collect();
+            // Groups (d0, d1, lp0 at 4) and (d2, d3, lp1 at 5); g at 6.
+            let group = |a: usize, b: usize, lp: usize| {
+                usize::from(have(a))
+                    + usize::from(have(b))
+                    + usize::from(have(lp) && have(a) != have(b))
+            };
+            let usable = group(0, 1, 4) + group(2, 3, 5) + usize::from(have(6));
+            match codec.decode(&mut slots, data.len()) {
+                Ok(got) => assert_eq!(got, data, "shards {mask:07b}: wrong data"),
+                Err(e) => assert!(
+                    usable < 4,
+                    "shards {mask:07b} decode in two steps, yet: {e}"
+                ),
+            }
+        }
     }
 
     #[test]

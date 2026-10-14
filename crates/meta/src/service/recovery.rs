@@ -790,6 +790,28 @@ impl MetaService {
         (answered > 0).then_some(!holds)
     }
 
+    /// Whether every copy at positions `to` answers and holds an object
+    /// other than `object_id` for `w`'s key, or none.
+    async fn held_nowhere(
+        &self,
+        members: &[Option<String>],
+        to: &BTreeSet<usize>,
+        w: &Work,
+        object_id: &[u8],
+    ) -> bool {
+        for &p in to {
+            let Some(address) = &members[p] else {
+                continue;
+            };
+            match key_state(address, &w.bucket, &w.key, &w.version_id).await {
+                Ok((Some(o), _)) if o.object_id == object_id => return false,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     /// Recover one placement group, its OSDs reserved: move it to its up set
     /// if it is to move, plan, work every object, record progress, then
     /// peer it.
@@ -1431,6 +1453,9 @@ impl MetaService {
         let mut left_out = false;
         let mut small: HashMap<usize, SmallShard> = HashMap::new();
         let mut written_to: HashSet<usize> = HashSet::new();
+        // Each stripe's shards written to an OSD (not with the metadata):
+        // freed again if the object turns out replaced on every copy.
+        let mut wrote: Vec<StripeMeta> = Vec::new();
         let stripes = object.stripes.clone();
         for (si, stripe) in stripes.iter().enumerate() {
             if !recoverable(stripe) {
@@ -1566,6 +1591,12 @@ impl MetaService {
                     crc32c: Some(crc),
                 });
             }
+            if !(si == 0 && stripe.shards_in_metadata) {
+                wrote.push(StripeMeta {
+                    shards: new_locations.clone(),
+                    ..stripe.clone()
+                });
+            }
             let s = &mut object.stripes[si];
             for loc in new_locations {
                 s.shards.retain(|l| l.position != loc.position);
@@ -1603,10 +1634,12 @@ impl MetaService {
             Outcome::Done
         };
         let mut displaced: Vec<ObjectMeta> = Vec::new();
-        for p in to {
+        let (mut asked, mut newer) = (0, 0);
+        for &p in &to {
             let Some(address) = &members[p] else {
                 continue;
             };
+            asked += 1;
             let request = PutObjectMetaRequest {
                 bucket: w.bucket.clone(),
                 key: w.key.clone(),
@@ -1627,12 +1660,35 @@ impl MetaService {
                 pg: Some(pg_ref.clone()),
             };
             match put_meta(address, request).await {
-                Ok(replaced) => {
+                Ok(put) => {
                     COPIES.fetch_add(1, Ordering::Relaxed);
-                    displaced.extend(replaced);
+                    displaced.extend(put.replaced);
+                    // Another object, or a delete, since: a stamp above
+                    // this object's (its own later update has the same).
+                    newer += usize::from(put.held.is_some_and(|h| h > object.stamp));
                 }
                 Err(e) => outcome = Outcome::Failed(format!("metadata to {address}: {e}")),
             }
+        }
+        if asked > 0
+            && newer == asked
+            && !written_to.is_empty()
+            && self.held_nowhere(members, &to, w, &object.object_id).await
+        {
+            // Overwritten or deleted on every copy while it was recovered:
+            // what recovery wrote for it no copy names, and the write that
+            // replaced it freed only the shards it knew of (soak run 27's
+            // test leaked one so). Freed now, through the registry, as a
+            // displaced object's shards are. A newer stamp alone isn't
+            // enough: a write superseded by a racing one is stamped again,
+            // the same object, so every copy must answer and hold another.
+            debug!(
+                "recovery: {} replaced on every copy while recovered; freeing the shards written for it",
+                w.name()
+            );
+            object.stripes = wrote;
+            self.free_displaced(&w.bucket, &[], vec![object]).await;
+            return Outcome::Changed;
         }
         if outcome == Outcome::Done {
             self.free_displaced(&w.bucket, &object.object_id, displaced)
@@ -2442,12 +2498,17 @@ async fn delete_shard(address: &str, shard: ShardId) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write a metadata copy; the object it displaced on that copy, if any
-/// (and not kept there as a version).
-async fn put_meta(
-    address: &str,
-    request: PutObjectMetaRequest,
-) -> anyhow::Result<Option<ObjectMeta>> {
+/// What a metadata copy said to recovery's write of it.
+struct Put {
+    /// The object the write displaced there, its shards to free (none if
+    /// that copy keeps it as a version).
+    replaced: Option<ObjectMeta>,
+    /// The copy held a newer write and kept it: the stamp it holds.
+    held: Option<u64>,
+}
+
+/// Write a metadata copy; what it displaced, or the newer write it kept.
+async fn put_meta(address: &str, request: PutObjectMetaRequest) -> anyhow::Result<Put> {
     let channel = crate::drain_observer::open_channel(address).await?;
     let r = tokio::time::timeout(
         RPC_TIMEOUT,
@@ -2459,7 +2520,10 @@ async fn put_meta(
     .await
     .map_err(|_| anyhow::anyhow!("timed out"))??
     .into_inner();
-    Ok(r.replaced.filter(|_| !r.replaced_version_kept))
+    Ok(Put {
+        replaced: r.replaced.filter(|_| !r.replaced_version_kept),
+        held: r.superseded.then_some(r.held_stamp),
+    })
 }
 
 /// Apply a delete (or a withdrawal) to a copy; the object it removed there.
