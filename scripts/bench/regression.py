@@ -10,8 +10,8 @@ OSDs, 4+2) and puts, then gets, 64 KiB and 4 MiB objects through it.
 Shared CI runners differ from each other by more than most regressions, so
 nothing here is an absolute number: both builds run on the same runner, in
 the same job, interleaved (base, head, head, base, ...) so a runner that
-slows down part way through slows both. The aio keeps its data in memory
-(/dev/shm) by default: a runner's disk swung one build's 64 KiB PUTs from
+slows down part way through slows both. CI gives the aio a tmpfs for its
+data (--workdir): a runner's disk swung one build's 64 KiB PUTs from
 208 to 372 a second between runs, which no threshold can see through, so
 the check measures the software (CPU, copies, RPCs, locks) and not the
 drive. A change that adds disk work (another fsync) is not seen here; the
@@ -156,9 +156,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.85,
                     help="fail when the head's throughput is below this share "
                          "of the base's (default 0.85)")
-    ap.add_argument("--workdir", type=Path, default=Path("/dev/shm"),
-                    help="where each run's aio keeps its data (default /dev/shm: "
-                         "memory, see above)")
+    ap.add_argument("--workdir", type=Path, default=Path(tempfile.gettempdir()),
+                    help="where each run's aio keeps its data: a tmpfs, see above "
+                         "(not under /dev, which an OSD takes for a device)")
     ap.add_argument("--logs", type=Path, default=Path(tempfile.gettempdir()),
                     help="where each run's aio log is kept")
     ap.add_argument("--json", type=Path, help="also write every run's numbers here")
