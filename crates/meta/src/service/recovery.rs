@@ -2191,7 +2191,6 @@ impl MetaService {
             .store
             .as_ref()
             .and_then(|s| s.read_named(super::peering::PG_STATE_TABLE, &key));
-        super::peering::set_latest(state.clone());
         if let Some(raft) = self.raft_handle() {
             let cmd = MetaCommand::MultiCas {
                 ops: vec![CasOp {
@@ -2202,9 +2201,12 @@ impl MetaService {
                 }],
                 requested_by: "pg-recovery".into(),
             };
+            // Shown once committed, not before: progress the next leader
+            // may not have (this one killed before the write reached a
+            // majority) is never reported, to go back after a failover.
             match raft.client_write(cmd).await {
                 Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasOk => super::peering::set_latest(state),
                     other => debug!("pg state not recorded: {other:?}"),
                 },
                 Err(e) => debug!("pg state not recorded: {e}"),
@@ -2215,6 +2217,7 @@ impl MetaService {
                 &key,
                 Some(&state.encode_to_vec()),
             );
+            super::peering::set_latest(state);
         }
     }
 
