@@ -10,7 +10,12 @@ OSDs, 4+2) and puts, then gets, 64 KiB and 4 MiB objects through it.
 Shared CI runners differ from each other by more than most regressions, so
 nothing here is an absolute number: both builds run on the same runner, in
 the same job, interleaved (base, head, head, base, ...) so a runner that
-slows down part way through slows both. A cell's result is the head's median
+slows down part way through slows both. The aio keeps its data in memory
+(/dev/shm) by default: a runner's disk swung one build's 64 KiB PUTs from
+208 to 372 a second between runs, which no threshold can see through, so
+the check measures the software (CPU, copies, RPCs, locks) and not the
+drive. A change that adds disk work (another fsync) is not seen here; the
+lab and cloud baselines measure the drives. A cell's result is the head's median
 over the base's; the check fails when a cell's throughput falls below
 `--threshold` of the base's. p99 latency is shown, not judged: on a shared
 runner's disk it moves too much from run to run.
@@ -37,7 +42,7 @@ from pathlib import Path
 # bound by the OSDs' fsyncs and the RPCs per request, and one large, bound
 # by erasure coding and the data path's copies. A few seconds a phase.
 CELLS = [
-    ("64KiB", "64KiB", 4000, 5, 32),
+    ("64KiB", "64KiB", 6000, 4, 32),
     ("4MiB", "4MiB", 150, 4, 8),
 ]
 
@@ -67,11 +72,11 @@ class Aio:
     """One aio on a fresh data directory, stopped (and its data removed)
     when the block ends."""
 
-    def __init__(self, binary, workdir, osds=6):
+    def __init__(self, binary, workdir, logs, osds=6):
         self.binary, self.osds = binary, osds
         self.data = Path(tempfile.mkdtemp(prefix="aio-", dir=workdir))
         self.endpoint = f"http://127.0.0.1:{free_port()}"
-        self.log = open(self.data.with_suffix(".log"), "w")
+        self.log = open(logs / f"{self.data.name}.log", "w")
 
     def __enter__(self):
         port = self.endpoint.rsplit(":", 1)[1]
@@ -125,8 +130,8 @@ def bench(client, endpoint, size, objects, passes, concurrency):
     return result
 
 
-def run(binary, client, workdir):
-    with Aio(binary, workdir) as aio:
+def run(binary, client, workdir, logs):
+    with Aio(binary, workdir, logs) as aio:
         # Unmeasured: the first requests pay for connections and the
         # pool's first placement; a pool still being made refuses them.
         deadline = time.monotonic() + 60
@@ -151,7 +156,11 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.85,
                     help="fail when the head's throughput is below this share "
                          "of the base's (default 0.85)")
-    ap.add_argument("--workdir", type=Path, default=Path(tempfile.gettempdir()))
+    ap.add_argument("--workdir", type=Path, default=Path("/dev/shm"),
+                    help="where each run's aio keeps its data (default /dev/shm: "
+                         "memory, see above)")
+    ap.add_argument("--logs", type=Path, default=Path(tempfile.gettempdir()),
+                    help="where each run's aio log is kept")
     ap.add_argument("--json", type=Path, help="also write every run's numbers here")
     args = ap.parse_args()
 
@@ -167,7 +176,7 @@ def main():
         for build in (("base", "head") if r % 2 == 0 else ("head", "base")):
             started = time.monotonic()
             try:
-                runs[build].append(run(builds[build], client, args.workdir))
+                runs[build].append(run(builds[build], client, args.workdir, args.logs))
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"round {r + 1}, {build}: {e}", file=sys.stderr)
                 sys.exit(2)
