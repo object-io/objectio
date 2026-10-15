@@ -17,8 +17,11 @@ use objectio_proto::storage::{
     DiskStatus,
     FindObjectsReferencingNodeRequest,
     FindObjectsReferencingNodeResponse,
+    GetObjectMetaAnswer,
     GetObjectMetaRequest,
     GetObjectMetaResponse,
+    GetObjectMetasRequest,
+    GetObjectMetasResponse,
     GetPgInfoRequest,
     GetPgInfoResponse,
     GetShardMetaRequest,
@@ -503,6 +506,55 @@ impl OsdService {
     /// Per-bucket usage of the objects this OSD is primary for.
     pub fn bucket_usage(&self) -> Vec<objectio_proto::storage::BucketUsage> {
         self.usage.snapshot()
+    }
+
+    /// What `GetObjectMeta` answers for `req` (alone, or as one of a
+    /// `GetObjectMetas`).
+    #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns
+    fn object_meta_answer(
+        &self,
+        req: &GetObjectMetaRequest,
+    ) -> Result<GetObjectMetaResponse, Status> {
+        // A version, if one is named; otherwise the current object.
+        let key = if req.version_id.is_empty() {
+            MetadataKey::object_meta(&req.bucket, &req.key)
+        } else {
+            MetadataKey::object_version(&req.bucket, &req.key, &req.version_id)
+        };
+
+        // Lookup in metadata store
+        match self.meta_store.get(&key) {
+            Some(value) => {
+                // Deserialize ObjectMeta from protobuf
+                let object = ObjectMeta::decode(&value[..]).map_err(|e| {
+                    Status::internal(format!("failed to decode object metadata: {}", e))
+                })?;
+
+                debug!("Found object metadata: {}/{}", req.bucket, req.key);
+
+                let small_shard = if req.with_small_shard {
+                    self.small_shard_of(&object)
+                } else {
+                    None
+                };
+                Ok(GetObjectMetaResponse {
+                    object: Some(object),
+                    found: true,
+                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
+                    small_shard,
+                })
+            }
+            None => {
+                debug!("Object metadata not found: {}/{}", req.bucket, req.key);
+
+                Ok(GetObjectMetaResponse {
+                    object: None,
+                    found: false,
+                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
+                    small_shard: None,
+                })
+            }
+        }
     }
 
     /// This OSD's shard of `object`, if it is kept in its record (B21) and
@@ -1897,48 +1949,32 @@ impl StorageService for OsdService {
         &self,
         request: Request<GetObjectMetaRequest>,
     ) -> Result<Response<GetObjectMetaResponse>, Status> {
-        let req = request.into_inner();
+        self.object_meta_answer(&request.into_inner())
+            .map(Response::new)
+    }
 
-        // If version_id specified, look up specific version; otherwise get current
-        let key = if req.version_id.is_empty() {
-            MetadataKey::object_meta(&req.bucket, &req.key)
-        } else {
-            MetadataKey::object_version(&req.bucket, &req.key, &req.version_id)
-        };
-
-        // Lookup in metadata store
-        match self.meta_store.get(&key) {
-            Some(value) => {
-                // Deserialize ObjectMeta from protobuf
-                let object = ObjectMeta::decode(&value[..]).map_err(|e| {
-                    Status::internal(format!("failed to decode object metadata: {}", e))
-                })?;
-
-                debug!("Found object metadata: {}/{}", req.bucket, req.key);
-
-                let small_shard = if req.with_small_shard {
-                    self.small_shard_of(&object)
-                } else {
-                    None
-                };
-                Ok(Response::new(GetObjectMetaResponse {
-                    object: Some(object),
-                    found: true,
-                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
-                    small_shard,
-                }))
-            }
-            None => {
-                debug!("Object metadata not found: {}/{}", req.bucket, req.key);
-
-                Ok(Response::new(GetObjectMetaResponse {
-                    object: None,
-                    found: false,
-                    tombstone_stamp: self.tombstone(&req.bucket, &req.key, &req.version_id),
-                    small_shard: None,
-                }))
-            }
-        }
+    async fn get_object_metas(
+        &self,
+        request: Request<GetObjectMetasRequest>,
+    ) -> Result<Response<GetObjectMetasResponse>, Status> {
+        let answers = request
+            .into_inner()
+            .requests
+            .iter()
+            .map(|req| match self.object_meta_answer(req) {
+                Ok(response) => GetObjectMetaAnswer {
+                    response: Some(response),
+                    code: 0,
+                    message: String::new(),
+                },
+                Err(status) => GetObjectMetaAnswer {
+                    response: None,
+                    code: status.code() as i32,
+                    message: status.message().to_string(),
+                },
+            })
+            .collect();
+        Ok(Response::new(GetObjectMetasResponse { answers }))
     }
 
     #[allow(clippy::result_large_err)] // tonic::Status, as every handler returns

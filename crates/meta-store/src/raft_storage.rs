@@ -346,6 +346,21 @@ impl MetaRaftStorage {
                 ops,
                 requested_by: _,
             } => apply_multi_cas(txn, ops, events),
+            // Each in turn, against what the one before it left, as
+            // consecutive entries would be. A conflict answers that
+            // command alone; an error (storage) fails the whole entry,
+            // as it would fail the entry holding the command that met it.
+            MetaCommand::Batch(cmds) => cmds
+                .iter()
+                .map(|cmd| match cmd {
+                    MetaCommand::Batch(_) => Err(decode_err(
+                        "MetaCommand",
+                        std::io::Error::other("a batch inside a batch"),
+                    )),
+                    cmd => Self::apply_command(txn, state, cmd, events),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(MetaResponse::Batch),
         }
     }
 }
@@ -1601,6 +1616,75 @@ mod tests {
         // isn't retried on leader restart.
         let (last, _) = s.last_applied_state().await.unwrap();
         assert_eq!(last.unwrap().index, 2);
+    }
+
+    /// A batch (meta's group commit) is applied as its commands would be as
+    /// consecutive entries: each answered on its own, a conflict failing
+    /// only its command, each seeing what the ones before it wrote.
+    #[tokio::test]
+    async fn a_batch_is_applied_as_its_commands_one_after_another() {
+        let (_d, mut s) = storage();
+        let put = |key: &str, expected: Option<&[u8]>, new: &[u8]| MetaCommand::MultiCas {
+            ops: vec![CasOp {
+                table: CasTable::IcebergTables,
+                key: key.into(),
+                expected: expected.map(<[u8]>::to_vec),
+                new_value: Some(new.to_vec()),
+            }],
+            requested_by: "batch".into(),
+        };
+        let batch = MetaCommand::Batch(vec![
+            put("ns/a", None, b"a1"),
+            // Sees the write before it in the same entry.
+            put("ns/a", Some(b"a1"), b"a2"),
+            // Conflicts: alone.
+            put("ns/b", Some(b"never"), b"b1"),
+            put("ns/c", None, b"c1"),
+            MetaCommand::SetConfig {
+                key: "k".into(),
+                value: b"v".to_vec(),
+                updated_by: "batch".into(),
+                updated_at: 1,
+            },
+        ]);
+        let r = s
+            .apply_to_state_machine(&[normal_entry(1, batch)])
+            .await
+            .unwrap();
+        let MetaResponse::Batch(answers) = &r[0] else {
+            panic!("expected a batch's answers, got {:?}", r[0]);
+        };
+        assert_eq!(answers.len(), 5);
+        assert!(matches!(answers[0], MetaResponse::MultiCasOk));
+        assert!(matches!(answers[1], MetaResponse::MultiCasOk));
+        assert!(
+            matches!(&answers[2], MetaResponse::MultiCasConflict { failed_indices } if failed_indices == &vec![0])
+        );
+        assert!(matches!(answers[3], MetaResponse::MultiCasOk));
+        assert!(matches!(answers[4], MetaResponse::ConfigSet { version: 1 }));
+
+        let txn = s.db.begin_read().unwrap();
+        let t = txn
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("iceberg_tables"))
+            .unwrap();
+        assert_eq!(t.get("ns/a").unwrap().unwrap().value(), b"a2");
+        assert!(t.get("ns/b").unwrap().is_none());
+        assert_eq!(t.get("ns/c").unwrap().unwrap().value(), b"c1");
+        let (last, _) = s.last_applied_state().await.unwrap();
+        assert_eq!(last.unwrap().index, 1);
+    }
+
+    /// A batch inside a batch is never written; one in the log fails the
+    /// entry rather than being applied some way.
+    #[tokio::test]
+    async fn a_batch_inside_a_batch_is_refused() {
+        let (_d, mut s) = storage();
+        let nested = MetaCommand::Batch(vec![MetaCommand::Batch(vec![])]);
+        assert!(
+            s.apply_to_state_machine(&[normal_entry(1, nested)])
+                .await
+                .is_err()
+        );
     }
 
     /// Setting an OSD's admin state tells every node's listener, not only

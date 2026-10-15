@@ -27,6 +27,7 @@ pub mod iam_api;
 pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
+pub mod meta_reads;
 pub mod metrics_middleware;
 pub mod node_cache;
 pub mod origin;

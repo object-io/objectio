@@ -19,11 +19,63 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const STATE: TableDefinition<&str, u64> = TableDefinition::new("state");
+/// The rest of a value split to fit a page ([`split_at`]), by its key.
+const TAILS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tails");
 /// The LSN through which the file holds every change.
 const CHECKPOINT_LSN: &str = "checkpoint_lsn";
 
 fn storage_err<E: Into<redb::Error>>(what: &str) -> impl Fn(E) -> Error + '_ {
     move |e| Error::Storage(format!("metadata index: {what}: {}", e.into()))
+}
+
+/// redb's room for one entry in a leaf of its own besides the key and
+/// value (a header and their end offsets: 12 bytes), with a margin.
+fn slack(key: &[u8]) -> usize {
+    key.len() + 64
+}
+
+/// The most a split value's rest may be.
+const TAIL_MAX: usize = 1024;
+
+/// Where to split a value of `len` bytes under `key` for the file, if at
+/// all (B21). redb gives a leaf the next power of two of pages up that
+/// holds it, so a value just past a power of two took twice its size, in
+/// the file and in what each checkpoint writes: a small shard of a 64 KiB
+/// object (16 KiB, 4+2) took a 32 KiB page. Such a value is kept as a
+/// first part that fills the page one size down exactly, and its rest
+/// (at most [`TAIL_MAX`]) in [`TAILS`], written in the same commit.
+fn split_at(key: &[u8], len: usize) -> Option<usize> {
+    let page = (len + slack(key)).next_power_of_two() / 2;
+    if page < 4096 {
+        return None;
+    }
+    let first = page - slack(key);
+    (len > first && len - first <= TAIL_MAX).then_some(first)
+}
+
+/// Whether a value of `len` bytes read from the file under `key` may be
+/// the first part of one split by [`split_at`]: its rest is then in
+/// [`TAILS`]. A value stored whole that happens to have this length has
+/// none there.
+fn may_be_split(key: &[u8], len: usize) -> bool {
+    let full = len + slack(key);
+    full >= 4096 && full.is_power_of_two()
+}
+
+/// `value`, read from the file under `key`, whole: with its rest from
+/// `tails` if it was split.
+fn whole<T: redb::ReadableTable<&'static [u8], &'static [u8]>>(
+    tails: &T,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Vec<u8>> {
+    let mut out = value.to_vec();
+    if may_be_split(key, value.len())
+        && let Some(rest) = tails.get(key).map_err(storage_err("read"))?
+    {
+        out.extend_from_slice(rest.value());
+    }
+    Ok(out)
 }
 
 /// An entry of a memtable: its key and value, `None` for a delete.
@@ -186,6 +238,7 @@ impl DiskIndex {
         {
             tx.open_table(ENTRIES).map_err(storage_err("open"))?;
             tx.open_table(STATE).map_err(storage_err("open"))?;
+            tx.open_table(TAILS).map_err(storage_err("open"))?;
         }
         tx.commit().map_err(storage_err("open"))?;
         Ok(Self {
@@ -248,10 +301,12 @@ impl DiskIndex {
         }
         let tx = self.db.begin_read().map_err(storage_err("read"))?;
         let entries = tx.open_table(ENTRIES).map_err(storage_err("read"))?;
-        Ok(entries
+        let tails = tx.open_table(TAILS).map_err(storage_err("read"))?;
+        entries
             .get(key)
             .map_err(storage_err("read"))?
-            .map(|v| v.value().to_vec()))
+            .map(|v| whole(&tails, key, v.value()))
+            .transpose()
     }
 
     /// Call `f` on each entry under `prefix`, in key order, starting after
@@ -269,6 +324,7 @@ impl DiskIndex {
 
         let tx = self.db.begin_read().map_err(storage_err("scan"))?;
         let entries = tx.open_table(ENTRIES).map_err(storage_err("scan"))?;
+        let tails = tx.open_table(TAILS).map_err(storage_err("scan"))?;
         let start = after.map_or(Bound::Included(prefix), Bound::Excluded);
         let mut file = entries
             .range::<&[u8]>((start, Bound::Unbounded))
@@ -300,7 +356,7 @@ impl DiskIndex {
                 }
             } else {
                 let (k, v) = file.next().expect("peeked");
-                if !f(k.value(), v.value()) {
+                if !f(k.value(), &whole(&tails, k.value(), v.value())?) {
                     return Ok(());
                 }
             }
@@ -331,9 +387,11 @@ impl DiskIndex {
         }
         let tx = self.db.begin_read().map_err(storage_err("snapshot"))?;
         let entries = tx.open_table(ENTRIES).map_err(storage_err("snapshot"))?;
+        let tails = tx.open_table(TAILS).map_err(storage_err("snapshot"))?;
         drop(t);
         Ok(Snapshot {
             entries,
+            tails,
             mem,
             from: from.to_vec(),
             below: below.to_vec(),
@@ -406,12 +464,29 @@ impl DiskIndex {
         // a soak VM, and growing with it). It costs each commit an extra
         // flush, and commits here are one a checkpoint.
         tx.set_quick_repair(true);
+        // Values split to fit a page only once every OSD reads them
+        // (format level 8): an OSD of the previous release would read the
+        // first part alone.
+        let split =
+            objectio_common::version::allows(objectio_common::version::SPLIT_INDEX_VALUES_LEVEL);
         {
             let mut entries = tx.open_table(ENTRIES).map_err(storage_err("checkpoint"))?;
+            let mut tails = tx.open_table(TAILS).map_err(storage_err("checkpoint"))?;
             for (k, v) in frozen.map.read().iter() {
+                let k = k.as_slice();
+                // A rest of the value this replaces goes with it.
+                tails.remove(k).map_err(storage_err("checkpoint"))?;
                 match v {
-                    Some(v) => entries.insert(k.as_slice(), v.as_slice()),
-                    None => entries.remove(k.as_slice()).map(|_| None),
+                    Some(v) => match split_at(k, v.len()).filter(|_| split) {
+                        Some(at) => {
+                            entries
+                                .insert(k, &v[..at])
+                                .map_err(storage_err("checkpoint"))?;
+                            tails.insert(k, &v[at..]).map(|_| None)
+                        }
+                        None => entries.insert(k, v.as_slice()),
+                    },
+                    None => entries.remove(k).map(|_| None),
                 }
                 .map_err(storage_err("checkpoint"))?;
             }
@@ -436,6 +511,7 @@ impl DiskIndex {
 /// and as the memtables held it.
 pub struct Snapshot {
     entries: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
+    tails: redb::ReadOnlyTable<&'static [u8], &'static [u8]>,
     mem: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     from: Vec<u8>,
     below: Vec<u8>,
@@ -480,7 +556,7 @@ impl Snapshot {
                 }
             } else {
                 let (k, v) = file.next().expect("peeked");
-                if !f(k.value(), v.value()) {
+                if !f(k.value(), &whole(&self.tails, k.value(), v.value())?) {
                     return Ok(());
                 }
             }
@@ -728,5 +804,103 @@ mod tests {
         let idx = DiskIndex::open(&crashed, 1 << 20).unwrap();
         assert_eq!(idx.checkpoint_lsn().unwrap(), 1);
         assert_eq!(idx.get(&7u32.to_be_bytes()).unwrap(), Some(vec![1; 100]));
+    }
+
+    /// Where values split: only just past a power of two, into a first
+    /// part that fills the page one size down.
+    #[test]
+    fn values_just_past_a_power_of_two_are_split_to_fit_a_page() {
+        let key = [7u8; 70];
+        let at = split_at(&key, 16384).expect("a 16 KiB small shard is split");
+        assert_eq!(at + slack(&key), 8192 * 2);
+        assert!(may_be_split(&key, at));
+        assert_eq!(split_at(&key, 16000), None, "fits its own page whole");
+        assert_eq!(split_at(&key, 2000), None, "small values share pages");
+        assert!(split_at(&key, 4600).is_some(), "a 4 KiB object inline");
+    }
+
+    /// A split value reads back whole through every path; replacing or
+    /// deleting it takes its rest with it, even when the replacement has
+    /// the length of a first part.
+    #[test]
+    fn split_values_read_whole_and_go_whole() {
+        objectio_common::version::set_active_level(
+            objectio_common::version::SPLIT_INDEX_VALUES_LEVEL,
+        );
+        let dir = tempdir().unwrap();
+        let idx = open(dir.path());
+        let value = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+                .collect()
+        };
+        let a = value(16384, 1);
+        let b = value(4600, 2);
+        idx.put(b"s/a".to_vec(), a.clone());
+        idx.put(b"s/b".to_vec(), b.clone());
+        idx.put(b"s/c".to_vec(), value(16384, 3));
+        assert!(idx.freeze());
+        idx.flush_frozen(1).unwrap();
+
+        assert_eq!(idx.get(b"s/a").unwrap(), Some(a.clone()));
+        assert_eq!(idx.get(b"s/b").unwrap(), Some(b.clone()));
+        let mut scanned = Vec::new();
+        idx.for_each_prefix(b"s/", None, |k, v| {
+            scanned.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(scanned[0], (b"s/a".to_vec(), a));
+        assert_eq!(scanned[1], (b"s/b".to_vec(), b));
+        let snap = idx.snapshot(b"s/", b"s0").unwrap();
+        let mut seen = Vec::new();
+        snap.for_each(|k, v| {
+            seen.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, scanned);
+        drop(snap);
+
+        // Replaced by a value as long as a first part, and deleted.
+        let first = split_at(b"s/a", 16384).unwrap();
+        let replacement = value(first, 4);
+        idx.put(b"s/a".to_vec(), replacement.clone());
+        idx.delete(b"s/c".to_vec());
+        assert!(idx.freeze());
+        idx.flush_frozen(2).unwrap();
+        assert_eq!(idx.get(b"s/a").unwrap(), Some(replacement));
+        assert_eq!(idx.get(b"s/c").unwrap(), None);
+        let tx = idx.db.begin_read().unwrap();
+        let tails = tx.open_table(TAILS).unwrap();
+        assert!(tails.get(&b"s/a"[..]).unwrap().is_none());
+        assert!(tails.get(&b"s/c"[..]).unwrap().is_none());
+    }
+
+    /// 16 KiB values (a 64 KiB object's small shards, 4+2) take about
+    /// their size in the file, not twice it.
+    #[test]
+    fn small_shards_take_about_their_size_in_the_file() {
+        objectio_common::version::set_active_level(
+            objectio_common::version::SPLIT_INDEX_VALUES_LEVEL,
+        );
+        let dir = tempdir().unwrap();
+        let idx = open(dir.path());
+        let n = 2000u32;
+        for i in 0..n {
+            let mut key = b"osd_small:".to_vec();
+            key.extend_from_slice(format!("{:064x}", i.wrapping_mul(2_654_435_761)).as_bytes());
+            idx.put(key, vec![i as u8; 16384]);
+        }
+        assert!(idx.freeze());
+        idx.flush_frozen(1).unwrap();
+        // The pages redb holds, not the file: it grows the file ahead.
+        let stats = idx.db.begin_write().unwrap().stats().unwrap();
+        let held = stats.allocated_pages() * stats.page_size() as u64;
+        let data = u64::from(n) * 16384;
+        assert!(
+            held < data * 12 / 10,
+            "{held} bytes of pages for {data} bytes of values"
+        );
     }
 }
