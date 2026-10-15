@@ -43,7 +43,7 @@ from pathlib import Path
 # by erasure coding and the data path's copies. A few seconds a phase.
 CELLS = [
     ("64KiB", "64KiB", 6000, 4, 32),
-    ("4MiB", "4MiB", 150, 4, 8),
+    ("4MiB", "4MiB", 400, 3, 8),
 ]
 
 PHASE = re.compile(r"^(PUT|GET): (\d+) ok, (\d+) failed in ([\d.]+) s", re.M)
