@@ -118,6 +118,11 @@ pub enum Command {
         #[command(subcommand)]
         action: AuditCmd,
     },
+    /// Bucket replication: targets, and resyncs of existing objects
+    Replication {
+        #[command(subcommand)]
+        action: ReplicationCmd,
+    },
     /// Buckets: create, owner, policy, dedup, lifecycle, CORS
     Bucket {
         #[command(subcommand)]
@@ -638,6 +643,78 @@ pub enum AuditCmd {
         #[command(flatten)]
         tenant: TenantOpt,
     },
+}
+
+// ── replication ─────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+pub enum ReplicationCmd {
+    /// Replication targets: remote clusters' buckets
+    Target {
+        #[command(subcommand)]
+        action: ReplicationTargetCmd,
+    },
+    /// Resyncs: a bucket's existing versions sent to a target
+    Resync {
+        #[command(subcommand)]
+        action: ResyncCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReplicationTargetCmd {
+    /// GET /_admin/replication/targets[?tenant=]
+    List {
+        #[command(flatten)]
+        tenant: TenantOpt,
+    },
+    /// POST /_admin/replication/targets[?tenant=] — create or replace
+    Set {
+        name: String,
+        /// The remote cluster's S3 endpoint, http(s)://host[:port]
+        #[arg(long)]
+        remote_endpoint: String,
+        /// The bucket there
+        #[arg(long)]
+        remote_bucket: String,
+        /// Credentials there, holding s3:ReplicateObject on the bucket
+        #[arg(long)]
+        remote_access_key: String,
+        #[arg(long, env = "OBIOCTL_REMOTE_SECRET_KEY", hide_env_values = true)]
+        remote_secret_key: String,
+        /// The remote cluster's SigV4 region (default us-east-1)
+        #[arg(long)]
+        remote_region: Option<String>,
+        /// Bytes a second the cluster may send to it (e.g. 100M); none
+        /// when omitted
+        #[arg(long)]
+        bandwidth: Option<String>,
+        #[command(flatten)]
+        tenant: TenantOpt,
+    },
+    /// DELETE /_admin/replication/targets/NAME[?tenant=]
+    Delete {
+        name: String,
+        #[command(flatten)]
+        tenant: TenantOpt,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ResyncCmd {
+    /// POST /_admin/replication/resync — send BUCKET's existing versions
+    /// to TARGET
+    Start {
+        bucket: String,
+        target: String,
+        /// Send versions the target has already received too
+        #[arg(long)]
+        again: bool,
+    },
+    /// GET /_admin/replication/resync?bucket= — each target's resync
+    Status { bucket: String },
+    /// DELETE /_admin/replication/resync?bucket=&target=
+    Cancel { bucket: String, target: String },
 }
 
 // ── bucket / provision ──────────────────────────────────────────────────

@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -98,6 +99,10 @@ pub struct Target {
     /// Set by the system admin: exempt from the tenant host allowlist.
     #[serde(default)]
     pub operator: bool,
+    /// Bytes a second the cluster may send to it, shared by the fast path
+    /// and the scanner on every gateway; 0: no limit.
+    #[serde(default)]
+    pub bandwidth: u64,
 }
 
 fn default_region() -> String {
@@ -114,6 +119,7 @@ impl Target {
             "bucket": self.bucket,
             "region": self.region,
             "access_key": self.access_key,
+            "bandwidth": self.bandwidth,
         })
     }
 }
@@ -865,6 +871,9 @@ struct Job {
     key: String,
     version_id: String,
     target: String,
+    /// Send it even if the version says the target has it (a resync with
+    /// `again`).
+    force: bool,
 }
 
 type CachedRules = (Option<Arc<Vec<Rule>>>, Instant);
@@ -884,10 +893,23 @@ pub struct Replication {
     backoff: Mutex<HashMap<Job, (u32, Instant)>>,
     /// Sends the fast path may have in flight.
     in_flight: Arc<tokio::sync::Semaphore>,
+    /// Versions this gateway is sending now: the scanner leaves them to the
+    /// fast path that is, rather than send them a second time.
+    sending: Mutex<std::collections::HashSet<Job>>,
+    /// Each limited target's pacer on this gateway, by `tenant/name`.
+    pacers: Mutex<HashMap<String, Arc<Pacer>>>,
+    /// Gateways up in the cluster, which share each target's limit.
+    gateways: AtomicU64,
 }
 
 /// The fast path's queue. Past it, versions wait for the scanner.
 const QUEUE: usize = 10_000;
+
+/// Sends the fast path may have in flight; a resync's, and the scanner's.
+const FAST_SENDS: usize = 8;
+const RESYNC_SENDS: usize = 8;
+/// Sends one gateway may have sharing a target's pace at once.
+const SHARING_SENDS: u32 = FAST_SENDS as u32 + RESYNC_SENDS as u32 + 1;
 
 impl Default for Replication {
     fn default() -> Self {
@@ -900,7 +922,10 @@ impl Default for Replication {
             queue,
             queue_rx: Mutex::new(Some(rx)),
             backoff: Mutex::default(),
-            in_flight: Arc::new(tokio::sync::Semaphore::new(8)),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(FAST_SENDS)),
+            sending: Mutex::default(),
+            pacers: Mutex::default(),
+            gateways: AtomicU64::new(1),
         }
     }
 }
@@ -910,6 +935,124 @@ impl Replication {
     pub fn forget_bucket(&self, bucket: &str) {
         self.rules.write().remove(bucket);
     }
+
+    /// The pace `target`'s bytes go at from this gateway: its limit,
+    /// shared evenly by the gateways up. None when it has no limit.
+    fn pace(&self, target: &Target) -> Option<Pace> {
+        if target.bandwidth == 0 {
+            return None;
+        }
+        let gateways = self.gateways.load(Ordering::Relaxed).max(1);
+        let pacer = Arc::clone(
+            self.pacers
+                .lock()
+                .entry(cache_key(&target.tenant, &target.name))
+                .or_default(),
+        );
+        Some(Pace {
+            pacer,
+            rate: (target.bandwidth / gateways).max(1),
+        })
+    }
+}
+
+// ── Bandwidth ───────────────────────────────────────────────────────────
+//
+// A target's limit is the cluster's: each gateway sends to it at the limit
+// divided by the gateways up (as meta last heard from them), its fast path,
+// scanner and resyncs sharing that pace. A gateway can't borrow another's
+// unused share, so a cluster may send below the limit, never above it
+// (but for the seconds before a new gateway's first report).
+
+/// Bytes go in chunks this size, each when the pace allows.
+const PACE_CHUNK: usize = 64 << 10;
+
+/// One target's pace on this gateway: when the next byte may go.
+#[derive(Debug)]
+struct Pacer {
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl Default for Pacer {
+    fn default() -> Self {
+        Self {
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+}
+
+impl Pacer {
+    /// Wait until `bytes` more may go at `rate` bytes a second. A pacer left
+    /// idle saves nothing up: no burst follows a quiet spell.
+    async fn take(&self, bytes: u64, rate: u64) {
+        let at = {
+            let mut next = self.next.lock().await;
+            let start = (*next).max(tokio::time::Instant::now());
+            *next = start + time_for(bytes, rate);
+            start
+        };
+        tokio::time::sleep_until(at).await;
+    }
+}
+
+fn time_for(bytes: u64, rate: u64) -> Duration {
+    #[allow(clippy::cast_precision_loss)]
+    Duration::from_secs_f64(bytes as f64 / rate.max(1) as f64)
+}
+
+/// A send's share of its target's pace.
+#[derive(Debug, Clone)]
+struct Pace {
+    pacer: Arc<Pacer>,
+    /// Bytes a second, this gateway's share.
+    rate: u64,
+}
+
+impl Pace {
+    fn time_for(&self, bytes: u64) -> Duration {
+        time_for(bytes, self.rate)
+    }
+
+    /// `body` as a stream whose chunks go at the pace.
+    fn paced(
+        &self,
+        body: bytes::Bytes,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+        let pace = self.clone();
+        futures::stream::unfold(body, move |mut rest| {
+            let pace = pace.clone();
+            async move {
+                if rest.is_empty() {
+                    return None;
+                }
+                let chunk = rest.split_to(rest.len().min(PACE_CHUNK));
+                pace.pacer.take(chunk.len() as u64, pace.rate).await;
+                Some((Ok(chunk), rest))
+            }
+        })
+    }
+}
+
+/// Keep `gateways` to the number of gateways meta heard from lately.
+async fn count_gateways(state: &AppState) {
+    let Ok(resp) = state
+        .meta_client
+        .clone()
+        .get_upgrade_status(objectio_proto::metadata::GetUpgradeStatusRequest {})
+        .await
+    else {
+        return;
+    };
+    let n = resp
+        .into_inner()
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "gateway")
+        .count();
+    state
+        .replication
+        .gateways
+        .store((n as u64).max(1), Ordering::Relaxed);
 }
 
 static SENT: std::sync::LazyLock<objectio_common::histogram::CounterVec> =
@@ -970,6 +1113,7 @@ pub fn enqueue(state: &AppState, object: &ObjectMeta) {
                 key: object.key.clone(),
                 version_id: object.version_id.clone(),
                 target: target.clone(),
+                force: false,
             });
         }
     }
@@ -992,6 +1136,14 @@ pub fn spawn(state: Arc<AppState>, timing: Timing) {
     let Some(mut rx) = state.replication.queue_rx.lock().take() else {
         return;
     };
+    let counting = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(objectio_proto::transport::VERSION_REPORT_EVERY);
+        loop {
+            ticker.tick().await;
+            count_gateways(&counting).await;
+        }
+    });
     let fast = Arc::clone(&state);
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
@@ -1023,6 +1175,7 @@ pub fn spawn(state: Arc<AppState>, timing: Timing) {
             if !lease(&state, &holder, timing).await {
                 continue;
             }
+            resyncs(&state, &holder, timing).await;
             scan(&state, &holder, timing).await;
         }
     });
@@ -1107,6 +1260,7 @@ async fn scan_bucket(
                         key: key.clone(),
                         version_id: v.version_id.clone(),
                         target: target.clone(),
+                        force: false,
                     };
                     let due = state
                         .replication
@@ -1128,8 +1282,18 @@ async fn scan_bucket(
 }
 
 /// Send `job` and record the outcome on the version: `COMPLETED`, or
-/// `FAILED` with a retry scheduled. Whether it was sent.
+/// `FAILED` with a retry scheduled. Whether it was sent (not, when this
+/// gateway is sending it already).
 async fn send_and_record(state: &Arc<AppState>, job: &Job) -> bool {
+    if !state.replication.sending.lock().insert(job.clone()) {
+        return false;
+    }
+    let sent = send_and_record_once(state, job).await;
+    state.replication.sending.lock().remove(job);
+    sent
+}
+
+async fn send_and_record_once(state: &Arc<AppState>, job: &Job) -> bool {
     let started = Instant::now();
     match send(state, job).await {
         Ok(Sent::Done(bytes)) => {
@@ -1217,11 +1381,14 @@ enum Sent {
     Gone,
 }
 
+/// How long a send may take, beyond the wait its bandwidth limit makes.
+const SEND_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(SEND_TIMEOUT)
             .build()
             .unwrap_or_default()
     })
@@ -1243,14 +1410,18 @@ async fn send(state: &Arc<AppState>, job: &Job) -> Result<Sent, String> {
     else {
         return Ok(Sent::Gone);
     };
-    if version.replication.get(&job.target).map(String::as_str) == Some(COMPLETED) {
+    if !job.force && version.replication.get(&job.target).map(String::as_str) == Some(COMPLETED) {
         return Ok(Sent::Done(0));
     }
     let target = bucket_target(state, &job.bucket, &job.target).await?;
+    let link = Link {
+        pace: state.replication.pace(&target),
+        target: &target,
+    };
     let replica = replica_headers(&version);
 
     if version.is_delete_marker {
-        call(&target, "DELETE", &job.key, &[], &replica, &[]).await?;
+        link.call("DELETE", &job.key, &[], &replica, &[]).await?;
         return Ok(Sent::Done(0));
     }
     let mut headers = object_headers(&version);
@@ -1264,10 +1435,10 @@ async fn send(state: &Arc<AppState>, job: &Job) -> Result<Sent, String> {
                 version.size
             ));
         }
-        call(&target, "PUT", &job.key, &[], &headers, &body).await?;
+        link.call("PUT", &job.key, &[], &headers, &body).await?;
         return Ok(Sent::Done(version.size));
     }
-    send_multipart(state, job, &target, &version, &headers).await?;
+    send_multipart(state, job, &link, &version, &headers).await?;
     Ok(Sent::Done(version.size))
 }
 
@@ -1377,11 +1548,13 @@ async fn read(
 async fn send_multipart(
     state: &Arc<AppState>,
     job: &Job,
-    target: &Target,
+    link: &Link<'_>,
     version: &ObjectMeta,
     headers: &[(String, String)],
 ) -> Result<(), String> {
-    let created = call(target, "POST", &job.key, &[("uploads", "")], headers, &[]).await?;
+    let created = link
+        .call("POST", &job.key, &[("uploads", "")], headers, &[])
+        .await?;
     let Some(upload) = created
         .split("<UploadId>")
         .nth(1)
@@ -1402,16 +1575,16 @@ async fn send_multipart(
                 return Err(format!("read {} bytes of part {n}", body.len()));
             }
             let number = n.to_string();
-            let etag = call_header(
-                target,
-                "PUT",
-                &job.key,
-                &[("partNumber", &number), ("uploadId", &upload)],
-                &[],
-                &body,
-                "etag",
-            )
-            .await?;
+            let etag = link
+                .call_header(
+                    "PUT",
+                    &job.key,
+                    &[("partNumber", &number), ("uploadId", &upload)],
+                    &[],
+                    &body,
+                    "etag",
+                )
+                .await?;
             use std::fmt::Write as _;
             let _ = write!(
                 parts,
@@ -1421,8 +1594,7 @@ async fn send_multipart(
             n += 1;
         }
         let complete = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
-        call(
-            target,
+        link.call(
             "POST",
             &job.key,
             &[("uploadId", &upload)],
@@ -1434,52 +1606,54 @@ async fn send_multipart(
     }
     .await;
     if result.is_err() {
-        let _ = call(
-            target,
-            "DELETE",
-            &job.key,
-            &[("uploadId", &upload)],
-            &[],
-            &[],
-        )
-        .await;
+        let _ = link
+            .call("DELETE", &job.key, &[("uploadId", &upload)], &[], &[])
+            .await;
     }
     result
 }
 
-/// A signed request to the target bucket; the response body on success.
-async fn call(
-    target: &Target,
-    method: &str,
-    key: &str,
-    query: &[(&str, &str)],
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Result<String, String> {
-    let resp = request(target, method, key, query, headers, body).await?;
-    resp.text().await.map_err(|e| e.to_string())
+/// A target, and the pace its bytes go at from this gateway.
+struct Link<'a> {
+    target: &'a Target,
+    pace: Option<Pace>,
 }
 
-/// As [`call`], returning one response header.
-async fn call_header(
-    target: &Target,
-    method: &str,
-    key: &str,
-    query: &[(&str, &str)],
-    headers: &[(String, String)],
-    body: &[u8],
-    name: &str,
-) -> Result<String, String> {
-    let resp = request(target, method, key, query, headers, body).await?;
-    resp.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .ok_or_else(|| format!("the target sent no {name}"))
+impl Link<'_> {
+    /// A signed request to the target bucket; the response body on success.
+    async fn call(
+        &self,
+        method: &str,
+        key: &str,
+        query: &[(&str, &str)],
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<String, String> {
+        let resp = request(self, method, key, query, headers, body).await?;
+        resp.text().await.map_err(|e| e.to_string())
+    }
+
+    /// As [`Link::call`], returning one response header.
+    async fn call_header(
+        &self,
+        method: &str,
+        key: &str,
+        query: &[(&str, &str)],
+        headers: &[(String, String)],
+        body: &[u8],
+        name: &str,
+    ) -> Result<String, String> {
+        let resp = request(self, method, key, query, headers, body).await?;
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| format!("the target sent no {name}"))
+    }
 }
 
 async fn request(
-    target: &Target,
+    link: &Link<'_>,
     method: &str,
     key: &str,
     query: &[(&str, &str)],
@@ -1487,6 +1661,7 @@ async fn request(
     body: &[u8],
 ) -> Result<reqwest::Response, String> {
     use objectio_auth::signer::{Request as SignRequest, Signer, escape_path, escape_segment};
+    let target = link.target;
     let base = target.endpoint.trim_end_matches('/');
     let host = base
         .split("://")
@@ -1538,7 +1713,19 @@ async fn request(
         req = req.header(k.as_str(), value);
     }
     if !body.is_empty() {
-        req = req.body(body.to_vec());
+        req = match &link.pace {
+            None => req.body(body.to_vec()),
+            Some(pace) => {
+                // Its bytes at the target's rate, with every send that may
+                // share the rate ahead of it.
+                let wait = pace.time_for(body.len() as u64 * u64::from(SHARING_SENDS));
+                req.header(reqwest::header::CONTENT_LENGTH, body.len())
+                    .timeout(SEND_TIMEOUT + wait)
+                    .body(reqwest::Body::wrap_stream(
+                        pace.paced(bytes::Bytes::copy_from_slice(body)),
+                    ))
+            }
+        };
     }
     let resp = req.send().await.map_err(|e| format!("the target: {e}"))?;
     if resp.status().is_success() {
@@ -1553,6 +1740,453 @@ async fn request(
             .unwrap_or("");
         Err(format!("the target answered {status} {code}"))
     }
+}
+
+// ── Resync ──────────────────────────────────────────────────────────────
+//
+// Existing versions — written before a rule, or sent to a target that has
+// since lost them — reach a target through a resync: the scanner walks the
+// bucket in key order, marks each version a rule sends to the target
+// `PENDING` and sends it, a page at a time. The resync is a record in meta
+// (`replication/resync/<bucket>/<target>`) saying how far it has got: the
+// key after which nothing is marked or sent yet. A page's marks and sends
+// finish before the record moves past it, so a gateway (or meta) that
+// stops mid-resync leaves the scanner, wherever it runs next, to take the
+// page again. What the page had marked but not sent is `PENDING` by then,
+// which the scanner sends; a version sent twice is no harm (the target
+// keeps one copy).
+
+const RESYNC_PREFIX: &str = "replication/resync/";
+/// How long the scanner gives resyncs on each pass before it scans for
+/// versions not yet sent: a resync of a big bucket goes on over passes and
+/// doesn't hold back other buckets' retries.
+const RESYNC_SLICE: Duration = Duration::from_secs(60);
+
+pub const RESYNC_RUNNING: &str = "running";
+pub const RESYNC_DONE: &str = "done";
+pub const RESYNC_CANCELLED: &str = "cancelled";
+
+/// A resync of a bucket's versions to one of its targets, and how far it
+/// has got.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Resync {
+    pub id: String,
+    pub bucket: String,
+    pub target: String,
+    /// Send versions the target has already (`COMPLETED`) too: for a target
+    /// replaced, or one that lost data.
+    pub again: bool,
+    /// `running`, `done` or `cancelled`.
+    pub state: String,
+    /// Every version of every key up to this one is marked and sent.
+    pub after: String,
+    /// Versions looked at, those a rule sends to the target.
+    pub scanned: u64,
+    pub covered: u64,
+    /// Marked `PENDING` (they hadn't been, or had been sent, with `again`).
+    pub marked: u64,
+    /// Sent, and failed (left `FAILED` for the scanner to retry).
+    pub sent: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub started_ms: u64,
+    pub updated_ms: u64,
+    pub finished_ms: u64,
+    pub by: String,
+    /// Why the last page was not finished, if it wasn't.
+    pub error: String,
+}
+
+fn resync_key(bucket: &str, target: &str) -> String {
+    format!("{RESYNC_PREFIX}{bucket}/{target}")
+}
+
+async fn read_resync(
+    state: &AppState,
+    bucket: &str,
+    target: &str,
+) -> Result<Option<Resync>, String> {
+    let resp = state
+        .meta_client
+        .clone()
+        .get_config(GetConfigRequest {
+            key: resync_key(bucket, target),
+        })
+        .await
+        .map_err(|e| e.message().to_string())?
+        .into_inner();
+    Ok(resp
+        .entry
+        .filter(|_| resp.found)
+        .and_then(|e| serde_json::from_slice(&e.value).ok()))
+}
+
+async fn write_resync(state: &AppState, r: &Resync) -> Result<(), String> {
+    state
+        .meta_client
+        .clone()
+        .set_config(SetConfigRequest {
+            key: resync_key(&r.bucket, &r.target),
+            value: serde_json::to_vec(r).unwrap_or_default(),
+            updated_by: r.by.clone(),
+        })
+        .await
+        .map(drop)
+        .map_err(|e| e.message().to_string())
+}
+
+async fn list_resyncs(state: &AppState, prefix: &str) -> Result<Vec<Resync>, String> {
+    let entries = state
+        .meta_client
+        .clone()
+        .list_config(ListConfigRequest {
+            prefix: prefix.to_string(),
+        })
+        .await
+        .map_err(|e| e.message().to_string())?
+        .into_inner()
+        .entries;
+    Ok(entries
+        .iter()
+        .filter_map(|e| serde_json::from_slice(&e.value).ok())
+        .collect())
+}
+
+/// The caller may resync `bucket` (its tenant's admin, or the system
+/// admin); the bucket's tenant.
+async fn bucket_admin(
+    state: &AppState,
+    auth: &Option<Extension<AuthResult>>,
+    headers: &HeaderMap,
+    bucket: &str,
+) -> Result<(), Response> {
+    let tenant = bucket_tenant(state, bucket)
+        .await
+        .map_err(|e| admin_error(StatusCode::NOT_FOUND, &e))?;
+    let admin = crate::iam_admin::admin_in(
+        state,
+        auth,
+        headers,
+        (!tenant.is_empty()).then_some(tenant.as_str()),
+    )
+    .await?;
+    if admin.system || admin.tenant == tenant {
+        Ok(())
+    } else {
+        Err(admin_error(
+            StatusCode::FORBIDDEN,
+            "not an admin of the bucket's tenant",
+        ))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResyncRequest {
+    pub bucket: String,
+    pub target: String,
+    #[serde(default)]
+    pub again: bool,
+}
+
+/// `POST /_admin/replication/resync` `{bucket, target, again}` — send the
+/// bucket's existing versions to one of its targets. A resync of the pair
+/// already running is returned as it is.
+pub async fn admin_start_resync(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Json(req): Json<ResyncRequest>,
+) -> Response {
+    if let Err(r) = bucket_admin(&state, &auth, &headers, &req.bucket).await {
+        return r;
+    }
+    state.replication.forget_bucket(&req.bucket);
+    let sends = bucket_rules(&state, &req.bucket)
+        .await
+        .is_some_and(|rules| rules.iter().any(|r| r.enabled && r.target == req.target));
+    if !sends {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "no enabled replication rule of bucket '{}' sends to '{}'",
+                req.bucket, req.target
+            ),
+        );
+    }
+    if let Err(e) = bucket_target(&state, &req.bucket, &req.target).await {
+        return admin_error(StatusCode::BAD_REQUEST, &e);
+    }
+    match read_resync(&state, &req.bucket, &req.target).await {
+        Ok(Some(r)) if r.state == RESYNC_RUNNING => return Json(r).into_response(),
+        Ok(_) => {}
+        Err(e) => return admin_error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+    let now = crate::lifecycle::now_ms();
+    let r = Resync {
+        id: uuid::Uuid::new_v4().to_string(),
+        bucket: req.bucket,
+        target: req.target,
+        again: req.again,
+        state: RESYNC_RUNNING.to_string(),
+        after: String::new(),
+        scanned: 0,
+        covered: 0,
+        marked: 0,
+        sent: 0,
+        failed: 0,
+        bytes: 0,
+        started_ms: now,
+        updated_ms: now,
+        finished_ms: 0,
+        by: crate::admin::extract_caller(&auth, &headers).user_id,
+        error: String::new(),
+    };
+    match write_resync(&state, &r).await {
+        Ok(()) => {
+            info!(
+                "replication: resync of {} to {} started by {}",
+                r.bucket, r.target, r.by
+            );
+            (StatusCode::ACCEPTED, Json(r)).into_response()
+        }
+        Err(e) => admin_error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+
+/// `GET /_admin/replication/resync?bucket=` — the bucket's resyncs, one per
+/// target, running or the last one finished.
+pub async fn admin_list_resyncs(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(bucket) = params.get("bucket").filter(|b| !b.is_empty()) else {
+        return admin_error(StatusCode::BAD_REQUEST, "bucket is required");
+    };
+    if let Err(r) = bucket_admin(&state, &auth, &headers, bucket).await {
+        return r;
+    }
+    match list_resyncs(&state, &format!("{RESYNC_PREFIX}{bucket}/")).await {
+        Ok(resyncs) => {
+            Json(serde_json::json!({ "bucket": bucket, "resyncs": resyncs })).into_response()
+        }
+        Err(e) => admin_error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+
+/// `DELETE /_admin/replication/resync?bucket=&target=` — stop a running
+/// resync. What it sent stays sent; what it marked is sent by the scanner.
+pub async fn admin_cancel_resync(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let (Some(bucket), Some(target)) = (params.get("bucket"), params.get("target")) else {
+        return admin_error(StatusCode::BAD_REQUEST, "bucket and target are required");
+    };
+    if let Err(r) = bucket_admin(&state, &auth, &headers, bucket).await {
+        return r;
+    }
+    match read_resync(&state, bucket, target).await {
+        Ok(Some(mut r)) => {
+            if r.state == RESYNC_RUNNING {
+                r.state = RESYNC_CANCELLED.to_string();
+                r.finished_ms = crate::lifecycle::now_ms();
+                r.updated_ms = r.finished_ms;
+                if let Err(e) = write_resync(&state, &r).await {
+                    return admin_error(StatusCode::SERVICE_UNAVAILABLE, &e);
+                }
+            }
+            Json(r).into_response()
+        }
+        Ok(None) => admin_error(
+            StatusCode::NOT_FOUND,
+            "no resync of that bucket to that target",
+        ),
+        Err(e) => admin_error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+
+/// Work on the running resyncs for up to [`RESYNC_SLICE`], a page at a
+/// time, while this gateway holds the scanner's lease.
+async fn resyncs(state: &Arc<AppState>, holder: &str, timing: Timing) {
+    let running = match list_resyncs(state, RESYNC_PREFIX).await {
+        Ok(all) => all
+            .into_iter()
+            .filter(|r| r.state == RESYNC_RUNNING)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            warn!("replication: cannot list resyncs: {e}");
+            return;
+        }
+    };
+    let until = Instant::now() + RESYNC_SLICE;
+    for mut r in running {
+        loop {
+            if Instant::now() >= until || !lease(state, holder, timing).await {
+                return;
+            }
+            match resync_page(state, &mut r).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    warn!(
+                        "replication: resync of {} to {} after {:?}: {e}",
+                        r.bucket, r.target, r.after
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// One page of a resync: mark and send the versions of the keys after
+/// `r.after`, then record how far it got. Whether there is more to do.
+async fn resync_page(state: &Arc<AppState>, r: &mut Resync) -> Result<bool, String> {
+    // Cancelled, or replaced by a new one, since it was read: leave it.
+    match read_resync(state, &r.bucket, &r.target).await? {
+        Some(now) if now.id == r.id && now.state == RESYNC_RUNNING => {}
+        _ => return Ok(false),
+    }
+    // Counted on a copy: a page not finished is taken again, and counted
+    // then.
+    let mut next = r.clone();
+    let outcome = resync_versions(state, &mut next).await;
+    // Cancelled while the page was under way: what the page did is kept,
+    // the record isn't brought back to life.
+    match read_resync(state, &r.bucket, &r.target).await? {
+        Some(now) if now.id == r.id && now.state == RESYNC_RUNNING => {}
+        _ => return Ok(false),
+    }
+    r.updated_ms = crate::lifecycle::now_ms();
+    let more = match outcome {
+        Ok(more) => {
+            next.updated_ms = r.updated_ms;
+            *r = next;
+            r.error.clear();
+            if !more {
+                r.state = RESYNC_DONE.to_string();
+                r.finished_ms = r.updated_ms;
+                info!(
+                    "replication: resync of {} to {} done: {} versions sent, {} failed",
+                    r.bucket, r.target, r.sent, r.failed
+                );
+            }
+            more
+        }
+        Err(e) => {
+            r.error.clone_from(&e);
+            write_resync(state, r).await?;
+            return Err(e);
+        }
+    };
+    write_resync(state, r).await?;
+    Ok(more)
+}
+
+/// Mark and send the versions of the page of keys after `r.after`, moving
+/// `r.after` past it only if every mark was recorded. Whether keys remain.
+async fn resync_versions(state: &Arc<AppState>, r: &mut Resync) -> Result<bool, String> {
+    use futures::StreamExt as _;
+    state.replication.forget_bucket(&r.bucket);
+    let rules = bucket_rules(state, &r.bucket).await.unwrap_or_default();
+    let (found, more) = crate::s3::gather_versions(state, &r.bucket, "", &r.after, "", PAGE)
+        .await
+        .map_err(|resp| format!("listing failed ({})", resp.status()))?;
+    // The listing may hold more keys than it was asked for: a page is the
+    // first PAGE of them after `after`.
+    let after = r.after.clone();
+    let mut keys = found
+        .into_iter()
+        .filter(|(k, _)| after.is_empty() || *k > after)
+        .peekable();
+    let mut jobs = Vec::new();
+    let mut last = None;
+    let mut taken = 0;
+    while taken < PAGE
+        && let Some((key, mut versions)) = keys.next()
+    {
+        taken += 1;
+        crate::s3::sort_versions(&mut versions);
+        // Oldest first, as the scanner sends them.
+        for v in versions.iter().rev() {
+            r.scanned += 1;
+            if !resync_covers(&rules, &r.target, v) {
+                continue;
+            }
+            r.covered += 1;
+            let status = v.replication.get(&r.target).map(String::as_str);
+            let mark = match status {
+                None => true,
+                Some(COMPLETED) => r.again,
+                Some(_) => false,
+            };
+            if mark {
+                let nodes = crate::s3::get_placement_nodes_for_object(state, &r.bucket, &key)
+                    .await
+                    .map_err(|resp| format!("placement of {key} ({})", resp.status()))?;
+                crate::osd_pool::set_replication_status(
+                    &state.osd_pool,
+                    &nodes,
+                    v,
+                    &r.target,
+                    PENDING,
+                )
+                .await
+                .map_err(|e| format!("marking {key} {}: {e}", v.version_id))?;
+                r.marked += 1;
+            }
+            // What is PENDING or FAILED already is the fast path's and the
+            // scanner's to send; a resync sends what it marks.
+            if mark {
+                jobs.push((
+                    Job {
+                        bucket: r.bucket.clone(),
+                        key: key.clone(),
+                        version_id: v.version_id.clone(),
+                        target: r.target.clone(),
+                        force: mark && r.again,
+                    },
+                    v.size,
+                ));
+            }
+        }
+        last = Some(key);
+    }
+    let results: Vec<(bool, u64)> = futures::stream::iter(jobs)
+        .map(|(job, size)| async move { (send_and_record(state, &job).await, size) })
+        .buffer_unordered(RESYNC_SENDS)
+        .collect()
+        .await;
+    for (ok, size) in results {
+        if ok {
+            r.sent += 1;
+            r.bytes += size;
+        } else {
+            r.failed += 1;
+        }
+    }
+    match last {
+        Some(k) if more || keys.peek().is_some() => {
+            r.after = k;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// A rule of the bucket sends `v` to `target`, and it is a version that
+/// replicates at all (not a replica, not SSE-C, versioned): what [`mark`]
+/// would have marked for the target.
+fn resync_covers(rules: &[Rule], target: &str, v: &ObjectMeta) -> bool {
+    let sse_c = v.encryption_algorithm == objectio_proto::metadata::SseAlgorithm::SseC as i32;
+    v.replica_of.is_empty()
+        && !sse_c
+        && !v.version_id.is_empty()
+        && rules.iter().any(|r| r.target == target && r.covers(v))
 }
 
 // ── The target's side: storing replicas ────────────────────────────────
@@ -1758,4 +2392,121 @@ pub async fn replica_delete(
     }
     crate::s3::sync_listing(state, &nodes, bucket, key).await;
     Some(answer(&version_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// At 100 KiB/s, 300 KiB goes in about 3 s: the first chunk at once,
+    /// each after it when the rate allows, whoever sends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pacer_holds_its_rate_across_sends() {
+        let pace = Pace {
+            pacer: Arc::default(),
+            rate: 100 << 10,
+        };
+        let started = tokio::time::Instant::now();
+        let sends = (0..3).map(|_| {
+            let pace = pace.clone();
+            async move {
+                use futures::StreamExt as _;
+                let chunks: Vec<_> = pace
+                    .paced(bytes::Bytes::from(vec![0u8; 100 << 10]))
+                    .collect()
+                    .await;
+                chunks
+                    .iter()
+                    .map(|c| c.as_ref().map_or(0, bytes::Bytes::len))
+                    .sum::<usize>()
+            }
+        });
+        let sent: usize = futures::future::join_all(sends).await.into_iter().sum();
+        assert_eq!(sent, 300 << 10);
+        let took = started.elapsed();
+        // The last chunk goes once everything before it has, at 100 KiB/s:
+        // 300 KiB less that chunk (at most one chunk's worth).
+        let least = time_for((300 << 10) - PACE_CHUNK as u64, 100 << 10);
+        assert!(took >= least && took < Duration::from_secs(3), "{took:?}");
+    }
+
+    /// An idle pacer saves nothing up: after a quiet spell, bytes still go
+    /// at the rate.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_pacer_allows_no_burst() {
+        let pacer = Pacer::default();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let started = tokio::time::Instant::now();
+        for _ in 0..5 {
+            pacer.take(1000, 1000).await;
+        }
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_limit_is_shared_by_the_gateways_up() {
+        let r = Replication::default();
+        let target = Target {
+            name: "dr".into(),
+            endpoint: "https://dr.example".into(),
+            bucket: "b".into(),
+            region: default_region(),
+            access_key: "a".into(),
+            secret_key: "s".into(),
+            tenant: String::new(),
+            operator: true,
+            bandwidth: 300,
+        };
+        assert_eq!(r.pace(&target).map(|p| p.rate), Some(300));
+        r.gateways.store(3, Ordering::Relaxed);
+        let shared = r.pace(&target).expect("a pace");
+        assert_eq!(shared.rate, 100);
+        // One pacer per target on a gateway, whoever asks.
+        let again = r.pace(&target).expect("a pace");
+        assert!(Arc::ptr_eq(&shared.pacer, &again.pacer));
+        let unlimited = Target {
+            bandwidth: 0,
+            ..target
+        };
+        assert!(r.pace(&unlimited).is_none());
+    }
+
+    /// A resync sends what the bucket's rules send to the target, and
+    /// nothing that never replicates.
+    #[test]
+    fn a_resync_covers_what_a_rule_sends_to_its_target() {
+        let rule = |target: &str, prefix: &str| Rule {
+            id: String::new(),
+            priority: 0,
+            enabled: true,
+            prefix: prefix.into(),
+            tags: Vec::new(),
+            delete_markers: false,
+            target: target.into(),
+        };
+        let rules = vec![rule("dr", "logs/"), rule("other", "")];
+        let version = |key: &str| ObjectMeta {
+            key: key.into(),
+            version_id: "v1".into(),
+            ..Default::default()
+        };
+        assert!(resync_covers(&rules, "dr", &version("logs/a")));
+        assert!(!resync_covers(&rules, "dr", &version("data/a")));
+        assert!(resync_covers(&rules, "other", &version("data/a")));
+        let replica = ObjectMeta {
+            replica_of: "source".into(),
+            ..version("logs/a")
+        };
+        assert!(!resync_covers(&rules, "dr", &replica));
+        let unversioned = ObjectMeta {
+            version_id: String::new(),
+            ..version("logs/a")
+        };
+        assert!(!resync_covers(&rules, "dr", &unversioned));
+        let marker = ObjectMeta {
+            is_delete_marker: true,
+            ..version("logs/a")
+        };
+        assert!(!resync_covers(&rules, "dr", &marker));
+    }
 }
