@@ -46,3 +46,4 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+redb = { workspace = true }

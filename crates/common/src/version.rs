@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
 /// | 6 | multipart uploads kept, marked as being completed, until their object is stored: a meta node of the previous release would take one for open and let an abort free the parts of a stored object |
 /// | 7 | every key placed through a placement group whose acting set and epoch are committed before use (objectio-docs `core/pg-recovery.md`, B31): a meta node of the previous release would place the default pool's keys elsewhere |
-pub const FORMAT_LEVEL: u32 = 7;
+/// | 8 | meta's group commit: several writes in one Raft entry (`MetaCommand::Batch`, objectio-docs `core/meta-log.md`); a gateway's metadata reads of an OSD several to a call (`GetObjectMetas`); an OSD's index values split to fit the index file's pages (`core/small-object-path.md`): a meta node of the previous release can't decode the first, an OSD of it doesn't answer the second and would read the first part of a split value alone |
+pub const FORMAT_LEVEL: u32 = 8;
 
 /// The level from which small shards are kept in the OSDs' metadata
 /// records and sent with their object's metadata (B21).
@@ -40,6 +41,19 @@ pub const COMPLETED_UPLOADS_LEVEL: u32 = 6;
 /// epoch before use, and OSDs refuse requests placed under an older epoch.
 /// Keys written before it keep the placement they were written with.
 pub const PG_PLACEMENT_LEVEL: u32 = 7;
+
+/// The level from which meta commits the writes that arrive while one is
+/// being committed together, in one Raft entry (`MetaCommand::Batch`).
+pub const BATCHED_WRITES_LEVEL: u32 = 8;
+
+/// The level from which a gateway sends its concurrent metadata reads of
+/// an OSD in one call (`GetObjectMetas`).
+pub const BATCHED_META_READS_LEVEL: u32 = 8;
+
+/// The level from which an OSD splits a value of its index that is just
+/// past a power of two, to fit the index file's pages (a small shard of a
+/// 64 KiB object took twice its size).
+pub const SPLIT_INDEX_VALUES_LEVEL: u32 = 8;
 
 /// The largest shard kept in an OSD's metadata record rather than a disk
 /// block (B21): a 64 KiB object's shards with 4+2.

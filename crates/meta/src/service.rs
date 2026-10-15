@@ -743,7 +743,7 @@ pub struct MetaService {
     /// write to redb directly pending their R2+ migration. Behind a
     /// `RwLock` so the service can be constructed before Raft (the
     /// existing startup order needs meta_service to register OSDs first).
-    raft: RwLock<Option<Arc<openraft::Raft<objectio_meta_store::MetaTypeConfig>>>>,
+    raft: RwLock<Option<Arc<crate::raft_batch::MetaRaft>>>,
     /// Per-OSD drain progress — populated by the Phase 3b migrator
     /// while an OSD is Draining, cleared when the OSD flips to Out or
     /// back to In. Keyed by 16-byte node_id.
@@ -959,11 +959,12 @@ impl MetaService {
     /// a handle set, they fall back to the legacy direct-redb path
     /// (useful for in-memory tests).
     pub fn set_raft(&self, raft: Arc<openraft::Raft<objectio_meta_store::MetaTypeConfig>>) {
-        *self.raft.write() = Some(raft);
+        *self.raft.write() = Some(Arc::new(crate::raft_batch::MetaRaft::new(raft)));
     }
 
-    /// Current Raft handle, if any.
-    pub fn raft_handle(&self) -> Option<Arc<openraft::Raft<objectio_meta_store::MetaTypeConfig>>> {
+    /// Current Raft handle, if any: its writes go through meta's group
+    /// commit ([`crate::raft_batch`]).
+    pub fn raft_handle(&self) -> Option<Arc<crate::raft_batch::MetaRaft>> {
         self.raft.read().clone()
     }
 

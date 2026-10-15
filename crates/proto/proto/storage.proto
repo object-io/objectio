@@ -46,6 +46,11 @@ service StorageService {
     // Get object metadata (called by gateway before reading shards)
     rpc GetObjectMeta(GetObjectMetaRequest) returns (GetObjectMetaResponse);
 
+    // Several GetObjectMeta in one call, each answered as GetObjectMeta
+    // would answer it alone: a gateway's concurrent reads of one OSD (B21,
+    // format level 8).
+    rpc GetObjectMetas(GetObjectMetasRequest) returns (GetObjectMetasResponse);
+
     // Delete object metadata (called by gateway when deleting object)
     rpc DeleteObjectMeta(DeleteObjectMetaRequest) returns (DeleteObjectMetaResponse);
 
@@ -524,6 +529,23 @@ message GetObjectMetaResponse {
     // This OSD's shard of `object`, when asked for and kept in its
     // metadata store; checked against its checksum before it is sent.
     SmallShard small_shard = 4;
+}
+
+message GetObjectMetasRequest {
+    repeated GetObjectMetaRequest requests = 1;
+}
+
+// One answer per request, in order.
+message GetObjectMetasResponse {
+    repeated GetObjectMetaAnswer answers = 1;
+}
+
+// What GetObjectMeta would have answered: its response, or its error
+// (a gRPC status code, non-zero, and message).
+message GetObjectMetaAnswer {
+    GetObjectMetaResponse response = 1;
+    int32 code = 2;
+    string message = 3;
 }
 
 // Delete object metadata request

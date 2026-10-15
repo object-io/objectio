@@ -79,6 +79,13 @@ pub enum MetaCommand {
         /// machine; landed in logs only.
         requested_by: String,
     },
+    /// Several commands in one log entry: meta's group commit (format
+    /// level 8, objectio-docs `core/meta-log.md`). Applied in order, each
+    /// exactly as if it were an entry of its own, each with its own answer
+    /// ([`MetaResponse::Batch`]); one entry, so one log sync, for every
+    /// write that arrived while the last one was being committed. Never
+    /// nested.
+    Batch(Vec<MetaCommand>),
 }
 
 /// A single conditional write inside a [`MetaCommand::MultiCas`].
@@ -187,6 +194,8 @@ pub enum MetaResponse {
     /// mismatched so the caller can retry with refreshed expected
     /// values. No writes were applied.
     MultiCasConflict { failed_indices: Vec<u32> },
+    /// `Batch` applied: each command's answer, in its order.
+    Batch(Vec<MetaResponse>),
 }
 
 declare_raft_types!(

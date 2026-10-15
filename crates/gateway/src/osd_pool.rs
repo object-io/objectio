@@ -155,6 +155,8 @@ pub struct OsdPool {
     heal: std::sync::OnceLock<
         objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
     >,
+    /// Object metadata reads, several to a call per OSD (B21).
+    meta_reads: crate::meta_reads::MetaReads,
 }
 
 impl OsdPool {
@@ -167,6 +169,7 @@ impl OsdPool {
             probing: Arc::default(),
             stale: Arc::default(),
             heal: std::sync::OnceLock::new(),
+            meta_reads: crate::meta_reads::MetaReads::default(),
         }
     }
 
@@ -1930,11 +1933,15 @@ async fn read_object_meta(
             bucket: bucket.to_string(),
             key: key.to_string(),
             version_id: version_id.to_string(),
-            with_small_shard,
+            // The data positions' shards are the object, with no decoding:
+            // a parity copy sends only its metadata, and a shard missing
+            // from the data copies is read afterwards (B21).
+            with_small_shard: with_small_shard
+                && placement.shard_type == objectio_proto::metadata::ShardType::ShardData as i32,
         };
         let mut again = true;
         loop {
-            let mut client = pool
+            let client = pool
                 .get_client_for_placement(placement)
                 .await
                 .map_err(|e| {
@@ -1944,28 +1951,26 @@ async fn read_object_meta(
                     );
                     e
                 })?;
-            // In a task of its own, so a copy that answers after the
-            // quorum did is let finish, not cancelled: an answer to a
-            // cancelled call counts towards h2 closing the connection
-            // ([`closed_by_us`]), and these were thousands a second.
-            let req = req.clone();
-            let call = tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    client.get_object_meta(req),
-                )
+            // With other reads of this OSD, in one call (B21). Either way a
+            // copy that answers after the quorum did is let finish, not
+            // cancelled (`meta_reads`, [`closed_by_us`]).
+            let reads = pool.meta_reads.to(&placement.node_address);
+            return match pool
+                .watched(&placement.node_address, reads.get(client, req.clone()))
                 .await
-            });
-            return match pool.watched(&placement.node_address, call).await {
-                Ok(Ok(Ok(resp))) => {
-                    let inner = resp.into_inner();
-                    Ok((
-                        if inner.found { inner.object } else { None },
-                        inner.tombstone_stamp,
-                        inner.small_shard,
+            {
+                Ok(inner) => Ok((
+                    if inner.found { inner.object } else { None },
+                    inner.tombstone_stamp,
+                    inner.small_shard,
+                )),
+                Err(e) if crate::meta_reads::is_timeout(&e) => {
+                    warn!("get_object_meta timeout from {}", placement.node_address);
+                    Err(OsdPoolError::ConnectionFailed(
+                        "get_object_meta timeout".to_string(),
                     ))
                 }
-                Ok(Ok(Err(e))) => {
+                Err(e) => {
                     warn!(
                         "get_object_meta from {} failed: {}",
                         placement.node_address, e
@@ -1977,16 +1982,6 @@ async fn read_object_meta(
                     }
                     Err(OsdPoolError::ConnectionFailed(e.to_string()))
                 }
-                Ok(Err(_)) => {
-                    warn!("get_object_meta timeout from {}", placement.node_address);
-                    Err(OsdPoolError::ConnectionFailed(
-                        "get_object_meta timeout".to_string(),
-                    ))
-                }
-                Err(e) => Err(OsdPoolError::ConnectionFailed(format!(
-                    "get_object_meta from {}: {e}",
-                    placement.node_address
-                ))),
             };
         }
     });
@@ -3512,12 +3507,74 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::time::{Duration, Instant};
 
-    /// An OSD that answers GetObjectMeta only, with the object, after its
-    /// delay (plus N ms for a key `slow-N`), counting the calls it finished.
+    /// An OSD that answers GetObjectMeta (and GetObjectMetas, each read as
+    /// GetObjectMeta would) only, with the object, after its delay (plus
+    /// N ms for a key `slow-N`), counting the reads it finished.
     #[derive(Clone)]
     struct MetaOsd {
         delay: Duration,
         finished: Arc<AtomicUsize>,
+        /// GetObjectMetas calls answered.
+        batch_calls: Arc<AtomicUsize>,
+    }
+
+    /// [`MetaOsd`]'s answer to one read.
+    async fn meta_osd_read(osd: &MetaOsd, req: GetObjectMetaRequest) -> GetObjectMetaResponse {
+        let extra = req
+            .key
+            .strip_prefix("slow-")
+            .map_or(0, |ms| ms.parse().unwrap());
+        tokio::time::sleep(osd.delay + Duration::from_millis(extra)).await;
+        osd.finished.fetch_add(1, SeqCst);
+        GetObjectMetaResponse {
+            found: true,
+            object: Some(ObjectMeta {
+                bucket: req.bucket,
+                key: req.key,
+                stamp: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// [`MetaOsd`] answering GetObjectMetas, counting the calls.
+    #[derive(Clone)]
+    struct MetaOsdBatch {
+        osd: MetaOsd,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl tonic::server::UnaryService<objectio_proto::storage::GetObjectMetasRequest> for MetaOsdBatch {
+        type Response = objectio_proto::storage::GetObjectMetasResponse;
+        type Future = futures::future::BoxFuture<
+            'static,
+            Result<tonic::Response<Self::Response>, tonic::Status>,
+        >;
+
+        fn call(
+            &mut self,
+            req: tonic::Request<objectio_proto::storage::GetObjectMetasRequest>,
+        ) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                this.calls.fetch_add(1, SeqCst);
+                let reads = req.into_inner().requests;
+                let answers = futures::future::join_all(
+                    reads.into_iter().map(|r| meta_osd_read(&this.osd, r)),
+                )
+                .await
+                .into_iter()
+                .map(|response| objectio_proto::storage::GetObjectMetaAnswer {
+                    response: Some(response),
+                    ..Default::default()
+                })
+                .collect();
+                Ok(tonic::Response::new(
+                    objectio_proto::storage::GetObjectMetasResponse { answers },
+                ))
+            })
+        }
     }
 
     impl tonic::server::NamedService for MetaOsd {
@@ -3537,14 +3594,29 @@ mod tests {
         }
 
         fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
-            assert_eq!(
-                req.uri().path(),
-                "/objectio.storage.StorageService/GetObjectMeta"
-            );
             let osd = self.clone();
             Box::pin(async move {
-                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
-                Ok(grpc.unary(osd, req).await)
+                use tonic::codec::ProstCodec;
+                use tonic::server::Grpc;
+                Ok(match req.uri().path() {
+                    "/objectio.storage.StorageService/GetObjectMeta" => {
+                        Grpc::new(
+                            ProstCodec::<GetObjectMetaResponse, GetObjectMetaRequest>::default(),
+                        )
+                        .unary(osd, req)
+                        .await
+                    }
+                    "/objectio.storage.StorageService/GetObjectMetas" => {
+                        let calls = Arc::clone(&osd.batch_calls);
+                        Grpc::new(ProstCodec::<
+                            objectio_proto::storage::GetObjectMetasResponse,
+                            objectio_proto::storage::GetObjectMetasRequest,
+                        >::default())
+                        .unary(MetaOsdBatch { osd, calls }, req)
+                        .await
+                    }
+                    other => panic!("MetaOsd asked {other}"),
+                })
             })
         }
     }
@@ -3559,23 +3631,9 @@ mod tests {
         fn call(&mut self, req: tonic::Request<GetObjectMetaRequest>) -> Self::Future {
             let osd = self.clone();
             Box::pin(async move {
-                let req = req.into_inner();
-                let extra = req
-                    .key
-                    .strip_prefix("slow-")
-                    .map_or(0, |ms| ms.parse().unwrap());
-                tokio::time::sleep(osd.delay + Duration::from_millis(extra)).await;
-                osd.finished.fetch_add(1, SeqCst);
-                Ok(tonic::Response::new(GetObjectMetaResponse {
-                    found: true,
-                    object: Some(ObjectMeta {
-                        bucket: req.bucket,
-                        key: req.key,
-                        stamp: 1,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }))
+                Ok(tonic::Response::new(
+                    meta_osd_read(&osd, req.into_inner()).await,
+                ))
             })
         }
     }
@@ -3644,6 +3702,7 @@ mod tests {
         let osd = |ms| MetaOsd {
             delay: Duration::from_millis(ms),
             finished: Arc::clone(&finished),
+            batch_calls: Arc::default(),
         };
         let placements = vec![
             placement(1, serve(osd(0)).await),
@@ -3670,6 +3729,55 @@ mod tests {
         }
     }
 
+    /// Reads of one OSD made together go in fewer calls than reads
+    /// (`GetObjectMetas`, B21), each answered with its own object; a read
+    /// alone goes by itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_meta_reads_of_an_osd_share_calls() {
+        objectio_common::version::set_active_level(
+            objectio_common::version::BATCHED_META_READS_LEVEL,
+        );
+        let finished = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let addr = serve(MetaOsd {
+            delay: Duration::from_millis(20),
+            finished: Arc::clone(&finished),
+            batch_calls: Arc::clone(&batch_calls),
+        })
+        .await;
+        let placements = vec![placement(1, addr)];
+        let pool = Arc::new(super::OsdPool::new());
+
+        let alone = super::get_object_meta_from_any(&pool, &placements, "b", "alone")
+            .await
+            .unwrap();
+        assert_eq!(alone.unwrap().key, "alone");
+        assert_eq!(batch_calls.load(SeqCst), 0, "a lone read was batched");
+
+        let reads: Vec<_> = (0..200)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                let placements = placements.clone();
+                tokio::spawn(async move {
+                    let key = format!("k{i}");
+                    let got = super::get_object_meta_from_any(&pool, &placements, "b", &key)
+                        .await
+                        .unwrap();
+                    assert_eq!(got.unwrap().key, key);
+                })
+            })
+            .collect();
+        for r in reads {
+            r.await.unwrap();
+        }
+        assert_eq!(finished.load(SeqCst), 201);
+        let calls = batch_calls.load(SeqCst);
+        assert!(
+            calls > 0 && calls < 100,
+            "{calls} batched calls for 200 reads"
+        );
+    }
+
     /// h2 closes a connection once more than 1024 answers came for calls it
     /// had cancelled and forgotten, over the connection's life, failing
     /// every call in flight on it. That is this side's doing: the OSD is not
@@ -3680,6 +3788,7 @@ mod tests {
         let osd = serve(MetaOsd {
             delay: Duration::ZERO,
             finished: Arc::default(),
+            batch_calls: Arc::default(),
         })
         .await;
         let link = slow_link(osd, Duration::from_millis(500)).await;

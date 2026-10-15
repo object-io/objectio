@@ -11,6 +11,7 @@ pub mod forward;
 pub mod liveness;
 mod op_metrics;
 pub mod raft_admin;
+pub mod raft_batch;
 pub mod raft_rpc;
 pub mod repair;
 pub mod service;
