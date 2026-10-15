@@ -1225,6 +1225,12 @@ pub async fn run(
             "/_admin/replication/targets/{name}",
             delete(replication::admin_delete_target),
         )
+        .route(
+            "/_admin/replication/resync",
+            get(replication::admin_list_resyncs)
+                .post(replication::admin_start_resync)
+                .delete(replication::admin_cancel_resync),
+        )
         .route("/_admin/upgrade", get(upgrade::status))
         .route("/_admin/upgrade/finalize", post(upgrade::finalize))
         .route(

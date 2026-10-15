@@ -120,6 +120,9 @@ Secrets are printed only once, when they are created: by `key create`,
 | `public-access-block bucket get` / `put` / `delete B` | `/{B}?publicAccessBlock` |
 | `public-access-block bucket policy-status B` | `GET /{B}?policyStatus` |
 | `audit get` / `delete` `[--tenant]`, `audit put --file F [--tenant]` | `/_admin/audit` |
+| `replication target list` / `delete N` `[--tenant]` | `GET /_admin/replication/targets`, `DELETE …/targets/N` |
+| `replication target set N --remote-endpoint E --remote-bucket B --remote-access-key A --remote-secret-key S [--remote-region --bandwidth 100M --tenant]` | `POST /_admin/replication/targets` |
+| `replication resync start B T [--again]` / `status B` / `cancel B T` | `POST` / `GET` / `DELETE /_admin/replication/resync` |
 | `bucket list [--tenant]` / `show B` | `GET /_admin/buckets` |
 | `bucket create B [--pool P --tenant]` / `delete B` | `POST /_admin/buckets`, `DELETE /_admin/buckets/B` |
 | `bucket set-owner B USER` | `PUT /_admin/buckets/B/owner` |

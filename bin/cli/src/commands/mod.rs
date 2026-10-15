@@ -4,6 +4,7 @@ pub mod access;
 pub mod bucket;
 pub mod cluster;
 pub mod iam;
+pub mod replication;
 
 use crate::cli::{Command, TenantOpt};
 use crate::http::ApiClient;
@@ -36,6 +37,7 @@ pub async fn run(cmd: Command, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         Command::Sts { action } => access::sts(action, ctx).await,
         Command::PublicAccessBlock { action } => access::public_access_block(action, ctx).await,
         Command::Audit { action } => access::audit(action, ctx).await,
+        Command::Replication { action } => replication::replication(action, ctx).await,
         Command::Bucket { action } => bucket::bucket(action, ctx).await,
         Command::Provision { action } => bucket::provision(action, ctx).await,
         Command::Cluster { action } => cluster::cluster(action, ctx).await,

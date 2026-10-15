@@ -549,4 +549,31 @@ fn targets_belong_to_a_tenant() {
     let r = as_acme("PUT", "/acme-src/k", &body);
     r.expect(200);
     await_replica(&dst, "dst", "k", &version_of(&r), &body);
+
+    resyncs_are_the_buckets_tenants(&src, (&acme_key, &acme_secret), (&beta_key, &beta_secret));
+}
+
+/// A resync is its bucket's tenant's: acme resyncs its bucket and sees how
+/// far it got; beta can do neither, nor acme with the system's buckets.
+fn resyncs_are_the_buckets_tenants(src: &Cluster, acme: (&str, &str), beta: (&str, &str)) {
+    let as_acme = |m: &str, p: &str, b: &[u8]| src.request_as(m, p, b, acme.0, acme.1);
+    let as_beta = |m: &str, p: &str, b: &[u8]| src.request_as(m, p, b, beta.0, beta.1);
+    let resync = |bucket: &str| {
+        json!({"bucket": bucket, "target": "dr"})
+            .to_string()
+            .into_bytes()
+    };
+    let post = "/_admin/replication/resync";
+    let started = as_acme("POST", post, &resync("acme-src"));
+    assert_eq!(started.status, 202, "{}", started.text());
+    let listed = as_acme("GET", &format!("{post}?bucket=acme-src"), &[]).json();
+    assert_eq!(listed["resyncs"][0]["target"], "dr", "{listed}");
+    assert_eq!(as_beta("POST", post, &resync("acme-src")).status, 403);
+    assert_eq!(
+        as_beta("GET", &format!("{post}?bucket=acme-src"), &[]).status,
+        403
+    );
+    src.json("POST", "/_admin/buckets", json!({ "name": "system-src" }))
+        .expect_ok();
+    assert_eq!(as_acme("POST", post, &resync("system-src")).status, 403);
 }
