@@ -55,4 +55,5 @@ rdma = ["objectio-transport-te/te"]
 rocksdb = ["objectio-storage/rocksdb"]
 
 [dev-dependencies]
+redb = { workspace = true }
 tempfile = { workspace = true }

@@ -290,6 +290,18 @@ pub(crate) fn shard_loc_meta_key(shard_key: &str) -> MetadataKey {
     MetadataKey::from_bytes(bytes)
 }
 
+/// A key just past every location record ([`SHARD_LOC_PREFIX`] ends in
+/// `:`, this in `;`), kept so the records' range ends in an ordinary leaf of
+/// the index file. A shard key starts with its object's id, a UUIDv7, so a
+/// new record sorts after every other and goes in the leaf that ends the
+/// range. Without this key that leaf held the first small shard's bytes
+/// ([`SMALL_DATA_PREFIX`], a value of a page or more), and redb gives a key
+/// inserted beside a leaf of one large value a leaf of its own: each record,
+/// some 70 bytes, took a 4 KiB page, and the startup pass over the records
+/// read one page per shard (an OSD of 135,000 shards took five minutes to
+/// start on a soak VM, B2 soak run 36).
+const LOC_END_KEY: &[u8] = b"osd_loc;";
+
 /// Prefix of a small shard's bytes (B21), apart from its location record:
 /// in the record, the startup pass over every location read every small
 /// shard's bytes too, and an OSD holding 115,000 of them took five minutes
@@ -956,6 +968,14 @@ impl BlockStore {
                  and will be rebuilt by Meta's repairer",
                 lost.len()
             );
+        }
+        let end = MetadataKey::from_bytes(LOC_END_KEY.to_vec());
+        if meta.get(&end).is_none()
+            && let Err(e) = meta.put(end, Vec::new())
+        {
+            // Only the index file's layout suffers: records written meanwhile
+            // take a page each.
+            warn!("recording the end of the shard locations: {e}");
         }
         info!("Shard index: {} shards", index.count());
         for (idx, disk) in disks.iter().enumerate() {
@@ -1990,6 +2010,56 @@ mod tests {
         assert_eq!(store.count(), 2);
         assert_eq!(store.read(&shard(3)).await.unwrap().0, bytes);
         assert_eq!(store.small_shard(&shard(3)).unwrap().data, bytes);
+    }
+
+    /// Location records written in key order, as they are (a shard key
+    /// starts with its object's id, a UUIDv7), pack many to a page of the
+    /// index file beside the small shards' bytes, which take a page each
+    /// ([`LOC_END_KEY`]).
+    #[test]
+    fn location_records_written_in_order_pack_many_to_a_page() {
+        const ENTRIES: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("entries");
+        let dir = tempfile::tempdir().unwrap();
+        let meta_dir = dir.path().join("state");
+        let n: u32 = 1_000;
+        {
+            let mut config = MetadataStoreConfig::with_data_dir(&meta_dir);
+            config.background_compaction = false;
+            let meta = Arc::new(MetadataStore::open_or_create(config).unwrap());
+            let disks =
+                Disks::open(&[dir.path().join("disk.raw").display().to_string()], BLOCK).unwrap();
+            let store = BlockStore::new(disks, Arc::clone(&meta) as _, meta_dir.clone());
+            let data = vec![7u8; 5_000];
+            for i in 0..n {
+                let mut object_id = vec![0u8; 16];
+                object_id[..4].copy_from_slice(&i.to_be_bytes());
+                let shard_id = ShardId {
+                    object_id,
+                    stripe_id: 0,
+                    position: 0,
+                };
+                let small = SmallShard {
+                    shard_id: Some(shard_id),
+                    crc32c: crc32c::crc32c(&data),
+                    data: data.clone(),
+                };
+                store.write_with_metadata(small, Vec::new()).unwrap();
+                // Into the file a few at a time, as checkpoints take them:
+                // each time after the bytes of the shards before.
+                if i % 50 == 49 {
+                    meta.checkpoint().unwrap();
+                }
+            }
+        }
+        let db = redb::Database::open(meta_dir.join("index.redb")).unwrap();
+        let tx = db.begin_read().unwrap();
+        let leaves = redb::ReadableTableMetadata::stats(&tx.open_table(ENTRIES).unwrap())
+            .unwrap()
+            .leaf_pages();
+        assert!(
+            leaves < u64::from(n) * 11 / 10,
+            "{leaves} leaf pages for {n} small shards and their records"
+        );
     }
 
     /// A shard key gives back the shard it was made from, and nothing else
