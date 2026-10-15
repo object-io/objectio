@@ -409,8 +409,12 @@ jobs:
           git checkout -q "$head"
       - name: compare
         run: |
+          # In memory: a runner's disk varies more from run to run than
+          # the regressions this is for (scripts/bench/regression.py).
+          mkdir -p "$RUNNER_TEMP/data"
+          sudo mount -t tmpfs -o size=8g tmpfs "$RUNNER_TEMP/data"
           scripts/bench/regression.py --base "$RUNNER_TEMP/base" --head "$RUNNER_TEMP/head" \
-            --logs "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
+            --workdir "$RUNNER_TEMP/data" --logs "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
