@@ -365,6 +365,65 @@ jobs:
           fi
           echo "only portable libraries — ok"
 
+  perf:
+    name: performance
+    # The tree that lands against main, on the same runner: release builds
+    # of both, run in turn (objectio-docs developer-guide/performance).
+    # In the merge queue, and on a pull request labelled `perf`.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      FEATURES: objectio-aio/isal,objectio-aio/io-uring
+      BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base is built from this clone
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev mold
+      # Head, then the base in the same checkout: the checkout leaves
+      # unchanged files' times alone, so only the crates the change touches
+      # are built twice.
+      - name: build the head and the base
+        run: |
+          set -euo pipefail
+          build() {
+            cargo build --release --features "$FEATURES" --bin objectio-aio --bin objectio-s3-bench
+            mkdir -p "$RUNNER_TEMP/$1"
+            cp target/release/objectio-aio target/release/objectio-s3-bench "$RUNNER_TEMP/$1/"
+          }
+          head=$(git rev-parse HEAD)
+          build head
+          git checkout -q "$BASE"
+          build base
+          git checkout -q "$head"
+      - name: compare
+        run: |
+          # In memory: a runner's disk varies more from run to run than
+          # the regressions this is for (scripts/bench/regression.py).
+          mkdir -p "$RUNNER_TEMP/data"
+          sudo mount -t tmpfs -o size=8g tmpfs "$RUNNER_TEMP/data"
+          scripts/bench/regression.py --base "$RUNNER_TEMP/base" --head "$RUNNER_TEMP/head" \
+            --workdir "$RUNNER_TEMP/data" --logs "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance
+          path: |
+            ${{ runner.temp }}/perf.json
+            ${{ runner.temp }}/aio-*.log
+          retention-days: 14
+
   console:
     name: console
     runs-on: ubuntu-latest

@@ -79,6 +79,11 @@ struct Args {
     #[arg(long, default_value_t = 8)]
     concurrency: usize,
 
+    /// GETs of each object in the GET phase: a phase long enough to
+    /// measure without writing more.
+    #[arg(long, default_value_t = 1)]
+    get_passes: usize,
+
     #[arg(long, value_enum, default_value_t = Op::Both)]
     op: Op,
 
@@ -575,8 +580,8 @@ fn print_phase(name: &str, r: &PhaseResult) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if args.concurrency == 0 || args.objects == 0 {
-        bail!("--objects and --concurrency must be at least 1");
+    if args.concurrency == 0 || args.objects == 0 || args.get_passes == 0 {
+        bail!("--objects, --concurrency and --get-passes must be at least 1");
     }
 
     let signer = match (&args.access_key, &args.secret_key) {
@@ -648,8 +653,8 @@ async fn main() -> Result<()> {
 
     if matches!(args.op, Op::Get | Op::Both) {
         let before = settled_scrape(&client.http, &metrics_url, args.metrics_wait).await;
-        let r = run_phase(args.objects, args.concurrency, |i| {
-            get(&client, key(i), args.size)
+        let r = run_phase(args.objects * args.get_passes, args.concurrency, |i| {
+            get(&client, key(i % args.objects), args.size)
         })
         .await;
         let after = settled_scrape(&client.http, &metrics_url, args.metrics_wait).await;
