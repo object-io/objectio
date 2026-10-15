@@ -681,6 +681,12 @@ pub async fn put_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // NOT TO MERGE: a slowdown the performance check must catch, 1 ms of
+    // CPU in every PUT (a 64 KiB PUT costs about 3.4 ms of CPU on a runner).
+    let spin = std::time::Instant::now();
+    while spin.elapsed() < std::time::Duration::from_millis(1) {
+        std::hint::spin_loop();
+    }
     let first = put_object_placed(
         Arc::clone(&state),
         bucket.clone(),
