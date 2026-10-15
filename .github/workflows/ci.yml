@@ -410,7 +410,7 @@ jobs:
       - name: compare
         run: |
           scripts/bench/regression.py --base "$RUNNER_TEMP/base" --head "$RUNNER_TEMP/head" \
-            --workdir "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
+            --logs "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
