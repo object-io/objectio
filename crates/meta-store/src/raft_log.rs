@@ -25,11 +25,11 @@
 //! segment with a valid index is not read (its records are checked when
 //! they are read, as every record is), one without is read and checked and
 //! its index written. So an open reads at most one segment and the indexes,
-//! however long the log (B25: the reopen time bound). A torn record at the
-//! end of the last segment (a crash during an append, which was never
-//! acknowledged) is cut off; any other damage, or a gap in the indexes,
-//! fails the open (or the read) with its position: a record is never
-//! skipped.
+//! however long the log (B25: the reopen time bound). A torn record in the
+//! last segment (a crash during an append, which was never acknowledged)
+//! is cut off with everything after it; any other damage, or a gap in the
+//! indexes, fails the open (or the read) with its position: a record is
+//! never skipped.
 //!
 //! The log knows indexes and terms, not openraft: entries are opaque bytes
 //! here, encoded by the caller.
@@ -45,6 +45,10 @@ pub const SEGMENT_BYTES: u64 = 64 << 20;
 
 /// `len`, `crc32c`, `index`, `term`.
 const HEADER: usize = 4 + 4 + 8 + 8;
+
+/// The unit a disk writes whole or not at all: what a crash leaves of a
+/// write is some of its sectors, the rest reading as zeros.
+const SECTOR: usize = 512;
 
 /// The largest entry the log accepts (a corrupt length must not make the
 /// open allocate gigabytes).
@@ -195,6 +199,23 @@ fn remove_index(dir: &Path, first: u64) -> Result<bool, LogError> {
     }
 }
 
+/// Whether part of the record at `data[from..to]` never reached the disk:
+/// one of its pieces between sector boundaries reads as zeros, as the
+/// sectors of a write a crash cut short do. (A power cut during the last
+/// append left its first sectors written and the rest, the file's new
+/// length included, zeros: B2 soak run 37.)
+fn never_written(data: &[u8], from: usize, to: usize) -> bool {
+    let mut start = from;
+    while start < to {
+        let end = ((start / SECTOR + 1) * SECTOR).min(to);
+        if data[start..end].iter().all(|b| *b == 0) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
 fn checksum(index: u64, term: u64, entry: &[u8]) -> u32 {
     let crc = crc32c::crc32c(&index.to_le_bytes());
     let crc = crc32c::crc32c_append(crc, &term.to_le_bytes());
@@ -244,7 +265,15 @@ impl RaftLog {
 
     /// Read one segment's records into `positions`, checking each, or, for
     /// a sealed segment, take them from its index if it has a valid one. On
-    /// the last segment a torn record at the end is cut off.
+    /// the last segment a torn record is cut off with everything after it.
+    ///
+    /// An append is one write and one sync, so a record of which some part
+    /// never reached the disk was never synced, and neither was anything
+    /// written after it: none of it was acknowledged. A record is torn when
+    /// it is cut short by the end of the file, or fails its checksum and
+    /// either ends the file or has a piece that reads as zeros (what a
+    /// crash leaves of the sectors it didn't write). A record that fails
+    /// its checksum otherwise is damage, and stops the open.
     fn load_segment(&mut self, first: u64, last: bool) -> Result<(), LogError> {
         let path = self.dir.join(segment_name(first));
         let file = OpenOptions::new()
@@ -325,7 +354,9 @@ impl RaftLog {
             }
             let entry = &rest[HEADER..end];
             if checksum(index, term, entry) != crc {
-                if last && offset + end == data.len() {
+                if last
+                    && (offset + end == data.len() || never_written(&data, offset, offset + end))
+                {
                     good_len = offset;
                     break;
                 }
@@ -357,8 +388,9 @@ impl RaftLog {
         let len = good_len as u64;
         if len < file_len {
             tracing::warn!(
-                "raft log {}: cutting a torn record at byte {len} (a crash during an append)",
-                path.display()
+                "raft log {}: cutting a torn record at byte {len}, {} bytes (a crash during an append)",
+                path.display(),
+                file_len - len
             );
             file.set_len(len).map_err(io_err(&path))?;
             file.sync_all().map_err(io_err(&path))?;
@@ -974,6 +1006,55 @@ mod tests {
         assert_eq!(log.read(1, 5).unwrap().len(), 4);
     }
 
+    /// A power cut during an append: its first sectors written, the rest
+    /// of them, to the file's new length, zeros. The record is cut off,
+    /// with the zeros after it.
+    #[test]
+    fn a_record_the_crash_left_part_zeros_is_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1)]).unwrap();
+        let path = log.segments[0].path.clone();
+        let synced = fs::metadata(&path).unwrap().len();
+        log.append(&[(2, 1, vec![b'x'; 3 * SECTOR]), (3, 1, vec![b'y'; 500])])
+            .unwrap();
+        drop(log);
+        let mut data = fs::read(&path).unwrap();
+        let cut = (usize::try_from(synced).unwrap() / SECTOR + 2) * SECTOR;
+        data[cut..].fill(0);
+        fs::write(&path, &data).unwrap();
+
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 1)));
+        assert_eq!(fs::metadata(&path).unwrap().len(), synced);
+        log.append(&[rec(2, 2)]).unwrap();
+        drop(log);
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 2)));
+        assert_eq!(log.term_of(2), Some(2));
+    }
+
+    /// The same with none of the append's sectors written: zeros from the
+    /// end of the last record synced.
+    #[test]
+    fn zeros_after_the_last_record_are_cut_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1), rec(2, 1)]).unwrap();
+        let path = log.segments[0].path.clone();
+        drop(log);
+        let synced = fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(synced + 2 * SECTOR as u64)
+            .unwrap();
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 2)));
+        assert_eq!(fs::metadata(&path).unwrap().len(), synced);
+    }
+
     #[test]
     fn damage_before_the_end_stops_the_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -986,5 +1067,27 @@ mod tests {
         fs::write(&path, &data).unwrap();
         let err = RaftLog::open(dir.path()).err().expect("refused");
         assert!(err.to_string().contains("checksum"), "{err}");
+    }
+
+    /// Damage to the last append that isn't a crash's (no piece of the
+    /// record zeros, a record after it) stops the open: it is never cut.
+    #[test]
+    fn damage_in_the_last_append_with_records_after_it_stops_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1)]).unwrap();
+        log.append(&[(2, 1, vec![b'x'; 3 * SECTOR]), rec(3, 1)])
+            .unwrap();
+        let path = log.segments[0].path.clone();
+        let record2 = log.pos(2).unwrap().offset;
+        drop(log);
+        let mut data = fs::read(&path).unwrap();
+        data[usize::try_from(record2).unwrap() + HEADER + SECTOR] ^= 0xff;
+        fs::write(&path, &data).unwrap();
+        let err = RaftLog::open(dir.path()).err().expect("refused");
+        assert!(
+            err.to_string().contains("record 2 fails its checksum"),
+            "{err}"
+        );
     }
 }
