@@ -64,3 +64,18 @@ the developer guide's performance page.
 ```bash
 BENCH=/data/bench scripts/bench/baseline.sh objectio rustfs seaweedfs
 ```
+
+## regression.py
+
+The CI performance check (B4): a build against its base on one machine,
+interleaved, 64 KiB and 4 MiB PUT and GET through a fresh 4+2 aio per run;
+fails when a cell's median throughput falls below 0.85 of the base's.
+CI runs it in the merge queue, and on a pull request labelled `perf`. Two
+release builds, each a directory with `objectio-aio` (the head's also
+`objectio-s3-bench`):
+
+```bash
+scripts/bench/regression.py --base /tmp/base --head target/release
+```
+
+How it decides and how to read it: the developer guide's performance page.
