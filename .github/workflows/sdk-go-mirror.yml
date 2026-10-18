@@ -24,7 +24,7 @@
 # Required repo settings:
 #   - The target repo object-io/objectio-go-sdk must exist (it may be
 #     empty; this workflow writes its first commit).
-#   - Secret SDK_MIRROR_TOKEN: a fine-grained PAT with Contents: read+write
+#   - Secret SDK_GO_DEPLOY_KEY: the private half of a deploy key with write access
 #     on object-io/objectio-go-sdk. The default GITHUB_TOKEN cannot write to
 #     another repository.
 #
@@ -82,7 +82,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.TARGET_REPO }}
-          token: ${{ secrets.SDK_MIRROR_TOKEN }}
+          ssh-key: ${{ secrets.SDK_GO_DEPLOY_KEY }}
           path: target
           fetch-depth: 0
 
