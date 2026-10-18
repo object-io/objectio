@@ -1,0 +1,20 @@
+//! ObjectIO Common - Shared types and utilities
+//!
+//! This crate provides common types, error definitions, and utilities
+//! used across all ObjectIO components.
+
+pub mod checksum;
+pub mod config;
+pub mod error;
+pub mod exposition;
+pub mod histogram;
+pub mod metrics_registry;
+pub mod process_metrics;
+pub mod stamp;
+pub mod types;
+pub mod version;
+
+pub use checksum::{Checksum, ChecksumCalculator};
+pub use config::Config;
+pub use error::{Error, Result};
+pub use types::*;

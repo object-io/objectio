@@ -1,0 +1,23 @@
+{
+  "categorical": {
+    "light": [
+      "#0077c7",
+      "#c46a00",
+      "#0f8f7c",
+      "#7c4dff"
+    ],
+    "dark": [
+      "#2f8fe0",
+      "#c97c12",
+      "#1fa896",
+      "#8a6cf5"
+    ]
+  },
+  "rules": [
+    "fixed hue order, never cycled",
+    "max 4 series per chart; more -> small multiples or Other",
+    "one y-axis per chart",
+    "status colors (ok/warn/err) never used for series",
+    "line 2px, end marker r3.5, grid = border token, axis text = faint token, mono 10px"
+  ]
+}

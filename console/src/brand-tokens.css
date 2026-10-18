@@ -1,0 +1,112 @@
+/* ==========================================================================
+   OBJECTIO — Brand tokens (CSS)
+
+   Primitives mirror objectio-brand/assets/brand-tokens.json. The `--oio-*`
+   names are the brand's own; the `--objectio-*` names are this app's older
+   vocabulary, kept as aliases so existing rules keep resolving.
+
+   The mark is the Shard Ring: eight segments, six data + two parity (amber,
+   at 12 and 6 o'clock). Never rotate it; never recolor the parity pair.
+   ========================================================================== */
+
+:root {
+  /* Brand primitives ------------------------------------------------------- */
+  --oio-ink:         #0c121a;
+  --oio-graphite:    #232933;
+  --oio-slate:       #677284;
+  --oio-mist:        #ccd1d9;
+  --oio-paper:       #f5f7f9;
+  --oio-data:        #249ff3;
+  --oio-data-deep:   #0077c7;
+  --oio-data-light:  #a2d4ff;
+  --oio-parity:      #fc9f30;
+
+  --oio-font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+  --oio-font-body:    'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --oio-font-mono:    'IBM Plex Mono', 'SF Mono', Menlo, monospace;
+
+  /* Aliases for the app's existing vocabulary ------------------------------ */
+  --objectio-ink:         var(--oio-ink);
+  --objectio-ink-raised:  var(--oio-graphite);
+  --objectio-ink-line:    #1b222c;
+  --objectio-paper:       var(--oio-paper);
+  --objectio-paper-line:  var(--oio-mist);
+  --objectio-fog:         var(--oio-mist);
+  --objectio-mute:        var(--oio-slate);
+  --objectio-snow:        var(--oio-paper);
+  --objectio-accent:      var(--oio-data);
+  --objectio-accent-600:  var(--oio-data-deep);
+  --objectio-parity:      var(--oio-parity);
+
+  --objectio-font-sans:   var(--oio-font-body);
+  --objectio-font-display: var(--oio-font-display);
+  --objectio-font-mono:   var(--oio-font-mono);
+
+  /* Gradients. Data blue into its deep tone; parity amber is reserved for the
+     mark's two parity shards and for genuine parity/repair states, so it is
+     deliberately absent here. ---------------------------------------------- */
+  --objectio-gradient:    linear-gradient(90deg, var(--oio-data) 0%, var(--oio-data-deep) 100%);
+  --objectio-gradient-l:  linear-gradient(90deg, var(--oio-data-deep) 0%, var(--oio-ink) 100%);
+  --objectio-bg-hero:     radial-gradient(1200px 400px at 50% 0%, var(--oio-graphite) 0%, var(--oio-ink) 70%);
+
+  /* Type scale (fluid-ish) ------------------------------------------------- */
+  --objectio-fs-display:  clamp(48px, 6vw, 96px);
+  --objectio-fs-h1:       clamp(36px, 4vw, 56px);
+  --objectio-fs-h2:       clamp(28px, 3vw, 40px);
+  --objectio-fs-h3:       clamp(20px, 2vw, 24px);
+  --objectio-fs-body:     16px;
+  --objectio-fs-small:    13px;
+  --objectio-fs-caption:  11px;
+
+  /* Radii & elevation ------------------------------------------------------ */
+  --objectio-radius-sm:   6px;
+  --objectio-radius-md:   12px;
+  --objectio-radius-lg:   16px;
+  --objectio-radius-xl:   24px;
+  --objectio-shadow-1:    0 1px 2px rgba(0,0,0,.2), 0 0 0 1px rgba(255,255,255,.04) inset;
+  --objectio-shadow-2:    0 8px 24px rgba(0,0,0,.35);
+  --objectio-shadow-glow: 0 0 0 2px rgba(36,159,243,.25), 0 8px 24px rgba(36,159,243,.15);
+
+  /* Spacing (4pt scale) ---------------------------------------------------- */
+  --objectio-space-1:     4px;
+  --objectio-space-2:     8px;
+  --objectio-space-3:     12px;
+  --objectio-space-4:     16px;
+  --objectio-space-5:     24px;
+  --objectio-space-6:     32px;
+  --objectio-space-7:     48px;
+  --objectio-space-8:     64px;
+
+  /* Motion ----------------------------------------------------------------- */
+  --objectio-ease:        cubic-bezier(.2,.8,.2,1);
+  --objectio-dur-fast:    120ms;
+  --objectio-dur-med:     240ms;
+  --objectio-dur-slow:    480ms;
+}
+
+/* Utility classes (optional) -------------------------------------------------- */
+.objectio-gradient-text {
+  background: var(--objectio-gradient);
+  -webkit-background-clip: text;
+          background-clip: text;
+  color: transparent;
+}
+.objectio-btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 16px;
+  font: 600 14px/1 var(--objectio-font-sans);
+  color: var(--oio-paper);
+  background: var(--oio-data);
+  border: 0;
+  border-radius: var(--objectio-radius-md);
+  cursor: pointer;
+  transition: transform var(--objectio-dur-fast) var(--objectio-ease),
+              box-shadow var(--objectio-dur-med) var(--objectio-ease);
+}
+.objectio-btn:hover { box-shadow: var(--objectio-shadow-glow); }
+.objectio-btn:active { transform: translateY(1px); }
+.objectio-btn--ghost {
+  background: transparent;
+  color: var(--objectio-snow);
+  box-shadow: inset 0 0 0 1px var(--objectio-ink-line);
+}

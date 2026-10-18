@@ -1,0 +1,3909 @@
+//! OSD Connection Pool
+//!
+//! Manages connections to multiple OSD nodes for distributed storage operations.
+
+use bytes::Bytes;
+use objectio_proto::metadata::NodePlacement;
+use objectio_proto::storage::storage_service_client::StorageServiceClient;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tonic::transport::Channel;
+use tracing::{debug, error, info, warn};
+
+/// Error type for OSD pool operations
+#[derive(Debug, thiserror::Error)]
+pub enum OsdPoolError {
+    #[error("node not found: {0}")]
+    NodeNotFound(String),
+
+    #[error("connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("no nodes available")]
+    #[allow(dead_code)]
+    NoNodesAvailable,
+
+    #[error("shard checksum mismatch: {0}")]
+    ChecksumMismatch(String),
+
+    /// The OSD has no room for a client write (B3): past its full ratio.
+    #[error("OSD full: {0}")]
+    Full(String),
+
+    /// The object needs a newer release to read correctly.
+    #[error("{0}")]
+    TooOld(String),
+
+    /// This gateway's clock is too far from meta's to stamp a write.
+    #[error("{0}")]
+    ClockSkew(String),
+
+    /// The OSD knows a newer epoch of the placement group than the write
+    /// was placed under (B31): it was refused, and is placed again.
+    #[error("{0}")]
+    StaleEpoch(String),
+}
+
+/// Marks a response to a request refused because an OSD knew a newer
+/// epoch of its placement group than it was placed under (B31): nothing
+/// was stored, and the request can be placed again and retried.
+#[derive(Clone, Copy, Debug)]
+pub struct StalePlacement;
+
+/// Whether `status` is an OSD refusing a request placed under an older
+/// epoch of its placement group than it knows (B31).
+#[must_use]
+pub fn is_stale_epoch(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(objectio_proto::STALE_EPOCH_HEADER)
+        .is_some()
+}
+
+/// The placement group and epoch a placement is, for the requests that
+/// write by it (B31). None for one made without a placement group.
+#[must_use]
+pub fn pg_ref(
+    placement: &objectio_proto::metadata::GetPlacementResponse,
+) -> Option<objectio_proto::storage::PgRef> {
+    (placement.pg_epoch > 0).then(|| objectio_proto::storage::PgRef {
+        pool: placement.pool.clone(),
+        pg_id: placement.pg_id,
+        epoch: placement.pg_epoch,
+    })
+}
+
+/// Node identifier (16-byte UUID)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId([u8; 16]);
+
+impl NodeId {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 16 {
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(bytes);
+            Some(Self(arr))
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl From<[u8; 16]> for NodeId {
+    fn from(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Information about a connected OSD node
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct OsdNode {
+    pub node_id: NodeId,
+    pub address: String,
+    pub client: StorageServiceClient<Channel>,
+}
+
+/// How long an OSD address that just failed at the transport level (no
+/// connection, or a connection that dropped) is failed fast, without
+/// trying it. A slow answer does not count: a busy OSD is not a dead one. A host that vanished without resetting its connections would
+/// otherwise cost every request a timeout; meanwhile writes go on with the
+/// other shards (the write quorum) and repair rebuilds the missing one.
+const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the probe after a transport failure waits for a connection:
+/// an OSD that restarted accepts at once; one that is gone does not.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long an OSD call runs before the gateway checks, in the
+/// background, whether the OSD still accepts connections ([`OsdPool::watched`]).
+const SUSPECT_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a failed-fast address is kept failed fast by its probe while
+/// it stays gone.
+const PROBE_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How often a failed-fast address is probed while its mark lasts.
+const PROBE_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Pool of OSD connections for multi-node operations
+pub struct OsdPool {
+    /// Connected nodes: node_id -> OsdNode
+    nodes: RwLock<HashMap<NodeId, OsdNode>>,
+    /// Address to node_id mapping for deduplication
+    address_map: RwLock<HashMap<String, NodeId>>,
+    /// Addresses that failed at the transport level, and when. Shared
+    /// with the probe that lifts a mark as soon as the OSD answers again.
+    unreachable: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Addresses being probed now, so one failure burst starts one probe.
+    probing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Addresses whose cached channel is to be dropped before next use: a
+    /// channel to a host that vanished can hang a call until its timeout
+    /// instead of failing, so after a failure the next call dials afresh.
+    stale: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Meta, for keys a write or delete left behind on some copies.
+    heal: std::sync::OnceLock<
+        objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    >,
+    /// Object metadata reads, several to a call per OSD (B21).
+    meta_reads: crate::meta_reads::MetaReads,
+}
+
+impl OsdPool {
+    /// Create a new empty OSD pool
+    pub fn new() -> Self {
+        Self {
+            nodes: RwLock::new(HashMap::new()),
+            address_map: RwLock::new(HashMap::new()),
+            unreachable: Arc::default(),
+            probing: Arc::default(),
+            stale: Arc::default(),
+            heal: std::sync::OnceLock::new(),
+            meta_reads: crate::meta_reads::MetaReads::default(),
+        }
+    }
+
+    /// Where keys go whose copies a write or delete left behind.
+    pub fn set_heal_queue(
+        &self,
+        meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    ) {
+        let _ = self.heal.set(meta);
+    }
+
+    /// A write or delete of `bucket/key` reached the quorum but not every
+    /// copy: queue the key for healing (core/object-metadata-quorum.md).
+    /// Before the caller acknowledges; if meta can't take it, the data is
+    /// still durable at quorum and only waits longer to converge.
+    pub async fn queue_heal(&self, bucket: &str, key: &str, version_id: &str) {
+        let Some(meta) = self.heal.get() else {
+            return;
+        };
+        let request = objectio_proto::metadata::HealEnqueueRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+        };
+        let r = meta.clone().heal_enqueue(request.clone()).await;
+        crate::gateway_metrics::record_heal_queued(r.is_ok());
+        if let Err(e) = r {
+            // Meta down or electing: keep trying for a while rather than
+            // leave the key unhealed (and, after a delete, still listed).
+            warn!("{bucket}/{key}: could not queue for healing yet: {e}");
+            let meta = meta.clone();
+            tokio::spawn(async move {
+                let mut wait = std::time::Duration::from_secs(1);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+                while std::time::Instant::now() < deadline {
+                    tokio::time::sleep(wait).await;
+                    if meta.clone().heal_enqueue(request.clone()).await.is_ok() {
+                        crate::gateway_metrics::record_heal_queued(true);
+                        return;
+                    }
+                    wait = (wait * 2).min(std::time::Duration::from_secs(30));
+                }
+                warn!(
+                    "{}/{}: could not queue for healing in 10 minutes; given up",
+                    request.bucket, request.key
+                );
+            });
+        }
+    }
+
+    /// Record an object as degraded on meta (B29), so repair rebuilds what
+    /// it lacks now rather than at its next walk. Retried like
+    /// [`Self::queue_heal`]: the write it follows was likely refused because
+    /// the cluster is in trouble, meta perhaps among it.
+    pub async fn report_degraded(&self, request: objectio_proto::metadata::ReportDegradedRequest) {
+        let Some(meta) = self.heal.get() else {
+            return;
+        };
+        let name = format!("{}/{}", request.bucket, request.key);
+        if meta.clone().report_degraded(request.clone()).await.is_ok() {
+            info!("{name}: short of shards; recorded for repair");
+            return;
+        }
+        let meta = meta.clone();
+        tokio::spawn(async move {
+            let mut wait = std::time::Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(wait).await;
+                if meta.clone().report_degraded(request.clone()).await.is_ok() {
+                    info!("{name}: short of shards; recorded for repair");
+                    return;
+                }
+                wait = (wait * 2).min(std::time::Duration::from_secs(30));
+            }
+            warn!("{name}: could not record it as short of shards in 10 minutes; given up");
+        });
+    }
+
+    /// `address` failed at the transport level: fail it fast for a while,
+    /// unless it answers a fresh connection at once. An OSD that restarted
+    /// closes every connection to it, so the next call on each fails though
+    /// it is back; held off for the whole `FAIL_FAST`, it cost every read
+    /// that needed it (the A6 chaos test: two OSDs stopped looked like four,
+    /// with the two just restarted, and nothing was readable).
+    pub fn mark_unreachable(&self, address: &str) {
+        self.unreachable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string(), std::time::Instant::now());
+        self.stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string());
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if !self
+            .probing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string())
+        {
+            return; // already being probed
+        }
+        let (unreachable, probing) = (Arc::clone(&self.unreachable), Arc::clone(&self.probing));
+        let address = address.to_string();
+        // Probed until it answers or the mark runs out: an OSD that was
+        // stopped when it failed and restarted within the window is used
+        // again as soon as it is up, not when the mark expires (the A6
+        // check stopped the next two OSDs inside that window, and four
+        // looked down).
+        runtime.spawn(async move {
+            let started = std::time::Instant::now();
+            let marked = || {
+                unreachable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&address)
+                    .is_some_and(|at| at.elapsed() < FAIL_FAST)
+            };
+            while marked() {
+                let answers = match objectio_proto::transport::endpoint(&address) {
+                    Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                    Err(_) => false,
+                };
+                {
+                    let mut marks = unreachable
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if answers {
+                        marks.remove(&address);
+                        debug!("{address} answers again; no longer failed fast");
+                        break;
+                    }
+                    // Still gone: kept failed fast, so requests don't each
+                    // wait out a connect timeout every time the mark would
+                    // run out (every 8 s, writes stalled for 3). Until
+                    // PROBE_FOR, after which the next failure starts over.
+                    if started.elapsed() < PROBE_FOR {
+                        marks.insert(address.clone(), std::time::Instant::now());
+                    }
+                }
+                tokio::time::sleep(PROBE_EVERY).await;
+            }
+            probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&address);
+        });
+    }
+
+    /// A call to the OSD at `address` failed with `e`: fail the OSD fast if
+    /// it could not be reached; if the gateway's own side closed the
+    /// connection ([`closed_by_us`]), dial it afresh for the next call
+    /// rather than have that one fail too (tonic hands the closed
+    /// connection's error to the first call after it).
+    pub fn call_failed(&self, address: &str, e: &tonic::Status) {
+        if is_transport_failure(e) {
+            self.mark_unreachable(address);
+        } else if closed_by_us(e) {
+            self.stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(address.to_string());
+        }
+    }
+
+    /// Await `call`, an RPC to the OSD at `address`. One still running after
+    /// [`SUSPECT_AFTER`] makes the gateway check, in the background, whether
+    /// the OSD still accepts a connection, and fail it fast if not.
+    ///
+    /// A call on a connection to a host that vanished without a reset hangs
+    /// until HTTP/2 keepalive gives up (about 5 s). By then the client has
+    /// often given up too, the request is dropped, and the failure is never
+    /// seen: the next request takes the same dead connection. In the A6
+    /// chaos test that held every write through one gateway for the whole
+    /// 60 s partition. A busy OSD still accepts connections, so a slow call
+    /// alone never fails one fast.
+    pub async fn watched<F: std::future::Future>(&self, address: &str, call: F) -> F::Output {
+        let mut call = std::pin::pin!(call);
+        tokio::select! {
+            out = &mut call => return out,
+            () = tokio::time::sleep(SUSPECT_AFTER) => {}
+        }
+        self.suspect(address);
+        call.await
+    }
+
+    /// Check whether `address` accepts a fresh connection, in the
+    /// background; fail it fast if it doesn't.
+    fn suspect(&self, address: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.is_unreachable(address)
+            || !self
+                .probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(address.to_string())
+        {
+            return; // known down, or already being checked
+        }
+        let (unreachable, stale, probing) = (
+            Arc::clone(&self.unreachable),
+            Arc::clone(&self.stale),
+            Arc::clone(&self.probing),
+        );
+        let address = address.to_string();
+        runtime.spawn(async move {
+            let answers = match objectio_proto::transport::endpoint(&address) {
+                Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                Err(_) => false,
+            };
+            if !answers {
+                warn!("{address}: a call hangs and a new connection fails; failing it fast");
+                unreachable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(address.clone(), std::time::Instant::now());
+                stale
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(address.clone());
+            }
+            probing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&address);
+        });
+    }
+
+    /// Whether `address` failed at the transport level within `FAIL_FAST`.
+    fn is_unreachable(&self, address: &str) -> bool {
+        let mut m = self
+            .unreachable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match m.get(address) {
+            Some(at) if at.elapsed() < FAIL_FAST => true,
+            Some(_) => {
+                m.remove(address);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Connect to an OSD node and add it to the pool
+    pub async fn connect(&self, node_id: NodeId, address: &str) -> Result<(), OsdPoolError> {
+        // Take the write lock immediately to avoid race conditions
+        let mut nodes = self.nodes.write().await;
+
+        // Double-check if already connected (another task may have inserted while we waited)
+        if nodes.contains_key(&node_id) {
+            return Ok(());
+        }
+
+        // Check if address already has a connection with a different node_id
+        let address_map = self.address_map.read().await;
+        if let Some(existing_node_id) = address_map.get(address).cloned() {
+            drop(address_map); // Release read lock before taking nodes read
+
+            if let Some(existing_node) = nodes.get(&existing_node_id).cloned() {
+                let aliased_node = OsdNode {
+                    node_id: node_id.clone(),
+                    address: address.to_string(),
+                    client: existing_node.client,
+                };
+                nodes.insert(node_id, aliased_node);
+                return Ok(());
+            }
+        } else {
+            drop(address_map);
+        }
+
+        // Need to create a new connection - release the lock during the network call
+        drop(nodes);
+
+        // Connect with increased message size limit (100MB for large objects)
+        let max_message_size = 100 * 1024 * 1024; // 100 MB
+        // A dead host is noticed in seconds: connecting gives up after 3 s,
+        // and an open connection that stops answering keepalives is closed
+        // after about 5 s, failing what is in flight on it (writes wait for
+        // every shard, so this bounds how long a vanished host holds them).
+        let channel = objectio_proto::transport::endpoint(address)
+            .map_err(OsdPoolError::ConnectionFailed)?
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+            .http2_keep_alive_interval(std::time::Duration::from_secs(2))
+            .keep_alive_timeout(std::time::Duration::from_secs(3))
+            .keep_alive_while_idle(true)
+            .connect()
+            .await
+            .map_err(|e| {
+                self.mark_unreachable(address);
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?;
+
+        let client = StorageServiceClient::new(channel)
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
+
+        // Re-acquire the lock and check again (another task may have connected)
+        let mut nodes = self.nodes.write().await;
+        if nodes.contains_key(&node_id) {
+            return Ok(()); // Another task connected while we were making the network call
+        }
+
+        let node = OsdNode {
+            node_id: node_id.clone(),
+            address: address.to_string(),
+            client,
+        };
+
+        nodes.insert(node_id.clone(), node);
+        drop(nodes);
+
+        self.address_map
+            .write()
+            .await
+            .insert(address.to_string(), node_id);
+
+        info!("Connected to OSD at {}", address);
+        Ok(())
+    }
+
+    /// Get a client for a specific node
+    #[allow(dead_code)]
+    pub async fn get_client(
+        &self,
+        node_id: &[u8],
+    ) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
+        let id = NodeId::from_bytes(node_id)
+            .ok_or_else(|| OsdPoolError::NodeNotFound("invalid node ID".to_string()))?;
+
+        self.nodes
+            .read()
+            .await
+            .get(&id)
+            .map(|n| n.client.clone())
+            .ok_or_else(|| OsdPoolError::NodeNotFound(id.to_hex()))
+    }
+
+    /// Get a client for a node by address, connecting if necessary
+    pub async fn get_or_connect(
+        &self,
+        node_id: &[u8],
+        address: &str,
+    ) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
+        let id = NodeId::from_bytes(node_id)
+            .ok_or_else(|| OsdPoolError::NodeNotFound("invalid node ID".to_string()))?;
+        if self.is_unreachable(address) {
+            return Err(OsdPoolError::ConnectionFailed(format!(
+                "{address} failed in the last {} s; not tried",
+                FAIL_FAST.as_secs()
+            )));
+        }
+
+        // A channel to an address that failed since it was cached: dropped,
+        // so this call dials afresh (and fails within the connect timeout
+        // if the host is still gone) rather than hanging on it.
+        let stale = self
+            .stale
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(address);
+        if stale {
+            self.nodes.write().await.retain(|_, n| n.address != address);
+            self.address_map.write().await.remove(address);
+        }
+
+        // Try to get existing client first (fast path)
+        if let Some(node) = self.nodes.read().await.get(&id) {
+            return Ok(node.client.clone());
+        }
+
+        // Connect (handles races internally)
+        self.connect(id.clone(), address).await?;
+
+        self.nodes
+            .read()
+            .await
+            .get(&id)
+            .map(|n| n.client.clone())
+            .ok_or_else(|| OsdPoolError::NodeNotFound(id.to_hex()))
+    }
+
+    /// Remove a node from the pool
+    #[allow(dead_code)]
+    pub async fn disconnect(&self, node_id: &NodeId) {
+        if let Some(node) = self.nodes.write().await.remove(node_id) {
+            self.address_map.write().await.remove(&node.address);
+            info!("Disconnected from OSD node {}", node_id.to_hex());
+        }
+    }
+
+    /// Get all connected node IDs
+    #[allow(dead_code)]
+    pub async fn connected_nodes(&self) -> Vec<NodeId> {
+        self.nodes.read().await.keys().cloned().collect()
+    }
+
+    /// Get the number of connected nodes
+    #[allow(dead_code)]
+    pub async fn node_count(&self) -> usize {
+        self.nodes.read().await.len()
+    }
+
+    /// Get a client for a node placement
+    pub async fn get_client_for_placement(
+        &self,
+        placement: &NodePlacement,
+    ) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
+        self.get_or_connect(&placement.node_id, &placement.node_address)
+            .await
+    }
+}
+
+impl Default for OsdPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Client for a shard call, counting a failure to connect as `refused`.
+async fn connect_for_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
+    pool.get_client_for_placement(placement)
+        .await
+        .inspect_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "refused");
+        })
+}
+
+/// A PUT shard's place in the gateway's registered memory, so an OSD can
+/// read it over Transfer Engine instead of receiving it as bytes.
+#[derive(Clone, Copy)]
+pub struct RdmaSource<'a> {
+    pub rdma: &'a crate::rdma::GatewayRdma,
+    /// Address of the shard's first byte in this process.
+    pub addr: u64,
+}
+
+/// Whether `e` says the OSD could not be reached (as opposed to an answer
+/// from it): unavailable, or a connection that dropped, which tonic reports
+/// as Unknown "transport error". Not a connection the gateway's side closed
+/// itself ([`closed_by_us`]): the OSD is up.
+fn is_transport_failure(e: &tonic::Status) -> bool {
+    (e.code() == tonic::Code::Unavailable || connection_broke(e)) && !closed_by_us(e)
+}
+
+/// The connection failed under the call, whatever tonic made of it: a
+/// transport error, or an HTTP/2 stream or connection reset ("h2 protocol
+/// error: error reading a body from connection", as a meta pod's restart
+/// cut a placement answer short, which became a 500).
+pub fn connection_broke(e: &tonic::Status) -> bool {
+    // tonic reports a connection that dropped mid-call either way round:
+    // "transport error", or the h2 layer's own message (seen as Unknown
+    // when a meta pod restarted during a call: a 500, not a retry, before).
+    // The code depends on the h2 reason: Unknown, Internal, and
+    // ResourceExhausted (ENHANCE_YOUR_CALM, seen across a partition healing
+    // in the B2 soak), so only the message tells.
+    // A deliberate answer (not found, refused) is never one, whatever it says.
+    !matches!(
+        e.code(),
+        tonic::Code::NotFound
+            | tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+    ) && (e.message() == "transport error" || e.message().starts_with("h2 protocol error"))
+}
+
+/// Whether the gateway's own HTTP/2 side closed the connection under the
+/// call: h2 does once more than 1024 answers arrived for calls it had
+/// cancelled and forgotten (a cancelled call is remembered 1 s, and only the
+/// last 50), counted over the connection's life and never reset. A call
+/// cancelled while its answer is on the way is one: thousands a second at
+/// the quorum of every metadata read, before those were let finish. The
+/// OSD is fine; the call can be made again on a new connection.
+pub fn closed_by_us(e: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        if let Some(h2) = s.downcast_ref::<h2::Error>() {
+            return h2.is_go_away()
+                && h2.is_library()
+                && h2.reason() == Some(h2::Reason::ENHANCE_YOUR_CALM);
+        }
+        source = s.source();
+    }
+    false
+}
+
+/// A shard call that did not succeed.
+enum ShardCallError {
+    Connect(OsdPoolError),
+    Timeout,
+    Status(tonic::Status),
+}
+
+impl OsdPoolError {
+    /// Whether this is an OSD refusing a write for lack of room.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        matches!(self, Self::Full(_))
+    }
+
+    /// Whether this is an OSD refusing a write placed under an old epoch.
+    #[must_use]
+    pub const fn is_stale_epoch(&self) -> bool {
+        matches!(self, Self::StaleEpoch(_))
+    }
+}
+
+impl From<ShardCallError> for OsdPoolError {
+    fn from(e: ShardCallError) -> Self {
+        match e {
+            ShardCallError::Connect(e) => e,
+            ShardCallError::Timeout => Self::ConnectionFailed("timeout".to_string()),
+            // The connection, not the disk: ResourceExhausted is also what
+            // tonic makes of a connection h2 closed (ENHANCE_YOUR_CALM).
+            ShardCallError::Status(s) if connection_broke(&s) => {
+                Self::ConnectionFailed(s.to_string())
+            }
+            ShardCallError::Status(s) if s.code() == tonic::Code::ResourceExhausted => {
+                Self::Full(s.message().to_string())
+            }
+            ShardCallError::Status(s) if is_stale_epoch(&s) => {
+                Self::StaleEpoch(s.message().to_string())
+            }
+            ShardCallError::Status(s) => Self::ConnectionFailed(s.to_string()),
+        }
+    }
+}
+
+/// Why a Transfer Engine attempt failed, and what to do about the OSD. A
+/// busy OSD refused before touching the gateway's memory; anything else
+/// means the path is suspect, so the OSD cools down.
+fn rdma_failure(
+    rdma: &crate::rdma::GatewayRdma,
+    te_segment: &str,
+    e: &ShardCallError,
+) -> crate::rdma::Fallback {
+    use crate::rdma::Fallback;
+    let reason = match e {
+        ShardCallError::Status(s)
+            if s.code() == tonic::Code::ResourceExhausted && !connection_broke(s) =>
+        {
+            return Fallback::OsdBusy;
+        }
+        ShardCallError::Status(s) if s.code() == tonic::Code::DataLoss => Fallback::Checksum,
+        _ => Fallback::Error,
+    };
+    rdma.cool_down(te_segment);
+    reason
+}
+
+/// Whether `data` is the shard the OSD described. A response without a
+/// checksum is taken as is: the field is optional on the wire.
+fn matches_checksum(checksum: Option<&objectio_proto::storage::Checksum>, data: &[u8]) -> bool {
+    checksum.is_none_or(|c| c.crc32c == crc32c::crc32c(data))
+}
+
+/// One WriteShard call, with the gateway's timeout and error accounting.
+async fn call_write_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::WriteShardRequest,
+) -> Result<objectio_proto::storage::BlockLocation, ShardCallError> {
+    let mut client = connect_for_shard(pool, placement)
+        .await
+        .map_err(ShardCallError::Connect)?;
+    let position = request.shard_id.as_ref().map_or(0, |s| s.position);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        pool.watched(&placement.node_address, client.write_shard(request)),
+    )
+    .await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "write", started.elapsed());
+    let response = result
+        .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            error!(
+                "Timeout writing shard {} to OSD {}",
+                position, placement.node_address
+            );
+            ShardCallError::Timeout
+        })?
+        .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            pool.call_failed(&placement.node_address, &e);
+            error!(
+                "Failed to write shard to OSD {}: {}",
+                placement.node_address, e
+            );
+            ShardCallError::Status(e)
+        })?;
+    response.into_inner().location.ok_or_else(|| {
+        ShardCallError::Connect(OsdPoolError::ConnectionFailed(
+            "no location returned".to_string(),
+        ))
+    })
+}
+
+/// One ReadShard call, with the gateway's timeout and error accounting;
+/// made once more on a new connection if the gateway's side closed the one
+/// it was on ([`closed_by_us`]).
+async fn call_read_shard(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::ReadShardRequest,
+) -> Result<objectio_proto::storage::ReadShardResponse, ShardCallError> {
+    match read_shard_once(pool, placement, request.clone()).await {
+        Err(ShardCallError::Status(e)) if closed_by_us(&e) => {
+            read_shard_once(pool, placement, request).await
+        }
+        r => r,
+    }
+}
+
+async fn read_shard_once(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    request: objectio_proto::storage::ReadShardRequest,
+) -> Result<objectio_proto::storage::ReadShardResponse, ShardCallError> {
+    let mut client = connect_for_shard(pool, placement)
+        .await
+        .map_err(ShardCallError::Connect)?;
+    let position = request.shard_id.as_ref().map_or(0, |s| s.position);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pool.watched(&placement.node_address, client.read_shard(request)),
+    )
+    .await;
+    crate::gateway_metrics::record_shard_io(&placement.node_address, "read", started.elapsed());
+    let response = result
+        .map_err(|_| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "timeout");
+            error!(
+                "Timeout reading shard {} from OSD {}",
+                position, placement.node_address
+            );
+            ShardCallError::Timeout
+        })?
+        .map_err(|e| {
+            crate::gateway_metrics::record_osd_error(&placement.node_address, "error");
+            pool.call_failed(&placement.node_address, &e);
+            warn!(
+                "Failed to read shard from OSD {}: {}",
+                placement.node_address, e
+            );
+            ShardCallError::Status(e)
+        })?;
+    Ok(response.into_inner())
+}
+
+/// Write a shard to the OSD in `placement`.
+///
+/// With `rdma`, and an OSD that offers Transfer Engine, the OSD reads the
+/// shard out of the gateway's memory; if that fails for any reason the same
+/// shard is sent again as bytes. `data` is the shard either way — for the
+/// checksum, and for the fallback.
+#[allow(clippy::too_many_arguments)]
+/// Returns where the shard went and its crc32c, which the object records
+/// (B23).
+pub async fn write_shard_to_osd(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    object_id: &[u8],
+    stripe_id: u64,
+    position: u32,
+    data: Bytes,
+    ec_k: u32,
+    ec_m: u32,
+    rdma: Option<RdmaSource<'_>>,
+    pg: Option<&objectio_proto::storage::PgRef>,
+) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
+    use objectio_proto::storage::{Checksum, RdmaBuffer, ShardId, WriteShardRequest};
+
+    let shard_id = ShardId {
+        object_id: object_id.to_vec(),
+        stripe_id,
+        position,
+    };
+    let checksum = Checksum {
+        crc32c: crc32c::crc32c(&data),
+        xxhash64: 0,
+        sha256: vec![],
+    };
+
+    if let Some(src) = rdma {
+        match src.rdma.check(&placement.te_segment) {
+            Ok(()) => {
+                let request = WriteShardRequest {
+                    shard_id: Some(shard_id.clone()),
+                    data: Bytes::new(),
+                    ec_k,
+                    ec_m,
+                    checksum: Some(checksum.clone()),
+                    rdma: Some(RdmaBuffer {
+                        segment: src.rdma.segment().to_string(),
+                        addr: src.addr,
+                        len: data.len() as u64,
+                    }),
+                    use_reserve: false,
+                    pg: pg.cloned(),
+                };
+                match call_write_shard(pool, placement, request).await {
+                    Ok(location) => {
+                        crate::gateway_metrics::record_shard_transfer("write", "rdma");
+                        return Ok((location, checksum.crc32c));
+                    }
+                    Err(e) => {
+                        let reason = rdma_failure(src.rdma, &placement.te_segment, &e);
+                        crate::gateway_metrics::record_rdma_fallback("write", reason);
+                        // The OSD may still be reading this memory.
+                        if reason != crate::rdma::Fallback::OsdBusy {
+                            src.rdma.quarantine(data.clone());
+                        }
+                        warn!(
+                            "shard {position} to {} over rdma: {}; sending it over gRPC",
+                            placement.node_address,
+                            reason.label()
+                        );
+                    }
+                }
+            }
+            Err(Some(reason)) => crate::gateway_metrics::record_rdma_fallback("write", reason),
+            Err(None) => {}
+        }
+    }
+
+    let crc = checksum.crc32c;
+    let request = WriteShardRequest {
+        shard_id: Some(shard_id),
+        ec_k,
+        ec_m,
+        checksum: Some(checksum),
+        data,
+        rdma: None,
+        use_reserve: false,
+        pg: pg.cloned(),
+    };
+    let location = call_write_shard(pool, placement, request)
+        .await
+        .inspect_err(|e| {
+            // The OSD refuses bytes that do not match the checksum sent
+            // with them: the shard was damaged between here and there.
+            if matches!(e, ShardCallError::Status(s) if s.code() == tonic::Code::DataLoss) {
+                crate::gateway_metrics::record_shard_checksum_mismatch("write");
+            }
+        })?;
+    crate::gateway_metrics::record_shard_transfer("write", "grpc");
+    Ok((location, crc))
+}
+
+/// Whether `data` is the shard its object recorded (B23); a shard with no
+/// recorded checksum passes.
+fn matches_recorded(expected_crc32c: Option<u32>, data: &[u8]) -> bool {
+    expected_crc32c.is_none_or(|c| crc32c::crc32c(data) == c)
+}
+
+/// Read a shard from the OSD in `placement`. `expected_crc32c` is the
+/// checksum its object records, checked as well as the OSD's.
+///
+/// With `rdma`, and an OSD that offers Transfer Engine, the OSD writes the
+/// shard into one of the gateway's read slots and the returned `Bytes` is a
+/// view of that slot — checked against the OSD's checksum. Any failure reads
+/// the shard again as bytes.
+pub async fn read_shard_from_osd(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    object_id: &[u8],
+    stripe_id: u64,
+    position: u32,
+    expected_crc32c: Option<u32>,
+    rdma: Option<&crate::rdma::GatewayRdma>,
+) -> Result<Bytes, OsdPoolError> {
+    use crate::rdma::Fallback;
+    use objectio_proto::storage::{RdmaBuffer, ReadShardRequest, ShardId};
+
+    let shard_id = ShardId {
+        object_id: object_id.to_vec(),
+        stripe_id,
+        position,
+    };
+
+    if let Some(r) = rdma {
+        match r.check(&placement.te_segment) {
+            Ok(()) => match r.read_slot() {
+                None => crate::gateway_metrics::record_rdma_fallback("read", Fallback::NoSlot),
+                Some(slot) => {
+                    let request = ReadShardRequest {
+                        shard_id: Some(shard_id.clone()),
+                        offset: 0,
+                        length: 0,
+                        expected_crc32c,
+                        rdma_dest: Some(RdmaBuffer {
+                            segment: r.segment().to_string(),
+                            addr: slot.addr(),
+                            len: slot.capacity() as u64,
+                        }),
+                    };
+                    let reason = match call_read_shard(pool, placement, request).await {
+                        Ok(resp) => {
+                            let len = usize::try_from(resp.rdma_len).unwrap_or(usize::MAX);
+                            if len > slot.capacity() {
+                                r.quarantine(slot.into_bytes(0));
+                                r.cool_down(&placement.te_segment);
+                                Fallback::Error
+                            } else {
+                                let bytes = slot.into_bytes(len);
+                                if matches_checksum(resp.checksum.as_ref(), &bytes)
+                                    && matches_recorded(expected_crc32c, &bytes)
+                                {
+                                    crate::gateway_metrics::record_shard_transfer("read", "rdma");
+                                    return Ok(bytes);
+                                }
+                                r.quarantine(bytes);
+                                r.cool_down(&placement.te_segment);
+                                Fallback::Checksum
+                            }
+                        }
+                        Err(e) => {
+                            let reason = rdma_failure(r, &placement.te_segment, &e);
+                            // The OSD may still be writing into this slot.
+                            if reason != Fallback::OsdBusy {
+                                r.quarantine(slot.into_bytes(0));
+                            }
+                            reason
+                        }
+                    };
+                    crate::gateway_metrics::record_rdma_fallback("read", reason);
+                    warn!(
+                        "shard {position} from {} over rdma: {}; reading it over gRPC",
+                        placement.node_address,
+                        reason.label()
+                    );
+                }
+            },
+            Err(Some(reason)) => crate::gateway_metrics::record_rdma_fallback("read", reason),
+            Err(None) => {}
+        }
+    }
+
+    let request = ReadShardRequest {
+        rdma_dest: None,
+        shard_id: Some(shard_id),
+        offset: 0,
+        length: 0, // 0 means read all
+        expected_crc32c,
+    };
+    let response = call_read_shard(pool, placement, request).await?;
+    // The same check the rdma path makes. A shard damaged on the way, or
+    // stored wrong (its OSD's checksum is of the wrong bytes), is a failed
+    // read, so the caller moves on to another shard or replica instead of
+    // decoding the damage into the object.
+    if !matches_checksum(response.checksum.as_ref(), &response.data)
+        || !matches_recorded(expected_crc32c, &response.data)
+    {
+        crate::gateway_metrics::record_shard_checksum_mismatch("read");
+        warn!(
+            "shard {position} from {} does not match its checksum; not using it",
+            placement.node_address
+        );
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} from {}",
+            placement.node_address
+        )));
+    }
+    crate::gateway_metrics::record_shard_transfer("read", "grpc");
+    Ok(response.data)
+}
+
+/// `length` bytes at `offset` of a shard, over gRPC: a packed object's
+/// slice, without moving the whole shard. The OSD checks the whole shard
+/// against its stored checksum before slicing, and the slice comes back
+/// with a checksum of its own, checked here.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_shard_range_from_osd(
+    pool: &OsdPool,
+    placement: &NodePlacement,
+    object_id: &[u8],
+    stripe_id: u64,
+    position: u32,
+    offset: u64,
+    length: u32,
+    expected_crc32c: Option<u32>,
+) -> Result<Bytes, OsdPoolError> {
+    use objectio_proto::storage::{ReadShardRequest, ShardId};
+    let request = ReadShardRequest {
+        // The OSD checks the whole shard against it before slicing.
+        expected_crc32c,
+        rdma_dest: None,
+        shard_id: Some(ShardId {
+            object_id: object_id.to_vec(),
+            stripe_id,
+            position,
+        }),
+        offset,
+        length,
+    };
+    let response = call_read_shard(pool, placement, request).await?;
+    if !matches_checksum(response.checksum.as_ref(), &response.data) {
+        crate::gateway_metrics::record_shard_checksum_mismatch("read");
+        warn!(
+            "shard {position} range from {} does not match its checksum; not using it",
+            placement.node_address
+        );
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} range from {}",
+            placement.node_address
+        )));
+    }
+    if response.data.len() > length as usize {
+        return Err(OsdPoolError::ChecksumMismatch(format!(
+            "shard {position} range from {}: {} bytes for a {length}-byte range",
+            placement.node_address,
+            response.data.len()
+        )));
+    }
+    crate::gateway_metrics::record_shard_transfer("read", "grpc");
+    Ok(response.data)
+}
+
+// ============================================================================
+// Object Metadata Operations
+//
+// ObjectMeta is replicated on every shard-carrying OSD (MinIO xl.meta / Ceph
+// OMAP style). Writes fan out to all k+m placements and require every replica
+// to succeed. Reads try each placement in CRUSH order and return the first
+// success. Deletes are best-effort across all replicas — a surviving stale
+// copy is harmless because ObjectListingEntry is the source of truth for
+// existence, and the next drain/rebalance sweep will GC it.
+// ============================================================================
+
+/// Deduplicate placements by node_id — `NodePlacement` carries a `position`
+/// alongside the node, so the same OSD appears once per shard it owns. For
+/// ObjectMeta fan-out we want one write per physical OSD.
+fn unique_node_placements(placements: &[NodePlacement]) -> Vec<NodePlacement> {
+    let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(placements.len());
+    for p in placements {
+        if seen.insert(p.node_id.clone()) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// A failed [`put_object_meta_to_all`].
+#[derive(Debug)]
+pub struct MetaWriteError {
+    pub error: OsdPoolError,
+    /// No replica can have applied the write: each one was unreachable or
+    /// refused it outright. Only then may the caller free the shards the
+    /// write would have referenced — after a timeout, or an error from
+    /// inside the OSD, a replica may hold the new ObjectMeta, and reads
+    /// served from it would find its shards gone.
+    pub unapplied: bool,
+    /// A refused small write some copies may still hold, to be withdrawn
+    /// from them in the background ([`withdraw_later`]); its shards are
+    /// free once it is.
+    pub withdrawing: Option<Withdrawal>,
+}
+
+/// A refused small write still to be withdrawn from `copies`, which didn't
+/// answer when asked.
+#[derive(Debug, Clone)]
+pub struct Withdrawal {
+    pub copies: Vec<NodePlacement>,
+    /// Every copy of the key: what its listing follows once this is
+    /// decided.
+    pub targets: Vec<NodePlacement>,
+    pub bucket: String,
+    pub key: String,
+    pub object_id: Vec<u8>,
+    pub version_id: String,
+    /// Set when the copies whose answer to the write was lost could hold
+    /// it on k with those that took it: they are asked first, and it is
+    /// withdrawn only if they don't.
+    pub undecided: Option<Undecided>,
+}
+
+/// A refused small write held by fewer than k copies that said so, and
+/// perhaps by others whose answer was lost: what deciding it needs.
+#[derive(Debug, Clone)]
+pub struct Undecided {
+    holds: Vec<bool>,
+    unsure: Vec<bool>,
+    shards: HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    object_meta: objectio_proto::metadata::ObjectMeta,
+}
+
+impl std::fmt::Display for MetaWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Write ObjectMeta to every shard-carrying OSD in parallel. Requires all
+/// replicas to accept — any failure fails the PUT and the caller surfaces a
+/// retryable error to the S3 client.
+///
+/// `expected_object_id`, when not empty, makes each replica refuse the
+/// write unless its current ObjectMeta for the key is that object: a
+/// read-modify-write must not put back an object that a PUT replaced, or a
+/// DELETE removed, and freed, after the read.
+///
+/// Returns what each replica displaced, for the caller to free.
+pub async fn put_object_meta_to_all(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    object_meta: objectio_proto::metadata::ObjectMeta,
+    versioning_enabled: bool,
+    expected_object_id: &[u8],
+) -> Result<Vec<Displaced>, MetaWriteError> {
+    put_object_meta_with(
+        pool,
+        placements,
+        bucket,
+        key,
+        object_meta,
+        MetaWrite {
+            versioning_enabled,
+            expected_object_id,
+            ..MetaWrite::default()
+        },
+    )
+    .await
+}
+
+/// How many times a write superseded by a newer stamp is stamped again.
+const MAX_RESTAMPS: usize = 5;
+
+/// How [`put_object_meta_with`] writes.
+#[derive(Default, Clone, Copy)]
+pub struct MetaWrite<'a> {
+    pub versioning_enabled: bool,
+    /// Only over this object (an update), which must still exist.
+    pub expected_object_id: &'a [u8],
+    /// Only the version entry `object.version_id` (an update of a version
+    /// that may not be current).
+    pub version_only: bool,
+    /// A replica: made current only if no newer version is.
+    pub keep_newer_current: bool,
+    /// Each OSD's small shard of the object, by node id, sent with the
+    /// metadata (B21): a copy is then the shard too, so the write needs the
+    /// shard quorum as well as the metadata one.
+    pub small_shards: Option<&'a HashMap<Vec<u8>, objectio_proto::storage::SmallShard>>,
+    /// The fewest copies the write needs, if more than the metadata quorum.
+    pub min_copies: usize,
+    /// The placement group and epoch the write was placed under (B31).
+    pub pg: Option<&'a objectio_proto::storage::PgRef>,
+}
+
+/// As [`put_object_meta_to_all`], with every option the OSD takes.
+pub async fn put_object_meta_with(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    object_meta: objectio_proto::metadata::ObjectMeta,
+    write: MetaWrite<'_>,
+) -> Result<Vec<Displaced>, MetaWriteError> {
+    use objectio_proto::storage::PutObjectMetaRequest;
+    let MetaWrite {
+        versioning_enabled,
+        expected_object_id,
+        version_only,
+        keep_newer_current,
+        small_shards,
+        min_copies,
+        pg,
+    } = write;
+
+    let targets = unique_node_placements(placements);
+    if targets.is_empty() {
+        return Err(MetaWriteError {
+            error: OsdPoolError::NoNodesAvailable,
+            unapplied: true,
+            withdrawing: None,
+        });
+    }
+    if let Some(why) = crate::clock_skew::refusal() {
+        return Err(MetaWriteError {
+            error: OsdPoolError::ClockSkew(why),
+            unapplied: true,
+            withdrawing: None,
+        });
+    }
+
+    // Exactly one replica counts the object in usage. Chosen from the
+    // key's placement rather than the stripes: a multipart object's
+    // stripes live wherever its parts were placed, which need not be any
+    // of the OSDs holding this ObjectMeta.
+    let mut object_meta = object_meta;
+    object_meta.usage_owner.clone_from(&targets[0].node_id);
+    // The placement group the key is placed through, kept by every copy
+    // and update: the OSDs index their copies by it (B31 phase 2).
+    if object_meta.pg_pool.is_empty()
+        && let Some(pg) = pg.filter(|p| !p.pool.is_empty())
+    {
+        object_meta.pg_pool.clone_from(&pg.pool);
+        object_meta.pg_id = pg.pg_id;
+    }
+    // Every copy gets the same stamp, above any this one was read at: the
+    // order the copies keep (core/object-metadata-quorum.md).
+    //
+    // An update of the object read (an expected id) keeps its stamp and is
+    // ordered among that object's updates: stamped above it, it would
+    // outrank a PUT of the key that raced it on some copies, and that PUT,
+    // acknowledged, would lose to the old object on every copy once healed.
+    if expected_object_id.is_empty() {
+        object_meta.stamp = objectio_common::stamp::CLOCK.next_after(object_meta.stamp);
+        object_meta.update_stamp = 0;
+    } else {
+        object_meta.update_stamp =
+            objectio_common::stamp::CLOCK.next_after(object_meta.update_stamp);
+    }
+
+    // A copy holding a newer stamp supersedes the write. When that is a
+    // write this one follows (acknowledged before it began, through a
+    // gateway whose clock is ahead of this one's), losing would lose an
+    // acknowledged overwrite: so stamp above what the copies hold and
+    // write again. Concurrent writes may land either way, as S3 allows.
+    // Updates are ordered by the object they read instead, and replicas
+    // by their versions' age.
+    let restamp = expected_object_id.is_empty() && !version_only && !keep_newer_current;
+    // What each copy displaced in the round it took the write: a later
+    // round would only report this write's own earlier stamp.
+    let mut took: Vec<Option<Displaced>> = vec![None; targets.len()];
+    let mut round = 0;
+    let results = loop {
+        let mut futs = Vec::with_capacity(targets.len());
+        for placement in &targets {
+            let req = PutObjectMetaRequest {
+                // A write over an object read (an expected id) is an update of
+                // it: one deleted since must not come back. Without this, a
+                // DELETE between a tagging, retention, legal-hold or packing
+                // update's read and its write brought the object back, naming
+                // shards the DELETE had freed.
+                require_existing: !expected_object_id.is_empty(),
+                version_only,
+                keep_newer_current,
+                replication_update: false,
+                replication_set: std::collections::HashMap::new(),
+                shard: small_shards.and_then(|m| m.get(&placement.node_id).cloned()),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                object: Some(object_meta.clone()),
+                versioning_enabled,
+                expected_object_id: expected_object_id.to_vec(),
+                pg: pg.cloned(),
+            };
+            let p = placement.clone();
+            // The bool on an error: this replica certainly did not apply it.
+            futs.push(async move {
+                let mut client = pool
+                    .get_client_for_placement(&p)
+                    .await
+                    .map_err(|e| (e, true))?;
+                let fut = pool.watched(&p.node_address, client.put_object_meta(req));
+                let resp = tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+                    .await
+                    .map_err(|_| {
+                        error!("Timeout putting object metadata to OSD {}", p.node_address);
+                        (
+                            OsdPoolError::ConnectionFailed("put_object_meta timeout".to_string()),
+                            false,
+                        )
+                    })?;
+                let resp = crate::test_hooks::maybe_lost("put_object_meta", resp)
+                    .map_err(|e| {
+                        error!(
+                            "Failed to put object metadata to OSD {}: {}",
+                            p.node_address, e
+                        );
+                        pool.call_failed(&p.node_address, &e);
+                        let refused = matches!(
+                            e.code(),
+                            tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                        );
+                        if is_stale_epoch(&e) {
+                            return (OsdPoolError::StaleEpoch(e.message().to_string()), true);
+                        }
+                        (OsdPoolError::ConnectionFailed(e.to_string()), refused)
+                    })?
+                    .into_inner();
+                Ok::<_, (OsdPoolError, bool)>((
+                    Displaced {
+                        replaced: resp.replaced,
+                        version_kept: resp.replaced_version_kept,
+                        superseded: resp.superseded,
+                        missed: false,
+                    },
+                    resp.held_stamp,
+                ))
+            });
+        }
+        let answers = futures::future::join_all(futs).await;
+        round += 1;
+        let held = answers
+            .iter()
+            .filter_map(|a| a.as_ref().ok())
+            .filter(|(d, _)| d.superseded)
+            .map(|&(_, h)| h)
+            .max()
+            .unwrap_or(0);
+        for (slot, answer) in took.iter_mut().zip(&answers) {
+            if let Ok((d, _)) = answer
+                && !d.superseded
+                && slot.is_none()
+            {
+                *slot = Some(d.clone());
+            }
+        }
+        if restamp && held != 0 && round < MAX_RESTAMPS {
+            debug!("{bucket}/{key}: a copy holds stamp {held}; writing again above it");
+            object_meta.stamp = objectio_common::stamp::CLOCK.next_after(held);
+            continue;
+        }
+        break answers
+            .into_iter()
+            .zip(&took)
+            .map(|(a, first)| a.map(|(d, _)| first.clone().unwrap_or(d)))
+            .collect::<Vec<_>>();
+    };
+
+    let quorum = meta_write_quorum(targets.len()).max(min_copies);
+    let mut displaced = Vec::with_capacity(results.len());
+    let mut failure: Option<OsdPoolError> = None;
+    let mut unapplied = true;
+    let mut applied = 0;
+    // Per copy: it holds this write; it may (an answer that never came).
+    let mut holds = Vec::with_capacity(results.len());
+    let mut may_hold = Vec::with_capacity(results.len());
+    for r in results {
+        holds.push(r.as_ref().is_ok_and(|d| !d.superseded));
+        may_hold.push(matches!(&r, Err((_, false))));
+        match r {
+            Ok(d) => {
+                unapplied = false;
+                applied += 1;
+                displaced.push(d);
+            }
+            Err((e, refused)) => {
+                unapplied &= refused;
+                failure.get_or_insert(e);
+                // A copy that may hold what this write replaced: nothing
+                // it could still name is freed (repair heals it).
+                displaced.push(Displaced {
+                    replaced: None,
+                    version_kept: false,
+                    superseded: false,
+                    missed: true,
+                });
+            }
+        }
+    }
+    match failure {
+        Some(error) if applied < quorum => {
+            let mut withdrawing = None;
+            let unapplied = if unapplied {
+                true
+            } else if let Some(shards) = small_shards {
+                settle_short_small_write(
+                    &mut withdrawing,
+                    pool,
+                    &targets,
+                    &holds,
+                    &may_hold,
+                    shards,
+                    bucket,
+                    key,
+                    &object_meta,
+                )
+                .await
+            } else {
+                // Shards at their quorum, metadata on some copies: a read
+                // may find it (a failed PUT may land, as S3 allows), so the
+                // copies are brought to agree rather than left to differ.
+                pool.queue_heal(bucket, key, &object_meta.version_id).await;
+                false
+            };
+            Err(MetaWriteError {
+                error,
+                unapplied,
+                withdrawing,
+            })
+        }
+        Some(error) => {
+            warn!(
+                "{bucket}/{key}: metadata on {applied} of {} copies (quorum {quorum}); \
+                 the rest are healed: {error}",
+                targets.len()
+            );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            if let Some(shards) = small_shards {
+                // The copies that missed it are positions without a shard.
+                report_missing_small_shards(
+                    pool,
+                    &targets,
+                    &holds,
+                    shards,
+                    bucket,
+                    key,
+                    &object_meta,
+                )
+                .await;
+            }
+            Ok(displaced)
+        }
+        None => Ok(displaced),
+    }
+}
+
+/// A small write (B21) refused short of its shard quorum after some copies
+/// took it. Its shards are on those copies only, so they decide what it
+/// may become: with at least k, a readable object a read may find, kept
+/// and brought to full redundancy at once (healed, and recorded as
+/// degraded for repair to rebuild the positions it lacks); with fewer, an
+/// object no read could decode, withdrawn from every copy that may hold
+/// it. Soak run 10 found the first case left as it was: a refused PUT,
+/// current on four copies with no shard to spare, lost to the next drive.
+///
+/// A copy whose answer was lost may hold it too. Soak run 25 found a
+/// small overwrite during a partition taken by all six copies, three of
+/// whose answers were lost: counted on three, it was withdrawn from all
+/// six, and the object it had replaced on each went with it. So when the
+/// copies that didn't answer could make k, they are asked first
+/// ([`withdraw_later`]), and it is withdrawn only if fewer than k hold it.
+///
+/// Returns whether no copy holds it any longer (the caller may then free
+/// its shards). Copies that didn't answer the withdrawal go in
+/// `withdrawing`.
+#[allow(clippy::too_many_arguments)]
+async fn settle_short_small_write(
+    withdrawing: &mut Option<Withdrawal>,
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    holds: &[bool],
+    may_hold: &[bool],
+    shards: &HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    bucket: &str,
+    key: &str,
+    object_meta: &objectio_proto::metadata::ObjectMeta,
+) -> bool {
+    let k = object_meta.stripes.first().map_or(0, |s| s.ec_k as usize);
+    let held = holds.iter().filter(|&&h| h).count();
+    if held >= k {
+        warn!(
+            "{bucket}/{key}: refused, but on {held} copies (k = {k}): kept, healed and \
+             repaired to full redundancy"
+        );
+        pool.queue_heal(bucket, key, &object_meta.version_id).await;
+        report_missing_small_shards(pool, targets, holds, shards, bucket, key, object_meta).await;
+        return false;
+    }
+
+    let suspects: Vec<NodePlacement> = targets
+        .iter()
+        .zip(holds.iter().zip(may_hold))
+        .filter(|(_, (h, m))| **h || **m)
+        .map(|(t, _)| t.clone())
+        .collect();
+    let unsure = may_hold.iter().filter(|&&m| m).count();
+    if held + unsure >= k {
+        warn!(
+            "{bucket}/{key}: refused on {held} copies (k = {k}); {unsure} more may hold it: \
+             asked before it is withdrawn"
+        );
+        *withdrawing = Some(Withdrawal {
+            copies: suspects,
+            targets: targets.to_vec(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            object_id: object_meta.object_id.clone(),
+            version_id: object_meta.version_id.clone(),
+            undecided: Some(Undecided {
+                holds: holds.to_vec(),
+                unsure: may_hold.to_vec(),
+                shards: shards.clone(),
+                object_meta: object_meta.clone(),
+            }),
+        });
+        return false;
+    }
+
+    warn!("{bucket}/{key}: refused on {held} copies (k = {k}): withdrawn");
+    let left = withdraw_from(pool, suspects, bucket, key, &object_meta.object_id).await;
+    if left.is_empty() {
+        // A copy that took it lost what it replaced: the others have that.
+        pool.queue_heal(bucket, key, &object_meta.version_id).await;
+        return true;
+    }
+    // A copy that didn't answer may still hold it: the caller keeps at it
+    // ([`withdraw_later`]). Until then its shards stay (a leak, not a loss).
+    *withdrawing = Some(Withdrawal {
+        copies: left,
+        targets: targets.to_vec(),
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        object_id: object_meta.object_id.clone(),
+        version_id: object_meta.version_id.clone(),
+        undecided: None,
+    });
+    false
+}
+
+/// Keep withdrawing `w` from the copies that didn't answer, for ten
+/// minutes; true once none can hold it (its shards may then go). An
+/// undecided write is first kept if k copies turn out to hold it.
+pub async fn withdraw_later(pool: &OsdPool, w: Withdrawal) -> bool {
+    let Withdrawal {
+        mut copies,
+        targets,
+        bucket,
+        key,
+        object_id,
+        version_id,
+        undecided,
+    } = w;
+    if let Some(u) = undecided
+        && kept_if_held(pool, &targets, u, &bucket, &key).await
+    {
+        return false;
+    }
+    let mut wait = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while !copies.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(wait).await;
+        copies = withdraw_from(pool, copies, &bucket, &key, &object_id).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+    if copies.is_empty() {
+        pool.queue_heal(&bucket, &key, &version_id).await;
+        return true;
+    }
+    warn!(
+        "{bucket}/{key}: a refused write could not be withdrawn from {} copies in 10 minutes",
+        copies.len()
+    );
+    false
+}
+
+/// Ask the copies whose answer to a refused small write was lost whether
+/// they hold it, for ten minutes. True when k copies do: it is kept, healed
+/// and repaired to full redundancy, as a write refused on k copies is.
+/// False when fewer than k can, or when some still can't be asked after
+/// ten minutes (a copy that long gone is rebuilt from the others): it is
+/// then withdrawn.
+async fn kept_if_held(
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    u: Undecided,
+    bucket: &str,
+    key: &str,
+) -> bool {
+    let Undecided {
+        mut holds,
+        mut unsure,
+        shards,
+        object_meta,
+    } = u;
+    let k = object_meta.stripes.first().map_or(0, |s| s.ec_k as usize);
+    let mut wait = std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let asks = targets
+            .iter()
+            .zip(&unsure)
+            .enumerate()
+            .filter(|(_, (_, u))| **u)
+            .map(|(i, (p, _))| {
+                let object_meta = &object_meta;
+                async move { (i, copy_holds(pool, p, bucket, key, object_meta).await) }
+            });
+        for (i, answer) in futures::future::join_all(asks).await {
+            if let Some(h) = answer {
+                unsure[i] = false;
+                holds[i] = h;
+            }
+        }
+        let held = holds.iter().filter(|&&h| h).count();
+        let left = unsure.iter().filter(|&&u| u).count();
+        if held >= k {
+            warn!(
+                "{bucket}/{key}: refused, but on {held} copies (k = {k}) once asked: kept, \
+                 healed and repaired to full redundancy"
+            );
+            pool.queue_heal(bucket, key, &object_meta.version_id).await;
+            report_missing_small_shards(pool, targets, &holds, &shards, bucket, key, &object_meta)
+                .await;
+            return true;
+        }
+        if held + left < k {
+            warn!("{bucket}/{key}: refused on {held} copies (k = {k}) once asked: withdrawn");
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "{bucket}/{key}: refused on {held} copies (k = {k}); {left} could not be asked \
+                 in 10 minutes: withdrawn"
+            );
+            return false;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Whether copy `p` holds `object` of `bucket/key`, current or as its
+/// version; `None` when it can't be asked.
+async fn copy_holds(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> Option<bool> {
+    let is_it = |o: Option<objectio_proto::metadata::ObjectMeta>| {
+        o.is_some_and(|o| o.object_id == object.object_id)
+    };
+    if is_it(copy_entry(pool, p, bucket, key, "").await?) {
+        return Some(true);
+    }
+    if object.version_id.is_empty() {
+        return Some(false);
+    }
+    // A newer write may have made it a version since.
+    Some(is_it(
+        copy_entry(pool, p, bucket, key, &object.version_id).await?,
+    ))
+}
+
+/// What copy `p` holds of `bucket/key` (`version_id`, or the current entry
+/// when empty); `None` when it can't be asked.
+async fn copy_entry(
+    pool: &OsdPool,
+    p: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Option<Option<objectio_proto::metadata::ObjectMeta>> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+    let mut client = pool.get_client_for_placement(p).await.ok()?;
+    let req = GetObjectMetaRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version_id.to_string(),
+        with_small_shard: false,
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pool.watched(&p.node_address, client.get_object_meta(req)),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            Some(if inner.found { inner.object } else { None })
+        }
+        _ => None,
+    }
+}
+
+/// Withdraw object `object_id` of `bucket/key` from `copies`; returns the
+/// copies that couldn't be asked.
+async fn withdraw_from(
+    pool: &OsdPool,
+    copies: Vec<NodePlacement>,
+    bucket: &str,
+    key: &str,
+    object_id: &[u8],
+) -> Vec<NodePlacement> {
+    use objectio_proto::storage::DeleteObjectMetaRequest;
+    let asks = copies.into_iter().map(|p| async move {
+        let Ok(mut client) = pool.get_client_for_placement(&p).await else {
+            return Some(p);
+        };
+        let req = DeleteObjectMetaRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            withdraw_object_id: object_id.to_vec(),
+            ..Default::default()
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pool.watched(&p.node_address, client.delete_object_meta(req)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                warn!("{bucket}/{key}: withdraw on {}: {e}", p.node_address);
+                Some(p)
+            }
+            Err(_) => Some(p),
+        }
+    });
+    futures::future::join_all(asks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Tell meta which positions of a small object's stripe the copies that
+/// missed its write left without a shard (B29): it records the object as
+/// degraded, and repair rebuilds them within seconds.
+async fn report_missing_small_shards(
+    pool: &OsdPool,
+    targets: &[NodePlacement],
+    holds: &[bool],
+    shards: &HashMap<Vec<u8>, objectio_proto::storage::SmallShard>,
+    bucket: &str,
+    key: &str,
+    object_meta: &objectio_proto::metadata::ObjectMeta,
+) {
+    let Some(stripe) = object_meta.stripes.first() else {
+        return;
+    };
+    let mut missing: Vec<u32> = targets
+        .iter()
+        .zip(holds)
+        .filter(|(_, h)| !**h)
+        .filter_map(|(t, _)| shards.get(&t.node_id)?.shard_id.as_ref())
+        .map(|id| id.position)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    missing.sort_unstable();
+    let present = holds.iter().filter(|&&h| h).count();
+    pool.report_degraded(objectio_proto::metadata::ReportDegradedRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        object_id: object_meta.object_id.clone(),
+        stripes: vec![objectio_proto::metadata::DegradedStripe {
+            stripe_id: stripe.stripe_id,
+            missing,
+            present: u32::try_from(present).unwrap_or(u32::MAX),
+            needed: stripe.ec_k,
+        }],
+    })
+    .await;
+}
+
+/// How many copies of a key's ObjectMeta a write (or delete) needs
+/// (core/object-metadata-quorum.md): a majority. Every copy until the
+/// cluster is finalized at the level that allows it: a reader from the
+/// release before takes the first copy that answers.
+fn meta_write_quorum(copies: usize) -> usize {
+    if objectio_common::version::allows(2) {
+        copies / 2 + 1
+    } else {
+        copies
+    }
+}
+
+/// How many copies a read must hear from: enough to include one that took
+/// the last acknowledged write.
+fn meta_read_quorum(copies: usize) -> usize {
+    copies - meta_write_quorum(copies) + 1
+}
+
+/// Read ObjectMeta from the shard-carrying OSDs: every copy at once, and the
+/// newest (highest stamp) that has it. Returns `Ok(None)` only when every
+/// reachable copy reports not-found — a mixed outcome (some down, some report
+/// Some) returns the Some. Returns `Err` only if every copy errored (no
+/// authoritative answer).
+pub async fn get_object_meta_from_any(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    get_object_version_meta_from_any(pool, placements, bucket, key, "").await
+}
+
+/// As [`get_object_meta_from_any`], for one version of the key; an empty
+/// `version_id` is the current object.
+pub async fn get_object_version_meta_from_any(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, version_id, true, None).await
+}
+
+/// Shards that came with an object's metadata (B21): position → bytes, of
+/// its first stripe, from the copies that keep them in their records.
+pub type SmallShards = HashMap<u32, bytes::Bytes>;
+
+/// As [`get_object_meta_from_any`] (or, with `every_copy`,
+/// [`get_object_meta_every_copy`]), also asking each copy for its shard of
+/// the object: when the object's shards are kept with its metadata, the
+/// read waits for k of them too, and `shards` gets them. A small GET then
+/// needs no shard reads.
+pub async fn get_object_meta_with_shards(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    every_copy: bool,
+    shards: &mut SmallShards,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, "", !every_copy, Some(shards)).await
+}
+
+/// As [`get_object_meta_from_any`], waiting for every copy: for a
+/// placement that may be stale (the gateway's cache, B21). A quorum taken
+/// from a key's old copies may miss a write made to its new ones; all of
+/// them, which share every position but the one that moved, can't.
+pub async fn get_object_meta_every_copy(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    read_object_meta(pool, placements, bucket, key, "", false, None).await
+}
+
+async fn read_object_meta(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    at_quorum: bool,
+    shards: Option<&mut SmallShards>,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+
+    let with_small_shard = shards.is_some();
+
+    let targets = unique_node_placements(placements);
+    if targets.is_empty() {
+        return Err(OsdPoolError::NoNodesAvailable);
+    }
+
+    // Every copy at once; the newest that has it wins
+    // (core/object-metadata-quorum.md). A copy that lacks it may just not
+    // have it yet (a new OSD during a drain), so "not found" is the answer
+    // only when no copy has it.
+    let asks = targets.iter().map(|placement| async move {
+        let req = GetObjectMetaRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: version_id.to_string(),
+            // The data positions' shards are the object, with no decoding:
+            // a parity copy sends only its metadata, and a shard missing
+            // from the data copies is read afterwards (B21).
+            with_small_shard: with_small_shard
+                && placement.shard_type == objectio_proto::metadata::ShardType::ShardData as i32,
+        };
+        let mut again = true;
+        loop {
+            let client = pool
+                .get_client_for_placement(placement)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        "get_object_meta: connect failed to {}: {}",
+                        placement.node_address, e
+                    );
+                    e
+                })?;
+            // With other reads of this OSD, in one call (B21). Either way a
+            // copy that answers after the quorum did is let finish, not
+            // cancelled (`meta_reads`, [`closed_by_us`]).
+            let reads = pool.meta_reads.to(&placement.node_address);
+            return match pool
+                .watched(&placement.node_address, reads.get(client, req.clone()))
+                .await
+            {
+                Ok(inner) => Ok((
+                    if inner.found { inner.object } else { None },
+                    inner.tombstone_stamp,
+                    inner.small_shard,
+                )),
+                Err(e) if crate::meta_reads::is_timeout(&e) => {
+                    warn!("get_object_meta timeout from {}", placement.node_address);
+                    Err(OsdPoolError::ConnectionFailed(
+                        "get_object_meta timeout".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    warn!(
+                        "get_object_meta from {} failed: {}",
+                        placement.node_address, e
+                    );
+                    pool.call_failed(&placement.node_address, &e);
+                    if again && closed_by_us(&e) {
+                        again = false;
+                        continue;
+                    }
+                    Err(OsdPoolError::ConnectionFailed(e.to_string()))
+                }
+            };
+        }
+    });
+    // Answers as they come. Any read quorum of them holds the newest
+    // acknowledged write (R + W > N), so once a quorum has answered and the
+    // newest copy among them is a live object, that is the answer: no
+    // waiting for the slowest copy (B21). "Not found" waits for every copy:
+    // a copy that lacks the object may not have it yet (a replacement OSD
+    // being filled), so it is the answer only when no copy has it.
+    let quorum = meta_read_quorum(targets.len());
+    let mut answers: futures::stream::FuturesUnordered<_> = asks.collect();
+    let mut newest: Option<objectio_proto::metadata::ObjectMeta> = None;
+    let mut deleted_at = 0u64;
+    let mut answered = 0;
+    let mut last_err: Option<OsdPoolError> = None;
+    // Shards that came with the copies, of whichever object each holds.
+    let mut got: Vec<objectio_proto::storage::SmallShard> = Vec::new();
+    // Whether the newest object's shards are in hand: k of them, if it
+    // keeps them with its metadata and they were asked for.
+    let enough = |newest: &Option<objectio_proto::metadata::ObjectMeta>,
+                  got: &[objectio_proto::storage::SmallShard]| {
+        !with_small_shard
+            || newest.as_ref().is_none_or(|o| {
+                small_stripe(o).is_none_or(|s| {
+                    got.iter()
+                        .filter(|g| shard_of(g, s))
+                        .filter_map(|g| g.shard_id.as_ref().map(|id| id.position))
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        >= s.ec_k as usize
+                })
+            })
+    };
+    while let Some(answer) = futures::StreamExt::next(&mut answers).await {
+        let live = |newest: &Option<objectio_proto::metadata::ObjectMeta>, deleted_at: u64| {
+            newest
+                .as_ref()
+                .is_some_and(|o| deleted_at == 0 || deleted_at < o.stamp)
+        };
+        match answer {
+            Ok((found, tombstone, small)) => {
+                answered += 1;
+                got.extend(small);
+                deleted_at = deleted_at.max(tombstone);
+                if let Some(o) = found
+                    && newest
+                        .as_ref()
+                        .is_none_or(|n| o.write_order() > n.write_order())
+                {
+                    newest = Some(o);
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+        if at_quorum && answered >= quorum && live(&newest, deleted_at) && enough(&newest, &got) {
+            break;
+        }
+    }
+    // Fewer answers than a read quorum could all be copies that missed the
+    // last write: no answer rather than a stale one.
+    if answered < quorum {
+        return Err(last_err.unwrap_or(OsdPoolError::NoNodesAvailable));
+    }
+    // A delete newer than every copy's object: gone, whatever a copy that
+    // missed the delete still holds.
+    if let Some(o) = newest.take_if(|o| deleted_at < o.stamp || deleted_at == 0) {
+        if o.required_level > objectio_common::version::FORMAT_LEVEL {
+            return Err(OsdPoolError::TooOld(format!(
+                "{bucket}/{key} needs format level {}; this gateway is at {}",
+                o.required_level,
+                objectio_common::version::FORMAT_LEVEL
+            )));
+        }
+        if let (Some(shards), Some(stripe)) = (shards, small_stripe(&o)) {
+            for g in got.into_iter().filter(|g| shard_of(g, stripe)) {
+                let position = g.shard_id.as_ref().map_or(0, |id| id.position);
+                shards.insert(position, g.data.into());
+            }
+        }
+        return Ok(Some(o));
+    }
+    Ok(None)
+}
+
+/// The stripe of `object` whose shards are kept with its metadata (B21).
+fn small_stripe(
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> Option<&objectio_proto::metadata::StripeMeta> {
+    object.stripes.first().filter(|s| s.shards_in_metadata)
+}
+
+/// Whether `shard` is one of `stripe`'s: a copy holding an older object
+/// sends that object's shard.
+fn shard_of(
+    shard: &objectio_proto::storage::SmallShard,
+    stripe: &objectio_proto::metadata::StripeMeta,
+) -> bool {
+    shard
+        .shard_id
+        .as_ref()
+        .is_some_and(|id| id.object_id == stripe.object_id && id.stripe_id == stripe.stripe_id)
+}
+
+/// One OSD's copy of one version of `key` (`""`: the current one). An
+/// error says this copy couldn't be read, not that there is none.
+pub async fn get_object_version_meta_from_osd(
+    pool: &OsdPool,
+    primary_placement: &NodePlacement,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<objectio_proto::metadata::ObjectMeta>, OsdPoolError> {
+    use objectio_proto::storage::GetObjectMetaRequest;
+
+    let mut client = pool.get_client_for_placement(primary_placement).await?;
+
+    let request = GetObjectMetaRequest {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version_id.to_string(),
+        with_small_shard: false,
+    };
+
+    let get_future = pool.watched(
+        &primary_placement.node_address,
+        client.get_object_meta(request),
+    );
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), get_future)
+        .await
+        .map_err(|_| {
+            error!(
+                "Timeout getting object metadata from OSD {}",
+                primary_placement.node_address
+            );
+            OsdPoolError::ConnectionFailed("get_object_meta timeout".to_string())
+        })?
+        .map_err(|e| {
+            warn!(
+                "Failed to get object metadata from OSD {}: {}",
+                primary_placement.node_address, e
+            );
+            OsdPoolError::ConnectionFailed(e.to_string())
+        })?;
+
+    let inner = response.into_inner();
+    if inner.found {
+        Ok(inner.object)
+    } else {
+        Ok(None)
+    }
+}
+
+/// What a delete of `bucket/key` (or one version of it) did on its
+/// replicas.
+#[derive(Debug, Default)]
+pub struct MetaDeleted {
+    /// Replicas that carried it out (or already held something newer), of
+    /// how many, and how many the delete needs.
+    pub ok: usize,
+    pub of: usize,
+    pub quorum: usize,
+    /// What those replicas removed, as each had it. Replicas can disagree
+    /// (a write racing the delete): each is what that copy named.
+    pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
+}
+
+impl MetaDeleted {
+    /// Every copy that carried the delete out removed the same object.
+    /// Otherwise it may have raced a write: the write, superseded by the
+    /// tombstone on some copies, is stamped again and written over it
+    /// everywhere, and its object, which other copies reported removed, is
+    /// current again; its shards are freed only once that has settled
+    /// ([`RESTAMP_SETTLE`]). A copy that missed an earlier write, or a
+    /// blank one being filled, disagrees the same way with no race.
+    #[must_use]
+    pub fn agreed(&self) -> bool {
+        self.removed.len() >= self.ok
+            && self
+                .removed
+                .windows(2)
+                .all(|w| w[0].object_id == w[1].object_id)
+    }
+}
+
+/// Delete the current object (`version_id` empty) or one version of
+/// `bucket/key` from every replica. For a version, each OSD makes the
+/// newest remaining one current if it was, under the key's lock.
+pub async fn delete_meta_from_all(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    pg: Option<&objectio_proto::storage::PgRef>,
+) -> MetaDeleted {
+    use objectio_proto::storage::DeleteObjectMetaRequest;
+
+    let targets = unique_node_placements(placements);
+    if let Some(why) = crate::clock_skew::refusal() {
+        warn!("delete {bucket}/{key}: {why}");
+        return MetaDeleted {
+            of: targets.len(),
+            quorum: meta_write_quorum(targets.len()),
+            ..MetaDeleted::default()
+        };
+    }
+    // Every copy records the same stamp as its tombstone. A copy holding a
+    // newer write keeps it; when that is a write this delete follows
+    // (through a gateway whose clock is ahead), the delete is stamped
+    // above it and sent again, as a superseded PUT is.
+    let mut stamp = objectio_common::stamp::CLOCK.now();
+    let mut removed = Vec::new();
+    let mut round = 0;
+    let answers = loop {
+        let futs = targets.iter().map(|p| async move {
+            let mut client = pool.get_client_for_placement(p).await?;
+            let fut = client.delete_object_meta(DeleteObjectMetaRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.to_string(),
+                stamp,
+                pg: pg.cloned(),
+                ..Default::default()
+            });
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                pool.watched(&p.node_address, fut),
+            )
+            .await
+            .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
+            .map_err(|e| {
+                pool.call_failed(&p.node_address, &e);
+                OsdPoolError::ConnectionFailed(e.to_string())
+            })?
+            .into_inner();
+            Ok::<_, OsdPoolError>(resp)
+        });
+        let answers = futures::future::join_all(futs).await;
+        round += 1;
+        // What a round removed stays removed whatever the next one does.
+        removed.extend(
+            answers
+                .iter()
+                .filter_map(|a| a.as_ref().ok())
+                .filter_map(|r| r.removed.clone()),
+        );
+        let held = answers
+            .iter()
+            .filter_map(|a| a.as_ref().ok())
+            .filter(|r| r.superseded)
+            .map(|r| r.held_stamp)
+            .max()
+            .unwrap_or(0);
+        if held != 0 && round < MAX_RESTAMPS {
+            debug!("delete {bucket}/{key}: a copy holds stamp {held}; deleting again above it");
+            stamp = objectio_common::stamp::CLOCK.next_after(held);
+            continue;
+        }
+        break answers;
+    };
+    let mut out = MetaDeleted {
+        of: targets.len(),
+        quorum: meta_write_quorum(targets.len()),
+        removed,
+        ..MetaDeleted::default()
+    };
+    for r in answers {
+        match r {
+            Ok(_) => out.ok += 1,
+            Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
+        }
+    }
+    // Left on some copies, the copies are brought to agree: a delete that
+    // made its quorum, and one refused short of it, which may take effect
+    // all the same (its copies hold the newest stamp). Not healed, the
+    // refused one left the copies disagreeing for good: the object came
+    // back whenever the copies that took the delete were down, and its
+    // shards were never freed.
+    if out.ok > 0 && out.ok < out.of {
+        pool.queue_heal(bucket, key, version_id).await;
+    }
+    out
+}
+
+/// What [`unreferenced`] makes of a replica it can't read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// It keeps everything: it may hold a removed object as a version, or
+    /// as current where the delete didn't make its quorum.
+    KeepAll,
+    /// It is passed over: the delete made its quorum, in a bucket that has
+    /// never had versioning. The delete is stamped above everything it
+    /// removed and a read hears from a quorum, so an object it removed is
+    /// never read again, whatever a replica that missed it still holds;
+    /// recovery takes it off that replica later. Keeping everything leaked
+    /// every object deleted while an OSD was down: most of 2.6 GB in soak
+    /// run 26, deleted while a lost drive's replacement was filled, which
+    /// then had nothing of them for recovery to free. (An overwrite passes
+    /// over a replica it missed the same way: [`reclaimable_after_overwrite`].)
+    PassOver,
+}
+
+/// Of the objects a delete removed, those no replica still has as its
+/// current object: what may be freed. A write racing the delete can leave
+/// an object current on some replicas (they saw the write after the
+/// delete); freeing it would leave them naming shards that are gone. A
+/// replica that can't be read keeps everything or is passed over, as
+/// `unread` says. An object gone from every replica can't come back: an
+/// update of one requires it to exist, and a PUT always writes a new one.
+pub async fn unreferenced(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    removed: Vec<objectio_proto::metadata::ObjectMeta>,
+    unread: Unread,
+) -> Vec<objectio_proto::metadata::ObjectMeta> {
+    let mut distinct: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
+    for o in removed {
+        if !o.object_id.is_empty() && !distinct.contains(&o) {
+            distinct.push(o);
+        }
+    }
+    if distinct.is_empty() {
+        return distinct;
+    }
+    // Every replica's current object, and the version entry of each removed
+    // object that has one (an object kept as a version too stays).
+    let versions: std::collections::BTreeSet<String> = distinct
+        .iter()
+        .map(|o| o.version_id.clone())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let mut held = std::collections::HashSet::new();
+    for p in &unique_node_placements(placements) {
+        for v in std::iter::once(String::new()).chain(versions.iter().cloned()) {
+            match get_object_version_meta_from_osd(pool, p, bucket, key, &v).await {
+                Ok(Some(o)) => {
+                    held.insert(o.object_id);
+                }
+                Ok(None) => {}
+                Err(e) if unread == Unread::PassOver => {
+                    debug!("{bucket}/{key}: a replica can't be read after the delete ({e})");
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "{bucket}/{key}: a replica can't be read after the delete ({e}); \
+                         its blocks stay allocated"
+                    );
+                    return Vec::new();
+                }
+            }
+        }
+    }
+    distinct
+        .into_iter()
+        .filter(|o| !held.contains(&o.object_id))
+        .collect()
+}
+
+// ============================================================================
+// Shard reclamation
+//
+// A shard is referenced by the ObjectMeta that lists it, or by a multipart
+// upload's part, and by nothing else. Whatever stops referencing a shard —
+// a delete, an overwrite, a re-uploaded or abandoned part, a write that
+// failed half way — has to delete it, or its block stays allocated forever
+// with nothing left that knows where it is.
+// ============================================================================
+
+/// Why shards are being freed: the `reason` label on the reclaim metrics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reclaim {
+    /// The object was deleted.
+    Delete,
+    /// A write to the key replaced the object.
+    Overwrite,
+    /// The write that sent them failed before its object was committed.
+    FailedWrite,
+    /// The same part number was uploaded again.
+    ReplacedPart,
+    /// The part was uploaded but left out of the completed object.
+    UnusedPart,
+    /// The multipart upload was aborted.
+    Abort,
+    /// The object moved into a pack: its own stripe goes.
+    Packed,
+}
+
+impl Reclaim {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Overwrite => "overwrite",
+            Self::FailedWrite => "failed_write",
+            Self::Packed => "packed",
+            Self::ReplacedPart => "replaced_part",
+            Self::UnusedPart => "unused_part",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+/// One shard to delete, and the OSD holding it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShardTarget {
+    pub node_id: Vec<u8>,
+    /// The OSD's address when the caller knows it; empty to look it up.
+    pub address: String,
+    pub object_id: Vec<u8>,
+    pub stripe_id: u64,
+    pub position: u32,
+    /// The object letting the shard go. A stripe shared with other objects
+    /// (a zero-copy copy) is freed only when its last referrer lets go;
+    /// see meta's `ReleaseStripes`.
+    pub owner: Vec<u8>,
+}
+
+/// Every shard of `object`'s stripes, released on the object's behalf.
+#[must_use]
+pub fn stripe_targets_of(object: &objectio_proto::metadata::ObjectMeta) -> Vec<ShardTarget> {
+    let mut targets = stripe_targets(&object.stripes);
+    if !object.object_id.is_empty() {
+        for t in &mut targets {
+            t.owner.clone_from(&object.object_id);
+        }
+    }
+    targets
+}
+
+/// Every shard `stripes` records, at the node its location names.
+///
+/// Routed by `ShardLocation::node_id` because that is where the shard is:
+/// a multipart object's parts are placed by their own keys, and a drained
+/// shard has moved, so the key's current placement can miss both.
+#[must_use]
+pub fn stripe_targets(stripes: &[objectio_proto::metadata::StripeMeta]) -> Vec<ShardTarget> {
+    let mut seen = std::collections::HashSet::new();
+    stripes
+        .iter()
+        .filter(|stripe| !stripe.object_id.is_empty() || !stripe.pack_id.is_empty())
+        .flat_map(|stripe| {
+            // A slice of a pack holds no shards of its own: one marker
+            // stands for its reference to the pack, which reclaim releases
+            // and, if it was the pack's last, expands into the pack's shards.
+            let marker = (!stripe.pack_id.is_empty()).then(|| ShardTarget {
+                node_id: Vec::new(),
+                address: String::new(),
+                object_id: stripe.pack_id.clone(),
+                stripe_id: stripe.stripe_id,
+                position: PACK_MARKER,
+                owner: stripe.pack_id.clone(),
+            });
+            let shards = stripe
+                .shards
+                .iter()
+                .filter(|_| stripe.pack_id.is_empty())
+                .map(move |shard| ShardTarget {
+                    node_id: shard.node_id.clone(),
+                    address: String::new(),
+                    object_id: stripe.object_id.clone(),
+                    stripe_id: stripe.stripe_id,
+                    position: shard.position,
+                    // Unless the caller knows better: the stripe's own writer.
+                    owner: stripe.object_id.clone(),
+                });
+            marker.into_iter().chain(shards)
+        })
+        .filter(|t| (t.is_pack_marker() || !t.node_id.is_empty()) && seen.insert(t.clone()))
+        .collect()
+}
+
+/// [`ShardTarget::position`] of a pack marker.
+const PACK_MARKER: u32 = u32::MAX;
+
+impl ShardTarget {
+    /// A packed object's reference to its pack, not a shard.
+    #[must_use]
+    pub const fn is_pack_marker(&self) -> bool {
+        self.position == PACK_MARKER && self.node_id.is_empty()
+    }
+}
+
+/// The object ids whose shards `object` refers to: its own, and each
+/// stripe's (a multipart object's stripes carry their parts' ids).
+#[must_use]
+pub fn referenced_object_ids(
+    object: &objectio_proto::metadata::ObjectMeta,
+) -> std::collections::HashSet<Vec<u8>> {
+    std::iter::once(object.object_id.clone())
+        .chain(object.stripes.iter().map(|s| s.object_id.clone()))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// What one replica's `PutObjectMeta` displaced.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Displaced {
+    pub replaced: Option<objectio_proto::metadata::ObjectMeta>,
+    /// The replaced object is still held there as a version.
+    pub version_kept: bool,
+    /// That copy already held a newer write; this one was not applied.
+    pub superseded: bool,
+    /// That copy did not answer: it may still hold what this write replaced.
+    pub missed: bool,
+}
+
+/// What an overwrite let go of, by what its copies answered.
+#[derive(Debug, Default, PartialEq)]
+pub struct Overwritten {
+    /// Every copy that answered displaced the same object: its shards,
+    /// freed at once.
+    pub now: Vec<ShardTarget>,
+    /// The copies disagreed: each object any of them displaced, freed once
+    /// [`RESTAMP_SETTLE`] has passed if no copy holds it then
+    /// ([`reclaim_unsettled`]).
+    pub unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+}
+
+/// How long a write can go on being stamped again and resent after a copy
+/// first took it: [`MAX_RESTAMPS`] rounds, each a connect (3 s) and an
+/// answer (10 s) at most, so about a minute; twice that.
+pub const RESTAMP_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The shards of the object an overwrite displaced, if it is safe to free
+/// them now; else what to check again later.
+///
+/// At once only when every copy that answered displaced the same object,
+/// and none still keeps it as a version. Two PUTs racing can reach the
+/// copies in different orders: then one copy reports the other PUT's
+/// object as replaced while that PUT, superseded elsewhere, is stamped
+/// again and written over this one everywhere. Its object, current again,
+/// must not lose its shards. Agreement across the answers rules that out:
+/// if all of them held X until this write, X's own write is done.
+///
+/// The copies also disagree with no race: a copy that missed an earlier
+/// write still has the object before it, and a blank one (a lost drive's
+/// replacement, being filled) has nothing. Each object any copy displaced
+/// is then checked again once a racing write can no longer be resent, and
+/// freed if no copy holds it. Freeing nothing leaked every object
+/// overwritten while a lost drive's replacement was filled (soak run 27).
+///
+/// A copy that didn't answer is passed over (the write made its quorum for
+/// these to be asked of): it may still hold X, but X is older than this
+/// write, which a quorum holds, so X is never read again; recovery
+/// replaces it there later. Waiting for every copy leaked every object
+/// overwritten while an OSD was down (soak run 26).
+///
+/// `keep` is what the new object refers to; nothing in it is freed, which
+/// covers a metadata-only rewrite of the same object.
+#[must_use]
+pub fn reclaimable_after_overwrite(
+    replies: &[Displaced],
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> Overwritten {
+    let replies: Vec<&Displaced> = replies.iter().filter(|d| !d.missed).collect();
+    if replies.iter().any(|d| d.version_kept) {
+        return Overwritten::default();
+    }
+    let displaced: Vec<&objectio_proto::metadata::ObjectMeta> = replies
+        .iter()
+        .filter_map(|d| d.replaced.as_ref())
+        .filter(|o| !o.object_id.is_empty() && !keep.contains(&o.object_id))
+        .collect();
+    let Some(first) = displaced.first() else {
+        return Overwritten::default();
+    };
+    let unanimous = replies.iter().all(|d| {
+        d.replaced
+            .as_ref()
+            .is_some_and(|r| r.object_id == first.object_id)
+    });
+    if !unanimous {
+        let mut unsettled: Vec<objectio_proto::metadata::ObjectMeta> = Vec::new();
+        for o in displaced {
+            if !unsettled.contains(o) {
+                unsettled.push(o.clone());
+            }
+        }
+        return Overwritten {
+            now: Vec::new(),
+            unsettled,
+        };
+    }
+    Overwritten {
+        now: targets_of(displaced.into_iter(), keep),
+        unsettled: Vec::new(),
+    }
+}
+
+/// Every shard `objects` name, less what `keep` refers to. Copies can
+/// disagree on where a shard is while a migration is refreshing them;
+/// deleting at every location any of them names is harmless where the
+/// shard is not.
+fn targets_of<'a>(
+    objects: impl Iterator<Item = &'a objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<ShardTarget> {
+    let mut seen = std::collections::HashSet::new();
+    objects
+        .flat_map(stripe_targets_of)
+        .filter(|t| !keep.contains(&t.object_id) && seen.insert(t.clone()))
+        .collect()
+}
+
+/// Free those of an overwrite's `unsettled` objects no copy of
+/// `bucket/key` holds, once [`RESTAMP_SETTLE`] has passed: a write racing
+/// the overwrite has been resent by then, if it was going to be, and holds
+/// its object current again. A copy that can't be read is passed over, as
+/// the overwrite passed over one it missed. Returns how many shards were
+/// not freed at the first try.
+pub async fn reclaim_unsettled(
+    pool: &Arc<OsdPool>,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    placements: &[NodePlacement],
+    bucket: &str,
+    key: &str,
+    unsettled: Vec<objectio_proto::metadata::ObjectMeta>,
+    keep: &std::collections::HashSet<Vec<u8>>,
+) -> usize {
+    let asked = unsettled.len();
+    let gone = unreferenced(pool, placements, bucket, key, unsettled, Unread::PassOver).await;
+    debug!(
+        "{bucket}/{key}: {} of {asked} objects an overwrite's copies disagreed on are held nowhere",
+        gone.len()
+    );
+    let targets = targets_of(gone.iter(), keep);
+    if targets.is_empty() {
+        return 0;
+    }
+    reclaim_shards(pool, meta, targets, Reclaim::Overwrite).await
+}
+
+/// Release each target's stripe on its owner's behalf, and return the
+/// `(owner, stripe)` pairs whose stripes no object references any more.
+/// What releasing `targets` freed: `(owner, stripe id)` pairs whose shards
+/// may go, and the packs whose last object let go.
+async fn freeable(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    targets: &[ShardTarget],
+) -> Result<
+    (
+        std::collections::HashSet<(Vec<u8>, Vec<u8>)>,
+        Vec<objectio_proto::metadata::StripeMeta>,
+    ),
+    tonic::Status,
+> {
+    let mut by_owner: HashMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = HashMap::new();
+    for t in targets {
+        by_owner
+            .entry(t.owner.clone())
+            .or_default()
+            .insert(t.object_id.clone());
+    }
+    let mut free = std::collections::HashSet::new();
+    let mut packs = Vec::new();
+    for (owner, ids) in by_owner {
+        let req = objectio_proto::metadata::ReleaseStripesRequest {
+            stripe_ids: ids.into_iter().collect(),
+            referrer: owner.clone(),
+        };
+        // Meta answers Aborted when the entry kept changing under it (many
+        // releases of one pack at once): try again, a little later.
+        let mut attempt = 0u32;
+        let resp = loop {
+            match meta.release_stripes(req.clone()).await {
+                Err(e) if e.code() == tonic::Code::Aborted && attempt < 4 => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                }
+                other => break other?.into_inner(),
+            }
+        };
+        free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
+        packs.extend(resp.freed_packs);
+    }
+    Ok((free, packs))
+}
+
+/// Drop `owner`'s reference to `stripe_ids` without deleting anything: an
+/// object replaced by one that still uses these stripes (a copy onto
+/// itself) stops referencing them, but they are not free.
+pub async fn release_only(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    owner: &[u8],
+    stripe_ids: Vec<Vec<u8>>,
+) {
+    if owner.is_empty() || stripe_ids.is_empty() {
+        return;
+    }
+    if let Err(e) = meta
+        .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
+            stripe_ids,
+            referrer: owner.to_vec(),
+        })
+        .await
+    {
+        warn!("could not release a replaced object's shared stripes: {e}");
+    }
+}
+
+/// Shards a write has sent to OSDs, freed again if the write is abandoned —
+/// an error return, or the request future being dropped mid-write.
+///
+/// Every shard is recorded when it is sent, not when it is acknowledged: a
+/// write that timed out may still have landed. [`Self::disarm`] hands the
+/// list over once the write's metadata commit begins, because from then on
+/// a replica may reference these shards and only the commit's outcome says
+/// whether they can go.
+pub struct PendingShards {
+    targets: Vec<ShardTarget>,
+    on_abandon: Option<Box<dyn FnOnce(Vec<ShardTarget>) + Send>>,
+}
+
+impl PendingShards {
+    pub fn new(on_abandon: impl FnOnce(Vec<ShardTarget>) + Send + 'static) -> Self {
+        Self {
+            targets: Vec::new(),
+            on_abandon: Some(Box::new(on_abandon)),
+        }
+    }
+
+    /// Record a shard about to be written to `placement`.
+    pub fn sent(
+        &mut self,
+        placement: &NodePlacement,
+        object_id: &[u8],
+        stripe_id: u64,
+        position: u32,
+    ) {
+        self.targets.push(ShardTarget {
+            node_id: placement.node_id.clone(),
+            address: placement.node_address.clone(),
+            object_id: object_id.to_vec(),
+            stripe_id,
+            position,
+            owner: object_id.to_vec(),
+        });
+    }
+
+    /// Stop freeing on drop; returns what was sent.
+    #[must_use]
+    pub fn disarm(mut self) -> Vec<ShardTarget> {
+        self.on_abandon = None;
+        std::mem::take(&mut self.targets)
+    }
+}
+
+impl Drop for PendingShards {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_abandon.take()
+            && !self.targets.is_empty()
+        {
+            f(std::mem::take(&mut self.targets));
+        }
+    }
+}
+
+/// How many shards [`reclaim_shards`] deletes at once.
+const RECLAIM_CONCURRENCY: usize = 64;
+
+/// How long shards that could not be freed (an OSD down, meta electing a
+/// leader) are tried again before their blocks are left allocated: longer
+/// than an OSD takes to restart, or its host to reboot. Soak run 26 left
+/// every shard whose delete met an OSD powered off allocated for good.
+const RECLAIM_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first wait before trying again; doubled each time, to a minute.
+const RECLAIM_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Delete `targets` from the OSDs holding them, and count the outcome.
+///
+/// Best-effort by design: a shard that cannot be deleted now is a leaked
+/// block, not a correctness problem, so this never fails the caller. What
+/// fails is tried again in the background for [`RECLAIM_RETRY_FOR`], and
+/// counted as failed only then. An OSD that does not hold a shard answers
+/// `success: false`, which is not a failure — deleting is idempotent under
+/// retry, and so is releasing (a release names its referrer). Returns how
+/// many shards were not freed at the first try.
+pub async fn reclaim_shards(
+    pool: &Arc<OsdPool>,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    targets: Vec<ShardTarget>,
+    reason: Reclaim,
+) -> usize {
+    let left = reclaim_round(
+        pool,
+        meta,
+        Unfreed {
+            release: targets,
+            delete: Vec::new(),
+        },
+        reason,
+    )
+    .await;
+    let failed = left.len();
+    if failed > 0 {
+        tokio::spawn(retry_reclaim(
+            Arc::clone(pool),
+            meta.clone(),
+            left,
+            reason,
+            RECLAIM_RETRY_FIRST,
+            RECLAIM_RETRY_FOR,
+        ));
+    }
+    failed
+}
+
+/// Shards not freed yet: those whose stripes are still to be released
+/// (meta didn't answer), and those released whose delete failed.
+#[derive(Debug, Default)]
+struct Unfreed {
+    release: Vec<ShardTarget>,
+    delete: Vec<ShardTarget>,
+}
+
+impl Unfreed {
+    fn len(&self) -> usize {
+        self.release.len() + self.delete.len()
+    }
+}
+
+/// Try `left` again, waiting `first` and then twice as long each time (to
+/// a minute), until it is all freed or `retry_for` is up; what is left
+/// then is counted as failed, its blocks allocated.
+async fn retry_reclaim(
+    pool: Arc<OsdPool>,
+    mut meta: objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    mut left: Unfreed,
+    reason: Reclaim,
+    first: std::time::Duration,
+    retry_for: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + retry_for;
+    let mut wait = first;
+    loop {
+        tokio::time::sleep(wait).await;
+        let before = left.len();
+        left = reclaim_round(&pool, &mut meta, left, reason).await;
+        if left.len() == 0 {
+            debug!(
+                "reclaim ({}): {before} shards freed on a retry",
+                reason.label()
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "reclaim ({}): {} shards still not freed after {} s; their blocks stay allocated",
+                reason.label(),
+                left.len(),
+                retry_for.as_secs()
+            );
+            crate::gateway_metrics::record_reclaim(reason.label(), 0, left.len() as u64);
+            return;
+        }
+        wait = (wait * 2).clamp(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(60),
+        );
+    }
+}
+
+/// One try at freeing `left`: release what is still to be released (only
+/// stripes no other object references may go), then delete what was
+/// released. Returns what is still not freed.
+async fn reclaim_round(
+    pool: &OsdPool,
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<Channel>,
+    left: Unfreed,
+    reason: Reclaim,
+) -> Unfreed {
+    use futures::StreamExt;
+    use objectio_proto::storage::{DeleteShardRequest, ShardId};
+
+    let mut out = Unfreed::default();
+    let mut delete = left.delete;
+    // Asked of meta once per releasing object; if meta cannot answer,
+    // nothing is deleted — a leak can be reclaimed later, deleted shared
+    // data cannot.
+    if !left.release.is_empty() {
+        match freeable(meta, &left.release).await {
+            Ok((free, packs)) => {
+                delete.extend(left.release.into_iter().filter(|t| {
+                    !t.is_pack_marker() && free.contains(&(t.owner.clone(), t.object_id.clone()))
+                }));
+                // A pack its last object let go: meta dropped its record in
+                // the same commit, so its shards are nobody's.
+                for mut pack in packs {
+                    pack.pack_id.clear();
+                    delete.extend(stripe_targets(std::slice::from_ref(&pack)));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "reclaim: cannot ask meta which stripes are still shared, keeping them for now: {e}"
+                );
+                out.release = left.release;
+            }
+        }
+    }
+    if delete.is_empty() {
+        return out;
+    }
+
+    // One client per OSD: connected already, at an address the caller gave,
+    // or — after a restart, or for a node outside this request's placement —
+    // at the address meta has registered for it, asked once.
+    let mut clients: HashMap<Vec<u8>, StorageServiceClient<Channel>> = HashMap::new();
+    let mut addresses: HashMap<Vec<u8>, String> = delete
+        .iter()
+        .filter(|t| !t.address.is_empty())
+        .map(|t| (t.node_id.clone(), t.address.clone()))
+        .collect();
+    let mut asked_meta = false;
+    let node_ids: std::collections::HashSet<Vec<u8>> =
+        delete.iter().map(|t| t.node_id.clone()).collect();
+    for node_id in node_ids {
+        if let Ok(client) = pool.get_client(&node_id).await {
+            clients.insert(node_id, client);
+            continue;
+        }
+        if !addresses.contains_key(&node_id) && !asked_meta {
+            asked_meta = true;
+            match meta
+                .get_listing_nodes(objectio_proto::metadata::GetListingNodesRequest {
+                    bucket: String::new(),
+                    include_all_states: true,
+                })
+                .await
+            {
+                Ok(resp) => {
+                    for n in resp.into_inner().nodes {
+                        addresses.entry(n.node_id).or_insert(n.address);
+                    }
+                }
+                Err(e) => warn!("reclaim: could not list OSD addresses: {e}"),
+            }
+        }
+        match addresses.get(&node_id) {
+            Some(addr) => match pool.get_or_connect(&node_id, addr).await {
+                Ok(client) => {
+                    clients.insert(node_id, client);
+                }
+                Err(e) => warn!("reclaim: cannot reach OSD {addr}: {e}"),
+            },
+            None => warn!("reclaim: no address for OSD {}", hex::encode(&node_id)),
+        }
+    }
+
+    let results: Vec<(ShardTarget, Result<bool, OsdPoolError>)> = futures::stream::iter(delete)
+        .map(|t| {
+            let client = clients.get(&t.node_id).cloned();
+            async move {
+                let result = async {
+                    let mut client = client
+                        .ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
+                    let req = DeleteShardRequest {
+                        shard_id: Some(ShardId {
+                            object_id: t.object_id.clone(),
+                            stripe_id: t.stripe_id,
+                            position: t.position,
+                        }),
+                    };
+                    let resp = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        client.delete_shard(req),
+                    )
+                    .await
+                    .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
+                    .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    Ok(resp.into_inner().success)
+                }
+                .await;
+                (t, result)
+            }
+        })
+        .buffer_unordered(RECLAIM_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut reclaimed = 0u64;
+    for (t, r) in results {
+        match r {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                debug!("reclaim ({}): delete_shard failed: {e}", reason.label());
+                out.delete.push(t);
+            }
+        }
+    }
+    crate::gateway_metrics::record_reclaim(reason.label(), reclaimed, 0);
+    out
+}
+
+#[cfg(test)]
+mod connection_broke_tests {
+    use super::connection_broke;
+
+    #[test]
+    fn a_dropped_connection_is_recognised_whatever_the_code() {
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Internal,
+            // Seen across a partition healing (B2 soak): h2's
+            // ENHANCE_YOUR_CALM.
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Unavailable,
+        ] {
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "transport error"
+            )));
+            assert!(connection_broke(&tonic::Status::new(
+                code,
+                "h2 protocol error: error reading a body from connection"
+            )));
+        }
+        assert!(!connection_broke(&tonic::Status::internal("disk exploded")));
+        // A full disk is ResourceExhausted too, and not a dropped connection.
+        assert!(!connection_broke(&tonic::Status::resource_exhausted(
+            "disk 0 is full"
+        )));
+        assert!(!connection_broke(&tonic::Status::not_found(
+            "transport error"
+        )));
+    }
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::*;
+    use objectio_proto::metadata::{ObjectMeta, ShardLocation, StripeMeta};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// A stripe of object `id`, its shard at each position on node `n`+pos.
+    fn stripe(id: u8, stripe_id: u64, n: u8, shards: u32) -> StripeMeta {
+        StripeMeta {
+            stripe_id,
+            object_id: vec![id; 16],
+            shards: (0..shards)
+                .map(|position| ShardLocation {
+                    position,
+                    node_id: vec![n + u8::try_from(position).unwrap(); 16],
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn object(id: u8, stripes: Vec<StripeMeta>) -> ObjectMeta {
+        ObjectMeta {
+            object_id: vec![id; 16],
+            stripes,
+            ..Default::default()
+        }
+    }
+
+    fn replaced(o: &ObjectMeta) -> Displaced {
+        Displaced {
+            replaced: Some(o.clone()),
+            version_kept: false,
+            superseded: false,
+            missed: false,
+        }
+    }
+
+    fn keep(o: &ObjectMeta) -> HashSet<Vec<u8>> {
+        referenced_object_ids(o)
+    }
+
+    #[test]
+    fn shards_are_addressed_to_the_node_holding_them() {
+        let t = stripe_targets(&[stripe(1, 0, 10, 3), stripe(1, 1, 20, 3)]);
+        assert_eq!(t.len(), 6);
+        assert!(t.iter().all(|t| t.object_id == vec![1; 16]));
+        let s1: Vec<u8> = t
+            .iter()
+            .filter(|t| t.stripe_id == 1)
+            .map(|t| t.node_id[0])
+            .collect();
+        assert_eq!(s1, [20, 21, 22]);
+    }
+
+    /// Each part of a multipart object is its own object id, on its own
+    /// placement.
+    #[test]
+    fn a_multipart_objects_stripes_keep_their_parts_ids() {
+        let o = object(9, vec![stripe(1, 0, 10, 2), stripe(2, 0, 30, 2)]);
+        let ids: HashSet<Vec<u8>> = stripe_targets(&o.stripes)
+            .into_iter()
+            .map(|t| t.object_id)
+            .collect();
+        assert_eq!(ids, HashSet::from([vec![1; 16], vec![2; 16]]));
+        assert_eq!(keep(&o).len(), 3);
+    }
+
+    #[test]
+    fn an_agreed_overwrite_frees_the_old_object() {
+        let old = object(1, vec![stripe(1, 0, 10, 6)]);
+        let new = object(2, vec![stripe(2, 0, 10, 6)]);
+        let got = reclaimable_after_overwrite(&[replaced(&old), replaced(&old)], &keep(&new));
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert!(got.unsettled.is_empty());
+    }
+
+    /// A replica down for the write may still hold the old object, but it
+    /// is never read again: the answers that agree free it.
+    #[test]
+    fn a_replica_that_missed_the_overwrite_holds_nothing_up() {
+        let old = object(1, vec![stripe(1, 0, 10, 6)]);
+        let new = object(2, vec![stripe(2, 0, 10, 6)]);
+        let missed = Displaced {
+            missed: true,
+            ..Displaced::default()
+        };
+        let got = reclaimable_after_overwrite(
+            &[missed.clone(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert_eq!(got.now, stripe_targets(&old.stripes));
+        assert_eq!(
+            reclaimable_after_overwrite(&[missed], &keep(&new)),
+            Overwritten::default()
+        );
+    }
+
+    /// A lost drive's replacement, not yet filled, held nothing; a copy
+    /// that missed an earlier write held the object before. Not a race
+    /// to tell apart from one: everything displaced is checked again
+    /// later, nothing freed at once (soak run 27).
+    #[test]
+    fn a_blank_or_stale_copy_leaves_the_old_object_to_be_checked_again() {
+        let older = object(1, vec![stripe(1, 0, 10, 6)]);
+        let old = object(2, vec![stripe(2, 0, 10, 6)]);
+        let new = object(3, vec![stripe(3, 0, 10, 6)]);
+        let got = reclaimable_after_overwrite(
+            &[Displaced::default(), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![old.clone()]);
+        let got = reclaimable_after_overwrite(
+            &[replaced(&older), replaced(&old), replaced(&old)],
+            &keep(&new),
+        );
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![older, old]);
+    }
+
+    /// A delete frees at once only what every copy that carried it out
+    /// removed alike: one that removed nothing, or another object, may be
+    /// a write racing it.
+    #[test]
+    fn a_delete_agrees_only_when_every_copy_removed_the_same_object() {
+        let x = object(1, vec![stripe(1, 0, 10, 2)]);
+        let b = object(2, vec![stripe(2, 0, 10, 2)]);
+        let deleted = |ok: usize, removed: Vec<ObjectMeta>| MetaDeleted {
+            ok,
+            of: 3,
+            quorum: 2,
+            removed,
+        };
+        assert!(deleted(3, vec![x.clone(), x.clone(), x.clone()]).agreed());
+        assert!(deleted(2, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), x.clone()]).agreed());
+        assert!(!deleted(3, vec![x.clone(), b, x]).agreed());
+    }
+
+    #[test]
+    fn a_new_key_frees_nothing() {
+        let new = object(2, vec![]);
+        for replies in [&[Displaced::default()][..], &[]] {
+            assert_eq!(
+                reclaimable_after_overwrite(replies, &keep(&new)),
+                Overwritten::default()
+            );
+        }
+    }
+
+    /// Two PUTs that reached the replicas in different orders: each sees the
+    /// other's object as replaced on some replica, while the other, stamped
+    /// again, may still be written over it. Neither frees anything at once;
+    /// what no copy holds once that has settled goes then.
+    #[test]
+    fn replicas_that_disagree_free_nothing_at_once() {
+        let a = object(1, vec![stripe(1, 0, 10, 2)]);
+        let b = object(2, vec![stripe(2, 0, 10, 2)]);
+        let x = object(3, vec![stripe(3, 0, 10, 2)]);
+        let got = reclaimable_after_overwrite(&[replaced(&x), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![x, b.clone()]);
+        let got = reclaimable_after_overwrite(&[Displaced::default(), replaced(&b)], &keep(&a));
+        assert!(got.now.is_empty());
+        assert_eq!(got.unsettled, vec![b]);
+    }
+
+    #[test]
+    fn an_object_kept_as_a_version_is_not_freed() {
+        let old = object(1, vec![stripe(1, 0, 10, 2)]);
+        let new = object(2, vec![]);
+        let kept = Displaced {
+            replaced: Some(old.clone()),
+            version_kept: true,
+            superseded: false,
+            missed: false,
+        };
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&old), kept], &keep(&new)),
+            Overwritten::default()
+        );
+    }
+
+    /// Retention, legal hold and shard migration rewrite the same object.
+    #[test]
+    fn rewriting_the_same_object_frees_nothing() {
+        let o = object(1, vec![stripe(1, 0, 10, 2)]);
+        assert_eq!(
+            reclaimable_after_overwrite(&[replaced(&o)], &keep(&o)),
+            Overwritten::default()
+        );
+    }
+
+    /// Nothing the new object still refers to is freed, whatever the old
+    /// one was called.
+    #[test]
+    fn stripes_the_new_object_shares_are_kept() {
+        let old = object(1, vec![stripe(7, 0, 10, 2), stripe(8, 0, 20, 2)]);
+        let new = object(2, vec![stripe(8, 0, 20, 2)]);
+        let got = reclaimable_after_overwrite(&[replaced(&old)], &keep(&new)).now;
+        assert!(got.iter().all(|t| t.object_id == vec![7; 16]));
+        assert_eq!(got.len(), 2);
+    }
+
+    /// While a migration refreshes the replicas they can name different
+    /// nodes for a shard; it is deleted wherever any of them says it is.
+    #[test]
+    fn locations_from_every_replica_are_freed() {
+        let here = object(1, vec![stripe(1, 0, 10, 2)]);
+        let moved = object(1, vec![stripe(1, 0, 40, 2)]);
+        let got = reclaimable_after_overwrite(
+            &[replaced(&here), replaced(&moved)],
+            &keep(&object(2, vec![])),
+        )
+        .now;
+        let nodes: HashSet<u8> = got.iter().map(|t| t.node_id[0]).collect();
+        assert_eq!(nodes, HashSet::from([10, 11, 40, 41]));
+    }
+
+    fn recorder() -> (Arc<Mutex<Vec<ShardTarget>>>, PendingShards) {
+        let freed = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&freed);
+        let pending = PendingShards::new(move |t| sink.lock().unwrap().extend(t));
+        (freed, pending)
+    }
+
+    fn node(n: u8) -> NodePlacement {
+        NodePlacement {
+            node_id: vec![n; 16],
+            node_address: format!("http://osd{n}:9200"),
+            ..Default::default()
+        }
+    }
+
+    /// An error return, or the request being dropped mid-write, frees every
+    /// shard sent — acknowledged or not, since a timed-out write may land.
+    #[test]
+    fn an_abandoned_write_frees_every_shard_it_sent() {
+        let (freed, mut pending) = recorder();
+        pending.sent(&node(1), &[5; 16], 0, 0);
+        pending.sent(&node(2), &[5; 16], 0, 1);
+        drop(pending);
+        let freed = freed.lock().unwrap();
+        assert_eq!(freed.len(), 2);
+        assert_eq!(freed[1].address, "http://osd2:9200");
+        assert_eq!(freed[1].position, 1);
+    }
+
+    #[test]
+    fn a_write_that_reached_its_commit_frees_nothing_by_itself() {
+        let (freed, mut pending) = recorder();
+        pending.sent(&node(1), &[5; 16], 0, 0);
+        let sent = pending.disarm();
+        assert_eq!(sent.len(), 1);
+        assert!(freed.lock().unwrap().is_empty());
+    }
+
+    /// Reclaim that can't get through (meta, or the OSD, unreachable)
+    /// returns at once with how much it didn't free, rather than failing
+    /// whatever triggered it. That is tried again, and counted as failed
+    /// once the retries are up.
+    #[tokio::test]
+    async fn what_cannot_be_freed_is_retried_then_counted() {
+        let pool = Arc::new(OsdPool::new());
+        let meta = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let mut meta =
+            objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta);
+        let target = ShardTarget {
+            node_id: vec![1; 16],
+            address: "http://127.0.0.1:1".into(),
+            object_id: vec![5; 16],
+            stripe_id: 0,
+            position: 0,
+            owner: vec![5; 16],
+        };
+        let failed =
+            reclaim_shards(&pool, &mut meta, vec![target.clone()], Reclaim::FailedWrite).await;
+        assert_eq!(failed, 1);
+
+        let left = Unfreed {
+            release: Vec::new(),
+            delete: vec![target],
+        };
+        let zero = std::time::Duration::ZERO;
+        retry_reclaim(pool, meta, left, Reclaim::FailedWrite, zero, zero).await;
+        assert!(
+            crate::gateway_metrics::render()
+                .contains("objectio_gateway_shard_reclaim_failures_total{reason=\"failed_write\"}")
+        );
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    use super::*;
+
+    /// A majority writes, and reads hear from enough copies to overlap it.
+    #[test]
+    fn the_metadata_quorums() {
+        objectio_common::version::set_active_level(2);
+        for (copies, write, read) in [(6, 4, 3), (12, 7, 6), (3, 2, 2), (1, 1, 1)] {
+            assert_eq!(meta_write_quorum(copies), write, "{copies} copies");
+            assert_eq!(meta_read_quorum(copies), read, "{copies} copies");
+            assert!(write + read > copies);
+        }
+    }
+}
+
+#[cfg(test)]
+mod fail_fast_tests {
+    use super::*;
+
+    /// An address that just failed is not tried for FAIL_FAST, then is.
+    #[tokio::test]
+    async fn an_unreachable_osd_fails_fast_for_a_while() {
+        let pool = OsdPool::new();
+        let addr = "http://10.0.0.1:9200";
+        pool.mark_unreachable(addr);
+        let r = pool.get_or_connect(&[1u8; 16], addr).await;
+        assert!(matches!(r, Err(OsdPoolError::ConnectionFailed(m)) if m.contains("not tried")));
+
+        // Once the window has passed, it is tried again.
+        pool.unreachable.lock().unwrap().insert(
+            addr.to_string(),
+            std::time::Instant::now().checked_sub(FAIL_FAST).unwrap(),
+        );
+        assert!(!pool.is_unreachable(addr));
+        // ...and dialled afresh, not over a channel cached before the failure.
+        assert!(
+            pool.stale.lock().unwrap().contains(addr),
+            "a failed address's cached channel is dropped on next use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_checksum;
+    use objectio_proto::storage::Checksum;
+
+    fn checksum(crc32c: u32) -> Checksum {
+        Checksum {
+            crc32c,
+            ..Default::default()
+        }
+    }
+
+    /// An address marked after a transport failure is tried again as soon
+    /// as it accepts a connection (an OSD that restarted), and stays failed
+    /// fast while it doesn't.
+    #[tokio::test]
+    async fn a_restarted_osd_is_not_failed_fast() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+
+        let pool = super::OsdPool::new();
+        pool.mark_unreachable(&up);
+        pool.mark_unreachable(&gone);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while pool.is_unreachable(&up) {
+            assert!(std::time::Instant::now() < deadline, "still failed fast");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pool.is_unreachable(&gone));
+
+        // Down when it failed, up a moment later: used again then, not
+        // when the mark runs out.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let back = format!("http://{addr}");
+        pool.mark_unreachable(&back);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(pool.is_unreachable(&back));
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while pool.is_unreachable(&back) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not used again once back"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A call that hangs makes the gateway check the OSD: one that no
+    /// longer accepts connections is failed fast even though the call
+    /// itself never failed (its request may be long gone); a slow one that
+    /// still answers is not.
+    #[tokio::test]
+    async fn a_hanging_call_to_a_vanished_osd_fails_it_fast() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let gone = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let hang =
+            || tokio::time::sleep(super::SUSPECT_AFTER + std::time::Duration::from_millis(500));
+
+        let pool = super::OsdPool::new();
+        // Dropped before it would be suspected: nothing checked.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            pool.watched(&gone, hang()),
+        )
+        .await;
+        assert!(!pool.is_unreachable(&gone));
+
+        tokio::join!(pool.watched(&gone, hang()), pool.watched(&busy, hang()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pool.is_unreachable(&gone) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a vanished OSD not failed fast"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !pool.is_unreachable(&busy),
+            "a slow OSD that answers was failed fast"
+        );
+    }
+
+    /// A connection cut under a call is a failure to retry (503), not a
+    /// server error, however tonic reports it.
+    #[test]
+    fn a_broken_connection_is_unavailable() {
+        for e in [
+            tonic::Status::unknown("transport error"),
+            tonic::Status::internal("h2 protocol error: error reading a body from connection"),
+        ] {
+            assert!(super::connection_broke(&e), "{e:?}");
+            assert!(crate::s3::S3Error::is_unavailable(&e), "{e:?}");
+        }
+        assert!(!super::connection_broke(&tonic::Status::internal(
+            "disk on fire"
+        )));
+    }
+
+    #[test]
+    fn a_shard_matches_the_checksum_of_its_own_bytes() {
+        let data = b"a shard as the osd stored it";
+        assert!(matches_checksum(
+            Some(&checksum(crc32c::crc32c(data))),
+            data
+        ));
+    }
+
+    /// Without this a shard damaged between OSD and gateway is decoded into
+    /// the object and handed to the client as good.
+    #[test]
+    fn a_damaged_shard_does_not_match() {
+        let data = b"a shard as the osd stored it".to_vec();
+        let sent = checksum(crc32c::crc32c(&data));
+        let mut damaged = data;
+        damaged[3] ^= 0x10;
+        assert!(!matches_checksum(Some(&sent), &damaged));
+        assert!(!matches_checksum(
+            Some(&sent),
+            &damaged[..damaged.len() - 1]
+        ));
+    }
+
+    #[test]
+    fn a_response_without_a_checksum_is_taken_as_is() {
+        assert!(matches_checksum(None, b"anything"));
+    }
+
+    use objectio_proto::metadata::{NodePlacement, ObjectMeta};
+    use objectio_proto::storage::{GetObjectMetaRequest, GetObjectMetaResponse};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::{Duration, Instant};
+
+    /// An OSD that answers GetObjectMeta (and GetObjectMetas, each read as
+    /// GetObjectMeta would) only, with the object, after its delay (plus
+    /// N ms for a key `slow-N`), counting the reads it finished.
+    #[derive(Clone)]
+    struct MetaOsd {
+        delay: Duration,
+        finished: Arc<AtomicUsize>,
+        /// GetObjectMetas calls answered.
+        batch_calls: Arc<AtomicUsize>,
+    }
+
+    /// [`MetaOsd`]'s answer to one read.
+    async fn meta_osd_read(osd: &MetaOsd, req: GetObjectMetaRequest) -> GetObjectMetaResponse {
+        let extra = req
+            .key
+            .strip_prefix("slow-")
+            .map_or(0, |ms| ms.parse().unwrap());
+        tokio::time::sleep(osd.delay + Duration::from_millis(extra)).await;
+        osd.finished.fetch_add(1, SeqCst);
+        GetObjectMetaResponse {
+            found: true,
+            object: Some(ObjectMeta {
+                bucket: req.bucket,
+                key: req.key,
+                stamp: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// [`MetaOsd`] answering GetObjectMetas, counting the calls.
+    #[derive(Clone)]
+    struct MetaOsdBatch {
+        osd: MetaOsd,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl tonic::server::UnaryService<objectio_proto::storage::GetObjectMetasRequest> for MetaOsdBatch {
+        type Response = objectio_proto::storage::GetObjectMetasResponse;
+        type Future = futures::future::BoxFuture<
+            'static,
+            Result<tonic::Response<Self::Response>, tonic::Status>,
+        >;
+
+        fn call(
+            &mut self,
+            req: tonic::Request<objectio_proto::storage::GetObjectMetasRequest>,
+        ) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                this.calls.fetch_add(1, SeqCst);
+                let reads = req.into_inner().requests;
+                let answers = futures::future::join_all(
+                    reads.into_iter().map(|r| meta_osd_read(&this.osd, r)),
+                )
+                .await
+                .into_iter()
+                .map(|response| objectio_proto::storage::GetObjectMetaAnswer {
+                    response: Some(response),
+                    ..Default::default()
+                })
+                .collect();
+                Ok(tonic::Response::new(
+                    objectio_proto::storage::GetObjectMetasResponse { answers },
+                ))
+            })
+        }
+    }
+
+    impl tonic::server::NamedService for MetaOsd {
+        const NAME: &'static str = "objectio.storage.StorageService";
+    }
+
+    impl tower::Service<http::Request<tonic::body::BoxBody>> for MetaOsd {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            let osd = self.clone();
+            Box::pin(async move {
+                use tonic::codec::ProstCodec;
+                use tonic::server::Grpc;
+                Ok(match req.uri().path() {
+                    "/objectio.storage.StorageService/GetObjectMeta" => {
+                        Grpc::new(
+                            ProstCodec::<GetObjectMetaResponse, GetObjectMetaRequest>::default(),
+                        )
+                        .unary(osd, req)
+                        .await
+                    }
+                    "/objectio.storage.StorageService/GetObjectMetas" => {
+                        let calls = Arc::clone(&osd.batch_calls);
+                        Grpc::new(ProstCodec::<
+                            objectio_proto::storage::GetObjectMetasResponse,
+                            objectio_proto::storage::GetObjectMetasRequest,
+                        >::default())
+                        .unary(MetaOsdBatch { osd, calls }, req)
+                        .await
+                    }
+                    other => panic!("MetaOsd asked {other}"),
+                })
+            })
+        }
+    }
+
+    impl tonic::server::UnaryService<GetObjectMetaRequest> for MetaOsd {
+        type Response = GetObjectMetaResponse;
+        type Future = futures::future::BoxFuture<
+            'static,
+            Result<tonic::Response<GetObjectMetaResponse>, tonic::Status>,
+        >;
+
+        fn call(&mut self, req: tonic::Request<GetObjectMetaRequest>) -> Self::Future {
+            let osd = self.clone();
+            Box::pin(async move {
+                Ok(tonic::Response::new(
+                    meta_osd_read(&osd, req.into_inner()).await,
+                ))
+            })
+        }
+    }
+
+    async fn serve(osd: MetaOsd) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(osd)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        addr
+    }
+
+    /// A link to `to` that holds what the client sends for `delay` and
+    /// passes the answers straight back: every call the client cancels
+    /// sooner than that is answered after it was cancelled.
+    async fn slow_link(to: std::net::SocketAddr, delay: Duration) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = tokio::net::TcpStream::connect(to).await else {
+                    continue;
+                };
+                let (mut client_rx, mut client_tx) = client.into_split();
+                let (mut server_rx, mut server_tx) = server.into_split();
+                tokio::spawn(async move { tokio::io::copy(&mut server_rx, &mut client_tx).await });
+                let (held, mut due) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n @ 1..) = client_rx.read(&mut buf).await {
+                        let _ = held.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
+                    }
+                });
+                tokio::spawn(async move {
+                    while let Some((at, bytes)) = due.recv().await {
+                        tokio::time::sleep_until(at).await;
+                        if server_tx.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn placement(n: u8, addr: std::net::SocketAddr) -> NodePlacement {
+        NodePlacement {
+            node_id: vec![n; 16],
+            node_address: format!("http://{addr}"),
+            ..Default::default()
+        }
+    }
+
+    /// A metadata read answered by a quorum lets the slower copies' calls
+    /// finish rather than cancel them: thousands of cancelled calls a
+    /// second, answered all the same, made h2 close the connection (see
+    /// `closed_by_us`).
+    #[tokio::test]
+    async fn a_meta_read_lets_the_slower_copies_finish() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let osd = |ms| MetaOsd {
+            delay: Duration::from_millis(ms),
+            finished: Arc::clone(&finished),
+            batch_calls: Arc::default(),
+        };
+        let placements = vec![
+            placement(1, serve(osd(0)).await),
+            placement(2, serve(osd(0)).await),
+            placement(3, serve(osd(500)).await),
+        ];
+        let pool = super::OsdPool::new();
+        let started = Instant::now();
+        let object = super::get_object_meta_from_any(&pool, &placements, "b", "k")
+            .await
+            .unwrap();
+        assert_eq!(object.unwrap().key, "k");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "waited for the slow copy"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while finished.load(SeqCst) < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the slow copy's call was cancelled"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Reads of one OSD made together go in fewer calls than reads
+    /// (`GetObjectMetas`, B21), each answered with its own object; a read
+    /// alone goes by itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_meta_reads_of_an_osd_share_calls() {
+        objectio_common::version::set_active_level(
+            objectio_common::version::BATCHED_META_READS_LEVEL,
+        );
+        let finished = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let addr = serve(MetaOsd {
+            delay: Duration::from_millis(20),
+            finished: Arc::clone(&finished),
+            batch_calls: Arc::clone(&batch_calls),
+        })
+        .await;
+        let placements = vec![placement(1, addr)];
+        let pool = Arc::new(super::OsdPool::new());
+
+        let alone = super::get_object_meta_from_any(&pool, &placements, "b", "alone")
+            .await
+            .unwrap();
+        assert_eq!(alone.unwrap().key, "alone");
+        assert_eq!(batch_calls.load(SeqCst), 0, "a lone read was batched");
+
+        let reads: Vec<_> = (0..200)
+            .map(|i| {
+                let pool = Arc::clone(&pool);
+                let placements = placements.clone();
+                tokio::spawn(async move {
+                    let key = format!("k{i}");
+                    let got = super::get_object_meta_from_any(&pool, &placements, "b", &key)
+                        .await
+                        .unwrap();
+                    assert_eq!(got.unwrap().key, key);
+                })
+            })
+            .collect();
+        for r in reads {
+            r.await.unwrap();
+        }
+        assert_eq!(finished.load(SeqCst), 201);
+        let calls = batch_calls.load(SeqCst);
+        assert!(
+            calls > 0 && calls < 100,
+            "{calls} batched calls for 200 reads"
+        );
+    }
+
+    /// h2 closes a connection once more than 1024 answers came for calls it
+    /// had cancelled and forgotten, over the connection's life, failing
+    /// every call in flight on it. That is this side's doing: the OSD is not
+    /// failed fast, a shard write cut off is not taken for a full disk, and
+    /// a read in flight is asked again on a new connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_closed_by_our_side_is_not_the_osd_down() {
+        let osd = serve(MetaOsd {
+            delay: Duration::ZERO,
+            finished: Arc::default(),
+            batch_calls: Arc::default(),
+        })
+        .await;
+        let link = slow_link(osd, Duration::from_millis(500)).await;
+        let placements = vec![placement(1, link)];
+        let pool = Arc::new(super::OsdPool::new());
+        let client = pool.get_client_for_placement(&placements[0]).await.unwrap();
+        let ask = |key: &str| GetObjectMetaRequest {
+            bucket: "b".into(),
+            key: key.into(),
+            ..Default::default()
+        };
+
+        // Waves of calls cancelled before their answers come, until h2
+        // closes the connection: how many open a stream in time (rather
+        // than being cancelled while still queued in tonic's buffer)
+        // depends on the machine's speed, and h2's count carries over.
+        // Each wave has in flight a call as it is, and a read, slow
+        // enough to still be waiting when the wave's answers come.
+        let mut closed = None;
+        for _ in 0..30 {
+            let call = tokio::spawn({
+                let mut client = client.clone();
+                let req = ask("slow-1500");
+                async move { client.get_object_meta(req).await }
+            });
+            let read = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                let placements = placements.clone();
+                async move {
+                    super::get_object_meta_from_any(&pool, &placements, "b", "slow-1500").await
+                }
+            });
+            let cancelled: Vec<_> = (0..1100)
+                .map(|_| {
+                    let mut client = client.clone();
+                    let req = ask("k");
+                    tokio::spawn(async move {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            client.get_object_meta(req),
+                        )
+                        .await;
+                    })
+                })
+                .collect();
+            for c in cancelled {
+                c.await.unwrap();
+            }
+            let object = read.await.unwrap().expect("the read was not asked again");
+            assert_eq!(object.unwrap().key, "slow-1500");
+            if let Err(e) = call.await.unwrap() {
+                closed = Some(e);
+                break;
+            }
+        }
+        let e = closed.expect("h2 no longer closes the connection");
+        assert!(super::closed_by_us(&e), "{e:?}");
+        assert!(super::connection_broke(&e), "{e:?}");
+        assert!(!super::is_transport_failure(&e), "{e:?}");
+        assert!(
+            !super::OsdPoolError::from(super::ShardCallError::Status(e)).is_full(),
+            "taken for a full disk"
+        );
+        assert!(!pool.is_unreachable(&placements[0].node_address));
+    }
+}
+
+/// Record `status` for replication `target` on every copy of `version`
+/// (its version entry, and the current entry if it is that version),
+/// changing nothing else: each OSD merges just the status under the key's
+/// lock, so a tag or retention change made since `version` was read stays.
+/// Succeeds if any copy took it.
+pub async fn set_replication_status(
+    pool: &OsdPool,
+    placements: &[NodePlacement],
+    version: &objectio_proto::metadata::ObjectMeta,
+    target: &str,
+    status: &str,
+) -> Result<(), OsdPoolError> {
+    use objectio_proto::storage::PutObjectMetaRequest;
+    let only_ids = objectio_proto::metadata::ObjectMeta {
+        object_id: version.object_id.clone(),
+        version_id: version.version_id.clone(),
+        ..Default::default()
+    };
+    let targets = unique_node_placements(placements);
+    let futs = targets.iter().map(|p| {
+        let req = PutObjectMetaRequest {
+            bucket: version.bucket.clone(),
+            key: version.key.clone(),
+            object: Some(only_ids.clone()),
+            replication_update: true,
+            replication_set: std::iter::once((target.to_string(), status.to_string())).collect(),
+            shard: None,
+            ..Default::default()
+        };
+        async move {
+            let mut client = pool.get_client_for_placement(p).await?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client.put_object_meta(req),
+            )
+            .await
+            .map_err(|_| OsdPoolError::ConnectionFailed("put_object_meta timeout".into()))?
+            .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+            Ok::<_, OsdPoolError>(())
+        }
+    });
+    let results = futures::future::join_all(futs).await;
+    if results.iter().any(Result::is_ok) {
+        Ok(())
+    } else {
+        Err(results
+            .into_iter()
+            .find_map(Result::err)
+            .unwrap_or(OsdPoolError::NoNodesAvailable))
+    }
+}

@@ -1,0 +1,72 @@
+/* ObjectIO console semantic tokens — generated from the design canvas.
+   Drop into console/src/index.css after @import "tailwindcss"; and reference
+   as var(--oio-*) or map into @theme. Toggle dark with [data-theme="dark"]. */
+:root {
+  --oio-font-display: 'Sora', 'Avenir Next', 'Helvetica Neue', sans-serif;
+  --oio-font-body: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --oio-font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
+  --oio-radius-control: 8px; --oio-radius-card: 12px; --oio-radius-dialog: 16px;
+  --oio-control-h: 32px; --oio-row-h: 36px; --oio-sidebar-w: 208px;
+}
+:root {
+  --oio-bg: #f5f7f9;
+  --oio-surface: #ffffff;
+  --oio-surface2: #f8fafc;
+  --oio-border: #e2e6ec;
+  --oio-border-strong: #ccd1d9;
+  --oio-text: #0c121a;
+  --oio-text2: #3f4856;
+  --oio-muted: #677284;
+  --oio-faint: #98a2b3;
+  --oio-accent: #0077c7;
+  --oio-accent-fg: #ffffff;
+  --oio-accent-soft: #e8f3fd;
+  --oio-accent-ring: #249ff3;
+  --oio-primary: #0c121a;
+  --oio-primary-fg: #ffffff;
+  --oio-primary-hover: #232933;
+  --oio-ok: #1e8e4d;
+  --oio-ok-soft: #e6f5ec;
+  --oio-warn: #a35a00;
+  --oio-warn-soft: #fff2e0;
+  --oio-warn-dot: #fc9f30;
+  --oio-err: #c92a2a;
+  --oio-err-soft: #fdecec;
+  --oio-info: #0077c7;
+  --oio-info-soft: #e8f3fd;
+  --oio-sidebar: #ffffff;
+  --oio-code-bg: #0c121a;
+  --oio-code-fg: #f5f7f9;
+  --oio-shadow: 0 1px 2px rgba(12,18,26,.06);
+}
+:root[data-theme="dark"] {
+  --oio-bg: #0c121a;
+  --oio-surface: #121924;
+  --oio-surface2: #171f2b;
+  --oio-border: #232933;
+  --oio-border-strong: #2f3846;
+  --oio-text: #f5f7f9;
+  --oio-text2: #cfd5de;
+  --oio-muted: #8b95a7;
+  --oio-faint: #5f6a7c;
+  --oio-accent: #249ff3;
+  --oio-accent-fg: #0c121a;
+  --oio-accent-soft: #132a41;
+  --oio-accent-ring: #249ff3;
+  --oio-primary: #f5f7f9;
+  --oio-primary-fg: #0c121a;
+  --oio-primary-hover: #ffffff;
+  --oio-ok: #4ade80;
+  --oio-ok-soft: #10281b;
+  --oio-warn: #fc9f30;
+  --oio-warn-soft: #2e2010;
+  --oio-warn-dot: #fc9f30;
+  --oio-err: #f87171;
+  --oio-err-soft: #331616;
+  --oio-info: #249ff3;
+  --oio-info-soft: #132a41;
+  --oio-sidebar: #0f151e;
+  --oio-code-bg: #05080c;
+  --oio-code-fg: #f5f7f9;
+  --oio-shadow: 0 1px 2px rgba(0,0,0,.4);
+}

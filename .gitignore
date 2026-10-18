@@ -1,0 +1,44 @@
+# Build artifacts
+/target/
+/target-*/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.pem
+*.key
+*.local.*
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+/tmp/
+
+# Python virtual environments
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+console/dist/
+.claude/
+
+# warp benchmark output (scripts/bench/baseline.sh writes it under $BENCH/results)
+warp-*.json.zst

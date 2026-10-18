@@ -1,0 +1,1173 @@
+//! ObjectIO all-in-one — the real monolith.
+//!
+//! Runs meta + OSD(s) + gateway as tokio tasks inside **one**
+//! process. Shares a single tracing subscriber, a single Ctrl-C
+//! handler, and a single memory space. Built on top of each
+//! service's `lib.rs::run(args, shutdown)` entrypoint.
+//!
+//! Still UX-identical to the supervisor version: one binary, one
+//! command, one log, one Ctrl-C. What changes is:
+//!
+//!   - Zero subprocess overhead; tasks share the tokio runtime.
+//!   - Inter-service RPC is still gRPC on loopback (we didn't
+//!     strip the tonic layer — that's a bigger surgery). So the
+//!     behavior against the wire protocol is identical to prod.
+//!   - Port conflicts affect only the one user-facing gateway port.
+//!     Internal ports are OS-assigned ephemeral.
+//!
+//! Defaults tuned for quick testing:
+//!   - 1 meta (single-voter Raft), 1 OSD, 1 gateway
+//!   - replication = 1 (no redundancy)
+//!   - tempdir data (wiped on exit) unless --data is passed
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use std::io::Read;
+use std::net::TcpListener as StdTcpListener;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use clap::Parser;
+use include_dir::{Dir, include_dir};
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Pre-built console SPA, baked into the binary at compile time.
+/// Built via `cd console && npm run build` before `cargo build`.
+static CONSOLE_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../console/dist");
+
+/// Extract the embedded console SPA into `dst`. Idempotent: safe to
+/// call on an existing directory (files are overwritten).
+fn extract_embedded_console(dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    CONSOLE_DIST
+        .extract(dst)
+        .with_context(|| format!("extracting console bundle to {}", dst.display()))?;
+    Ok(())
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "objectio-aio")]
+#[command(version)]
+#[command(about = "ObjectIO all-in-one — single-process local cluster for testing.")]
+struct Args {
+    /// Public port for the S3 / Iceberg / Delta Sharing / console
+    /// endpoint. The only port the caller needs to know about.
+    #[arg(long, default_value_t = 9000)]
+    port: u16,
+
+    /// Interface the S3 endpoint binds to. Defaults to `0.0.0.0`
+    /// so the cluster is reachable from other hosts on the LAN —
+    /// pass `127.0.0.1` to restrict to loopback (useful for CI
+    /// runners or shared dev boxes).
+    #[arg(long, default_value = "0.0.0.0")]
+    listen_addr: String,
+
+    /// Root data directory. Meta + each OSD get subdirs. Empty =
+    /// tempdir (wiped on exit).
+    #[arg(long)]
+    data: Option<PathBuf>,
+
+    /// Number of OSDs to spawn. Defaults to 1 for the replication=1
+    /// quick-test pool. Pass `--ec-k`/`--ec-m` with at least k+m OSDs
+    /// to run erasure coding instead.
+    #[arg(long, default_value_t = 1)]
+    osds: usize,
+
+    /// Erasure-coding data shards. Set together with `--ec-m` to run EC
+    /// instead of replication — e.g. `--osds 6 --ec-k 4 --ec-m 2` for the
+    /// 4+2 scheme the docs call the default.
+    ///
+    /// This did nothing before: aio always passed `--replication 1` to meta,
+    /// and meta gives replication precedence over EC, so every aio cluster
+    /// was replication-1 no matter how many OSDs it span up — while
+    /// `--osds`'s own help advertised EC.
+    #[arg(long, default_value_t = 0)]
+    ec_k: u8,
+
+    /// Erasure-coding parity shards. See `--ec-k`.
+    #[arg(long, default_value_t = 0)]
+    ec_m: u8,
+
+    /// Log level. Honored by RUST_LOG if present; otherwise this is
+    /// used as the global default.
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
+    /// Fail fast on --port conflict instead of falling back to an
+    /// ephemeral port.
+    #[arg(long)]
+    strict_port: bool,
+
+    /// Enable SigV4 auth on the gateway. Default off — aio is a quick
+    /// laptop-scale dev binary and disabled auth keeps the curl-based
+    /// flow simple. Turn on when testing flows that depend on the auth
+    /// layer (vended STS scope enforcement, IAM policies, etc.); the
+    /// auto-created admin credentials are printed at startup.
+    #[arg(long)]
+    auth: bool,
+
+    /// Name of the `--port` endpoint, for policies (`aws:SourceVpce`).
+    #[arg(long, default_value = "")]
+    endpoint_name: String,
+
+    /// A further S3 endpoint as `PORT=NAME` on `--listen-addr` (data plane
+    /// only). Repeatable.
+    #[arg(long = "data-port")]
+    data_port: Vec<String>,
+
+    /// Proxies whose `X-Forwarded-For` names the client (comma-separated
+    /// CIDRs or addresses).
+    #[arg(long, default_value = "")]
+    trusted_proxies: String,
+
+    /// Append every request's audit event (JSON lines) to this file, `-`
+    /// for stdout.
+    #[arg(long)]
+    audit_log: Option<String>,
+
+    /// Size of each OSD's disk file, in bytes, when it is created (0: the
+    /// OSD's default, 10 GiB, sparse). Small disks fill quickly, for tests
+    /// of what a full cluster does.
+    #[arg(long, default_value_t = 0)]
+    disk_size: u64,
+
+    /// Keep audit events here before delivery (A8c). Default: `audit-spool`
+    /// in the data directory when `--audit-system-bucket` is given.
+    #[arg(long)]
+    audit_spool: Option<PathBuf>,
+
+    /// The system always audits: every event also into this bucket.
+    #[arg(long)]
+    audit_system_bucket: Option<String>,
+
+    /// Seconds a bucket-logging object collects records before it is
+    /// written (the gateway's default when not given).
+    #[arg(long)]
+    bucket_log_roll_secs: Option<u64>,
+
+    /// How often the lifecycle worker scans (seconds).
+    #[arg(long)]
+    lifecycle_interval_secs: Option<u64>,
+
+    /// Length of a lifecycle "day" in seconds (testing only).
+    #[arg(long, hide = true)]
+    lifecycle_day_secs: Option<u64>,
+
+    /// Mount the gateway's `/_admin/test/*` hooks (testing only).
+    #[arg(long, hide = true)]
+    test_hooks: bool,
+
+    /// Run the gateway's stamp clock this many milliseconds off (testing
+    /// only; forwarded).
+    #[arg(long, default_value_t = 0, hide = true, allow_negative_numbers = true)]
+    test_clock_offset_ms: i64,
+
+    /// How often the packer moves small objects into packs (seconds);
+    /// forwarded to the gateway. 0 leaves packing off.
+    #[arg(long)]
+    pack_interval_secs: Option<u64>,
+
+    /// Objects written more recently than this aren't packed (seconds).
+    #[arg(long)]
+    pack_min_age_secs: Option<u64>,
+
+    /// How often the replication scanner runs (seconds); forwarded to the
+    /// gateway.
+    #[arg(long)]
+    replication_scan_secs: Option<u64>,
+
+    /// Turn the replication fast path off (testing only).
+    #[arg(long, hide = true)]
+    no_replication_fast_path: bool,
+
+    /// The packer's wait between switching and releasing (testing only).
+    #[arg(long, hide = true)]
+    pack_grace_secs: Option<u64>,
+
+    /// The OSDs' metadata index engine: `native`, or `rocksdb` (a build
+    /// with the `rocksdb` feature).
+    #[arg(long, env = "OBJECTIO_OSD_META_ENGINE", default_value = "native")]
+    meta_engine: String,
+
+    /// Optional dedicated port for the admin API (`/_admin/*` + `/metrics`).
+    /// Bound on `--listen-addr`. When set, admin endpoints move OFF
+    /// the data port. Pass 0 to leave admin co-mounted on `--port`
+    /// (single-port, the default).
+    #[arg(long, default_value_t = 0)]
+    admin_port: u16,
+
+    /// Optional dedicated port for the **ops** console SPA (full
+    /// admin surface for system operators). Bound on `--listen-addr`.
+    /// When set, the ops bundle is served on this port; the data
+    /// port no longer serves `/_console/`. Pass 0 to skip.
+    #[arg(long, default_value_t = 0)]
+    ops_console_port: u16,
+
+    /// Optional dedicated port for the **tenant** console SPA
+    /// (self-service: my buckets, my keys, my catalogs). Bound on
+    /// `--listen-addr`. Safe to expose publicly. Pass 0 to skip.
+    #[arg(long, default_value_t = 0)]
+    tenant_console_port: u16,
+
+    /// Public base URL clients reach this server on, e.g.
+    /// `https://s3.example.com`. Used for the OIDC callback, Iceberg vended
+    /// credentials, and Delta Sharing presigned URLs — all of which must hand
+    /// out an address that resolves for the *caller*, not the bind address.
+    ///
+    /// Seed this on any deployment that is reachable by a name. Left empty it
+    /// is derived from `--listen-addr`, which cannot produce a usable URL for
+    /// a wildcard bind.
+    #[arg(long, env = "OBJECTIO_EXTERNAL_ENDPOINT", default_value = "")]
+    external_endpoint: String,
+
+    /// Base URL of a Prometheus that scrapes this server, e.g.
+    /// `http://127.0.0.1:9090`. Forwarded to the gateway, which proxies the
+    /// console's range queries to it.
+    ///
+    /// Without it the console falls back to polling `/metrics` in the browser,
+    /// which only knows what happened since the page opened — about five
+    /// minutes — and carries no per-instance labels. Leave empty for that.
+    #[arg(long, env = "OBJECTIO_PROMETHEUS_URL", default_value = "")]
+    prometheus_url: String,
+
+    /// Move shards between the gateway and the OSDs over Mooncake Transfer
+    /// Engine: `rdma`, or `tcp` to exercise the same path without RDMA
+    /// hardware. Unset: gRPC bytes. Everything is on 127.0.0.1, so `rdma`
+    /// needs an RDMA device on loopback's address — in practice `tcp`.
+    #[cfg(feature = "rdma")]
+    #[arg(long)]
+    rdma: Option<String>,
+
+    /// Objects of at most this many bytes are stored inside their metadata
+    /// record instead of in shards. Forwarded to the gateway; 0 turns it off.
+    #[arg(long, default_value_t = 4096)]
+    inline_max_size: usize,
+
+    /// The largest shard sent with its object's metadata (B21). Forwarded
+    /// to the gateway; 0 turns it off.
+    #[arg(long, default_value_t = 16 * 1024)]
+    small_shard_max: usize,
+
+    /// Seconds between repair passes, which rebuild missing or corrupt
+    /// shards and restore missing listing entries. Forwarded to meta; 0
+    /// turns it off.
+    #[arg(long, default_value_t = 3600)]
+    repair_interval_secs: u64,
+
+    /// Seconds between drain sweeps, which move shards off OSDs set to
+    /// Draining. Forwarded to meta.
+    #[arg(long, default_value_t = 30)]
+    drain_interval_secs: u64,
+
+    /// Seconds between scrub passes, which read every shard and check its
+    /// checksums. Forwarded to every OSD; 0 turns it off.
+    #[arg(long, default_value_t = 7 * 24 * 60 * 60)]
+    scrub_interval_secs: u64,
+
+    /// Run the block gateway too, with its gRPC BlockService on this port.
+    /// 0 (the default) leaves block storage off.
+    #[arg(long, default_value_t = 0)]
+    block_port: u16,
+
+    /// NBD port for the block gateway, when --block-port is set.
+    #[arg(long, default_value_t = 10809)]
+    nbd_port: u16,
+
+    /// mTLS between the services (A8a): with these, even the all-in-one's
+    /// own gRPC hops go over mutual TLS.
+    #[command(flatten)]
+    tls: objectio_proto::transport::TlsArgs,
+}
+
+/// Pick a free loopback port by binding to :0 and releasing.
+fn ephemeral_port() -> Result<u16> {
+    let l = StdTcpListener::bind("127.0.0.1:0").context("bind 127.0.0.1:0")?;
+    let port = l.local_addr()?.port();
+    drop(l);
+    Ok(port)
+}
+
+/// Pick a free loopback port that none of `taken` already claims.
+///
+/// `bind(:0)` hands back any port free *at that instant*, including one this
+/// process has earmarked but not yet bound — and the gateway's port is chosen
+/// first and bound much later. A subsystem handed the gateway's port wins the
+/// race, and because meta and the OSD both serve `/health` on their metrics
+/// listeners, the result is a process answering health checks on the S3 port
+/// and returning a bare 404 to everything else. That is a confusing failure
+/// to chase: the server is plainly up, and only some routes exist.
+///
+/// Also used to keep the OSDs' derived ports clear, which were never checked
+/// against anything at all.
+fn ephemeral_port_excluding(taken: &[u16]) -> Result<u16> {
+    for _ in 0..64 {
+        let port = ephemeral_port()?;
+        if !taken.contains(&port) {
+            return Ok(port);
+        }
+    }
+    Err(anyhow!(
+        "could not find a free loopback port outside the {} already claimed",
+        taken.len()
+    ))
+}
+
+fn port_free(addr: &str, port: u16) -> bool {
+    StdTcpListener::bind((addr, port)).is_ok()
+}
+
+/// Listen for Ctrl-C on the task that owns main, then broadcast
+/// shutdown to every subsystem. Returns when broadcast fires.
+async fn wait_ctrl_c(tx: broadcast::Sender<()>) {
+    if tokio::signal::ctrl_c().await.is_ok() {
+        info!("shutdown requested");
+        let _ = tx.send(());
+    }
+}
+
+/// Build a broadcast-receiver → Output=() future for a subsystem.
+fn sub_shutdown(
+    tx: &broadcast::Sender<()>,
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    let mut rx = tx.subscribe();
+    async move {
+        let _ = rx.recv().await;
+    }
+}
+
+/// Poll a closure every 100ms until it returns `Some`, or give up
+/// after `max`. Used by the admin-creds reader since meta writes
+/// the file asynchronously after start-up.
+async fn for_a_moment<T>(mut f: impl FnMut() -> Option<T>, max: Duration) -> Option<T> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < max {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// Parse KEY=VAL lines from meta's admin-creds.env.
+fn parse_creds(path: &std::path::Path) -> Option<(String, String)> {
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut ak = None;
+    let mut sk = None;
+    for line in body.lines() {
+        let line = line.trim_start_matches("export ").trim();
+        if let Some((k, v)) = line.split_once('=') {
+            match k {
+                "AWS_ACCESS_KEY_ID" => ak = Some(v.trim().to_string()),
+                "AWS_SECRET_ACCESS_KEY" => sk = Some(v.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    match (ak, sk) {
+        (Some(a), Some(s)) => Some((a, s)),
+        _ => None,
+    }
+}
+
+/// Poll a port until something is listening there. Used to sequence
+/// start-up: OSD can't register until meta is up, gateway can't
+/// resolve buckets until OSD is up.
+async fn wait_listening(port: u16, label: &str, max: u64) -> Result<()> {
+    for i in 0..(max * 10) {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if i % 10 == 0 {
+            info!("waiting for {label} on :{port}…");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("{label} did not listen on :{port} within {max}s"))
+}
+
+/// Fail unless the block gateway's ports are its own: `BlockService`
+/// answers on `grpc_port` and the NBD handshake on `nbd_port`.
+async fn serves_block(grpc_port: u16, nbd_port: u16, max: u64) -> Result<()> {
+    use objectio_proto::block::ListVolumesRequest;
+    use objectio_proto::block::block_service_client::BlockServiceClient;
+    use tokio::io::AsyncReadExt;
+
+    const NBD_MAGIC: &[u8; 8] = b"NBDMAGIC";
+    let url = format!("127.0.0.1:{grpc_port}");
+    let mut last = String::new();
+    for _ in 0..(max * 10) {
+        let connected = match objectio_proto::transport::endpoint(&url) {
+            Ok(ep) => ep
+                .connect()
+                .await
+                .map(BlockServiceClient::new)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        match connected {
+            Ok(mut client) => match client
+                .list_volumes(ListVolumesRequest {
+                    max_results: 1,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(_) => {
+                    last.clear();
+                    break;
+                }
+                Err(s) if s.code() == tonic::Code::Unimplemented => {
+                    return Err(anyhow!(
+                        "block port :{grpc_port} answers, but not as the block gateway \
+                         (taken by another server)"
+                    ));
+                }
+                Err(s) => last = s.to_string(),
+            },
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !last.is_empty() {
+        return Err(anyhow!(
+            "block gateway on :{grpc_port} not serving within {max}s: {last}"
+        ));
+    }
+    let mut magic = [0u8; 8];
+    let nbd = async {
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", nbd_port)).await?;
+        conn.read_exact(&mut magic).await
+    };
+    match tokio::time::timeout(Duration::from_secs(5), nbd).await {
+        Ok(Ok(_)) if &magic == NBD_MAGIC => {}
+        _ => return Err(anyhow!("NBD port :{nbd_port} is not the block gateway's")),
+    }
+
+    Ok(())
+}
+
+/// Wait for OSD `i` to write the address it bound, and return its port.
+async fn wait_osd_addr(path: &std::path::Path, i: usize, max: u64) -> Result<u16> {
+    for _ in 0..(max * 10) {
+        if let Ok(addr) = std::fs::read_to_string(path)
+            && let Some(port) = addr.trim().rsplit(':').next().and_then(|p| p.parse().ok())
+        {
+            return Ok(port);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(anyhow!(
+        "osd-{i} did not report its address in {} within {max}s",
+        path.display()
+    ))
+}
+
+/// Wait for the gateway's `/_ready` to answer 200. Gives up after `max`
+/// seconds with a warning rather than an error: the cluster may still
+/// become usable, and the banner is how the user finds out where it is.
+async fn wait_gateway_ready(port: u16, max: u64) {
+    for i in 0..(max * 4) {
+        if let Ok((status, _)) = http_oneshot(port, "GET", "/_ready", b"").await
+            && status.contains(" 200 ")
+        {
+            return;
+        }
+        if i % 8 == 0 {
+            info!("waiting for the gateway to reach its OSDs…");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    warn!(
+        "gateway on :{port} is not ready after {max}s — writes may fail until \
+         its OSDs are reachable; see http://127.0.0.1:{port}/_ready"
+    );
+}
+
+/// Minimal HTTP GET/POST over a one-shot TCP connection. Returns (status_line, body).
+async fn http_oneshot(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<(String, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .context("raft admin connect")?;
+    s.write_all(req.as_bytes()).await?;
+    if !body.is_empty() {
+        s.write_all(body).await?;
+    }
+    let mut resp = Vec::with_capacity(1024);
+    let mut buf = [0u8; 1024];
+    loop {
+        match s.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let raw = String::from_utf8_lossy(&resp).into_owned();
+    let status = raw.lines().next().unwrap_or("").to_string();
+    let body_start = raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(raw.len());
+    let body = raw[body_start..].to_string();
+    Ok((status, body))
+}
+
+/// Bootstrap the meta raft cluster as a single voter. Idempotent: skips
+/// `/init` when `/status` shows voters already present (warm restart).
+async fn bootstrap_raft(port: u16) -> Result<()> {
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Warm-restart shortcut: if /status reports any voters, the cluster
+    // is already initialized — skip /init to avoid openraft's internal
+    // "Can not initialize" ERROR log on every restart.
+    if let Ok((status, body)) = http_oneshot(port, "GET", "/status", &[]).await
+        && status.starts_with("HTTP/1.1 200")
+        && body.contains("\"voters\"")
+        && !body.contains("\"voters\":[]")
+    {
+        info!("raft already initialized — skipping /init");
+        return Ok(());
+    }
+    let (status, _body) = http_oneshot(port, "POST", "/init", b"{}").await?;
+    if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.1 409") {
+        info!("raft bootstrap: {}", status);
+        Ok(())
+    } else {
+        Err(anyhow!("raft bootstrap failed: {}", status))
+    }
+}
+
+// The gateway's runtime: its request handlers need its workers' stacks.
+fn main() -> Result<()> {
+    objectio_gateway::runtime()?.block_on(serve())
+}
+
+async fn serve() -> Result<()> {
+    let args = Args::parse();
+    // Once for the process: every service run below shares it.
+    objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
+
+    // Single tracing subscriber for everyone. Default: --log-level for
+    // our own crates, warn for the noisy deps (hyper, h2, tower, tonic,
+    // openraft internals). Override via RUST_LOG — e.g.
+    //   RUST_LOG=debug          everything
+    //   RUST_LOG=objectio=debug just our crates
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!(
+                    "{lvl},hyper=warn,h2=warn,tower=warn,tonic=warn,\
+                     openraft::raft::core=warn,\
+                     tokio_util=warn,reqwest=warn",
+                    lvl = args.log_level
+                )
+                .into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .init();
+
+    // Data root.
+    let (data_root, _tempdir) = match args.data {
+        Some(p) => (p, None),
+        None => {
+            let td = tempfile::tempdir().context("tempdir")?;
+            info!(
+                "no --data given, using temp dir {} (wiped on exit)",
+                td.path().display()
+            );
+            (td.path().to_path_buf(), Some(td))
+        }
+    };
+    std::fs::create_dir_all(&data_root)?;
+
+    // Gateway port — the one user-facing knob. Check availability
+    // on the requested bind address (not just 0.0.0.0), so e.g.
+    // --listen-addr 127.0.0.1 --port 9000 doesn't fight with another
+    // process that bound 0.0.0.0:9000 (which would block loopback).
+    let gateway_port = if port_free(&args.listen_addr, args.port) {
+        args.port
+    } else if args.strict_port {
+        return Err(anyhow!(
+            "{}:{} in use and --strict-port set",
+            args.listen_addr,
+            args.port
+        ));
+    } else {
+        let p = ephemeral_port()?;
+        warn!(
+            "{}:{} in use — S3 API falling back to ephemeral port {p}. \
+             Pass --strict-port to fail instead.",
+            args.listen_addr, args.port
+        );
+        p
+    };
+
+    // Every subsequent port must avoid the ones already spoken for. The
+    // gateway's is the one that matters most: it is claimed here and bound
+    // only once the whole stack is assembled.
+    let meta_grpc = ephemeral_port_excluding(&[gateway_port])?;
+    let meta_admin = ephemeral_port_excluding(&[gateway_port, meta_grpc])?;
+
+    // ------------------------------------------------------------
+    // SSE master key. Gateway's bin logs a scary warning when this
+    // env var isn't set and then generates an in-memory key that
+    // renders every SSE-encrypted object unreadable across restart.
+    // For aio we persist one in the data root so SSE just works —
+    // subsequent runs against the same --data dir reuse it, temp-
+    // dir runs get a fresh key (and nothing to decrypt post-reset).
+    // ------------------------------------------------------------
+    let master_key_path = data_root.join("master_key");
+    let master_key_b64 = match std::fs::read_to_string(&master_key_path) {
+        Ok(s) if s.trim().len() == 44 => s.trim().to_string(),
+        _ => {
+            use std::io::Write;
+            let mut k = [0u8; 32];
+            // Minimal RNG — we already depend on `tempfile` which pulls
+            // `rand`, but we avoid it at this layer to stay dep-light.
+            // Use /dev/urandom (macOS + linux).
+            std::fs::File::open("/dev/urandom")
+                .context("open /dev/urandom")?
+                .read(&mut k)
+                .context("read /dev/urandom")?;
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(k);
+            let mut f = std::fs::File::create(&master_key_path)?;
+            f.write_all(b64.as_bytes())?;
+            info!("Generated SSE master key at {}", master_key_path.display());
+            b64
+        }
+    };
+    // SAFETY: setting env vars is unsafe in Rust 2024 because another
+    // thread might be reading them concurrently. We're still on the
+    // single main thread here — no other tasks have been spawned yet.
+    unsafe {
+        std::env::set_var("OBJECTIO_MASTER_KEY", &master_key_b64);
+    }
+
+    // ------------------------------------------------------------
+    // Console SPA — embedded at build time. The gateway serves it from
+    // $OBJECTIO_CONSOLE_DIR (default /usr/share/objectio/console, not
+    // present on a developer laptop). Extract the embedded tree to a
+    // per-run dir under the data root so the gateway's ServeDir finds
+    // it. Callers can override OBJECTIO_CONSOLE_DIR themselves if they
+    // want to serve a locally-built tree instead (e.g. during frontend
+    // dev against this aio binary).
+    //
+    // The embedded tree contains both `ops/` and `tenant/` subdirs
+    // (multi-page Vite output). The gateway resolves
+    // OBJECTIO_OPS_CONSOLE_DIR / OBJECTIO_TENANT_CONSOLE_DIR relative
+    // to OBJECTIO_CONSOLE_DIR by default, so a single extraction
+    // covers both split mode and single-port.
+    // ------------------------------------------------------------
+    {
+        let console_dst = data_root.join("console");
+        // Embedded tree contains ops/ and tenant/ subdirs (multi-bundle
+        // Vite output). Extract once; point each env var at the matching
+        // subdir, for single-port and split-mode alike.
+        extract_embedded_console(&console_dst)?;
+        let ops_dir = console_dst.join("ops");
+        let tenant_dir = console_dst.join("tenant");
+        // SAFETY: no tasks have been spawned yet, so no concurrent reads.
+        unsafe {
+            if std::env::var("OBJECTIO_OPS_CONSOLE_DIR").is_err() {
+                std::env::set_var("OBJECTIO_OPS_CONSOLE_DIR", &ops_dir);
+            }
+            if std::env::var("OBJECTIO_TENANT_CONSOLE_DIR").is_err() {
+                std::env::set_var("OBJECTIO_TENANT_CONSOLE_DIR", &tenant_dir);
+            }
+        }
+    }
+
+    // Shutdown broadcast — every subsystem subscribes, Ctrl-C fans out.
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
+
+    // ------------------------------------------------------------
+    // Meta — single-voter Raft, auto-bootstrapped below.
+    //
+    // We build each service's Args via parse_from() with a synthetic
+    // argv so aio stays insulated from new Args fields downstream —
+    // any field we don't pass keeps its clap default_value, which is
+    // exactly what standalone meta/osd/gateway would use when run
+    // without that flag.
+    // ------------------------------------------------------------
+    let meta_data = data_root.join("meta");
+    std::fs::create_dir_all(&meta_data)?;
+    // Replication takes precedence over EC inside meta, so the two are
+    // mutually exclusive here: ask for EC and we simply do not pass
+    // `--replication`.
+    let use_ec = args.ec_k > 0 && args.ec_m > 0;
+    let mut meta_argv: Vec<String> = vec![
+        "objectio-meta".into(),
+        "--node-id".into(),
+        "1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{meta_grpc}"),
+        "--data-dir".into(),
+        meta_data.display().to_string(),
+        "--metrics-port".into(),
+        "0".into(),
+        "--admin-port".into(),
+        meta_admin.to_string(),
+        "--log-level".into(),
+        args.log_level.clone(),
+        "--repair-interval-secs".into(),
+        args.repair_interval_secs.to_string(),
+        "--drain-interval-secs".into(),
+        args.drain_interval_secs.to_string(),
+    ];
+    if use_ec {
+        let need = usize::from(args.ec_k) + usize::from(args.ec_m);
+        if args.osds < need {
+            return Err(anyhow!(
+                "--ec-k {} --ec-m {} needs at least {need} OSDs, but --osds is {}",
+                args.ec_k,
+                args.ec_m,
+                args.osds
+            ));
+        }
+        meta_argv.push("--ec-k".into());
+        meta_argv.push(args.ec_k.to_string());
+        meta_argv.push("--ec-m".into());
+        meta_argv.push(args.ec_m.to_string());
+    } else {
+        meta_argv.push("--replication".into());
+        meta_argv.push("1".into());
+    }
+    let meta_args = <objectio_meta::Args as clap::Parser>::parse_from(&meta_argv);
+    let meta_handle: JoinHandle<Result<()>> = {
+        let sd = sub_shutdown(&shutdown_tx);
+        tokio::spawn(async move { objectio_meta::run(meta_args, sd).await })
+    };
+    wait_listening(meta_grpc, "meta gRPC", 20).await?;
+    bootstrap_raft(meta_admin).await?;
+
+    // Meta writes admin-creds.env to its data dir on first boot (and
+    // on every subsequent boot when an admin user already exists).
+    // Read it so we can surface AK/SK in the banner.
+    let creds_path = meta_data.join("admin-creds.env");
+    let (ak, sk) = for_a_moment(|| parse_creds(&creds_path), Duration::from_secs(5))
+        .await
+        .unwrap_or_default();
+
+    // ------------------------------------------------------------
+    // OSDs.
+    // ------------------------------------------------------------
+    let mut osd_handles: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let mut osd_ports: Vec<u16> = Vec::new();
+    for i in 0..args.osds {
+        let osd_dir = data_root.join(format!("osd-{i}"));
+        std::fs::create_dir_all(osd_dir.join("disk0"))?;
+        std::fs::create_dir_all(osd_dir.join("state"))?;
+        let disk = osd_dir.join("disk0/disk.raw");
+        if args.disk_size > 0 && !disk.exists() {
+            std::fs::File::create(&disk)?.set_len(args.disk_size)?;
+        }
+        let state = osd_dir.join("state");
+        // The OSD binds port 0 and writes the address it got here; a stale
+        // one from the last run must not be mistaken for it.
+        let addr_file = state.join("osd.addr");
+        let _ = std::fs::remove_file(&addr_file);
+
+        #[allow(unused_mut)]
+        let mut osd_argv: Vec<String> = [
+            "objectio-osd",
+            // Port 0: the OSD binds whatever the OS gives it and registers
+            // that. Choosing a free port here and binding it later lost the
+            // port to other sockets often enough to break startup.
+            "--listen",
+            "127.0.0.1:0",
+            "--meta-endpoint",
+            &format!("http://127.0.0.1:{meta_grpc}"),
+            "--data-dir",
+            &state.display().to_string(),
+            "--disks",
+            &disk.display().to_string(),
+            "--advertise-addr",
+            "http://127.0.0.1:0",
+            // Every OSD defaulted to the same metrics port (9201), so with
+            // more than one the first bound it and the rest logged
+            // "Metrics server error: Address already in use" and exported
+            // nothing — five of six on a 4+2 cluster. Whichever won was
+            // arbitrary, which is worse than none: the numbers looked like
+            // the cluster's and were one disk's. aio's scrape target is the
+            // gateway's :9000/metrics, and meta is already given 0 here.
+            "--metrics-port",
+            "0",
+            "--log-level",
+            &args.log_level,
+            "--scrub-interval-secs",
+            &args.scrub_interval_secs.to_string(),
+            "--meta-engine",
+            &args.meta_engine,
+        ]
+        .map(str::to_string)
+        .to_vec();
+        #[cfg(feature = "rdma")]
+        if let Some(protocol) = &args.rdma {
+            osd_argv.extend(["--rdma", protocol, "--rdma-host", "127.0.0.1"].map(str::to_string));
+        }
+        let osd_args = <objectio_osd::Args as clap::Parser>::parse_from(&osd_argv);
+        let sd = sub_shutdown(&shutdown_tx);
+        osd_handles.push(tokio::spawn(async move {
+            objectio_osd::run(osd_args, sd).await
+        }));
+        let port = wait_osd_addr(&addr_file, i, 20).await?;
+        wait_listening(port, &format!("osd-{i}"), 20).await?;
+        osd_ports.push(port);
+    }
+
+    // ------------------------------------------------------------
+    // Gateway.
+    // ------------------------------------------------------------
+    // Gateway binds on the caller's requested interface. external-endpoint
+    // (used for OIDC callback + Iceberg vended creds + Delta Sharing
+    // presign) stays as `localhost` when loopback-only; otherwise falls
+    // back to the bind address for LAN-reachable mode.
+    // A wildcard bind has no usable host in it: `http://0.0.0.0:9000` is not
+    // an address any client — or any identity provider — can resolve. Fall
+    // back to localhost and say so, rather than handing out a URL that fails
+    // silently at the point an operator is configuring SSO.
+    let wildcard_bind = matches!(args.listen_addr.as_str(), "0.0.0.0" | "::" | "[::]");
+    let external_endpoint = if !args.external_endpoint.is_empty() {
+        args.external_endpoint.trim_end_matches('/').to_string()
+    } else {
+        let host = if args.listen_addr == "127.0.0.1"
+            || args.listen_addr == "localhost"
+            || wildcard_bind
+        {
+            "localhost".to_string()
+        } else {
+            args.listen_addr.clone()
+        };
+        if wildcard_bind {
+            eprintln!(
+                "  WARNING: --external-endpoint is not set and the server binds {}.",
+                args.listen_addr
+            );
+            eprintln!("           Falling back to http://localhost:{gateway_port} for OIDC");
+            eprintln!("           callbacks, vended credentials and presigned URLs. Set");
+            eprintln!("           --external-endpoint to this server's public URL.");
+        }
+        format!("http://{host}:{gateway_port}")
+    };
+    let mut gw_argv: Vec<String> = vec![
+        "objectio-gateway".into(),
+        "--listen".into(),
+        format!("{}:{}", args.listen_addr, gateway_port),
+        "--meta-endpoint".into(),
+        format!("http://127.0.0.1:{meta_grpc}"),
+        "--external-endpoint".into(),
+        external_endpoint.clone(),
+        "--log-level".into(),
+        args.log_level.clone(),
+    ];
+    if !args.auth {
+        gw_argv.push("--no-auth".into());
+    }
+    #[cfg(feature = "rdma")]
+    if let Some(protocol) = &args.rdma {
+        gw_argv.extend(["--rdma", protocol, "--rdma-host", "127.0.0.1"].map(str::to_string));
+    }
+    gw_argv.push("--inline-max-size".into());
+    gw_argv.push(args.inline_max_size.to_string());
+    gw_argv.push("--small-shard-max".into());
+    gw_argv.push(args.small_shard_max.to_string());
+    if !args.prometheus_url.is_empty() {
+        gw_argv.push("--prometheus-url".into());
+        gw_argv.push(args.prometheus_url.trim_end_matches('/').to_string());
+    }
+    // Forward optional split-mode listener flags. Empty / port 0 →
+    // single-port behavior (the default).
+    let split_addrs: Vec<u16> = [
+        args.admin_port,
+        args.ops_console_port,
+        args.tenant_console_port,
+    ]
+    .into_iter()
+    .filter(|p| *p != 0)
+    .collect();
+    for &p in &split_addrs {
+        if !port_free(&args.listen_addr, p) {
+            return Err(anyhow!(
+                "{}:{} requested for split listener is already in use",
+                args.listen_addr,
+                p
+            ));
+        }
+    }
+    if args.admin_port != 0 {
+        gw_argv.push("--admin-listen".into());
+        gw_argv.push(format!("{}:{}", args.listen_addr, args.admin_port));
+    }
+    if args.ops_console_port != 0 {
+        gw_argv.push("--ops-console-listen".into());
+        gw_argv.push(format!("{}:{}", args.listen_addr, args.ops_console_port));
+    }
+    if args.tenant_console_port != 0 {
+        gw_argv.push("--tenant-console-listen".into());
+        gw_argv.push(format!("{}:{}", args.listen_addr, args.tenant_console_port));
+    }
+    if !args.endpoint_name.is_empty() {
+        gw_argv.extend(["--endpoint-name".to_string(), args.endpoint_name.clone()]);
+    }
+    for spec in &args.data_port {
+        let (port, name) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--data-port {spec}: expected PORT=NAME"))?;
+        gw_argv.extend([
+            "--data-listen".to_string(),
+            format!("{}:{port}={name}", args.listen_addr),
+        ]);
+    }
+    if let Some(secs) = args.lifecycle_interval_secs {
+        gw_argv.extend(["--lifecycle-interval-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.lifecycle_day_secs {
+        gw_argv.extend(["--lifecycle-day-secs".to_string(), secs.to_string()]);
+    }
+    if args.test_hooks {
+        gw_argv.push("--test-hooks".to_string());
+    }
+    if args.test_clock_offset_ms != 0 {
+        gw_argv.push(format!(
+            "--test-clock-offset-ms={}",
+            args.test_clock_offset_ms
+        ));
+    }
+    if let Some(secs) = args.pack_interval_secs {
+        gw_argv.extend(["--pack-interval-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.pack_min_age_secs {
+        gw_argv.extend(["--pack-min-age-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.replication_scan_secs {
+        gw_argv.extend(["--replication-scan-secs".to_string(), secs.to_string()]);
+    }
+    if args.no_replication_fast_path {
+        gw_argv.extend(["--replication-fast-path".to_string(), "false".to_string()]);
+    }
+    if let Some(secs) = args.pack_grace_secs {
+        gw_argv.extend(["--pack-grace-secs".to_string(), secs.to_string()]);
+    }
+    let spool = args.audit_spool.clone().or_else(|| {
+        args.audit_system_bucket
+            .as_ref()
+            .map(|_| data_root.join("audit-spool"))
+    });
+    if let Some(dir) = spool {
+        gw_argv.extend(["--audit-spool".to_string(), dir.display().to_string()]);
+    }
+    if let Some(bucket) = &args.audit_system_bucket {
+        gw_argv.extend(["--audit-system-bucket".to_string(), bucket.clone()]);
+    }
+    // Bucket logging's records wait in the data directory: always on.
+    gw_argv.extend([
+        "--bucket-log-spool".to_string(),
+        data_root.join("bucket-log-spool").display().to_string(),
+    ]);
+    if let Some(secs) = args.bucket_log_roll_secs {
+        gw_argv.extend(["--bucket-log-roll-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(path) = &args.audit_log {
+        gw_argv.extend(["--audit-log".to_string(), path.clone()]);
+    }
+    if !args.trusted_proxies.is_empty() {
+        gw_argv.extend([
+            "--trusted-proxies".to_string(),
+            args.trusted_proxies.clone(),
+        ]);
+    }
+    let gw_args = <objectio_gateway::Args as clap::Parser>::parse_from(&gw_argv);
+    let gw_handle: JoinHandle<Result<()>> = {
+        let sd = sub_shutdown(&shutdown_tx);
+        tokio::spawn(async move { objectio_gateway::run(gw_args, sd).await })
+    };
+    wait_listening(gateway_port, "gateway", 20).await?;
+    // Listening is not the same as able to write: the OSDs may not be
+    // registered or reachable yet, and a PUT then fails with "write quorum
+    // not met". Only announce ready once the gateway says it is.
+    wait_gateway_ready(gateway_port, 60).await;
+    if args.block_port != 0 {
+        let block_data = data_root.join("block");
+        let block_args = <objectio_block_gateway::Args as clap::Parser>::parse_from([
+            "objectio-block-gateway".to_string(),
+            "--listen".into(),
+            format!("{}:{}", args.listen_addr, args.block_port),
+            "--nbd-listen".into(),
+            format!("{}:{}", args.listen_addr, args.nbd_port),
+            "--meta-endpoint".into(),
+            format!("http://127.0.0.1:{meta_grpc}"),
+            "--data-dir".into(),
+            block_data.display().to_string(),
+            "--log-level".into(),
+            args.log_level.clone(),
+            // Served on the gateway's /metrics, as the rest of aio is.
+            "--metrics-listen".into(),
+            String::new(),
+        ]);
+        tokio::spawn(async move {
+            if let Err(e) = objectio_block_gateway::run(block_args).await {
+                tracing::error!("block gateway stopped: {e:#}");
+            }
+        });
+        wait_listening(args.block_port, "block gateway", 20).await?;
+        // Listening is not the same as ours: when a port was taken between
+        // being picked and being bound, the block gateway exits and the
+        // port answers for whatever holds it (another process's OSD, say),
+        // and a client's first call fails as Unimplemented.
+        serves_block(args.block_port, args.nbd_port, 20).await?;
+    }
+    // An OSD that could not start (typically: its port was taken between
+    // being picked and being bound) leaves meta pointing at an address
+    // something else answers. Running on like that fails writes in ways
+    // that are hard to trace back, so stop here and say why.
+    if let Some(i) = osd_handles.iter().position(JoinHandle::is_finished) {
+        let result = osd_handles.remove(i).await;
+        return Err(anyhow!(
+            "OSD {i} exited during startup: {}",
+            match result {
+                Ok(Ok(())) => "without an error".to_string(),
+                Ok(Err(e)) => format!("{e:#}"),
+                Err(e) => e.to_string(),
+            }
+        ));
+    }
+
+    // Banner — show the address the caller can actually reach us at.
+    let display_host = if args.listen_addr == "0.0.0.0" {
+        // Bound to all interfaces: show localhost for the copy-paste
+        // curl/aws hint, but also tell the user LAN access is on.
+        "localhost".to_string()
+    } else {
+        args.listen_addr.clone()
+    };
+    eprintln!();
+    eprintln!("━━━ ObjectIO ready ━━━");
+    eprintln!("  S3 / Iceberg / Delta Sharing : http://{display_host}:{gateway_port}");
+    if args.ops_console_port == 0 && args.tenant_console_port == 0 {
+        eprintln!(
+            "  Console                       : http://{display_host}:{gateway_port}/_console/"
+        );
+    }
+    if args.admin_port != 0 {
+        eprintln!(
+            "  Admin API + /metrics          : http://{display_host}:{port}/_admin/  (split listener)",
+            port = args.admin_port
+        );
+    }
+    if args.ops_console_port != 0 {
+        eprintln!(
+            "  Ops console                   : http://{display_host}:{port}/_console/  (system admins)",
+            port = args.ops_console_port
+        );
+    }
+    if args.tenant_console_port != 0 {
+        eprintln!(
+            "  Tenant console                : http://{display_host}:{port}/_console/  (end users)",
+            port = args.tenant_console_port
+        );
+    }
+    if args.listen_addr == "0.0.0.0" {
+        eprintln!(
+            "  LAN bind                      : 0.0.0.0 — reachable from \
+             other hosts on the network"
+        );
+    }
+    eprintln!("  Data directory                : {}", data_root.display());
+    eprintln!(
+        "  Internals (loopback only)     : meta=:{meta_grpc} osd={osd_ports:?} \
+         (monolith — same process)"
+    );
+    if !ak.is_empty() {
+        eprintln!("  Admin access key              : {ak}");
+        eprintln!("  Admin secret key              : {sk}");
+    }
+    eprintln!(
+        "  SSE master key                : persisted at {} (set OBJECTIO_MASTER_KEY \
+         to override)",
+        data_root.join("master_key").display()
+    );
+    eprintln!();
+    if !ak.is_empty() {
+        eprintln!("  AWS_ACCESS_KEY_ID={ak} AWS_SECRET_ACCESS_KEY={sk} \\");
+        eprintln!("    aws --endpoint-url http://{display_host}:{gateway_port} s3 mb s3://test");
+    } else {
+        eprintln!(
+            "  aws --endpoint-url http://{display_host}:{gateway_port} --no-sign-request \
+             s3 mb s3://test"
+        );
+    }
+    eprintln!();
+
+    // Wait for Ctrl-C → broadcast shutdown → join every task.
+    wait_ctrl_c(shutdown_tx.clone()).await;
+
+    // Second Ctrl-C = hard exit. Some background tasks (OSD chunk
+    // flushes, meta raft machinery) occasionally refuse to yield in
+    // under a couple of seconds; the user shouldn't have to wait.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n[aio] second Ctrl-C — forcing exit");
+            std::process::exit(130);
+        }
+    });
+
+    // Collect results under a hard deadline. If a service refuses to
+    // shut down within `graceful` seconds, we exit the process anyway
+    // — leaking the task beats hanging the shell.
+    let graceful = Duration::from_secs(5);
+    let join_all = async {
+        for (label, handle) in [("meta", meta_handle), ("gateway", gw_handle)]
+            .into_iter()
+            .chain(
+                osd_handles
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, h)| (Box::leak(format!("osd-{i}").into_boxed_str()) as &str, h)),
+            )
+        {
+            match handle.await {
+                Ok(Ok(())) => info!("{label} exited cleanly"),
+                Ok(Err(e)) => warn!("{label} error: {e}"),
+                Err(e) => warn!("{label} join error: {e}"),
+            }
+        }
+    };
+    match tokio::time::timeout(graceful, join_all).await {
+        Ok(()) => info!("all services shut down cleanly"),
+        Err(_) => eprintln!(
+            "[aio] graceful shutdown timed out after {}s — exiting",
+            graceful.as_secs()
+        ),
+    }
+    // Explicitly exit. Services spawn detached background tasks
+    // (metrics timers, openraft background workers, tonic keepalives)
+    // that don't get joined; without this, the runtime keeps the
+    // process alive even after every run() returned.
+    std::process::exit(0);
+}

@@ -1,0 +1,144 @@
+//! Redb table definitions for persistent metadata storage.
+
+use redb::TableDefinition;
+
+// S3 metadata
+pub const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
+// Stored as bytes (UTF-8 JSON) — must match the redb table type the
+// Raft CAS apply path opens. raft_storage::apply_multi_cas opens every
+// CAS table as `Table<&str, &[u8]>`; defining it as `<&str, &str>` here
+// would surface as a runtime type-mismatch on any transactional write.
+pub const BUCKET_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("bucket_policies");
+pub const MULTIPART_UPLOADS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("multipart_uploads");
+
+// Cluster
+pub const OSD_NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("osd_nodes");
+
+// IAM
+pub const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+pub const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
+pub const GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("groups");
+
+// Iceberg catalog
+// Key: namespace path (e.g. "db1" or "db1\x00schema1"), Value: prost-encoded properties
+pub const ICEBERG_NAMESPACES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("iceberg_namespaces");
+// Key: "ns1\x00ns2\x00table_name", Value: prost-encoded IcebergTableEntry
+pub const ICEBERG_TABLES: TableDefinition<&str, &[u8]> = TableDefinition::new("iceberg_tables");
+// Key: filter_id, Value: protobuf StoredDataFilter
+pub const DATA_FILTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("data_filters");
+
+// Delta Sharing
+// Key: share name, Value: prost-encoded DeltaShareEntry
+pub const DELTA_SHARES: TableDefinition<&str, &[u8]> = TableDefinition::new("delta_shares");
+// Key: "{share}\x00{schema}\x00{table_name}", Value: prost-encoded DeltaShareTableEntry
+pub const DELTA_TABLES: TableDefinition<&str, &[u8]> = TableDefinition::new("delta_tables");
+// Key: recipient name, Value: prost-encoded DeltaRecipientEntry
+pub const DELTA_RECIPIENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("delta_recipients");
+
+// Cluster configuration
+// Key: hierarchical config path (e.g. "identity/openid/keycloak"), Value: prost-encoded ConfigEntry
+pub const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
+
+// ---- Raft consensus tables ----
+// One row per log index → JSON-encoded openraft::Entry<MetaTypeConfig>.
+// Indexes are contiguous; the low watermark moves forward via purge.
+pub const RAFT_LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs");
+// Single-row table; the row holds the serialized current vote (JSON).
+pub const RAFT_VOTE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_vote");
+// Single-row table: last applied log id + stored membership + last purged
+// log id, JSON-encoded. Written in the same transaction as apply() so
+// recovery after crash never re-applies committed commands.
+pub const RAFT_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_state");
+
+// Server pools
+// Key: pool name, Value: prost-encoded PoolConfig
+pub const POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("pools");
+
+// Tenants
+// Key: tenant name, Value: prost-encoded TenantConfig
+pub const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
+
+// Named IAM policies
+// Key: policy name, Value: prost-encoded PolicyObject
+pub const IAM_POLICIES: TableDefinition<&str, &[u8]> = TableDefinition::new("iam_policies");
+// Key: "user:{user_id}" or "group:{group_id}", Value: bytes of comma-separated
+// policy-name string. Stored as `&[u8]` so the Raft CAS apply path
+// (raft_storage.rs) — which opens every CAS table as `Table<&str, &[u8]>` —
+// can write to it without a redb table-type mismatch.
+pub const POLICY_ATTACHMENTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("policy_attachments");
+
+// Iceberg warehouses
+// Key: warehouse name, Value: prost-encoded IcebergWarehouse
+pub const ICEBERG_WAREHOUSES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("iceberg_warehouses");
+
+// Unity Catalog
+// Three-level namespacing (catalog.schema.table); each level gets its own
+// table, keyed with `\x00` separators. Values are prost-encoded UnityCatalog
+// / UnitySchema / UnityTable. Identical pattern to ICEBERG_NAMESPACES /
+// ICEBERG_TABLES so range scans work the same way.
+// Key: catalog name. Value: prost-encoded UnityCatalog.
+pub const UNITY_CATALOGS: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_catalogs");
+// Key: "{catalog}\x00{schema}". Value: prost-encoded UnitySchema.
+pub const UNITY_SCHEMAS: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_schemas");
+// Key: "{catalog}\x00{schema}\x00{table}". Value: prost-encoded UnityTable.
+pub const UNITY_TABLES: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_tables");
+// Key: "{catalog}\x00{schema}\x00{function}". Value: prost-encoded UnityFunction.
+pub const UNITY_FUNCTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_functions");
+// Key: "{catalog}\x00{schema}\x00{volume}". Value: prost-encoded UnityVolume.
+pub const UNITY_VOLUMES: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_volumes");
+// Key: "{catalog}\x00{schema}\x00{model}". Value: prost-encoded UnityModel.
+pub const UNITY_MODELS: TableDefinition<&str, &[u8]> = TableDefinition::new("unity_models");
+// Key: "{catalog}\x00{schema}\x00{model}\x00{version}". Version is a
+// zero-padded `u32` (so range scans land in numeric order). Value:
+// prost-encoded UnityModelVersion.
+pub const UNITY_MODEL_VERSIONS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("unity_model_versions");
+
+// Object lock configurations
+// Key: bucket name, Value: prost-encoded ObjectLockConfiguration
+pub const OBJECT_LOCK_CONFIGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("object_lock_configs");
+
+// Shared stripes: who references a stripe that more than one object does.
+// Key: the stripe's object id, hex. Value: prost-encoded StripeRefs.
+pub const STRIPE_REFS: TableDefinition<&str, &[u8]> = TableDefinition::new("stripe_refs");
+
+// Lifecycle configurations
+// Key: bucket name, Value: prost-encoded LifecycleConfiguration
+pub const LIFECYCLE_CONFIGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("lifecycle_configs");
+
+// Bucket default SSE configurations
+// Key: bucket name, Value: prost-encoded BucketSseConfiguration
+pub const BUCKET_ENCRYPTION_CONFIGS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("bucket_encryption_configs");
+
+// KMS keys (service-master-key-wrapped key material)
+// Key: key_id, Value: prost-encoded KmsKey
+pub const KMS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("kms_keys");
+
+// Object listing index. Strongly-consistent "does (bucket,key[,version])
+// exist in this cluster" source of truth, maintained by the gateway's
+// S3 PUT/DELETE path via Raft MultiCas against CasTable::ObjectListings.
+// Key format: "{bucket}\0{key}\0{version_id}" — null-byte separators so
+// redb's range scan over a bucket prefix ("foo\0") reliably stops at the
+// next bucket. Value: prost-encoded ObjectListingEntry.
+pub const OBJECT_LISTINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("object_listings");
+
+/// Objects acknowledged short of shards (B29): "{bucket}/{key}" ->
+/// prost-encoded `DegradedObject`.
+pub const DEGRADED_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("degraded_objects");
+/// Objects found unrecoverable (B29): "{bucket}/{key}" -> prost-encoded
+/// `LostObject`.
+pub const LOST_OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lost_objects");
+
+// Placement groups. One row per PG, keyed as "{pool}\0{pg_id:010}"
+// (10-digit zero-padded so a range scan over a pool returns PGs in
+// pg_id order). Value: prost-encoded PlacementGroup. Mutated by the
+// balancer via CasTable::PlacementGroups so every follower observes
+// membership changes at the same Raft log position.
+pub const PLACEMENT_GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("placement_groups");

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "objectio.osd.fullname" . }}-config
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+data:
+  osd.toml.tpl: |
+    [osd]
+    node_name = "__NODE_NAME__"
+    listen = "0.0.0.0:{{ .Values.osd.service.port }}"
+    advertise_addr = "http://__ADVERTISE_ADDR__"
+    meta_endpoint = "http://{{ include "objectio.meta.fullname" . }}:{{ .Values.meta.service.port }}"
+    weight = 1.0
+
+    [osd.failure_domain]
+    region = {{ .Values.osd.failureDomain.region | quote }}
+    {{- if .Values.osd.failureDomain.zone }}
+    zone = {{ .Values.osd.failureDomain.zone | quote }}
+    {{- end }}
+    datacenter = {{ .Values.osd.failureDomain.datacenter | quote }}
+    rack = {{ .Values.osd.failureDomain.rack | quote }}
+    # The k8s worker node the pod is scheduled on — not the pod name.
+    # Host failure domain tolerates a machine going down, so "host" must
+    # map to the real machine. Multiple OSD pods scheduled on the same
+    # node share a host and CRUSH spreads shards across the actual
+    # hardware. The statefulset init container computes this from the
+    # downward API (spec.nodeName) and substitutes __HOST_NAME__.
+    host = "__HOST_NAME__"
+
+    [storage]
+    disks = ["/data/disk0/{{ .Values.osd.storage.diskFile }}"]
+    {{- with .Values.osd.storage.blockSize }}
+    block_size = {{ . | int }}
+    {{- end }}
+    data_dir = "/var/lib/objectio/osd"
+
+    [logging]
+    level = {{ .Values.osd.logLevel | quote }}

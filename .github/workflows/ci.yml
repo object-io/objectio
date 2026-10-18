@@ -1,0 +1,454 @@
+# Rust CI — formatting, lints, unit tests, and the end-to-end smoke test.
+#
+# This did not exist. The only workflows were a manual release and three
+# that fire on `sdk/**`, so `cargo test` never ran anywhere but a developer's
+# laptop: a pull request could break the build, fail every test, and nothing
+# would say so. The workspace already had 448 unit tests and a `make ci`
+# target; nothing invoked them.
+#
+# Jobs are split so a failure names itself — "fmt" and "clippy" are cheap and
+# fail fast, "test" is the bulk, and "e2e" is the slow one that boots a real
+# cluster. Splitting also means a formatting nit does not hide a test failure
+# behind it.
+#
+# Not using `make ci` directly: it runs fmt → lint → test in one sequence, so
+# the first failure masks the rest. Same commands, run independently.
+
+name: CI
+
+on:
+  # A pull request runs the fast checks only (format, lints, unit tests,
+  # console, chart: ~9 minutes); the heavy jobs (end-to-end, docker image,
+  # rolling upgrade, rdma, aio release build) are skipped there, which the
+  # ruleset counts as passed. They run once, in the merge queue, on the
+  # tree that lands. Running everything on both doubled the time to merge
+  # (~16 minutes, twice) for the same answer.
+  pull_request:
+  # The merge queue tests each batch of queued PRs on top of main: the one
+  # full run every change gets before it lands.
+  merge_group:
+  # Nightly on main instead: GitHub Actions caches saved on main are the
+  # ones every PR can restore, so this keeps the Rust and Docker caches
+  # warm for new PRs, and catches anything that breaks without a code
+  # change (toolchain, base images, dependencies).
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref. Saves minutes on
+  # a branch being pushed to repeatedly.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the cache useful without blowing the size limit: debug info is the
+  # bulk of target/ and the tests do not need it.
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # The workspace sets clippy::all + pedantic + nursery in Cargo.toml and
+      # the Makefile passes -D warnings; match it rather than letting CI be
+      # laxer than the local command.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    env:
+      # mold: linking the test binaries is a large part of this job.
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      # Excluding the e2e package: it boots a cluster and belongs in its own
+      # job so its runtime and its failures stay legible.
+      - run: cargo test --workspace --exclude objectio-e2e
+      # The release erasure-codes with ISA-L and does disk I/O through
+      # io_uring; without these the tests above run the pure-Rust code and
+      # pread only. An ISA-L decode bug that rebuilt shards from zeros
+      # passed here for that reason (the B2 soak found it).
+      - name: ISA-L and io_uring deps
+        run: sudo apt-get install -y nasm autoconf automake libtool libclang-dev
+      - run: cargo test -p objectio-erasure --features isal
+      - run: cargo test -p objectio-storage --features io-uring
+      # The RocksDB metadata engine (B27): its conformance suite and the
+      # refusal to open the other engine's directory.
+      - run: cargo test -p objectio-storage --features rocksdb --lib metadata
+
+  # The end-to-end suite boots real clusters and took ~40 minutes run as
+  # one job, test after test: the critical path of every PR. It is built
+  # once, then run as shards in parallel, each on its own runner (the
+  # tests stay one at a time within a shard: each boots a cluster).
+  e2e-build:
+    name: end-to-end (build)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      # aio embeds console/dist. build.rs creates it empty when absent so a
+      # clone still builds, but the e2e job should exercise the real thing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: build the console aio embeds
+        working-directory: console
+        run: npm ci && npm run build
+      - name: build the binaries the tests drive, and archive the tests
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+          cargo nextest archive --package objectio-e2e --archive-file e2e.tar.zst
+          mkdir -p bins && cp target/debug/objectio-aio target/debug/obioctl target/debug/objectio-meta target/debug/objectio-osd target/debug/objectio-gateway target/debug/objectio-block-gateway bins/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e
+          path: |
+            e2e.tar.zst
+            bins/
+          retention-days: 1
+
+  e2e-shard:
+    name: end-to-end (${{ matrix.shard }}/8)
+    needs: e2e-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Eight: with six, the shard holding full_disk (~4 minutes alone)
+        # ran ~10 minutes while others took 3.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: e2e
+      - name: run this shard
+        run: |
+          # The tests find the services' binaries next to their own.
+          mkdir -p target/debug && cp bins/* target/debug/ && chmod +x target/debug/*
+          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --partition hash:${{ matrix.shard }}/8 --test-threads 1 --no-fail-fast --success-output never --failure-output final
+
+  # The check the main ruleset requires: every shard passed (or, on a pull
+  # request, the suite was left to the merge queue).
+  e2e:
+    name: end-to-end
+    needs: e2e-shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          r="${{ needs.e2e-shard.result }}"
+          test "$r" = success || { test "$r" = skipped && test "${{ github.event_name }}" = pull_request; }
+
+  upgrade:
+    name: rolling upgrade
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # A cluster on the previous release, rolled node by node to this one
+    # under traffic (objectio-docs core/upgrade-path.md). The e2e job skips
+    # this test: it needs the previous release's binaries, built here.
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the previous release is the latest tag
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc and mold
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      - name: find the previous release
+        id: previous
+        run: |
+          if tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null); then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no release before this commit, nothing to upgrade from"
+          fi
+      - name: build this release
+        if: steps.previous.outputs.tag
+        run: cargo build --bin objectio-meta --bin objectio-osd --bin objectio-gateway
+      - name: build the previous release
+        if: steps.previous.outputs.tag
+        run: |
+          bins=$(scripts/upgrade-test/previous-release.sh "${{ steps.previous.outputs.tag }}")
+          echo "OBJECTIO_PREVIOUS_RELEASE_BIN=$bins" >> "$GITHUB_ENV"
+      - name: run
+        if: steps.previous.outputs.tag
+        run: cargo test --package objectio-e2e --test rolling_upgrade -- --nocapture
+
+  image:
+    name: docker image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The image build broke the moment tests/e2e became a workspace member —
+    # cargo would not read the workspace without its manifest, so `cargo fetch`
+    # failed before compiling anything — and stayed broken for five commits
+    # because nothing here ever built it. The test jobs above compile the
+    # workspace from a checkout; only this compiles it the way a release does,
+    # from the paths the Dockerfile chooses to COPY.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # The builder stage is the one that can break: it compiles every
+          # binary. The runtime stages only copy the results out.
+          target: builder
+          push: false
+          # Layer cache across runs, so an unchanged dependency graph does not
+          # pay for a cold Rust build every time.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  rdma:
+    name: rdma (transfer engine, tcp)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The Transfer Engine code paths (objectio-transport-te, and the OSD's,
+    # gateway's and aio's `rdma` features) only build against a Mooncake build,
+    # so the jobs above never compile them. This builds Mooncake at the pinned
+    # commit in an image — cached across runs, so only a Mooncake bump pays for
+    # it — and runs every test that needs it with Transfer Engine in TCP mode,
+    # including the e2e suite against aio --rdma tcp. No RDMA hardware needed.
+    timeout-minutes: 90
+    steps:
+      # Mooncake's dependencies plus the Rust builds do not fit next to what
+      # the runner image ships with.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build the Mooncake test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: crates/transport-te/test.Dockerfile
+          load: true
+          tags: objectio-te-test
+          cache-from: type=gha,scope=te-test
+          cache-to: type=gha,scope=te-test,mode=max
+      - name: test
+        run: docker run --rm objectio-te-test
+
+  chart:
+    name: helm chart
+    runs-on: ubuntu-latest
+    # Nothing validated the chart. A broken template, a values key that no
+    # longer exists, or an image the registry does not carry were all
+    # discovered by `publish-chart` at the end of a release — after the
+    # version bump had already been committed and tagged.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: lint
+        run: helm lint deploy/helm/objectio --strict
+
+      # Render with the defaults a published install gets, and with the kind
+      # overlay, because the two take different branches of the image helper.
+      - name: render
+        run: |
+          set -euo pipefail
+          helm template objectio deploy/helm/objectio > /tmp/default.yaml
+          helm template objectio deploy/helm/objectio \
+            --values deploy/kind/values.yaml > /tmp/kind.yaml
+          for f in /tmp/default.yaml /tmp/kind.yaml; do
+            echo "$f: $(grep -c '^kind:' "$f") resources"
+          done
+
+      # The check that matters: a default install must only ask for images
+      # this project actually publishes. The release pushes exactly one —
+      # the Dockerfile's `all` target — and the chart shipped asking for
+      # per-service images (objectio-gateway, objectio-meta, objectio-osd)
+      # that have never existed in any registry, so `helm install` from the
+      # published chart sat in ImagePullBackOff.
+      - name: every own-registry image is one we publish
+        run: |
+          set -euo pipefail
+          OWNER='${{ github.repository_owner }}'
+          bad=0
+          while read -r img; do
+            case "$img" in
+              ghcr.io/$OWNER/objectio:*) ;;
+              ghcr.io/$OWNER/*)
+                echo "::error::default install references $img, which the release does not publish"
+                bad=1 ;;
+            esac
+          done < <(grep -oE 'image: \S+' /tmp/default.yaml | awk '{print $2}' | sort -u)
+          [ "$bad" -eq 0 ]
+
+      - name: package
+        run: helm package deploy/helm/objectio --destination /tmp/chart && ls -lh /tmp/chart
+
+  aio-release-build:
+    name: aio (release features)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The release compiles objectio-aio with feature flags nothing else turns
+    # on — ISA-L erasure coding, io_uring, the PCRE2 and Hyperscan grep
+    # engines. A cfg-gated path that no longer compiles under those is
+    # invisible until a release is half-done: the version bump and tag land in
+    # `prepare`, and the binary build fails after.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libpcre2-dev \
+            nasm autoconf automake libtool libclang-dev
+      # aio embeds console/dist; build.rs creates it empty when absent, which
+      # is enough to compile. Debug profile: this links, which is the point,
+      # and the linkage is the same as release without paying for optimisation.
+      - name: build with the release feature set
+        run: |
+          cargo build --bin objectio-aio \
+            --features isal,io-uring,grep-pcre2
+
+      # The release binary is downloaded and run on machines that are not this
+      # runner. v0.0.1's linux-amd64 build succeeded here and then failed on
+      # startup everywhere else with
+      #   error while loading shared libraries: libhs.so.5
+      # because --features grep-hyperscan links Hyperscan dynamically and
+      # nothing ships it. A build that passes is not the same as an artifact
+      # that runs, and only this distinguishes them.
+      - name: the binary links nothing exotic
+        run: |
+          set -euo pipefail
+          ALLOWED='libc|libm|libgcc_s|libpthread|libdl|librt|ld-linux|linux-vdso|libpcre2-8|libssl|libcrypto'
+          echo "--- ldd ---"; ldd target/debug/objectio-aio
+          bad=$(ldd target/debug/objectio-aio \
+                | awk '{print $1}' \
+                | grep -vE "^($ALLOWED)" \
+                | grep -E '^lib|^ld-' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::the release binary needs libraries a user will not have: $bad"
+            exit 1
+          fi
+          echo "only portable libraries — ok"
+
+  perf:
+    name: performance
+    # The tree that lands against main, on the same runner: release builds
+    # of both, run in turn (objectio-docs developer-guide/performance).
+    # In the merge queue, and on a pull request labelled `perf`.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      FEATURES: objectio-aio/isal,objectio-aio/io-uring
+      BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base is built from this clone
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: perf
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev mold
+      # Head, then the base in the same checkout: the checkout leaves
+      # unchanged files' times alone, so only the crates the change touches
+      # are built twice.
+      - name: build the head and the base
+        run: |
+          set -euo pipefail
+          build() {
+            cargo build --release --features "$FEATURES" --bin objectio-aio --bin objectio-s3-bench
+            mkdir -p "$RUNNER_TEMP/$1"
+            cp target/release/objectio-aio target/release/objectio-s3-bench "$RUNNER_TEMP/$1/"
+          }
+          head=$(git rev-parse HEAD)
+          build head
+          git checkout -q "$BASE"
+          build base
+          git checkout -q "$head"
+      - name: compare
+        run: |
+          # In memory: a runner's disk varies more from run to run than
+          # the regressions this is for (scripts/bench/regression.py).
+          mkdir -p "$RUNNER_TEMP/data"
+          sudo mount -t tmpfs -o size=8g tmpfs "$RUNNER_TEMP/data"
+          scripts/bench/regression.py --base "$RUNNER_TEMP/base" --head "$RUNNER_TEMP/head" \
+            --workdir "$RUNNER_TEMP/data" --logs "$RUNNER_TEMP" --json "$RUNNER_TEMP/perf.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance
+          path: |
+            ${{ runner.temp }}/perf.json
+            ${{ runner.temp }}/aio-*.log
+          retention-days: 14
+
+  console:
+    name: console
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - working-directory: console
+        run: npm ci
+      - working-directory: console
+        run: npm run lint
+      # tsc runs as part of the build, so this covers type errors too.
+      - working-directory: console
+        run: npm run build

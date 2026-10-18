@@ -1,0 +1,3472 @@
+syntax = "proto3";
+
+package objectio.metadata;
+
+import "block.proto";
+
+// Metadata service for bucket and object operations
+service MetadataService {
+    // Bucket operations
+    rpc CreateBucket(CreateBucketRequest) returns (CreateBucketResponse);
+    // Reassign a bucket's owner. Also the backfill path for buckets created
+    // before the gateway recorded a real owner.
+    rpc SetBucketOwner(SetBucketOwnerRequest) returns (SetBucketOwnerResponse);
+    // A bucket's byte and object quotas (0 = unlimited).
+    rpc SetBucketQuota(SetBucketQuotaRequest) returns (SetBucketQuotaResponse);
+    rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse);
+    rpc GetBucket(GetBucketRequest) returns (GetBucketResponse);
+    rpc ListBuckets(ListBucketsRequest) returns (ListBucketsResponse);
+
+    // Object metadata operations
+    rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
+    // A reader found an object short of shards (B29, heal on read): it is
+    // recorded as degraded, and repaired from the record.
+    rpc ReportDegraded(ReportDegradedRequest) returns (ReportDegradedResponse);
+    rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+    rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+    rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+    // Placement
+    rpc GetPlacement(GetPlacementRequest) returns (GetPlacementResponse);
+    // What a PUT needs before its data moves, in one call (B21): the
+    // bucket's encryption, versioning and object-lock answers and the key's
+    // placement, each exactly as its own call would give it.
+    rpc GetWriteContext(GetWriteContextRequest) returns (GetWriteContextResponse);
+
+    // Multipart upload
+    rpc CreateMultipartUpload(CreateMultipartUploadRequest) returns (CreateMultipartUploadResponse);
+    rpc GetMultipartUpload(GetMultipartUploadRequest) returns (GetMultipartUploadResponse);
+    rpc RegisterPart(RegisterPartRequest) returns (RegisterPartResponse);
+    rpc ListParts(ListPartsRequest) returns (ListPartsResponse);
+    rpc CompleteMultipartUpload(CompleteMultipartUploadRequest) returns (CompleteMultipartUploadResponse);
+    rpc AbortMultipartUpload(AbortMultipartUploadRequest) returns (AbortMultipartUploadResponse);
+    // After a two-phase CompleteMultipartUpload: the object was stored (the
+    // upload goes) or certainly wasn't (the upload is as it was before).
+    rpc SettleMultipartUpload(SettleMultipartUploadRequest) returns (SettleMultipartUploadResponse);
+    rpc ListMultipartUploads(ListMultipartUploadsRequest) returns (ListMultipartUploadsResponse);
+
+    // Bucket policy
+    rpc SetBucketPolicy(SetBucketPolicyRequest) returns (SetBucketPolicyResponse);
+    rpc GetBucketPolicy(GetBucketPolicyRequest) returns (GetBucketPolicyResponse);
+    rpc DeleteBucketPolicy(DeleteBucketPolicyRequest) returns (DeleteBucketPolicyResponse);
+
+    // OSD registration (for placement)
+    rpc RegisterOsd(RegisterOsdRequest) returns (RegisterOsdResponse);
+
+    // Get all active nodes for listing operations (scatter-gather)
+    rpc GetListingNodes(GetListingNodesRequest) returns (GetListingNodesResponse);
+
+    // Set operator-declared state for an OSD (In / Out / Draining).
+    // Persisted via Raft and honoured by CRUSH on the next topology
+    // rebuild — Out and Draining are excluded from new placements.
+    rpc SetOsdAdminState(SetOsdAdminStateRequest) returns (SetOsdAdminStateResponse);
+
+    // Snapshot of per-OSD drain progress kept in meta's in-memory map.
+    // Returns one entry per currently-Draining OSD; empty response
+    // means no drains in flight. Used by /_admin/drain-status.
+    rpc GetDrainStatus(GetDrainStatusRequest) returns (GetDrainStatusResponse);
+
+    // Cluster-wide rebalance progress. Populated by the reconciler
+    // sweep that migrates shards whose current ShardLocation
+    // disagrees with CRUSH's current pick. Consumed by
+    // /_admin/rebalance-status.
+    rpc GetRebalanceStatus(GetRebalanceStatusRequest) returns (GetRebalanceStatusResponse);
+
+    // IAM operations (user/credential persistence)
+    rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+    rpc GetUser(GetUserRequest) returns (GetUserResponse);
+    rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+    rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse);
+    rpc CreateAccessKey(CreateAccessKeyRequest) returns (CreateAccessKeyResponse);
+    rpc ListAccessKeys(ListAccessKeysRequest) returns (ListAccessKeysResponse);
+    rpc DeleteAccessKey(DeleteAccessKeyRequest) returns (DeleteAccessKeyResponse);
+    rpc GetAccessKeyForAuth(GetAccessKeyForAuthRequest) returns (GetAccessKeyForAuthResponse);
+    // A key's record whatever its status, without its secret: for the admin
+    // API to find whose key it is (GetAccessKeyForAuth refuses inactive ones).
+    rpc GetAccessKey(GetAccessKeyRequest) returns (GetAccessKeyResponse);
+
+    // Iceberg catalog operations
+    rpc IcebergCreateNamespace(IcebergCreateNamespaceRequest) returns (IcebergCreateNamespaceResponse);
+    rpc IcebergLoadNamespace(IcebergLoadNamespaceRequest) returns (IcebergLoadNamespaceResponse);
+    rpc IcebergDropNamespace(IcebergDropNamespaceRequest) returns (IcebergDropNamespaceResponse);
+    rpc IcebergListNamespaces(IcebergListNamespacesRequest) returns (IcebergListNamespacesResponse);
+    rpc IcebergUpdateNamespaceProperties(IcebergUpdateNamespacePropertiesRequest) returns (IcebergUpdateNamespacePropertiesResponse);
+    rpc IcebergNamespaceExists(IcebergNamespaceExistsRequest) returns (IcebergNamespaceExistsResponse);
+    rpc IcebergCreateTable(IcebergCreateTableRequest) returns (IcebergCreateTableResponse);
+    rpc IcebergLoadTable(IcebergLoadTableRequest) returns (IcebergLoadTableResponse);
+    rpc IcebergCommitTable(IcebergCommitTableRequest) returns (IcebergCommitTableResponse);
+    rpc IcebergCommitTransaction(IcebergCommitTransactionRequest) returns (IcebergCommitTransactionResponse);
+    rpc IcebergDropTable(IcebergDropTableRequest) returns (IcebergDropTableResponse);
+    rpc IcebergRenameTable(IcebergRenameTableRequest) returns (IcebergRenameTableResponse);
+    rpc IcebergListTables(IcebergListTablesRequest) returns (IcebergListTablesResponse);
+    rpc IcebergTableExists(IcebergTableExistsRequest) returns (IcebergTableExistsResponse);
+
+    // Iceberg warehouse management
+    rpc IcebergCreateWarehouse(IcebergCreateWarehouseRequest) returns (IcebergCreateWarehouseResponse);
+    rpc IcebergListWarehouses(IcebergListWarehousesRequest) returns (IcebergListWarehousesResponse);
+    rpc IcebergDeleteWarehouse(IcebergDeleteWarehouseRequest) returns (IcebergDeleteWarehouseResponse);
+
+    // Iceberg table policy
+    rpc IcebergSetTablePolicy(IcebergSetTablePolicyRequest) returns (IcebergSetTablePolicyResponse);
+    rpc IcebergGetTablePolicy(IcebergGetTablePolicyRequest) returns (IcebergGetTablePolicyResponse);
+
+    // Group management
+    rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+    rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
+    rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+    rpc AddUserToGroup(AddUserToGroupRequest) returns (AddUserToGroupResponse);
+    rpc RemoveUserFromGroup(RemoveUserFromGroupRequest) returns (RemoveUserFromGroupResponse);
+    rpc GetUserGroups(GetUserGroupsRequest) returns (GetUserGroupsResponse);
+
+    // Data filter management (column/row security)
+    rpc CreateDataFilter(CreateDataFilterRequest) returns (CreateDataFilterResponse);
+    rpc ListDataFilters(ListDataFiltersRequest) returns (ListDataFiltersResponse);
+    rpc DeleteDataFilter(DeleteDataFilterRequest) returns (DeleteDataFilterResponse);
+    rpc GetDataFiltersForPrincipal(GetDataFiltersForPrincipalRequest) returns (ListDataFiltersResponse);
+
+    // Unity Catalog REST API backing — three-level (catalog.schema.table) lakehouse catalog
+    rpc UnityCreateCatalog(UnityCreateCatalogRequest) returns (UnityCreateCatalogResponse);
+    rpc UnityListCatalogs(UnityListCatalogsRequest)   returns (UnityListCatalogsResponse);
+    rpc UnityGetCatalog(UnityGetCatalogRequest)       returns (UnityGetCatalogResponse);
+    rpc UnityUpdateCatalog(UnityUpdateCatalogRequest) returns (UnityUpdateCatalogResponse);
+    rpc UnityDeleteCatalog(UnityDeleteCatalogRequest) returns (UnityDeleteCatalogResponse);
+    rpc UnityCreateSchema(UnityCreateSchemaRequest)   returns (UnityCreateSchemaResponse);
+    rpc UnityListSchemas(UnityListSchemasRequest)     returns (UnityListSchemasResponse);
+    rpc UnityGetSchema(UnityGetSchemaRequest)         returns (UnityGetSchemaResponse);
+    rpc UnityUpdateSchema(UnityUpdateSchemaRequest)   returns (UnityUpdateSchemaResponse);
+    rpc UnityDeleteSchema(UnityDeleteSchemaRequest)   returns (UnityDeleteSchemaResponse);
+    rpc UnityCreateTable(UnityCreateTableRequest)     returns (UnityCreateTableResponse);
+    rpc UnityListTables(UnityListTablesRequest)       returns (UnityListTablesResponse);
+    rpc UnityGetTable(UnityGetTableRequest)           returns (UnityGetTableResponse);
+    rpc UnityDeleteTable(UnityDeleteTableRequest)     returns (UnityDeleteTableResponse);
+    rpc UnitySetTableSecurity(UnitySetTableSecurityRequest) returns (UnitySetTableSecurityResponse);
+    rpc UnitySetCatalogPolicy(UnitySetCatalogPolicyRequest) returns (UnitySetCatalogPolicyResponse);
+    rpc UnityGetCatalogPolicy(UnityGetCatalogPolicyRequest) returns (UnityGetCatalogPolicyResponse);
+    rpc UnitySetSchemaPolicy(UnitySetSchemaPolicyRequest)   returns (UnitySetSchemaPolicyResponse);
+    rpc UnityGetSchemaPolicy(UnityGetSchemaPolicyRequest)   returns (UnityGetSchemaPolicyResponse);
+    rpc UnitySetTablePolicy(UnitySetTablePolicyRequest)     returns (UnitySetTablePolicyResponse);
+    rpc UnityGetTablePolicy(UnityGetTablePolicyRequest)     returns (UnityGetTablePolicyResponse);
+    // Functions / Volumes / Models — same catalog→schema→entity layout
+    // as Tables. No nested policies (yet); the schema/catalog policy chain
+    // applies.
+    rpc UnityCreateFunction(UnityCreateFunctionRequest) returns (UnityCreateFunctionResponse);
+    rpc UnityListFunctions(UnityListFunctionsRequest)   returns (UnityListFunctionsResponse);
+    rpc UnityGetFunction(UnityGetFunctionRequest)       returns (UnityGetFunctionResponse);
+    rpc UnityDeleteFunction(UnityDeleteFunctionRequest) returns (UnityDeleteFunctionResponse);
+    rpc UnityCreateVolume(UnityCreateVolumeRequest) returns (UnityCreateVolumeResponse);
+    rpc UnityListVolumes(UnityListVolumesRequest)   returns (UnityListVolumesResponse);
+    rpc UnityGetVolume(UnityGetVolumeRequest)       returns (UnityGetVolumeResponse);
+    rpc UnityDeleteVolume(UnityDeleteVolumeRequest) returns (UnityDeleteVolumeResponse);
+    rpc UnityCreateModel(UnityCreateModelRequest) returns (UnityCreateModelResponse);
+    rpc UnityListModels(UnityListModelsRequest)   returns (UnityListModelsResponse);
+    rpc UnityGetModel(UnityGetModelRequest)       returns (UnityGetModelResponse);
+    rpc UnityDeleteModel(UnityDeleteModelRequest) returns (UnityDeleteModelResponse);
+    rpc UnityCreateModelVersion(UnityCreateModelVersionRequest) returns (UnityCreateModelVersionResponse);
+    rpc UnityListModelVersions(UnityListModelVersionsRequest)   returns (UnityListModelVersionsResponse);
+    rpc UnityGetModelVersion(UnityGetModelVersionRequest)       returns (UnityGetModelVersionResponse);
+    rpc UnityUpdateModelVersionStatus(UnityUpdateModelVersionStatusRequest) returns (UnityUpdateModelVersionStatusResponse);
+    rpc UnityDeleteModelVersion(UnityDeleteModelVersionRequest) returns (UnityDeleteModelVersionResponse);
+
+    // Delta Sharing protocol — share, schema (namespace), table, and recipient management
+    rpc DeltaCreateShare(DeltaCreateShareRequest)         returns (DeltaCreateShareResponse);
+    rpc DeltaGetShare(DeltaGetShareRequest)               returns (DeltaGetShareResponse);
+    rpc DeltaListShares(DeltaListSharesRequest)           returns (DeltaListSharesResponse);
+    rpc DeltaDropShare(DeltaDropShareRequest)             returns (DeltaDropShareResponse);
+    rpc DeltaAddTable(DeltaAddTableRequest)               returns (DeltaAddTableResponse);
+    rpc DeltaRemoveTable(DeltaRemoveTableRequest)         returns (DeltaRemoveTableResponse);
+    rpc DeltaListTables(DeltaListTablesRequest)           returns (DeltaListTablesResponse);
+    rpc DeltaCreateRecipient(DeltaCreateRecipientRequest) returns (DeltaCreateRecipientResponse);
+    rpc DeltaGetRecipientByToken(DeltaGetRecipientByTokenRequest) returns (DeltaGetRecipientByTokenResponse);
+    rpc DeltaListRecipients(DeltaListRecipientsRequest)   returns (DeltaListRecipientsResponse);
+    rpc DeltaDropRecipient(DeltaDropRecipientRequest)     returns (DeltaDropRecipientResponse);
+
+    // Cluster configuration (OIDC, storage settings, etc.)
+    rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+    rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
+    rpc DeleteConfig(DeleteConfigRequest) returns (DeleteConfigResponse);
+    rpc ListConfig(ListConfigRequest) returns (ListConfigResponse);
+
+    // Server Pools
+    rpc CreatePool(CreatePoolRequest) returns (CreatePoolResponse);
+    rpc GetPool(GetPoolRequest) returns (GetPoolResponse);
+    rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
+    rpc UpdatePool(UpdatePoolRequest) returns (UpdatePoolResponse);
+    rpc DeletePool(DeletePoolRequest) returns (DeletePoolResponse);
+
+    // Placement groups — explicit PG → OSD mapping. Mutated by the
+    // balancer service; consumed by Gateway read/write paths.
+    rpc GetPlacementGroup(GetPlacementGroupRequest) returns (GetPlacementGroupResponse);
+    rpc ListPlacementGroups(ListPlacementGroupsRequest) returns (ListPlacementGroupsResponse);
+    // Scrub a placement group now rather than when next due (B31 phase 4).
+    rpc RequestPgScrub(RequestPgScrubRequest) returns (RequestPgScrubResponse);
+
+    // Tenants (multi-tenancy)
+    rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+    rpc GetTenant(GetTenantRequest) returns (GetTenantResponse);
+    rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+    rpc UpdateTenant(UpdateTenantRequest) returns (UpdateTenantResponse);
+    rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+
+    // Bucket versioning
+    rpc PutBucketVersioning(PutBucketVersioningRequest) returns (PutBucketVersioningResponse);
+    rpc GetBucketVersioning(GetBucketVersioningRequest) returns (GetBucketVersioningResponse);
+
+    // Deduplication policy (objectio-docs architecture/design/dedup.md)
+    rpc SetBucketDedup(SetBucketDedupRequest) returns (SetBucketDedupResponse);
+    rpc GetDedupPolicy(GetDedupPolicyRequest) returns (GetDedupPolicyResponse);
+    // Primary OSD of each chunk fingerprint, for dry-run accounting.
+    rpc LocateChunks(LocateChunksRequest) returns (LocateChunksResponse);
+
+    // Stripes referenced by more than one object (a zero-copy CopyObject;
+    // later block snapshots and dedup). Unshared stripes have no entry.
+    rpc ShareStripes(ShareStripesRequest) returns (ShareStripesResponse);
+    rpc ReleaseStripes(ReleaseStripesRequest) returns (ReleaseStripesResponse);
+    // Small-object packs (objectio-docs architecture/design/small-object-packing.md).
+    rpc IntendPack(IntendPackRequest) returns (IntendPackResponse);
+    rpc SealPack(SealPackRequest) returns (SealPackResponse);
+    rpc AbortPack(AbortPackRequest) returns (AbortPackResponse);
+    rpc GetPack(GetPackRequest) returns (GetPackResponse);
+    rpc ListPacks(ListPacksRequest) returns (ListPacksResponse);
+    rpc PackMoveShard(PackMoveShardRequest) returns (PackMoveShardResponse);
+    rpc PackSettle(PackSettleRequest) returns (PackSettleResponse);
+
+    // Block storage metadata, replicated through Raft: volumes, each
+    // volume's chunk map, snapshots, clones. The block gateway keeps none
+    // of its own. Chunks shared with snapshots and clones are counted in
+    // the shared-stripe registry, so each frees only what it alone used.
+    rpc BlockCreateVolume(BlockCreateVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockGetVolume(BlockGetVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockListVolumes(BlockListVolumesRequest) returns (BlockListVolumesResponse);
+    rpc BlockUpdateVolume(BlockUpdateVolumeRequest) returns (BlockVolumeResponse);
+    rpc BlockDeleteVolume(BlockDeleteVolumeRequest) returns (BlockReleaseResponse);
+    rpc BlockGetChunks(BlockGetChunksRequest) returns (BlockGetChunksResponse);
+    rpc BlockCommitChunks(BlockCommitChunksRequest) returns (BlockReleaseResponse);
+    rpc BlockCreateSnapshot(BlockCreateSnapshotRequest) returns (BlockSnapshotResponse);
+    rpc BlockGetSnapshot(BlockGetSnapshotRequest) returns (BlockSnapshotResponse);
+    rpc BlockListSnapshots(BlockListSnapshotsRequest) returns (BlockListSnapshotsResponse);
+    rpc BlockDeleteSnapshot(BlockDeleteSnapshotRequest) returns (BlockReleaseResponse);
+    rpc BlockCloneVolume(BlockCloneVolumeRequest) returns (BlockVolumeResponse);
+
+    // Object lock configuration
+    rpc PutObjectLockConfiguration(PutObjectLockConfigRequest) returns (PutObjectLockConfigResponse);
+    rpc GetObjectLockConfiguration(GetObjectLockConfigRequest) returns (GetObjectLockConfigResponse);
+
+    // Lifecycle configuration
+    rpc PutBucketLifecycle(PutBucketLifecycleRequest) returns (PutBucketLifecycleResponse);
+    rpc GetBucketLifecycle(GetBucketLifecycleRequest) returns (GetBucketLifecycleResponse);
+    rpc DeleteBucketLifecycle(DeleteBucketLifecycleRequest) returns (DeleteBucketLifecycleResponse);
+
+    // Bucket default server-side encryption configuration
+    rpc PutBucketEncryption(PutBucketEncryptionRequest) returns (PutBucketEncryptionResponse);
+    rpc GetBucketEncryption(GetBucketEncryptionRequest) returns (GetBucketEncryptionResponse);
+    rpc DeleteBucketEncryption(DeleteBucketEncryptionRequest) returns (DeleteBucketEncryptionResponse);
+
+    // Small per-bucket settings (public access block, CORS, ...), each a
+    // named opaque value. Removed with the bucket.
+    rpc GetBucketSetting(GetBucketSettingRequest) returns (GetBucketSettingResponse);
+    // A named lease held by one caller at a time, for cluster-wide
+    // background work only one gateway should do (the lifecycle scan).
+    rpc AcquireLease(AcquireLeaseRequest) returns (AcquireLeaseResponse);
+    // Rolling upgrades (objectio-docs core/upgrade-path.md): every node
+    // reports its release and format level; the operator finalizes once all
+    // run the new release, raising the level the cluster may write.
+    rpc ReportVersion(ReportVersionRequest) returns (ReportVersionResponse);
+    rpc GetUpgradeStatus(GetUpgradeStatusRequest) returns (GetUpgradeStatusResponse);
+    rpc FinalizeUpgrade(FinalizeUpgradeRequest) returns (FinalizeUpgradeResponse);
+    rpc PutBucketSetting(PutBucketSettingRequest) returns (PutBucketSettingResponse);
+
+    // KMS key management (for SSE-KMS). Key material is wrapped by the
+    // service master key before it reaches meta, so meta never sees
+    // plaintext KEKs — they're encrypted-at-rest in Redb.
+    rpc CreateKmsKey(CreateKmsKeyRequest) returns (CreateKmsKeyResponse);
+    rpc GetKmsKey(GetKmsKeyRequest) returns (GetKmsKeyResponse);
+    rpc ListKmsKeys(ListKmsKeysRequest) returns (ListKmsKeysResponse);
+    rpc DeleteKmsKey(DeleteKmsKeyRequest) returns (DeleteKmsKeyResponse);
+
+    // Named IAM policies (PBAC)
+    rpc CreatePolicy(CreatePolicyRequest) returns (CreatePolicyResponse);
+    rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse);
+    rpc ListPolicies(ListPoliciesRequest) returns (ListPoliciesResponse);
+    rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse);
+    rpc AttachPolicy(AttachPolicyRequest) returns (AttachPolicyResponse);
+    rpc DetachPolicy(DetachPolicyRequest) returns (DetachPolicyResponse);
+    rpc ListAttachedPolicies(ListAttachedPoliciesRequest) returns (ListAttachedPoliciesResponse);
+    // Replace a named policy's document (it stays attached where it is).
+    rpc UpdatePolicy(UpdatePolicyRequest) returns (UpdatePolicyResponse);
+    // Suspend or reactivate a user, or change its display name or email.
+    rpc UpdateUser(UpdateUserRequest) returns (UpdateUserResponse);
+    // Deactivate or reactivate an access key.
+    rpc UpdateAccessKey(UpdateAccessKeyRequest) returns (UpdateAccessKeyResponse);
+    // The cluster's STS signing key: random, created on first use, shared
+    // by every gateway so each accepts the others' temporary credentials.
+    // Internal (gateway to meta); never exposed through an admin API.
+    rpc GetStsSigningKey(GetStsSigningKeyRequest) returns (GetStsSigningKeyResponse);
+    // Roles: identities that are assumed (STS), with a trust policy saying
+    // who may assume them, and named policies attached saying what they
+    // may do.
+    rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+    rpc GetRole(GetRoleRequest) returns (GetRoleResponse);
+    rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+    rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
+    rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+    // Rename a group or change its path.
+    rpc UpdateGroup(UpdateGroupRequest) returns (UpdateGroupResponse);
+    // Inline policies of users, groups and roles. Put replaces one of the
+    // same name; Delete of one that isn't there is NOT_FOUND.
+    rpc PutInlinePolicy(PutInlinePolicyRequest) returns (PutInlinePolicyResponse);
+    rpc GetInlinePolicy(GetInlinePolicyRequest) returns (GetInlinePolicyResponse);
+    rpc ListInlinePolicies(ListInlinePoliciesRequest) returns (ListInlinePoliciesResponse);
+    rpc DeleteInlinePolicy(DeleteInlinePolicyRequest) returns (DeleteInlinePolicyResponse);
+
+    // Keys whose ObjectMeta copies may disagree: a write or delete that
+    // reached the quorum but not every copy. Gateways heal them
+    // (objectio-docs core/object-metadata-quorum.md, healing).
+    rpc HealEnqueue(HealEnqueueRequest) returns (HealEnqueueResponse);
+    rpc HealList(HealListRequest) returns (HealListResponse);
+    rpc HealClaim(HealClaimRequest) returns (HealClaimResponse);
+    rpc HealDone(HealDoneRequest) returns (HealDoneResponse);
+
+    // This node's Prometheus exposition, so the gateway can serve it from
+    // its own /metrics instead of every meta node needing a scrape target.
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+
+    // This node's wall clock, answered locally. Gateways compare theirs
+    // with it and refuse stamped writes while they differ by more than
+    // 500 ms (core/object-metadata-quorum.md, "Stamps").
+    rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
+}
+
+message GetTimeRequest {}
+message GetTimeResponse {
+    uint64 unix_millis = 1;
+}
+
+// Shared by MetadataService.GetMetrics and StorageService.GetMetrics.
+message GetMetricsRequest {}
+message GetMetricsResponse {
+    string text = 1;    // Prometheus text exposition format 0.0.4
+    // objectio_common::process_metrics::instance_id() of the responding
+    // process. The gateway drops `process_*` from a response that came
+    // from its own process (the all-in-one binary) instead of repeating it.
+    string process_instance = 2;
+}
+
+// Bucket metadata
+message BucketMeta {
+    string name = 1;
+    string owner = 2;
+    uint64 created_at = 3;
+    string storage_class = 4;
+    VersioningState versioning = 5;
+    string pool = 6;                 // Server pool for placement (empty = default pool)
+    string tenant = 7;               // Owning tenant (empty = system tenant)
+    uint64 quota_bytes = 8;          // Per-bucket storage quota (0 = unlimited)
+    uint64 quota_objects = 9;        // Per-bucket object count quota (0 = unlimited)
+    ObjectLockConfiguration object_lock = 10;  // Object lock config (immutable after creation)
+    DedupPolicy dedup = 11;          // Unset fields inherit from the tenant, then the cluster
+    // NOTE: default encryption is persisted in a separate table keyed by bucket name
+    // (BUCKET_ENCRYPTION_CONFIGS) to keep BucketMeta read-hot and avoid rewriting it on
+    // PutBucketEncryption. Loaded into the meta service on boot. No field here.
+}
+
+enum VersioningState {
+    VERSIONING_DISABLED = 0;
+    VERSIONING_ENABLED = 1;
+    VERSIONING_SUSPENDED = 2;
+}
+
+// Erasure coding type
+enum ErasureType {
+    // Standard Reed-Solomon MDS (Maximum Distance Separable)
+    // Any k shards can reconstruct the data
+    ERASURE_MDS = 0;
+
+    // Locally Repairable Codes (LRC)
+    // Local parity groups enable faster single-shard recovery
+    ERASURE_LRC = 1;
+
+    // Simple replication (no erasure coding)
+    // Data is replicated N times without encoding
+    // Use replication_count=1 for single-disk mode (no redundancy)
+    // Use replication_count=3 for 3-way replication
+    ERASURE_REPLICATION = 2;
+}
+
+// Object metadata
+message ObjectMeta {
+    string bucket = 1;
+    string key = 2;
+    bytes object_id = 3;        // 16-byte UUID
+    uint64 size = 4;
+    string etag = 5;
+    string content_type = 6;
+    uint64 created_at = 7;
+    uint64 modified_at = 8;
+    string storage_class = 9;
+    map<string, string> user_metadata = 10;
+    string version_id = 11;
+    bool is_delete_marker = 12;
+    repeated StripeMeta stripes = 13;
+    ObjectRetention retention = 14;   // Object-level retention policy
+    LegalHold legal_hold = 15;        // Legal hold status
+
+    // Server-side encryption (all optional; absent = plaintext, backward compatible).
+    // Populated on PutObject; consulted on GetObject to decrypt the reconstructed stream.
+    SseAlgorithm encryption_algorithm = 16;
+    string kms_key_id = 17;                        // KMS key ARN (SSE_KMS only)
+    bytes encrypted_dek = 18;                      // DEK wrapped by master/KMS key
+    bytes encryption_iv = 19;                      // Base IV; per-chunk IVs derived deterministically
+    map<string, string> encryption_context = 20;   // AWS KMS encryption context
+
+    // Node that counts this object in usage accounting. ObjectMeta is
+    // written to every OSD in the key's placement; exactly one of them —
+    // this one — reports it, so per-OSD usage sums without double
+    // counting. Set by the gateway on write. Empty on objects written
+    // before it existed; OSDs then fall back to the holder of shard 0 of
+    // stripe 0, which is the same node for single-part PUTs.
+    bytes usage_owner = 21;
+
+    // The object's bytes, for a small object stored in this record instead
+    // of in shards: `stripes` is then empty. As stored — ciphertext when the
+    // object is encrypted. Written whole to every OSD in the key's
+    // placement, so any one of them can serve it. Empty for every other
+    // object, and in listings, which never carry it.
+    bytes inline_data = 22;
+
+    // The flexible checksum (x-amz-checksum-*) the client sent with the PUT,
+    // checked against the body before anything was stored. Returned on
+    // GET/HEAD with `x-amz-checksum-mode: ENABLED`. Absent when the PUT
+    // carried none, and on objects written before it existed.
+    ObjectChecksum checksum = 23;
+
+    // Object tags (S3 object tagging): at most 10, set by PutObjectTagging,
+    // `x-amz-tagging` on PUT / CreateMultipartUpload, or copied by CopyObject.
+    map<string, string> tags = 24;
+
+    // A multipart object's parts' checksums, in order (GetObjectAttributes
+    // lists them); `checksum` is then their composite.
+    repeated ObjectChecksum part_checksums = 25;
+
+    // Bucket replication (architecture/design/bucket-replication.md):
+    // each target this version is to reach, and how far it got — "PENDING",
+    // "COMPLETED" or "FAILED". Written with the version itself, so a
+    // version is never committed without its mark.
+    map<string, string> replication = 26;
+    // This version is a replica another cluster sent: never replicated
+    // again (two-way rules can't loop). The source cluster, for audit.
+    string replica_of = 27;
+
+    // The format level a reader needs to read this version correctly
+    // (objectio-docs core/upgrade-path.md): set by a writer that uses a
+    // feature a lower level would misread. A reader below it refuses the
+    // object instead of serving wrong bytes. 0: nothing beyond the base.
+    uint32 required_level = 28;
+    // Order of writes to this object's metadata copies: a hybrid logical
+    // clock value (objectio_common::stamp). An OSD keeps the highest; a
+    // read takes the newest of a read quorum. 0 = unstamped.
+    uint64 stamp = 29;
+    // Order of updates of this same object (tagging, retention, legal
+    // hold, packing, a shard moved or rebuilt), which keep `stamp`: compared
+    // only between copies of one object (same stamp and object id), so an
+    // update never outranks a newer object. 0 = never updated.
+    uint64 update_stamp = 30;
+    // The placement group the key is placed through (B31): set by the
+    // gateway when it writes the object, kept by every copy and update. An
+    // OSD indexes its copies by it, so one PG's contents are one prefix
+    // scan. Empty pool: a key placed per key (written before level 7).
+    string pg_pool = 31;
+    uint32 pg_id = 32;
+}
+
+// A full-object checksum, as S3 reports it.
+message ObjectChecksum {
+    string algorithm = 1;   // S3 name: CRC32, CRC32C, CRC64NVME, SHA1, SHA256
+    string value = 2;       // base64 of the big-endian checksum / digest
+}
+
+// Stripe metadata (EC group)
+message StripeMeta {
+    uint64 stripe_id = 1;
+    uint32 ec_k = 2;                // Data shards
+    uint32 ec_m = 3;                // Total parity shards (local + global for LRC)
+    repeated ShardLocation shards = 4;
+
+    // LRC-specific fields
+    ErasureType ec_type = 5;        // MDS or LRC
+    uint32 ec_local_parity = 6;     // Number of local parity shards (LRC only)
+    uint32 ec_global_parity = 7;    // Number of global parity shards (LRC only)
+    uint32 local_group_size = 8;    // Data shards per local group (LRC only)
+
+    // Original data size for this stripe (needed for decoding multipart uploads)
+    uint64 data_size = 9;
+
+    // Object ID used when writing shards (needed for multipart uploads where each part has different ID)
+    bytes object_id = 10;
+
+    // AES-CTR initialization vector used to encrypt this stripe's bytes,
+    // when the object is SSE-S3/SSE-KMS. Multipart objects set it per
+    // stripe; a single-part object leaves it empty and uses
+    // `ObjectMeta.encryption_iv` for its whole body.
+    bytes encryption_iv = 11;
+
+    // This object's bytes are [slice_offset, slice_offset + slice_length)
+    // of the stripe's data: the stripe is a pack shared by several small
+    // objects (see objectio-docs architecture/design/small-object-packing.md).
+    // slice_length 0: the whole stripe is this object's.
+    uint64 slice_offset = 14;
+    uint64 slice_length = 15;
+    // Set for a packed object: its stripe is the pack recorded under this id
+    // in meta (GetPack), which holds the shard locations; `shards` is empty
+    // here and `object_id` is the pack id.
+    bytes pack_id = 16;
+    // Each shard is kept in its OSD's metadata record, not a disk block, and
+    // was sent with the object's metadata (B21, format level 5).
+    bool shards_in_metadata = 17;
+}
+
+// A pack: one erasure-coded stripe holding many small objects' bytes,
+// recorded once so repair and drain update one record. Its referrers are
+// the objects in it, in the shared-stripe registry under `pack_id`.
+message PackRecord {
+    bytes pack_id = 1;
+    StripeMeta stripe = 2;      // ec scheme, shard locations, data size
+    uint64 data_len = 3;
+    uint64 version = 4;         // bumped on every location change
+    uint64 created_at = 5;
+    bool sealed = 6;            // false from IntendPack until SealPack
+    // The bucket whose objects it holds: its shards are placed in that
+    // bucket's pool, under the key `.objectio-pack/<hex pack id>`.
+    string bucket = 7;
+    // The objects packed into it, as the packer read them: how
+    // reconciliation finds the ObjectMeta behind each referrer.
+    repeated PackMember members = 8;
+}
+
+message PackMember {
+    bytes object_id = 1;
+    string key = 2;
+    string version_id = 3;      // empty: an unversioned object
+    uint64 slice_offset = 4;
+    uint64 slice_length = 5;
+    // The stripe it had before: released once every copy names the pack.
+    // Cleared when the member is settled.
+    StripeMeta old_stripe = 6;
+    // Its switch is done or abandoned: reconciliation leaves it alone. Kept
+    // in the record (key and slice) so compaction knows what's live.
+    bool settled = 7;
+}
+
+// Settle members of a pack: their switch is finished or abandoned, so
+// reconciliation needn't look at them again. They stay in the record,
+// marked settled, without their old stripe. Members not in the record
+// are ignored.
+message PackSettleRequest {
+    bytes pack_id = 1;
+    repeated bytes object_ids = 2;
+}
+message PackSettleResponse {}
+
+// Shard location
+message ShardLocation {
+    uint32 position = 1;        // Position in stripe
+    bytes node_id = 2;          // 16-byte UUID
+    bytes disk_id = 3;          // 16-byte UUID
+    uint64 offset = 4;
+
+    // LRC-specific fields
+    ShardType shard_type = 5;   // Type of shard (data, local parity, global parity)
+    uint32 local_group = 6;     // Local group index (for LRC)
+    // The shard's crc32c as its writer encoded it (B23), kept with the
+    // object rather than only by the OSD that holds it: reads and repair
+    // check against it, so a shard stored wrong (with an OSD-side checksum
+    // of its own wrong bytes) is caught.
+    optional uint32 crc32c = 7;
+}
+
+// Shard type for LRC
+enum ShardType {
+    SHARD_DATA = 0;             // Data shard
+    SHARD_LOCAL_PARITY = 1;     // Local parity shard (XOR of local group)
+    SHARD_GLOBAL_PARITY = 2;    // Global parity shard (RS over all data)
+}
+
+// Create bucket
+message CreateBucketRequest {
+    string name = 1;
+    string owner = 2;
+    string storage_class = 3;
+    string region = 4;
+    string tenant = 5;              // Owning tenant (empty = system tenant)
+    // Settings the bucket starts with (see GetBucketSetting), written in the
+    // same commit as the bucket: it never exists without them.
+    map<string, bytes> settings = 6;
+    // The pool its data goes to. Empty: the tenant's default pool, else the
+    // cluster's default placement. Fixed for the bucket's life.
+    string pool = 7;
+}
+
+message SetBucketOwnerRequest {
+    string bucket = 1;
+    string owner = 2;               // user_id of the new owner
+}
+
+message SetBucketOwnerResponse {
+    bool success = 1;
+}
+
+message SetBucketQuotaRequest {
+    string bucket = 1;
+    uint64 quota_bytes = 2;      // 0 = unlimited
+    uint64 quota_objects = 3;    // 0 = unlimited
+}
+
+message SetBucketQuotaResponse {}
+
+message CreateBucketResponse {
+    BucketMeta bucket = 1;
+}
+
+// Delete bucket
+message DeleteBucketRequest {
+    string name = 1;
+}
+
+message DeleteBucketResponse {
+    bool success = 1;
+}
+
+// Get bucket
+message GetBucketRequest {
+    string name = 1;
+}
+
+message GetBucketResponse {
+    BucketMeta bucket = 1;
+}
+
+// List buckets
+message ListBucketsRequest {
+    string owner = 1;
+    string tenant = 2;              // Filter by tenant (empty = all for system admin)
+}
+
+message ListBucketsResponse {
+    repeated BucketMeta buckets = 1;
+}
+
+// Create object
+message CreateObjectRequest {
+    string bucket = 1;
+    string key = 2;
+    uint64 size = 3;
+    string content_type = 4;
+    string etag = 5;
+    map<string, string> user_metadata = 6;
+    repeated StripeMeta stripes = 7;
+    bytes object_id = 8;        // 16-byte UUID (provided by caller)
+    // Placement context the gateway picked up from GetPlacementResponse.
+    // Server trusts these for the listing entry so reads don't need a
+    // second hash+pool lookup. 0 / "" = placed without a placement group
+    // (per-object CRUSH); the listing entry has no PG then.
+    uint32 pg_id = 9;
+    string pool = 10;
+    // 11 was the key's home: a key's copies are its placement group's
+    // acting set (B31).
+    reserved 11;
+    // A conditional PUT (If-Match / If-None-Match): the listing entry, the
+    // key's current object as Raft knows it, must be in this state when
+    // this write commits, or it is refused (FAILED_PRECONDITION with the
+    // message "PreconditionFailed", or "NoSuchKey" for If-Match on a key
+    // with no object). "*" or an ETag; empty = no condition.
+    string if_match = 12;
+    string if_none_match = 13;
+}
+
+// An object acknowledged short of shards (B29): recorded in the Raft
+// command that creates it, removed once repair has every position back.
+// Keyed by "{bucket}/{key}"; a later write of the key replaces it.
+message DegradedObject {
+    bytes object_id = 1;
+    repeated DegradedStripe stripes = 2;
+    // Unix seconds.
+    uint64 recorded_at = 3;
+}
+
+// An object found unrecoverable (B29): a stripe with fewer than k shards
+// left, every holder of the rest answering that it has none. Recorded so
+// the loss is seen (a metric that alerts, the key in the record) rather
+// than waited on; keyed by "{bucket}/{key}".
+message LostObject {
+    bytes object_id = 1;
+    uint64 stripe_id = 2;
+    // Shards left, and how many a read needs (k).
+    uint32 good = 3;
+    uint32 needed = 4;
+    // Unix seconds.
+    uint64 recorded_at = 5;
+    // What found it, e.g. "evacuation".
+    string found_by = 6;
+}
+
+message ReportDegradedRequest {
+    string bucket = 1;
+    string key = 2;
+    // The object read: a key holding another one by now is not recorded.
+    bytes object_id = 3;
+    // What the reader found: positions it could not read, per stripe.
+    repeated DegradedStripe stripes = 4;
+}
+
+message ReportDegradedResponse {
+    // Whether a record was made (false: one was there already).
+    bool recorded = 1;
+}
+
+message DegradedStripe {
+    uint64 stripe_id = 1;
+    // Positions the write left without a shard.
+    repeated uint32 missing = 2;
+    // Shards written, and how many a read needs (k): repair takes the
+    // objects with the fewest to spare first.
+    uint32 present = 3;
+    uint32 needed = 4;
+}
+
+message CreateObjectResponse {
+    ObjectMeta object = 1;
+}
+
+// Delete object
+message DeleteObjectRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;      // Optional: delete specific version
+    reserved 4;
+}
+
+message DeleteObjectResponse {
+    bool success = 1;
+    string version_id = 2;      // Version ID of delete marker (if versioning enabled)
+}
+
+// Get object
+message GetObjectRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;      // Optional: get specific version
+}
+
+message GetObjectResponse {
+    ObjectMeta object = 1;
+}
+
+// Lightweight per-object summary stored in the Meta-backed
+// OBJECT_LISTINGS index. Carries the fields a client needs for
+// ListObjects responses (key, size, etag, timestamps) plus enough
+// routing info (primary_osd_id) for the gateway to locate the full
+// ObjectMeta without a scatter-gather. This is the authoritative
+// source of truth for "does object (bucket,key) exist in this
+// cluster" — updates happen through Raft MultiCas so every meta
+// replica sees the same commit at the same log position.
+message ObjectListingEntry {
+    string bucket = 1;
+    string key = 2;
+    uint64 size = 3;
+    string etag = 4;
+    string content_type = 5;
+    uint64 created_at = 6;
+    uint64 modified_at = 7;
+    string version_id = 8;
+    bool is_delete_marker = 9;
+    string storage_class = 10;
+    map<string, string> user_metadata = 11;
+    // Any one OSD that should have the full ObjectMeta replica. With
+    // the fan-out ObjectMeta model (every shard host holds a copy),
+    // this is a hint — the gateway tries this one first, falls back to
+    // the CRUSH placement on miss.
+    bytes primary_osd_id = 12;
+
+    // Placement-group ID the object was routed through. 0 = placed
+    // without a placement group (per-object CRUSH). With a non-zero
+    // pg_id the gateway can look up the PG's current osd_ids in one
+    // in-memory cache hit instead of recomputing CRUSH.
+    uint32 pg_id = 13;
+    // The pool name the PG lives in. Empty = default pool.
+    string pool = 14;
+    // The object this entry lists: a conditional create sent again (its
+    // answer lost to a leader change or a timeout) is recognised as
+    // already applied, rather than refused by its own entry.
+    bytes object_id = 15;
+}
+
+// List objects
+message ListObjectsRequest {
+    string bucket = 1;
+    string prefix = 2;
+    string delimiter = 3;
+    string start_after = 4;
+    string continuation_token = 5;
+    uint32 max_keys = 6;
+    bool include_versions = 7;
+}
+
+message ListObjectsResponse {
+    reserved 1;  // was `objects`, full ObjectMeta entries; `entries` replaced it
+    repeated string common_prefixes = 2;
+    string next_continuation_token = 3;
+    bool is_truncated = 4;
+    uint32 key_count = 5;
+    // The listing, from meta's index.
+    repeated ObjectListingEntry entries = 6;
+}
+
+// Get placement for new object
+message GetPlacementRequest {
+    string bucket = 1;
+    string key = 2;
+    uint64 size = 3;
+    string storage_class = 4;
+}
+
+message GetPlacementResponse {
+    string storage_class = 1;
+    uint32 ec_k = 2;
+    uint32 ec_m = 3;                // Total parity (local + global for LRC)
+    repeated NodePlacement nodes = 4;
+
+    // LRC-specific fields
+    ErasureType ec_type = 5;        // MDS, LRC, or REPLICATION
+    uint32 ec_local_parity = 6;     // Number of local parity shards (LRC only)
+    uint32 ec_global_parity = 7;    // Number of global parity shards (LRC only)
+    uint32 local_group_size = 8;    // Data shards per local group (LRC only)
+
+    // Replication-specific fields
+    uint32 replication_count = 9;   // Number of replicas (REPLICATION mode only)
+
+    // Placement group this object was routed through. The gateway
+    // stamps it into ObjectListingEntry.pg_id so LIST and GET can
+    // short-circuit the jump-hash + PG lookup on the next request.
+    // pg_version is the CAS version at placement time — lets the
+    // gateway detect a mid-flight PG migration and retry from
+    // GetPlacement rather than writing against a stale tuple.
+    uint32 pg_id = 11;
+    // The epoch of the PG's acting set this placement is (B31): sent with
+    // every write, refused by an OSD that knows a newer one. 0: placed
+    // without a placement group (a key written before format level 7).
+    uint64 pg_epoch = 12;
+    string pool = 13;               // Pool this PG lives in.
+
+    // Effective dedup policy for this bucket — bucket, then tenant, then
+    // cluster default — resolved here so a PUT needs no extra round trip.
+    // The gateway needs only the mode and the fingerprint domain, never
+    // the scope.
+    DedupMode dedup_mode = 14;
+    string dedup_domain = 15;
+}
+
+message NodePlacement {
+    uint32 position = 1;            // Shard position
+    bytes node_id = 2;
+    string node_address = 3;
+    bytes disk_id = 4;
+
+    // LRC-specific fields
+    ShardType shard_type = 5;       // Type of shard
+    uint32 local_group = 6;         // Local group index (for LRC)
+    string te_segment = 7;          // OSD's Transfer Engine segment; empty if none
+}
+
+// One call's answer inside another: its status code (0 for OK) and
+// message, and, when OK, its encoded response.
+message CallResult {
+    int32 code = 1;
+    string message = 2;
+    bytes response = 3;
+}
+
+message GetWriteContextRequest {
+    GetPlacementRequest placement = 1;
+}
+
+message GetWriteContextResponse {
+    CallResult encryption = 1;    // GetBucketEncryptionResponse
+    CallResult versioning = 2;    // GetBucketVersioningResponse
+    CallResult object_lock = 3;   // GetObjectLockConfigResponse
+    CallResult placement = 4;     // GetPlacementResponse
+}
+
+// Multipart upload
+message CreateMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string content_type = 3;
+    map<string, string> user_metadata = 4;
+
+    // SSE decision made on the CreateMultipartUpload request (AWS semantics:
+    // multipart SSE is fixed at creation time; per-UploadPart SSE headers
+    // are ignored). The gateway generates + wraps the DEK here so parts
+    // can decrypt it without round-tripping through a KMS again.
+    SseAlgorithm encryption_algorithm = 5;
+    string kms_key_id = 6;
+    bytes encrypted_dek = 7;
+    // SSE-C only: the base64-encoded MD5 of the customer-supplied key.
+    // UploadPart requests for this MPU must resupply the key and a matching
+    // MD5 — we never store the key itself.
+    string customer_key_md5 = 8;
+    // SSE-KMS only: AWS-compatible encryption context (arbitrary string map).
+    // Supplied at CreateMultipartUpload time as an AEAD binding on the wrapped
+    // DEK — decrypt fails if the context differs.
+    map<string, string> encryption_context = 9;
+}
+
+message CreateMultipartUploadResponse {
+    string upload_id = 1;
+    string bucket = 2;
+    string key = 3;
+
+    // Echo back the SSE decision so the gateway response to the client
+    // can include the right `x-amz-server-side-encryption` header.
+    SseAlgorithm encryption_algorithm = 4;
+    string kms_key_id = 5;
+}
+
+// Look up an in-flight MPU so the gateway can fetch its encryption
+// state when an UploadPart request arrives (AWS semantics fix SSE at
+// CreateMultipartUpload time; per-part SSE headers are ignored).
+message GetMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+}
+
+message GetMultipartUploadResponse {
+    bool found = 1;
+    string content_type = 2;
+    map<string, string> user_metadata = 3;
+    uint64 initiated = 4;
+    SseAlgorithm encryption_algorithm = 5;
+    string kms_key_id = 6;
+    bytes encrypted_dek = 7;
+    string customer_key_md5 = 8;
+    map<string, string> encryption_context = 9;
+    // Being completed (two-phase): the object the completion made, its
+    // version, and since when (Unix seconds). Empty otherwise.
+    bytes completing_object_id = 10;
+    string completing_version_id = 11;
+    uint64 completing_since = 12;
+}
+
+message CompleteMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    repeated PartInfo parts = 4;
+    // The version the object gets (empty: unversioned).
+    string version_id = 5;
+    // Two-phase: keep the upload, marked as being completed, until the
+    // caller settles it (SettleMultipartUpload) once the object is stored
+    // or certainly isn't. Sent again meanwhile, the completion returns the
+    // same object. Without it the upload goes at once (the release before).
+    // Meta honours it only once the cluster is at COMPLETED_UPLOADS_LEVEL.
+    bool settle_after_commit = 6;
+}
+
+message PartInfo {
+    uint32 part_number = 1;
+    string etag = 2;
+    uint64 size = 3;
+}
+
+message CompleteMultipartUploadResponse {
+    ObjectMeta object = 1;
+    // Stripes of parts that were uploaded but left out of the object. The
+    // upload is gone, so nothing refers to them; the caller frees them.
+    repeated StripeMeta unused_stripes = 2;
+    // The upload is kept, being completed, until the caller settles it.
+    // False: it is gone already, and a failed store frees the parts.
+    bool settling = 3;
+}
+
+message SettleMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    // The object the completion made: settles only that completion.
+    bytes object_id = 4;
+    // Stored: the upload goes (its parts are the object's now). Not stored:
+    // the upload is open again, its parts kept.
+    bool committed = 5;
+}
+
+message SettleMultipartUploadResponse {
+    // False when there was nothing of that completion to settle.
+    bool settled = 1;
+}
+
+message AbortMultipartUploadRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+}
+
+message AbortMultipartUploadResponse {
+    bool success = 1;
+    // Stripes of every part the aborted upload held, taken out of the upload
+    // in the same step that dropped it, so the caller can free them without
+    // racing a CompleteMultipartUpload.
+    repeated StripeMeta stripes = 2;
+}
+
+message ListMultipartUploadsRequest {
+    string bucket = 1;
+    string prefix = 2;
+    string key_marker = 3;
+    string upload_id_marker = 4;
+    uint32 max_uploads = 5;
+}
+
+message ListMultipartUploadsResponse {
+    repeated MultipartUpload uploads = 1;
+    string next_key_marker = 2;
+    string next_upload_id_marker = 3;
+    bool is_truncated = 4;
+}
+
+message MultipartUpload {
+    string key = 1;
+    string upload_id = 2;
+    uint64 initiated = 3;
+    string storage_class = 4;
+}
+
+// Register a completed part upload
+message RegisterPartRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    uint32 part_number = 4;
+    string etag = 5;
+    uint64 size = 6;
+    repeated StripeMeta stripes = 7;  // EC stripes info for this part (multiple for large parts)
+    // The part's flexible checksum (x-amz-checksum-*), checked against its
+    // body; the object's composite checksum is made of these.
+    ObjectChecksum checksum = 8;
+}
+
+message RegisterPartResponse {
+    bool success = 1;
+    string etag = 2;            // Confirmed ETag
+    // Stripes of the part this one replaced (same part number uploaded
+    // again). Nothing refers to them any more; the caller frees them.
+    repeated StripeMeta replaced_stripes = 3;
+}
+
+// List parts of a multipart upload
+message ListPartsRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    uint32 part_number_marker = 4;  // Start listing after this part number
+    uint32 max_parts = 5;           // Max parts to return (default 1000)
+}
+
+message ListPartsResponse {
+    repeated PartMeta parts = 1;
+    bool is_truncated = 2;
+    uint32 next_part_number_marker = 3;
+    string bucket = 4;
+    string key = 5;
+    string upload_id = 6;
+}
+
+// Extended part metadata (includes stripe info for internal use)
+message PartMeta {
+    uint32 part_number = 1;
+    string etag = 2;
+    uint64 size = 3;
+    uint64 last_modified = 4;
+    repeated StripeMeta stripes = 5;  // EC stripes info (multiple for large parts)
+    ObjectChecksum checksum = 6;
+}
+
+// Bucket policy operations
+message SetBucketPolicyRequest {
+    string bucket = 1;
+    string policy_json = 2;  // JSON-encoded bucket policy
+}
+
+message SetBucketPolicyResponse {
+    bool success = 1;
+}
+
+message GetBucketPolicyRequest {
+    string bucket = 1;
+}
+
+message GetBucketPolicyResponse {
+    string policy_json = 1;  // JSON-encoded bucket policy (empty if no policy)
+    bool has_policy = 2;     // True if bucket has a policy set
+}
+
+message DeleteBucketPolicyRequest {
+    string bucket = 1;
+}
+
+message DeleteBucketPolicyResponse {
+    bool success = 1;
+}
+
+// Failure domain for CRUSH placement. Empty string at any level means
+// "inherit from enclosing level"; default-zero keeps OSDs that only
+// populate region/datacenter/rack backward-compatible with this richer
+// model. `zone` sits between region and datacenter (AZ / row); `host`
+// sits below rack (physical host) so multiple OSDs on the same box can
+// share a failure-correlation group.
+message FailureDomainInfo {
+    string region = 1;          // Region name (e.g., "us-east-1")
+    string datacenter = 2;      // Datacenter name (e.g., "dc1"); in cloud: empty and rely on zone
+    string rack = 3;            // Rack identifier (e.g., "rack-01")
+    string zone = 4;            // Availability zone (e.g., "us-east-1a") or row (on-prem)
+    string host = 5;            // Physical host (e.g., "node-07")
+}
+
+// OSD registration
+message RegisterOsdRequest {
+    bytes node_id = 1;                  // 16-byte UUID
+    string address = 2;                 // gRPC endpoint (e.g., "http://192.168.1.10:9002")
+    repeated bytes disk_ids = 3;        // 16-byte UUIDs for each disk
+    FailureDomainInfo failure_domain = 4; // Where this OSD sits in the topology
+    string node_name = 5;               // Human-readable name (optional)
+    double weight = 6;                  // Placement weight (default: 1.0)
+    // Raw capacity of each disk in bytes, index-aligned with `disk_ids`.
+    // Meta sums these across OSDs for cluster capacity accounting. Older OSDs
+    // that don't populate this report 0 for their disks.
+    repeated uint64 disk_capacity_bytes = 7;
+    // Transfer Engine segment ("ip:port") this OSD accepts shard transfers
+    // on. Empty when it has none; gateways then use gRPC bytes.
+    string te_segment = 8;
+    // Shards the OSD forgot at start because their disk came back blank
+    // (replaced, or wiped): Meta starts its repair walk at once rather
+    // than when it is next due (up to its interval, an hour by default).
+    uint64 shards_dropped = 9;
+}
+
+message RegisterOsdResponse {
+    bool success = 1;
+    uint64 topology_version = 2;        // Current cluster topology version
+    // 16-byte UUID identifying this cluster. Meta lazily generates one
+    // on first need and persists it in the config store (`cluster/uuid`).
+    // OSDs write it into each disk's superblock so a disk cannot be
+    // accidentally mounted by a different cluster — matches Ceph's
+    // FSID guard. Empty on pre-3.1 meta nodes; OSDs treat that as
+    // "leave existing superblock alone".
+    bytes cluster_uuid = 3;
+    // Every placement group's epoch (B31): the OSD refuses a request placed
+    // under an older one, including for PGs it is no longer a member of.
+    repeated PgEpoch pg_epochs = 4;
+}
+
+message PgEpoch {
+    string pool = 1;
+    uint32 pg_id = 2;
+    uint64 epoch = 3;
+}
+
+// Operator-declared state for an OSD. Serialised as a string so adding
+// future variants (e.g. "quiescing") doesn't break older clients.
+enum OsdAdminState {
+    OSD_ADMIN_IN = 0;        // Default — participates in placement.
+    OSD_ADMIN_OUT = 1;       // Forced out; no new shards; existing shards stay.
+    OSD_ADMIN_DRAINING = 2;  // Migration in progress; excluded from placement.
+}
+
+message SetOsdAdminStateRequest {
+    bytes node_id = 1;          // 16-byte UUID
+    OsdAdminState state = 2;
+    string requested_by = 3;    // Audit (user id / "console" / "cli")
+}
+
+message SetOsdAdminStateResponse {
+    bool found = 1;             // node_id matched a registered OSD
+    bool changed = 2;           // state actually changed (false if no-op)
+    OsdAdminState effective = 3; // State after apply
+}
+
+// Snapshot of drain progress per currently-Draining OSD.
+message GetDrainStatusRequest {}
+
+message GetDrainStatusResponse {
+    repeated DrainStatus drains = 1;
+}
+
+message DrainStatus {
+    bytes node_id = 1;              // 16-byte UUID
+    uint64 shards_remaining = 2;    // Current shard_count on the OSD
+    uint64 initial_shards = 3;      // shard_count when drain started (this leader term)
+    uint64 shards_migrated = 4;     // Successfully moved by migrator
+    uint64 updated_at = 5;          // Unix seconds of last sweep
+    string last_error = 6;          // Empty when last sweep OK
+}
+
+message GetRebalanceStatusRequest {}
+
+message GetRebalanceStatusResponse {
+    bool started = 1;
+    bool paused = 2;
+    uint64 last_sweep_at = 3;
+    uint64 scanned_this_pass = 4;
+    uint64 drifts_seen_this_pass = 5;
+    uint64 shards_rebalanced_total = 6;
+    string last_error = 7;
+    // Balancer (PG engine) counters. Since the greenfield cutover the
+    // balancer is the only thing moving placement; the drift fields
+    // above are kept for wire compat and now mirror pgs_moved_total.
+    uint64 pgs_moved_total = 8;
+    uint64 pg_candidates_last_tick = 9;
+    uint64 pgs_scanned_last_tick = 10;
+}
+
+// Get listing nodes for scatter-gather list operations
+message GetListingNodesRequest {
+    string bucket = 1;          // Optional: filter by bucket's storage class
+    // When true, include OSDs that are not currently Active (Draining,
+    // Decommissioning, Out). Default false — scatter-gather callers
+    // only want live nodes, admin UI sets this to true to render
+    // state-colored topology.
+    bool include_all_states = 2;
+}
+
+message GetListingNodesResponse {
+    repeated ListingNode nodes = 1;
+    uint64 topology_version = 2; // For continuation token validation
+}
+
+message ListingNode {
+    bytes node_id = 1;
+    string address = 2;
+    uint32 shard_id = 3;        // Logical shard ID for partitioned listing (0..N-1)
+    // Full failure-domain coordinates so gateways can render the topology
+    // tree and prefer same-domain shards on reads (Phase 2). Empty fields
+    // on older meta servers fall back to "default".
+    FailureDomainInfo failure_domain = 4;
+    // Operator-declared state. Defaults to OSD_ADMIN_IN on meta servers
+    // that predate this field, which is the same as "no admin override".
+    OsdAdminState admin_state = 5;
+    // Transfer Engine segment ("ip:port"); empty when the OSD has none.
+    string te_segment = 6;
+}
+
+// ============ IAM Messages ============
+
+// User status
+enum UserStatus {
+    USER_ACTIVE = 0;
+    USER_SUSPENDED = 1;
+    USER_DELETED = 2;
+}
+
+// Access key status
+enum KeyStatus {
+    KEY_ACTIVE = 0;
+    KEY_INACTIVE = 1;
+}
+
+// What a scoped access key may do. READ_WRITE is deliberately the zero value
+// so that an unset field — a key issued before scoping existed, or a client
+// that does not set it — imposes no restriction.
+enum KeyOperation {
+    KEY_OP_READ_WRITE = 0;
+    KEY_OP_READ = 1;
+}
+
+// User metadata
+message UserMeta {
+    string user_id = 1;
+    string display_name = 2;
+    string arn = 3;
+    UserStatus status = 4;
+    uint64 created_at = 5;
+    string email = 6;
+    string tenant = 7;              // Owning tenant (empty = system tenant)
+    // IAM path, "/" or "/a/b/": in the ARN between "user" and the name.
+    // Empty means "/". Written from format level 3.
+    string path = 8;
+}
+
+// Access key metadata
+message AccessKeyMeta {
+    string access_key_id = 1;
+    string secret_access_key = 2;   // Only returned on creation
+    string user_id = 3;
+    KeyStatus status = 4;
+    uint64 created_at = 5;
+    string tenant = 6;              // Inherited from user's tenant
+    // Bucket/prefix this key is confined to, as "s3://bucket/prefix/".
+    // Empty = unscoped. Narrowing only: it subtracts from the owning user's
+    // permissions and can never add to them.
+    string scope = 7;
+    KeyOperation operation = 8;     // Applies with or without a scope
+}
+
+// Create user
+message CreateUserRequest {
+    string display_name = 1;
+    string email = 2;
+    string tenant = 3;              // Assign user to tenant (empty = system tenant)
+    string path = 4;                // IAM path (empty = "/"); level 3
+}
+
+message CreateUserResponse {
+    UserMeta user = 1;
+}
+
+// Get user
+message GetUserRequest {
+    string user_id = 1;
+}
+
+message GetUserResponse {
+    UserMeta user = 1;
+}
+
+// List users
+message ListUsersRequest {
+    uint32 max_results = 1;
+    string marker = 2;
+}
+
+message ListUsersResponse {
+    repeated UserMeta users = 1;
+    string next_marker = 2;
+    bool is_truncated = 3;
+}
+
+// Delete user
+message DeleteUserRequest {
+    string user_id = 1;
+}
+
+message DeleteUserResponse {
+    bool success = 1;
+}
+
+// Create access key
+message CreateAccessKeyRequest {
+    string user_id = 1;
+    string scope = 2;               // Optional "s3://bucket/prefix/"
+    KeyOperation operation = 3;     // Defaults to READ_WRITE
+}
+
+message CreateAccessKeyResponse {
+    AccessKeyMeta access_key = 1;   // Includes secret_access_key
+}
+
+// List access keys
+message ListAccessKeysRequest {
+    string user_id = 1;
+}
+
+message ListAccessKeysResponse {
+    repeated AccessKeyMeta access_keys = 1;  // secret_access_key is empty
+}
+
+// Delete access key
+message DeleteAccessKeyRequest {
+    string access_key_id = 1;
+}
+
+message DeleteAccessKeyResponse {
+    bool success = 1;
+}
+
+// Get access key for authentication (includes secret for verification)
+message GetAccessKeyRequest {
+    string access_key_id = 1;
+}
+
+message GetAccessKeyResponse {
+    bool found = 1;
+    AccessKeyMeta access_key = 2;   // secret_access_key always empty
+}
+
+message GetAccessKeyForAuthRequest {
+    string access_key_id = 1;
+}
+
+message GetAccessKeyForAuthResponse {
+    AccessKeyMeta access_key = 1;   // Includes secret_access_key
+    UserMeta user = 2;
+}
+
+// ============ Iceberg Catalog Messages ============
+
+// Iceberg namespace (multi-level, e.g. ["db1", "schema1"])
+message IcebergNamespace {
+    repeated string levels = 1;
+}
+
+// Iceberg table identifier
+message IcebergTableIdentifier {
+    repeated string namespace_levels = 1;
+    string name = 2;
+}
+
+// Iceberg table entry stored in meta
+message IcebergTableEntry {
+    string metadata_location = 1;   // S3 URL to metadata.json
+    uint64 created_at = 2;
+    uint64 updated_at = 3;
+    bytes metadata_json = 4;        // Full table metadata JSON
+    bytes policy_json = 5;          // Optional: IAM-style access policy JSON
+}
+
+// ---- Namespace RPCs ----
+
+message IcebergCreateNamespaceRequest {
+    repeated string namespace_levels = 1;
+    map<string, string> properties = 2;
+    string warehouse = 10;
+}
+
+message IcebergCreateNamespaceResponse {
+    repeated string namespace_levels = 1;
+    map<string, string> properties = 2;
+}
+
+message IcebergLoadNamespaceRequest {
+    repeated string namespace_levels = 1;
+    string warehouse = 10;
+}
+
+message IcebergLoadNamespaceResponse {
+    repeated string namespace_levels = 1;
+    map<string, string> properties = 2;
+}
+
+message IcebergDropNamespaceRequest {
+    repeated string namespace_levels = 1;
+    string warehouse = 10;
+}
+
+message IcebergDropNamespaceResponse {
+    bool success = 1;
+}
+
+message IcebergListNamespacesRequest {
+    repeated string parent_levels = 1;  // empty = list top-level
+    string page_token = 2;
+    uint32 page_size = 3;
+    string warehouse = 10;
+}
+
+message IcebergListNamespacesResponse {
+    repeated IcebergNamespace namespaces = 1;
+    string next_page_token = 2;
+}
+
+message IcebergUpdateNamespacePropertiesRequest {
+    repeated string namespace_levels = 1;
+    repeated string removals = 2;
+    map<string, string> updates = 3;
+    string warehouse = 10;
+}
+
+message IcebergUpdateNamespacePropertiesResponse {
+    repeated string updated = 1;
+    repeated string removed = 2;
+    repeated string missing = 3;    // keys requested for removal that didn't exist
+}
+
+message IcebergNamespaceExistsRequest {
+    repeated string namespace_levels = 1;
+    string warehouse = 10;
+}
+
+message IcebergNamespaceExistsResponse {
+    bool exists = 1;
+}
+
+// ---- Table RPCs ----
+
+message IcebergCreateTableRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string metadata_location = 3;   // S3 URL to initial metadata.json
+    bytes metadata_json = 4;        // Full table metadata JSON
+    string warehouse = 10;
+}
+
+message IcebergCreateTableResponse {
+    string metadata_location = 1;
+    bytes metadata_json = 2;        // Stored metadata JSON echoed back
+}
+
+message IcebergLoadTableRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string warehouse = 10;
+}
+
+message IcebergLoadTableResponse {
+    string metadata_location = 1;
+    bytes metadata_json = 2;        // Stored metadata JSON
+}
+
+message IcebergCommitTableRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string current_metadata_location = 3;   // Expected (CAS)
+    string new_metadata_location = 4;       // Desired
+    bytes new_metadata_json = 5;            // New metadata JSON to store
+    string warehouse = 10;
+}
+
+message IcebergCommitTableResponse {
+    string metadata_location = 1;
+    bytes metadata_json = 2;                // Stored metadata JSON
+}
+
+// One table's piece of an atomic multi-table transaction.
+message IcebergCommitTableChange {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string current_metadata_location = 3;   // Expected (CAS). Empty = must not exist.
+    string new_metadata_location = 4;
+    bytes new_metadata_json = 5;
+}
+
+// Atomic multi-table commit. Every table-change's expected location must
+// match, or the whole transaction aborts with no writes landed. Mapped to
+// a single Raft MultiCas by the meta service, so every follower sees the
+// commit at the same log position.
+message IcebergCommitTransactionRequest {
+    string warehouse = 1;
+    repeated IcebergCommitTableChange table_changes = 2;
+}
+
+message IcebergCommitTransactionResponse {
+    // Same length + order as the request's `table_changes`.
+    repeated IcebergCommitTableResponse committed = 1;
+}
+
+message IcebergDropTableRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    bool purge = 3;
+    string warehouse = 10;
+}
+
+message IcebergDropTableResponse {
+    bool success = 1;
+}
+
+message IcebergRenameTableRequest {
+    IcebergTableIdentifier source = 1;
+    IcebergTableIdentifier destination = 2;
+}
+
+message IcebergRenameTableResponse {
+    bool success = 1;
+}
+
+message IcebergListTablesRequest {
+    repeated string namespace_levels = 1;
+    string page_token = 2;
+    uint32 page_size = 3;
+    string warehouse = 10;
+}
+
+message IcebergListTablesResponse {
+    repeated IcebergTableIdentifier identifiers = 1;
+    string next_page_token = 2;
+}
+
+message IcebergTableExistsRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string warehouse = 10;
+}
+
+message IcebergTableExistsResponse {
+    bool exists = 1;
+}
+
+// ---- Table policy RPCs ----
+
+message IcebergSetTablePolicyRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    bytes policy_json = 3;
+}
+
+message IcebergSetTablePolicyResponse {
+    bool success = 1;
+}
+
+message IcebergGetTablePolicyRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+}
+
+message IcebergGetTablePolicyResponse {
+    bytes policy_json = 1;
+}
+
+// ============ Group Messages ============
+
+message GroupMeta {
+    string group_id = 1;
+    string group_name = 2;
+    string arn = 3;
+    repeated string member_user_ids = 4;
+    uint64 created_at = 5;
+    // The tenant that owns it (empty = system scope), as in its ARN's
+    // account segment: arn:obio:iam::<tenant|objectio>:group/<name>.
+    string tenant = 6;
+    string path = 7;        // IAM path (empty = "/"); level 3
+}
+
+message CreateGroupRequest {
+    string group_name = 1;
+    string tenant = 2;      // empty = system scope; names are unique per tenant
+    string path = 3;        // IAM path (empty = "/"); level 3
+}
+
+// Rename a group or move it to another path (level 3). Its id, members
+// and attachments stay.
+message UpdateGroupRequest {
+    string group_id = 1;
+    optional string group_name = 2;
+    optional string path = 3;
+}
+message UpdateGroupResponse { GroupMeta group = 1; }
+
+message CreateGroupResponse {
+    GroupMeta group = 1;
+}
+
+message DeleteGroupRequest {
+    string group_id = 1;
+}
+
+message DeleteGroupResponse {
+    bool success = 1;
+}
+
+message ListGroupsRequest {
+    uint32 max_results = 1;
+    string marker = 2;
+}
+
+message ListGroupsResponse {
+    repeated GroupMeta groups = 1;
+    string next_marker = 2;
+    bool is_truncated = 3;
+}
+
+message AddUserToGroupRequest {
+    string group_id = 1;
+    string user_id = 2;
+}
+
+message AddUserToGroupResponse {
+    bool success = 1;
+}
+
+message RemoveUserFromGroupRequest {
+    string group_id = 1;
+    string user_id = 2;
+}
+
+message RemoveUserFromGroupResponse {
+    bool success = 1;
+}
+
+message GetUserGroupsRequest {
+    string user_id = 1;
+}
+
+message GetUserGroupsResponse {
+    repeated GroupMeta groups = 1;
+}
+
+// ============ Iceberg Data Filter Messages ============
+
+message IcebergDataFilter {
+    string filter_id = 1;
+    string filter_name = 2;
+    repeated string namespace_levels = 3;
+    string table_name = 4;
+    repeated string principal_arns = 5;
+    repeated string allowed_columns = 6;
+    repeated string excluded_columns = 7;
+    string row_filter_expression = 8;
+    uint64 created_at = 9;
+    uint64 updated_at = 10;
+}
+
+message CreateDataFilterRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string filter_name = 3;
+    repeated string principal_arns = 4;
+    repeated string allowed_columns = 5;
+    repeated string excluded_columns = 6;
+    string row_filter_expression = 7;
+}
+
+message CreateDataFilterResponse {
+    IcebergDataFilter filter = 1;
+}
+
+message ListDataFiltersRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+}
+
+message ListDataFiltersResponse {
+    repeated IcebergDataFilter filters = 1;
+}
+
+message DeleteDataFilterRequest {
+    string filter_id = 1;
+}
+
+message DeleteDataFilterResponse {
+    bool success = 1;
+}
+
+message GetDataFiltersForPrincipalRequest {
+    repeated string namespace_levels = 1;
+    string table_name = 2;
+    string principal_arn = 3;
+    repeated string group_arns = 4;
+}
+
+// ============================================================
+// Delta Sharing Protocol Messages
+// ============================================================
+
+// A Share is a named collection of Iceberg namespace+table pairs shared with recipients.
+message DeltaShareEntry {
+    string name    = 1;
+    string comment = 2;
+    int64  created_at = 3;
+    string tenant  = 4;     // Owning tenant (empty = system)
+}
+
+// A table inside a share. Schema maps to an Iceberg namespace; name maps to an Iceberg table.
+message DeltaShareTableEntry {
+    string share              = 1;
+    string schema             = 2;   // Iceberg namespace (first-level)
+    string table_name         = 3;   // Iceberg table name
+    string share_id           = 4;   // stable UUID for delta-sharing responses
+    string table_type         = 5;   // "delta", "uniform" (Iceberg via Delta Sharing), or empty (default: infer)
+    string bucket             = 6;   // For delta tables: S3 bucket containing Delta Lake files
+    string path               = 7;   // For delta tables: path within bucket to Delta table root
+    string warehouse          = 8;   // For uniform/iceberg tables: warehouse name
+    string namespace          = 9;   // For uniform/iceberg tables: full namespace (dot-separated)
+}
+
+// A recipient identified by a bearer token (stored as bcrypt hash).
+message DeltaRecipientEntry {
+    string name          = 1;
+    // bcrypt hash of the bearer token; the raw token is returned only once at creation time
+    string token_hash    = 2;
+    repeated string shares = 3;
+    int64  created_at    = 4;
+}
+
+// ---- Share RPCs ----
+
+message DeltaCreateShareRequest {
+    string name    = 1;
+    string comment = 2;
+    string tenant  = 3;
+}
+message DeltaCreateShareResponse {
+    DeltaShareEntry share = 1;
+}
+
+message DeltaGetShareRequest {
+    string name = 1;
+}
+message DeltaGetShareResponse {
+    DeltaShareEntry share = 1;
+}
+
+message DeltaListSharesRequest {
+    uint32 max_results       = 1;
+    string page_token        = 2;
+    string tenant            = 3;   // Filter by tenant (empty = all)
+}
+message DeltaListSharesResponse {
+    repeated DeltaShareEntry shares = 1;
+    string next_page_token          = 2;
+}
+
+message DeltaDropShareRequest {
+    string name = 1;
+}
+message DeltaDropShareResponse {
+    bool success = 1;
+}
+
+// ---- Table RPCs ----
+
+message DeltaAddTableRequest {
+    string share      = 1;
+    string schema     = 2;
+    string table_name = 3;
+    string table_type = 4;   // "delta" or "uniform" (Iceberg)
+    string bucket     = 5;   // For delta: S3 bucket
+    string path       = 6;   // For delta: path to Delta table root
+    string warehouse  = 7;   // For uniform: warehouse name
+    string namespace  = 8;   // For uniform: full namespace
+}
+message DeltaAddTableResponse {
+    DeltaShareTableEntry table = 1;
+}
+
+message DeltaRemoveTableRequest {
+    string share      = 1;
+    string schema     = 2;
+    string table_name = 3;
+}
+message DeltaRemoveTableResponse {
+    bool success = 1;
+}
+
+message DeltaListTablesRequest {
+    string share        = 1;
+    string schema       = 2;   // optional: filter by schema
+    uint32 max_results  = 3;
+    string page_token   = 4;
+}
+message DeltaListTablesResponse {
+    repeated DeltaShareTableEntry tables = 1;
+    string next_page_token               = 2;
+}
+
+// ---- Recipient RPCs ----
+
+message DeltaCreateRecipientRequest {
+    string name             = 1;
+    repeated string shares  = 2;
+}
+message DeltaCreateRecipientResponse {
+    DeltaRecipientEntry recipient  = 1;
+    // Raw bearer token (returned once; not stored in plain text)
+    string              raw_token  = 2;
+}
+
+message DeltaGetRecipientByTokenRequest {
+    // Raw bearer token presented in the Authorization header
+    string raw_token = 1;
+}
+message DeltaGetRecipientByTokenResponse {
+    DeltaRecipientEntry recipient = 1;
+    bool                found     = 2;
+}
+
+message DeltaListRecipientsRequest {
+    uint32 max_results = 1;
+    string page_token  = 2;
+}
+message DeltaListRecipientsResponse {
+    repeated DeltaRecipientEntry recipients = 1;
+    string next_page_token                  = 2;
+}
+
+message DeltaDropRecipientRequest {
+    string name = 1;
+}
+message DeltaDropRecipientResponse {
+    bool success = 1;
+}
+
+// ============================================================
+// Unity Catalog REST API Messages
+// ============================================================
+
+// Top-level Unity catalog. Auto-provisions a backing bucket "unity-{name}"
+// for MANAGED tables; EXTERNAL tables may live in any bucket.
+message UnityCatalog {
+    string name        = 1;          // Globally unique catalog name (first level of catalog.schema.table)
+    string comment     = 2;
+    string owner       = 3;          // Principal that owns the catalog
+    string bucket      = 4;          // Backing bucket for MANAGED tables (auto: "unity-{name}")
+    string location    = 5;          // s3://{bucket} root for managed storage
+    uint64 created_at  = 6;
+    uint64 updated_at  = 7;
+    map<string, string> properties = 8;
+    string tenant      = 9;          // Owning tenant (empty = system)
+    bytes  policy_json = 10;         // Catalog-level access policy (JSON-serialized BucketPolicy)
+}
+
+// Schema (second level). Belongs to exactly one catalog.
+message UnitySchema {
+    string catalog_name = 1;
+    string name         = 2;         // Schema name within the catalog
+    string comment      = 3;
+    string owner        = 4;
+    uint64 created_at   = 5;
+    uint64 updated_at   = 6;
+    map<string, string> properties = 7;
+    bytes  policy_json  = 8;         // Schema-level access policy
+}
+
+// Table (third level). MANAGED tables auto-derive storage_location under the
+// catalog's bucket; EXTERNAL tables accept a caller-supplied location.
+message UnityTable {
+    string catalog_name       = 1;
+    string schema_name        = 2;
+    string name               = 3;
+    string table_id           = 4;   // Stable UUID (server-assigned at create)
+    string table_type         = 5;   // "MANAGED" | "EXTERNAL" | "VIEW"
+    string data_source_format = 6;   // "DELTA" | "ICEBERG" | "PARQUET" | "CSV" | "JSON"
+    string storage_location   = 7;   // Full S3 URL (s3://bucket/key/)
+    string columns_json       = 8;   // JSON-serialized Vec<UnityColumn> (column metadata)
+    string owner              = 9;
+    uint64 created_at         = 10;
+    uint64 updated_at         = 11;
+    map<string, string> properties = 12;
+    bytes  policy_json        = 13;  // Table-level access policy
+    // Row filter binding — UDF (catalog.schema.function_name) returning
+    // BOOLEAN. Engine injects `WHERE function_name(input_columns)` into
+    // every read of this table. Empty = no row filter.
+    UnityRowFilter row_filter   = 14;
+    // Column masks — per-column UDF transformation. Engine wraps every
+    // read of `column_name` with `function_name(column_name, ...using_cols)`.
+    // Map key = column name. Empty = no masks.
+    map<string, UnityColumnMask> column_masks = 15;
+}
+
+message UnityRowFilter {
+    // Fully-qualified function name: "catalog.schema.function".
+    string function_full_name = 1;
+    // Column names from the bound table that are passed to the function as
+    // arguments. Order matches the function's parameter list.
+    repeated string input_column_names = 2;
+}
+
+message UnityColumnMask {
+    // Fully-qualified function name: "catalog.schema.function".
+    string function_full_name = 1;
+    // Optional extra columns the mask function reads (besides the masked
+    // column itself, which is always the first argument).
+    repeated string using_column_names = 2;
+}
+
+// ---- Catalog RPCs ----
+
+message UnityCreateCatalogRequest {
+    string name    = 1;
+    string comment = 2;
+    string owner   = 3;
+    string tenant  = 4;
+    map<string, string> properties = 5;
+}
+message UnityCreateCatalogResponse {
+    UnityCatalog catalog = 1;
+}
+
+message UnityListCatalogsRequest {
+    uint32 max_results = 1;
+    string page_token  = 2;
+    string tenant      = 3;          // Empty = list all
+}
+message UnityListCatalogsResponse {
+    repeated UnityCatalog catalogs = 1;
+    string next_page_token         = 2;
+}
+
+message UnityGetCatalogRequest {
+    string name = 1;
+}
+message UnityGetCatalogResponse {
+    UnityCatalog catalog = 1;
+}
+
+message UnityUpdateCatalogRequest {
+    string name        = 1;
+    string new_comment = 2;          // empty = leave unchanged
+    string new_owner   = 3;
+    map<string, string> properties = 4; // full replacement (Unity PATCH semantics)
+}
+message UnityUpdateCatalogResponse {
+    UnityCatalog catalog = 1;
+}
+
+message UnityDeleteCatalogRequest {
+    string name  = 1;
+    bool   force = 2;                // If true, drop even if schemas exist
+}
+message UnityDeleteCatalogResponse {
+    bool success = 1;
+}
+
+// ---- Schema RPCs ----
+
+message UnityCreateSchemaRequest {
+    string catalog_name = 1;
+    string name         = 2;
+    string comment      = 3;
+    string owner        = 4;
+    map<string, string> properties = 5;
+}
+message UnityCreateSchemaResponse {
+    UnitySchema schema = 1;
+}
+
+message UnityListSchemasRequest {
+    string catalog_name = 1;
+    uint32 max_results  = 2;
+    string page_token   = 3;
+}
+message UnityListSchemasResponse {
+    repeated UnitySchema schemas = 1;
+    string next_page_token       = 2;
+}
+
+message UnityGetSchemaRequest {
+    string catalog_name = 1;
+    string name         = 2;
+}
+message UnityGetSchemaResponse {
+    UnitySchema schema = 1;
+}
+
+message UnityUpdateSchemaRequest {
+    string catalog_name = 1;
+    string name         = 2;
+    string new_comment  = 3;
+    string new_owner    = 4;
+    map<string, string> properties = 5;
+}
+message UnityUpdateSchemaResponse {
+    UnitySchema schema = 1;
+}
+
+message UnityDeleteSchemaRequest {
+    string catalog_name = 1;
+    string name         = 2;
+    bool   force        = 3;         // If true, drop even if tables exist
+}
+message UnityDeleteSchemaResponse {
+    bool success = 1;
+}
+
+// ---- Table RPCs ----
+
+message UnityCreateTableRequest {
+    string catalog_name       = 1;
+    string schema_name        = 2;
+    string name               = 3;
+    string table_type         = 4;   // "MANAGED" | "EXTERNAL"
+    string data_source_format = 5;   // "DELTA" (default) | "ICEBERG" | ...
+    string storage_location   = 6;   // Required for EXTERNAL; ignored for MANAGED
+    string columns_json       = 7;
+    string owner              = 8;
+    map<string, string> properties = 9;
+}
+message UnityCreateTableResponse {
+    UnityTable table = 1;
+}
+
+message UnityListTablesRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    uint32 max_results  = 3;
+    string page_token   = 4;
+}
+message UnityListTablesResponse {
+    repeated UnityTable tables = 1;
+    string next_page_token     = 2;
+}
+
+message UnityGetTableRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityGetTableResponse {
+    UnityTable table = 1;
+}
+
+message UnityDeleteTableRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityDeleteTableResponse {
+    bool success = 1;
+}
+
+// ---- Table-security (row filter / column masks) bindings ----
+//
+// Set-and-replace semantics: every call replaces the table's bindings with
+// what's in the request. To clear, send a request with empty `row_filter`
+// and empty `column_masks`. Validated server-side (function must exist in
+// the catalog and return BOOLEAN for row filter, etc.).
+message UnitySetTableSecurityRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+    UnityRowFilter row_filter = 4;
+    map<string, UnityColumnMask> column_masks = 5;
+}
+
+message UnitySetTableSecurityResponse {
+    UnityTable table = 1;
+}
+
+// ---- Policy RPCs (mirroring IcebergSetTablePolicy / IcebergGetTablePolicy) ----
+
+message UnitySetCatalogPolicyRequest {
+    string catalog_name = 1;
+    bytes  policy_json  = 2;
+}
+message UnitySetCatalogPolicyResponse {
+    bool success = 1;
+}
+
+message UnityGetCatalogPolicyRequest {
+    string catalog_name = 1;
+}
+message UnityGetCatalogPolicyResponse {
+    bytes policy_json = 1;
+}
+
+message UnitySetSchemaPolicyRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    bytes  policy_json  = 3;
+}
+message UnitySetSchemaPolicyResponse {
+    bool success = 1;
+}
+
+message UnityGetSchemaPolicyRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+}
+message UnityGetSchemaPolicyResponse {
+    bytes policy_json = 1;
+}
+
+message UnitySetTablePolicyRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string table_name   = 3;
+    bytes  policy_json  = 4;
+}
+message UnitySetTablePolicyResponse {
+    bool success = 1;
+}
+
+message UnityGetTablePolicyRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string table_name   = 3;
+}
+message UnityGetTablePolicyResponse {
+    bytes policy_json = 1;
+}
+
+// ============================================================
+// Unity Catalog — Functions / Volumes / Models
+// ============================================================
+// These mirror the table layout (catalog → schema → entity) so handlers
+// reuse the existing catalog/schema lookups + policy chain. Each entity
+// is keyed by `{catalog}\x00{schema}\x00{name}` in its meta table.
+
+// ---- Functions (UDFs) ----
+// Pure metadata. No backing storage; the function source ships to the
+// query engine (Spark / Trino / Databricks SQL) which executes it.
+//
+// Field names track the Databricks Unity Catalog REST spec exactly so
+// the official Databricks SDK client works against this surface
+// unmodified:
+//   * `routine_definition` carries the source text (the SQL/code)
+//   * `routine_body` carries the dispatch flag: "SQL" | "EXTERNAL"
+//   * `external_language` carries the runtime language for EXTERNAL bodies
+//     (e.g. "PYTHON"); empty for SQL.
+message UnityFunction {
+    string catalog_name      = 1;
+    string schema_name       = 2;
+    string name              = 3;
+    string function_id       = 4;   // Server-assigned UUID
+    string routine_definition = 5;  // Source text — the SQL/code body
+    string routine_body      = 6;   // "SQL" | "EXTERNAL"
+    string external_language = 7;   // Runtime for EXTERNAL bodies, e.g. "PYTHON"
+    string data_type         = 8;   // Return type, e.g. "STRING" / "INT"
+    string full_data_type    = 9;   // Verbose form, e.g. "DECIMAL(10,2)"
+    string parameter_style   = 10;  // "S" (SQL standard) is the only common value
+    bool   is_deterministic  = 11;
+    string sql_data_access   = 12;  // "CONTAINS_SQL" | "READS_SQL_DATA" | "MODIFIES_SQL_DATA" | "NO_SQL"
+    bool   is_null_call      = 13;
+    string security_type     = 14;  // "DEFINER" | "INVOKER"
+    string specific_name     = 15;  // Used by Spark — usually equals `name`
+    string input_params_json = 16;  // JSON: {"parameters": [...]} per Databricks spec
+    string return_params_json = 17; // JSON: {"parameters": [...]} per Databricks spec
+    string comment           = 18;
+    string owner             = 19;
+    uint64 created_at        = 20;
+    uint64 updated_at        = 21;
+    map<string, string> properties = 22;
+}
+
+message UnityCreateFunctionRequest {
+    string catalog_name      = 1;
+    string schema_name       = 2;
+    string name              = 3;
+    string routine_definition = 4;
+    string routine_body      = 5;   // "SQL" | "EXTERNAL"
+    string external_language = 6;
+    string data_type         = 7;
+    string full_data_type    = 8;
+    string parameter_style   = 9;
+    bool   is_deterministic  = 10;
+    string sql_data_access   = 11;
+    bool   is_null_call      = 12;
+    string security_type     = 13;
+    string specific_name     = 14;
+    string input_params_json = 15;
+    string return_params_json = 16;
+    string comment           = 17;
+    string owner             = 18;
+    map<string, string> properties = 19;
+}
+message UnityCreateFunctionResponse { UnityFunction function = 1; }
+
+message UnityListFunctionsRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    uint32 max_results  = 3;
+    string page_token   = 4;
+}
+message UnityListFunctionsResponse {
+    repeated UnityFunction functions = 1;
+    string next_page_token            = 2;
+}
+
+message UnityGetFunctionRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityGetFunctionResponse { UnityFunction function = 1; }
+
+message UnityDeleteFunctionRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityDeleteFunctionResponse { bool success = 1; }
+
+// ---- Volumes ----
+// Governed S3 prefixes for non-tabular data (model artifacts, training
+// inputs, libraries). MANAGED → server-derived `unity-{catalog}/{schema}/__volumes/{name}/`;
+// EXTERNAL → caller-supplied location.
+message UnityVolume {
+    string catalog_name     = 1;
+    string schema_name      = 2;
+    string name             = 3;
+    string volume_id        = 4;     // Server-assigned UUID
+    string volume_type      = 5;     // "MANAGED" | "EXTERNAL"
+    string storage_location = 6;     // s3://bucket/prefix/
+    string comment          = 7;
+    string owner            = 8;
+    uint64 created_at       = 9;
+    uint64 updated_at       = 10;
+    map<string, string> properties = 11;
+}
+
+message UnityCreateVolumeRequest {
+    string catalog_name     = 1;
+    string schema_name      = 2;
+    string name             = 3;
+    string volume_type      = 4;
+    string storage_location = 5;     // Required for EXTERNAL; ignored for MANAGED.
+    string comment          = 6;
+    string owner            = 7;
+    map<string, string> properties = 8;
+}
+message UnityCreateVolumeResponse { UnityVolume volume = 1; }
+
+message UnityListVolumesRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    uint32 max_results  = 3;
+    string page_token   = 4;
+}
+message UnityListVolumesResponse {
+    repeated UnityVolume volumes = 1;
+    string next_page_token        = 2;
+}
+
+message UnityGetVolumeRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityGetVolumeResponse { UnityVolume volume = 1; }
+
+message UnityDeleteVolumeRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityDeleteVolumeResponse { bool success = 1; }
+
+// ---- Models (registered ML models) + Versions ----
+// MLflow-shaped two-level entity. The Model has metadata; each
+// ModelVersion points at a `source` URI containing the artifacts. We do
+// not host the artifacts — same pattern as Tables/Volumes, just
+// version-aware.
+message UnityModel {
+    string catalog_name     = 1;
+    string schema_name      = 2;
+    string name             = 3;
+    string model_id         = 4;     // Server-assigned UUID
+    string storage_location = 5;     // Default `s3://unity-{catalog}/{schema}/__models/{name}/` for MANAGED
+    string comment          = 6;
+    string owner            = 7;
+    uint64 created_at       = 8;
+    uint64 updated_at       = 9;
+    map<string, string> properties = 10;
+}
+
+message UnityModelVersion {
+    string catalog_name     = 1;
+    string schema_name      = 2;
+    string model_name       = 3;
+    uint32 version          = 4;     // 1-indexed, monotonic per model
+    string version_id       = 5;     // Server-assigned UUID
+    string source           = 6;     // s3://… URI of the artifact dir
+    string run_id           = 7;     // External tracking ID (MLflow run)
+    string status           = 8;     // "PENDING_REGISTRATION" | "READY" | "FAILED_REGISTRATION"
+    string description      = 9;
+    uint64 created_at       = 10;
+    uint64 updated_at       = 11;
+    map<string, string> properties = 12;
+}
+
+message UnityCreateModelRequest {
+    string catalog_name     = 1;
+    string schema_name      = 2;
+    string name             = 3;
+    string storage_location = 4;     // Empty → MANAGED, server-derived
+    string comment          = 5;
+    string owner            = 6;
+    map<string, string> properties = 7;
+}
+message UnityCreateModelResponse { UnityModel model = 1; }
+
+message UnityListModelsRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    uint32 max_results  = 3;
+    string page_token   = 4;
+}
+message UnityListModelsResponse {
+    repeated UnityModel models = 1;
+    string next_page_token      = 2;
+}
+
+message UnityGetModelRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityGetModelResponse { UnityModel model = 1; }
+
+message UnityDeleteModelRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string name         = 3;
+}
+message UnityDeleteModelResponse { bool success = 1; }
+
+message UnityCreateModelVersionRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string model_name   = 3;
+    string source       = 4;
+    string run_id       = 5;
+    string description  = 6;
+    map<string, string> properties = 7;
+}
+message UnityCreateModelVersionResponse { UnityModelVersion version = 1; }
+
+message UnityListModelVersionsRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string model_name   = 3;
+    uint32 max_results  = 4;
+    string page_token   = 5;
+}
+message UnityListModelVersionsResponse {
+    repeated UnityModelVersion versions = 1;
+    string next_page_token               = 2;
+}
+
+message UnityGetModelVersionRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string model_name   = 3;
+    uint32 version      = 4;
+}
+message UnityGetModelVersionResponse { UnityModelVersion version = 1; }
+
+message UnityUpdateModelVersionStatusRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string model_name   = 3;
+    uint32 version      = 4;
+    string new_status   = 5;
+}
+message UnityUpdateModelVersionStatusResponse { UnityModelVersion version = 1; }
+
+message UnityDeleteModelVersionRequest {
+    string catalog_name = 1;
+    string schema_name  = 2;
+    string model_name   = 3;
+    uint32 version      = 4;
+}
+message UnityDeleteModelVersionResponse { bool success = 1; }
+
+// ============ Cluster Configuration ============
+
+message ConfigEntry {
+    string key = 1;           // Hierarchical key: "identity/openid/keycloak", "cluster/region"
+    bytes value = 2;          // JSON-encoded config value
+    uint64 updated_at = 3;    // Unix timestamp of last update
+    string updated_by = 4;    // user_id or "system" for CLI defaults
+    uint64 version = 5;       // Monotonically increasing version for change detection
+}
+
+message GetConfigRequest {
+    string key = 1;
+}
+message GetConfigResponse {
+    ConfigEntry entry = 1;
+    bool found = 2;
+}
+
+message SetConfigRequest {
+    string key = 1;
+    bytes value = 2;
+    string updated_by = 3;
+}
+message SetConfigResponse {
+    ConfigEntry entry = 1;
+}
+
+message DeleteConfigRequest {
+    string key = 1;
+}
+message DeleteConfigResponse {
+    bool success = 1;
+}
+
+message ListConfigRequest {
+    string prefix = 1;        // e.g. "identity/openid" lists all OIDC providers
+}
+message ListConfigResponse {
+    repeated ConfigEntry entries = 1;
+}
+
+// ============ Server Pools ============
+
+// A pool is a named group of OSDs with its own EC config and placement rules.
+// Pools are shared infrastructure — multiple tenants can use the same pool.
+message PoolConfig {
+    string name = 1;                      // Unique pool name (e.g. "default", "fast-nvme", "archive")
+    ErasureType ec_type = 2;              // MDS, LRC, or Replication
+    uint32 ec_k = 3;                      // Data shards
+    uint32 ec_m = 4;                      // Parity shards (MDS) or total parity (LRC)
+    uint32 ec_local_parity = 5;           // LRC local parity per group
+    uint32 ec_global_parity = 6;          // LRC global parity
+    uint32 replication_count = 7;         // Replication factor (if type=Replication)
+    repeated string osd_tags = 8;         // Only place data on OSDs with matching tags (empty = all)
+    string failure_domain = 9;            // Minimum failure domain separation: "rack", "node", "datacenter"
+    uint64 quota_bytes = 10;              // Pool-level capacity quota (0 = unlimited)
+    string description = 11;
+    bool enabled = 12;
+    uint64 created_at = 13;
+    uint64 updated_at = 14;
+
+    // Placement-group knobs. pg_count is fixed at pool creation —
+    // growable pg_count is a v2 feature. tier selects the storage
+    // class the balancer places this pool's PGs on ("nvme" / "ssd" /
+    // "hdd" / "cold"). Empty tier = no constraint.
+    // pg_count = 0 places each object directly (per-object CRUSH, no
+    // placement groups): the default.
+    uint32 pg_count = 15;
+    string tier = 16;
+
+    // Placement rule (B31 phase 1b, objectio-docs core/pg-recovery.md): a
+    // PG's copies over `spread_domains` domains at `failure_domain`, at
+    // most `per_domain` in one, on distinct hosts above the host level.
+    // 0 and 0: one copy per domain, as many domains as copies. With
+    // `lrc_groups_per_domain`, an LRC pool keeps each local group (its
+    // data and its local parity) in a domain of its own, and its global
+    // parity in others: a lost shard is rebuilt from inside its domain.
+    uint32 spread_domains = 17;
+    uint32 per_domain = 18;
+    bool lrc_groups_per_domain = 19;
+}
+
+// One placement group (B31, objectio-docs core/pg-recovery.md). A key maps
+// to its PG by jump-hash(xxh64("{bucket}/{key}"), pg_count); its copies are
+// the PG's acting set. Every change of `acting` is one Raft commit that
+// raises `epoch`, made before any write uses it; OSDs refuse a request
+// placed under an older epoch.
+message PlacementGroup {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // Where the PG's objects are and where writes go: one OSD per
+    // position (index 0 = first data shard).
+    repeated bytes acting = 3;
+    // Raised with every change of `acting`.
+    uint64 epoch = 4;
+    uint64 updated_at = 5;
+    reserved 6, 7, 8;
+    // Where the balancer wants the PG. Acting follows it only once the
+    // data is copied (recovery, a later phase); until then the two differ.
+    repeated bytes up = 9;
+    // Positions whose acting member stands in for one that couldn't take
+    // writes, and doesn't yet hold the PG's existing objects' metadata.
+    repeated PgFill filling = 10;
+}
+
+message PgFill {
+    uint32 position = 1;
+    // The member it stands in for.
+    bytes from = 2;
+    // The epoch that made the change.
+    uint64 epoch = 3;
+}
+
+message GetPlacementGroupRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message GetPlacementGroupResponse {
+    PlacementGroup pg = 1;
+    bool found = 2;
+    // What peering last found (B31 phase 2); unset if it hasn't run yet.
+    PgState state = 3;
+    // Its scrub (B31 phase 4); unset if none has run.
+    PgScrub scrub = 4;
+}
+message ListPlacementGroupsRequest {
+    string pool = 1;
+    // The first PG to list (0, the default, lists from the start). It was
+    // `start_after`, exclusive, so PG 0 could never be listed.
+    uint32 start_at_pg_id = 2;
+    uint32 max_results = 3;           // 0 = default 1000
+}
+message ListPlacementGroupsResponse {
+    repeated PlacementGroup pgs = 1;
+    uint32 next_pg_id = 2;            // the next page's start_at; 0 = end of list
+    // What peering last found for each PG listed that it has run on.
+    repeated PgState states = 3;
+    // Each listed PG's scrub, where one has run or is running.
+    repeated PgScrub scrubs = 4;
+}
+
+message RequestPgScrubRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message RequestPgScrubResponse {}
+
+// A placement group's scrub (B31 phase 4): how far it got through each
+// member, so a new leader resumes, and when it last went through all of
+// them. Kept in Raft table `pg_scrub`.
+message PgScrub {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // The epoch the cursors are for: another starts the scrub again.
+    uint64 epoch = 3;
+    // Per member (hex node id): the last entry scrubbed; a member with
+    // none is not started, one in `done` is through.
+    map<string, string> cursors = 4;
+    repeated string done = 5;
+    // Unix s: when this scrub started, and when the last one finished.
+    uint64 started_at = 6;
+    uint64 last_complete = 7;
+    // In this scrub: shard bytes read, shards checked, shards bad.
+    uint64 bytes = 8;
+    uint64 shards = 9;
+    uint64 bad = 10;
+    // Asked for (RequestPgScrub): scrubbed before PGs merely due.
+    bool requested = 11;
+}
+
+// What peering found of a placement group (B31 phase 2, objectio-docs
+// core/pg-recovery.md): computed by the leader from its members' summaries
+// and, when they differ, their listings, and recovery's progress through it
+// (phase 3a). Kept in the Raft table `pg_state`, keyed
+// "{pool}\0{pg_id:010}", written when it changes.
+message PgState {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // Peering's: Clean, Degraded, Undersized, Incomplete or Down (most
+    // severe first: Down, Incomplete, Undersized, Degraded, Clean).
+    // Recovery's, while it works the PG: Recovering (members lack objects
+    // or shards), Backfilling (a member is being filled: a stand-in, or
+    // one the up set names), WaitTooFull (a member to fill is too full).
+    string state = 3;
+    // The PG's epoch when this was computed.
+    uint64 epoch = 4;
+    // Current objects (and tombstones) in the authoritative view.
+    uint64 objects = 5;
+    uint64 tombstones = 6;
+    // Objects some acting member lacks something of (its metadata copy,
+    // an up-to-date copy, or its shard).
+    uint64 objects_degraded = 7;
+    // Objects with fewer than k complete copies among the members that
+    // answered: unreadable if nothing else comes back.
+    uint64 objects_unfound = 8;
+    // (member, object) pairs: no metadata copy; an older one; shards
+    // the member should hold at its position and doesn't.
+    uint64 copies_missing = 9;
+    uint64 copies_stale = 10;
+    uint64 shards_missing = 11;
+    // Acting members that didn't answer.
+    uint32 members_down = 12;
+    // Acting != up (the balancer wants it elsewhere; recovery moves it).
+    bool remapped = 13;
+    // Whether the members agreed by summary alone (no listing needed).
+    bool by_summary = 14;
+    string last_error = 15;
+    // When the PG entered this state, and when this was computed (Unix s).
+    uint64 since = 16;
+    uint64 computed_at = 17;
+    repeated PgMemberState members = 18;
+
+    // Recovery (B31 phase 3a). The fewest copies to spare any object has:
+    // complete copies (a member holding the newest object and every shard
+    // at its position) beyond what a read needs. Recovery takes the PGs
+    // with the least first.
+    sint64 min_spare = 19;
+    // How far recovery got through the PG at `cursor_epoch`, in key order:
+    // every key up to `cursor` ("{bucket}\0{key}") is done. A new leader
+    // resumes from it; another epoch starts again.
+    string cursor = 20;
+    uint64 cursor_epoch = 21;
+    // Objects recovery has made whole in this PG, counted over every
+    // leader since it was last Clean; and what was left at the last count.
+    uint64 recovered = 22;
+    uint64 remaining = 23;
+    uint64 bytes_remaining = 24;
+    // OSDs recovery holds a reservation on for this PG.
+    repeated bytes reserved_on = 25;
+    // Keys ("{bucket}/{key}") recovery found unfound: fewer complete shards
+    // anywhere than a read needs. Up to 64; `objects_unfound` counts all.
+    repeated string unfound_keys = 26;
+    // While WaitTooFull: not tried again before this (Unix s).
+    uint64 retry_at = 27;
+}
+
+message PgMemberState {
+    bytes node_id = 1;
+    uint32 position = 2;
+    bool answered = 3;
+    uint64 copies_missing = 4;
+    uint64 copies_stale = 5;
+    uint64 shards_missing = 6;
+}
+
+message CreatePoolRequest { PoolConfig pool = 1; }
+message CreatePoolResponse { PoolConfig pool = 1; }
+
+message GetPoolRequest { string name = 1; }
+message GetPoolResponse { PoolConfig pool = 1; bool found = 2; }
+
+message ListPoolsRequest {}
+message ListPoolsResponse { repeated PoolConfig pools = 1; }
+
+message UpdatePoolRequest { PoolConfig pool = 1; }
+message UpdatePoolResponse { PoolConfig pool = 1; }
+
+message DeletePoolRequest { string name = 1; }
+message DeletePoolResponse { bool success = 1; }
+
+// ============ Tenants (Multi-tenancy) ============
+
+// A tenant is an isolation boundary for users, buckets, and access policies.
+// Tenants are assigned to pool(s) via configuration. The default pool is shared.
+message TenantConfig {
+    string name = 1;                      // Unique tenant name (e.g. "acme-corp", "team-analytics")
+    string display_name = 2;
+    string default_pool = 3;              // Default pool for new buckets in this tenant (empty = system default)
+    repeated string allowed_pools = 4;    // Pools this tenant may use (empty = all pools)
+    uint64 quota_bytes = 5;               // Tenant-level storage quota (0 = unlimited)
+    uint64 quota_buckets = 6;             // Max buckets for this tenant (0 = unlimited)
+    uint64 quota_objects = 7;             // Max objects across all buckets (0 = unlimited)
+    repeated string admin_users = 8;      // User ARNs with admin rights for this tenant
+    string oidc_provider = 9;             // OIDC provider name for this tenant's users (empty = any)
+    map<string, string> labels = 10;      // Arbitrary metadata labels
+    bool enabled = 11;
+    uint64 created_at = 12;
+    uint64 updated_at = 13;
+    DedupPolicy dedup = 14;               // Unset fields inherit from the cluster default
+}
+
+message CreateTenantRequest { TenantConfig tenant = 1; }
+message CreateTenantResponse { TenantConfig tenant = 1; }
+
+message GetTenantRequest { string name = 1; }
+message GetTenantResponse { TenantConfig tenant = 1; bool found = 2; }
+
+message ListTenantsRequest {}
+message ListTenantsResponse { repeated TenantConfig tenants = 1; }
+
+message UpdateTenantRequest { TenantConfig tenant = 1; }
+message UpdateTenantResponse { TenantConfig tenant = 1; }
+
+message DeleteTenantRequest { string name = 1; }
+message DeleteTenantResponse { bool success = 1; }
+
+// ============================================================
+// Object Lock & Retention
+// ============================================================
+
+enum RetentionMode {
+    RETENTION_NONE = 0;
+    RETENTION_GOVERNANCE = 1;
+    RETENTION_COMPLIANCE = 2;
+}
+
+message RetentionRule {
+    RetentionMode mode = 1;
+    uint32 days = 2;        // Retention period in days (0 = not set)
+    uint32 years = 3;       // Retention period in years (0 = not set)
+}
+
+message ObjectLockConfiguration {
+    bool enabled = 1;
+    RetentionRule default_retention = 2;  // Default retention applied to new objects
+}
+
+message ObjectRetention {
+    RetentionMode mode = 1;
+    uint64 retain_until_date = 2;   // Unix timestamp
+}
+
+message LegalHold {
+    bool status = 1;    // true = ON, false = OFF
+}
+
+// ============================================================
+// Lifecycle Configuration
+// ============================================================
+
+message LifecycleConfiguration {
+    repeated LifecycleRule rules = 1;
+}
+
+message LifecycleRule {
+    string id = 1;
+    bool enabled = 2;
+    string prefix = 3;                                  // Filter by key prefix
+    uint32 expiration_days = 4;                         // Delete objects after N days
+    uint64 expiration_date = 5;                         // Delete objects after this date (unix timestamp, 0 = not set)
+    uint32 noncurrent_version_expiration_days = 6;      // Delete non-current versions after N days
+    bool expired_object_delete_marker = 7;              // Remove expired delete markers
+    uint32 abort_incomplete_multipart_upload_days = 8;  // Abort incomplete uploads after N days
+    // The rule's filter, as S3 has it. has_filter: written as <Filter>
+    // (false: the legacy top-level <Prefix>), so it reads back as written.
+    bool has_filter = 9;
+    map<string, string> filter_tags = 10;               // every tag must match
+    uint64 object_size_greater_than = 11;               // 0 = no lower bound
+    uint64 object_size_less_than = 12;                  // 0 = no upper bound
+    // NoncurrentVersionExpiration: keep this many newest noncurrent versions
+    // whatever their age (0 = none kept).
+    uint32 newer_noncurrent_versions = 13;
+}
+
+// ============================================================
+// Versioning RPCs
+// ============================================================
+
+message PutBucketVersioningRequest {
+    string bucket = 1;
+    VersioningState state = 2;
+}
+message PutBucketVersioningResponse { bool success = 1; }
+
+message GetBucketVersioningRequest { string bucket = 1; }
+message GetBucketVersioningResponse { VersioningState state = 1; }
+
+// ============================================================
+// Object Lock RPCs
+// ============================================================
+
+message PutObjectLockConfigRequest {
+    string bucket = 1;
+    ObjectLockConfiguration config = 2;
+}
+message PutObjectLockConfigResponse { bool success = 1; }
+
+message GetObjectLockConfigRequest { string bucket = 1; }
+message GetObjectLockConfigResponse {
+    ObjectLockConfiguration config = 1;
+    bool found = 2;
+}
+
+// ============================================================
+// Lifecycle RPCs
+// ============================================================
+
+message PutBucketLifecycleRequest {
+    string bucket = 1;
+    LifecycleConfiguration config = 2;
+}
+message PutBucketLifecycleResponse { bool success = 1; }
+
+message GetBucketLifecycleRequest { string bucket = 1; }
+message GetBucketLifecycleResponse {
+    LifecycleConfiguration config = 1;
+    bool found = 2;
+}
+
+message DeleteBucketLifecycleRequest { string bucket = 1; }
+message DeleteBucketLifecycleResponse { bool success = 1; }
+
+// ============================================================
+// Iceberg Warehouse Management
+// ============================================================
+
+message IcebergWarehouse {
+    string name = 1;                    // Warehouse name (e.g. "production", "analytics")
+    string bucket = 2;                  // Backing S3 bucket name
+    string location = 3;               // S3 location (e.g. "s3://wh-production")
+    string tenant = 4;                  // Owning tenant (empty = system)
+    uint64 created_at = 5;
+    map<string, string> properties = 6; // Custom properties
+}
+
+message IcebergCreateWarehouseRequest {
+    string name = 1;
+    string tenant = 2;                  // Owning tenant
+    map<string, string> properties = 3;
+}
+
+message IcebergCreateWarehouseResponse {
+    IcebergWarehouse warehouse = 1;
+}
+
+message IcebergListWarehousesRequest {
+    string tenant = 1;                  // Filter by tenant (empty = all)
+}
+
+message IcebergListWarehousesResponse {
+    repeated IcebergWarehouse warehouses = 1;
+}
+
+message IcebergDeleteWarehouseRequest {
+    string name = 1;
+}
+
+message IcebergDeleteWarehouseResponse {
+    bool success = 1;
+}
+
+// ============================================================
+// Named IAM Policies (PBAC)
+// ============================================================
+
+message PolicyObject {
+    string name = 1;                // Unique policy name (e.g. "readonly", "dev-readwrite")
+    string policy_json = 2;         // AWS IAM JSON policy document
+    uint64 created_at = 3;
+    uint64 updated_at = 4;
+    // The tenant that owns it (empty = system scope). Stored under
+    // "<tenant>/<name>" for a tenant's, "<name>" for a system one.
+    string tenant = 5;
+    // A system policy tenant admins may attach to their own users and
+    // groups (but not change): the operator's catalogue.
+    bool shared = 6;
+    string path = 7;          // IAM path (empty = "/"); level 3
+    string policy_id = 8;     // set at creation from level 3
+    string description = 9;
+}
+
+message CreatePolicyRequest {
+    string name = 1;          // letters, digits and +=,.@_- (no "/" or ":")
+    string policy_json = 2;
+    string tenant = 3;        // empty = system scope
+    bool shared = 4;          // system scope only
+    string path = 5;          // IAM path (empty = "/"); level 3
+    string description = 6;
+}
+message CreatePolicyResponse { PolicyObject policy = 1; }
+
+message GetPolicyRequest { string name = 1; }
+message GetPolicyResponse { PolicyObject policy = 1; bool found = 2; }
+
+message ListPoliciesRequest {}
+message ListPoliciesResponse { repeated PolicyObject policies = 1; }
+
+message DeletePolicyRequest { string name = 1; }
+message DeletePolicyResponse { bool success = 1; }
+
+// Attach/detach a named policy to a user or group
+message AttachPolicyRequest {
+    string policy_name = 1;
+    string user_id = 2;            // Attach to user (set one of user_id, group_id, role_name)
+    string group_id = 3;           // Attach to group
+    string role_name = 4;          // Attach to role
+}
+message AttachPolicyResponse { bool success = 1; }
+
+message DetachPolicyRequest {
+    string policy_name = 1;
+    string user_id = 2;
+    string group_id = 3;
+    string role_name = 4;
+}
+message DetachPolicyResponse { bool success = 1; }
+
+message ListAttachedPoliciesRequest {
+    string user_id = 1;            // List policies for user (set one)
+    string group_id = 2;           // List policies for group
+    string role_name = 3;          // List policies for role
+}
+
+message UpdatePolicyRequest { string name = 1; string policy_json = 2; }
+message UpdatePolicyResponse { PolicyObject policy = 1; }
+
+message UpdateUserRequest {
+    string user_id = 1;
+    // Each field: unset leaves it as it is.
+    optional UserStatus status = 2;   // ACTIVE or SUSPENDED only
+    optional string display_name = 3;   // renames: the ARN follows
+    optional string email = 4;
+    optional string path = 5;           // the ARN follows; level 3
+}
+message UpdateUserResponse { UserMeta user = 1; }
+
+message UpdateAccessKeyRequest {
+    string access_key_id = 1;
+    KeyStatus status = 2;
+}
+message UpdateAccessKeyResponse { AccessKeyMeta key = 1; }
+
+message GetStsSigningKeyRequest {}
+message GetStsSigningKeyResponse { bytes key = 1; }
+
+message RoleObject {
+    string name = 1;
+    string arn = 2;                       // arn:obio:iam::<tenant|objectio>:role/<name>
+    string tenant = 3;                    // empty = system scope
+    string description = 4;
+    // Who may assume it: an IAM trust policy (Principal, sts:AssumeRole*
+    // actions, conditions such as the OIDC token's issuer and claims).
+    string trust_policy_json = 5;
+    uint32 max_session_seconds = 6;       // 0 = default (3600)
+    uint64 created_at = 7;
+    uint64 updated_at = 8;
+    string path = 9;                      // IAM path (empty = "/"); level 3
+    string role_id = 10;                  // set at creation from level 3
+}
+message CreateRoleRequest { RoleObject role = 1; }
+message CreateRoleResponse { RoleObject role = 1; }
+message GetRoleRequest { string name = 1; }
+message GetRoleResponse { RoleObject role = 1; bool found = 2; }
+message ListRolesRequest { string tenant = 1; }   // empty = all
+message ListRolesResponse { repeated RoleObject roles = 1; }
+message UpdateRoleRequest {
+    string name = 1;
+    optional string description = 2;
+    optional string trust_policy_json = 3;
+    optional uint32 max_session_seconds = 4;
+}
+message UpdateRoleResponse { RoleObject role = 1; }
+message DeleteRoleRequest { string name = 1; }
+message DeleteRoleResponse { bool success = 1; }
+message ListAttachedPoliciesResponse { repeated string policy_names = 1; }
+
+// An inline policy: a document embedded in one user, group or role, by
+// name, that goes when its principal goes (level 3). The principal is
+// named as attachments name it: "user:<user_id>", "group:<group_id>" or
+// "role:<role key>".
+message InlinePolicy {
+    string principal = 1;
+    string name = 2;
+    string policy_json = 3;
+    uint64 created_at = 4;
+    uint64 updated_at = 5;
+}
+message PutInlinePolicyRequest {
+    string principal = 1;
+    string name = 2;
+    string policy_json = 3;
+}
+message PutInlinePolicyResponse { InlinePolicy policy = 1; }
+message GetInlinePolicyRequest { string principal = 1; string name = 2; }
+message GetInlinePolicyResponse { InlinePolicy policy = 1; bool found = 2; }
+message ListInlinePoliciesRequest { string principal = 1; }
+message ListInlinePoliciesResponse { repeated InlinePolicy policies = 1; }
+message DeleteInlinePolicyRequest { string principal = 1; string name = 2; }
+message DeleteInlinePolicyResponse { bool success = 1; }
+
+// ============================================================
+// Server-Side Encryption
+// ============================================================
+
+// Encryption algorithm for an object.
+// Per-bucket defaults use the same enum (SSE_C cannot be a bucket default).
+enum SseAlgorithm {
+    SSE_NONE = 0;       // Plaintext (absent field on ObjectMeta defaults here)
+    SSE_S3 = 1;         // AES256, server-managed DEK wrapped by service master key
+    SSE_KMS = 2;        // aws:kms — DEK wrapped by external KMS
+    SSE_C = 3;          // Customer-provided key (per-request only; never a bucket default)
+}
+
+// One rule inside BucketSseConfiguration. AWS allows exactly one rule today;
+// we model it as repeated for wire compatibility with the AWS XML schema.
+message SseRule {
+    SseAlgorithm algorithm = 1;
+    string kms_key_id = 2;          // KMS key ARN (SSE_KMS only)
+    bool bucket_key_enabled = 3;    // S3 Bucket Keys optimization (SSE_KMS only)
+}
+
+// Default server-side encryption for a bucket.
+// Applied when a PutObject request does not specify its own SSE headers.
+message BucketSseConfiguration {
+    repeated SseRule rules = 1;
+}
+
+message PutBucketEncryptionRequest {
+    string bucket = 1;
+    BucketSseConfiguration config = 2;
+}
+message PutBucketEncryptionResponse { bool success = 1; }
+
+message GetBucketEncryptionRequest { string bucket = 1; }
+message GetBucketEncryptionResponse {
+    BucketSseConfiguration config = 1;
+    bool found = 2;
+}
+
+message DeleteBucketEncryptionRequest { string bucket = 1; }
+message DeleteBucketEncryptionResponse { bool success = 1; }
+
+message AcquireLeaseRequest {
+    string name = 1;
+    string holder = 2;       // the caller's unique id
+    uint64 ttl_secs = 3;
+    bool release = 4;        // give it up (if held by `holder`)
+}
+message AcquireLeaseResponse {
+    bool acquired = 1;
+    string holder = 2;       // who holds it now
+    uint64 expires_at = 3;   // unix seconds
+}
+
+message GetBucketSettingRequest {
+    string bucket = 1;
+    string name = 2;
+}
+message GetBucketSettingResponse {
+    bool found = 1;
+    bytes value = 2;
+}
+// `value` empty with `delete` set removes the setting.
+message PutBucketSettingRequest {
+    string bucket = 1;
+    string name = 2;
+    bytes value = 3;
+    bool delete = 4;
+}
+message PutBucketSettingResponse {
+    // Whether a setting was there before (for a delete: whether one was removed).
+    bool existed = 1;
+}
+
+// ============================================================
+// KMS Keys (for SSE-KMS)
+// ============================================================
+
+enum KmsKeyStatus {
+    KMS_KEY_ENABLED = 0;
+    KMS_KEY_DISABLED = 1;
+    KMS_KEY_PENDING_DELETION = 2;
+}
+
+// A KMS key entry. The gateway never sends plaintext key material over
+// the wire — `wrapped_key_material` is always encrypted by the gateway's
+// service master key (env `OBJECTIO_MASTER_KEY`). Meta stores the blob
+// verbatim and returns it on read; the gateway unwraps in-process.
+message KmsKey {
+    string key_id = 1;                 // Short id, e.g. "obj-2026-04-17-abc"
+    string arn = 2;                    // arn:obio:kms:::{key_id}
+    string description = 3;
+    bytes wrapped_key_material = 4;    // Encrypted by service master key
+    KmsKeyStatus status = 5;
+    uint64 created_at = 6;
+    uint64 updated_at = 7;
+    string created_by = 8;             // User ARN that created the key
+}
+
+message CreateKmsKeyRequest {
+    string key_id = 1;                 // Optional: server generates if empty
+    string description = 2;
+    bytes wrapped_key_material = 3;    // Already-wrapped 32 bytes
+    string created_by = 4;
+}
+message CreateKmsKeyResponse { KmsKey key = 1; }
+
+message GetKmsKeyRequest { string key_id = 1; }
+message GetKmsKeyResponse { KmsKey key = 1; bool found = 2; }
+
+message ListKmsKeysRequest {
+    uint32 max_results = 1;
+    string page_token = 2;
+}
+message ListKmsKeysResponse {
+    repeated KmsKey keys = 1;
+    string next_page_token = 2;
+}
+
+message DeleteKmsKeyRequest { string key_id = 1; }
+message DeleteKmsKeyResponse { bool success = 1; }
+
+
+// ---- Deduplication (objectio-docs architecture/design/dedup.md) ----
+
+enum DedupMode {
+    DEDUP_MODE_UNSET = 0;     // inherit
+    DEDUP_MODE_OFF = 1;
+    DEDUP_MODE_DRY_RUN = 2;   // fingerprint and count would-be savings; store as usual
+    DEDUP_MODE_ON = 3;        // phase 2; refused until then
+}
+
+enum DedupScope {
+    DEDUP_SCOPE_UNSET = 0;    // inherit
+    DEDUP_SCOPE_BUCKET = 1;
+    DEDUP_SCOPE_TENANT = 2;
+    DEDUP_SCOPE_CLUSTER = 3;
+}
+
+// Mode and scope inherit separately: a bucket may set only its mode and
+// take its scope from the tenant.
+message DedupPolicy {
+    DedupMode mode = 1;
+    DedupScope scope = 2;
+}
+
+message SetBucketDedupRequest {
+    string bucket = 1;
+    DedupPolicy policy = 2;   // absent or all-unset: inherit everything
+}
+message SetBucketDedupResponse {}
+
+// The policy at each level for `bucket`, and what they resolve to. With
+// an empty bucket, just the cluster default.
+message GetDedupPolicyRequest {
+    string bucket = 1;
+}
+message GetDedupPolicyResponse {
+    DedupPolicy bucket = 1;
+    DedupPolicy tenant = 2;
+    DedupPolicy cluster = 3;
+    string tenant_name = 4;
+    DedupMode effective_mode = 5;
+    DedupScope effective_scope = 6;
+    string effective_domain = 7;
+    string mode_from = 8;     // "bucket" | "tenant" | "cluster" | "default"
+    string scope_from = 9;
+}
+
+message LocateChunksRequest {
+    string bucket = 1;
+    repeated bytes fingerprints = 2;
+}
+message LocateChunksResponse {
+    repeated string addresses = 1;   // primary OSD per fingerprint, in order; "" if none
+    repeated bytes node_ids = 2;     // the same OSDs' node ids; empty if none
+}
+
+// ---- Shared stripes ----
+
+// Who references a shared stripe: object ids (an object's, or a version's).
+// Stored in meta's `stripe_refs` table, keyed by the stripe's object id in
+// hex. A stripe with no entry has exactly one referrer, the object that
+// wrote it.
+message StripeRefs {
+    repeated bytes referrers = 1;
+}
+
+// Make each stripe referenced by `sharer` as well as `owner`, the object
+// it is copied from. FAILED_PRECONDITION if a stripe is already shared and
+// `owner` is not among its referrers: the owner has let it go.
+message ShareStripesRequest {
+    repeated bytes stripe_ids = 1;
+    bytes owner = 2;
+    bytes sharer = 3;
+}
+message ShareStripesResponse {}
+
+// `referrer` no longer references these stripes. `freeable` are those no
+// one references any more — unshared ones, and shared ones whose last
+// referrer this was — and only those may have their shards deleted.
+message ReleaseStripesRequest {
+    repeated bytes stripe_ids = 1;
+    bytes referrer = 2;
+}
+message ReleaseStripesResponse {
+    repeated bytes freeable = 1;
+    // Packs whose last referrer this was: their records are gone (in the
+    // same commit), and these are their stripes, for their shards to be
+    // reclaimed.
+    repeated StripeMeta freed_packs = 2;
+}
+
+// Record a pack about to be written (unsealed): its shards are known
+// before any is written. ALREADY_EXISTS if the id is taken.
+message IntendPackRequest { PackRecord pack = 1; }
+message IntendPackResponse {}
+
+// Seal a written pack and register its referrers, in one commit.
+// FAILED_PRECONDITION unless it is recorded unsealed.
+message SealPackRequest {
+    bytes pack_id = 1;
+    repeated bytes referrers = 2;   // the object ids packed into it
+    // The stripe as written: where each shard landed. Replaces the
+    // intended locations IntendPack recorded.
+    StripeMeta stripe = 3;
+}
+message SealPackResponse {}
+
+// Drop an unsealed pack's record (a pack abandoned before sealing); the
+// record is returned so its written shards can be deleted. A sealed pack
+// is refused.
+message AbortPackRequest { bytes pack_id = 1; }
+message AbortPackResponse { PackRecord pack = 1; bool found = 2; }
+
+message GetPackRequest { bytes pack_id = 1; }
+message GetPackResponse { PackRecord pack = 1; bool found = 2; }
+
+message ListPacksRequest {
+    bytes start_after = 1;
+    uint32 limit = 2;
+}
+message ListPacksResponse {
+    repeated PackRecord packs = 1;
+    bool truncated = 2;
+    // Per pack, in the same order: the object ids that reference it now
+    // (the shared-stripe registry), so the caller can tell what's live.
+    repeated PackReferrers referrers = 3;
+}
+
+message PackReferrers {
+    repeated bytes object_ids = 1;
+}
+
+// A pack shard moved (drain, repair): the record's location for
+// `position` changes from `from_node` to `to`, and its version is bumped.
+message PackMoveShardRequest {
+    bytes pack_id = 1;
+    uint32 position = 2;
+    bytes from_node = 3;
+    ShardLocation to = 4;
+}
+message PackMoveShardResponse {}
+
+// ---- Block storage metadata ----
+
+// One chunk of a volume or snapshot: the erasure-coded stripe holding its
+// bytes, and the referrer it holds that stripe as in the shared-stripe
+// registry (the stripe's own id for a chunk the volume wrote itself, the
+// snapshot's id, or a clone's volume id for a chunk it inherited).
+message BlockChunkRef {
+    uint64 chunk_id = 1;
+    StripeMeta stripe = 2;
+    bytes owner = 3;
+}
+
+message BlockCreateVolumeRequest {
+    string name = 1;
+    uint64 size_bytes = 2;
+    string pool = 3;
+    uint32 chunk_size_bytes = 4;   // 0 = 4 MiB
+    map<string, string> metadata = 5;
+}
+message BlockVolumeResponse {
+    objectio.block.Volume volume = 1;
+}
+// By id, or by name when the id is empty.
+message BlockGetVolumeRequest {
+    string volume_id = 1;
+    string name = 2;
+}
+message BlockListVolumesRequest {}
+message BlockListVolumesResponse {
+    repeated objectio.block.Volume volumes = 1;
+}
+// Grow the volume (0 = unchanged) and/or set its state (UNKNOWN = unchanged).
+message BlockUpdateVolumeRequest {
+    string volume_id = 1;
+    uint64 size_bytes = 2;
+    objectio.block.VolumeState state = 3;
+    // With a state set: whether the volume is attached read-only. Recorded
+    // as the volume's `attached_read_only` (cleared by any other state), so
+    // a restarted gateway exports it again the way it was attached.
+    bool read_only = 4;
+}
+message BlockDeleteVolumeRequest {
+    string volume_id = 1;
+}
+// Stripes no volume, snapshot or clone references any more: the caller
+// deletes their shards.
+message BlockReleaseResponse {
+    repeated StripeMeta freeable = 1;
+}
+
+// Chunks [start, start + count) that are stored; unwritten ones are absent.
+message BlockGetChunksRequest {
+    string volume_id = 1;
+    uint64 start_chunk = 2;
+    uint64 count = 3;
+}
+message BlockGetChunksResponse {
+    repeated BlockChunkRef chunks = 1;
+}
+
+// Point chunks at newly written stripes. Each update names the stripe it
+// replaces (expected_object_id, empty for none), so a stale writer cannot
+// overwrite a newer one: ABORTED if any does not match, and nothing is
+// changed. The replaced stripes are released; those now unreferenced are
+// returned to free.
+message BlockChunkUpdate {
+    uint64 chunk_id = 1;
+    bytes expected_object_id = 2;
+    StripeMeta stripe = 3;         // absent: the chunk is unwritten again (trim)
+}
+message BlockCommitChunksRequest {
+    string volume_id = 1;
+    repeated BlockChunkUpdate updates = 2;
+}
+
+message BlockCreateSnapshotRequest {
+    string volume_id = 1;
+    string name = 2;
+}
+message BlockSnapshotResponse {
+    objectio.block.Snapshot snapshot = 1;
+}
+message BlockGetSnapshotRequest {
+    string snapshot_id = 1;
+}
+// All snapshots, or a volume's when volume_id is set.
+message BlockListSnapshotsRequest {
+    string volume_id = 1;
+}
+message BlockListSnapshotsResponse {
+    repeated objectio.block.Snapshot snapshots = 1;
+}
+message BlockDeleteSnapshotRequest {
+    string snapshot_id = 1;
+}
+message BlockCloneVolumeRequest {
+    string snapshot_id = 1;
+    string name = 2;
+}
+
+// ---- Rolling upgrades ----
+
+message ReportVersionRequest {
+    string kind = 1;          // "meta", "osd", "gateway", "block-gateway"
+    string id = 2;            // meta: Raft node id; osd: node id (hex); others: host:port
+    string release = 3;
+    uint32 format_level = 4;
+    uint32 min_level = 5;
+    string address = 6;
+}
+
+message ReportVersionResponse {
+    uint32 active_level = 1;  // the level the cluster may write
+}
+
+message NodeVersion {
+    string kind = 1;
+    string id = 2;
+    string release = 3;
+    uint32 format_level = 4;
+    uint32 min_level = 5;
+    string address = 6;
+    uint64 seen_secs_ago = 7;
+}
+
+message GetUpgradeStatusRequest {}
+
+message GetUpgradeStatusResponse {
+    uint32 active_level = 1;
+    repeated NodeVersion nodes = 2;   // every node heard from recently
+    uint32 finalize_to = 3;           // what finalize would raise the level to (= active_level: nothing to do)
+    repeated string blockers = 4;     // why finalize would be refused now
+}
+
+message FinalizeUpgradeRequest {
+    string requested_by = 1;
+}
+
+message FinalizeUpgradeResponse {
+    uint32 active_level = 1;
+}
+
+// ============================================================
+// Heal queue (object metadata at quorum)
+// ============================================================
+
+message HealEntry {
+    string bucket = 1;
+    string key = 2;
+    // The version the write or delete was of; empty for an unversioned key.
+    string version_id = 3;
+    uint64 enqueued_at_ms = 4;
+    // Who is healing it, until when (empty/0: nobody).
+    string claimed_by = 5;
+    uint64 claimed_until_ms = 6;
+}
+
+message HealEnqueueRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;
+}
+message HealEnqueueResponse {}
+
+message HealListRequest {
+    uint32 limit = 1;
+}
+message HealListResponse {
+    repeated HealEntry entries = 1;
+}
+
+// Claim `entry` (as listed) for `lease_ms`: refused if it changed since.
+message HealClaimRequest {
+    HealEntry entry = 1;
+    string claimer = 2;
+    uint64 lease_ms = 3;
+}
+message HealClaimResponse {
+    bool claimed = 1;
+    HealEntry entry = 2;
+}
+
+// Remove `entry` (as claimed): kept if it was enqueued again meanwhile.
+message HealDoneRequest {
+    HealEntry entry = 1;
+}
+message HealDoneResponse {
+    bool done = 1;
+}

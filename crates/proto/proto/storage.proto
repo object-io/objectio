@@ -1,0 +1,667 @@
+syntax = "proto3";
+
+package objectio.storage;
+
+import "metadata.proto";
+
+// Storage service for OSD (Object Storage Daemon) operations
+service StorageService {
+    // Write a shard to the storage node
+    rpc WriteShard(WriteShardRequest) returns (WriteShardResponse);
+
+    // Read a shard from the storage node
+    rpc ReadShard(ReadShardRequest) returns (ReadShardResponse);
+
+    // Delete a shard from the storage node
+    rpc DeleteShard(DeleteShardRequest) returns (DeleteShardResponse);
+
+    // Get shard metadata
+    rpc GetShardMeta(GetShardMetaRequest) returns (GetShardMetaResponse);
+
+    // List shards on this node
+    rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // Get node status
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+    // Find objects whose any stripe references `draining_node_id`.
+    // Used by the Phase 3b drain migrator: meta asks every OSD in the
+    // cluster which of its primary-stored object metas contain
+    // ShardLocations pointing at the draining OSD, collects the list,
+    // then migrates the affected shards + updates each ObjectMeta via
+    // PutObjectMeta on this same OSD (the primary).
+    //
+    // Scans the OSD's meta_store — O(total objects on this OSD).
+    // Acceptable because drains are rare and admin-initiated.
+    rpc FindObjectsReferencingNode(FindObjectsReferencingNodeRequest)
+        returns (FindObjectsReferencingNodeResponse);
+
+    // Object metadata operations (stored on primary OSD)
+    // Put object metadata (called by gateway after writing all shards)
+    rpc PutObjectMeta(PutObjectMetaRequest) returns (PutObjectMetaResponse);
+
+    // Get object metadata (called by gateway before reading shards)
+    rpc GetObjectMeta(GetObjectMetaRequest) returns (GetObjectMetaResponse);
+
+    // Several GetObjectMeta in one call, each answered as GetObjectMeta
+    // would answer it alone: a gateway's concurrent reads of one OSD (B21,
+    // format level 8).
+    rpc GetObjectMetas(GetObjectMetasRequest) returns (GetObjectMetasResponse);
+
+    // Delete object metadata (called by gateway when deleting object)
+    rpc DeleteObjectMeta(DeleteObjectMetaRequest) returns (DeleteObjectMetaResponse);
+
+    // List objects by prefix (for ListObjects operation)
+    rpc ListObjectsMeta(ListObjectsMetaRequest) returns (ListObjectsMetaResponse);
+
+    // Stream object metadata by prefix (for large-scale listing)
+    rpc StreamListObjectsMeta(ListObjectsMetaRequest) returns (stream ListObjectsMetaChunk);
+
+    // List all versions of objects in a bucket (for ListObjectVersions)
+    rpc ListObjectVersionsMeta(ListObjectVersionsMetaRequest) returns (ListObjectVersionsMetaResponse);
+
+    // This OSD's Prometheus exposition (disk, SMART, gRPC, WAL, block), so
+    // the gateway can serve it from its /metrics. In the all-in-one binary
+    // the OSDs have no metrics port of their own.
+    rpc GetMetrics(objectio.metadata.GetMetricsRequest) returns (objectio.metadata.GetMetricsResponse);
+
+    // Whether this OSD holds each shard, and whether it is intact: missing,
+    // or found corrupt by the scrubber or a read. Asked by Meta's repairer.
+    rpc CheckShards(CheckShardsRequest) returns (CheckShardsResponse);
+
+    // The epochs of placement groups, from meta after a commit that
+    // changes one (B31): a request placed under an older epoch is refused.
+    rpc SetPgEpochs(SetPgEpochsRequest) returns (SetPgEpochsResponse);
+
+    // Peering (B31 phase 2): this OSD's summary of what it holds of a
+    // placement group, and the entries themselves, a page at a time.
+    rpc GetPgInfo(GetPgInfoRequest) returns (GetPgInfoResponse);
+    rpc ListPg(ListPgRequest) returns (ListPgResponse);
+
+    // Scrub (B31 phase 4): read back the shards this OSD holds of a
+    // placement group's objects, a page at a time from `after`, checking
+    // each against its checksum; a shard that fails is marked corrupt.
+    rpc ScrubPg(ScrubPgRequest) returns (ScrubPgResponse);
+
+    // Dedup dry-run: record chunk fingerprints this OSD is primary for and
+    // say which it had already seen; and forget them all, to start a new
+    // measurement window.
+    rpc NoteChunks(NoteChunksRequest) returns (NoteChunksResponse);
+    rpc ResetChunkNotes(ResetChunkNotesRequest) returns (ResetChunkNotesResponse);
+    // Wipe this OSD: every shard (its blocks freed) and every object and
+    // version metadata entry. Only for an OSD meta has drained and marked
+    // Out, when nothing refers to anything on it. Refused unless node_id is
+    // this OSD's, so a mixed-up address can't wipe the wrong one.
+    rpc Purge(PurgeRequest) returns (PurgeResponse);
+}
+
+// Shard identifier
+message ShardId {
+    bytes object_id = 1;    // 16-byte UUID
+    uint64 stripe_id = 2;   // Stripe number
+    uint32 position = 3;    // Position within stripe (0..k+m-1)
+}
+
+// Block location on disk
+message BlockLocation {
+    bytes node_id = 1;      // 16-byte UUID
+    bytes disk_id = 2;      // 16-byte UUID
+    uint64 offset = 3;      // Offset on disk
+    uint32 size = 4;        // Size in bytes
+}
+
+// Checksum values
+message Checksum {
+    uint32 crc32c = 1;
+    uint64 xxhash64 = 2;
+    bytes sha256 = 3;       // Optional, 32 bytes
+}
+
+// Write shard request
+message WriteShardRequest {
+    ShardId shard_id = 1;
+    bytes data = 2;         // Empty when `rdma` is set
+    uint32 ec_k = 3;        // Data shard count
+    uint32 ec_m = 4;        // Parity shard count
+    Checksum checksum = 5;  // Required when `rdma` is set
+    // Where the OSD reads the shard from over Transfer Engine, instead of
+    // `data`. Only sent to OSDs that advertised a `te_segment`.
+    RdmaBuffer rdma = 6;
+    // A write that restores redundancy (repair, drain, backfill): it may
+    // use the space an OSD keeps back from client writes (`--full-ratio`).
+    bool use_reserve = 7;
+    // The placement group and epoch the gateway placed this write under
+    // (B31). Unset for meta's own writes (repair, drain), which are
+    // directed at an OSD, not placed.
+    PgRef pg = 8;
+}
+
+// A placement group and the epoch of its acting set (B31). An OSD refuses
+// a request with an older epoch than it knows for the PG: StaleEpoch.
+message PgRef {
+    string pool = 1;
+    uint32 pg_id = 2;
+    uint64 epoch = 3;
+}
+
+message SetPgEpochsRequest {
+    repeated PgRef epochs = 1;
+}
+message SetPgEpochsResponse {}
+
+// What an OSD holds of one placement group: one entry per key, its current
+// object or, when it has none, the tombstone of its last delete. Kept with
+// every write, in the same atomic write (B31 phase 2).
+message PgSummary {
+    uint64 objects = 1;
+    uint64 tombstones = 2;
+    // The highest stamp of any entry.
+    uint64 max_stamp = 3;
+    // XOR of a 128-bit hash of each entry (key, kind, write order):
+    // independent of order, so two copies holding the same entries have
+    // the same digest. Big-endian.
+    bytes digest = 4;
+    // Over current objects: their stripes; positions no shard location
+    // names; positions whose location names this OSD.
+    uint64 stripes = 5;
+    uint64 positions_short = 6;
+    uint64 named_here = 7;
+}
+
+// One key of a placement group on an OSD.
+message PgEntry {
+    string bucket = 1;
+    string key = 2;
+    bool tombstone = 3;
+    // The write order: (stamp, object id, update stamp); a tombstone has
+    // only its stamp.
+    uint64 stamp = 4;
+    bytes object_id = 5;
+    uint64 update_stamp = 6;
+    uint32 stripes = 7;
+    uint32 positions_short = 8;
+    uint32 named_here = 9;
+    // Of the positions named here, how many this OSD holds intact (ListPg
+    // only).
+    uint32 held_here = 10;
+    // Shards a read needs (the object's k; 1 for one held whole).
+    uint32 needed = 11;
+    // The object's size in bytes: what recovery has left to move.
+    uint64 size = 12;
+    // A version of a versioned key: its id (`null` for the version written
+    // while versioning was off); empty for the key's current object or
+    // delete. Each version is an entry of its own.
+    string version_id = 13;
+}
+
+message ScrubPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // As ListPg's: the last entry of the previous page; empty: from the start.
+    string after = 3;
+    // Stop once this many shard bytes were read (0: no limit), or this
+    // many entries were looked at (0: 1000).
+    uint64 max_bytes = 4;
+    uint32 max_entries = 5;
+}
+message ScrubPgResponse {
+    // For the next page; empty after the last.
+    string next = 1;
+    uint32 entries = 2;
+    uint32 shards = 3;
+    uint64 bytes = 4;
+    repeated ScrubBadShard bad = 5;
+}
+// A shard an object's metadata copy here names on this OSD that it doesn't
+// hold (`corrupt` false), or holds and fails its checksum.
+message ScrubBadShard {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;
+    uint64 stripe_id = 4;
+    uint32 position = 5;
+    bool corrupt = 6;
+}
+
+message GetPgInfoRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+}
+message GetPgInfoResponse {
+    PgSummary summary = 1;
+}
+
+message ListPgRequest {
+    string pool = 1;
+    uint32 pg_id = 2;
+    // "{bucket}\0{key}" (then "\0{version_id}" for a version's entry) of
+    // the last entry of the previous page; empty: from the start.
+    string after = 3;
+    uint32 limit = 4;   // 0: 1000
+}
+message ListPgResponse {
+    repeated PgEntry entries = 1;
+    // For the next page; empty after the last.
+    string next = 2;
+}
+
+// Memory in another process that a shard moves through over Mooncake
+// Transfer Engine (RDMA, or TCP in development). The OSD always initiates:
+// it reads PUT shards from here and writes GET shards to here. See
+// objectio-docs architecture/design/rdma-data-plane.md.
+message RdmaBuffer {
+    string segment = 1;     // Owning process's Transfer Engine segment, "ip:port"
+    uint64 addr = 2;        // Start address in that process
+    uint64 len = 3;
+}
+
+message WriteShardResponse {
+    BlockLocation location = 1;
+    uint64 timestamp = 2;
+}
+
+// Read shard request
+message ReadShardRequest {
+    ShardId shard_id = 1;
+    // Optional: read only a range
+    uint64 offset = 2;
+    uint32 length = 3;
+    // If set, the OSD writes the shard here over Transfer Engine and
+    // ReadShardResponse.data is empty. Only sent to OSDs that advertised a
+    // `te_segment`.
+    RdmaBuffer rdma_dest = 4;
+    // The shard's crc32c as its object records it (B23). The OSD checks the
+    // whole shard against it, as well as against its own, and answers
+    // DATA_LOSS (marking the shard corrupt) when they differ.
+    optional uint32 expected_crc32c = 5;
+}
+
+message ReadShardResponse {
+    bytes data = 1;         // Empty when the request carried `rdma_dest`
+    Checksum checksum = 2;
+    uint64 timestamp = 3;
+    uint64 rdma_len = 4;    // Bytes written to `rdma_dest`, when it was set
+}
+
+// Delete shard request
+message DeleteShardRequest {
+    ShardId shard_id = 1;
+}
+
+message DeleteShardResponse {
+    bool success = 1;
+}
+
+// Get shard metadata
+message GetShardMetaRequest {
+    ShardId shard_id = 1;
+}
+
+message GetShardMetaResponse {
+    ShardId shard_id = 1;
+    BlockLocation location = 2;
+    uint32 size = 3;
+    Checksum checksum = 4;
+    uint64 created_at = 5;
+}
+
+// List shards
+message ListShardsRequest {
+    bytes object_id = 1;    // Optional: filter by object
+    uint32 limit = 2;
+    bytes continuation_token = 3;
+}
+
+message ListShardsResponse {
+    repeated GetShardMetaResponse shards = 1;
+    bytes next_token = 2;
+}
+
+// Health check
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+    enum Status {
+        UNKNOWN = 0;
+        HEALTHY = 1;
+        DEGRADED = 2;
+        UNHEALTHY = 3;
+    }
+    Status status = 1;
+    string message = 2;
+}
+
+// Node status
+message GetStatusRequest {
+    // OSDs the caller currently sees as up. When non-empty, the OSD checks
+    // the objects it owns against it and fills `safety`. Empty = skip.
+    repeated bytes up_nodes = 1;
+    // Answer at once while the OSD is still counting its bucket usage after
+    // a start (objectio-docs `core/osd-start.md`), with no usage and
+    // `usage_counting` set. Unset (a caller from before), the answer waits
+    // until the count is done, so a partial count is never taken as usage.
+    bool answer_while_counting = 2;
+}
+
+message GetStatusResponse {
+    bytes node_id = 1;
+    string node_name = 2;
+    repeated DiskStatus disks = 3;
+    uint64 total_capacity = 4;
+    uint64 used_capacity = 5;
+    uint64 shard_count = 6;
+    uint64 uptime_seconds = 7;
+    // Host/environment info
+    string kubernetes_node = 8;     // K8s node name (empty on bare-metal)
+    string pod_name = 9;            // K8s pod name or hostname
+    string os_info = 10;            // OS version string
+    string hostname = 11;           // Real hostname
+    uint64 cpu_cores = 12;          // Number of CPU cores
+    uint64 memory_bytes = 13;       // Total RAM in bytes
+    string version = 14;            // ObjectIO version
+    // Per-bucket usage of the objects this OSD is the `usage_owner` of.
+    // ObjectMeta is copied to every OSD in the key's placement and exactly
+    // one of them owns it, so a caller can sum across OSDs without counting
+    // any object more than once.
+    repeated BucketUsage bucket_usage = 15;
+    // Shard availability of the objects this OSD owns (see bucket_usage),
+    // judged against GetStatusRequest.up_nodes. Absent when up_nodes was
+    // empty.
+    ObjectSafety safety = 16;
+    // The OSD is still counting its bucket usage after a start:
+    // `bucket_usage` is empty and is not this OSD's usage.
+    bool usage_counting = 17;
+}
+
+// Nested counts: every unreadable object is also at risk, every at-risk
+// object is also degraded. Current versions and noncurrent versions both
+// count — both hold data.
+message ObjectSafety {
+    uint64 objects_checked = 1;
+    uint64 objects_degraded = 2;     // some shard is on a node that is not up
+    uint64 objects_at_risk = 3;      // fewer than k+1 shards reachable
+    uint64 objects_unreadable = 4;   // fewer than k shards reachable
+    uint64 bytes_degraded = 5;       // logical bytes of degraded objects
+    uint64 bytes_at_risk = 6;
+    uint64 bytes_unreadable = 7;
+}
+
+message BucketUsage {
+    string bucket = 1;
+    uint64 objects = 2;               // Current, non-delete-marker objects
+    uint64 logical_bytes = 3;         // Sum of their sizes as uploaded
+    uint64 stored_bytes = 4;          // On-disk bytes incl. EC parity, all versions
+    uint64 noncurrent_versions = 5;
+    uint64 noncurrent_bytes = 6;      // Logical bytes of noncurrent versions
+    uint64 last_modified = 7;         // Newest modified_at seen (unix secs)
+}
+
+message DiskStatus {
+    bytes disk_id = 1;
+    string path = 2;
+    uint64 total_capacity = 3;
+    uint64 used_capacity = 4;
+    string status = 5;      // "healthy", "degraded", "failed"
+    uint64 shard_count = 6;
+}
+
+// Drain migration: ask an OSD which of its primary-held objects
+// contain shards on `draining_node_id`. The OSD scans its meta_store
+// and returns every (bucket, key) whose ObjectMeta.stripes[].shards[]
+// references the draining node.
+message FindObjectsReferencingNodeRequest {
+    bytes draining_node_id = 1;    // 16-byte UUID of the draining OSD
+    uint32 limit = 2;              // Cap on results; 0 = unlimited
+}
+
+message FindObjectsReferencingNodeResponse {
+    repeated AffectedObject objects = 1;
+    // True iff the scan hit `limit`; caller should paginate by
+    // excluding already-processed (bucket, key) pairs on the next call.
+    bool truncated = 2;
+}
+
+message AffectedObject {
+    string bucket = 1;
+    string key = 2;
+    bytes object_id = 3;
+    // Positions within the stripe that map to the draining node.
+    // The migrator uses this to know which ShardLocations to rewrite.
+    // One entry per (stripe_id, position) pair; meta walks the
+    // object's stripes in order so the list is compact.
+    repeated AffectedShardRef shards = 4;
+}
+
+message AffectedShardRef {
+    uint64 stripe_id = 1;
+    uint32 position = 2;
+    // The id the shard is stored under: the stripe's own (multipart parts,
+    // stripes shared by copies) or, when the stripe has none, the object's.
+    bytes shard_object_id = 3;
+}
+
+// ============================================================
+// Object Metadata Operations (stored on primary OSD)
+// ============================================================
+
+// Put object metadata request
+message PutObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+    objectio.metadata.ObjectMeta object = 3;
+    bool versioning_enabled = 4;  // If true, also store version entry
+    // Compare-and-swap for read-modify-write callers (retention, legal hold,
+    // shard migration, the repairer): when set, the write is refused with
+    // FAILED_PRECONDITION if the key's current ObjectMeta is a different
+    // object. Without it, such a write built from a stale read would put
+    // back an object a newer PUT replaced — and whose shards that PUT freed.
+    // An absent current entry does not refuse the write (shard migration
+    // writes to OSDs that hold no copy yet) unless `require_existing` is set.
+    bytes expected_object_id = 5;
+    // With `expected_object_id`: an absent entry refuses the write too. For
+    // a writer that must not bring back an object deleted since it read it
+    // — the repairer adding a rebuilt shard's location.
+    bool require_existing = 6;
+    // Update only the version entry `object.version_id`, leaving the
+    // current entry alone (with `expected_object_id`: only over that
+    // object, and only if the entry exists). For a change to a version
+    // that is no longer current — its replication status, say.
+    bool version_only = 7;
+    // A replica from another cluster (bucket replication): made current only
+    // if no newer version is current (versions arrive in any order: a
+    // retried older one after a newer one); otherwise stored as a version
+    // entry alone. Requires `object.version_id`.
+    bool keep_newer_current = 8;
+    // Merge `replication_set` into the replication map of the stored
+    // entries for `object` (its version entry, and the current entry if it
+    // is the same version), under the key's lock, changing nothing else: a
+    // replicator recording a send must not undo a tag or retention change
+    // made since it read the object. Only `object.object_id` and
+    // `object.version_id` are used; refused if neither entry holds it.
+    bool replication_update = 9;
+    map<string, string> replication_set = 10;
+    // This OSD's shard of a small object (B21): kept in its record and
+    // written with the metadata in one log batch, one flush. Sent only once
+    // the cluster is finalized at format level 5.
+    SmallShard shard = 11;
+    // See WriteShardRequest.pg.
+    PgRef pg = 12;
+}
+
+message PutObjectMetaResponse {
+    bool success = 1;
+    uint64 timestamp = 2;
+    // The current ObjectMeta this write displaced, if the key had one. The
+    // gateway frees its shards once every replica reports the same one.
+    objectio.metadata.ObjectMeta replaced = 3;
+    // `replaced` is still kept on this OSD as a version entry, so its shards
+    // are still referenced and must not be freed.
+    bool replaced_version_kept = 4;
+    // This copy already held a newer write (a higher stamp): this one was
+    // not applied. Last writer wins; once every copy says so, the caller
+    // frees the shards this write made, which nothing references.
+    bool superseded = 5;
+    // With `superseded`: the stamp this copy holds (its object's or its
+    // tombstone's), so the writer can stamp above it and write again.
+    uint64 held_stamp = 6;
+}
+
+// Get object metadata request
+message GetObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;  // Optional: get specific version
+    // Return this OSD's shard of the object with it, if the shard is kept
+    // in its metadata store (B21): a small GET in one round trip.
+    bool with_small_shard = 4;
+}
+
+message GetObjectMetaResponse {
+    objectio.metadata.ObjectMeta object = 1;
+    bool found = 2;
+    // The stamp of the last delete of this key (or version) on this copy,
+    // 0 if none: a reader takes "not found" when it is newer than every
+    // copy's object.
+    uint64 tombstone_stamp = 3;
+    // This OSD's shard of `object`, when asked for and kept in its
+    // metadata store; checked against its checksum before it is sent.
+    SmallShard small_shard = 4;
+}
+
+message GetObjectMetasRequest {
+    repeated GetObjectMetaRequest requests = 1;
+}
+
+// One answer per request, in order.
+message GetObjectMetasResponse {
+    repeated GetObjectMetaAnswer answers = 1;
+}
+
+// What GetObjectMeta would have answered: its response, or its error
+// (a gRPC status code, non-zero, and message).
+message GetObjectMetaAnswer {
+    GetObjectMetaResponse response = 1;
+    int32 code = 2;
+    string message = 3;
+}
+
+// Delete object metadata request
+message DeleteObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+    string version_id = 3;  // Optional: delete specific version
+    // The delete's stamp (objectio_common::stamp). The copy records it as a
+    // tombstone, so a copy that missed this delete is outvoted and a late,
+    // older write is refused. 0 = unstamped (a previous-release writer).
+    uint64 stamp = 4;
+    // Withdraw one write rather than delete the key: remove the entries
+    // (current, version) that hold this object, and only those, with no
+    // tombstone; a version left becomes current. For a small write (B21)
+    // refused on fewer copies than a read needs: its copies hold the only
+    // shards it has, and newest on a read, it would be unreadable.
+    // `version_id` and `stamp` are ignored.
+    bytes withdraw_object_id = 5;
+    // See WriteShardRequest.pg.
+    PgRef pg = 6;
+}
+
+message DeleteObjectMetaResponse {
+    bool success = 1;
+    // For a delete by version: the key's current object afterwards. When
+    // the version deleted was current, the OSD makes the newest remaining
+    // version current (or removes it, none being left) in the same step,
+    // under the key's lock, so concurrent deletes of a key's versions can
+    // never leave it pointing at a version that is gone.
+    objectio.metadata.ObjectMeta current = 2;
+    // What this replica removed (the current object, or the version), if
+    // anything: what the caller may free, rather than what it read before.
+    objectio.metadata.ObjectMeta removed = 3;
+    // This copy already held a newer write than the delete: nothing removed.
+    bool superseded = 4;
+    // With `superseded`: the stamp of the write it holds.
+    uint64 held_stamp = 5;
+}
+
+// List objects metadata request (for ListObjects)
+message ListObjectsMetaRequest {
+    string bucket = 1;
+    string prefix = 2;
+    string start_after = 3;
+    uint32 max_keys = 4;
+    string continuation_token = 5;
+}
+
+message ListObjectsMetaResponse {
+    repeated objectio.metadata.ObjectMeta objects = 1;
+    string next_continuation_token = 2;
+    bool is_truncated = 3;
+    uint32 key_count = 4;
+}
+
+// Streaming list chunk (one message per batch of objects)
+message ListObjectsMetaChunk {
+    repeated objectio.metadata.ObjectMeta objects = 1;
+    // Cursor for the next chunk; empty on the last chunk
+    string next_start_after = 2;
+    bool   is_last          = 3;
+}
+
+// List object versions request (for ListObjectVersions S3 API)
+message ListObjectVersionsMetaRequest {
+    string bucket = 1;
+    string prefix = 2;
+    string key_marker = 3;          // Start listing after this key
+    string version_id_marker = 4;   // Start listing after this version
+    uint32 max_keys = 5;
+}
+
+message ListObjectVersionsMetaResponse {
+    repeated objectio.metadata.ObjectMeta versions = 1;
+    string next_key_marker = 2;
+    string next_version_id_marker = 3;
+    bool is_truncated = 4;
+}
+
+message CheckShardsRequest {
+    repeated ShardId shards = 1;
+}
+
+enum ShardState {
+    SHARD_STATE_OK = 0;
+    SHARD_STATE_MISSING = 1;   // not on this OSD
+    SHARD_STATE_CORRUPT = 2;   // on this OSD, but its bytes fail their checksum
+}
+
+message CheckShardsResponse {
+    repeated ShardState states = 1;   // one per requested shard, in order
+}
+
+
+message NoteChunksRequest {
+    repeated bytes fingerprints = 1;
+}
+message NoteChunksResponse {
+    repeated bool seen = 1;   // per fingerprint, in order
+}
+message ResetChunkNotesRequest {}
+message ResetChunkNotesResponse {
+    uint64 forgotten = 1;
+}
+
+message PurgeRequest {
+    bytes node_id = 1;   // must be this OSD's
+}
+message PurgeResponse {
+    uint64 shards = 1;    // shards removed
+    uint64 entries = 2;   // object/version metadata entries removed
+}
+
+// A small shard sent with its object's metadata (B21).
+message SmallShard {
+    ShardId shard_id = 1;
+    bytes data = 2;
+    uint32 crc32c = 3;
+}

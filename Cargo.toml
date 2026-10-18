@@ -1,0 +1,130 @@
+[workspace]
+resolver = "2"
+
+members = [
+    # Libraries, the services' code among them.
+    "crates/*",
+    # Binaries: the services' thin entry points, the all-in-one, the CLI
+    # and tools.
+    "bin/*",
+    # End-to-end tests: boot a real cluster and drive it over HTTP.
+    "tests/e2e",
+]
+
+[workspace.package]
+version = "0.1.0-rc.1"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0"
+repository = "https://github.com/objectio/objectio"
+authors = ["ObjectIO Contributors"]
+
+[workspace.dependencies]
+# The services' allocator: returns freed memory to the OS, where glibc's
+# kept an OSD's snapshot peaks as resident memory (B22). Built with its
+# heap profiler, which stays off unless a process is started with
+# _RJEM_MALLOC_CONF=prof:true (B33; read with jeprof).
+tikv-jemallocator = { version = "0.7", features = ["profiling"] }
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP/Web
+axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1.5", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["full"] }
+
+# gRPC
+tonic = { version = "0.12", features = ["tls"] }
+prost = { version = "0.13" }
+prost-types = { version = "0.13" }
+
+# Erasure coding
+reed-solomon-simd = "3.0"
+erasure-isa-l = "0.2"
+
+# Consensus & Storage
+openraft = { version = "0.9", features = ["serde"] }
+redb = "2.4"
+
+# Checksums & Crypto
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha1 = "0.10"
+sha2 = "0.10"
+blake3 = "1"
+fastcdc = "3"
+hmac = "0.12"
+aes = "0.8"
+aes-gcm = "0.10"
+ctr = "0.9"
+ring = "0.17"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = { version = "0.37", features = ["serialize"] }
+base64 = "0.22"
+
+# Utilities
+uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+bytes = "1.9"
+hex = "0.4"
+md-5 = "0.10"
+futures = "0.3"
+parking_lot = "0.12"
+dashmap = "6.1"
+thiserror = "2.0"
+anyhow = "1.0"
+derive_more = { version = "1.0", features = ["full"] }
+
+# Tracing & Metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Config
+config = "0.14"
+
+# HTTP client (used by Vault KMS provider and other outbound integrations)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Unix-specific
+nix = { version = "0.29", features = ["fs", "ioctl"] }
+libc = "0.2"
+
+# Testing
+tempfile = "3.14"
+rand = "0.8"
+
+# Internal crates
+objectio-common = { path = "crates/common" }
+objectio-proto = { path = "crates/proto" }
+objectio-erasure = { path = "crates/erasure" }
+objectio-placement = { path = "crates/placement" }
+objectio-storage = { path = "crates/storage" }
+objectio-meta-store = { path = "crates/meta-store" }
+objectio-auth = { path = "crates/auth" }
+objectio-block = { path = "crates/block" }
+objectio-iceberg = { path = "crates/iceberg" }
+objectio-delta-sharing = { path = "crates/delta-sharing" }
+objectio-unity-catalog = { path = "crates/unity-catalog" }
+objectio-kms = { path = "crates/kms" }
+objectio-transport-te = { path = "crates/transport-te" }
+objectio-gateway = { path = "crates/gateway" }
+objectio-meta = { path = "crates/meta" }
+objectio-osd = { path = "crates/osd" }
+objectio-block-gateway = { path = "crates/block-gateway" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"

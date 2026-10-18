@@ -1,0 +1,21 @@
+[package]
+name = "objectio-unity-catalog"
+description = "Unity Catalog REST API for ObjectIO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objectio-auth = { workspace = true }
+objectio-common = { workspace = true }
+objectio-proto = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+prost = { workspace = true }
+
+[lints]
+workspace = true

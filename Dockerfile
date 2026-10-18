@@ -1,0 +1,335 @@
+# ObjectIO Multi-Stage Dockerfile
+# Builds all services with automatic platform detection
+#
+# Multi-Architecture Support:
+#   - linux/amd64 (x86_64): Uses ISA-L for accelerated erasure coding
+#   - linux/arm64 (aarch64): Uses pure Rust reed-solomon-simd
+#
+# Build targets:
+#   docker build --target gateway -t objectio-gateway .
+#   docker build --target meta -t objectio-meta .
+#   docker build --target osd -t objectio-osd .
+#   docker build --target cli -t objectio-cli .
+#   docker build --target all -t objectio .
+#
+# Multi-platform build (requires docker buildx):
+#   docker buildx build --platform linux/amd64,linux/arm64 --target gateway -t objectio-gateway .
+#
+# Build args:
+#   RUST_VERSION - Rust version (default: 1.92)
+#   FEATURES - Override cargo features (default: auto-detect based on arch)
+
+# Match rust-toolchain.toml. The pin makes rustup fetch that exact toolchain on
+# the first cargo call regardless, so a stale value here only buys a download
+# on every build — and silently diverges the image from what CI and developers
+# actually compile with.
+ARG RUST_VERSION=1.94
+
+# =============================================================================
+# Stage 0: Console builder (React SPA → static /_console assets)
+# =============================================================================
+# Declared first because the Rust builder stage (and the final gateway / all
+# images) COPY --from this one; Docker requires the source stage to appear
+# earlier in the file.
+#
+# console/dist is .gitignored, so a fresh checkout (CI runner, `docker build`
+# on a clean clone) has nothing to COPY from the host — we build it here so
+# the image is self-contained. Local rebuilds still cache on the
+# package-lock.json layer.
+FROM node:22-bookworm-slim AS console-builder
+
+WORKDIR /build/console
+
+COPY console/package.json console/package-lock.json ./
+RUN npm ci --no-audit --no-fund --prefer-offline
+
+COPY console/ ./
+RUN npm run build
+# Output: /build/console/dist/
+
+# =============================================================================
+# Stage 1: Builder base with Rust and build dependencies
+# =============================================================================
+FROM rust:${RUST_VERSION}-bookworm AS builder-base
+
+# Platform args provided by Docker buildx
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG TARGETOS
+
+# Install build dependencies
+# NASM is only needed for ISA-L on x86_64, but we install it anyway
+# (it's small and simplifies the Dockerfile)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf \
+    automake \
+    libtool \
+    libclang-dev \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install NASM only on x86_64 (required for ISA-L assembly)
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends nasm \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install rustfmt + clippy (not always bundled in the base image)
+RUN rustup component add rustfmt clippy
+
+WORKDIR /build
+
+# =============================================================================
+# Stage 2: Dependencies, cached apart from the source (cargo-chef)
+# =============================================================================
+# The dependency layer used to copy the whole source tree, so any change to
+# any crate rebuilt every dependency from scratch: ~15 minutes per image
+# build, cache or not. cargo-chef builds them from a recipe of the
+# manifests alone, a layer that changes only with Cargo.lock or a
+# manifest.
+FROM builder-base AS chef
+RUN cargo install cargo-chef --locked --version 0.1.73
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bin ./bin
+# The end-to-end suite is a workspace member, so cargo refuses to read the
+# workspace at all without its manifest.
+COPY tests ./tests
+RUN cargo chef prepare --recipe-path recipe.json
+
+# The features the image builds with, per architecture:
+# - x86_64/amd64: ISA-L for hardware-accelerated erasure coding (~3-5x
+#   faster than the pure Rust code via Intel's assembly routines);
+# - both: io-uring. The image is always Linux and tokio-uring is pure Rust,
+#   so it adds no build or runtime library: the documented +25% throughput
+#   and -43% p99.9 on 4 MiB stripes. The helm deployment (the production
+#   path) once ran a less optimised build than the standalone aio binary
+#   because the image had never enabled it.
+# grep-pcre2 is deliberately not here: it links a C library, so it needs
+# libpcre2-dev in this stage and libpcre2-8 in runtime-base. Enabling a
+# feature whose shared library the runtime lacks is how the v0.0.1 binary
+# shipped needing libhs.so.5 and failed to start.
+# `FEATURES` overrides.
+FROM chef AS builder
+ARG TARGETARCH
+ARG TARGETPLATFORM
+ARG FEATURES=""
+RUN set -e; ARCH="$(uname -m)"; \
+    if [ -n "$FEATURES" ]; then F="$FEATURES"; \
+    elif [ "$TARGETARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then F="isal,io-uring"; \
+    elif [ "$TARGETARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then F="io-uring"; \
+    else F=""; fi; \
+    echo "platform ${TARGETPLATFORM:-native}, features: ${F:-default}"; \
+    echo "$F" > /build/.features
+COPY --from=planner /build/recipe.json recipe.json
+RUN F="$(cat /build/.features)"; \
+    cargo chef cook --release ${F:+--features "$F"} --recipe-path recipe.json
+
+# =============================================================================
+# Stage 3: Build all binaries
+# =============================================================================
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY bin ./bin
+COPY tests ./tests
+
+# objectio-aio embeds the console SPA at compile time via
+# `include_dir!("$CARGO_MANIFEST_DIR/../../console/dist")`, so the
+# built console must exist on disk before cargo runs. Pull it from the
+# console-builder stage.
+COPY --from=console-builder /build/console/dist /build/console/dist
+
+# Baked into objectio_build_info. The release workflow passes the tag and
+# the commit; a local build reports the crate version and "unknown".
+ARG OBJECTIO_VERSION
+ARG OBJECTIO_GIT_COMMIT
+ENV OBJECTIO_VERSION=${OBJECTIO_VERSION} OBJECTIO_GIT_COMMIT=${OBJECTIO_GIT_COMMIT}
+
+RUN F="$(cat /build/.features)"; \
+    cargo build --release ${F:+--features "$F"}
+
+# =============================================================================
+# Stage 4: Runtime base image (minimal)
+# =============================================================================
+FROM debian:bookworm-slim AS runtime-base
+
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for running services
+RUN groupadd -r objectio && useradd -r -g objectio objectio
+
+# Common directories
+RUN mkdir -p /etc/objectio /var/lib/objectio /var/log/objectio \
+    && chown -R objectio:objectio /var/lib/objectio /var/log/objectio
+
+# Health check script
+COPY --chmod=755 <<'EOF' /usr/local/bin/healthcheck.sh
+#!/bin/sh
+# Generic health check - services should override
+exit 0
+EOF
+
+# =============================================================================
+# Stage 5: Gateway service (S3 API)
+# =============================================================================
+FROM runtime-base AS gateway
+
+ARG TARGETARCH
+ARG TARGETPLATFORM
+
+LABEL org.opencontainers.image.title="ObjectIO Gateway"
+LABEL org.opencontainers.image.description="S3-compatible API gateway for ObjectIO"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/objectio-gateway /usr/local/bin/
+
+# Console web UI — gateway serves it as a static SPA at /_console.
+# Built in the console-builder stage above, not from the host.
+COPY --from=console-builder /build/console/dist /usr/share/objectio/console
+
+USER objectio
+EXPOSE 9000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:9000/health || exit 1
+
+ENTRYPOINT ["objectio-gateway"]
+CMD ["--bind", "0.0.0.0:9000"]
+
+# =============================================================================
+# Stage 6: Metadata service (Raft consensus)
+# =============================================================================
+FROM runtime-base AS meta
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="ObjectIO Metadata Service"
+LABEL org.opencontainers.image.description="Raft-based metadata service for ObjectIO"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/objectio-meta /usr/local/bin/
+
+USER objectio
+
+# 9100: Client gRPC API
+# 9101: Raft peer communication
+EXPOSE 9100 9101
+
+VOLUME ["/var/lib/objectio"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["objectio-meta"]
+CMD ["--bind", "0.0.0.0:9100", "--raft-bind", "0.0.0.0:9101", "--data-dir", "/var/lib/objectio/meta"]
+
+# =============================================================================
+# Stage 7: OSD (Object Storage Daemon)
+# =============================================================================
+FROM runtime-base AS osd
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="ObjectIO OSD"
+LABEL org.opencontainers.image.description="Object Storage Daemon with erasure coding"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/objectio-osd /usr/local/bin/
+
+USER objectio
+
+# 9200: Client gRPC API
+# 9201: Data transfer / replication
+EXPOSE 9200 9201
+
+VOLUME ["/var/lib/objectio"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["objectio-osd"]
+CMD ["--bind", "0.0.0.0:9200", "--data-dir", "/var/lib/objectio/osd"]
+
+# =============================================================================
+# Stage 8: CLI tool
+# =============================================================================
+FROM runtime-base AS cli
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="ObjectIO CLI"
+LABEL org.opencontainers.image.description="Admin CLI for ObjectIO cluster management"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/obioctl /usr/local/bin/
+
+USER objectio
+
+ENTRYPOINT ["obioctl"]
+CMD ["--help"]
+
+# =============================================================================
+# Stage 9: Block Gateway (NBD + gRPC block storage gateway)
+# =============================================================================
+FROM runtime-base AS block-gateway
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="ObjectIO Block Gateway"
+LABEL org.opencontainers.image.description="NBD + gRPC block storage gateway for ObjectIO"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/objectio-block-gateway /usr/local/bin/
+
+USER objectio
+
+# 9300: gRPC BlockService
+# 10809: NBD TCP server
+EXPOSE 9300 10809
+
+VOLUME ["/var/lib/objectio"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+
+ENTRYPOINT ["objectio-block-gateway"]
+CMD ["--listen", "0.0.0.0:9300", "--nbd-listen", "0.0.0.0:10809", "--data-dir", "/var/lib/objectio/block-gw"]
+
+# =============================================================================
+# Stage 10: All-in-one image (for development/testing)
+# =============================================================================
+FROM runtime-base AS all
+
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="ObjectIO"
+LABEL org.opencontainers.image.description="ObjectIO distributed object storage (all components)"
+LABEL org.opencontainers.image.architecture="${TARGETARCH}"
+
+COPY --from=builder /build/target/release/objectio-gateway /usr/local/bin/
+COPY --from=builder /build/target/release/objectio-meta /usr/local/bin/
+COPY --from=builder /build/target/release/objectio-osd /usr/local/bin/
+COPY --from=builder /build/target/release/obioctl /usr/local/bin/
+COPY --from=builder /build/target/release/objectio-install /usr/local/bin/
+COPY --from=builder /build/target/release/objectio-block-gateway /usr/local/bin/
+
+# Console web UI (built in the console-builder stage)
+COPY --from=console-builder /build/console/dist /usr/share/objectio/console
+
+USER objectio
+
+EXPOSE 9000 9100 9101 9200 9201 9300 10809
+
+VOLUME ["/var/lib/objectio"]
+
+# Default shows available commands
+CMD ["sh", "-c", "echo 'ObjectIO - Available commands:' && echo '  objectio-gateway  - S3 API gateway' && echo '  objectio-meta     - Metadata service' && echo '  objectio-osd      - Storage daemon' && echo '  obioctl           - Admin CLI' && echo '  objectio-install  - Installation tool'"]

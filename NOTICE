@@ -1,0 +1,20 @@
+ObjectIO
+Copyright (c) 2026 ObjectIO
+
+This product includes software developed at ObjectIO (https://github.com/object-io/objectio).
+
+Licensing
+=========
+
+This repository is licensed under the Apache License, Version 2.0.
+See the root [LICENSE](./LICENSE) file for the full terms. Every crate,
+binary, SDK and the console UI ships under that one license; there is no
+source-available or commercially restricted component.
+
+Third-party components
+======================
+
+See `Cargo.lock` for the full dependency tree. Notable upstream components
+include tokio, axum, tonic, prost, reed-solomon-simd, redb, and ed25519-dalek.
+Each is distributed under its own upstream license (Apache-2.0, MIT, or
+dual).

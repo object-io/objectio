@@ -1,0 +1,1066 @@
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  Layers,
+  Plus,
+  Trash2,
+  Edit,
+  Shield,
+  Info,
+  AlertTriangle,
+  Check,
+  ExternalLink,
+  Minus,
+  Plus as PlusIcon,
+} from "lucide-react";
+import PageHeader from "../components/PageHeader";
+import Tabs from "../components/Tabs";
+import SummaryPanel, {
+  type ValidationState,
+} from "../components/SummaryPanel";
+import { Badge, Chip, Table, Row, Cell } from "../components/ui";
+
+interface Pool {
+  name: string;
+  ec_type: number;
+  ec_k: number;
+  ec_m: number;
+  ec_local_parity: number;
+  ec_global_parity: number;
+  replication_count: number;
+  osd_tags: string[];
+  failure_domain: string;
+  quota_bytes: number;
+  description: string;
+  enabled: boolean;
+  created_at: number;
+  // PG-engine fields; optional because older pools + older gateways
+  // may not return them.
+  pg_count?: number;
+  tier?: string;
+}
+
+const emptyPool: Omit<Pool, "created_at"> = {
+  name: "",
+  ec_type: 0,
+  ec_k: 4,
+  ec_m: 2,
+  ec_local_parity: 0,
+  ec_global_parity: 0,
+  replication_count: 3,
+  osd_tags: [],
+  failure_domain: "rack",
+  quota_bytes: 0,
+  description: "",
+  enabled: true,
+  pg_count: 0,
+  tier: "",
+};
+
+function formatBytes(b: number) {
+  if (!b) return "Unlimited";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  return `${(b / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+}
+
+function ecLabel(p: Pool) {
+  if (p.ec_type === 2) return `${p.replication_count}x Replication`;
+  if (p.ec_type === 1)
+    return `LRC ${p.ec_k}+${p.ec_local_parity}+${p.ec_global_parity}`;
+  return `${p.ec_k}+${p.ec_m} RS`;
+}
+
+function ecEfficiency(p: Pool) {
+  if (p.ec_type === 2) return `${(100 / (p.replication_count || 1)).toFixed(0)}%`;
+  const total = p.ec_k + p.ec_m;
+  if (total === 0) return "-";
+  return `${((p.ec_k / total) * 100).toFixed(0)}%`;
+}
+
+function ecMinNodes(p: Pool) {
+  if (p.ec_type === 2) return p.replication_count;
+  return p.ec_k + p.ec_m;
+}
+
+function ecTypeBadge(ec_type: number) {
+  if (ec_type === 1) return "bg-warn-soft text-warn";
+  if (ec_type === 2) return "bg-accent-soft text-accent";
+  return "bg-ok-soft text-ok";
+}
+
+function ecTypeName(ec_type: number) {
+  if (ec_type === 1) return "LRC";
+  if (ec_type === 2) return "Replication";
+  return "Reed-Solomon";
+}
+
+// Maps pool EC config → an implicit CRUSH rule name. Real rules are
+// defined server-side; this is just a convenience label for the summary.
+function crushRuleName(form: Omit<Pool, "created_at">) {
+  if (form.ec_type === 2)
+    return `rep_${form.replication_count}_${form.failure_domain}_rule`;
+  return `ec_${form.ec_k}_${form.ec_m}_${form.failure_domain}_rule`;
+}
+
+type WizardTab = "config" | "volumes" | "policies";
+
+// ---------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------
+
+interface PoolsProps {
+  embedded?: boolean;
+}
+
+export default function Pools({ embedded = false }: PoolsProps = {}) {
+  const navigate = useNavigate();
+  const [pools, setPools] = useState<Pool[]>([]);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [form, setForm] = useState(emptyPool);
+  const [tagsStr, setTagsStr] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [osdCount, setOsdCount] = useState(0);
+  const [k8sNodeCount, setK8sNodeCount] = useState(0);
+  const [tab, setTab] = useState<WizardTab>("config");
+  const [compression, setCompression] = useState(true);
+  const [encryption, setEncryption] = useState(false);
+  // No synchronous `setLoading(true)`: the initial state already covers the
+  // mount path, and a refresh updating in place reads better than flashing
+  // a spinner over data already on screen.
+
+  const load = () => {
+    Promise.all([
+      fetch("/_admin/pools")
+        .then((r) => r.json())
+        .catch(() => []),
+      fetch("/_admin/nodes")
+        .then((r) => r.json())
+        .catch(() => ({ nodes: [] })),
+    ])
+      .then(([p, n]) => {
+        setPools(Array.isArray(p) ? p : p.pools || []);
+        const nodes = n.nodes || [];
+        setOsdCount(
+          nodes.filter((nd: { online: boolean }) => nd.online).length,
+        );
+        const uniqueK8s = new Set(
+          nodes
+            .map((nd: { kubernetes_node: string }) => nd.kubernetes_node)
+            .filter(Boolean),
+        );
+        setK8sNodeCount(uniqueK8s.size);
+      })
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const startEdit = (p?: Pool) => {
+    if (p) {
+      setForm({ ...emptyPool, ...p });
+      setTagsStr(p.osd_tags?.join(", ") || "");
+      setEditing(p.name);
+    } else {
+      setForm({ ...emptyPool });
+      setTagsStr("");
+      setEditing("__new__");
+    }
+    setTab("config");
+  };
+
+  const save = async () => {
+    const payload = {
+      ...form,
+      osd_tags: tagsStr
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    };
+    const method = editing === "__new__" ? "POST" : "PUT";
+    const url =
+      editing === "__new__"
+        ? "/_admin/pools"
+        : `/_admin/pools/${form.name}`;
+    await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    setEditing(null);
+    load();
+  };
+
+  const remove = async (name: string) => {
+    if (!confirm(`Delete pool "${name}"?`)) return;
+    await fetch(`/_admin/pools/${name}`, { method: "DELETE" });
+    load();
+  };
+
+  // -----------------------------------------------------------------
+  // Derived — validation + summary rows for the right-side panel
+  // -----------------------------------------------------------------
+  const validation: ValidationState = useMemo(() => {
+    if (!form.name.trim()) {
+      return { kind: "warning", message: "Pool name is required." };
+    }
+    const needed = ecMinNodes(form as Pool);
+    if (osdCount > 0 && needed > osdCount) {
+      return {
+        kind: "error",
+        message: `Needs ${needed} OSDs but only ${osdCount} online.`,
+      };
+    }
+    if (form.failure_domain !== "osd" && k8sNodeCount <= 1) {
+      return {
+        kind: "warning",
+        message: `Failure domain "${form.failure_domain}" needs 2+ distinct nodes. Only ${k8sNodeCount} observed.`,
+      };
+    }
+    return {
+      kind: "passed",
+      message: `Requested scheme is valid for ${osdCount} online OSD${osdCount !== 1 ? "s" : ""}.`,
+    };
+  }, [form, osdCount, k8sNodeCount]);
+
+  return (
+    <div className={embedded ? "" : "p-6"}>
+      {!embedded && (
+        <PageHeader
+          title="Storage Management"
+          description="Manage pools, volumes, and data policies."
+          action={
+            !editing ? (
+              <button
+                onClick={() => startEdit()}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-accent text-primary-fg rounded-lg text-[12px] font-medium hover:bg-accent"
+              >
+                <Plus size={14} /> Create Pool
+              </button>
+            ) : null
+          }
+        />
+      )}
+      {embedded && !editing && (
+        <div className="flex items-center justify-end mb-3">
+          <button
+            onClick={() => startEdit()}
+            className="flex items-center gap-1.5 px-2.5 py-1 bg-accent text-primary-fg rounded-lg text-[11px] font-medium hover:bg-accent"
+          >
+            <Plus size={12} /> Create Pool
+          </button>
+        </div>
+      )}
+
+      {editing ? (
+        <PoolWizard
+          editing={editing}
+          form={form}
+          setForm={setForm}
+          tagsStr={tagsStr}
+          setTagsStr={setTagsStr}
+          tab={tab}
+          setTab={setTab}
+          osdCount={osdCount}
+          k8sNodeCount={k8sNodeCount}
+          validation={validation}
+          compression={compression}
+          setCompression={setCompression}
+          encryption={encryption}
+          setEncryption={setEncryption}
+          onCancel={() => setEditing(null)}
+          onSave={save}
+        />
+      ) : (
+        <PoolList
+          loading={loading}
+          pools={pools}
+          onEdit={startEdit}
+          onDelete={remove}
+          onViewPlacement={(name) => navigate(`/cluster/pools/${encodeURIComponent(name)}`)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Wizard (Create/Edit)
+// ---------------------------------------------------------------------
+
+interface WizardProps {
+  editing: string;
+  form: Omit<Pool, "created_at">;
+  setForm: React.Dispatch<React.SetStateAction<Omit<Pool, "created_at">>>;
+  tagsStr: string;
+  setTagsStr: (s: string) => void;
+  tab: WizardTab;
+  setTab: (t: WizardTab) => void;
+  osdCount: number;
+  k8sNodeCount: number;
+  validation: ValidationState;
+  compression: boolean;
+  setCompression: (b: boolean) => void;
+  encryption: boolean;
+  setEncryption: (b: boolean) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}
+
+function PoolWizard({
+  editing,
+  form,
+  setForm,
+  tagsStr,
+  setTagsStr,
+  tab,
+  setTab,
+  osdCount,
+  k8sNodeCount,
+  validation,
+  compression,
+  setCompression,
+  encryption,
+  setEncryption,
+  onCancel,
+  onSave,
+}: WizardProps) {
+  const isNew = editing === "__new__";
+  return (
+    <div className="flex gap-4 items-start">
+      {/* Form column */}
+      <div className="flex-1 min-w-0 space-y-4">
+        <div className="bg-surface border border-border rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-lg bg-accent-soft flex items-center justify-center">
+                <Layers size={14} className="text-accent" />
+              </div>
+              <div>
+                <h2 className="text-[14px] font-semibold text-text">
+                  {isNew ? "New pool" : `Edit · ${editing}`}
+                </h2>
+                <p className="text-[11px] text-muted">
+                  Configure redundancy, placement, and policies.
+                </p>
+              </div>
+            </div>
+            <Tabs
+              variant="pill"
+              active={tab}
+              onChange={setTab}
+              tabs={[
+                { key: "config" as const, label: "Pool config" },
+                { key: "volumes" as const, label: "Volumes" },
+                { key: "policies" as const, label: "Policies" },
+              ]}
+            />
+          </div>
+
+          <div className="p-4">
+            {tab === "config" && (
+              <ConfigTab
+                form={form}
+                setForm={setForm}
+                tagsStr={tagsStr}
+                setTagsStr={setTagsStr}
+                osdCount={osdCount}
+                k8sNodeCount={k8sNodeCount}
+                compression={compression}
+                setCompression={setCompression}
+                encryption={encryption}
+                setEncryption={setEncryption}
+                isNew={isNew}
+              />
+            )}
+            {tab === "volumes" && (
+              <EmptyTabPlaceholder
+                title="Volumes"
+                message="Per-pool volume provisioning UI is not yet wired. Use the block CLI or block-gateway API in the meantime."
+              />
+            )}
+            {tab === "policies" && (
+              <EmptyTabPlaceholder
+                title="Policies"
+                message="Lifecycle + object-lock policies for this pool will live here. Bucket-level policies remain on the Policies page."
+              />
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Right column: Change Summary */}
+      <SummaryPanel
+        title="Change summary"
+        subtitle="Review configuration before applying."
+        validation={validation}
+        rows={[
+          { label: "Pool Name", value: form.name || "—", mono: true },
+          { label: "Type", value: ecLabel(form as Pool) },
+          { label: "Failure Domain", value: form.failure_domain },
+          { label: "CRUSH Rule", value: crushRuleName(form), mono: true },
+          {
+            label: "Compression",
+            value: compression ? "Enabled (LZ4)" : "Disabled",
+          },
+          {
+            label: "Encryption",
+            value: encryption ? "AES-256 (KMS)" : "Disabled",
+          },
+          {
+            label: "Expected Efficiency",
+            value: ecEfficiency(form as Pool),
+          },
+          {
+            label: "Fault Tolerance",
+            value: `${form.ec_type === 2 ? form.replication_count - 1 : form.ec_m} failures`,
+          },
+        ]}
+        footer={
+          <div className="space-y-2">
+            <div className="flex items-start gap-1.5 p-2 rounded-card bg-warn-soft border border-warn/25">
+              <AlertTriangle
+                size={12}
+                className="text-warn shrink-0 mt-px"
+              />
+              <div className="text-[10px] text-warn">
+                <div className="font-semibold">Data Rebalancing</div>
+                <div className="opacity-80">
+                  Applying this pool may initiate background peering and
+                  temporarily affect cluster IOPS.
+                </div>
+              </div>
+            </div>
+            <div className="flex gap-1.5">
+              <button
+                onClick={onCancel}
+                className="flex-1 px-2.5 py-1.5 border border-border text-text-2 rounded-md text-[12px] font-medium hover:bg-surface-2"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={onSave}
+                disabled={validation.kind === "error" || !form.name.trim()}
+                className="flex-1 flex items-center justify-center gap-1 px-2.5 py-1.5 bg-accent text-primary-fg rounded-md text-[12px] font-medium hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Check size={12} />
+                {isNew ? "Create pool" : "Apply"}
+              </button>
+            </div>
+          </div>
+        }
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Config tab sections
+// ---------------------------------------------------------------------
+
+interface ConfigTabProps {
+  form: Omit<Pool, "created_at">;
+  setForm: React.Dispatch<React.SetStateAction<Omit<Pool, "created_at">>>;
+  tagsStr: string;
+  setTagsStr: (s: string) => void;
+  osdCount: number;
+  k8sNodeCount: number;
+  compression: boolean;
+  setCompression: (b: boolean) => void;
+  encryption: boolean;
+  setEncryption: (b: boolean) => void;
+  isNew: boolean;
+}
+
+function ConfigTab({
+  form,
+  setForm,
+  tagsStr,
+  setTagsStr,
+  osdCount,
+  k8sNodeCount,
+  compression,
+  setCompression,
+  encryption,
+  setEncryption,
+  isNew,
+}: ConfigTabProps) {
+  return (
+    <div className="space-y-6">
+      {/* Basic Information */}
+      <Section title="Basic Information" icon={<Info size={13} />}>
+        <div className="grid grid-cols-2 gap-3">
+          <FormField label="Pool Name">
+            <input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              disabled={!isNew}
+              placeholder="production-nvme-pool"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none disabled:bg-surface-2"
+            />
+          </FormField>
+          <FormField label="Application Type">
+            <select
+              value={form.description}
+              onChange={(e) =>
+                setForm({ ...form, description: e.target.value })
+              }
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
+            >
+              <option value="">Object / S3</option>
+              <option value="Database (Block)">Database (Block)</option>
+              <option value="Filesystem">Filesystem</option>
+              <option value="Archive">Archive</option>
+            </select>
+          </FormField>
+        </div>
+      </Section>
+
+      {/* Redundancy Strategy */}
+      <Section
+        title="Redundancy Strategy"
+        icon={<Shield size={13} />}
+        rightAccessory={
+          form.ec_type === 2 ? (
+            <Tag tone="blue">Replication Selected</Tag>
+          ) : (
+            <Tag tone="blue">Erasure Coding Selected</Tag>
+          )
+        }
+      >
+        <div className="grid grid-cols-2 gap-2">
+          <RadioCard
+            selected={form.ec_type === 2}
+            onClick={() =>
+              setForm({ ...form, ec_type: 2, replication_count: 3 })
+            }
+            title="Replication"
+            desc="High performance, higher storage overhead. Best for small block I/O."
+          />
+          <RadioCard
+            selected={form.ec_type !== 2}
+            onClick={() => setForm({ ...form, ec_type: 0, ec_k: 4, ec_m: 2 })}
+            title="Erasure Coding"
+            desc="Efficient storage, slightly higher latency. Best for object/bulk storage."
+          />
+        </div>
+
+        {form.ec_type === 2 ? (
+          <div className="mt-3 p-3 bg-surface-2 border border-border rounded-lg">
+            <div className="text-[11px] text-muted uppercase tracking-wider mb-2">
+              Replica Count
+            </div>
+            <Stepper
+              value={form.replication_count}
+              onChange={(v) => setForm({ ...form, replication_count: v })}
+              min={1}
+              max={10}
+              width="w-28"
+            />
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-ok bg-ok-soft border border-ok/25 rounded-[5px] px-2 py-1 w-fit">
+              <Check size={11} />
+              {(100 / Math.max(1, form.replication_count)).toFixed(0)}%
+              efficiency. Survives {form.replication_count - 1} concurrent
+              failures.
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 p-3 bg-surface-2 border border-border rounded-lg">
+            <div className="text-[11px] text-muted uppercase tracking-wider mb-2">
+              Erasure Code Profile (K + M)
+            </div>
+            <div className="flex items-start gap-8">
+              <div>
+                <div className="text-[10px] text-faint uppercase tracking-wider mb-1">
+                  Data Chunks (K)
+                </div>
+                <Stepper
+                  value={form.ec_k}
+                  onChange={(v) => setForm({ ...form, ec_k: v })}
+                  min={1}
+                  max={20}
+                />
+              </div>
+              <div>
+                <div className="text-[10px] text-faint uppercase tracking-wider mb-1">
+                  Coding Chunks (M)
+                </div>
+                <Stepper
+                  value={form.ec_m}
+                  onChange={(v) => setForm({ ...form, ec_m: v })}
+                  min={1}
+                  max={10}
+                />
+              </div>
+            </div>
+            <div className="mt-3 flex items-center gap-1.5 text-[11px] text-ok bg-ok-soft border border-ok/25 rounded-[5px] px-2 py-1 w-fit">
+              <Check size={11} />
+              Yields {ecEfficiency(form as Pool)} storage efficiency. Can
+              survive {form.ec_m} concurrent {form.failure_domain}{" "}
+              failures.
+            </div>
+          </div>
+        )}
+      </Section>
+
+      {/* Placement & Failure Domain */}
+      <Section
+        title="Placement & Failure Domain"
+        icon={<Layers size={13} />}
+        rightAccessory={
+          <button className="flex items-center gap-1 text-[11px] text-accent hover:text-accent">
+            View Topology <ExternalLink size={10} />
+          </button>
+        }
+      >
+        <FormField
+          label="Failure Domain Level"
+          hint="Determines the physical level at which data replicas or EC chunks are distributed to ensure survival."
+        >
+          <select
+            value={form.failure_domain}
+            onChange={(e) =>
+              setForm({ ...form, failure_domain: e.target.value })
+            }
+            className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
+          >
+            <option value="osd">OSD (disk-level)</option>
+            <option
+              value="host"
+              disabled={k8sNodeCount <= 1 && k8sNodeCount > 0}
+            >
+              Host{k8sNodeCount <= 1 && k8sNodeCount > 0 ? " (need 2+ hosts)" : ""}
+            </option>
+            <option
+              value="rack"
+              disabled={k8sNodeCount <= 1 && k8sNodeCount > 0}
+            >
+              Rack
+            </option>
+            <option
+              value="datacenter"
+              disabled={k8sNodeCount <= 1 && k8sNodeCount > 0}
+            >
+              Datacenter
+            </option>
+          </select>
+        </FormField>
+        <div className="mt-3">
+          <FormField label="Target CRUSH Rule">
+            <div className="flex gap-2">
+              <input
+                readOnly
+                value={crushRuleName(form)}
+                className="flex-1 px-2.5 py-1.5 border border-border bg-surface-2 rounded-lg text-[13px] font-mono text-text-2"
+              />
+              <button
+                disabled
+                title="CRUSH rule editor is admin-only; coming soon"
+                className="px-3 py-1.5 border border-border text-muted rounded-lg text-[12px] font-medium hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Edit Rule
+              </button>
+            </div>
+          </FormField>
+        </div>
+      </Section>
+
+      {/* Features & Quotas */}
+      <Section title="Features & Quotas" icon={<Shield size={13} />}>
+        <div className="grid grid-cols-2 gap-3">
+          <FeatureToggle
+            title="Compression"
+            desc="Inline LZ4 compression"
+            checked={compression}
+            onChange={setCompression}
+          />
+          <FeatureToggle
+            title="Encryption (At Rest)"
+            desc="AES-256 via KMS"
+            checked={encryption}
+            onChange={setEncryption}
+          />
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <FormField label="OSD Tags" hint="Optional — limits placement to matching OSDs.">
+            <input
+              value={tagsStr}
+              onChange={(e) => setTagsStr(e.target.value)}
+              placeholder="nvme, ssd"
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] focus:ring-1 focus:ring-accent focus:outline-none"
+            />
+          </FormField>
+          <FormField label="Storage Quota" hint="Optional">
+            <select
+              value={form.quota_bytes}
+              onChange={(e) =>
+                setForm({ ...form, quota_bytes: Number(e.target.value) })
+              }
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
+            >
+              <option value={0}>Unlimited</option>
+              <option value={107374182400}>100 GB</option>
+              <option value={1099511627776}>1 TB</option>
+              <option value={10995116277760}>10 TB</option>
+              <option value={109951162777600}>100 TB</option>
+            </select>
+          </FormField>
+          <FormField
+            label="Placement Groups"
+            hint="0 = legacy CRUSH. Rec: 100 × OSDs ÷ (k+m), rounded up"
+          >
+            <select
+              value={form.pg_count ?? 0}
+              onChange={(e) =>
+                setForm({ ...form, pg_count: Number(e.target.value) })
+              }
+              className="w-full px-2.5 py-1.5 border border-border-strong rounded-lg text-[13px] bg-surface focus:ring-1 focus:ring-accent focus:outline-none"
+            >
+              <option value={0}>0 (legacy)</option>
+              <option value={64}>64</option>
+              <option value={128}>128</option>
+              <option value={256}>256</option>
+              <option value={512}>512</option>
+              <option value={1024}>1024</option>
+              <option value={2048}>2048</option>
+              <option value={4096}>4096</option>
+            </select>
+          </FormField>
+        </div>
+        {osdCount > 0 && (
+          <p className="mt-2 text-[11px] text-faint">
+            {osdCount} OSDs on {k8sNodeCount} host
+            {k8sNodeCount !== 1 ? "s" : ""} available in the cluster.
+          </p>
+        )}
+      </Section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Shared local building blocks
+// ---------------------------------------------------------------------
+
+function Section({
+  title,
+  icon,
+  rightAccessory,
+  children,
+}: {
+  title: string;
+  icon?: React.ReactNode;
+  rightAccessory?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="border border-border rounded-xl">
+      <header className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-surface-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold text-text">
+          <span className="text-faint">{icon}</span>
+          {title}
+        </div>
+        {rightAccessory}
+      </header>
+      <div className="p-4">{children}</div>
+    </section>
+  );
+}
+
+function FormField({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="block">
+      <div className="text-[11px] font-medium text-text-2 mb-1">{label}</div>
+      {hint && <div className="text-[10px] text-faint mb-1">{hint}</div>}
+      {children}
+    </label>
+  );
+}
+
+function RadioCard({
+  selected,
+  onClick,
+  title,
+  desc,
+}: {
+  selected: boolean;
+  onClick: () => void;
+  title: string;
+  desc: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`text-left p-3 rounded-lg border transition-colors ${
+        selected
+          ? "border-accent bg-accent-soft ring-1 ring-accent"
+          : "border-border hover:bg-surface-2"
+      }`}
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <span
+          className={`w-3 h-3 rounded-full border-2 flex items-center justify-center shrink-0 ${
+            selected ? "border-accent" : "border-border-strong"
+          }`}
+        >
+          {selected && <span className="w-1.5 h-1.5 bg-accent rounded-full" />}
+        </span>
+        <span className="text-[13px] font-semibold text-text">{title}</span>
+      </div>
+      <p className="text-[11px] text-muted">{desc}</p>
+    </button>
+  );
+}
+
+function Stepper({
+  value,
+  onChange,
+  min,
+  max,
+  width = "w-24",
+}: {
+  value: number;
+  onChange: (n: number) => void;
+  min: number;
+  max: number;
+  width?: string;
+}) {
+  return (
+    <div className={`inline-flex items-center border border-border-strong rounded-lg ${width}`}>
+      <button
+        onClick={() => onChange(Math.max(min, value - 1))}
+        className="px-2 py-1.5 text-muted hover:text-text hover:bg-surface-2 rounded-l-lg"
+        aria-label="Decrement"
+      >
+        <Minus size={12} />
+      </button>
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          if (!Number.isNaN(n)) onChange(Math.min(max, Math.max(min, n)));
+        }}
+        className="flex-1 min-w-0 px-1 py-1 text-center text-[13px] font-semibold text-text focus:outline-none tabular-nums"
+      />
+      <button
+        onClick={() => onChange(Math.min(max, value + 1))}
+        className="px-2 py-1.5 text-muted hover:text-text hover:bg-surface-2 rounded-r-lg"
+        aria-label="Increment"
+      >
+        <PlusIcon size={12} />
+      </button>
+    </div>
+  );
+}
+
+function FeatureToggle({
+  title,
+  desc,
+  checked,
+  onChange,
+}: {
+  title: string;
+  desc: string;
+  checked: boolean;
+  onChange: (b: boolean) => void;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 p-3 border border-border rounded-lg">
+      <div>
+        <div className="text-[13px] font-semibold text-text">{title}</div>
+        <div className="text-[11px] text-muted">{desc}</div>
+      </div>
+      <button
+        onClick={() => onChange(!checked)}
+        role="switch"
+        aria-checked={checked}
+        className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${
+          checked ? "bg-ok" : "bg-border-strong"
+        }`}
+      >
+        <span
+          className={`inline-block h-4 w-4 transform rounded-full bg-surface transition-transform ${
+            checked ? "translate-x-4" : "translate-x-0.5"
+          }`}
+        />
+      </button>
+    </div>
+  );
+}
+
+function Tag({
+  tone,
+  children,
+}: {
+  tone: "blue" | "green" | "gray";
+  children: React.ReactNode;
+}) {
+  const style =
+    tone === "blue"
+      ? "bg-accent-soft text-accent border-accent"
+      : tone === "green"
+        ? "bg-ok-soft text-ok border-ok/25"
+        : "bg-surface-2 text-text-2 border-border";
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border ${style}`}
+    >
+      {children}
+    </span>
+  );
+}
+
+function EmptyTabPlaceholder({
+  title,
+  message,
+}: {
+  title: string;
+  message: string;
+}) {
+  return (
+    <div className="py-12 text-center">
+      <div className="text-[14px] font-semibold text-text">{title}</div>
+      <p className="mt-1 text-[12px] text-muted max-w-md mx-auto">{message}</p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// Pool list (unchanged UX; kept for non-wizard mode)
+// ---------------------------------------------------------------------
+
+function PoolList({
+  loading,
+  pools,
+  onEdit,
+  onDelete,
+  onViewPlacement,
+}: {
+  loading: boolean;
+  pools: Pool[];
+  onEdit: (p: Pool) => void;
+  onDelete: (name: string) => void;
+  onViewPlacement?: (name: string) => void;
+}) {
+  return (
+    <Table
+      columns={[
+        { key: "pool", label: "Pool" },
+        { key: "protection", label: "Protection", className: "w-56" },
+        { key: "efficiency", label: "Efficiency", align: "right", className: "w-28" },
+        { key: "domain", label: "Domain", className: "w-28" },
+        { key: "pgs", label: "PGs", align: "right", className: "w-24" },
+        { key: "quota", label: "Quota", align: "right", className: "w-28" },
+        { key: "status", label: "Status", className: "w-28" },
+        { key: "actions", label: "", className: "w-24" },
+      ]}
+      loading={loading}
+      empty="No storage pools configured"
+      footer={
+        pools.length
+          ? `${pools.length} pool${pools.length === 1 ? "" : "s"} · ${
+              pools.filter((p) => p.enabled).length
+            } active`
+          : undefined
+      }
+    >
+      {pools.length
+        ? pools.map((p) => (
+            <Row key={p.name}>
+              <Cell>
+                <span className="flex items-center gap-2">
+                  <Layers size={14} className="text-muted shrink-0" />
+                  <span className="flex flex-col min-w-0">
+                    <span className="font-mono text-[13px] font-medium text-text truncate">
+                      {p.name}
+                    </span>
+                    {p.description && (
+                      <span className="text-[11px] text-muted truncate">{p.description}</span>
+                    )}
+                  </span>
+                </span>
+              </Cell>
+              <Cell>
+                <span className="flex items-center gap-1.5">
+                  <span
+                    className={`inline-flex items-center px-1.5 py-px rounded-[5px] text-[10px] font-medium ${ecTypeBadge(
+                      p.ec_type
+                    )}`}
+                  >
+                    {ecTypeName(p.ec_type)}
+                  </span>
+                  <span className="font-mono text-[12px] text-text-2">{ecLabel(p)}</span>
+                </span>
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {ecEfficiency(p)}
+              </Cell>
+              <Cell>
+                <Chip mono>{p.failure_domain}</Chip>
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {p.pg_count && p.pg_count > 0 ? (
+                  <button
+                    onClick={() => onViewPlacement?.(p.name)}
+                    className="text-accent hover:underline"
+                    title="Show placement-group distribution"
+                  >
+                    {p.pg_count.toLocaleString()}
+                  </button>
+                ) : (
+                  // 0 PGs is not "none" — it selects the legacy per-object
+                  // CRUSH path, which is a different placement mode.
+                  <span className="text-faint">legacy</span>
+                )}
+              </Cell>
+              <Cell align="right" className="font-mono">
+                {p.quota_bytes ? formatBytes(p.quota_bytes) : "—"}
+              </Cell>
+              <Cell>
+                <Badge kind={p.enabled ? "ok" : "neutral"}>
+                  {p.enabled ? "Active" : "Disabled"}
+                </Badge>
+              </Cell>
+              <Cell align="right">
+                <span className="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                  {p.pg_count && p.pg_count > 0 && onViewPlacement && (
+                    <button
+                      onClick={() => onViewPlacement(p.name)}
+                      title="View placement groups"
+                      className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                    >
+                      <Layers size={13} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => onEdit(p)}
+                    title="Edit pool"
+                    className="p-1 rounded text-muted hover:text-text hover:bg-surface-2"
+                  >
+                    <Edit size={13} />
+                  </button>
+                  <button
+                    onClick={() => onDelete(p.name)}
+                    title="Delete pool"
+                    className="p-1 rounded text-muted hover:text-err hover:bg-surface-2"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </span>
+              </Cell>
+            </Row>
+          ))
+        : undefined}
+    </Table>
+  );
+}

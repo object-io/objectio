@@ -1,0 +1,28 @@
+[package]
+name = "objectio-transport-te"
+description = "Shard transport over Mooncake Transfer Engine (RDMA, with a TCP mode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Link Mooncake Transfer Engine and build the engine half of this crate.
+# Linux only, and needs a Mooncake CMake build at build time: see
+# vendor/transfer_engine_rust/VENDORED.md. Without it only the slot pool is
+# built, which is what every other build of the workspace sees.
+te = ["dep:transfer_engine_rust", "transfer_engine_rust/link"]
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+transfer_engine_rust = { path = "vendor/transfer_engine_rust", optional = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+
+[lints]
+workspace = true

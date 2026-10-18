@@ -1,0 +1,233 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "objectio.gateway.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  {{- if not .Values.gateway.autoscaling.enabled }}
+  # When the HPA is enabled, omit replicas so helm doesn't keep
+  # re-asserting it against the autoscaler's desired count.
+  replicas: {{ .Values.gateway.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "objectio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "objectio.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      {{- if and .Values.gateway.hostProvider.enabled (eq .Values.gateway.hostProvider.kind "k8s") }}
+      serviceAccountName: {{ include "objectio.gateway.fullname" . }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "objectio.image" (dict "global" .Values.global "component" .Values.gateway) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["objectio-gateway"]
+          args:
+            - "--listen"
+            - "0.0.0.0:{{ .Values.gateway.service.port }}"
+            - "--meta-endpoint"
+            - "http://{{ include "objectio.meta.fullname" . }}:{{ .Values.meta.service.port }}"
+            - "--ec-k"
+            - {{ .Values.ec.k | quote }}
+            - "--ec-m"
+            - {{ .Values.ec.m | quote }}
+            - "--region"
+            - {{ .Values.gateway.region | quote }}
+            {{- if .Values.gateway.noAuth }}
+            - "--no-auth"
+            {{- end }}
+            {{- if not .Values.gateway.reexportMetrics }}
+            - "--no-reexport-metrics"
+            {{- end }}
+            - "--external-endpoint"
+            {{- /*
+              gateway.externalUrl is the canonical key — the public URL the
+              gateway is reachable at. Consumed by Iceberg vended creds,
+              Delta Sharing presigned URLs, and the console OIDC callback.
+              gateway.deltaSharing.externalEndpoint is kept as a fallback
+              so existing deployments that only set the Delta Sharing key
+              don't break on upgrade.
+            */}}
+            - {{ (default .Values.gateway.deltaSharing.externalEndpoint .Values.gateway.externalUrl) | quote }}
+            - "--delta-access-key-id"
+            - {{ .Values.gateway.deltaSharing.accessKeyId | quote }}
+            - "--delta-secret-key"
+            - {{ .Values.gateway.deltaSharing.secretKey | quote }}
+            - "--log-level"
+            - {{ .Values.gateway.logLevel | quote }}
+            {{- with .Values.gateway.endpoints }}
+            {{- if .internalName }}
+            - "--endpoint-name"
+            - {{ .internalName | quote }}
+            {{- end }}
+            {{- if .external.port }}
+            - "--data-listen"
+            - "0.0.0.0:{{ .external.port }}={{ .external.name }}"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.gateway.trustedProxies }}
+            - "--trusted-proxies"
+            - {{ .Values.gateway.trustedProxies | quote }}
+            {{- end }}
+            {{- if .Values.gateway.hostProvider.enabled }}
+            - "--host-provider"
+            - {{ .Values.gateway.hostProvider.kind | quote }}
+            - "--host-provider-osd-sts"
+            - {{ include "objectio.osd.fullname" . | quote }}
+            {{- end }}
+            {{- if .Values.gateway.kms }}
+            - "--kms-backend"
+            - {{ .Values.gateway.kms.backend | default "local" | quote }}
+            {{- end }}
+            {{- if .Values.gateway.oidc.issuerUrl }}
+            - "--oidc-issuer-url"
+            - {{ .Values.gateway.oidc.issuerUrl | quote }}
+            - "--oidc-client-id"
+            - {{ .Values.gateway.oidc.clientId | quote }}
+            - "--oidc-client-secret"
+            - {{ .Values.gateway.oidc.clientSecret | quote }}
+            {{- if .Values.gateway.oidc.audience }}
+            - "--oidc-audience"
+            - {{ .Values.gateway.oidc.audience | quote }}
+            {{- end }}
+            {{- if .Values.gateway.oidc.groupsClaim }}
+            - "--oidc-groups-claim"
+            - {{ .Values.gateway.oidc.groupsClaim | quote }}
+            {{- end }}
+            {{- if .Values.gateway.oidc.scopes }}
+            - "--oidc-scopes"
+            - {{ .Values.gateway.oidc.scopes | quote }}
+            {{- end }}
+            {{- if .Values.gateway.oidc.adminRoles }}
+            - "--oidc-admin-roles"
+            - {{ .Values.gateway.oidc.adminRoles | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.gateway.topology }}
+            {{- if .region }}
+            - "--topology-region"
+            - {{ .region | quote }}
+            {{- end }}
+            {{- if .zone }}
+            - "--topology-zone"
+            - {{ .zone | quote }}
+            {{- end }}
+            {{- if .datacenter }}
+            - "--topology-datacenter"
+            - {{ .datacenter | quote }}
+            {{- end }}
+            {{- if .rack }}
+            - "--topology-rack"
+            - {{ .rack | quote }}
+            {{- end }}
+            {{- end }}
+          env:
+            # Always present — the host provider (even if noop) reads
+            # POD_NAMESPACE from the downward API. SSE / KMS envs
+            # below are conditional on gateway.sse.enabled.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.gateway.sse.enabled }}
+            - name: OBJECTIO_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "objectio.gateway.fullname" . }}-sse
+                  key: master-key
+            {{- if eq (.Values.gateway.kms.backend | default "local") "vault" }}
+            - name: VAULT_ADDR
+              value: {{ .Values.gateway.kms.vault.addr | quote }}
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.kms.vault.tokenSecretName | default (printf "%s-vault" (include "objectio.gateway.fullname" .)) }}
+                  key: token
+            {{- if .Values.gateway.kms.vault.transitPath }}
+            - name: VAULT_TRANSIT_PATH
+              value: {{ .Values.gateway.kms.vault.transitPath | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with (include "objectio.tls.env" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.gateway.audit.spool.enabled }}
+            - name: OBJECTIO_AUDIT_SPOOL
+              value: /var/lib/objectio/audit-spool
+            - name: OBJECTIO_AUDIT_DRAIN_SECS
+              value: {{ .Values.gateway.audit.spool.drainSeconds | quote }}
+            - name: OBJECTIO_AUDIT_SPOOL_MAX_BYTES
+              value: {{ .Values.gateway.audit.spool.maxBytes | int64 | quote }}
+            # Bucket logging's records wait in the same volume
+            # (audit-spool/bucket-logging).
+            - name: OBJECTIO_BUCKET_LOG_SPOOL_MAX_BYTES
+              value: {{ .Values.gateway.audit.spool.bucketLogMaxBytes | int64 | quote }}
+            {{- if .Values.gateway.audit.systemBucket }}
+            - name: OBJECTIO_AUDIT_SYSTEM_BUCKET
+              value: {{ .Values.gateway.audit.systemBucket | quote }}
+            - name: OBJECTIO_AUDIT_RETENTION_DAYS
+              value: {{ .Values.gateway.audit.retentionDays | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.service.port }}
+              protocol: TCP
+            {{- if .Values.gateway.endpoints.external.port }}
+            - name: http-external
+              containerPort: {{ .Values.gateway.endpoints.external.port }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # /_ready answers 503 until meta is reachable and enough OSDs are
+          # for a write to meet quorum, so a starting gateway takes no
+          # traffic it would fail. It stays 200 once reached (a startup
+          # gate, not a health check); liveness remains /health.
+          readinessProbe:
+            httpGet:
+              path: /_ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
+          volumeMounts:
+            {{- with (include "objectio.tls.volumeMount" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- if .Values.gateway.audit.spool.enabled }}
+            - name: audit-spool
+              mountPath: /var/lib/objectio/audit-spool
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+      {{- if .Values.gateway.audit.spool.enabled }}
+      # Room to deliver the audit spool on the way out.
+      terminationGracePeriodSeconds: {{ add .Values.gateway.audit.spool.drainSeconds 30 }}
+      {{- end }}
+      {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
+      volumes:
+        {{- with (include "objectio.tls.volume" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.gateway.audit.spool.enabled }}
+        - name: audit-spool
+          emptyDir:
+            sizeLimit: {{ .Values.gateway.audit.spool.sizeLimit }}
+        {{- end }}
+      {{- end }}

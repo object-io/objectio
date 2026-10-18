@@ -1,0 +1,327 @@
+global:
+  imageRegistry: ghcr.io/object-io
+  imagePullPolicy: IfNotPresent
+  # One image carries every service; each container overrides the entrypoint
+  # (see `command:` in the templates). This is the only image the release
+  # publishes — `ghcr.io/object-io/objectio:<tag>`, the Dockerfile's `all`
+  # target — and the chart used to ask for per-service images
+  # (objectio-gateway, objectio-meta, objectio-osd) that have never been
+  # pushed to any registry, so a `helm install` from the published chart
+  # sat in ImagePullBackOff.
+  #
+  # Set `global.image: null` to fall back to each component's own
+  # `image.repository`, which is what a local build wants: `make kind-up`
+  # builds and loads the per-service images by those names.
+  image:
+    repository: objectio
+    tag: latest
+
+gateway:
+  # The system always audits (A8c): every request is an event, kept in the
+  # gateway's spool before it is delivered and in the system bucket.
+  audit:
+    # Spooled events wait in an emptyDir: they survive the gateway being
+    # killed (the container restarts), and on a normal shutdown the gateway
+    # delivers what is left before it exits (drainSeconds). A pod deleted
+    # without a shutdown loses what it had not delivered.
+    spool:
+      enabled: true
+      sizeLimit: 10Gi
+      # The gateway's own cap, below sizeLimit (an emptyDir past its limit
+      # gets the pod evicted): past it new events are dropped and counted.
+      maxBytes: 9663676416   # 9 GiB
+      # Bucket logging's records (A12) wait in the same volume until they
+      # are written into their target buckets; with maxBytes, below
+      # sizeLimit.
+      bucketLogMaxBytes: 536870912   # 512 MiB
+      drainSeconds: 20
+    # Every event also goes here (created on first start), kept retentionDays.
+    systemBucket: objectio-audit
+    retentionDays: 365
+  image:
+    repository: objectio-gateway
+    tag: latest
+  # Gateway is stateless — two replicas is the HA floor. Production
+  # should sit at ≥ 3; dev/kind can drop to 1 via --set gateway.replicas=1.
+  replicas: 2
+  # Re-export every OSD's and meta node's metrics on the gateway's
+  # /metrics. Off here: with several gateways each would export a copy,
+  # and the chart's Prometheus scrapes meta (:9101) and the OSDs (:9201)
+  # directly. Turn on only for a single gateway scraped alone.
+  reexportMetrics: false
+  # Autoscale the gateway tier based on CPU. Opt-in because the default
+  # install shouldn't create K8s objects the cluster may not support.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    # Leave memory target at 0 to disable — ObjectIO gateways are
+    # CPU-bound (SigV4 + EC encode), not memory-bound.
+    targetMemoryUtilizationPercentage: 0
+  # Keep at least one gateway up during voluntary disruptions (node
+  # drains, rolling upgrades). Rejects pod evictions that would leave
+  # zero ready replicas.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  service:
+    type: ClusterIP
+    port: 9000
+  noAuth: true
+  logLevel: info
+  region: us-east-1
+  # Gateway's own topological position. Feeds locality-aware read routing:
+  # shards on OSDs that share enclosing failure-domain levels are pulled
+  # first, saving cross-zone / cross-DC bandwidth. Empty strings disable
+  # the ranking (every OSD ranks as "unknown" distance).
+  topology:
+    region: ""
+    zone: ""
+    datacenter: ""
+    rack: ""
+  # Host lifecycle provider for the admin Add Host / Reboot endpoints.
+  # When `enabled: true` and `kind: k8s`, the chart renders a
+  # ServiceAccount + Role granting patch-scale on the OSD StatefulSet
+  # and delete-pod in this namespace, and the gateway container mounts
+  # that SA. Leave disabled for BYO-Linux or Appliance deployments
+  # (future providers supply their own auth mechanism).
+  hostProvider:
+    enabled: true
+    kind: k8s
+  # Public URL the gateway is reachable at (e.g. https://s3.example.com
+  # or http://localhost:9000 for kind). Consumed by Iceberg vended
+  # credentials, Delta Sharing presigned URLs, and the console OIDC
+  # callback. Leave empty to default to http://<listen>.
+  externalUrl: ""
+  # Delta Sharing presigned URL config. Credentials only — the URL base
+  # is taken from gateway.externalUrl. The old deltaSharing.externalEndpoint
+  # key is still read as a fallback for older deployments but should be
+  # migrated to gateway.externalUrl.
+  deltaSharing:
+    externalEndpoint: ""
+    accessKeyId: ""
+    secretKey: ""
+  oidc:
+    issuerUrl: ""
+    clientId: ""
+    clientSecret: ""
+    audience: ""
+    groupsClaim: "groups"
+    scopes: "openid profile email"
+    adminRoles: ""
+  # Server-side encryption (SSE-S3) master key. When enabled, the gateway
+  # gets OBJECTIO_MASTER_KEY mounted from a Secret; buckets with default
+  # encryption will encrypt at rest. The Secret is generated once on first
+  # install and preserved across `helm upgrade` — rotating it would make
+  # existing encrypted objects unreadable.
+  sse:
+    enabled: false
+    # Optional: pin the 32-byte base64 key. Leave empty to auto-generate.
+    masterKey: ""
+  # KMS backend. `local` is self-contained and uses the service master key
+  # above to wrap per-KMS-key material. `vault` points at an external
+  # HashiCorp Vault Transit engine; the referenced `tokenSecretName` Secret
+  # must contain a `token` key holding a Vault token with the right ACLs.
+  kms:
+    backend: local
+    vault:
+      addr: ""
+      transitPath: transit
+      tokenSecretName: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  # Named endpoints, for bucket policies that care where a request came
+  # from (aws:SourceVpce): e.g. "readable without keys from inside the
+  # cluster only", or "this key works only from inside".
+  endpoints:
+    # Name of the in-cluster endpoint (the gateway Service). "" = unnamed.
+    internalName: ""
+    # A separate port for traffic from outside, with its own name; the
+    # ingress is pointed at it. port 0 = the ingress uses the main port.
+    external:
+      port: 0
+      name: external
+  # Proxies (CIDRs, comma-separated) whose X-Forwarded-For names the
+  # client for aws:SourceIp — typically the ingress controller's pod CIDR.
+  # Empty: the connecting peer is the client.
+  trustedProxies: ""
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts: []
+    tls: []
+
+meta:
+  image:
+    repository: objectio-meta
+    tag: latest
+  # Raft cluster. `replicas: 3` survives a single pod loss (the
+  # standard quorum floor). `replicas: 1` is a single-voter cluster
+  # for dev/kind — no election drama but zero fault tolerance; set
+  # via --set meta.replicas=1. Post-install Job bootstraps automatically.
+  replicas: 3
+  podDisruptionBudget:
+    enabled: true
+    # Keep a majority (2/3) up during voluntary disruptions so Raft
+    # retains quorum. Always 1 less than the voter count.
+    maxUnavailable: 1
+  service:
+    port: 9100          # gRPC (MetadataService + RaftRpc)
+    metricsPort: 9101   # Prometheus
+    adminPort: 9102     # Raft bootstrap + membership admin (HTTP)
+  logLevel: info
+  persistence:
+    size: 10Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+osd:
+  image:
+    repository: objectio-osd
+    tag: latest
+  replicas: 1
+  service:
+    port: 9200
+    metricsPort: 9201
+  logLevel: info
+  persistence:
+    data:
+      size: 50Gi
+      storageClass: ""
+    state:
+      size: 5Gi
+      storageClass: ""
+  failureDomain:
+    region: default
+    datacenter: default
+    rack: rack1
+  storage:
+    # Allocation unit for a new disk; unset, the OSD's own (4 KiB). A
+    # shard takes whole blocks, so a larger one wastes space on every
+    # shard smaller than it (at 4 MiB, a 25 KB shard took 4 MiB).
+    # blockSize: 4096
+    diskFile: disk.raw
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+blockGateway:
+  enabled: false
+  image:
+    repository: objectio-block-gateway
+    tag: latest
+  replicas: 1
+  advertiseHost: ""   # Hostname/IP advertised in NBD attachment URLs; defaults to service ClusterIP
+  cacheBytes: 268435456   # 256 MB write cache
+  flushIntervalS: 5
+  logLevel: info
+  service:
+    type: ClusterIP
+    grpcPort: 9300
+    nbdPort: 10809
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+ec:
+  k: 1
+  m: 0
+
+monitoring:
+  enabled: false
+
+  # The alert rules (alerts/objectio-rules.yaml) as a PrometheusRule, for
+  # a prometheus-operator in the cluster. The chart's own Prometheus
+  # (enabled above) loads them either way.
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+  prometheus:
+    image:
+      repository: prom/prometheus
+      tag: v2.48.0
+    retention: 30d
+    scrapeInterval: 15s
+    service:
+      type: ClusterIP
+      port: 9090
+    persistence:
+      size: 10Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
+  grafana:
+    image:
+      repository: grafana/grafana
+      tag: "10.2.2"
+    adminUser: admin
+    adminPassword: objectio
+    service:
+      type: ClusterIP
+      port: 3000
+    persistence:
+      size: 5Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# mTLS between the services (A8a): gRPC between gateway, meta, OSDs and the
+# block gateway (Raft included) accepts only peers presenting a certificate
+# this cluster's CA signed. Client-facing TLS (S3, console) is the
+# ingress's. Enable it at install: turning it on (or off) later restarts
+# every component at once, as a cluster can't speak both.
+tls:
+  enabled: false
+  # A Secret with tls.crt, tls.key and ca.crt (cert-manager's format).
+  # Default: <release>-objectio-tls. Made by cert-manager when an issuer
+  # is named below; otherwise create it yourself.
+  secretName: ""
+  certManager:
+    # e.g. {name: objectio-ca, kind: Issuer}: a CA issuer, so ca.crt is
+    # the CA that signs every component's certificate.
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    # Components read their certificate when they start: after a renewal,
+    # roll them (kubectl rollout restart) to pick it up, well before the
+    # old one expires. Long-lived, so that is a yearly task.
+    duration: 8760h      # 1 year
+    renewBefore: 720h    # 30 days

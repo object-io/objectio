@@ -1,0 +1,22 @@
+[package]
+name = "objectio-proto"
+description = "Protocol buffer definitions for ObjectIO"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objectio-common = { workspace = true }
+tower = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# tonic 0.12's balanced channel takes tower 0.4's `Change`.
+tower04 = { package = "tower", version = "0.4", default-features = false, features = ["discover"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"

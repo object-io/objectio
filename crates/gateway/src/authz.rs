@@ -1,0 +1,1481 @@
+//! Centralized S3 authorization.
+//!
+//! Every S3 route is authorized here, in one middleware, rather than by
+//! per-handler calls. The handler-side pattern this replaces covered 7 of 25
+//! handlers and left whole routes unguarded — most importantly the multipart
+//! upload path, which had no check at all, so any valid key could write into
+//! any bucket once a client crossed the 8 MB threshold and switched to
+//! multipart.
+//!
+//! The layer runs immediately after [`crate::auth_middleware::auth_layer`], so
+//! the caller's identity is already on the request. It maps method + path +
+//! query onto an S3 action and a resource ARN, then evaluates the target
+//! bucket's policy against them.
+//!
+//! Only path-style addressing (`/{bucket}/{key…}`) is handled — the gateway
+//! has no virtual-hosted-style rewrite, so there is no host-derived bucket to
+//! consider.
+//!
+//! ## Semantics
+//!
+//! This preserves the previous authorization *outcome* exactly — an explicit
+//! `Deny` in a bucket policy blocks, everything else allows — and only widens
+//! where it is applied. Turning "no policy anywhere" into owner-only, and
+//! folding in identity policies and per-key scopes, change the default and
+//! land separately; keeping them out keeps this coverage fix reviewable on
+//! its own.
+
+use axum::{
+    body::Body,
+    extract::State,
+    http::{HeaderMap, Method, Request, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+use objectio_auth::{
+    AuthResult,
+    policy::{BucketPolicy, PolicyDecision, RequestContext},
+};
+use objectio_proto::metadata::{
+    GetBucketPolicyRequest, GetBucketRequest, GetPolicyRequest, ListAttachedPoliciesRequest,
+};
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
+
+use crate::s3::{AppState, S3Error, build_s3_arn, sse_condition_vars};
+
+/// How long a fetched bucket policy stays usable before it is re-read from
+/// meta. Short, because this is the window in which a policy change has not
+/// taken effect yet; long enough that a hot bucket costs one meta RPC per
+/// window instead of one per request.
+pub const POLICY_CACHE_TTL_SECS: u64 = 15;
+
+/// What authorization a request needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authz {
+    /// Nothing to evaluate — service-level routes with no bucket.
+    Skip,
+    /// The handler runs a finer-grained check of its own. Batch delete uses
+    /// this: S3 requires per-key `AccessDenied` entries inside a 200 response
+    /// rather than a single 403 for the whole request.
+    DeferToHandler,
+    /// Evaluate `action` against this bucket (and key, when object-scoped).
+    Check {
+        action: &'static str,
+        bucket: String,
+        key: Option<String>,
+    },
+}
+
+/// Percent-decode one path segment. Falls back to the raw text when the
+/// escape sequence is not valid UTF-8, matching how axum's `Path` extractor
+/// surfaces the same input to handlers.
+fn decode(segment: &str) -> String {
+    urlencoding::decode(segment).map_or_else(|_| segment.to_string(), |s| s.into_owned())
+}
+
+/// Is `name` present as a query parameter? S3 sub-resources are signalled by
+/// presence alone (`?uploads`, `?policy`), so the value is irrelevant.
+fn has(query: &str, name: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split('=').next().unwrap_or("") == name)
+}
+
+/// Map an incoming request onto the S3 action and resource it needs.
+pub fn classify(method: &Method, path: &str, query: &str) -> Authz {
+    let trimmed = path.trim_start_matches('/');
+
+    // `GET /` (ListAllMyBuckets) is already tenant-filtered by the handler and
+    // has no bucket to evaluate against; `/health` is deliberately open.
+    if trimmed.is_empty() || trimmed == "health" || trimmed == "_ready" {
+        return Authz::Skip;
+    }
+
+    let (raw_bucket, raw_key) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+    let bucket = decode(raw_bucket);
+
+    // A trailing slash (`/{bucket}/`) routes to the bucket handlers.
+    if raw_key.is_empty() {
+        classify_bucket(method, bucket, query)
+    } else {
+        classify_object(method, bucket, decode(raw_key), query)
+    }
+}
+
+fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
+    let action = match *method {
+        Method::PUT => {
+            if has(query, "policy") {
+                "s3:PutBucketPolicy"
+            } else if has(query, "versioning") {
+                "s3:PutBucketVersioning"
+            } else if has(query, "object-lock") {
+                "s3:PutBucketObjectLockConfiguration"
+            } else if has(query, "lifecycle") {
+                "s3:PutLifecycleConfiguration"
+            } else if has(query, "encryption") {
+                "s3:PutEncryptionConfiguration"
+            } else if has(query, "acl") {
+                "s3:PutBucketAcl"
+            } else if has(query, "ownershipControls") {
+                "s3:PutBucketOwnershipControls"
+            } else if has(query, "publicAccessBlock") {
+                "s3:PutBucketPublicAccessBlock"
+            } else if has(query, "cors") {
+                "s3:PutBucketCORS"
+            } else if has(query, "tagging") {
+                "s3:PutBucketTagging"
+            } else if has(query, "replication") {
+                "s3:PutReplicationConfiguration"
+            } else if has(query, "logging") {
+                "s3:PutBucketLogging"
+            } else {
+                "s3:CreateBucket"
+            }
+        }
+        Method::DELETE => {
+            if has(query, "policy") {
+                "s3:DeleteBucketPolicy"
+            } else if has(query, "lifecycle") {
+                "s3:PutLifecycleConfiguration"
+            } else if has(query, "encryption") {
+                "s3:PutEncryptionConfiguration"
+            } else if has(query, "publicAccessBlock") {
+                "s3:PutBucketPublicAccessBlock"
+            } else if has(query, "cors") {
+                // S3 authorizes DeleteBucketCors as s3:PutBucketCORS.
+                "s3:PutBucketCORS"
+            } else if has(query, "tagging") {
+                // S3 authorizes DeleteBucketTagging as s3:PutBucketTagging.
+                "s3:PutBucketTagging"
+            } else if has(query, "replication") {
+                // And DeleteBucketReplication as s3:PutReplicationConfiguration.
+                "s3:PutReplicationConfiguration"
+            } else {
+                "s3:DeleteBucket"
+            }
+        }
+        Method::HEAD => "s3:ListBucket",
+        Method::GET => {
+            if has(query, "policy") {
+                "s3:GetBucketPolicy"
+            } else if has(query, "versioning") {
+                "s3:GetBucketVersioning"
+            } else if has(query, "object-lock") {
+                "s3:GetBucketObjectLockConfiguration"
+            } else if has(query, "lifecycle") {
+                "s3:GetLifecycleConfiguration"
+            } else if has(query, "encryption") {
+                "s3:GetEncryptionConfiguration"
+            } else if has(query, "acl") {
+                "s3:GetBucketAcl"
+            } else if has(query, "ownershipControls") {
+                "s3:GetBucketOwnershipControls"
+            } else if has(query, "publicAccessBlock") {
+                "s3:GetBucketPublicAccessBlock"
+            } else if has(query, "policyStatus") {
+                "s3:GetBucketPolicyStatus"
+            } else if has(query, "cors") {
+                "s3:GetBucketCORS"
+            } else if has(query, "tagging") {
+                "s3:GetBucketTagging"
+            } else if has(query, "replication") {
+                "s3:GetReplicationConfiguration"
+            } else if has(query, "logging") {
+                "s3:GetBucketLogging"
+            } else if has(query, "versions") {
+                "s3:ListBucketVersions"
+            } else if has(query, "uploads") {
+                "s3:ListBucketMultipartUploads"
+            } else {
+                "s3:ListBucket"
+            }
+        }
+        Method::POST => {
+            if has(query, "delete") {
+                return Authz::DeferToHandler;
+            }
+            // Prefix grep reads every object under a prefix. Evaluated at
+            // bucket scope; per-key evaluation belongs with the
+            // deny-by-default work, where a prefix-limited grant would
+            // otherwise reject the whole scan.
+            if has(query, "grep") {
+                return Authz::Check {
+                    action: "s3:GetObject",
+                    bucket,
+                    key: Some("*".to_string()),
+                };
+            }
+            return Authz::Skip;
+        }
+        _ => return Authz::Skip,
+    };
+
+    Authz::Check {
+        action,
+        bucket,
+        key: None,
+    }
+}
+
+fn classify_object(method: &Method, bucket: String, key: String, query: &str) -> Authz {
+    let action = match *method {
+        // `?uploadId` + `?partNumber` is an UploadPart, which AWS authorizes
+        // as s3:PutObject — same action as the plain write.
+        Method::PUT => {
+            if has(query, "retention") {
+                "s3:PutObjectRetention"
+            } else if has(query, "legal-hold") {
+                "s3:PutObjectLegalHold"
+            } else if has(query, "tagging") {
+                "s3:PutObjectTagging"
+            } else if has(query, "acl") {
+                "s3:PutObjectAcl"
+            } else {
+                "s3:PutObject"
+            }
+        }
+        Method::GET => {
+            if has(query, "retention") {
+                "s3:GetObjectRetention"
+            } else if has(query, "legal-hold") {
+                "s3:GetObjectLegalHold"
+            } else if has(query, "tagging") {
+                "s3:GetObjectTagging"
+            } else if has(query, "acl") {
+                "s3:GetObjectAcl"
+            } else if has(query, "uploadId") {
+                "s3:ListMultipartUploadParts"
+            } else {
+                "s3:GetObject"
+            }
+        }
+        Method::HEAD => "s3:GetObject",
+        Method::DELETE => {
+            if has(query, "uploadId") {
+                "s3:AbortMultipartUpload"
+            } else if has(query, "tagging") {
+                "s3:DeleteObjectTagging"
+            } else {
+                "s3:DeleteObject"
+            }
+        }
+        // `?uploads` initiates and `?uploadId` completes a multipart upload;
+        // both write the object. `?grep` and `?select` (S3 Select) read it.
+        Method::POST => {
+            if has(query, "grep") || has(query, "select") {
+                "s3:GetObject"
+            } else {
+                "s3:PutObject"
+            }
+        }
+        _ => return Authz::Skip,
+    };
+
+    Authz::Check {
+        action,
+        bucket,
+        key: Some(key),
+    }
+}
+
+/// TTL cache backing every authorization decision.
+///
+/// Without it the chain would add three or more meta round-trips to every
+/// object operation — bucket policy, bucket owner, and one lookup per attached
+/// identity policy — including on each part of a multipart upload.
+pub struct AuthzCache {
+    buckets: RwLock<HashMap<String, BucketEntry>>,
+    identities: RwLock<HashMap<String, IdentityEntry>>,
+    /// Tenant- and cluster-wide documents (public access block), by config key.
+    accounts: RwLock<HashMap<String, (Option<serde_json::Value>, Instant)>>,
+    /// Each bucket's CORS configuration (see `crate::cors`).
+    pub cors: crate::cors::CorsCache,
+    /// Each bucket's lifecycle rules, for `x-amz-expiration` (see
+    /// `crate::lifecycle`).
+    pub lifecycle: crate::lifecycle::RulesCache,
+    ttl: Duration,
+}
+
+#[derive(Clone)]
+struct BucketEntry {
+    /// `None` means the bucket has no enforceable policy — either none is set
+    /// or the stored JSON did not parse.
+    policy: Option<Arc<BucketPolicy>>,
+    /// `user_id` of the owner. Empty or `"default"` marks a bucket created
+    /// before the gateway recorded real ownership.
+    owner: String,
+    /// Owning tenant. Empty = the system tenant, which is also what every
+    /// bucket created before tenancy carries.
+    tenant: String,
+    /// The bucket's own public access block (its tenant's and the
+    /// cluster's are added when it matters).
+    public_block: crate::public_access::PublicAccessBlock,
+    /// Meta answered that the bucket doesn't exist (not: meta couldn't be
+    /// read, which leaves this false and the entry empty).
+    missing: bool,
+    cached_at: Instant,
+}
+
+/// Named, parsed policies attached to one principal.
+type AttachedPolicies = Arc<Vec<(String, Arc<BucketPolicy>)>>;
+
+/// Policies attached to one principal (a user or a group), already parsed.
+#[derive(Clone)]
+struct IdentityEntry {
+    policies: AttachedPolicies,
+    cached_at: Instant,
+}
+
+impl AuthzCache {
+    #[must_use]
+    pub fn new(ttl_secs: u64) -> Self {
+        Self {
+            buckets: RwLock::new(HashMap::new()),
+            identities: RwLock::new(HashMap::new()),
+            accounts: RwLock::new(HashMap::new()),
+            cors: crate::cors::CorsCache::new(ttl_secs),
+            lifecycle: crate::lifecycle::RulesCache::new(ttl_secs),
+            ttl: Duration::from_secs(ttl_secs),
+        }
+    }
+
+    fn bucket(&self, bucket: &str) -> Option<BucketEntry> {
+        let entries = self.buckets.read();
+        let entry = entries.get(bucket)?;
+        (entry.cached_at.elapsed() < self.ttl).then(|| entry.clone())
+    }
+
+    fn put_bucket(&self, bucket: &str, entry: BucketEntry) {
+        self.buckets.write().insert(bucket.to_string(), entry);
+    }
+
+    fn identity(&self, principal: &str) -> Option<AttachedPolicies> {
+        let entries = self.identities.read();
+        let entry = entries.get(principal)?;
+        (entry.cached_at.elapsed() < self.ttl).then(|| Arc::clone(&entry.policies))
+    }
+
+    fn put_identity(&self, principal: &str, policies: AttachedPolicies) {
+        self.identities.write().insert(
+            principal.to_string(),
+            IdentityEntry {
+                policies,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Drop the cached entry for one bucket. Called when this gateway changes
+    /// a bucket's policy or owner, so the writer sees its own change
+    /// immediately; other gateways pick it up within [`POLICY_CACHE_TTL_SECS`].
+    pub fn invalidate(&self, bucket: &str) {
+        self.buckets.write().remove(bucket);
+        self.cors.invalidate(bucket);
+        self.lifecycle.invalidate(bucket);
+    }
+
+    /// Drop the cached policies for one user or group, after an attach or
+    /// detach.
+    pub fn invalidate_identity(&self, principal: &str) {
+        self.identities.write().remove(principal);
+    }
+
+    /// A cached tenant- or cluster-wide document: `Some(None)` is a cached
+    /// absence.
+    pub fn account(&self, key: &str) -> Option<Option<serde_json::Value>> {
+        let entries = self.accounts.read();
+        let (doc, at) = entries.get(key)?;
+        (at.elapsed() < self.ttl).then(|| doc.clone())
+    }
+
+    pub fn put_account(&self, key: &str, doc: Option<serde_json::Value>) {
+        self.accounts
+            .write()
+            .insert(key.to_string(), (doc, Instant::now()));
+    }
+
+    pub fn forget_account(&self, key: &str) {
+        self.accounts.write().remove(key);
+    }
+
+    /// Drop every identity's cached policies (a named policy's document
+    /// changed, and any of them may hold it).
+    pub fn invalidate_all_identities(&self) {
+        self.identities.write().clear();
+    }
+}
+
+impl Default for AuthzCache {
+    fn default() -> Self {
+        Self::new(POLICY_CACHE_TTL_SECS)
+    }
+}
+
+/// Fetch a bucket's policy and owner, via the cache when it is warm.
+///
+/// Meta errors yield an empty entry rather than propagating. An unreadable
+/// bucket therefore looks unowned and unpoliced, which the chain denies to
+/// everyone but the system admin.
+async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
+    if let Some(cached) = state.policy_cache.bucket(bucket) {
+        return cached;
+    }
+
+    let mut client = state.meta_client.clone();
+
+    let policy = match client
+        .get_bucket_policy(GetBucketPolicyRequest {
+            bucket: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let resp = response.into_inner();
+            if resp.has_policy {
+                match BucketPolicy::from_json(&resp.policy_json) {
+                    Ok(policy) => Some(Arc::new(policy)),
+                    Err(e) => {
+                        error!("Failed to parse bucket policy for {bucket}: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Err(e) => {
+            if e.code() != tonic::Code::NotFound {
+                error!("Failed to fetch bucket policy for {bucket}: {e}");
+            }
+            None
+        }
+    };
+
+    let mut missing = false;
+    let (owner, tenant, found) = match client
+        .get_bucket(GetBucketRequest {
+            name: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(response) => match response.into_inner().bucket {
+            Some(b) => (b.owner, b.tenant, true),
+            None => {
+                missing = true;
+                (String::new(), String::new(), false)
+            }
+        },
+        Err(e) => {
+            if e.code() == tonic::Code::NotFound {
+                missing = true;
+            } else {
+                error!("Failed to fetch bucket meta for {bucket}: {e}");
+            }
+            (String::new(), String::new(), false)
+        }
+    };
+
+    let public_block = if found {
+        crate::public_access::bucket_block(state, bucket)
+            .await
+            .unwrap_or_default()
+    } else {
+        crate::public_access::PublicAccessBlock::ALL
+    };
+    let entry = BucketEntry {
+        policy,
+        owner,
+        tenant,
+        public_block,
+        missing,
+        cached_at: Instant::now(),
+    };
+
+    // Only cache a bucket we actually read. `CreateBucket` is authorized
+    // *before* the bucket exists, so caching the miss would leave a
+    // tenant-less, owner-less entry standing for the whole TTL — and during
+    // that window the tenant gate sees no tenant to compare and the ownership
+    // fallback sees no owner, so a freshly created bucket would be reachable
+    // by anyone. A miss from a degraded meta read is left uncached for the
+    // same reason.
+    if found {
+        state.policy_cache.put_bucket(bucket, entry.clone());
+    }
+    entry
+}
+
+/// How meta names a principal's attachments and inline policies:
+/// "user:<id>", "group:<id>" or "role:<tenant/name>" (a role session's
+/// `user_id` is already "role:<key>").
+pub(crate) fn principal_key(principal_id: &str, is_group: bool) -> String {
+    if principal_id.starts_with("role:") {
+        principal_id.to_string()
+    } else if is_group {
+        format!("group:{principal_id}")
+    } else {
+        format!("user:{principal_id}")
+    }
+}
+
+/// Load and parse every policy of one principal (user, group or role
+/// session): the named ones attached to it, the AWS managed ones attached
+/// to it, and its inline ones.
+pub(crate) async fn load_identity_policies(
+    state: &AppState,
+    principal_id: &str,
+    is_group: bool,
+) -> AttachedPolicies {
+    if principal_id.is_empty() {
+        return Arc::new(Vec::new());
+    }
+    if let Some(cached) = state.policy_cache.identity(principal_id) {
+        return cached;
+    }
+
+    let mut client = state.meta_client.clone();
+    let request = if let Some(role) = principal_id.strip_prefix("role:") {
+        // An assumed role's session: the role's attachments, keyed the way
+        // the admin API invalidates them ("role:<tenant/name>").
+        ListAttachedPoliciesRequest {
+            user_id: String::new(),
+            group_id: String::new(),
+            role_name: role.to_string(),
+        }
+    } else if is_group {
+        ListAttachedPoliciesRequest {
+            user_id: String::new(),
+            group_id: principal_id.to_string(),
+            role_name: String::new(),
+        }
+    } else {
+        ListAttachedPoliciesRequest {
+            user_id: principal_id.to_string(),
+            group_id: String::new(),
+            role_name: String::new(),
+        }
+    };
+
+    let names = match client.list_attached_policies(request).await {
+        Ok(r) => r.into_inner().policy_names,
+        Err(e) => {
+            // Treated as "no attached policies". Combined with the ownership
+            // fallback this fails closed for non-owners rather than opening up.
+            error!("list_attached_policies for {principal_id} failed: {e}");
+            Vec::new()
+        }
+    };
+
+    let mut policies = Vec::with_capacity(names.len());
+    for name in names {
+        let json = if let Some(doc) = objectio_auth::managed::attached(&name) {
+            doc.to_string()
+        } else {
+            let Ok(resp) = client
+                .get_policy(GetPolicyRequest { name: name.clone() })
+                .await
+            else {
+                continue;
+            };
+            let inner = resp.into_inner();
+            let Some(obj) = inner.policy.filter(|_| inner.found) else {
+                continue;
+            };
+            obj.policy_json
+        };
+        match BucketPolicy::from_json(&json) {
+            Ok(policy) => policies.push((name, Arc::new(policy))),
+            Err(e) => warn!("attached policy '{name}' for {principal_id} failed to parse: {e}"),
+        }
+    }
+    // Inline policies. An unreadable list is treated as none, which fails
+    // closed for an Allow but could miss a Deny: logged, as attachments are.
+    match client
+        .list_inline_policies(objectio_proto::metadata::ListInlinePoliciesRequest {
+            principal: principal_key(principal_id, is_group),
+        })
+        .await
+    {
+        Ok(r) => {
+            for p in r.into_inner().policies {
+                match BucketPolicy::from_json(&p.policy_json) {
+                    Ok(policy) => policies.push((format!("inline:{}", p.name), Arc::new(policy))),
+                    Err(e) => warn!(
+                        "inline policy '{}' of {principal_id} failed to parse: {e}",
+                        p.name
+                    ),
+                }
+            }
+        }
+        Err(e) => error!("list_inline_policies for {principal_id} failed: {e}"),
+    }
+
+    let policies = Arc::new(policies);
+    state
+        .policy_cache
+        .put_identity(principal_id, Arc::clone(&policies));
+    policies
+}
+
+/// The tags of the object at `bucket/key`, if it exists.
+async fn existing_object_tags(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> std::collections::HashMap<String, String> {
+    let Ok(placement) = state
+        .meta_client
+        .clone()
+        .get_placement(objectio_proto::metadata::GetPlacementRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: 0,
+            storage_class: String::new(),
+        })
+        .await
+    else {
+        return std::collections::HashMap::new();
+    };
+    crate::osd_pool::get_object_meta_from_any(
+        &state.osd_pool,
+        &placement.into_inner().nodes,
+        bucket,
+        key,
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|o| o.tags)
+    .unwrap_or_default()
+}
+
+/// Everything one authorization decision needs.
+///
+/// Grouped into a struct because the two resource identities differ: `key`
+/// builds the policy resource ARN, while `scope_key` is what a credential
+/// scope is tested against.
+pub struct AuthzRequest<'a> {
+    pub method: &'a Method,
+    pub action: &'a str,
+    pub bucket: &'a str,
+    /// Object key when the request targets one; `None` for bucket-level
+    /// requests, which get a bucket ARN.
+    pub key: Option<&'a str>,
+    /// Key used for scope containment. For bucket-level requests this is the
+    /// `?prefix=` value, so a LIST narrower than the scope is admitted and a
+    /// broader one is refused.
+    pub scope_key: &'a str,
+    pub headers: Option<&'a HeaderMap>,
+}
+
+/// Evaluate one request against the full chain.
+///
+/// Precedence, in order:
+///
+/// 1. explicit `Deny` in any identity policy or the bucket policy — terminal
+/// 2. the credential's own scope, which can only narrow
+/// 3. tenant mismatch — terminal, evaluated before any policy so that no
+///    policy can grant across a tenant boundary
+/// 4. `Allow` in any identity policy or the bucket policy
+/// 5. the caller owns the bucket, or is the system admin
+/// 6. otherwise deny
+///
+/// Step 5: no policy anywhere means the owner, not everyone. A bucket with no
+/// recorded owner is reachable only through a policy, or by the system admin.
+///
+/// Returns `Some(response)` when the request must be rejected.
+pub async fn authorize(
+    state: &AppState,
+    auth: &AuthResult,
+    req: &AuthzRequest<'_>,
+) -> Option<Response> {
+    // Scope first. It needs no meta round-trip, and it can only ever reject,
+    // so resolving it early skips policy loads for requests that cannot
+    // succeed either way.
+    if let Some(scope) = &auth.scope {
+        let method = req.method.as_str();
+        if !scope.allows(req.bucket, req.scope_key, method) {
+            let reason = scope.denial_reason(req.bucket, req.scope_key, method);
+            debug!(
+                "Scope denied {} {} s3://{}/{}: {reason}",
+                auth.access_key_id, method, req.bucket, req.scope_key
+            );
+            return Some(deny(&reason));
+        }
+    }
+
+    // The system admin bypasses the chain, so a misconfigured policy can never
+    // lock every operator out of the cluster.
+    if auth.user_arn == crate::admin::SYSTEM_ADMIN_USER_ARN {
+        // Its tenant still learns of it: the event goes to the bucket's
+        // tenant's audit stream like anyone else's.
+        let bucket = load_bucket(state, req.bucket).await;
+        crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
+        return None;
+    }
+
+    let bucket = load_bucket(state, req.bucket).await;
+    crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
+
+    // A bucket that doesn't exist is "no such bucket" to everyone, as in S3:
+    // there is nothing in it to protect. Creating it goes on to the
+    // handler. (A bucket meta couldn't read is not `missing`: denied below.)
+    if bucket.missing && !req.bucket.is_empty() && req.action != "s3:CreateBucket" {
+        return Some(S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+
+    if auth.auth_mode == objectio_auth::AuthMode::Anonymous {
+        return authorize_anonymous(state, auth, req, &bucket).await;
+    }
+
+    if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant, auth.auth_mode) {
+        debug!(
+            "Tenant boundary denied {} ({}) on {} ({})",
+            auth.user_arn, auth.tenant, req.bucket, bucket.tenant
+        );
+        return Some(deny(&reason));
+    }
+
+    let resource = build_s3_arn(req.bucket, req.key);
+    let context = request_context(state, auth, req, &bucket).await;
+
+    let mut any_allow = false;
+
+    // Identity policies: the user's own, plus every group it belongs to.
+    let mut principals: Vec<(&str, bool)> = vec![(auth.user_id.as_str(), false)];
+    principals.extend(auth.group_ids.iter().map(|g| (g.as_str(), true)));
+
+    for (principal, is_group) in principals {
+        for (name, policy) in load_identity_policies(state, principal, is_group)
+            .await
+            .iter()
+        {
+            match state.policy_evaluator.evaluate(policy, &context) {
+                PolicyDecision::Deny => {
+                    debug!(
+                        "Identity policy '{name}' denied {} {} {}",
+                        auth.user_arn, req.action, resource
+                    );
+                    return Some(deny(&format!(
+                        "Action {} on {resource} denied by policy {name}",
+                        req.action
+                    )));
+                }
+                PolicyDecision::Allow => any_allow = true,
+                PolicyDecision::ImplicitDeny => {}
+            }
+        }
+    }
+
+    // RestrictPublicBuckets: a public grant reaches no one outside the
+    // bucket's tenant (anonymous callers are handled above).
+    let restricted;
+    let mut bucket_policy = bucket.policy.as_deref();
+    if let Some(policy) = bucket_policy
+        && auth.tenant != bucket.tenant
+        && auth.auth_mode != objectio_auth::AuthMode::Sts
+        && policy.is_public()
+        && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
+            .await
+            .restrict_public_buckets
+    {
+        restricted = policy.without_public_grants();
+        bucket_policy = Some(&restricted);
+    }
+
+    if let Some(policy) = bucket_policy {
+        match state.policy_evaluator.evaluate(policy, &context) {
+            PolicyDecision::Deny => {
+                debug!(
+                    "Bucket policy denied access: {} {} {}",
+                    auth.user_arn, req.action, resource
+                );
+                return Some(deny("Access Denied by bucket policy"));
+            }
+            PolicyDecision::Allow => any_allow = true,
+            PolicyDecision::ImplicitDeny => {}
+        }
+    }
+
+    if any_allow {
+        return None;
+    }
+
+    // Nothing granted it explicitly — fall back to ownership.
+    if !bucket.owner.is_empty() && bucket.owner == auth.user_id {
+        return None;
+    }
+    // Any authenticated caller may create a bucket (and becomes its
+    // owner); for one that exists the handler answers BucketAlreadyExists
+    // (409). Explicit Denies and the tenant boundary were applied above.
+    if req.action == "s3:CreateBucket" {
+        return None;
+    }
+
+    Some(deny(&format!(
+        "No policy allows {} on {resource}",
+        req.action
+    )))
+}
+
+/// What a caller's own policies say of `context`: those of the caller
+/// itself (a user, or a role's session) and of every group it is in. An
+/// explicit Deny anywhere wins, then any Allow; else nothing granted it.
+pub(crate) async fn identity_decision(
+    state: &AppState,
+    auth: &AuthResult,
+    context: &RequestContext,
+) -> PolicyDecision {
+    let mut principals: Vec<(&str, bool)> = vec![(auth.user_id.as_str(), false)];
+    principals.extend(auth.group_ids.iter().map(|g| (g.as_str(), true)));
+    let mut allowed = false;
+    for (principal, is_group) in principals {
+        for (_, policy) in load_identity_policies(state, principal, is_group)
+            .await
+            .iter()
+        {
+            match state.policy_evaluator.evaluate(policy, context) {
+                PolicyDecision::Deny => return PolicyDecision::Deny,
+                PolicyDecision::Allow => allowed = true,
+                PolicyDecision::ImplicitDeny => {}
+            }
+        }
+    }
+    if allowed {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::ImplicitDeny
+    }
+}
+
+/// Whether the caller's own policies explicitly deny listing its buckets
+/// (`GET /`). ListAllMyBuckets has no bucket to authorize against, and
+/// lists what the caller owns; a Deny of it still holds.
+async fn list_buckets_denied(state: &AppState, auth: &AuthResult) -> bool {
+    if auth.user_arn == crate::admin::SYSTEM_ADMIN_USER_ARN || auth.user_id.is_empty() {
+        return false;
+    }
+    let mut context = RequestContext::new(&auth.user_arn, "s3:ListAllMyBuckets", "arn:obio:s3:::*");
+    if let Some(ip) = auth.source_ip {
+        context = context.with_source_ip(ip);
+    }
+    context = with_credential_vars(context, auth);
+    identity_decision(state, auth, &context).await == PolicyDecision::Deny
+}
+
+/// The condition keys that say how the caller authenticated:
+/// `obio:CredentialType`, and `sts:authentication` ("true") for temporary
+/// credentials.
+fn with_credential_vars(mut context: RequestContext, auth: &AuthResult) -> RequestContext {
+    use objectio_auth::AuthMode;
+    context = context.with_variable(
+        "obio:CredentialType".to_string(),
+        auth.auth_mode.as_str().to_string(),
+    );
+    if matches!(
+        auth.auth_mode,
+        AuthMode::Sts | AuthMode::AssumedRole | AuthMode::SessionToken
+    ) {
+        context = context.with_variable("sts:authentication".to_string(), "true".to_string());
+    }
+    context
+}
+
+/// The policy-evaluation context of a request by `principal`.
+async fn request_context(
+    state: &AppState,
+    auth: &AuthResult,
+    req: &AuthzRequest<'_>,
+    bucket: &BucketEntry,
+) -> RequestContext {
+    let resource = build_s3_arn(req.bucket, req.key);
+    let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
+    // Where it came from: the client's address, and the named endpoint.
+    if let Some(ip) = auth.source_ip {
+        context = context.with_source_ip(ip);
+    }
+    if let Some(endpoint) = &auth.source_endpoint {
+        context = context.with_variable("aws:SourceVpce", endpoint.clone());
+    }
+    for (k, v) in sse_condition_vars(req.headers) {
+        context = context.with_variable(k, v);
+    }
+    // A listing's prefix.
+    if req.key.is_none() && !req.scope_key.is_empty() {
+        context = context.with_variable("s3:prefix", req.scope_key);
+    }
+    // The object's own tags, read only when the bucket policy asks.
+    if let (Some(key), Some(policy)) = (req.key, &bucket.policy)
+        && format!("{policy:?}").contains("s3:ExistingObjectTag/")
+    {
+        for (k, v) in existing_object_tags(state, req.bucket, key).await {
+            context = context.with_variable(format!("s3:ExistingObjectTag/{k}"), v);
+        }
+    }
+    // Surface credential-type so policies can deny permanent-key direct
+    // access while still allowing STS-vended sessions through.
+    with_credential_vars(context, auth)
+}
+
+/// An unsigned request: only a bucket policy's grants to everyone can let
+/// it in. A grant open to anyone anywhere (a public policy) is shut off by
+/// `RestrictPublicBuckets`; one pinned to a network or an endpoint ("anyone
+/// inside the cluster") isn't public, and is not.
+async fn authorize_anonymous(
+    state: &AppState,
+    auth: &AuthResult,
+    req: &AuthzRequest<'_>,
+    bucket: &BucketEntry,
+) -> Option<Response> {
+    let refused = || deny("Anonymous access is not allowed");
+    let Some(policy) = bucket.policy.as_deref() else {
+        return Some(refused());
+    };
+    let mut anonymous = policy.for_anonymous();
+    if policy.is_public()
+        && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
+            .await
+            .restrict_public_buckets
+    {
+        anonymous = anonymous.without_public_grants();
+    }
+    let context = request_context(state, auth, req, bucket).await;
+    match state.policy_evaluator.evaluate(&anonymous, &context) {
+        PolicyDecision::Allow => None,
+        _ => Some(refused()),
+    }
+}
+
+/// Who an unsigned request is, to policy evaluation: no ARN, so only `"*"`
+/// can name it.
+pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
+
+/// Decide whether a caller in `caller_tenant` may touch a bucket in
+/// `bucket_tenant`, returning the denial reason when it may not.
+///
+/// The boundary is structural: it is checked before any policy is consulted,
+/// so no bucket policy or attached policy can grant access across it. That is
+/// the difference between tenancy as a real boundary and tenancy as a label
+/// that a stray `Principal: "*"` can undo.
+///
+/// Two deliberate exemptions:
+///
+/// * A bucket with **no tenant** is in the system tenant, which is also where
+///   every bucket created before tenancy landed. Those stay policy-governed
+///   rather than becoming unreachable, so enabling this does not strand an
+///   existing deployment — exactly the migration cliff the ownership work
+///   needed a flag for.
+/// * **STS sessions** carry no tenant today (`auth_middleware` sets it empty
+///   when it validates a session token), so comparing would deny every
+///   Iceberg and Unity vended credential whose warehouse belongs to a tenant.
+///   They are already pinned to a single bucket and prefix by their scope,
+///   which is a narrower guarantee than the tenant check would add. Carrying
+///   the tenant in the session token would let this exemption go away.
+fn tenant_violation(
+    caller_tenant: &str,
+    bucket_tenant: &str,
+    auth_mode: objectio_auth::AuthMode,
+) -> Option<String> {
+    if auth_mode == objectio_auth::AuthMode::Sts {
+        return None;
+    }
+    if bucket_tenant.is_empty() || caller_tenant == bucket_tenant {
+        return None;
+    }
+    Some(if caller_tenant.is_empty() {
+        format!("bucket belongs to tenant '{bucket_tenant}'")
+    } else {
+        format!("tenant '{caller_tenant}' may not access a bucket in tenant '{bucket_tenant}'")
+    })
+}
+
+fn deny(message: &str) -> Response {
+    crate::gateway_metrics::record_auth_failure("policy");
+    S3Error::xml_response("AccessDenied", message, StatusCode::FORBIDDEN)
+}
+
+/// Pull a single query parameter out of a raw query string, URL-decoded.
+/// Used to read `?prefix=` for scope containment on bucket-level requests.
+fn extract_query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| decode(v))
+    })
+}
+
+/// The bucket named by an `s3://bucket/prefix/` scope URI.
+///
+/// Returns an empty string for a malformed scope, which matches no bucket —
+/// the safe direction for a filter.
+#[must_use]
+pub fn scope_bucket(scope: &str) -> String {
+    scope
+        .strip_prefix("s3://")
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Authorization middleware. Runs after `auth_layer`, before any handler.
+pub async fn authz_layer(
+    State(state): State<Arc<AppState>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    // No identity on the request means `--no-auth`, or a route that sits ahead
+    // of the auth layer. Either way there is no principal to evaluate.
+    // What a proxy forwards is believed only from a trusted one: anyone
+    // could send "X-Forwarded-Proto: https" over plain HTTP and pass a
+    // policy that requires TLS.
+    let peer = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| c.0.ip());
+    if peer.is_some_and(|p| !state.trusted_proxies.trusts(p)) {
+        request.headers_mut().remove("x-forwarded-proto");
+    }
+    if request.extensions().get::<AuthResult>().is_none() {
+        return next.run(request).await;
+    }
+    // Where the request came from, on its identity, for every check made
+    // of it — here and in the handlers (a copy's source, a batch delete).
+    let source_ip = request
+        .extensions()
+        .get::<crate::origin::ClientAddr>()
+        .map(|c| state.trusted_proxies.client_ip(c.0.ip(), request.headers()));
+    let source_endpoint = request
+        .extensions()
+        .get::<crate::origin::Endpoint>()
+        .and_then(|e| e.0.clone());
+    let Some(auth) = request.extensions_mut().get_mut::<AuthResult>() else {
+        return next.run(request).await;
+    };
+    auth.source_ip = source_ip;
+    auth.source_endpoint = source_endpoint;
+    let auth = auth.clone();
+
+    let uri = request.uri().clone();
+    let classification = classify(request.method(), uri.path(), uri.query().unwrap_or(""));
+
+    // An anonymous caller reaches only what a bucket policy grants it.
+    if auth.auth_mode == objectio_auth::AuthMode::Anonymous
+        && !matches!(classification, Authz::Check { .. } | Authz::DeferToHandler)
+    {
+        return deny("Anonymous access is not allowed");
+    }
+
+    // ListAllMyBuckets: nothing to check but the caller's own Denies.
+    if uri.path() == "/"
+        && request.method() == Method::GET
+        && auth.auth_mode != objectio_auth::AuthMode::Anonymous
+        && list_buckets_denied(&state, &auth).await
+    {
+        crate::audit::note_action("s3:ListAllMyBuckets");
+        return deny("Action s3:ListAllMyBuckets denied by an identity policy");
+    }
+
+    let Authz::Check {
+        action,
+        bucket,
+        key,
+    } = classification
+    else {
+        return next.run(request).await;
+    };
+
+    // Object requests are contained by their own key; bucket requests by the
+    // prefix they ask for, so a scoped key can LIST inside its scope but not
+    // above it.
+    let scope_key = key.clone().unwrap_or_else(|| {
+        extract_query_param(uri.query().unwrap_or(""), "prefix").unwrap_or_default()
+    });
+
+    // What the request acts on, for its audit event: as the request names
+    // it (checks made inside handlers, of a copy's source say, don't
+    // change it).
+    crate::audit::note_target(action, &bucket, key.as_deref());
+
+    if let Some(deny) = authorize(
+        &state,
+        &auth,
+        &AuthzRequest {
+            method: request.method(),
+            action,
+            bucket: &bucket,
+            key: key.as_deref(),
+            scope_key: &scope_key,
+            headers: Some(request.headers()),
+        },
+    )
+    .await
+    {
+        // Bucket names are one namespace: asking to create one that someone
+        // else holds is answered as S3 does, "taken", not "forbidden".
+        if action == "s3:CreateBucket" {
+            let entry = load_bucket(&state, &bucket).await;
+            if !entry.owner.is_empty() && entry.owner != auth.user_id {
+                return crate::s3::S3Error::xml_response(
+                    "BucketAlreadyExists",
+                    "The requested bucket name is not available",
+                    StatusCode::CONFLICT,
+                );
+            }
+        }
+        return deny;
+    }
+
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_of(method: Method, path: &str, query: &str) -> (&'static str, String, Option<String>) {
+        match classify(&method, path, query) {
+            Authz::Check {
+                action,
+                bucket,
+                key,
+            } => (action, bucket, key),
+            other => panic!("expected Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_routes_need_no_bucket_policy() {
+        assert_eq!(classify(&Method::GET, "/", ""), Authz::Skip);
+        assert_eq!(classify(&Method::GET, "/health", ""), Authz::Skip);
+        assert_eq!(classify(&Method::GET, "/_ready", ""), Authz::Skip);
+    }
+
+    #[test]
+    fn bucket_subresources_map_to_distinct_actions() {
+        assert_eq!(check_of(Method::GET, "/b", "").0, "s3:ListBucket");
+        assert_eq!(check_of(Method::HEAD, "/b", "").0, "s3:ListBucket");
+        assert_eq!(
+            check_of(Method::GET, "/b", "policy").0,
+            "s3:GetBucketPolicy"
+        );
+        assert_eq!(
+            check_of(Method::PUT, "/b", "policy").0,
+            "s3:PutBucketPolicy"
+        );
+        assert_eq!(
+            check_of(Method::DELETE, "/b", "policy").0,
+            "s3:DeleteBucketPolicy"
+        );
+        assert_eq!(check_of(Method::PUT, "/b", "").0, "s3:CreateBucket");
+        assert_eq!(check_of(Method::DELETE, "/b", "").0, "s3:DeleteBucket");
+        assert_eq!(
+            check_of(Method::GET, "/b", "uploads").0,
+            "s3:ListBucketMultipartUploads"
+        );
+    }
+
+    #[test]
+    fn cors_configuration_has_its_own_permissions() {
+        assert_eq!(check_of(Method::GET, "/b", "cors").0, "s3:GetBucketCORS");
+        assert_eq!(check_of(Method::PUT, "/b", "cors").0, "s3:PutBucketCORS");
+        assert_eq!(
+            check_of(Method::PUT, "/b", "logging").0,
+            "s3:PutBucketLogging"
+        );
+        assert_eq!(
+            check_of(Method::GET, "/b", "logging").0,
+            "s3:GetBucketLogging"
+        );
+        // As in S3, deleting the configuration is putting it.
+        assert_eq!(check_of(Method::DELETE, "/b", "cors").0, "s3:PutBucketCORS");
+    }
+
+    #[test]
+    fn trailing_slash_is_a_bucket_request() {
+        let (action, bucket, key) = check_of(Method::GET, "/b/", "");
+        assert_eq!(action, "s3:ListBucket");
+        assert_eq!(bucket, "b");
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn object_routes_carry_the_key() {
+        let (action, bucket, key) = check_of(Method::GET, "/b/a/deep/key.txt", "");
+        assert_eq!(action, "s3:GetObject");
+        assert_eq!(bucket, "b");
+        assert_eq!(key.as_deref(), Some("a/deep/key.txt"));
+        assert_eq!(check_of(Method::HEAD, "/b/k", "").0, "s3:GetObject");
+        assert_eq!(check_of(Method::PUT, "/b/k", "").0, "s3:PutObject");
+        assert_eq!(check_of(Method::DELETE, "/b/k", "").0, "s3:DeleteObject");
+    }
+
+    /// The gap this middleware exists to close: every multipart verb now maps
+    /// onto a real action instead of reaching the handler unchecked.
+    #[test]
+    fn multipart_upload_path_is_authorized() {
+        assert_eq!(check_of(Method::POST, "/b/k", "uploads").0, "s3:PutObject");
+        assert_eq!(
+            check_of(Method::PUT, "/b/k", "partNumber=1&uploadId=abc").0,
+            "s3:PutObject"
+        );
+        assert_eq!(
+            check_of(Method::POST, "/b/k", "uploadId=abc").0,
+            "s3:PutObject"
+        );
+        assert_eq!(
+            check_of(Method::DELETE, "/b/k", "uploadId=abc").0,
+            "s3:AbortMultipartUpload"
+        );
+        assert_eq!(
+            check_of(Method::GET, "/b/k", "uploadId=abc").0,
+            "s3:ListMultipartUploadParts"
+        );
+    }
+
+    #[test]
+    fn object_lock_subresources_are_distinct_from_the_object() {
+        assert_eq!(
+            check_of(Method::PUT, "/b/k", "retention").0,
+            "s3:PutObjectRetention"
+        );
+        assert_eq!(
+            check_of(Method::GET, "/b/k", "legal-hold").0,
+            "s3:GetObjectLegalHold"
+        );
+    }
+
+    #[test]
+    fn tagging_is_its_own_permission() {
+        for (method, action) in [
+            (Method::GET, "s3:GetObjectTagging"),
+            (Method::PUT, "s3:PutObjectTagging"),
+            (Method::DELETE, "s3:DeleteObjectTagging"),
+        ] {
+            assert_eq!(check_of(method, "/b/k", "tagging").0, action);
+        }
+    }
+
+    #[test]
+    fn batch_delete_defers_to_the_per_key_loop() {
+        assert_eq!(
+            classify(&Method::POST, "/b", "delete"),
+            Authz::DeferToHandler
+        );
+    }
+
+    #[test]
+    fn prefix_grep_is_a_bucket_wide_read() {
+        let (action, bucket, key) = check_of(Method::POST, "/b", "grep");
+        assert_eq!(action, "s3:GetObject");
+        assert_eq!(bucket, "b");
+        assert_eq!(key.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn s3_select_reads_the_object() {
+        let (action, bucket, key) = check_of(Method::POST, "/b/data.csv", "select&select-type=2");
+        assert_eq!(action, "s3:GetObject");
+        assert_eq!(bucket, "b");
+        assert_eq!(key.as_deref(), Some("data.csv"));
+    }
+
+    #[test]
+    fn percent_encoded_keys_are_decoded_to_match_policy_resources() {
+        let (_, bucket, key) = check_of(Method::GET, "/my%20bucket/a%2Fb%20c.txt", "");
+        assert_eq!(bucket, "my bucket");
+        assert_eq!(key.as_deref(), Some("a/b c.txt"));
+    }
+
+    #[test]
+    fn query_matching_is_on_the_name_not_the_value() {
+        // `?prefix=policy` must not be read as the `?policy` sub-resource.
+        assert_eq!(
+            check_of(Method::GET, "/b", "prefix=policy").0,
+            "s3:ListBucket"
+        );
+        assert!(has("a=1&uploads&b=2", "uploads"));
+        assert!(!has("uploadsX=1", "uploads"));
+    }
+
+    #[test]
+    fn scope_bucket_extracts_the_bucket_or_nothing() {
+        assert_eq!(scope_bucket("s3://reports/2026/"), "reports");
+        assert_eq!(scope_bucket("s3://reports"), "reports");
+        // Malformed scopes match no bucket rather than every bucket.
+        assert_eq!(scope_bucket("reports/2026"), "");
+        assert_eq!(scope_bucket(""), "");
+    }
+
+    #[test]
+    fn prefix_is_the_scope_key_for_bucket_listings() {
+        assert_eq!(
+            extract_query_param("list-type=2&prefix=logs%2F2026%2F", "prefix").as_deref(),
+            Some("logs/2026/")
+        );
+        assert_eq!(extract_query_param("list-type=2", "prefix"), None);
+        // Name match, not substring: `?myprefix=` is not `?prefix=`.
+        assert_eq!(extract_query_param("myprefix=x", "prefix"), None);
+    }
+
+    /// The classifier feeds scope enforcement, so the key it reports for an
+    /// object request is exactly what the scope is tested against.
+    #[test]
+    fn object_key_is_the_scope_key() {
+        let (_, bucket, key) = check_of(Method::PUT, "/reports/2026/q1.csv", "");
+        assert_eq!(bucket, "reports");
+        let scope = objectio_auth::CredentialScope {
+            scope: "s3://reports/2026/".to_string(),
+            operation: objectio_auth::Operation::ReadWrite,
+        };
+        assert!(scope.allows(&bucket, key.as_deref().unwrap(), "PUT"));
+
+        let (_, other_bucket, other_key) = check_of(Method::PUT, "/payroll/2026/q1.csv", "");
+        assert!(!scope.allows(&other_bucket, other_key.as_deref().unwrap(), "PUT"));
+    }
+
+    /// A multipart write is classified as PUT/POST, so a read-only key is
+    /// refused on it the same way it is on a simple PUT.
+    #[test]
+    fn read_only_scope_blocks_the_multipart_verbs() {
+        let ro = objectio_auth::CredentialScope {
+            scope: "s3://data/".to_string(),
+            operation: objectio_auth::Operation::Read,
+        };
+        for (method, query) in [
+            (Method::POST, "uploads"),
+            (Method::PUT, "partNumber=1&uploadId=x"),
+            (Method::POST, "uploadId=x"),
+        ] {
+            let (_, bucket, key) = check_of(method.clone(), "/data/big.bin", query);
+            assert!(
+                !ro.allows(&bucket, key.as_deref().unwrap(), method.as_str()),
+                "read-only key must not {method} ?{query}"
+            );
+        }
+        let (_, bucket, key) = check_of(Method::GET, "/data/big.bin", "");
+        assert!(ro.allows(&bucket, key.as_deref().unwrap(), "GET"));
+    }
+
+    fn empty_entry() -> BucketEntry {
+        BucketEntry {
+            policy: None,
+            owner: "u1".to_string(),
+            tenant: String::new(),
+            public_block: crate::public_access::PublicAccessBlock::ALL,
+            missing: false,
+            cached_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn bucket_cache_returns_within_ttl_and_expires_after() {
+        let cache = AuthzCache::new(60);
+        assert!(cache.bucket("b").is_none());
+        cache.put_bucket("b", empty_entry());
+        assert_eq!(cache.bucket("b").unwrap().owner, "u1");
+        cache.invalidate("b");
+        assert!(cache.bucket("b").is_none());
+
+        let expired = AuthzCache::new(0);
+        expired.put_bucket("b", empty_entry());
+        assert!(expired.bucket("b").is_none());
+    }
+
+    /// `CreateBucket` is authorized before the bucket exists. If that miss were
+    /// cached, the entry would carry no tenant and no owner for the whole TTL,
+    /// and during that window the tenant gate would find nothing to compare
+    /// and the ownership fallback nothing to match — leaving a freshly created
+    /// bucket open to anyone. Caching only happens on a real read, so an
+    /// absent bucket must leave the cache untouched.
+    #[test]
+    fn a_missing_bucket_is_never_cached() {
+        let cache = AuthzCache::new(60);
+        assert!(cache.bucket("brand-new").is_none());
+        // Whatever a miss produced, nothing was stored for it.
+        assert!(cache.bucket("brand-new").is_none());
+
+        // A real read is cached, and carries the tenant the gate compares.
+        cache.put_bucket(
+            "brand-new",
+            BucketEntry {
+                policy: None,
+                owner: "u1".to_string(),
+                tenant: "globex".to_string(),
+                public_block: crate::public_access::PublicAccessBlock::ALL,
+                cached_at: Instant::now(),
+                missing: false,
+            },
+        );
+        assert_eq!(cache.bucket("brand-new").unwrap().tenant, "globex");
+    }
+
+    #[test]
+    fn identity_cache_is_invalidated_independently_of_buckets() {
+        let cache = AuthzCache::new(60);
+        cache.put_bucket("b", empty_entry());
+        cache.put_identity("u1", Arc::new(Vec::new()));
+        assert!(cache.identity("u1").is_some());
+
+        // Invalidating a bucket must not drop attached-policy entries.
+        cache.invalidate("b");
+        assert!(cache.identity("u1").is_some());
+
+        cache.invalidate_identity("u1");
+        assert!(cache.identity("u1").is_none());
+    }
+
+    #[test]
+    fn tenants_cannot_reach_each_others_buckets() {
+        use objectio_auth::AuthMode;
+        // The case this exists for.
+        assert!(tenant_violation("acme", "globex", AuthMode::Permanent).is_some());
+        // Same tenant is fine.
+        assert!(tenant_violation("acme", "acme", AuthMode::Permanent).is_none());
+    }
+
+    #[test]
+    fn system_tenant_buckets_stay_policy_governed() {
+        use objectio_auth::AuthMode;
+        // Every bucket created before tenancy carries an empty tenant. Denying
+        // those would strand an existing deployment, so they fall through to
+        // ownership and policy instead.
+        assert!(tenant_violation("acme", "", AuthMode::Permanent).is_none());
+        assert!(tenant_violation("", "", AuthMode::Permanent).is_none());
+    }
+
+    #[test]
+    fn a_system_user_cannot_reach_into_a_tenant() {
+        use objectio_auth::AuthMode;
+        // Not the system *admin* — that bypasses the chain earlier. An
+        // ordinary account outside any tenant gets no implicit reach in.
+        assert!(tenant_violation("", "acme", AuthMode::Permanent).is_some());
+    }
+
+    /// STS sessions carry no tenant, so gating them would deny every vended
+    /// Iceberg/Unity credential whose warehouse belongs to a tenant. Their
+    /// scope already pins them to one bucket and prefix.
+    #[test]
+    fn sts_sessions_are_exempt_until_tokens_carry_a_tenant() {
+        use objectio_auth::AuthMode;
+        assert!(tenant_violation("", "acme", AuthMode::Sts).is_none());
+        assert!(tenant_violation("acme", "globex", AuthMode::Sts).is_none());
+    }
+
+    #[test]
+    fn denial_reason_names_both_sides() {
+        use objectio_auth::AuthMode;
+        let r = tenant_violation("acme", "globex", AuthMode::Permanent).unwrap();
+        assert!(r.contains("acme") && r.contains("globex"));
+        let r = tenant_violation("", "globex", AuthMode::Permanent).unwrap();
+        assert!(r.contains("globex"));
+    }
+}

@@ -1,0 +1,691 @@
+//! Placement-group balancer.
+//!
+//! The balancer runs on the Raft leader and periodically evaluates
+//! every placement group against a cost function. When a PG is
+//! overloaded on one of its OSDs relative to the ideal target, or
+//! an OSD is underloaded, the balancer picks a better copyset from
+//! the precomputed pool and commits it as the PG's `up` set via MultiCas.
+//!
+//! # What a move moves
+//!
+//! Nothing, yet (B31 phase 1). A PG's `acting` set is where its objects
+//! are and where writes go; it changes only with an epoch, and only once
+//! the data is where the new set says (recovery, a later phase). Moving
+//! `acting` without copying would hide every object the PG holds: a key's
+//! copies are its PG's acting set, with no per-key record of where else
+//! they might be. So the balancer plans: it writes `up`, which recovery will
+//! follow. Below format level 7 it does not run at all.
+//!
+//! # Tuning knobs (config keys, all optional)
+//!
+//! Every tick re-reads these from the Meta `config` table, so they
+//! hot-swap without a restart:
+//!
+//! - `balancer/sweep_interval_seconds` — how often the balancer
+//!   evaluates. Default 60. Non-critical timer.
+//! - `balancer/overload_multiplier` — a PG is only a candidate if at
+//!   least one of its OSDs carries `>= multiplier × target` PGs.
+//!   Default 1.20. Lower values = more aggressive rebalance.
+//! - `balancer/underload_multiplier` — also flag a PG as a candidate
+//!   if at least one of its OSDs carries `<= multiplier × target`
+//!   PGs AND the PG has another OSD above average. Default 0.0
+//!   (disabled). Set to e.g. 0.70 to drain cold OSDs too.
+//! - `balancer/improvement_factor` — a move only commits when the
+//!   candidate copyset's total load is `<= factor × current`.
+//!   Default 0.90 (≥10% improvement required). Stops flip-flop
+//!   between near-equal options.
+//! - `balancer/scatter_width` — copyset-pool diversity target.
+//!   Default 10 (Cidon/Stutsman recommended). Lower = fewer distinct
+//!   copysets = lower correlated-loss probability but less diversity
+//!   for the balancer to choose from.
+//! - `balancer/per_tick_cap` — hard cap on moves per pool per tick.
+//!   Default 0 (auto = `max(3, osd_count / 3)`). Set explicitly to
+//!   bound churn on very large or very small clusters.
+//! - `balancer/paused` — set to "true" to halt all moves. Logs still
+//!   advance so operators can see what the balancer *would* do.
+//!
+//! - **Leader-only**: non-leader replicas skip the tick.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use objectio_placement::CopysetPool;
+use objectio_proto::metadata::{ErasureType, PlacementGroup, PoolConfig};
+use prost::Message;
+use rand::SeedableRng;
+use std::collections::HashMap;
+use tokio::time::{MissedTickBehavior, interval};
+use tracing::{debug, info, warn};
+
+use crate::service::MetaService;
+
+const DEFAULT_SWEEP_SECS: u64 = 60;
+const DEFAULT_OVERLOAD_MULTIPLIER: f64 = 1.20;
+const DEFAULT_UNDERLOAD_MULTIPLIER: f64 = 0.0; // disabled
+const DEFAULT_IMPROVEMENT_FACTOR: f64 = 0.90;
+const DEFAULT_SCATTER_WIDTH: usize = 10;
+/// Floor so very long configured intervals still leave the loop
+/// responsive to a paused->unpaused flip within a reasonable window.
+const MIN_SWEEP_SECS: u64 = 5;
+const MAX_SWEEP_SECS: u64 = 3600;
+
+/// Tuning knobs snapshot — read once per tick so hot-reloading config
+/// doesn't race with the evaluation logic.
+#[derive(Clone, Debug)]
+struct Tuning {
+    sweep: Duration,
+    overload: f64,
+    underload: f64,
+    improvement: f64,
+    scatter_width: usize,
+    per_tick_cap_override: usize,
+    paused: bool,
+}
+
+impl Tuning {
+    fn load(meta: &Arc<MetaService>) -> Self {
+        let secs = meta
+            .config_parsed::<u64>("balancer/sweep_interval_seconds", DEFAULT_SWEEP_SECS)
+            .clamp(MIN_SWEEP_SECS, MAX_SWEEP_SECS);
+        Self {
+            sweep: Duration::from_secs(secs),
+            overload: meta
+                .config_parsed::<f64>("balancer/overload_multiplier", DEFAULT_OVERLOAD_MULTIPLIER)
+                .max(1.0),
+            underload: meta
+                .config_parsed::<f64>(
+                    "balancer/underload_multiplier",
+                    DEFAULT_UNDERLOAD_MULTIPLIER,
+                )
+                .clamp(0.0, 1.0),
+            improvement: meta
+                .config_parsed::<f64>("balancer/improvement_factor", DEFAULT_IMPROVEMENT_FACTOR)
+                .clamp(0.0, 1.0),
+            scatter_width: meta
+                .config_parsed::<usize>("balancer/scatter_width", DEFAULT_SCATTER_WIDTH)
+                .max(1),
+            per_tick_cap_override: meta.config_parsed::<usize>("balancer/per_tick_cap", 0),
+            paused: meta
+                .config_str("balancer/paused", "false")
+                .eq_ignore_ascii_case("true"),
+        }
+    }
+}
+
+pub fn spawn(meta: Arc<MetaService>) {
+    tokio::spawn(async move {
+        run(meta).await;
+    });
+    info!(
+        "PG balancer spawned (tick every {}s by default; overrideable via balancer/* config)",
+        DEFAULT_SWEEP_SECS
+    );
+}
+
+async fn run(meta: Arc<MetaService>) {
+    // Re-read the tuning knobs each iteration so hot-swapping the
+    // config (via /_admin/config) takes effect on the next tick
+    // without a restart. Interval is re-created only when the
+    // sweep_interval_seconds knob changes.
+    let mut cur_sweep = Tuning::load(&meta).sweep;
+    let mut ticker = interval(cur_sweep);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let tuning = Tuning::load(&meta);
+        if tuning.sweep != cur_sweep {
+            info!(
+                "balancer: sweep interval changed {:?} -> {:?}",
+                cur_sweep, tuning.sweep
+            );
+            cur_sweep = tuning.sweep;
+            ticker = interval(cur_sweep);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker.tick().await; // consume the immediate first tick
+        }
+        if let Err(e) = sweep_once(&meta, &tuning).await {
+            warn!("balancer sweep failed: {e}");
+        }
+    }
+}
+
+async fn sweep_once(meta: &Arc<MetaService>, tuning: &Tuning) -> anyhow::Result<()> {
+    if !meta.is_raft_leader() {
+        debug!("balancer: not leader, skipping tick");
+        return Ok(());
+    }
+    // Mirror paused flag into RebalanceProgress so the UI banner
+    // reflects it even when no moves happen this tick.
+    meta.update_rebalance_progress(|p| {
+        p.paused = tuning.paused;
+    });
+    if tuning.paused {
+        debug!("balancer: paused via balancer/paused config");
+        return Ok(());
+    }
+    if !crate::service::pgs::pg_placement() {
+        return Ok(()); // see "What a move moves"
+    }
+
+    let topology = meta.topology_snapshot();
+    let active_osds: usize = topology.active_nodes().count();
+    if active_osds == 0 {
+        return Ok(());
+    }
+
+    let mut committed_this_tick: u64 = 0;
+    let mut candidates_this_tick: u64 = 0;
+    let mut scanned_this_tick: u64 = 0;
+    let mut last_err = String::new();
+    for pool in meta.pools_snapshot() {
+        if pool.pg_count == 0 {
+            continue;
+        }
+        match evaluate_pool(meta, &pool, active_osds, tuning).await {
+            Ok(stats) => {
+                committed_this_tick += stats.committed;
+                candidates_this_tick += stats.candidates;
+                scanned_this_tick += stats.scanned;
+            }
+            Err(e) => {
+                last_err = format!("pool '{}': {e}", pool.name);
+                warn!("balancer: pool '{}' evaluation failed: {e}", pool.name);
+            }
+        }
+    }
+
+    meta.update_rebalance_progress(|p| {
+        p.started = true;
+        p.last_sweep_at = now_unix();
+        p.pgs_scanned_last_tick = scanned_this_tick;
+        p.pg_candidates_last_tick = candidates_this_tick;
+        p.pgs_moved_total = p.pgs_moved_total.saturating_add(committed_this_tick);
+        // Keep legacy field live so the existing UI banner still
+        // reflects activity while we migrate the console to the new
+        // pgs_moved_total field.
+        p.shards_rebalanced_total = p.pgs_moved_total;
+        if !last_err.is_empty() {
+            p.last_error = last_err;
+        } else if committed_this_tick > 0 || candidates_this_tick > 0 {
+            p.last_error.clear();
+        }
+    });
+    Ok(())
+}
+
+/// Per-pool tick accounting returned by [`evaluate_pool`]. The sweep
+/// aggregates this into [`RebalanceProgress`] for UI consumption.
+#[derive(Default)]
+struct PoolStats {
+    scanned: u64,
+    candidates: u64,
+    committed: u64,
+}
+
+fn copy_count(pool: &PoolConfig) -> usize {
+    match pool.ec_type() {
+        ErasureType::ErasureMds => (pool.ec_k + pool.ec_m) as usize,
+        ErasureType::ErasureLrc => {
+            (pool.ec_k + pool.ec_local_parity + pool.ec_global_parity) as usize
+        }
+        ErasureType::ErasureReplication => pool.replication_count as usize,
+    }
+}
+
+/// How many moves one pool may commit in a single tick.
+///
+/// `0` means auto, documented as `max(3, osd_count / 3)`. The code applied the
+/// floor to the wrong operand — `active_osds.max(3) / 3` — so the floor never
+/// took effect and it read as `osd_count / 3`, which on a small cluster is 1.
+/// A three-OSD cluster that needed rebalancing therefore moved one PG a
+/// minute, a floor of three being the whole reason `.max(3)` was written.
+fn per_tick_cap(active_osds: usize, override_value: usize) -> usize {
+    if override_value > 0 {
+        override_value
+    } else {
+        (active_osds / 3).max(3)
+    }
+}
+
+/// How many PGs each of this PG's OSDs is currently carrying.
+///
+/// An osd_id that is not 16 bytes is dropped rather than counted as zero:
+/// treating a malformed id as an empty OSD would make the PG look colder than
+/// it is and pull work toward a disk that does not exist.
+fn pg_osd_counts(pg: &PlacementGroup, osd_counts: &HashMap<[u8; 16], usize>) -> Vec<usize> {
+    members(pg)
+        .iter()
+        .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
+        .map(|arr| *osd_counts.get(&arr).unwrap_or(&0))
+        .collect()
+}
+
+/// Where the balancer wants the PG: its `up` set, which starts as its
+/// acting set (and is empty in a PG made before level 7).
+fn members(pg: &PlacementGroup) -> &[Vec<u8>] {
+    if pg.up.is_empty() { &pg.acting } else { &pg.up }
+}
+
+/// A PG's cost: how far its hottest OSD is above the ideal share. Sorted on,
+/// so the hottest PG is considered first.
+fn pg_cost(counts: &[usize], target: f64) -> f64 {
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+    (max_count as f64) - target
+}
+
+/// Whether a PG is worth considering for a move this tick.
+///
+/// Two independent reasons. Hot: one of its OSDs is at or above the overload
+/// threshold. Cold-swap: some OSD in the cluster is underloaded *and* this PG
+/// has an OSD above target to swap away from it — without that second half
+/// every PG in the pool would qualify the moment one disk ran cold, and the
+/// balancer would churn through all of them.
+fn is_candidate(
+    counts: &[usize],
+    target: f64,
+    overload_threshold: f64,
+    has_cold_osd: bool,
+) -> bool {
+    let hot = counts.iter().any(|c| (*c as f64) >= overload_threshold);
+    let cold_swap = has_cold_osd && counts.iter().any(|c| (*c as f64) > target);
+    hot || cold_swap
+}
+
+/// Whether a candidate copyset is enough better than the current one to be
+/// worth the move. Requires `best <= factor * current`, which with the default
+/// 0.90 means a 10% improvement. Without a margin the balancer flip-flops
+/// between two near-equal placements forever.
+fn improves_enough(best_cost: f64, current_load: f64, factor: f64) -> bool {
+    best_cost < current_load * factor
+}
+
+async fn evaluate_pool(
+    meta: &Arc<MetaService>,
+    pool: &PoolConfig,
+    active_osds: usize,
+    tuning: &Tuning,
+) -> anyhow::Result<PoolStats> {
+    let mut stats = PoolStats::default();
+    let pgs = meta.placement_groups_for_pool(&pool.name);
+    if pgs.is_empty() {
+        return Ok(stats);
+    }
+    stats.scanned = pgs.len() as u64;
+
+    let k_plus_m = copy_count(pool);
+    if k_plus_m == 0 {
+        return Ok(stats);
+    }
+
+    // Live per-OSD PG-membership counts — updated in-place as moves
+    // commit in this tick so later PGs see the post-move state
+    // instead of over-moving onto the same OSD.
+    let mut osd_counts: HashMap<[u8; 16], usize> = HashMap::new();
+    for pg in &pgs {
+        for osd in members(pg) {
+            if let Ok(arr) = <[u8; 16]>::try_from(osd.as_slice()) {
+                *osd_counts.entry(arr).or_insert(0) += 1;
+            }
+        }
+    }
+    // Include zero-count OSDs so underload detection sees them.
+    for node in meta.topology_snapshot().active_nodes() {
+        osd_counts.entry(*node.id.as_bytes()).or_insert(0);
+    }
+
+    let total_slots = pgs.len() * k_plus_m;
+    let target = (total_slots as f64) / (active_osds as f64);
+    let overload_threshold = target * tuning.overload;
+    let underload_threshold = target * tuning.underload;
+
+    // Build the copyset pool once per pass — scoring candidate
+    // replacements reuses it across every overloaded PG.
+    // Within the pool's placement rule (B31 phase 1b): a copyset the
+    // balancer picks keeps the pool's spread and LRC groups.
+    let rule = crate::service::pgs::placement_rule(pool).map_err(|e| anyhow::anyhow!(e))?;
+    let seed = topology_seed(meta, pool);
+    let cs_pool =
+        CopysetPool::build_with_rule(&meta.topology_snapshot(), &rule, tuning.scatter_width, seed)?;
+    if cs_pool.sets.is_empty() {
+        warn!("balancer: pool '{}' has no feasible copysets", pool.name);
+        return Ok(stats);
+    }
+
+    let per_tick_cap = per_tick_cap(active_osds, tuning.per_tick_cap_override);
+
+    // Score PGs: cost = max count across its OSDs - target. Filter
+    // when either (a) some OSD >= overload_threshold, or (b) any
+    // active OSD in the cluster is <= underload_threshold and this
+    // PG has an OSD we could replace (i.e. a non-minimum OSD the
+    // move can swap out). Sort hottest first.
+    let has_cold_osd = tuning.underload > 0.0
+        && osd_counts
+            .values()
+            .any(|c| (*c as f64) <= underload_threshold);
+    let mut scored: Vec<(f64, PlacementGroup)> = pgs
+        .into_iter()
+        .map(|pg| {
+            let counts = pg_osd_counts(&pg, &osd_counts);
+            (pg_cost(&counts, target), counts, pg)
+        })
+        .filter(|(_, counts, _)| is_candidate(counts, target, overload_threshold, has_cold_osd))
+        .map(|(cost, _, pg)| (cost, pg))
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    stats.candidates = scored.len() as u64;
+
+    let mut committed = 0usize;
+    for (cost, pg) in scored {
+        if committed >= per_tick_cap {
+            break;
+        }
+
+        let current_load: f64 = members(&pg)
+            .iter()
+            .filter_map(|osd| <[u8; 16]>::try_from(osd.as_slice()).ok())
+            .map(|arr| *osd_counts.get(&arr).unwrap_or(&0) as f64)
+            .sum();
+
+        let mut rng = rand::rngs::StdRng::from_seed(seed_bytes(seed.wrapping_add(pg.pg_id.into())));
+        let best_cost_cell = std::cell::Cell::new(f64::INFINITY);
+        let target_set = cs_pool.pick_min_cost(&mut rng, |cs| {
+            let c: f64 = cs
+                .osds
+                .iter()
+                .map(|id| *osd_counts.get(id.as_bytes()).unwrap_or(&0) as f64)
+                .sum();
+            if c < best_cost_cell.get() {
+                best_cost_cell.set(c);
+            }
+            c
+        });
+        let Some(cs) = target_set else {
+            warn!(
+                "balancer: pool={} pg_id={} no candidate copyset",
+                pool.name, pg.pg_id
+            );
+            continue;
+        };
+        let best_cost = best_cost_cell.get();
+
+        // Improvement gate: require best candidate ≤ factor × current.
+        if !improves_enough(best_cost, current_load, tuning.improvement) {
+            debug!(
+                "balancer: pool={} pg_id={} improvement {}→{} below {}×; skip",
+                pool.name, pg.pg_id, current_load, best_cost, tuning.improvement
+            );
+            continue;
+        }
+
+        // The plan: `up` only. The epoch is acting's, and acting stays.
+        let old_bytes = pg.encode_to_vec();
+        let new_pg = PlacementGroup {
+            up: cs.osds.iter().map(|n| n.as_bytes().to_vec()).collect(),
+            updated_at: now_unix(),
+            ..pg.clone()
+        };
+        let new_bytes = new_pg.encode_to_vec();
+
+        match commit_pg(meta, &pg, old_bytes, new_bytes).await {
+            Ok(()) => {
+                info!(
+                    "balancer: planned pool={} pg_id={} cost={:.2} load {}→{}",
+                    pool.name, pg.pg_id, cost, current_load, best_cost
+                );
+                // Update in-memory osd_counts so the next PG in this
+                // tick sees the post-commit state.
+                for osd in members(&pg) {
+                    if let Ok(arr) = <[u8; 16]>::try_from(osd.as_slice())
+                        && let Some(c) = osd_counts.get_mut(&arr)
+                    {
+                        *c = c.saturating_sub(1);
+                    }
+                }
+                for n in &cs.osds {
+                    *osd_counts.entry(*n.as_bytes()).or_insert(0) += 1;
+                }
+                committed += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "balancer: pool={} pg_id={} commit failed: {e}",
+                    pool.name, pg.pg_id
+                );
+            }
+        }
+    }
+
+    stats.committed = committed as u64;
+    if committed > 0 {
+        info!(
+            "balancer: pool '{}' committed {}/{} moves (target={:.2}, overload>={:.2}, underload<={:.2})",
+            pool.name, committed, per_tick_cap, target, overload_threshold, underload_threshold
+        );
+    }
+    Ok(stats)
+}
+
+async fn commit_pg(
+    meta: &Arc<MetaService>,
+    pg: &PlacementGroup,
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse, MetaStore};
+
+    let Some(raft) = meta.raft_handle() else {
+        return Err(anyhow::anyhow!("no raft handle — cannot commit PG move"));
+    };
+    let cmd = MetaCommand::MultiCas {
+        ops: vec![CasOp {
+            table: CasTable::PlacementGroups,
+            key: MetaStore::pg_key(&pg.pool, pg.pg_id),
+            expected: Some(old_bytes),
+            new_value: Some(new_bytes),
+        }],
+        requested_by: "balancer".into(),
+    };
+    match raft.client_write(cmd).await {
+        Ok(r) => match r.data {
+            MetaResponse::MultiCasOk => Ok(()),
+            MetaResponse::MultiCasConflict { .. } => {
+                Err(anyhow::anyhow!("pg changed concurrently — skip this tick"))
+            }
+            other => Err(anyhow::anyhow!("unexpected raft response: {other:?}")),
+        },
+        Err(e) => Err(anyhow::anyhow!("raft write failed: {e}")),
+    }
+}
+
+/// Deterministic per-pool seed: topology version × pool name hash.
+/// Keeps the copyset pool stable across ticks that see the same
+/// topology, so the balancer doesn't jitter between near-equal
+/// candidates.
+fn topology_seed(meta: &Arc<MetaService>, pool: &PoolConfig) -> u64 {
+    let v = meta.topology_snapshot().version;
+    let name_hash = xxhash_rust::xxh64::xxh64(pool.name.as_bytes(), 0);
+    v.wrapping_mul(1_000_003).wrapping_add(name_hash)
+}
+
+fn seed_bytes(seed: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[..8].copy_from_slice(&seed.to_le_bytes());
+    b[8..16].copy_from_slice(&seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    b[16..24].copy_from_slice(&seed.wrapping_add(0xbf58_476d_1ce4_e5b9).to_le_bytes());
+    b[24..32].copy_from_slice(&seed.wrapping_mul(0x94d0_49bb_1331_11eb).to_le_bytes());
+    b
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pg(osd_ids: &[[u8; 16]]) -> PlacementGroup {
+        PlacementGroup {
+            pg_id: 1,
+            acting: osd_ids.iter().map(|id| id.to_vec()).collect(),
+            epoch: 1,
+            ..Default::default()
+        }
+    }
+
+    fn osd(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+
+    // ── per-tick cap ──────────────────────────────────────────────────────
+
+    /// The floor is the point of the auto value.
+    ///
+    /// `active_osds.max(3) / 3` put the `.max(3)` on the wrong side of the
+    /// division, so it never did anything: a three-OSD cluster got a cap of
+    /// one move per tick and, at the default 60-second sweep, took an hour to
+    /// move sixty PGs.
+    #[test]
+    fn a_small_cluster_still_gets_three_moves_a_tick() {
+        for osds in [1, 2, 3, 6, 9] {
+            assert!(
+                per_tick_cap(osds, 0) >= 3,
+                "{osds} OSDs got a cap of {}",
+                per_tick_cap(osds, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_cluster_scales_with_a_third_of_its_osds() {
+        assert_eq!(per_tick_cap(30, 0), 10);
+        assert_eq!(per_tick_cap(300, 0), 100);
+    }
+
+    #[test]
+    fn an_explicit_cap_wins_over_the_auto_value() {
+        assert_eq!(per_tick_cap(300, 1), 1);
+        assert_eq!(per_tick_cap(3, 25), 25);
+    }
+
+    #[test]
+    fn an_empty_cluster_does_not_divide_by_zero() {
+        assert_eq!(per_tick_cap(0, 0), 3);
+    }
+
+    // ── per-PG counts ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_pgs_counts_are_read_from_the_live_map() {
+        let mut counts = HashMap::new();
+        counts.insert(osd(1), 5);
+        counts.insert(osd(2), 2);
+        assert_eq!(pg_osd_counts(&pg(&[osd(1), osd(2)]), &counts), vec![5, 2]);
+    }
+
+    #[test]
+    fn an_osd_absent_from_the_map_counts_as_empty() {
+        // A newly registered OSD holds no PGs yet; that is a real zero, not a
+        // missing measurement.
+        let counts = HashMap::new();
+        assert_eq!(pg_osd_counts(&pg(&[osd(9)]), &counts), vec![0]);
+    }
+
+    /// A malformed osd_id is dropped, not counted as an empty OSD.
+    ///
+    /// Counting it as zero would drag the PG's apparent load down and make the
+    /// balancer move work toward a disk that does not exist.
+    #[test]
+    fn a_malformed_osd_id_is_ignored_rather_than_read_as_empty() {
+        let mut counts = HashMap::new();
+        counts.insert(osd(1), 7);
+        let mut bad = pg(&[osd(1)]);
+        bad.acting.push(vec![0u8; 4]);
+        assert_eq!(pg_osd_counts(&bad, &counts), vec![7]);
+    }
+
+    // ── cost ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cost_is_the_hottest_osds_distance_above_target() {
+        assert!((pg_cost(&[2, 9, 4], 5.0) - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_underloaded_pg_has_a_negative_cost_and_sorts_last() {
+        let hot = pg_cost(&[9], 5.0);
+        let cold = pg_cost(&[1], 5.0);
+        assert!(cold < 0.0);
+        assert!(hot > cold, "a cold PG outranked a hot one");
+    }
+
+    #[test]
+    fn a_pg_with_no_usable_osds_costs_nothing_above_target() {
+        assert!((pg_cost(&[], 5.0) - -5.0).abs() < f64::EPSILON);
+    }
+
+    // ── candidate filter ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_pg_at_the_overload_threshold_is_a_candidate() {
+        // Inclusive: exactly at the threshold counts as hot.
+        assert!(is_candidate(&[6, 2], 5.0, 6.0, false));
+    }
+
+    #[test]
+    fn a_balanced_pg_is_left_alone() {
+        assert!(!is_candidate(&[5, 5, 5], 5.0, 6.0, false));
+    }
+
+    /// The cold-swap path needs both halves.
+    ///
+    /// A cold OSD somewhere is not on its own a reason to move *this* PG — if
+    /// it were, every PG in the pool would qualify the moment one disk ran
+    /// cold and the balancer would churn through all of them. It also needs an
+    /// OSD above target here, to swap away from.
+    #[test]
+    fn a_cold_osd_alone_does_not_make_every_pg_a_candidate() {
+        assert!(!is_candidate(&[5, 5], 5.0, 6.0, true));
+        assert!(is_candidate(&[6, 5], 5.0, 99.0, true));
+    }
+
+    #[test]
+    fn underload_rebalancing_stays_off_unless_it_is_enabled() {
+        // has_cold_osd is false whenever the multiplier is 0, so a PG that is
+        // merely above target is not moved.
+        assert!(!is_candidate(&[6, 5], 5.0, 99.0, false));
+    }
+
+    // ── improvement gate ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_move_needs_to_beat_the_current_placement_by_the_margin() {
+        // 10% better is not enough at factor 0.90 — the gate is strict.
+        assert!(!improves_enough(90.0, 100.0, 0.90));
+        assert!(improves_enough(89.0, 100.0, 0.90));
+    }
+
+    #[test]
+    fn a_worse_or_equal_candidate_is_refused() {
+        assert!(!improves_enough(100.0, 100.0, 0.90));
+        assert!(!improves_enough(120.0, 100.0, 0.90));
+    }
+
+    /// Near-equal placements must not trade back and forth.
+    ///
+    /// Without a margin, two copysets one PG apart would each look better than
+    /// the other on alternate ticks and the balancer would move data forever.
+    #[test]
+    fn two_near_equal_placements_do_not_flip_flop() {
+        assert!(!improves_enough(29.0, 30.0, 0.90));
+        assert!(!improves_enough(30.0, 29.0, 0.90));
+    }
+
+    #[test]
+    fn an_empty_pg_cannot_be_improved_on() {
+        assert!(!improves_enough(0.0, 0.0, 0.90));
+    }
+}
