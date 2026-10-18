@@ -293,11 +293,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          # GHCR_TOKEN = classic PAT with write:packages (owned by
-          # repository_owner). Preferred over GITHUB_TOKEN because
-          # fine-grained / repo-scoped defaults tripped denied:
-          # permission_denied: write_package on the first attempts.
-          password: ${{ secrets.GHCR_TOKEN }}
+          # GITHUB_TOKEN, unless a GHCR_TOKEN secret (a classic PAT with
+          # write:packages) is set: it can push only to packages linked to
+          # this repository, which a package its first push creates is.
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Build and push by digest
         id: build
@@ -346,11 +345,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          # GHCR_TOKEN = classic PAT with write:packages (owned by
-          # repository_owner). Preferred over GITHUB_TOKEN because
-          # fine-grained / repo-scoped defaults tripped denied:
-          # permission_denied: write_package on the first attempts.
-          password: ${{ secrets.GHCR_TOKEN }}
+          # GITHUB_TOKEN, unless a GHCR_TOKEN secret (a classic PAT with
+          # write:packages) is set: it can push only to packages linked to
+          # this repository, which a package its first push creates is.
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -414,7 +412,7 @@ jobs:
 
       - name: helm push to GHCR
         env:
-          HELM_REGISTRY_LOGIN_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          HELM_REGISTRY_LOGIN_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           echo "$HELM_REGISTRY_LOGIN_TOKEN" \
             | helm registry login ghcr.io \
