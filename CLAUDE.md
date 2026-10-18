@@ -6,12 +6,16 @@ where to look. It holds no design: how each part works is in the docs repo
 
 ## Rules
 
-- **Roadmap first.** `../objectio-docs/ROADMAP.md` is the plan of record.
-  Before any work on a new feature, even one asked for directly, find its
-  row there; add one (🔨, plus a milestone with an exit test if it's
-  sizeable) or mark the existing one 🔨, then start. Mark it ✅ in the docs
-  PR that documents it. Bug fixes need no row unless they change a
-  feature's status.
+- **Issue first.** Work is tracked as issues on this repo, labelled
+  `area:<domain>` (s3, core, datalake, security, block, file, platform,
+  ci, docs), milestoned to a release and on the
+  [ObjectIO project](https://github.com/orgs/object-io/projects/1); each
+  is a line in `../objectio-docs/ROADMAP.md` linking it. Before any work
+  on a new feature, even one asked for directly, find or open its issue
+  (and its roadmap line), set it In progress, then start; the PR closes
+  it. The docs PR that documents it moves its line from `ROADMAP.md` into
+  `features.md` and the release's notes. Bug fixes need no issue unless
+  they change a feature's status.
 - **No legacy support.** No code for old releases, old formats or old
   clients (old-layout decoders, fallbacks for data "written before X",
   `serde(default)` only so old records parse). Ask before adding any.
@@ -32,7 +36,9 @@ In `../objectio-docs/` (clone it next to this repo):
 
 | For | Read |
 |---|---|
-| What exists, what's planned, its status | `ROADMAP.md` |
+| What exists, and how far it is proven | `features.md` |
+| What's ahead, by release | `ROADMAP.md` (each line links its issue) |
+| What a release shipped, and how it was tested | `releases/<version>.md` |
 | The system in an hour | `architecture/README.md`, then its short phase docs (`vision`, `data`, `services`, `decisions`, …) |
 | How a part works | `architecture/design/README.md` (index by area: `core/`, `s3/`, `datalake/`, `security/`, `block/`, `file/`, `platform/`), then the design |
 | Why a decision was made | `architecture/decisions.md`, `architecture/adr/` |
