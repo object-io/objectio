@@ -248,11 +248,17 @@ pub(crate) fn is_busy(id: &(String, u32)) -> bool {
 
 /// Keep, in a state peering computed, recovery's progress from the one it
 /// replaces: the cursor (if for this epoch), the counts, the unfound keys
-/// and when to try a too-full PG again.
+/// and when to try a too-full PG again. A PG waiting for room stays
+/// `WaitTooFull`, with its reason, while it is still degraded in the same
+/// epoch: recovery, not a peering round, decides when it is tried again.
 pub(crate) fn keep_progress(state: &mut PgState, held: &PgState) {
     if held.cursor_epoch == state.epoch {
         state.cursor.clone_from(&held.cursor);
         state.cursor_epoch = held.cursor_epoch;
+    }
+    if held.state == "WaitTooFull" && held.epoch == state.epoch && state.state == "Degraded" {
+        state.state.clone_from(&held.state);
+        state.last_error.clone_from(&held.last_error);
     }
     state.recovered = held.recovered;
     state.remaining = held.remaining;
@@ -2715,6 +2721,42 @@ mod tests {
         assert!(next.cursor.is_empty(), "another epoch starts again");
         assert!(next.unfound_keys.is_empty(), "none unfound now");
         assert_eq!(next.recovered, 30, "the count goes on until clean");
+    }
+
+    #[test]
+    fn a_pg_waiting_for_room_keeps_waiting_through_peering() {
+        let held = PgState {
+            epoch: 4,
+            state: "WaitTooFull".into(),
+            last_error: "osd 1f is 95% full".into(),
+            retry_at: 99,
+            ..PgState::default()
+        };
+        let peered = |epoch, state: &str| {
+            let mut s = PgState {
+                epoch,
+                state: state.into(),
+                ..PgState::default()
+            };
+            keep_progress(&mut s, &held);
+            s
+        };
+        let still = peered(4, "Degraded");
+        assert_eq!(
+            (
+                still.state.as_str(),
+                still.last_error.as_str(),
+                still.retry_at
+            ),
+            ("WaitTooFull", "osd 1f is 95% full", 99)
+        );
+        assert_eq!(peered(4, "Undersized").state, "Undersized");
+        assert_eq!(peered(4, "Down").state, "Down");
+        assert_eq!(
+            peered(5, "Degraded").state,
+            "Degraded",
+            "a new epoch peers afresh"
+        );
     }
 
     #[test]
