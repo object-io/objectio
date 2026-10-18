@@ -12,6 +12,10 @@
 #        - prerelease: tick if this is an RC / beta
 #   Dispatching without step 1 fails at the push: the bump commit it would
 #   make is refused by main's rules, and nothing is tagged or built.
+#   3. After it is out, a PR setting main to the next release with "-dev"
+#      (after 0.1.0-rc.1: 0.1.0-dev). The rolling-upgrade test refuses to
+#      upgrade a release to itself, so main must never carry a released
+#      version once its tag exists.
 #
 # What it does:
 #   1. Validates the version and checks Cargo.toml on main already carries

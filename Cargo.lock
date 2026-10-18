@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-aio"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-auth"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-block"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-block-gateway"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-block-gateway-bin"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-common"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "bytes",
  "crc32c",
@@ -2499,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-dedup-estimate"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2508,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-delta-sharing"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "axum 0.8.8",
  "chrono",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-e2e"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "base64 0.22.1",
  "bzip2",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-erasure"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "bytes",
  "erasure-isa-l",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-gateway"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-gateway-bin"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-iceberg"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "axum 0.8.8",
  "objectio-auth",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-install"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-io-bench"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-kms"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-meta"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-meta-bin"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-meta-store"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "crc32c",
  "objectio-common",
@@ -2779,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-osd"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-osd-bin"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-placement"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "objectio-common",
  "parking_lot",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-proto"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "clap",
  "objectio-common",
@@ -2857,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-s3-bench"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-storage"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "async-trait",
  "bindgen 0.72.1",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-transport-te"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "bytes",
  "futures",
@@ -2914,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "objectio-unity-catalog"
-version = "0.1.0-rc.1"
+version = "0.1.0-dev"
 dependencies = [
  "axum 0.8.8",
  "objectio-auth",
