@@ -38,7 +38,9 @@ __pycache__/
 # Node
 node_modules/
 console/dist/
-.claude/
+# Local agent state; the contributor skills are shared.
+.claude/*
+!.claude/skills/
 
 # warp benchmark output (scripts/bench/baseline.sh writes it under $BENCH/results)
 warp-*.json.zst
