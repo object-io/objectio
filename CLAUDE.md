@@ -4,6 +4,11 @@ How to work in this repository: the rules, the commands, the map, and
 where to look. It holds no design: how each part works is in the docs repo
 (`../objectio-docs/`, below), which is the one place it is written down.
 
+The rules every contributor follows, and how a change gets in, are in
+`CONTRIBUTING.md`; this file adds what a maintainer's agent needs on top
+(the docs repo, the tracking). Two skills in `.claude/skills/` walk the
+work: `objectio-contribute` (issue to merge) and `objectio-testing`.
+
 ## Rules
 
 - **Issue first.** Work is tracked as issues on this repo, labelled

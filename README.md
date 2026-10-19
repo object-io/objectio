@@ -73,6 +73,12 @@ make build            # debug build, with ISA-L (x86_64); on ARM: cargo build --
 make test             # all tests (tests/e2e runs real clusters of processes)
 ```
 
+## Contributing
+
+Bug reports, fixes and features are welcome: start with
+[CONTRIBUTING.md](CONTRIBUTING.md). Security problems are reported
+privately ([SECURITY.md](SECURITY.md)).
+
 ## License
 
 [Apache License 2.0](./LICENSE). Everything is open source: no license

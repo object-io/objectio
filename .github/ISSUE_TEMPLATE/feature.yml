@@ -1,0 +1,47 @@
+name: Feature
+description: Something ObjectIO should do that it doesn't.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap](https://object-io.github.io/latest/ROADMAP/) and the open issues first: it may be planned already.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and what stops you today. The use case matters more than the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: What will be true when this exists, put so it can be tested. For S3 behaviour, what AWS S3 does.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or other ways it could be done.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - S3
+        - Storage core (OSD, erasure coding, placement, meta, repair)
+        - Data lake (Iceberg, Unity Catalog, Delta Sharing)
+        - Security (IAM, STS, tenants, encryption)
+        - Block
+        - File
+        - Platform (install, Helm, console, CLI, SDKs, metrics)
+    validations:
+      required: true
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this (see CONTRIBUTING.md; we'll agree the approach here first).
