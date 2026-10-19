@@ -169,9 +169,21 @@ struct Loaded {
 /// multipart upload in flight, a tenant with a user and a key, a
 /// replication target and rule. Objects go into `stored`.
 fn load(c: &Cluster, stored: &Stored) -> Loaded {
-    for b in ["/data", "/traffic", "/packed", "/ver", "/ver-dst"] {
+    for b in ["/data", "/traffic", "/ver", "/ver-dst"] {
         assert_eq!(c.request("PUT", b, &[]).status, 200, "{b}");
     }
+    // Packs hold objects too big for their shards to be kept in metadata
+    // and at most `PACK_MAX` (64 KiB). On the default 4+2 pool that range is
+    // empty (a 64 KiB object's shards are 16 KiB, kept in metadata), so the
+    // packed bucket is on a 2+1 pool, where it is 32 to 64 KiB.
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "packs", "ec_type": 0, "ec_k": 2, "ec_m": 1, "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    let r = c.request_with_headers("PUT", "/packed", &[], &[("x-objectio-pool", "packs")]);
+    assert_eq!(r.status, 200, "/packed: {}", r.text());
     let put = |path: &str, bytes: Vec<u8>, headers: &[(&str, &[u8])]| -> Response {
         let r = c.request_signed("PUT", path, &bytes, headers, false);
         assert_eq!(r.status, 200, "{path}: {}", r.text());
@@ -220,7 +232,7 @@ fn load_packed(c: &Cluster, put: &Put) {
     for (i, k) in (0u64..).zip(&keys) {
         put(
             &format!("/packed/{k}"),
-            payload(6_000 + usize::try_from(i).unwrap() * 2_311, 200 + i),
+            payload(34_000 + usize::try_from(i).unwrap() * 2_311, 200 + i),
             &[],
         );
     }
