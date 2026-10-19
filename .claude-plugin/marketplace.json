@@ -1,0 +1,29 @@
+{
+  "name": "objectio",
+  "owner": {
+    "name": "object-io"
+  },
+  "description": "Agent skills for ObjectIO: deploying and running a cluster, and building on its APIs",
+  "plugins": [
+    {
+      "name": "objectio-ops",
+      "source": "./",
+      "strict": false,
+      "description": "For operators: install, size, upgrade, monitor and troubleshoot ObjectIO, and run a cluster with obioctl",
+      "category": "deployment",
+      "license": "Apache-2.0",
+      "homepage": "https://object-io.github.io",
+      "skills": ["./skills/objectio-deploy/", "./skills/objectio-admin/"]
+    },
+    {
+      "name": "objectio-dev",
+      "source": "./",
+      "strict": false,
+      "description": "For application developers: S3 clients, the Python and Go SDKs, credentials and STS, the data lake APIs",
+      "category": "development",
+      "license": "Apache-2.0",
+      "homepage": "https://object-io.github.io",
+      "skills": ["./skills/objectio-sdk/"]
+    }
+  ]
+}

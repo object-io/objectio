@@ -61,6 +61,25 @@ helm install objectio oci://ghcr.io/object-io/charts/objectio --version 0.1.0-rc
 Installation, administration and the APIs are covered in the
 [documentation](https://object-io.github.io).
 
+## Agent skills
+
+Skills that teach a coding agent (Claude Code, Codex, opencode, …) to
+deploy and run ObjectIO (`objectio-ops`) and to build on its APIs
+(`objectio-dev`). `obioctl` carries them:
+
+```sh
+obioctl skills install
+```
+
+or, in Claude Code, from this repository:
+
+```
+/plugin install objectio-ops --marketplace object-io/objectio
+/plugin install objectio-dev --marketplace object-io/objectio
+```
+
+What each covers: [skills/README.md](skills/README.md).
+
 ## Building from source
 
 ```sh

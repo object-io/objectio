@@ -137,6 +137,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bin ./bin
 COPY tests ./tests
+# obioctl carries the agent skills (`include_str!`).
+COPY skills ./skills
 
 # objectio-aio embeds the console SPA at compile time via
 # `include_dir!("$CARGO_MANIFEST_DIR/../../console/dist")`, so the

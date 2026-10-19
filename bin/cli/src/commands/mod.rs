@@ -50,9 +50,10 @@ pub async fn run(cmd: Command, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         Command::Warehouse { action } => cluster::warehouse(action, ctx).await,
         Command::Config { action } => cluster::config(action, ctx).await,
         Command::Metrics { action } => cluster::metrics(action, ctx).await,
-        Command::Configure(_) | Command::Volume { .. } | Command::Snapshot { .. } => {
-            Err(anyhow!("not a management-API command"))
-        }
+        Command::Configure(_)
+        | Command::Volume { .. }
+        | Command::Snapshot { .. }
+        | Command::Skills { .. } => Err(anyhow!("not a management-API command")),
     }
 }
 

@@ -181,3 +181,11 @@ Get temporary credentials from an OIDC token (no key needed):
 eval "$(obioctl sts assume-role-with-web-identity \
   --role-arn arn:obio:iam::acme:role/etl --token-file /var/run/secrets/token --env)"
 ```
+
+## Agent skills
+
+`obioctl skills list` shows the skills this binary carries, and
+`obioctl skills install` copies them where coding agents read skills
+(`--agent`, `--all`, `--dir`, `--audience ops|dev`, `--force`). They need
+no endpoint or credentials. What they are and how they're maintained:
+[skills/README.md](../../skills/README.md).
