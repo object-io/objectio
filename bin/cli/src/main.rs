@@ -22,6 +22,7 @@ mod config;
 mod configure;
 mod http;
 mod output;
+mod skills;
 /// `SigV4` signing, shared with the gateway's replicator.
 use objectio_auth::signer as sigv4;
 #[cfg(test)]
@@ -62,6 +63,11 @@ pub async fn execute(
         Command::Volume { action } => block::volume(action, &args.block_endpoint, &mut out).await,
         Command::Snapshot { action } => {
             block::snapshot(action, &args.block_endpoint, &mut out).await
+        }
+        Command::Skills { action } => {
+            // Local files only: no gateway, no credentials.
+            let home = env("HOME").map(std::path::PathBuf::from);
+            skills::run(action, home.as_deref(), &mut out)
         }
         Command::Oidc {
             action: OidcCmd::TenantName { tenant },

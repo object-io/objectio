@@ -193,6 +193,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SnapshotCmd,
     },
+    /// Agent skills for coding agents (Claude Code, Codex, ...): list, install
+    Skills {
+        #[command(subcommand)]
+        action: crate::skills::SkillsCmd,
+    },
 }
 
 // ── configure ───────────────────────────────────────────────────────────
