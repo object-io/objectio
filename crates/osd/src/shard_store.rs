@@ -11,7 +11,8 @@
 //!   storage, bytes and location: a restart finds it.
 //! - **Checksums.** A shard is checked against its CRC32C when written (a
 //!   mismatch is refused, nothing stored), when read and when scrubbed; one
-//!   that fails is reported corrupt until it is rewritten.
+//!   that fails is reported corrupt until it is rewritten. Bytes stored as
+//!   another shard, intact or not, are never served as this one.
 //! - **Atomic with metadata.** A small shard and its object's metadata go
 //!   in one all-or-nothing write (B21).
 //! - **Space comes back.** A delete, or a rewrite of the same shard, frees
@@ -29,8 +30,8 @@ use std::time::Instant;
 
 use objectio_common::version::SMALL_SHARD_MAX;
 use objectio_proto::storage::{ShardId, ShardState, SmallShard};
-use objectio_storage::DiskManager;
 use objectio_storage::metadata::{MetaIndex, MetadataKey, MetadataOp};
+use objectio_storage::{BlockHeader, DiskManager};
 use parking_lot::RwLock;
 use tonic::Status;
 use tracing::{debug, error, info, warn};
@@ -301,6 +302,165 @@ pub(crate) fn shard_loc_meta_key(shard_key: &str) -> MetadataKey {
 /// read one page per shard (an OSD of 135,000 shards took five minutes to
 /// start on a soak VM, B2 soak run 36).
 const LOC_END_KEY: &[u8] = b"osd_loc;";
+
+/// Which disk is at each index a location names (`ShardLocation.disk_idx`):
+/// a [`DiskSetRecord`], written when the OSD first opens its disks and
+/// whenever the set changes. A disk is known by the id in its superblock,
+/// not by its path or its place in a list: paths sort differently when a
+/// disk is missing or renamed, and a location read against the wrong disk
+/// hands that disk's live blocks to new writes.
+const DISK_SET_KEY: &[u8] = b"osd_disks";
+
+/// The disks of this OSD, by index.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct DiskSetRecord {
+    #[prost(message, repeated, tag = "1")]
+    disks: Vec<DiskSlotRecord>,
+}
+
+/// The disk at one index.
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct DiskSlotRecord {
+    /// The disk's id, as its superblock carries it.
+    #[prost(bytes = "vec", tag = "1")]
+    id: Vec<u8>,
+    /// Where it was last opened: for the operator, when it is missing.
+    #[prost(string, tag = "2")]
+    path: String,
+}
+
+/// A disk as [`Disks::open`] found it, for [`arrange_disks`].
+struct OpenedDisk {
+    id: [u8; 16],
+    path: String,
+    /// Formatted just now: blank, so a replacement or a new disk.
+    formatted_now: bool,
+}
+
+/// Which opened disk is at each index, from [`arrange_disks`].
+#[derive(Debug)]
+struct Arrangement {
+    /// For each index, the opened disk at it.
+    order: Vec<usize>,
+    /// The indexes whose disk was formatted just now: whatever the shard
+    /// index says was on them is gone.
+    replaced: Vec<bool>,
+    /// The record to write, when it isn't the one there.
+    record: Option<DiskSetRecord>,
+}
+
+/// Put each of the `opened` disks at its index in the set `recorded` (none
+/// on a first open). A recorded disk is found by its id, wherever it is now
+/// and in whatever order the disks were named. A disk formatted just now
+/// (blank) takes the index of one missing, as a replacement, its shards
+/// forgotten to be rebuilt; or a new index at the end. Refused: a disk
+/// missing with no blank one in its place, a disk that is not blank and not
+/// one of the set, and one disk named twice.
+fn arrange_disks(
+    recorded: Option<&DiskSetRecord>,
+    opened: &[OpenedDisk],
+) -> Result<Arrangement, String> {
+    let record_of = |order: &[usize]| DiskSetRecord {
+        disks: order
+            .iter()
+            .map(|&i| DiskSlotRecord {
+                id: opened[i].id.to_vec(),
+                path: opened[i].path.clone(),
+            })
+            .collect(),
+    };
+    for (i, d) in opened.iter().enumerate() {
+        if let Some(other) = opened[..i].iter().find(|o| o.id == d.id) {
+            return Err(format!(
+                "{} and {} are the same disk (id {}): name each disk once",
+                other.path,
+                d.path,
+                hex::encode(d.id)
+            ));
+        }
+    }
+    let Some(recorded) = recorded else {
+        let order: Vec<usize> = (0..opened.len()).collect();
+        return Ok(Arrangement {
+            replaced: opened.iter().map(|d| d.formatted_now).collect(),
+            record: Some(record_of(&order)),
+            order,
+        });
+    };
+    let mut slots: Vec<Option<usize>> = vec![None; recorded.disks.len()];
+    let mut blanks = Vec::new();
+    for (i, d) in opened.iter().enumerate() {
+        if d.formatted_now {
+            blanks.push(i);
+            continue;
+        }
+        let Some(slot) = recorded.disks.iter().position(|r| r.id == d.id) else {
+            return Err(format!(
+                "disk {} (id {}) is not one of this OSD's {} disks: it belongs to another \
+                 OSD, or was replaced. Remove it from this OSD's disks, or wipe it to add it \
+                 as a new disk",
+                d.path,
+                hex::encode(d.id),
+                recorded.disks.len()
+            ));
+        };
+        slots[slot] = Some(i);
+    }
+    let mut replaced = vec![false; slots.len()];
+    let mut blanks = blanks.into_iter();
+    for (slot, at) in slots.iter_mut().enumerate() {
+        if at.is_none()
+            && let Some(blank) = blanks.next()
+        {
+            warn!(
+                "disk {slot} (id {}, last at {}) is replaced by blank disk {}: the shards \
+                 it held are forgotten, and rebuilt by Meta's repairer",
+                hex::encode(&recorded.disks[slot].id),
+                recorded.disks[slot].path,
+                opened[blank].path
+            );
+            *at = Some(blank);
+            replaced[slot] = true;
+        }
+    }
+    for blank in blanks {
+        info!("disk {} added at index {}", opened[blank].path, slots.len());
+        slots.push(Some(blank));
+        replaced.push(true);
+    }
+    let missing: Vec<String> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, at)| at.is_none())
+        .map(|(slot, _)| {
+            format!(
+                "disk {slot} (id {}, last at {})",
+                hex::encode(&recorded.disks[slot].id),
+                recorded.disks[slot].path
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        let (is, it, blank) = if missing.len() == 1 {
+            ("is", "it", "a blank disk")
+        } else {
+            ("are", "them", "blank disks")
+        };
+        return Err(format!(
+            "this OSD's {} {is} missing; not starting, as its shards would be looked for on \
+             other disks. Attach {it} again (at any path), or replace {it} with {blank} as \
+             the operations guide's \"Replacing a disk\" says",
+            missing.join(", ")
+        ));
+    }
+    let order: Vec<usize> = slots.into_iter().flatten().collect();
+    let record = record_of(&order);
+    Ok(Arrangement {
+        record: (record != *recorded).then_some(record),
+        order,
+        replaced,
+    })
+}
 
 /// Prefix of a small shard's bytes (B21), apart from its location record:
 /// in the record, the startup pass over every location read every small
@@ -621,7 +781,6 @@ pub fn render_disk_metrics(out: &mut String, osd_label: &str) {
 /// The raw disks a [`BlockStore`] is opened on, before its index is.
 pub struct Disks {
     disks: Vec<DiskManager>,
-    disk_ids: Vec<[u8; 16]>,
     /// Disks formatted just now, by index: whatever the shard index says
     /// was on them is gone.
     formatted_now: Vec<bool>,
@@ -633,7 +792,6 @@ impl Disks {
     /// keep the block size in their superblock.
     pub fn open(paths: &[String], block_size: u32) -> Result<Self, String> {
         let mut disks = Vec::new();
-        let mut disk_ids = Vec::new();
         let mut formatted_now = Vec::new();
 
         for path in paths {
@@ -704,7 +862,6 @@ impl Disks {
                 }
             };
 
-            disk_ids.push(*disk.id().as_bytes());
             disks.push(disk);
         }
 
@@ -713,7 +870,6 @@ impl Disks {
         }
         Ok(Self {
             disks,
-            disk_ids,
             formatted_now,
         })
     }
@@ -861,6 +1017,55 @@ fn resolve_node_identity(
     Ok((id, Uuid::nil(), false))
 }
 
+/// The object id a shard's block header carries: the first 16 bytes of
+/// its object's id, zero-padded.
+fn header_object_id(id: &ShardId) -> [u8; 16] {
+    let mut object_id = [0u8; 16];
+    let n = id.object_id.len().min(16);
+    object_id[..n].copy_from_slice(&id.object_id[..n]);
+    object_id
+}
+
+/// Whether the block read at `loc` is shard `id`: its header names the
+/// shard's object and stripe, and its payload has the length and checksum
+/// the location records. The block's own checks pass for any intact block,
+/// so a location that points at another shard's (a disk at the wrong
+/// index, a block handed out twice) would serve that shard's bytes as this
+/// one's.
+fn check_block(
+    id: &ShardId,
+    loc: &ShardLocation,
+    header: &BlockHeader,
+    data: &[u8],
+) -> Result<(), String> {
+    if header.object_id != header_object_id(id) || header.object_offset != id.stripe_id {
+        return Err(format!(
+            "block {} on disk {} holds object {} stripe {}, not this shard",
+            loc.block_num,
+            loc.disk_idx,
+            hex::encode(header.object_id),
+            header.object_offset
+        ));
+    }
+    if data.len() != loc.size as usize {
+        return Err(format!(
+            "block {} on disk {} holds {} bytes, the shard {}",
+            loc.block_num,
+            loc.disk_idx,
+            data.len(),
+            loc.size
+        ));
+    }
+    let crc32c = crc32c::crc32c(data);
+    if crc32c != loc.crc32c {
+        return Err(format!(
+            "block {} on disk {} has crc32c {crc32c:08x}, the shard {:08x}",
+            loc.block_num, loc.disk_idx, loc.crc32c
+        ));
+    }
+    Ok(())
+}
+
 /// [`ShardStore`] on raw disks: each shard an extent of checksummed blocks,
 /// its location recorded in the OSD's metadata index (`osd_loc:` keys); a
 /// small shard (B21) kept in its record instead.
@@ -890,13 +1095,49 @@ pub struct BlockStore {
 impl BlockStore {
     /// The store over `disks`, its locations in `meta` (kept in `meta_dir`,
     /// whose free space decides where small shards go). The index, as
-    /// replayed when `meta` was opened, is reconciled with the disks.
-    pub fn new(disks: Disks, meta: Arc<dyn MetaIndex>, meta_dir: PathBuf) -> Self {
+    /// replayed when `meta` was opened, is reconciled with the disks: each
+    /// is put at the index the OSD recorded for it ([`arrange_disks`]), and
+    /// the store isn't opened when one is missing or isn't this OSD's.
+    pub fn new(disks: Disks, meta: Arc<dyn MetaIndex>, meta_dir: PathBuf) -> Result<Self, String> {
         let Disks {
             disks,
-            disk_ids,
             formatted_now,
         } = disks;
+        let set_key = MetadataKey::from_bytes(DISK_SET_KEY.to_vec());
+        let recorded = meta
+            .get(&set_key)
+            .map(|v| {
+                <DiskSetRecord as prost::Message>::decode(v.as_slice())
+                    .map_err(|e| format!("the record of this OSD's disks is unreadable: {e}"))
+            })
+            .transpose()?;
+        let opened: Vec<OpenedDisk> = disks
+            .iter()
+            .zip(&formatted_now)
+            .map(|(d, &formatted_now)| OpenedDisk {
+                id: *d.id().as_bytes(),
+                path: d.path().to_string(),
+                formatted_now,
+            })
+            .collect();
+        let Arrangement {
+            order,
+            replaced: formatted_now,
+            record,
+        } = arrange_disks(recorded.as_ref(), &opened)?;
+        let mut unplaced: Vec<Option<DiskManager>> = disks.into_iter().map(Some).collect();
+        let disks: Vec<DiskManager> = order
+            .iter()
+            .map(|&i| unplaced[i].take().ok_or("a disk placed twice"))
+            .collect::<Result<_, _>>()?;
+        let disk_ids: Vec<[u8; 16]> = disks.iter().map(|d| *d.id().as_bytes()).collect();
+        for (idx, disk) in disks.iter().enumerate() {
+            info!(
+                "Disk {idx}: {} (id {})",
+                disk.path(),
+                hex::encode(disk_ids[idx])
+            );
+        }
         let num_disks = disks.len();
         // Rebuild the in-memory shard index from persisted entries
         // (replayed from its log when the metadata index was opened
@@ -914,6 +1155,7 @@ impl BlockStore {
         //   disk opens with every block free (the index is the only record
         //   of what is on it), and would hand out block 0 over live shards.
         let mut lost = Vec::new();
+        let mut beyond: Option<(String, usize)> = None;
         let mut reclaimed_check: Vec<u64> = vec![0; num_disks];
         let prefix = MetadataKey::from_bytes(SHARD_LOC_PREFIX.to_vec());
         meta.for_each_prefix(&prefix, None, &mut |k: &[u8], v: &[u8]| {
@@ -934,12 +1176,11 @@ impl BlockStore {
                 return true;
             }
             if loc.disk_idx >= disks.len() {
-                warn!(
-                    "Shard index references disk {} but only {} are attached; skipping",
-                    loc.disk_idx,
-                    disks.len()
-                );
-                return true;
+                // A disk of this OSD that isn't in its set: the index and the
+                // disks disagree, and any block handed out could be a live
+                // shard's.
+                beyond = Some((String::from_utf8_lossy(k).into_owned(), loc.disk_idx));
+                return false;
             }
             index.counted(None, Some(&loc));
             let blocks = disks[loc.disk_idx].blocks_for_len(loc.size as usize);
@@ -953,12 +1194,28 @@ impl BlockStore {
             }
             true
         });
+        if let Some((key, disk_idx)) = beyond {
+            return Err(format!(
+                "the shard index places {key} on disk {disk_idx}, and this OSD has {} disks: \
+                 a disk is missing. Not starting",
+                disks.len()
+            ));
+        }
+        // The set before the forgetting: a restart in between finds the
+        // records left on the new disk's index, and every read of them fails
+        // its checks (the block isn't the shard), so they are rebuilt. The
+        // other way round, it would find the new disk in no slot and refuse.
+        if let Some(record) = record {
+            meta.put(set_key, prost::Message::encode_to_vec(&record))
+                .map_err(|e| format!("recording this OSD's disks: {e}"))?;
+        }
         // In batches, one log record (and fsync) each: one per shard took
         // over five minutes for a disk of 24,000 shards.
         for chunk in lost.chunks(1000) {
             if let Err(e) = meta.batch_delete(chunk) {
-                // Harmless if they stay: the disk was formatted, so the
-                // entries' CRCs never match and the shards read as corrupt.
+                // Harmless if they stay: the disk was formatted, so a read of
+                // one finds another block or none, fails its checks, and the
+                // shard is rebuilt.
                 warn!("forgetting {} shards on a formatted disk: {e}", chunk.len());
             }
         }
@@ -986,7 +1243,7 @@ impl BlockStore {
                 reclaimed_check[idx]
             );
         }
-        Self {
+        Ok(Self {
             disks,
             disk_ids,
             index,
@@ -996,7 +1253,7 @@ impl BlockStore {
             corrupt_found: AtomicU64::new(0),
             dropped_at_open: lost.len() as u64,
             meta_space: MetaSpace::new(meta_dir),
-        }
+        })
     }
 
     /// Select disk for write (round-robin)
@@ -1114,9 +1371,7 @@ impl BlockStore {
         let blocks = disk.blocks_for_len(data.len());
         self.check_room(disk_idx, blocks)?;
         let block_num = self.allocate_extent(disk_idx, blocks)?;
-        let mut object_id = [0u8; 16];
-        let n = id.object_id.len().min(16);
-        object_id[..n].copy_from_slice(&id.object_id[..n]);
+        let object_id = header_object_id(id);
         let started = Instant::now();
         if let Err(e) = disk.write_block(block_num, object_id, id.stripe_id, data) {
             let _ = disk.free_extent(block_num, blocks);
@@ -1175,10 +1430,7 @@ impl ShardStore for BlockStore {
 
         let disk = &self.disks[disk_idx];
 
-        // Prepare object_id as fixed array
-        let mut object_id = [0u8; 16];
-        let copy_len = id.object_id.len().min(16);
-        object_id[..copy_len].copy_from_slice(&id.object_id[..copy_len]);
+        let object_id = header_object_id(id);
 
         // Write block through the async IoBackend — the tokio
         // reactor stays free during the syscall / io_uring wait. On
@@ -1313,17 +1565,31 @@ impl ShardStore for BlockStore {
             }
             small
         } else {
-            let disk = &self.disks[location.disk_idx];
+            let Some(disk) = self.disks.get(location.disk_idx) else {
+                self.mark_corrupt_at(&key, location.block_num);
+                return Err(Status::data_loss(format!(
+                    "shard is on disk {}, and this OSD has {}",
+                    location.disk_idx,
+                    self.disks.len()
+                )));
+            };
 
             // Async read — same semantics, reactor stays free during I/O.
             let read_started = Instant::now();
             let read = disk.read_block_async(location.block_num).await;
             DISK_SECONDS.observe_duration("op=\"read\"", read_started.elapsed());
-            let (_header, data) = read.map_err(|e| {
+            let (header, data) = read.map_err(|e| {
                 // Unreadable is as good as gone: report it for rebuilding.
                 self.mark_corrupt_at(&key, location.block_num);
                 Status::data_loss(format!("shard is unreadable: {e}"))
             })?;
+            // Another shard's block is no copy of this one: an error, so the
+            // gateway reads around it and the shard is rebuilt.
+            if let Err(e) = check_block(id, &location, &header, &data) {
+                warn!("shard {key}: {e}");
+                self.mark_corrupt_at(&key, location.block_num);
+                return Err(Status::data_loss(format!("shard failed its checks: {e}")));
+            }
             data
         };
         Ok((data, self.info_of(&location)))
@@ -1468,18 +1734,27 @@ impl ShardStore for BlockStore {
                     checked(u64::from(loc.size));
                     continue;
                 }
-                if loc.disk_idx >= self.disks.len() {
-                    continue;
-                }
                 // Any failure counts, not only a checksum: a block whose header
-                // no longer parses, or that the disk cannot return, cannot be
-                // served either. `mark_corrupt_at` ignores a shard rewritten or
-                // deleted since the snapshot.
-                if let Err(e) = self.disks[loc.disk_idx]
-                    .read_block_async(loc.block_num)
-                    .await
-                {
-                    debug!("scrub: {key} is unreadable: {e}");
+                // no longer parses, that the disk cannot return, or that is
+                // another shard's cannot be served either. `mark_corrupt_at`
+                // ignores a shard rewritten or deleted since the snapshot.
+                let Some(disk) = self.disks.get(loc.disk_idx) else {
+                    error!(
+                        "scrub: {key} is on disk {}, and this OSD has {}",
+                        loc.disk_idx,
+                        self.disks.len()
+                    );
+                    self.mark_corrupt_at(&key, loc.block_num);
+                    continue;
+                };
+                let checked_block = match disk.read_block_async(loc.block_num).await {
+                    Ok((header, data)) => id_of(&key)
+                        .ok_or_else(|| "not a shard key".to_string())
+                        .and_then(|id| check_block(&id, &loc, &header, &data)),
+                    Err(e) => Err(format!("unreadable: {e}")),
+                };
+                if let Err(e) = checked_block {
+                    warn!("scrub: {key}: {e}");
                     self.mark_corrupt_at(&key, loc.block_num);
                 }
                 bytes += u64::from(loc.size);
@@ -1945,7 +2220,7 @@ mod tests {
         let meta_dir = dir.join("state");
         let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(&meta_dir))
             .unwrap();
-        let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir);
+        let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir).unwrap();
         (Arc::new(store), meta)
     }
 
@@ -2028,7 +2303,7 @@ mod tests {
             let meta = Arc::new(MetadataStore::open_or_create(config).unwrap());
             let disks =
                 Disks::open(&[dir.path().join("disk.raw").display().to_string()], BLOCK).unwrap();
-            let store = BlockStore::new(disks, Arc::clone(&meta) as _, meta_dir.clone());
+            let store = BlockStore::new(disks, Arc::clone(&meta) as _, meta_dir.clone()).unwrap();
             let data = vec![7u8; 5_000];
             for i in 0..n {
                 let mut object_id = vec![0u8; 16];
@@ -2258,5 +2533,281 @@ mod tests {
     fn an_empty_store_rebuilds_to_an_empty_index() {
         let (_dir, s) = store();
         assert!(load_persisted_shard_index(&s).is_empty());
+    }
+
+    /// A store on the disk files `names` in `dir` (each made, 1 GiB, if not
+    /// there), its metadata in `dir/state`.
+    fn open_disks(dir: &Path, names: &[&str]) -> Result<(BlockStore, Arc<dyn MetaIndex>), String> {
+        let paths: Vec<String> = names
+            .iter()
+            .map(|n| {
+                let path = dir.join(n);
+                if !path.exists() {
+                    drop(DiskManager::init(&path, 1 << 30, Some(BLOCK)).unwrap());
+                }
+                path.display().to_string()
+            })
+            .collect();
+        let disks = Disks::open(&paths, BLOCK)?;
+        let meta_dir = dir.join("state");
+        let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(&meta_dir))
+            .unwrap();
+        let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir)?;
+        Ok((store, meta))
+    }
+
+    fn shard(object: u8) -> ShardId {
+        ShardId {
+            object_id: vec![object; 16],
+            stripe_id: u64::from(object) * 3,
+            position: 0,
+        }
+    }
+
+    fn bytes_of(object: u8) -> Vec<u8> {
+        (0..10_000u32).map(|i| (i % 251) as u8 ^ object).collect()
+    }
+
+    /// Write shards `objects` (round-robin over the disks), then close.
+    async fn write_shards(dir: &Path, names: &[&str], objects: std::ops::Range<u8>) {
+        let (store, _meta) = open_disks(dir, names).unwrap();
+        for o in objects {
+            let data = bytes_of(o);
+            store
+                .write(&shard(o), &data, crc32c::crc32c(&data), false)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn assert_reads(store: &BlockStore, objects: std::ops::Range<u8>) {
+        for o in objects {
+            let (data, _) = store
+                .read(&shard(o))
+                .await
+                .unwrap_or_else(|e| panic!("shard {o}: {e}"));
+            assert!(data == bytes_of(o), "shard {o} read back another's bytes");
+        }
+    }
+
+    /// An OSD started with one of its disks missing refuses, naming it,
+    /// rather than renumbering the rest; with it back, all is as before.
+    #[tokio::test]
+    async fn a_missing_disk_refuses_the_store_and_says_which() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b", "c"], 0..9).await;
+        let err = open_disks(dir.path(), &["a", "c"])
+            .err()
+            .expect("opened with a disk missing");
+        assert!(err.contains("disk 1"), "{err}");
+        assert!(
+            err.contains(&dir.path().join("b").display().to_string()),
+            "{err}"
+        );
+        let (store, _meta) = open_disks(dir.path(), &["a", "b", "c"]).unwrap();
+        assert_reads(&store, 0..9).await;
+    }
+
+    /// Disks named in another order (paths renamed, a glob sorting another
+    /// way) are found by their ids: every shard reads back as written, and
+    /// new writes take no live shard's blocks.
+    #[tokio::test]
+    async fn disks_in_another_order_are_found_by_their_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b", "c"], 0..9).await;
+        {
+            let (store, _meta) = open_disks(dir.path(), &["c", "a", "b"]).unwrap();
+            assert_reads(&store, 0..9).await;
+            for o in 9..30 {
+                let data = bytes_of(o);
+                store
+                    .write(&shard(o), &data, crc32c::crc32c(&data), false)
+                    .await
+                    .unwrap();
+            }
+            assert_reads(&store, 0..30).await;
+        }
+        let (store, _meta) = open_disks(dir.path(), &["b", "c", "a"]).unwrap();
+        assert_reads(&store, 0..30).await;
+    }
+
+    /// A disk that isn't blank and isn't one of the OSD's is refused; a
+    /// blank one is added at a new index.
+    #[tokio::test]
+    async fn a_disk_not_of_the_set_is_refused_and_a_blank_one_added() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b"], 0..4).await;
+        // Formatted elsewhere: it may hold another OSD's shards.
+        drop(DiskManager::init(dir.path().join("other"), 1 << 30, Some(BLOCK)).unwrap());
+        let err = open_disks(dir.path(), &["a", "b", "other"])
+            .err()
+            .expect("opened with a disk of no one's");
+        assert!(err.contains("not one of this OSD's"), "{err}");
+        // A blank file: formatted, at index 2.
+        let blank = dir.path().join("new");
+        std::fs::File::create(&blank)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        {
+            let (store, _meta) = open_disks(dir.path(), &["new", "a", "b"]).unwrap();
+            assert_reads(&store, 0..4).await;
+            assert_eq!(store.disks()[2].path, blank.display().to_string());
+        }
+        let (store, _meta) = open_disks(dir.path(), &["a", "b", "new"]).unwrap();
+        assert_reads(&store, 0..4).await;
+    }
+
+    /// A blank disk in place of a missing one replaces it, as the
+    /// operations guide's disk replacement says: the shards that were on it
+    /// are forgotten (rebuilt by repair), the rest read as before.
+    #[tokio::test]
+    async fn a_blank_disk_replaces_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b", "c"], 0..9).await;
+        let blank = dir.path().join("b2");
+        std::fs::File::create(&blank)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        let (store, _meta) = open_disks(dir.path(), &["a", "b2", "c"]).unwrap();
+        assert_eq!(store.dropped_at_open(), 3);
+        for o in 0..9 {
+            // Round-robin from disk 0: every third shard was on disk 1.
+            if o % 3 == 1 {
+                assert_eq!(store.state(&shard(o)), ShardState::Missing, "shard {o}");
+            } else {
+                assert!(store.read(&shard(o)).await.unwrap().0 == bytes_of(o));
+            }
+        }
+    }
+
+    /// A disk whose primary superblock is torn is opened by its backup and
+    /// keeps its place.
+    #[tokio::test]
+    async fn a_disk_with_a_torn_primary_superblock_keeps_its_place() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b", "c"], 0..9).await;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("b"))
+            .unwrap();
+        f.seek(SeekFrom::Start(100)).unwrap();
+        f.write_all(&[0xAA; 64]).unwrap();
+        drop(f);
+        let (store, _meta) = open_disks(dir.path(), &["a", "b", "c"]).unwrap();
+        assert_eq!(store.dropped_at_open(), 0);
+        assert_reads(&store, 0..9).await;
+    }
+
+    /// A location that points at another shard's block, intact, is no copy
+    /// of its shard: the read is an error and the shard is reported corrupt,
+    /// and so does scrub find it; as it does a location on a disk the OSD
+    /// doesn't have.
+    #[tokio::test]
+    async fn a_location_pointing_at_another_shard_s_block_fails_read_and_scrub() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b"], 0..4).await;
+        let (store, meta) = open_disks(dir.path(), &["a", "b"]).unwrap();
+        let record = |o: u8| {
+            ShardLocation::from_bytes(&meta.get(&shard_loc_meta_key(&key_of(&shard(o)))).unwrap())
+                .unwrap()
+        };
+        // Shard 0's record made shard 2's (same disk), size and checksum
+        // too: only the block header tells them apart.
+        let other = record(2);
+        persist_shard_location(meta.as_ref(), &key_of(&shard(0)), &other, None).unwrap();
+        let err = store
+            .read(&shard(0))
+            .await
+            .expect_err("read another's block");
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+        assert_eq!(store.state(&shard(0)), ShardState::Corrupt);
+        // Shard 1's checksum not the one its block holds.
+        let mut wrong_crc = record(1);
+        wrong_crc.crc32c ^= 1;
+        persist_shard_location(meta.as_ref(), &key_of(&shard(1)), &wrong_crc, None).unwrap();
+        // Shard 3's disk one the OSD hasn't got.
+        let mut no_disk = record(3);
+        no_disk.disk_idx = 7;
+        persist_shard_location(meta.as_ref(), &key_of(&shard(3)), &no_disk, None).unwrap();
+        let err = store.read(&shard(3)).await.expect_err("read from no disk");
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+        store.corrupt.write().clear();
+
+        store.scrub(0, &|_| {}).await;
+        for o in [0, 1, 3] {
+            assert_eq!(store.state(&shard(o)), ShardState::Corrupt, "shard {o}");
+        }
+        assert_eq!(store.state(&shard(2)), ShardState::Ok);
+    }
+
+    /// The disks a store is opened on are placed by what was recorded:
+    /// each by its id, a blank one in a missing one's place or at the end.
+    #[test]
+    fn disks_are_arranged_by_their_recorded_ids() {
+        let d = |id: u8, formatted_now: bool| OpenedDisk {
+            id: [id; 16],
+            path: format!("/d{id}"),
+            formatted_now,
+        };
+        let set = |ids: &[u8]| DiskSetRecord {
+            disks: ids
+                .iter()
+                .map(|&id| DiskSlotRecord {
+                    id: vec![id; 16],
+                    path: format!("/d{id}"),
+                })
+                .collect(),
+        };
+        // First open: as named, and recorded.
+        let a = arrange_disks(None, &[d(1, false), d(2, true)]).unwrap();
+        assert_eq!(a.order, [0, 1]);
+        assert_eq!(a.replaced, [false, true]);
+        assert_eq!(a.record, Some(set(&[1, 2])));
+        // Reordered: back in place, nothing to record.
+        let a = arrange_disks(
+            Some(&set(&[1, 2, 3])),
+            &[d(3, false), d(1, false), d(2, false)],
+        )
+        .unwrap();
+        assert_eq!(a.order, [1, 2, 0]);
+        assert_eq!(a.replaced, [false; 3]);
+        assert_eq!(a.record, None);
+        // A blank one for a missing one, and one more at the end.
+        let a = arrange_disks(
+            Some(&set(&[1, 2, 3])),
+            &[d(9, true), d(1, false), d(3, false), d(8, true)],
+        )
+        .unwrap();
+        assert_eq!(a.order, [1, 0, 2, 3]);
+        assert_eq!(a.replaced, [false, true, false, true]);
+        assert_eq!(a.record, Some(set(&[1, 9, 3, 8])));
+        // Missing, unknown, twice.
+        let e = arrange_disks(Some(&set(&[1, 2, 3])), &[d(1, false), d(3, false)]).unwrap_err();
+        assert!(e.contains("disk 1 (id 0202"), "{e}");
+        let e = arrange_disks(Some(&set(&[1])), &[d(1, false), d(4, false)]).unwrap_err();
+        assert!(e.contains("not one of this OSD's"), "{e}");
+        let e = arrange_disks(None, &[d(1, false), d(1, false)]).unwrap_err();
+        assert!(e.contains("same disk"), "{e}");
+    }
+
+    /// An index that places a shard on a disk past the OSD's (records from
+    /// before the set was, with a disk gone) refuses the store.
+    #[tokio::test]
+    async fn a_location_past_the_disks_refuses_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b"], 0..4).await;
+        {
+            let (store, meta) = open_disks(dir.path(), &["a", "b"]).unwrap();
+            drop(store);
+            meta.delete(&MetadataKey::from_bytes(DISK_SET_KEY.to_vec()))
+                .unwrap();
+        }
+        let err = open_disks(dir.path(), &["a"])
+            .err()
+            .expect("opened short a disk");
+        assert!(err.contains("on disk 1, and this OSD has 1 disks"), "{err}");
     }
 }

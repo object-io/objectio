@@ -374,6 +374,16 @@ pub async fn run(
                         );
                     }
                 }
+                // A disk the operator named is one the OSD must have: run
+                // without it and the shards on it are as good as gone, so
+                // the OSD doesn't start. A glob match is only a candidate.
+                discovery::DiskState::Foreign { reason } if is_explicit => {
+                    anyhow::bail!(
+                        "disk {path} was named with --disks but cannot be claimed: {reason}. \
+                         Check the device; to replace it, see the operations guide's \
+                         \"Replacing a disk\""
+                    );
+                }
                 discovery::DiskState::Foreign { reason } => {
                     warn!("discovery: refusing foreign disk {path}: {reason}");
                 }
