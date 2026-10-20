@@ -674,3 +674,51 @@ fn a_replicated_part_is_acknowledged_with_the_replica_quorum() {
     let got = part(c, 3);
     assert_eq!(got.status, 503, "UploadPart with one copy: {}", got.text());
 }
+
+/// A part in an erasure-coded pool is acknowledged as a PUT is: with k + 1
+/// shards on disk (5 of 4+2), and 503 short of that.
+#[test]
+fn an_erasure_coded_part_is_acknowledged_with_a_puts_quorum() {
+    use objectio_e2e::ha::HaCluster;
+    use std::time::Duration;
+
+    // Six OSDs, all six the pool's one placement group: none to stand in
+    // for one stopped.
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "ec42", "ec_type": 0, "ec_k": 4, "ec_m": 2, "pg_count": 1,
+            "failure_domain": "osd", "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    c.request_with_headers("PUT", "/ecb", &[], &[("x-objectio-pool", "ec42")])
+        .expect(200);
+    let body: Vec<u8> = (0..PART).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    c.request("PUT", "/ecb/whole", &body).expect(200);
+    let upload = initiate(c, "ecb", "parts");
+    let part = |c: &Cluster, n: u32| {
+        c.request(
+            "PUT",
+            &format!("/ecb/parts?partNumber={n}&uploadId={upload}"),
+            &body,
+        )
+    };
+    part(c, 1).expect(200);
+
+    // One shard short: both still have k + 1.
+    ha.stop_osd(0);
+    let c = &ha.clients[0];
+    c.request("PUT", "/ecb/one-down", &body).expect(200);
+    part(c, 2).expect(200);
+
+    // Two short: k shards are no acknowledgement, for either.
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    let put = c.request("PUT", "/ecb/two-down", &body);
+    assert_eq!(put.status, 503, "PUT with k shards: {}", put.text());
+    let got = part(c, 3);
+    assert_eq!(got.status, 503, "UploadPart with k shards: {}", got.text());
+}
