@@ -745,11 +745,13 @@ fn table_locations_stay_inside_their_warehouse() {
     assert_eq!(r.status, 400, "a commit moved the table out: {}", r.text());
 }
 
-/// A vended session is held to the tenant it was vended in. They used to be
-/// exempt from the tenant boundary, so a table pointed at another tenant's
-/// bucket got credentials that a grant there to the vending user honoured.
+/// Unity's external tables and volumes stay inside their catalog's
+/// storage, where their vended credentials are scoped, and those credentials
+/// stay in the catalog's tenant. An external table over another tenant's
+/// bucket used to get credentials that a grant there to the vending user
+/// honoured.
 #[test]
-fn vended_credentials_stay_in_their_tenant() {
+fn unity_storage_stays_in_its_catalog_and_its_tenant() {
     let c = Cluster::start();
     let acme = provision_tenant_admin(&c, "acme");
     let globex = provision_tenant_admin(&c, "globex");
@@ -787,8 +789,10 @@ fn vended_credentials_stay_in_their_tenant() {
         "acme read globex's bucket directly: {}",
         r.text()
     );
+    // And a bucket of acme's own, outside the catalog.
+    c.request_as("PUT", "/acme-other", &[], &acme.ak, &acme.sk)
+        .expect_ok();
 
-    // An acme catalog with an external table over globex's bucket.
     let uc = "/api/2.1/unity-catalog";
     json_as(
         &c,
@@ -808,12 +812,43 @@ fn vended_credentials_stay_in_their_tenant() {
         &acme.sk,
     )
     .expect_ok();
+
+    // Outside the catalog's bucket: refused, whoever's bucket it is.
+    for location in [
+        "s3://globex-secret/",
+        "s3://acme-other/t/",
+        "s3://unity-acat/../globex-secret/",
+    ] {
+        let r = json_as(
+            &c,
+            "POST",
+            &format!("{uc}/tables"),
+            &json!({"name": "t", "catalog_name": "acat", "schema_name": "s",
+                    "table_type": "EXTERNAL", "storage_location": location}),
+            &acme.ak,
+            &acme.sk,
+        );
+        assert_eq!(r.status, 400, "external table at {location}: {}", r.text());
+        let r = json_as(
+            &c,
+            "POST",
+            &format!("{uc}/volumes"),
+            &json!({"name": "v", "catalog_name": "acat", "schema_name": "s",
+                    "volume_type": "EXTERNAL", "storage_location": location}),
+            &acme.ak,
+            &acme.sk,
+        );
+        assert_eq!(r.status, 400, "external volume at {location}: {}", r.text());
+    }
+
+    // Inside it, fine; and the session vended for it gets nothing in
+    // globex's bucket.
     let table = json_as(
         &c,
         "POST",
         &format!("{uc}/tables"),
         &json!({"name": "t", "catalog_name": "acat", "schema_name": "s",
-                "table_type": "EXTERNAL", "storage_location": "s3://globex-secret/"}),
+                "table_type": "EXTERNAL", "storage_location": "s3://unity-acat/ext/t/"}),
         &acme.ak,
         &acme.sk,
     );

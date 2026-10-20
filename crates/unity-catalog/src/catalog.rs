@@ -115,8 +115,9 @@ impl UnityCatalogClient {
             .collect())
     }
 
-    /// The tenant a catalog belongs to (empty = the system tenant).
-    pub async fn catalog_tenant(&self, name: &str) -> Result<String> {
+    /// The tenant a catalog belongs to (empty = the system tenant) and its
+    /// storage root.
+    pub async fn catalog_tenant_and_root(&self, name: &str) -> Result<(String, String)> {
         let resp = self
             .meta_client
             .clone()
@@ -126,7 +127,7 @@ impl UnityCatalogClient {
             .await?
             .into_inner();
         resp.catalog
-            .map(|c| c.tenant)
+            .map(|c| (c.tenant, c.location))
             .ok_or_else(|| UnityError::not_found(format!("catalog '{name}' not found")))
     }
 

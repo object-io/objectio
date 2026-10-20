@@ -137,9 +137,26 @@ struct CatalogAccess<'a> {
     /// The catalog's tenant (empty = the system tenant). Vended sessions
     /// are held to it.
     tenant: String,
+    /// The catalog's storage root: every table and volume lies under it.
+    root: String,
     /// The caller administers the catalog: a catalog admin, or an admin of
     /// its tenant. With no policy granting a request, only they go ahead.
     administers: bool,
+}
+
+impl CatalogAccess<'_> {
+    /// Vend nothing for a location outside the catalog's storage root: meta
+    /// refuses to record one, and the credentials would be scoped to it.
+    fn confine(&self, location: &str) -> Result<()> {
+        if objectio_common::location::within(location, &self.root) {
+            Ok(())
+        } else {
+            Err(UnityError::forbidden(format!(
+                "storage location \"{location}\" is outside its catalog ({})",
+                self.root
+            )))
+        }
+    }
 }
 
 /// The catalog `name`, for this caller: one of another tenant is "not
@@ -150,7 +167,7 @@ async fn catalog_access<'a>(
     name: &str,
 ) -> Result<CatalogAccess<'a>> {
     let caller = caller(state, auth)?;
-    let tenant = state.catalog.catalog_tenant(name).await?;
+    let (tenant, root) = state.catalog.catalog_tenant_and_root(name).await?;
     let (visible, administers) = match caller {
         Caller::Unchecked => (true, true),
         Caller::Identity(a) if is_admin(a, state) => (true, true),
@@ -168,6 +185,7 @@ async fn catalog_access<'a>(
     Ok(CatalogAccess {
         caller,
         tenant,
+        root,
         administers,
     })
 }
@@ -1494,6 +1512,7 @@ pub async fn temporary_table_credentials(
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
+    access.confine(&table.storage_location)?;
     // Held to the catalog's tenant: a location in another tenant's bucket
     // gets nothing there.
     let creds = sts.issue(user_arn, &access.tenant, &table.storage_location, operation);
@@ -1548,6 +1567,7 @@ pub async fn temporary_volume_credentials(
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
+    access.confine(&volume.storage_location)?;
     let creds = sts.issue(
         user_arn,
         &access.tenant,
