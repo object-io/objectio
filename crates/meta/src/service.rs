@@ -1929,7 +1929,12 @@ const PAST_PREFIX: char = char::MAX;
 /// previous page already returned.
 ///
 /// `fetch(after, n)` returns up to `n` entries with keys strictly after
-/// `after` (and under the request prefix), and whether more exist.
+/// `after` (and under the request prefix), and whether more exist. A
+/// batch is used whole: the keys of a common prefix just returned are
+/// passed over in it, and only when a batch ends inside one does the next
+/// fetch seek past it. Fetching again after every common prefix read up
+/// to a batch of rows to use one, `max_keys` batches for a page of
+/// prefixes.
 fn page_listing<F, E>(
     mut fetch: F,
     prefix: &str,
@@ -1968,16 +1973,21 @@ where
         let exhausted = batch.is_empty();
         for e in batch {
             let cp = rolls_up(&e.key);
+            // Another key of the common prefix just returned: it adds
+            // nothing, and doesn't count.
+            if cp.is_some() && cp.as_ref() == page.common_prefixes.last() {
+                continue;
+            }
             if emitted(&page) >= max_keys {
                 page.is_truncated = true;
                 break 'scan;
             }
             if let Some(cp) = cp {
-                // Jump past the whole prefix: its other keys add nothing.
+                // A batch that ends inside the prefix resumes past it.
                 cursor = format!("{cp}{PAST_PREFIX}");
                 page.next_token.clone_from(&cp);
                 page.common_prefixes.push(cp);
-                continue 'scan;
+                continue;
             }
             cursor.clone_from(&e.key);
             page.next_token.clone_from(&e.key);
@@ -2442,12 +2452,30 @@ mod listing_page_tests {
         start_after: &str,
         max: usize,
     ) -> (Vec<String>, bool, String) {
-        let mut keys: Vec<String> = keys.iter().map(ToString::to_string).collect();
+        let (out, truncated, token, _) = run_counted(keys, "", delimiter, start_after, max);
+        (out, truncated, token)
+    }
+
+    /// As [`run`], under `prefix`, also counting the rows fetched.
+    fn run_counted(
+        keys: &[&str],
+        prefix: &str,
+        delimiter: &str,
+        start_after: &str,
+        max: usize,
+    ) -> (Vec<String>, bool, String, usize) {
+        let mut keys: Vec<String> = keys
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .map(ToString::to_string)
+            .collect();
         keys.sort();
+        let mut fetched = 0;
         let page = page_listing(
             |after, n| {
                 let rest: Vec<_> = keys.iter().filter(|k| k.as_str() > after).collect();
                 let more = rest.len() > n;
+                fetched += rest.len().min(n);
                 Ok::<_, std::convert::Infallible>((
                     rest.into_iter()
                         .take(n)
@@ -2459,7 +2487,7 @@ mod listing_page_tests {
                     more,
                 ))
             },
-            "",
+            prefix,
             delimiter,
             start_after,
             max,
@@ -2468,7 +2496,7 @@ mod listing_page_tests {
         let mut out: Vec<String> = page.entries.into_iter().map(|e| e.key).collect();
         out.extend(page.common_prefixes);
         out.sort();
-        (out, page.is_truncated, page.next_token)
+        (out, page.is_truncated, page.next_token, fetched)
     }
 
     /// Page through to the end the way a V2 client does.
@@ -2516,6 +2544,68 @@ mod listing_page_tests {
     fn resuming_from_a_prefix_skips_its_keys() {
         let (items, _, _) = run(KEYS, "/", "dir/", 100);
         assert_eq!(items, ["e"]);
+    }
+
+    /// A page of common prefixes, each over many keys, reads each row at
+    /// most once: the keys under a prefix just returned are passed over in
+    /// the batch at hand, not fetched again one batch per prefix.
+    #[test]
+    fn a_page_of_common_prefixes_reads_each_row_at_most_once() {
+        let keys: Vec<String> = (0..200)
+            .flat_map(|d| (0..5).map(move |k| format!("d{d:03}/{k}")))
+            .collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (items, truncated, token, fetched) = run_counted(&keys, "", "/", "", 100);
+        assert_eq!(items.len(), 100);
+        assert_eq!(items[0], "d000/");
+        assert_eq!(items[99], "d099/");
+        assert!(truncated);
+        assert_eq!(token, "d099/");
+        // 500 rows hold the page's 100 prefixes; re-fetching after each
+        // prefix read a batch of 101 per prefix.
+        assert!(fetched <= 600, "{fetched} rows fetched");
+        let (items, truncated, _, _) = run_counted(&keys, "", "/", &token, 100);
+        assert_eq!(items.len(), 100);
+        assert_eq!(items[0], "d100/");
+        assert!(!truncated);
+    }
+
+    /// A prefix with more keys than a batch: the next fetch seeks past it.
+    #[test]
+    fn a_prefix_longer_than_a_batch_is_returned_once() {
+        let mut keys: Vec<String> = (0..50).map(|k| format!("big/{k:02}")).collect();
+        keys.extend(["a".to_string(), "big0".to_string(), "z/1".to_string()]);
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let pages = all_pages(&keys, "/", 2);
+        assert_eq!(pages.concat(), ["a", "big/", "big0", "z/"]);
+        let (items, _, _, fetched) = run_counted(&keys, "", "/", "", 10);
+        assert_eq!(items, ["a", "big/", "big0", "z/"]);
+        assert!(fetched <= 15, "{fetched} rows fetched");
+    }
+
+    /// Keys that are prefixes of each other, a request prefix, and markers
+    /// inside a common prefix (a V1 marker that is a key under it).
+    #[test]
+    fn keys_that_prefix_each_other_and_markers_inside_a_prefix() {
+        const K: &[&str] = &[
+            "p", "p/", "p/a", "p/a/1", "p/a/2", "p/ab", "p/b/1", "p0", "q",
+        ];
+        let list = |prefix: &str, delimiter: &str, after: &str| {
+            run_counted(K, prefix, delimiter, after, 100).0
+        };
+        assert_eq!(list("", "/", ""), ["p", "p/", "p0", "q"]);
+        assert_eq!(list("p/", "/", ""), ["p/", "p/a", "p/a/", "p/ab", "p/b/"]);
+        // A marker under a common prefix: the rest of that prefix still
+        // rolls up into it, once.
+        assert_eq!(list("p/", "/", "p/a/1"), ["p/a/", "p/ab", "p/b/"]);
+        assert_eq!(list("p/", "/", "p/a/"), ["p/ab", "p/b/"]);
+        assert_eq!(list("p/", "", "p/a"), ["p/a/1", "p/a/2", "p/ab", "p/b/1"]);
+        assert_eq!(list("", "/", "p"), ["p/", "p0", "q"]);
+        // Every page of every size covers the listing exactly once.
+        for max in 1..=4 {
+            let pages = all_pages(K, "/", max);
+            assert_eq!(pages.concat(), ["p", "p/", "p0", "q"], "max {max}");
+        }
     }
 }
 
