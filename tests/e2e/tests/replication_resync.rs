@@ -289,6 +289,10 @@ fn bytes_sent(src: &Cluster) -> u64 {
 fn a_targets_bandwidth_limit_holds() {
     const LIMIT: u64 = 256 << 10;
     const SIZE: usize = 64 << 10;
+    // Sends a gateway may have in flight to one target: the fast path's 8
+    // and a resync's 8. The metric counts a send once the target has taken
+    // it, so a slow target bunches up the counts of all of them.
+    const IN_FLIGHT: u64 = 16;
     let src = Cluster::start_with_ec_and_args(6, 4, 2, &["--replication-scan-secs", "1"]);
     let dst = Cluster::start_with_ec(6, 4, 2);
     versioned_bucket(&src, "src");
@@ -349,7 +353,8 @@ fn a_targets_bandwidth_limit_holds() {
         "{total} bytes sent in {elapsed:?}, faster than the limit allows"
     );
     // Over any 4 s: at most the limit's 1 MiB (15% off for the samples'
-    // timing), but for two objects under way at the window's edges.
+    // timing), and the sends already paced and under way when the window
+    // opened (`IN_FLIGHT`). The pace itself is the whole run's time, above.
     let window = Duration::from_secs(4);
     for (i, (t0, b0)) in samples.iter().enumerate() {
         for (t1, b1) in &samples[i + 1..] {
@@ -358,7 +363,7 @@ fn a_targets_bandwidth_limit_holds() {
                 break;
             }
             let span_ms = u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
-            let allowed = LIMIT * span_ms / 1000 * 115 / 100 + 2 * SIZE as u64;
+            let allowed = LIMIT * span_ms / 1000 * 115 / 100 + IN_FLIGHT * SIZE as u64;
             assert!(
                 b1 - b0 <= allowed,
                 "{} bytes sent between {t0:?} and {t1:?}: over the limit",
