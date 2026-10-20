@@ -700,21 +700,24 @@ pub(crate) async fn upload_part_internal(
                 }
             }
 
-            if success < 1 {
+            // As a PUT's: a part acknowledged with one copy would have its
+            // data on one disk.
+            let quorum = replica_quorum(total_replicas);
+            if success < quorum {
                 error!(
-                    "Replication failed for part stripe {}: no successful writes",
-                    stripe_idx
+                    "Replication failed for part stripe {}: {} successful writes, need {}",
+                    stripe_idx, success, quorum
                 );
                 if full {
                     return S3Error::storage_full();
                 }
                 return S3Error::xml_response(
-                    "InternalError",
+                    "ServiceUnavailable",
                     &format!(
-                        "Replication failed for stripe {}: no successful writes",
-                        stripe_idx
+                        "Replication failed for stripe {}: {} successful writes, need {}",
+                        stripe_idx, success, quorum
                     ),
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
 
