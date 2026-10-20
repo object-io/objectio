@@ -628,7 +628,9 @@ async fn bucket_public_access_block_is_the_s3_subresource() {
 
 #[tokio::test]
 async fn audit_put_sends_the_file_with_the_tenant() {
-    let (_d, f) = file_with(r#"{"targets":[{"type":"stdout","name":"out"}]}"#);
+    let (_d, f) = file_with(
+        r#"{"targets":[{"type":"webhook","name":"siem","url":"https://siem.acme.example/x"}]}"#,
+    );
     let r = cli(
         &["audit", "put", "--file", &f, "--tenant", "acme"],
         vec![ok(json!({}))],
@@ -638,7 +640,7 @@ async fn audit_put_sends_the_file_with_the_tenant() {
     assert_eq!(r.seen[0].method, "PUT");
     assert_eq!(r.seen[0].path, "/_admin/audit");
     assert_eq!(r.seen[0].query, q(&[("tenant", "acme")]));
-    assert_eq!(r.seen[0].json()["targets"][0]["type"], "stdout");
+    assert_eq!(r.seen[0].json()["targets"][0]["type"], "webhook");
 }
 
 // ── buckets / provisioning ──────────────────────────────────────────────

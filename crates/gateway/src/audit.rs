@@ -1773,6 +1773,25 @@ pub async fn admin_put(
             }
         }
     } else {
+        // Said plainly, not as the parser's "missing field `url`": stdout
+        // is the gateway's own output, the operator's to configure.
+        if let Some(kind) = doc["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("type").and_then(serde_json::Value::as_str))
+            .find(|kind| *kind != "webhook")
+        {
+            return admin_error(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "a tenant's audit targets are webhooks only, not {kind}: https, to a \
+                     host the operator lists in allowed_tenant_hosts. A stdout target writes \
+                     to the gateway's own output: only the system admin sets one, in the \
+                     cluster's configuration (/_admin/audit with no tenant)"
+                ),
+            );
+        }
         let cfg: TenantAudit = match serde_json::from_value(doc.clone()) {
             Ok(c) => c,
             Err(e) => {

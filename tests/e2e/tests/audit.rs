@@ -228,6 +228,22 @@ fn a_tenant_streams_only_to_hosts_the_operator_allows() {
         put(target("https://siem.acme.example@127.0.0.1/x")).status,
         400
     );
+    // stdout is the gateway's own output, the operator's: refused plainly,
+    // saying what a tenant can use (it read "missing field `url`").
+    let r = put(json!({"targets": [{"type": "stdout", "name": "out"}]}));
+    assert_eq!(r.status, 400, "{}", r.text());
+    for says in [
+        "webhooks only",
+        "not stdout",
+        "allowed_tenant_hosts",
+        "system admin",
+    ] {
+        assert!(r.text().contains(says), "{says}: {}", r.text());
+    }
+    let r = put(
+        json!({"targets": [{"type": "webhook", "name": "t", "url": "https://siem.acme.example/x"}]}),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
     let ok = put(
         json!({"targets": [{"name": "t", "url": "https://siem.acme.example/x",
         "auth_token": "s3cret"}]}),
