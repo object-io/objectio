@@ -136,6 +136,16 @@ pub fn server() -> Server {
 /// Header marking a meta liveness probe (see [`meta_channel`]).
 pub const META_PROBE_HEADER: &str = "x-objectio-probe";
 
+/// A probe's answer from a meta node that is up (an UNAVAILABLE status
+/// carrying this message: the probe is never served as a call).
+pub const META_PROBE_ALIVE: &str = "alive";
+
+/// A probe's answer from a meta node that is up but can't serve: it
+/// leads, but no quorum has confirmed that lately (cut off from its
+/// followers, which may have elected another leader). Calls to it fail
+/// UNAVAILABLE, so the channel leaves it out while others serve.
+pub const META_PROBE_NOT_SERVING: &str = "alive, not serving";
+
 /// The longest a call to meta may take before the client gives up on it:
 /// a meta node that stopped answering (frozen, cut off) would otherwise
 /// hold the call, and the request behind it, forever. Meta answers in
@@ -154,8 +164,10 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// call — a follower forwards it to the Raft leader — so with several, the
 /// channel spreads calls over those that answer: each is probed every
 /// second (a gRPC call it answers itself, with a one-second timeout — a
-/// frozen node still accepts connections), and one that doesn't answer is
-/// left out until it does. With one, the connection is made now, as
+/// frozen node still accepts connections), and one that doesn't answer,
+/// or answers that it can't serve, is left out until it does (a call
+/// already sent to it fails UNAVAILABLE, and the caller's retry goes to
+/// another). With one, the connection is made now, as
 /// before, so a wrong address fails at startup. Every call times out after
 /// [`META_CALL_TIMEOUT`].
 ///
@@ -233,8 +245,9 @@ async fn keep_healthy(
     }
 }
 
-/// Whether the meta node at `ep` answers a probe: any gRPC answer means
-/// it's up; a connection failure or a timeout means it isn't.
+/// Whether the meta node at `ep` answers a probe and can serve: any gRPC
+/// answer but [`META_PROBE_NOT_SERVING`] means it can; a connection
+/// failure or a timeout means it isn't up.
 async fn probe(ep: &tonic::transport::Endpoint) -> bool {
     let attempt = async {
         let channel = ep.connect().await.ok()?;
@@ -247,7 +260,8 @@ async fn probe(ep: &tonic::transport::Endpoint) -> bool {
         );
         match client.get_metrics(req).await {
             Ok(_) => Some(()),
-            // An answer, whatever it says: the node is up.
+            Err(status) if status.message() == META_PROBE_NOT_SERVING => None,
+            // Any other answer: the node is up.
             Err(status) if !status.message().contains("transport error") => Some(()),
             Err(_) => None,
         }

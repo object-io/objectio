@@ -248,6 +248,89 @@ fn a_frozen_leader_steps_down_when_it_returns() {
     assert_all_readable(&ha.clients[0], "fz", &acked, "after the thaw");
 }
 
+/// A list of buckets read from meta node `i` directly, not through a
+/// follower or the balanced channel.
+fn list_buckets_at(
+    rt: &tokio::runtime::Runtime,
+    ha: &HaCluster,
+    i: usize,
+) -> Result<usize, Box<tonic::Status>> {
+    use objectio_proto::metadata::ListBucketsRequest;
+    use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
+    objectio_e2e::tls::client();
+    rt.block_on(async {
+        let channel = objectio_proto::transport::meta_channel(&ha.meta_endpoint(i))
+            .await
+            .map_err(|e| Box::new(tonic::Status::unavailable(e)))?;
+        MetadataServiceClient::new(channel)
+            .list_buckets(ListBucketsRequest::default())
+            .await
+            .map(|r| r.into_inner().buckets.len())
+            .map_err(Box::new)
+    })
+}
+
+/// A leader cut off from both its followers still believes it leads
+/// (openraft doesn't step it down), but it must stop answering from its
+/// own state once the others could have elected another leader: a read
+/// sent to it directly fails UNAVAILABLE, which clients retry elsewhere.
+/// Once the followers are back, every node serves again.
+#[test]
+fn a_leader_cut_off_from_its_followers_stops_serving_reads() {
+    let ha = HaCluster::start(3, 0, 0);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let leader = ha.await_leader(Duration::from_secs(20));
+    list_buckets_at(&rt, &ha, leader).expect("a read from the leader");
+    let followers: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
+    for &f in &followers {
+        ha.freeze_meta(f);
+    }
+    let frozen_at = Instant::now();
+    // The election timeout is 2-4 s; give it plenty.
+    let deadline = frozen_at + Duration::from_secs(15);
+    let refused = loop {
+        let Err(status) = list_buckets_at(&rt, &ha, leader) else {
+            assert!(
+                Instant::now() < deadline,
+                "the cut-off leader still served reads {:?} after its followers froze",
+                frozen_at.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        break status;
+    };
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused}");
+    // And it goes on refusing, not just once.
+    for _ in 0..3 {
+        let status = list_buckets_at(&rt, &ha, leader).expect_err("a cut-off leader served a read");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+    }
+    assert_eq!(
+        ha.status(leader).map(|s| s.state),
+        Some("Leader".to_string()),
+        "the test needs the cut-off node to still think it leads"
+    );
+
+    for &f in &followers {
+        ha.thaw_meta(f);
+    }
+    let leader = ha.await_leader(Duration::from_secs(30));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for i in 0..3 {
+        loop {
+            match list_buckets_at(&rt, &ha, i) {
+                Ok(_) => break,
+                Err(status) => assert!(
+                    Instant::now() < deadline,
+                    "meta {i} (leader {leader}) never served again: {status}"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 /// Two of three meta nodes gone: no majority, so writes are refused —
 /// promptly, not hanging, and never acknowledged. One back: service
 /// resumes, and nothing acknowledged before was lost.

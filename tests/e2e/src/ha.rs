@@ -288,6 +288,12 @@ impl HaCluster {
         cluster
     }
 
+    /// Meta node `i`'s gRPC address.
+    #[must_use]
+    pub fn meta_endpoint(&self, i: usize) -> String {
+        format!("http://127.0.0.1:{}", self.metas[i].grpc)
+    }
+
     /// Every meta node's gRPC address, comma-separated.
     #[must_use]
     pub fn meta_endpoints(&self) -> String {
@@ -802,8 +808,12 @@ impl HaCluster {
         n
     }
 
-    /// Wait until every OSD is known to the cluster (placement works).
+    /// Wait until every OSD is known to the cluster (placement works). A
+    /// cluster of meta nodes alone has nothing to wait for.
     fn await_osds(&self, osds: usize) {
+        if osds == 0 {
+            return;
+        }
         // Generous: clusters of ten OSDs start alongside other tests'.
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {

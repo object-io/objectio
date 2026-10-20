@@ -13,6 +13,7 @@ mod op_metrics;
 pub mod raft_admin;
 pub mod raft_batch;
 pub mod raft_rpc;
+pub mod read_gate;
 pub mod repair;
 pub mod service;
 
