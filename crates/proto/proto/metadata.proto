@@ -1291,6 +1291,12 @@ message UserMeta {
     // IAM path, "/" or "/a/b/": in the ARN between "user" and the name.
     // Empty means "/". Written from format level 3.
     string path = 8;
+    // A user created by a single sign-on: the OIDC issuer (the token's
+    // `iss`) and subject (`sub`) it was created for. A sign-on is mapped to
+    // this user only. Both empty for a user made any other way. Set once,
+    // at creation; written from format level 9.
+    string federated_issuer = 9;
+    string federated_subject = 10;
 }
 
 // Access key metadata
@@ -1314,6 +1320,12 @@ message CreateUserRequest {
     string email = 2;
     string tenant = 3;              // Assign user to tenant (empty = system tenant)
     string path = 4;                // IAM path (empty = "/"); level 3
+    // Both set: the user for this OIDC issuer and subject (a single
+    // sign-on). A live user already bound to them is returned unchanged,
+    // or refused (FAILED_PRECONDITION) when it belongs to another tenant;
+    // a name another user has is ALREADY_EXISTS. Level 9.
+    string federated_issuer = 5;
+    string federated_subject = 6;
 }
 
 message CreateUserResponse {

@@ -88,7 +88,7 @@ pub async fn query(
     headers: HeaderMap,
     Query(q): Query<InstantQuery>,
 ) -> Response {
-    if let Some(deny) = crate::admin::require_admin_or_session(&auth, &headers) {
+    if let Some(deny) = crate::admin::require_system_admin(&auth, &headers) {
         return deny;
     }
     if state.prometheus_url.is_empty() {
@@ -108,7 +108,7 @@ pub async fn query_range(
     headers: HeaderMap,
     Query(q): Query<RangeQuery>,
 ) -> Response {
-    if let Some(deny) = crate::admin::require_admin_or_session(&auth, &headers) {
+    if let Some(deny) = crate::admin::require_system_admin(&auth, &headers) {
         return deny;
     }
     if state.prometheus_url.is_empty() {

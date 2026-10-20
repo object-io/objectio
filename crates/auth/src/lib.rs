@@ -73,7 +73,7 @@ pub use providers::BuiltinSigV4Provider;
 
 // Re-export OIDC types (feature-gated)
 #[cfg(feature = "oidc")]
-pub use providers::{OidcConfig, OidcProvider, TokenResponse};
+pub use providers::{Claims, OidcConfig, OidcProvider, TokenResponse};
 
 // Re-export OpenFGA types (feature-gated)
 #[cfg(feature = "openfga")]

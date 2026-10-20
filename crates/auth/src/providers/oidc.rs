@@ -435,6 +435,9 @@ impl OidcProvider {
         let mut validation = Validation::new(algorithm);
         validation.set_issuer(&[&self.resolve_expected_issuer(token).await]);
         validation.set_audience(&[&self.config.audience]);
+        // An issuer or audience is checked only when the token carries one:
+        // without this, a token that left `iss` out passed the issuer check.
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.leeway = 60; // 60 seconds clock skew tolerance
 
         let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {

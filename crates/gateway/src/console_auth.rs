@@ -199,11 +199,17 @@ pub async fn resolve_or_register_tenant(
         .into_inner()
         .tenants;
 
-    // Match on the immutable upstream id, never the name.
+    // Match on the immutable upstream id, never the name; and only a tenant
+    // this provider serves.
     if let Some(t) = existing
         .iter()
         .find(|t| t.labels.get(OIDC_TID_LABEL).is_some_and(|v| v == tid))
     {
+        if !provider_binds_tenant(provider_name, t) {
+            return Err(format!(
+                "upstream tenant {tid} is registered through another provider"
+            ));
+        }
         return Ok(t.name.clone());
     }
 
@@ -421,6 +427,150 @@ fn session_key() -> &'static [u8] {
 /// Session token validity: 24 hours
 const SESSION_TTL_SECS: u64 = 86400;
 
+/// How long a sign-on may take between leaving for the provider and coming
+/// back: the life of its `state`.
+const OIDC_STATE_TTL_SECS: u64 = 600;
+
+/// What each signed value is for, mixed into its MAC: a value signed for one
+/// purpose is never accepted for another (an OAuth `state` as a session).
+const SESSION_PURPOSE: &str = "console-session";
+const OIDC_STATE_PURPOSE: &str = "oidc-state";
+
+/// What a console session carries. Signed as a whole, so none of it can be
+/// changed without the session key.
+#[derive(Serialize, Deserialize)]
+struct SessionClaims {
+    /// The user's id.
+    u: String,
+    /// The access key the session was opened with; `oidc` for a sign-on.
+    k: String,
+    /// The user's tenant; empty for the system scope.
+    t: String,
+    /// The user's ARN.
+    a: String,
+    /// Whether the session acts as a system administrator. Decided at
+    /// sign-in: the system admin's own keys, or the operator's identity
+    /// provider. A system-scope user is not one by being in the system
+    /// scope.
+    sa: bool,
+    /// Expiry, Unix seconds.
+    exp: u64,
+}
+
+/// What a sign-on's OAuth `state` carries through the provider and back.
+/// Signed, so the provider and tenant the callback acts on are the ones
+/// this gateway chose, not whatever came back in the URL.
+#[derive(Serialize, Deserialize)]
+struct OidcState {
+    /// Random: ties the callback to the browser that started the flow,
+    /// through the `oidc-state` cookie.
+    n: String,
+    /// The provider's name; `system` for the gateway's `--oidc-*` one.
+    p: String,
+    /// The tenant the user asked to sign in to; empty for none.
+    t: String,
+    /// Expiry, Unix seconds.
+    exp: u64,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn mac(purpose: &str, body: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(session_key()).expect("HMAC key");
+    mac.update(purpose.as_bytes());
+    mac.update(&[0]);
+    mac.update(body.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// `value` as `base64url(json).hex(mac)`, signed for `purpose`.
+fn seal<T: Serialize>(purpose: &str, value: &T) -> String {
+    use base64::Engine;
+    let json = serde_json::to_vec(value).unwrap_or_default();
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+    let sig = mac(purpose, &body);
+    format!("{body}.{sig}")
+}
+
+/// What [`seal`] made for `purpose`, if `token` is one and is unchanged.
+fn unseal<T: serde::de::DeserializeOwned>(purpose: &str, token: &str) -> Option<T> {
+    use base64::Engine;
+    let (body, sig) = token.rsplit_once('.')?;
+    if !constant_time_eq(sig.as_bytes(), mac(purpose, body).as_bytes()) {
+        return None;
+    }
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+/// A session token for this user, and when it expires.
+fn mint_session(
+    user_id: &str,
+    access_key: &str,
+    tenant: &str,
+    arn: &str,
+    system_admin: bool,
+) -> (String, u64) {
+    let exp = now_secs() + SESSION_TTL_SECS;
+    let token = seal(
+        SESSION_PURPOSE,
+        &SessionClaims {
+            u: user_id.to_string(),
+            k: access_key.to_string(),
+            t: tenant.to_string(),
+            a: arn.to_string(),
+            sa: system_admin,
+            exp,
+        },
+    );
+    (token, exp)
+}
+
+/// The session `token` stands for, if it is genuine and unexpired.
+fn open_session(token: &str) -> Option<SessionInfo> {
+    let c: SessionClaims = unseal(SESSION_PURPOSE, token)?;
+    if now_secs() > c.exp {
+        return None;
+    }
+    Some(SessionInfo {
+        user: c.u,
+        access_key: c.k,
+        expires_at: c.exp,
+        tenant: c.t,
+        arn: c.a,
+        system_admin: c.sa,
+        display_name: String::new(),
+        email: String::new(),
+    })
+}
+
+/// A fresh, signed `state` for a sign-on through `provider` to `tenant`.
+fn seal_oidc_state(provider: &str, tenant: &str) -> String {
+    seal(
+        OIDC_STATE_PURPOSE,
+        &OidcState {
+            n: format!("{:x}", uuid::Uuid::new_v4().as_u128()),
+            p: provider.to_string(),
+            t: tenant.to_string(),
+            exp: now_secs() + OIDC_STATE_TTL_SECS,
+        },
+    )
+}
+
+/// The `state` this gateway issued, if `value` is one, unchanged and
+/// unexpired.
+fn open_oidc_state(value: &str) -> Option<OidcState> {
+    let s: OidcState = unseal(OIDC_STATE_PURPOSE, value)?;
+    (now_secs() <= s.exp).then_some(s)
+}
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
     #[serde(rename = "accessKey")]
@@ -444,6 +594,11 @@ pub struct SessionInfo {
     pub access_key: String,
     pub expires_at: u64,
     pub tenant: String,
+    /// The user's ARN, as it was at sign-in.
+    pub arn: String,
+    /// Whether the session acts as a system administrator (see
+    /// [`SessionClaims::sa`]).
+    pub system_admin: bool,
     /// Human-readable display name for the console UI. Populated on login
     /// and by `/_console/api/session` (via a meta lookup); empty on paths
     /// where only the signed session payload is available.
@@ -480,15 +635,20 @@ pub async fn console_login(
         }
     };
 
-    if access_key_meta.secret_access_key != body.secret_key {
+    if !constant_time_eq(
+        access_key_meta.secret_access_key.as_bytes(),
+        body.secret_key.as_bytes(),
+    ) {
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
 
     let user_id = access_key_meta.user_id;
-    let (tenant, display_name, email) = match resp.user {
-        Some(u) => (u.tenant, u.display_name, u.email),
-        None => (String::new(), String::new(), String::new()),
+    let Some(user) = resp.user else {
+        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     };
+    let (tenant, display_name, email, arn) = (user.tenant, user.display_name, user.email, user.arn);
+    // Known by its ARN, as over SigV4: not by having no tenant.
+    let system_admin = arn == objectio_auth::SYSTEM_ADMIN_USER_ARN;
 
     // Per-listener audience gate.
     //
@@ -549,21 +709,9 @@ pub async fn console_login(
             .into_response();
     }
 
-    // Build session token: base64(user_id|access_key|tenant|expires_at|hmac)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let expires = now + SESSION_TTL_SECS;
-
-    let payload = format!("{user_id}|{}|{tenant}|{expires}", body.access_key);
-    let sig = sign_payload(&payload);
-    let token = format!("{payload}|{sig}");
-    let token_b64 = base64_encode(&token);
-
-    // Set cookie
+    let (token, expires) = mint_session(&user_id, &body.access_key, &tenant, &arn, system_admin);
     let cookie = format!(
-        "objectio-session={token_b64}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECS}"
+        "objectio-session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL_SECS}"
     );
 
     let session = SessionInfo {
@@ -571,6 +719,8 @@ pub async fn console_login(
         access_key: body.access_key,
         expires_at: expires,
         tenant: tenant.clone(),
+        arn,
+        system_admin,
         display_name,
         email,
     };
@@ -639,69 +789,12 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
         })?;
-
-    let token = base64_decode(token_b64)?;
-
-    // Parse: user_id|access_key|tenant|expires_at|sig
-    let (payload, sig) = token.rsplit_once('|')?;
-
-    // Verify HMAC
-    let expected_sig = sign_payload(payload);
-    if !constant_time_eq(sig.as_bytes(), expected_sig.as_bytes()) {
-        return None;
-    }
-
-    // Parse payload fields: user_id|access_key|tenant|expires_at
-    let fields: Vec<&str> = payload.splitn(4, '|').collect();
-    if fields.len() != 4 {
-        return None;
-    }
-    let user_id = fields[0];
-    let access_key = fields[1];
-    let tenant = fields[2];
-    let expires_at: u64 = fields[3].parse().ok()?;
-
-    // Check expiry
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now > expires_at {
-        return None;
-    }
-
-    Some(SessionInfo {
-        user: user_id.to_string(),
-        access_key: access_key.to_string(),
-        expires_at,
-        tenant: tenant.to_string(),
-        display_name: String::new(),
-        email: String::new(),
-    })
+    open_session(token_b64)
 }
 
 /// Equal, compared in time that doesn't depend on where they differ.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn sign_payload(payload: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(session_key()).expect("HMAC key");
-    mac.update(payload.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
-fn base64_encode(s: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s.as_bytes())
-}
-
-fn base64_decode(s: &str) -> Option<String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(s)
-        .ok()?;
-    String::from_utf8(bytes).ok()
 }
 
 // ============================================================
@@ -783,22 +876,20 @@ pub async fn my_delete_key(
         None => return (StatusCode::UNAUTHORIZED, "No session").into_response(),
     };
 
-    // Verify the key belongs to this user first
+    // Verify the key belongs to this user first; unable to tell, delete
+    // nothing.
     let mut client = state.meta_client.clone();
-    if let Ok(resp) = client
+    let owned = match client
         .list_access_keys(objectio_proto::metadata::ListAccessKeysRequest {
             user_id: session.user.clone(),
         })
         .await
     {
-        let owns_key = resp
-            .into_inner()
-            .access_keys
-            .iter()
-            .any(|k| k.access_key_id == key_id);
-        if !owns_key {
-            return (StatusCode::FORBIDDEN, "Key does not belong to you").into_response();
-        }
+        Ok(resp) => resp.into_inner().access_keys,
+        Err(e) => return crate::admin::meta_failure(&e),
+    };
+    if !owned.iter().any(|k| k.access_key_id == key_id) {
+        return (StatusCode::FORBIDDEN, "Key does not belong to you").into_response();
     }
 
     match client
@@ -996,91 +1087,332 @@ pub async fn tenant_sso_info(
     .into_response()
 }
 
+/// Whether the provider stored as `provider` signs in users of `tenant`: the
+/// tenant's own `t-<tenant>`, or the provider the tenant names. The same
+/// rule STS applies to a tenant's roles.
+#[must_use]
+pub fn provider_binds_tenant(
+    provider: &str,
+    tenant: &objectio_proto::metadata::TenantConfig,
+) -> bool {
+    provider == format!("t-{}", tenant.name.to_lowercase())
+        || (!tenant.oidc_provider.is_empty() && tenant.oidc_provider == provider)
+}
+
+/// The tenant a sign-on through a single-tenant provider lands in, given
+/// the tenants the provider is bound to and the one the user asked for
+/// (empty for none). Empty is the system scope, which only a system
+/// provider bound to no tenant reaches.
+///
+/// # Errors
+///
+/// The message to show the user, when the provider does not serve the
+/// tenant asked for, serves none and is not a system provider, or serves
+/// several and none was asked for.
+pub fn choose_tenant(
+    bound: &[String],
+    requested: &str,
+    system_provider: bool,
+) -> Result<String, &'static str> {
+    if !requested.is_empty() {
+        return if bound.iter().any(|t| t == requested) {
+            Ok(requested.to_string())
+        } else {
+            Err("This identity provider does not sign in to that tenant")
+        };
+    }
+    match bound {
+        [only] => Ok(only.clone()),
+        [] if system_provider => Ok(String::new()),
+        [] => Err("No tenant configured for this provider"),
+        _ => Err("This identity provider serves several tenants: sign in from your tenant's page"),
+    }
+}
+
+/// Who a validated token says the user is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederatedIdentity {
+    /// The token's `iss`: validation has checked it is the provider's.
+    pub issuer: String,
+    /// The token's `sub`: with the issuer, what identifies the user.
+    pub subject: String,
+    /// The name a user created for it is given: `preferred_username`, else
+    /// the email, else the subject. Only a label: never used to find a user.
+    pub name: String,
+}
+
+impl FederatedIdentity {
+    /// The identity in `claims`, if they carry an issuer and a subject.
+    #[must_use]
+    pub fn from_claims(claims: &objectio_auth::Claims) -> Option<Self> {
+        let issuer = claims
+            .extra
+            .get("iss")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        if claims.sub.is_empty() {
+            return None;
+        }
+        let name = claims
+            .extra
+            .get("preferred_username")
+            .and_then(|v| v.as_str())
+            .or(claims.email.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&claims.sub)
+            .to_string();
+        Some(Self {
+            issuer,
+            subject: claims.sub.clone(),
+            name,
+        })
+    }
+
+    /// Whether `user` is the user of this identity in `tenant`.
+    #[must_use]
+    pub fn is(&self, user: &objectio_proto::metadata::UserMeta, tenant: &str) -> bool {
+        !user.user_id.is_empty()
+            && user.federated_issuer == self.issuer
+            && user.federated_subject == self.subject
+            && user.tenant == tenant
+    }
+}
+
+/// A provider a console sign-on goes through.
+struct LoginProvider {
+    /// As stored (`identity/openid/<name>`); `system` for the gateway's
+    /// `--oidc-*` provider.
+    name: String,
+    oidc: objectio_auth::OidcProvider,
+    /// The gateway's own `--oidc-*` provider.
+    global: bool,
+    /// Signs in system administrators: the gateway's own provider, or a
+    /// stored one with `system_admin`.
+    system_admin: bool,
+    tenancy: ProviderTenancy,
+}
+
+/// The provider named `name`, if it exists and is enabled.
+async fn load_login_provider(
+    state: &ConsoleOidcState,
+    name: &str,
+) -> Result<LoginProvider, (StatusCode, &'static str)> {
+    if name.is_empty() || name == "system" {
+        // A provider from CLI flags has no stored document: single-tenant,
+        // no self-registration, and the operator's own.
+        return state
+            .oidc_provider
+            .as_ref()
+            .map(|p| LoginProvider {
+                name: "system".to_string(),
+                oidc: (**p).clone(),
+                global: true,
+                system_admin: true,
+                tenancy: ProviderTenancy::from_config(&serde_json::json!({})),
+            })
+            .ok_or((StatusCode::BAD_REQUEST, "OIDC not configured"));
+    }
+    let resp = state
+        .meta_client
+        .clone()
+        .get_config(objectio_proto::metadata::GetConfigRequest {
+            key: format!("identity/openid/{name}"),
+        })
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "OIDC provider not found"))?
+        .into_inner();
+    let entry = resp
+        .entry
+        .filter(|_| resp.found)
+        .ok_or((StatusCode::NOT_FOUND, "OIDC provider not found"))?;
+    let config: serde_json::Value = serde_json::from_slice(&entry.value)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid OIDC config"))?;
+    if !config
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        return Err((StatusCode::BAD_REQUEST, "OIDC provider is disabled"));
+    }
+    let oidc = build_oidc_provider_from_config(&config)
+        .ok_or((StatusCode::BAD_REQUEST, "Invalid OIDC config"))?;
+    Ok(LoginProvider {
+        name: name.to_string(),
+        oidc,
+        global: false,
+        system_admin: config
+            .get("system_admin")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        tenancy: ProviderTenancy::from_config(&config),
+    })
+}
+
+/// The tenant a sign-on through `provider` lands in (empty: the system
+/// scope). Always one the provider is bound to; `requested`, the tenant
+/// the user started from, only chooses among those.
+async fn resolve_login_tenant(
+    state: &ConsoleOidcState,
+    provider: &LoginProvider,
+    requested: &str,
+    upstream_tid: Option<String>,
+    upstream_user: &str,
+) -> Result<String, String> {
+    if provider.global {
+        return if requested.is_empty() {
+            Ok(String::new())
+        } else {
+            Err("The system identity provider does not sign in to a tenant".to_string())
+        };
+    }
+    let mut meta = state.meta_client.clone();
+    if provider.tenancy.multi_tenant {
+        // The ObjectIO tenant follows the *upstream* tenant the user signed
+        // in from, and is created on first contact. Without a `tid` there is
+        // nothing to key on, so the login is refused rather than landing
+        // everyone in one shared tenant.
+        let Some(tid) = upstream_tid else {
+            warn!(
+                "provider '{}' is multi-tenant but the token carries no usable tid — login denied",
+                provider.name
+            );
+            return Err("Token has no tenant claim".to_string());
+        };
+        let name = resolve_or_register_tenant(
+            &mut meta,
+            &provider.tenancy,
+            &provider.name,
+            &tid,
+            upstream_user,
+        )
+        .await?;
+        if !requested.is_empty() && requested != name {
+            return Err("This sign-in belongs to another tenant".to_string());
+        }
+        return Ok(name);
+    }
+    let tenants = meta
+        .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
+        .await
+        .map_err(|_| "Tenant lookup failed".to_string())?
+        .into_inner()
+        .tenants;
+    let bound: Vec<String> = tenants
+        .iter()
+        .filter(|t| provider_binds_tenant(&provider.name, t))
+        .map(|t| t.name.clone())
+        .collect();
+    choose_tenant(&bound, requested, provider.system_admin).map_err(|e| {
+        warn!(
+            "OIDC sign-in through '{}' refused (tenant asked for: '{requested}'): {e}",
+            provider.name
+        );
+        e.to_string()
+    })
+}
+
+/// The user `identity` signs in as in `tenant`: the one created for it,
+/// created now on its first sign-in.
+async fn provision_federated_user(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    identity: &FederatedIdentity,
+    tenant: &str,
+) -> Result<objectio_proto::metadata::UserMeta, String> {
+    let user = match meta
+        .create_user(objectio_proto::metadata::CreateUserRequest {
+            display_name: identity.name.clone(),
+            tenant: tenant.to_string(),
+            federated_issuer: identity.issuer.clone(),
+            federated_subject: identity.subject.clone(),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner().user.unwrap_or_default(),
+        Err(e) if e.code() == tonic::Code::AlreadyExists => {
+            // Another user, made some other way or for another sign-on, has
+            // this name. Taking it over would sign this person in as them.
+            warn!(
+                "OIDC sign-in refused: the name '{}' (iss={}, sub={}) belongs to another user",
+                identity.name, identity.issuer, identity.subject
+            );
+            return Err("Another user already has this name: ask an administrator".to_string());
+        }
+        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+            warn!("OIDC sign-in refused: {}", e.message());
+            return Err(e.message().to_string());
+        }
+        Err(e) => {
+            warn!("OIDC sign-in: could not provision the user: {e}");
+            return Err("Could not create the user".to_string());
+        }
+    };
+    // Whatever came back, only the user bound to this sign-on is signed in as.
+    if !identity.is(&user, tenant) {
+        warn!(
+            "OIDC sign-in refused: meta answered user '{}', which is not bound to iss={}, sub={}",
+            user.user_id, identity.issuer, identity.subject
+        );
+        return Err("Could not create the user".to_string());
+    }
+    if user.status != objectio_proto::metadata::UserStatus::UserActive as i32 {
+        return Err("This user is not active".to_string());
+    }
+    Ok(user)
+}
+
+/// Back to the console the flow started on, with `msg` to show.
+fn login_error(base: &str, msg: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(
+            header::LOCATION,
+            format!("{base}?error={}", urlencoding::encode(msg)),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
 /// GET /_console/api/oidc/authorize — redirect to OIDC provider
 pub async fn oidc_authorize(
     State(state): State<Arc<ConsoleOidcState>>,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    // Resolve the OIDC provider: by provider name, by tenant, or global default
-    let (oidc, tenant_name) = if !params.provider.is_empty() && params.provider != "system" {
-        // Look up named provider from config store
-        let mut client = state.meta_client.clone();
-        let config_key = format!("identity/openid/{}", params.provider);
-        match client
-            .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
-            .await
-        {
-            Ok(resp) => {
-                let entry = resp.into_inner().entry.unwrap_or_default();
-                match serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                    Ok(config) => match build_oidc_provider_from_config(&config) {
-                        Some(p) => (p, params.tenant.clone()),
-                        None => {
-                            return (StatusCode::BAD_REQUEST, "Invalid OIDC config")
-                                .into_response();
-                        }
-                    },
-                    Err(_) => {
-                        return (StatusCode::BAD_REQUEST, "Invalid OIDC config").into_response();
-                    }
-                }
-            }
-            Err(_) => return (StatusCode::NOT_FOUND, "OIDC provider not found").into_response(),
-        }
+    // The provider: by name, the tenant's, or the gateway's own.
+    let provider_name = if !params.provider.is_empty() {
+        params.provider.clone()
     } else if !params.tenant.is_empty() {
-        // Look up tenant's OIDC provider
-        let mut client = state.meta_client.clone();
-        match client
+        let tenant = match state
+            .meta_client
+            .clone()
             .get_tenant(objectio_proto::metadata::GetTenantRequest {
                 name: params.tenant.clone(),
             })
             .await
         {
-            Ok(resp) => {
-                let tc = resp.into_inner().tenant.unwrap_or_default();
-                if tc.oidc_provider.is_empty() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        "Tenant has no OIDC provider configured",
-                    )
-                        .into_response();
-                }
-                let config_key = format!("identity/openid/{}", tc.oidc_provider);
-                match client
-                    .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
-                    .await
-                {
-                    Ok(resp2) => {
-                        let entry = resp2.into_inner().entry.unwrap_or_default();
-                        match serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                            Ok(config) => match build_oidc_provider_from_config(&config) {
-                                Some(p) => (p, params.tenant.clone()),
-                                None => {
-                                    return (StatusCode::BAD_REQUEST, "Invalid OIDC config")
-                                        .into_response();
-                                }
-                            },
-                            Err(_) => {
-                                return (StatusCode::BAD_REQUEST, "Invalid OIDC config")
-                                    .into_response();
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        return (StatusCode::NOT_FOUND, "OIDC provider config not found")
-                            .into_response();
-                    }
-                }
-            }
+            Ok(resp) => resp.into_inner().tenant.unwrap_or_default(),
             Err(_) => return (StatusCode::NOT_FOUND, "Tenant not found").into_response(),
+        };
+        if tenant.oidc_provider.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Tenant has no OIDC provider configured",
+            )
+                .into_response();
         }
+        tenant.oidc_provider
     } else {
-        // Global default
-        match state.oidc_provider.as_ref() {
-            Some(p) => ((**p).clone(), String::new()),
-            None => return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response(),
-        }
+        "system".to_string()
     };
+    let provider = match load_login_provider(&state, &provider_name).await {
+        Ok(p) => p,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    let oidc = &provider.oidc;
 
     let auth_endpoint = match oidc.resolve_authorization_endpoint().await {
         Ok(ep) => ep,
@@ -1102,14 +1434,9 @@ pub async fn oidc_authorize(
 
     let callback_url = format!("{}/_console/api/oidc/callback", state.external_endpoint);
 
-    // Encode provider + tenant in state for callback resolution
-    let csrf = format!("{:x}", uuid::Uuid::new_v4().as_u128());
-    let state_value = format!(
-        "{}:{}:{}",
-        csrf,
-        params.provider.replace(':', "_"),
-        tenant_name.replace(':', "_")
-    );
+    // Provider and tenant travel in a signed state: the callback trusts only
+    // what this gateway put there.
+    let state_value = seal_oidc_state(&provider.name, &params.tenant);
 
     let config = oidc.config();
     let auth_url = format!(
@@ -1123,11 +1450,12 @@ pub async fn oidc_authorize(
 
     debug!(
         "OIDC authorize redirect (provider={}, tenant={}): {}",
-        params.provider, tenant_name, auth_url
+        provider.name, params.tenant, auth_url
     );
 
-    let state_cookie =
-        format!("oidc-state={state_value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600");
+    let state_cookie = format!(
+        "oidc-state={state_value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={OIDC_STATE_TTL_SECS}"
+    );
 
     Response::builder()
         .status(StatusCode::FOUND)
@@ -1175,17 +1503,7 @@ pub async fn oidc_callback(
     // act on; say so rather than attempting an exchange with an empty code.
     if params.code.is_empty() && params.error.is_none() {
         warn!("OIDC callback carried neither code nor error");
-        return Response::builder()
-            .status(StatusCode::FOUND)
-            .header(
-                header::LOCATION,
-                format!(
-                    "{base}?error={}",
-                    urlencoding::encode("Sign-in did not return a result")
-                ),
-            )
-            .body(axum::body::Body::empty())
-            .unwrap();
+        return login_error(base, "Sign-in did not return a result");
     }
 
     // Check for error from provider
@@ -1194,20 +1512,11 @@ pub async fn oidc_callback(
             "OIDC callback error: {} {:?}",
             err, params.error_description
         );
-        return Response::builder()
-            .status(StatusCode::FOUND)
-            .header(
-                header::LOCATION,
-                format!(
-                    "{base}?error={}",
-                    urlencoding::encode(params.error_description.as_deref().unwrap_or(err))
-                ),
-            )
-            .body(axum::body::Body::empty())
-            .unwrap();
+        return login_error(base, params.error_description.as_deref().unwrap_or(err));
     }
 
-    // Validate CSRF state
+    // The state must be the one this browser was handed (the cookie), and one
+    // this gateway signed.
     let state_cookie = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -1218,105 +1527,33 @@ pub async fn oidc_callback(
             })
         })
         .unwrap_or_default();
-
-    if state_cookie.is_empty() || state_cookie != params.state {
+    if state_cookie.is_empty()
+        || !constant_time_eq(state_cookie.as_bytes(), params.state.as_bytes())
+    {
         warn!("OIDC callback: state mismatch");
-        return Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, format!("{base}?error=Invalid+state"))
-            .body(axum::body::Body::empty())
-            .unwrap();
+        return login_error(base, "Invalid state");
     }
+    let Some(flow) = open_oidc_state(&params.state) else {
+        warn!("OIDC callback: state not signed by this cluster, or expired");
+        return login_error(base, "Invalid state");
+    };
 
-    // Parse state: "csrf:provider:tenant"
-    let state_parts: Vec<&str> = params.state.splitn(3, ':').collect();
-    let provider_name = state_parts.get(1).unwrap_or(&"").to_string();
-    let tenant_from_state = state_parts.get(2).unwrap_or(&"").to_string();
-
-    // Resolve OIDC provider (same logic as authorize). Also captures
-    // the provider's `system_admin` flag — when true, a user
-    // authenticated through this provider lands on the system-admin
-    // console even if no tenant maps to the provider.
-    let (oidc, provider_is_system_admin, tenancy) =
-        if !provider_name.is_empty() && provider_name != "system" {
-            let mut client = state.meta_client.clone();
-            let config_key = format!("identity/openid/{provider_name}");
-            match client
-                .get_config(objectio_proto::metadata::GetConfigRequest { key: config_key })
-                .await
-            {
-                Ok(resp) => {
-                    let entry = resp.into_inner().entry.unwrap_or_default();
-                    let config_json: Option<serde_json::Value> =
-                        serde_json::from_slice(&entry.value).ok();
-                    let system_admin = config_json
-                        .as_ref()
-                        .and_then(|c| c.get("system_admin"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let tenancy = config_json
-                        .as_ref()
-                        .map(ProviderTenancy::from_config)
-                        .unwrap_or_else(|| ProviderTenancy::from_config(&serde_json::json!({})));
-                    match config_json.and_then(|c| build_oidc_provider_from_config(&c)) {
-                        Some(p) => (p, system_admin, tenancy),
-                        None => {
-                            return Response::builder()
-                                .status(StatusCode::FOUND)
-                                .header(
-                                    header::LOCATION,
-                                    format!("{base}?error=Invalid+provider+config"),
-                                )
-                                .body(axum::body::Body::empty())
-                                .unwrap();
-                        }
-                    }
-                }
-                Err(_) => {
-                    return Response::builder()
-                        .status(StatusCode::FOUND)
-                        .header(header::LOCATION, format!("{base}?error=Provider+not+found"))
-                        .body(axum::body::Body::empty())
-                        .unwrap();
-                }
-            }
-        } else {
-            // Global provider from --oidc-* CLI args is implicitly
-            // system-admin scoped.
-            match state.oidc_provider.as_ref() {
-                // A provider configured from CLI flags has no stored document, so
-                // it is single-tenant with no self-registration.
-                Some(p) => (
-                    (**p).clone(),
-                    true,
-                    ProviderTenancy::from_config(&serde_json::json!({})),
-                ),
-                None => {
-                    return (StatusCode::BAD_REQUEST, "OIDC not configured").into_response();
-                }
-            }
-        };
+    let provider = match load_login_provider(&state, &flow.p).await {
+        Ok(p) => p,
+        Err((_, msg)) => return login_error(base, msg),
+    };
 
     // Exchange authorization code for tokens
     let callback_url = format!("{}/_console/api/oidc/callback", state.external_endpoint);
-    let token_resp = match oidc
+    let token_resp = match provider
+        .oidc
         .exchange_authorization_code(&params.code, &callback_url)
         .await
     {
         Ok(resp) => resp,
         Err(e) => {
             warn!("OIDC token exchange failed: {e}");
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(
-                    header::LOCATION,
-                    format!(
-                        "{base}?error={}",
-                        urlencoding::encode(&format!("Token exchange failed: {e}"))
-                    ),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap();
+            return login_error(base, &format!("Token exchange failed: {e}"));
         }
     };
 
@@ -1327,169 +1564,53 @@ pub async fn oidc_callback(
         .as_deref()
         .unwrap_or(&token_resp.access_token);
 
-    let (user_id, groups, upstream_tid) = match oidc.validate_token(token_to_validate).await {
-        Ok(claims) => {
-            let sub = claims
-                .extra
-                .get("preferred_username")
-                .or(claims.extra.get("email"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&claims.sub)
-                .to_string();
-            let groups = oidc.extract_groups(&claims);
-            // Present on Entra tokens; absent elsewhere, in which case there
-            // is no upstream tenant to key self-registration on.
-            let tid = objectio_auth::OidcProvider::tenant_id(&claims);
-            (sub, groups, tid)
-        }
-        Err(e) => {
-            warn!("OIDC token validation failed: {e}");
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(
-                    header::LOCATION,
-                    format!("{base}?error=Token+validation+failed"),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap();
-        }
-    };
-
-    // Resolve tenant: from state, or look up which tenant uses this
-    // provider. If the provider is flagged as system_admin AND no
-    // tenant maps to it, fall through to system-admin login instead
-    // of erroring — that's the new behavior set by the "Allow
-    // system-admin SSO" checkbox on the Identity page.
-    let tenant = if !tenant_from_state.is_empty() {
-        tenant_from_state
-    } else if tenancy.multi_tenant && !provider_name.is_empty() && provider_name != "system" {
-        // Multi-tenant provider: the ObjectIO tenant follows the *upstream*
-        // tenant the user signed in from, and is created on first contact.
-        // Without a `tid` there is nothing to key on, so the login is refused
-        // rather than silently landing everyone in one shared tenant.
-        let Some(tid) = upstream_tid.clone() else {
-            warn!(
-                "provider '{provider_name}' is multi-tenant but the token carries no \
-                 usable tid — login denied"
-            );
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(
-                    header::LOCATION,
-                    format!("{base}?error=Token+has+no+tenant+claim").as_str(),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap();
-        };
-        let mut t_client = state.meta_client.clone();
-        match resolve_or_register_tenant(&mut t_client, &tenancy, &provider_name, &tid, &user_id)
-            .await
-        {
-            Ok(name) => name,
+    // Validation checks the signature, the audience, and that `iss` is this
+    // provider's issuer.
+    let (identity, groups, upstream_tid) =
+        match provider.oidc.validate_token(token_to_validate).await {
+            Ok(claims) => {
+                let Some(identity) = FederatedIdentity::from_claims(&claims) else {
+                    warn!("OIDC token has no issuer or subject");
+                    return login_error(base, "Token validation failed");
+                };
+                let groups = provider.oidc.extract_groups(&claims);
+                // Present on Entra tokens; absent elsewhere, in which case there
+                // is no upstream tenant to key self-registration on.
+                let tid = objectio_auth::OidcProvider::tenant_id(&claims);
+                (identity, groups, tid)
+            }
             Err(e) => {
-                warn!("tenant self-registration failed for tid={tid}: {e}");
-                return Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(
-                        header::LOCATION,
-                        format!("{base}?error={}", urlencoding::encode(&e)),
-                    )
-                    .body(axum::body::Body::empty())
-                    .unwrap();
+                warn!("OIDC token validation failed: {e}");
+                return login_error(base, "Token validation failed");
             }
-        }
-    } else if !provider_name.is_empty() && provider_name != "system" {
-        // Single-tenant provider: exactly one tenant is bound to it, and
-        // nothing is created automatically.
-        let mut t_client = state.meta_client.clone();
-        let resolved = if let Ok(resp) = t_client
-            .list_tenants(objectio_proto::metadata::ListTenantsRequest {})
-            .await
-        {
-            resp.into_inner()
-                .tenants
-                .iter()
-                .find(|t| t.oidc_provider == provider_name)
-                .map(|t| t.name.clone())
-        } else {
-            None
         };
-        match resolved {
-            Some(t) => t,
-            None if provider_is_system_admin => {
-                // Intentional: operator enabled "Allow system-admin SSO".
-                String::new()
-            }
-            None => {
-                warn!(
-                    "OIDC provider '{}' not mapped to any tenant and not flagged \
-                     system_admin — login denied",
-                    provider_name
-                );
-                return Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(
-                        header::LOCATION,
-                        format!("{base}?error=No+tenant+configured+for+this+provider").as_str(),
-                    )
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-            }
-        }
-    } else {
-        String::new() // system admin (global SSO)
+
+    let tenant = match resolve_login_tenant(
+        &state,
+        &provider,
+        &flow.t,
+        upstream_tid,
+        &identity.name,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return login_error(base, &e),
     };
 
-    // Auto-provision OIDC user in meta service (idempotent)
     let mut meta = state.meta_client.clone();
-    let provisioned_user_id = match meta
-        .create_user(objectio_proto::metadata::CreateUserRequest {
-            display_name: user_id.clone(),
-            email: String::new(),
-            tenant: tenant.clone(),
-            path: String::new(),
-        })
-        .await
-    {
-        Ok(resp) => resp
-            .into_inner()
-            .user
-            .map(|u| u.user_id)
-            .unwrap_or(user_id.clone()),
-        Err(e) => {
-            // Already exists — look up by display name
-            if e.code() == tonic::Code::AlreadyExists {
-                // Find user by listing and matching display name
-                if let Ok(resp) = meta
-                    .list_users(objectio_proto::metadata::ListUsersRequest {
-                        max_results: 1000,
-                        marker: String::new(),
-                    })
-                    .await
-                {
-                    resp.into_inner()
-                        .users
-                        .iter()
-                        .find(|u| u.display_name == user_id)
-                        .map(|u| u.user_id.clone())
-                        .unwrap_or(user_id.clone())
-                } else {
-                    user_id.clone()
-                }
-            } else {
-                debug!("Failed to auto-provision OIDC user: {e}");
-                user_id.clone()
-            }
-        }
+    let user = match provision_federated_user(&mut meta, &identity, &tenant).await {
+        Ok(u) => u,
+        Err(e) => return login_error(base, &e),
     };
 
     // Promote to tenant admin when the token carries the provider's configured
     // admin role. Done after provisioning so the ARN exists, and on every
     // login so a change in the customer's IdP takes effect on their next
-    // sign-in rather than needing us to touch anything.
+    // sign-in rather than needing us to touch anything. The provider is one
+    // bound to this tenant, so its role claim is the tenant's to give.
     if !tenant.is_empty() {
-        let user_arn = format!("arn:objectio:iam::{tenant}:user/{user_id}");
-        apply_tenant_admin_role(&mut meta, &tenancy, &tenant, &user_arn, &groups).await;
+        apply_tenant_admin_role(&mut meta, &provider.tenancy, &tenant, &user.arn, &groups).await;
     }
 
     // Per-listener audience gate (mirror of the AK/SK login gate in
@@ -1515,40 +1636,24 @@ pub async fn oidc_callback(
             } else {
                 "Tenant SSO is only on the tenant console"
             };
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(
-                    header::LOCATION,
-                    format!("{base}?error={}", urlencoding::encode(msg)),
-                )
-                .body(axum::body::Body::empty())
-                .unwrap();
+            return login_error(base, msg);
         }
     }
 
-    // Build session cookie (same format as AK/SK login)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let expires = now + SESSION_TTL_SECS;
-    // tenant already resolved above
-
-    let payload = format!("{provisioned_user_id}|oidc|{tenant}|{expires}");
-    let sig = sign_payload(&payload);
-    let token = format!("{payload}|{sig}");
-    let token_b64 = base64_encode(&token);
-
+    // The operator's identity provider signs in system administrators: the
+    // system scope is reached only through one (`resolve_login_tenant`).
+    let system_admin = tenant.is_empty() && provider.system_admin;
+    let (token, _) = mint_session(&user.user_id, "oidc", &tenant, &user.arn, system_admin);
     let session_cookie = format!(
-        "objectio-session={token_b64}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
+        "objectio-session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
     );
 
     // Clear state cookie + set session cookie + redirect to console
     let clear_state = "oidc-state=; Path=/; HttpOnly; Max-Age=0";
 
     debug!(
-        "OIDC login successful: oidc_sub={}, provisioned_id={}",
-        user_id, provisioned_user_id
+        "OIDC login successful: iss={}, sub={}, user={}, tenant={}",
+        identity.issuer, identity.subject, user.user_id, tenant
     );
 
     Response::builder()
@@ -1733,5 +1838,212 @@ mod landing_tests {
         );
         // No usable referer still lands somewhere real.
         assert_eq!(console_base(console_audience("", None)), "/_console/admin/");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use base64::Engine;
+
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    /// `token` with its signed body changed by `edit`, and its signature
+    /// kept.
+    fn tampered(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+        let (body, sig) = token.rsplit_once('.').unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&B64.decode(body).unwrap()).unwrap();
+        edit(&mut v);
+        format!("{}.{sig}", B64.encode(v.to_string()))
+    }
+
+    #[test]
+    fn the_state_carries_the_provider_and_tenant_it_was_issued_for() {
+        let s = seal_oidc_state("t-acme", "acme");
+        let opened = open_oidc_state(&s).unwrap();
+        assert_eq!((opened.p.as_str(), opened.t.as_str()), ("t-acme", "acme"));
+        // Two flows never share a state.
+        assert_ne!(s, seal_oidc_state("t-acme", "acme"));
+    }
+
+    #[test]
+    fn a_state_with_another_tenant_or_provider_is_refused() {
+        let s = seal_oidc_state("t-acme", "acme");
+        assert!(open_oidc_state(&tampered(&s, |v| v["t"] = "other".into())).is_none());
+        assert!(open_oidc_state(&tampered(&s, |v| v["p"] = "system".into())).is_none());
+        // The shape the state used to have, unsigned.
+        assert!(open_oidc_state("abc:t-acme:other").is_none());
+        assert!(open_oidc_state("").is_none());
+    }
+
+    #[test]
+    fn an_expired_state_is_refused() {
+        let s = seal(
+            OIDC_STATE_PURPOSE,
+            &OidcState {
+                n: "n".into(),
+                p: "t-acme".into(),
+                t: "acme".into(),
+                exp: now_secs() - 1,
+            },
+        );
+        assert!(open_oidc_state(&s).is_none());
+    }
+
+    #[test]
+    fn a_state_is_never_a_session_nor_a_session_a_state() {
+        let (session, _) = mint_session("u", "oidc", "acme", "arn", false);
+        assert!(open_oidc_state(&session).is_none());
+        // Same fields, signed for the other purpose.
+        let as_state = seal(
+            OIDC_STATE_PURPOSE,
+            &SessionClaims {
+                u: "u".into(),
+                k: "oidc".into(),
+                t: String::new(),
+                a: "arn".into(),
+                sa: true,
+                exp: now_secs() + 60,
+            },
+        );
+        assert!(open_session(&as_state).is_none());
+    }
+
+    #[test]
+    fn a_session_carries_the_arn_and_whether_it_is_the_system_admin() {
+        let (token, _) = mint_session("u1", "AK", "", "arn:objectio:iam::user/ops", false);
+        let s = open_session(&token).unwrap();
+        assert_eq!(s.arn, "arn:objectio:iam::user/ops");
+        assert!(!s.system_admin);
+        assert!(s.tenant.is_empty());
+        // Neither can be raised without the key.
+        assert!(open_session(&tampered(&token, |v| v["sa"] = true.into())).is_none());
+        assert!(open_session(&tampered(&token, |v| v["a"] = SYSTEM_ADMIN_ARN.into())).is_none());
+    }
+
+    const SYSTEM_ADMIN_ARN: &str = objectio_auth::SYSTEM_ADMIN_USER_ARN;
+
+    /// A system-scope user is not the system admin for being in the system
+    /// scope; the system admin's ARN or a system sign-in is.
+    #[test]
+    fn the_system_scope_alone_is_not_the_system_admin() {
+        let caller = |arn: &str, sa: bool| crate::admin::CallerIdentity {
+            user_id: "u".into(),
+            user_arn: arn.into(),
+            tenant: String::new(),
+            authenticated: true,
+            session_system_admin: sa,
+        };
+        assert!(!crate::admin::is_system_admin(&caller(
+            "arn:objectio:iam::user/ops",
+            false
+        )));
+        assert!(!crate::admin::is_system_admin(&caller("", false)));
+        assert!(crate::admin::is_system_admin(&caller(
+            SYSTEM_ADMIN_ARN,
+            false
+        )));
+        assert!(crate::admin::is_system_admin(&caller(
+            "arn:objectio:iam::user/alice",
+            true
+        )));
+        let mut nobody = caller(SYSTEM_ADMIN_ARN, true);
+        nobody.authenticated = false;
+        assert!(!crate::admin::is_system_admin(&nobody));
+    }
+
+    fn tenant(name: &str, provider: &str) -> objectio_proto::metadata::TenantConfig {
+        objectio_proto::metadata::TenantConfig {
+            name: name.into(),
+            oidc_provider: provider.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_provider_is_bound_to_its_own_tenant_and_the_tenants_naming_it() {
+        assert!(provider_binds_tenant("t-acme", &tenant("acme", "")));
+        assert!(provider_binds_tenant("t-acme", &tenant("Acme", "")));
+        assert!(provider_binds_tenant("corp", &tenant("acme", "corp")));
+        assert!(!provider_binds_tenant("t-acme", &tenant("other", "")));
+        assert!(!provider_binds_tenant("t-acme", &tenant("other", "corp")));
+        assert!(!provider_binds_tenant("", &tenant("other", "")));
+    }
+
+    #[test]
+    fn a_tenant_provider_signs_in_only_to_a_tenant_it_is_bound_to() {
+        let bound = vec!["acme".to_string()];
+        assert_eq!(choose_tenant(&bound, "", false).unwrap(), "acme");
+        assert_eq!(choose_tenant(&bound, "acme", false).unwrap(), "acme");
+        // Asking for another tenant does not get it.
+        assert!(choose_tenant(&bound, "other", false).is_err());
+        assert!(choose_tenant(&bound, "other", true).is_err());
+        // Bound to no tenant: the system scope, for a system provider only.
+        assert_eq!(choose_tenant(&[], "", true).unwrap(), "");
+        assert!(choose_tenant(&[], "", false).is_err());
+        assert!(choose_tenant(&[], "acme", true).is_err());
+        // Bound to several: the user says which, and it must be one of them.
+        let two = vec!["a".to_string(), "b".to_string()];
+        assert!(choose_tenant(&two, "", false).is_err());
+        assert_eq!(choose_tenant(&two, "b", false).unwrap(), "b");
+    }
+
+    fn claims(extra: serde_json::Value, email: Option<&str>) -> objectio_auth::Claims {
+        objectio_auth::Claims {
+            sub: "sub-1".into(),
+            email: email.map(Into::into),
+            name: None,
+            exp: 0,
+            extra: serde_json::from_value(extra).unwrap(),
+        }
+    }
+
+    #[test]
+    fn an_identity_is_its_issuer_and_subject_and_the_name_only_labels_it() {
+        let id = FederatedIdentity::from_claims(&claims(
+            serde_json::json!({"iss": "https://idp", "preferred_username": "admin"}),
+            Some("a@x.io"),
+        ))
+        .unwrap();
+        assert_eq!(
+            (id.issuer.as_str(), id.subject.as_str(), id.name.as_str()),
+            ("https://idp", "sub-1", "admin")
+        );
+        let by_email = FederatedIdentity::from_claims(&claims(
+            serde_json::json!({"iss": "https://idp"}),
+            Some("a@x.io"),
+        ))
+        .unwrap();
+        assert_eq!(by_email.name, "a@x.io");
+        let by_sub = FederatedIdentity::from_claims(&claims(
+            serde_json::json!({"iss": "https://idp"}),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(by_sub.name, "sub-1");
+        // No issuer: nothing to bind to.
+        assert!(
+            FederatedIdentity::from_claims(&claims(
+                serde_json::json!({"preferred_username": "admin"}),
+                None
+            ))
+            .is_none()
+        );
+
+        // The user for it is the one bound to it, in that tenant; a user of
+        // the same name is not.
+        let user = |iss: &str, sub: &str, tenant: &str| objectio_proto::metadata::UserMeta {
+            user_id: "id".into(),
+            display_name: "admin".into(),
+            tenant: tenant.into(),
+            federated_issuer: iss.into(),
+            federated_subject: sub.into(),
+            ..Default::default()
+        };
+        assert!(id.is(&user("https://idp", "sub-1", "acme"), "acme"));
+        assert!(!id.is(&user("", "", "acme"), "acme"));
+        assert!(!id.is(&user("https://other", "sub-1", "acme"), "acme"));
+        assert!(!id.is(&user("https://idp", "sub-2", "acme"), "acme"));
+        assert!(!id.is(&user("https://idp", "sub-1", "other"), "acme"));
     }
 }

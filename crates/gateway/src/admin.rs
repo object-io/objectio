@@ -521,6 +521,10 @@ pub struct CallerIdentity {
     pub user_arn: String,
     pub tenant: String,
     pub authenticated: bool,
+    /// A console session its sign-in made a system administrator's: the
+    /// system admin's own keys, or the operator's identity provider. Never
+    /// set over SigV4, where only the system admin's ARN is one.
+    pub session_system_admin: bool,
 }
 
 /// Pull the caller's identity from either SigV4 auth extension or a valid
@@ -539,14 +543,16 @@ pub fn extract_caller(
             user_arn: a.user_arn.clone(),
             tenant: a.tenant.clone(),
             authenticated: true,
+            session_system_admin: false,
         };
     }
     if let Some(s) = crate::console_auth::validate_session_from_headers(headers) {
         return CallerIdentity {
             user_id: s.user,
-            user_arn: String::new(),
+            user_arn: s.arn,
             tenant: s.tenant,
             authenticated: true,
+            session_system_admin: s.system_admin,
         };
     }
     CallerIdentity::default()
@@ -585,22 +591,12 @@ fn deny_scoped_credential(auth: &Option<Extension<AuthResult>>) -> Option<Respon
 
 pub(crate) use objectio_auth::SYSTEM_ADMIN_USER_ARN;
 
-/// True iff the caller is a system-scope admin. Tenant users (tenant != "")
-/// never satisfy this.
-///
-/// - SigV4 path: requires the canonical admin ARN (strict).
-/// - Session path: any authenticated session with an empty tenant scope
-///   passes. The session payload does not carry the ARN, so we rely on the
-///   invariant that users in the system scope are, by definition,
-///   system-scope admins.
+/// True iff the caller is a system administrator: the system admin's ARN,
+/// or a console session its sign-in made one. Being in the system scope is
+/// not enough: the system admin creates system-scope users who are not.
 pub fn is_system_admin(caller: &CallerIdentity) -> bool {
-    if !caller.authenticated {
-        return false;
-    }
-    if !caller.user_arn.is_empty() {
-        return caller.user_arn == SYSTEM_ADMIN_USER_ARN;
-    }
-    caller.tenant.is_empty()
+    caller.authenticated
+        && (caller.user_arn == SYSTEM_ADMIN_USER_ARN || caller.session_system_admin)
 }
 
 /// Check whether the caller is allowed to act as an admin for `target_tenant`:
@@ -683,11 +679,14 @@ pub(crate) async fn tenant_admin(
         .any(|entry| entry == user_id || entry == user_arn))
 }
 
-/// Validate admin access from either SigV4 auth or console session cookie.
-/// This is the "tenant-unaware" gate — passes for system admin or any
-/// authenticated session. Tenant-scoped endpoints should prefer
-/// [`require_tenant_admin_access`] instead so tenant users cannot touch
-/// other tenants.
+/// Gate for a listing a tenant's console users may see of their own tenant:
+/// passes for the system admin (SigV4 or session), or for a tenant-scoped
+/// console session, which the handler must then filter to its tenant
+/// ([`extract_tenant`]). Cluster-wide data goes behind
+/// [`require_system_admin`] instead.
+///
+/// A system-scope session that is not a system administrator's is refused:
+/// to these listings an empty tenant means every tenant.
 pub fn require_admin_or_session(
     auth: &Option<Extension<AuthResult>>,
     headers: &axum::http::HeaderMap,
@@ -703,13 +702,14 @@ pub fn require_admin_or_session(
         return Some((StatusCode::FORBIDDEN, "Admin access required").into_response());
     }
 
-    // Otherwise check for console session cookie
-    // Login already validated credentials — any valid session is allowed
-    if crate::console_auth::validate_session_from_headers(headers).is_some() {
+    let caller = extract_caller(auth, headers);
+    if !caller.authenticated {
+        return Some((StatusCode::UNAUTHORIZED, "Authentication required").into_response());
+    }
+    if is_system_admin(&caller) || !caller.tenant.is_empty() {
         return None;
     }
-
-    Some((StatusCode::UNAUTHORIZED, "Authentication required").into_response())
+    Some((StatusCode::FORBIDDEN, "System admin access required").into_response())
 }
 
 /// Gate that only allows the true system admin — used for cluster-wide
@@ -2331,16 +2331,20 @@ pub async fn admin_list_recipients_tenant(
                     })
                 })
                 .collect();
-            // If tenant user, filter recipients to only show those with access to tenant's shares
-            if !tenant.is_empty()
-                && let Ok(shares_resp) = client
+            // If tenant user, filter recipients to only show those with
+            // access to tenant's shares; unable to filter, show none.
+            if !tenant.is_empty() {
+                let shares_resp = match client
                     .delta_list_shares(objectio_proto::metadata::DeltaListSharesRequest {
                         max_results: 0,
                         page_token: String::new(),
                         tenant: tenant.clone(),
                     })
                     .await
-            {
+                {
+                    Ok(r) => r,
+                    Err(e) => return meta_failure(&e),
+                };
                 let tenant_shares: std::collections::HashSet<String> = shares_resp
                     .into_inner()
                     .shares
@@ -2916,7 +2920,7 @@ pub async fn admin_cluster_info(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
     let mut client = state.meta_client.clone();
@@ -2989,7 +2993,7 @@ pub async fn admin_get_topology(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
     let mut client = state.meta_client.clone();
@@ -3134,7 +3138,7 @@ pub async fn admin_validate_placement(
     headers: HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    if let Some(deny) = require_system_admin(&auth, &headers) {
         return deny;
     }
     let Some(pool_name) = params.get("pool") else {

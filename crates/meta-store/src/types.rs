@@ -261,6 +261,12 @@ pub struct StoredUser {
     /// level 3.
     #[prost(string, tag = "8")]
     pub path: String,
+    /// The OIDC issuer and subject a single sign-on created this user for;
+    /// empty for any other user. Written from format level 9.
+    #[prost(string, tag = "9")]
+    pub federated_issuer: String,
+    #[prost(string, tag = "10")]
+    pub federated_subject: String,
 }
 
 /// Internal access key storage
