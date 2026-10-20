@@ -935,13 +935,17 @@ pub(crate) async fn get_object_version_once(
         );
         plan
     } else {
-        // Full object: all stripes, offsets unused since we don't slice
-        object
-            .stripes
-            .iter()
-            .enumerate()
-            .map(|(i, _)| (i, 0u64))
-            .collect()
+        // Full object: all stripes, each at its place in the object. Not
+        // sliced, but a single-part encrypted object is one stream across
+        // its stripes, decrypted from there: from 0, every stripe after the
+        // first decrypted to garbage, served with 200.
+        overlapping_stripes(
+            &object.stripes,
+            &ByteRange {
+                start: 0,
+                end: u64::MAX - 1,
+            },
+        )
     };
 
     // Pre-allocate with appropriate capacity
