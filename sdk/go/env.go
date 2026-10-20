@@ -60,10 +60,11 @@ func readValue(fileEnv, directEnv string, fallbacks ...string) (string, error) {
 // ConfigFromEnv builds a Config from the environment.
 //
 //	OBJECTIO_ENDPOINT     | OBJECTIO_URL                          (required)
-//	OBJECTIO_ACCESS_KEY   | OBJECTIO_ACCESS_KEY_FILE | AWS_ACCESS_KEY_ID
-//	OBJECTIO_SECRET_KEY   | OBJECTIO_SECRET_KEY_FILE | AWS_SECRET_ACCESS_KEY
-//	OBJECTIO_REGION       | AWS_REGION | AWS_DEFAULT_REGION        (default us-east-1)
+//	OBJECTIO_ACCESS_KEY_FILE | OBJECTIO_ACCESS_KEY | AWS_ACCESS_KEY_ID
+//	OBJECTIO_SECRET_KEY_FILE | OBJECTIO_SECRET_KEY | AWS_SECRET_ACCESS_KEY
+//	OBJECTIO_REGION          | AWS_REGION | AWS_DEFAULT_REGION     (default us-east-1)
 //
+// For each, the first one set is used.
 // The credential must be unscoped: a key confined to a bucket is refused on
 // the management API.
 func ConfigFromEnv() (Config, error) {

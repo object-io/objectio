@@ -2,15 +2,16 @@
 //! of the voters.
 //!
 //! A node cut off from the others times out waiting for the leader and
-//! starts an election every election timeout (0.5-1 s), raising its term
-//! each time, though it can never win. When it is reachable again its
-//! term is far ahead, the leader that served all along sees it and steps
-//! down, and the cluster goes without a leader for an election: in the A6
-//! chaos test, a partition healing cost every write a few seconds. Raft's
-//! answer is pre-vote, which openraft 0.9 doesn't have; this is the same
-//! effect from outside it: every [`EVERY`] each other voter's Raft port is
-//! tried (a TCP connection), and openraft's elections are turned off while
-//! fewer than a majority, counting this node, answer.
+//! starts an election every election timeout (2-4 s by default,
+//! `--raft-election-ms`), raising its term each time, though it can never
+//! win. When it is reachable again its term is far ahead, the leader that
+//! served all along sees it and steps down, and the cluster goes without a
+//! leader for an election: in the A6 chaos test, a partition healing cost
+//! every write a few seconds. Raft's answer is pre-vote, which openraft 0.9
+//! doesn't have; this is the same effect from outside it: every [`EVERY`]
+//! each other voter's Raft port is tried (a TCP connection), and openraft's
+//! elections are turned off while fewer than a majority, counting this
+//! node, answer.
 //!
 //! It never stops a reachable majority from electing: any node that can
 //! reach one keeps campaigning. A leader is unaffected (elections only

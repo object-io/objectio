@@ -142,10 +142,12 @@ class Client(IAMMixin, STSMixin, ConfigMixin, AccessMixin, ClusterMixin):
 
         ::
 
-            OBJECTIO_ENDPOINT   | OBJECTIO_URL                           (required)
-            OBJECTIO_ACCESS_KEY | OBJECTIO_ACCESS_KEY_FILE | AWS_ACCESS_KEY_ID
-            OBJECTIO_SECRET_KEY | OBJECTIO_SECRET_KEY_FILE | AWS_SECRET_ACCESS_KEY
-            OBJECTIO_REGION     | AWS_REGION | AWS_DEFAULT_REGION   (default us-east-1)
+            OBJECTIO_ENDPOINT        | OBJECTIO_URL                      (required)
+            OBJECTIO_ACCESS_KEY_FILE | OBJECTIO_ACCESS_KEY | AWS_ACCESS_KEY_ID
+            OBJECTIO_SECRET_KEY_FILE | OBJECTIO_SECRET_KEY | AWS_SECRET_ACCESS_KEY
+            OBJECTIO_REGION          | AWS_REGION | AWS_DEFAULT_REGION (default us-east-1)
+
+        For each, the first one set is used.
 
         The AWS names are accepted so one set of variables configures both this
         client and the boto3 client beside it.
