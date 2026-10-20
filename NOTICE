@@ -15,6 +15,7 @@ Third-party components
 ======================
 
 See `Cargo.lock` for the full dependency tree. Notable upstream components
-include tokio, axum, tonic, prost, reed-solomon-simd, redb, and ed25519-dalek.
-Each is distributed under its own upstream license (Apache-2.0, MIT, or
-dual).
+include tokio, axum, tonic, prost, reed-solomon-simd, redb, and ed25519-dalek,
+and Intel's ISA-L (BSD-3-Clause), whose erasure code is built from source
+and linked into every binary. Each is distributed under its own upstream
+license (Apache-2.0, MIT, BSD-3-Clause, or dual).

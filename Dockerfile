@@ -1,9 +1,8 @@
 # ObjectIO Multi-Stage Dockerfile
 # Builds all services with automatic platform detection
 #
-# Multi-Architecture Support:
-#   - linux/amd64 (x86_64): Uses ISA-L for accelerated erasure coding
-#   - linux/arm64 (aarch64): Uses pure Rust reed-solomon-simd
+# Multi-Architecture Support: linux/amd64 and linux/arm64, both erasure-
+# coding with ISA-L (one code on every build, so nodes of either mix).
 #
 # Build targets:
 #   docker build --target gateway -t objectio-gateway .
@@ -17,7 +16,7 @@
 #
 # Build args:
 #   RUST_VERSION - Rust version (default: 1.92)
-#   FEATURES - Override cargo features (default: auto-detect based on arch)
+#   FEATURES - Override cargo features (default: io-uring)
 
 # Match rust-toolchain.toml. The pin makes rustup fetch that exact toolchain on
 # the first cargo call regardless, so a stale value here only buys a download
@@ -57,9 +56,9 @@ ARG TARGETPLATFORM
 ARG TARGETARCH
 ARG TARGETOS
 
-# Install build dependencies
-# NASM is only needed for ISA-L on x86_64, but we install it anyway
-# (it's small and simplifies the Dockerfile)
+# Install build dependencies. ISA-L, which every build erasure-codes with,
+# is built from source by autotools (autoconf, automake, libtool) and its
+# bindings by libclang; on x86_64 it needs NASM too (below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf \
     automake \
@@ -102,14 +101,13 @@ COPY bin ./bin
 COPY tests ./tests
 RUN cargo chef prepare --recipe-path recipe.json
 
-# The features the image builds with, per architecture:
-# - x86_64/amd64: ISA-L for hardware-accelerated erasure coding (~3-5x
-#   faster than the pure Rust code via Intel's assembly routines);
-# - both: io-uring. The image is always Linux and tokio-uring is pure Rust,
-#   so it adds no build or runtime library: the documented +25% throughput
-#   and -43% p99.9 on 4 MiB stripes. The helm deployment (the production
-#   path) once ran a less optimised build than the standalone aio binary
-#   because the image had never enabled it.
+# The features the image builds with: io-uring, on both architectures
+# (ISA-L erasure coding is not a feature: every build has it). The image
+# is always Linux and tokio-uring is pure Rust, so it adds no build or
+# runtime library: the documented +25% throughput and -43% p99.9 on 4 MiB
+# stripes. The helm deployment (the production path) once ran a less
+# optimised build than the standalone aio binary because the image had
+# never enabled it.
 # grep-pcre2 is deliberately not here: it links a C library, so it needs
 # libpcre2-dev in this stage and libpcre2-8 in runtime-base. Enabling a
 # feature whose shared library the runtime lacks is how the v0.0.1 binary
@@ -119,11 +117,8 @@ FROM chef AS builder
 ARG TARGETARCH
 ARG TARGETPLATFORM
 ARG FEATURES=""
-RUN set -e; ARCH="$(uname -m)"; \
-    if [ -n "$FEATURES" ]; then F="$FEATURES"; \
-    elif [ "$TARGETARCH" = "amd64" ] || [ "$ARCH" = "x86_64" ]; then F="isal,io-uring"; \
-    elif [ "$TARGETARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then F="io-uring"; \
-    else F=""; fi; \
+RUN set -e; \
+    if [ -n "$FEATURES" ]; then F="$FEATURES"; else F="io-uring"; fi; \
     echo "platform ${TARGETPLATFORM:-native}, features: ${F:-default}"; \
     echo "$F" > /build/.features
 COPY --from=planner /build/recipe.json recipe.json

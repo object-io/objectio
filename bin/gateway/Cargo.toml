@@ -23,8 +23,6 @@ tikv-jemallocator = { workspace = true }
 
 [features]
 default = []
-# ISA-L erasure coding (x86_64).
-isal = ["objectio-gateway/isal"]
 # Shard transfers over Mooncake Transfer Engine.
 rdma = ["objectio-gateway/rdma"]
 # The PCRE2 grep engine.

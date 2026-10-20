@@ -67,8 +67,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # ISA-L, which every build erasure-codes with, is built from source.
+      - name: protoc and ISA-L's build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev
       # The workspace sets clippy::all + pedantic + nursery in Cargo.toml and
       # the Makefile passes -D warnings; match it rather than letting CI be
       # laxer than the local command.
@@ -84,18 +85,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: protoc and mold
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      - name: protoc, mold and ISA-L's build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # Excluding the e2e package: it boots a cluster and belongs in its own
       # job so its runtime and its failures stay legible.
       - run: cargo test --workspace --exclude objectio-e2e
-      # The release erasure-codes with ISA-L and does disk I/O through
-      # io_uring; without these the tests above run the pure-Rust code and
-      # pread only. An ISA-L decode bug that rebuilt shards from zeros
-      # passed here for that reason (the B2 soak found it).
-      - name: ISA-L and io_uring deps
-        run: sudo apt-get install -y nasm autoconf automake libtool libclang-dev
-      - run: cargo test -p objectio-erasure --features isal
+      # The release does disk I/O through io_uring; without it the tests
+      # above run pread only.
       - run: cargo test -p objectio-storage --features io-uring
       # The RocksDB metadata engine (B27): its conformance suite and the
       # refusal to open the other engine's directory.
@@ -115,8 +111,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: protoc and mold
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      - name: protoc, mold and ISA-L's build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist. build.rs creates it empty when absent so a
       # clone still builds, but the e2e job should exercise the real thing.
       - uses: actions/setup-node@v4
@@ -194,8 +190,8 @@ jobs:
           fetch-depth: 0 # the previous release is the latest tag
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: protoc and mold
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold
+      - name: protoc, mold and ISA-L's build tools
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       - name: find the previous release
         id: previous
         run: |
@@ -333,8 +329,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # The release compiles objectio-aio with feature flags nothing else turns
-    # on — ISA-L erasure coding, io_uring, the PCRE2 and Hyperscan grep
-    # engines. A cfg-gated path that no longer compiles under those is
+    # on — io_uring, the PCRE2 and Hyperscan grep engines. A cfg-gated path that no longer compiles under those is
     # invisible until a release is half-done: the version bump and tag land in
     # `prepare`, and the binary build fails after.
     steps:
@@ -352,7 +347,7 @@ jobs:
       - name: build with the release feature set
         run: |
           cargo build --bin objectio-aio \
-            --features isal,io-uring,grep-pcre2
+            --features io-uring,grep-pcre2
 
       # The release binary is downloaded and run on machines that are not this
       # runner. v0.0.1's linux-amd64 build succeeded here and then failed on
@@ -388,7 +383,7 @@ jobs:
     timeout-minutes: 60
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
-      FEATURES: objectio-aio/isal,objectio-aio/io-uring
+      FEATURES: objectio-aio/io-uring
       BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
     steps:
       - uses: actions/checkout@v4

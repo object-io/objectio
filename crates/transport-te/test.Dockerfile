@@ -10,7 +10,7 @@
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y git curl ca-certificates sudo pkg-config libclang-dev clang \
-    protobuf-compiler
+    protobuf-compiler nasm autoconf automake libtool
 ARG MOONCAKE_REF=c3fa13ecaf1038df933dcb784ff8ffe026381100
 RUN git clone https://github.com/kvcache-ai/Mooncake /mooncake && cd /mooncake \
  && git checkout ${MOONCAKE_REF} && git submodule update --init --recursive

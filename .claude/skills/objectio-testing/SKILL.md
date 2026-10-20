@@ -21,14 +21,13 @@ without it.
 ```bash
 cargo test -p objectio-meta                          # one crate
 cargo test -p objectio-meta --lib -- keep_progress   # tests whose name matches
-cargo test -p objectio-erasure --features isal       # ISA-L, x86_64 only
+cargo test -p objectio-erasure                       # ISA-L on x86_64 and arm64
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-`isal` is declared on `objectio-erasure` and forwarded by the gateway, OSD
-and aio crates; pass it with `--workspace` or to those, not to other
-crates.
+Every build erasure-codes with ISA-L, built from source: it needs
+autoconf, automake, libtool and libclang-dev (NASM too on x86_64).
 
 ## End-to-end tests
 

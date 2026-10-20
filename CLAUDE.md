@@ -57,15 +57,14 @@ explanation; if they're wrong, fix them in the same PR.
 
 ```bash
 make build | build-release | test | lint | fmt | fmt-fix | ci | coverage
-cargo test -p objectio-erasure --features isal          # one crate
+cargo test -p objectio-erasure                          # one crate
 cargo test -p objectio-e2e --test <file>                # e2e: spawns target/debug binaries; build them first
 cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
 ```
 
-- Needs `protoc`. `isal` (x86_64 only) needs NASM, autoconf, automake,
-  libtool, libclang-dev. It is declared on `objectio-erasure` and forwarded
-  by gateway, osd and aio: use `--workspace --features isal` or
-  `--bin objectio-aio --features isal`, not on other crates.
+- Needs `protoc`, and for ISA-L (every build erasure-codes with it, on
+  x86_64 and arm64; built from source) autoconf, automake, libtool,
+  libclang-dev, and NASM on x86_64.
 - Clippy runs with `-D warnings`. The `pedantic` and `nursery` groups apply
   only where a crate opts into `[lints] workspace = true` (today 5 of the
   17 library crates and 3 of the 10 binaries).
@@ -99,7 +98,7 @@ prefix; packages and binaries keep it: `crates/gateway` is the package
 | `crates/common` | | `Error`/`Result`, shared types, metrics, format levels (`version`) |
 | `crates/proto` | | gRPC definitions (`proto/*.proto`, built by its `build.rs`); meta channel (`transport`) |
 | `crates/storage` | | The OSD's disk engine and metadata store |
-| `crates/erasure` | | Erasure coding (rust-simd, ISA-L) |
+| `crates/erasure` | | Erasure coding: MDS on ISA-L, LRC on reed-solomon-simd |
 | `crates/placement` | | CRUSH placement, topology |
 | `crates/meta-store` | | Meta's redb tables, Raft storage and network |
 | `crates/block` | | Block engine: volumes, write cache, journal |

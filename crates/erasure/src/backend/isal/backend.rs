@@ -1,18 +1,14 @@
-//! ISA-L backend implementation
-//!
-//! Uses the `erasure-isa-l` crate for hardware-accelerated erasure coding.
-//! The crate bundles ISA-L source and compiles it during build, so no system
-//! library installation is required (but nasm, autoconf, automake, libtool are needed).
+//! The ISA-L MDS backend, through the `erasure-isa-l` crate.
 
 use crate::ErasureError;
 use crate::backend::{BackendCapabilities, BackendResult, ErasureBackend};
 use erasure_isa_l::erasure::ErasureCode;
 use std::num::NonZeroUsize;
 
-/// ISA-L MDS Reed-Solomon backend
+/// MDS Reed-Solomon on ISA-L's Vandermonde matrix (`gf_gen_rs_matrix`).
 ///
-/// Uses Intel ISA-L for hardware-accelerated erasure coding on x86/x86_64.
-/// Works on both Intel and AMD processors (uses standard AVX/AVX2/AVX-512).
+/// ISA-L picks its code for the CPU at run time (AVX2, AVX-512 and GFNI on
+/// x86_64; NEON and SVE on aarch64); every one writes the same parity.
 pub struct IsalBackend {
     k: usize,
     m: usize,
@@ -44,8 +40,8 @@ impl IsalBackend {
             return Err(ErasureError::InvalidConfig("k + m must be <= 255".into()));
         }
 
-        // Use Reed-Solomon (Vandermonde) matrix - more reliable than Cauchy
-        // in some ISA-L versions
+        // The Vandermonde matrix, not ISA-L's Cauchy one: stripes are
+        // coded with it, and decode only with it.
         let k_nz = NonZeroUsize::new(k).unwrap(); // Safe: we checked k > 0 above
         let m_nz = NonZeroUsize::new(m).unwrap(); // Safe: we checked m > 0 above
         let encoder = ErasureCode::with_reed_solomon(k_nz, m_nz).map_err(|e| {

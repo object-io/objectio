@@ -25,9 +25,7 @@
 //! let backend = BackendFactory::create_mds(&config).unwrap();
 //! ```
 
-use crate::backend::{
-    BackendConfig, BackendFactory, BackendType, ErasureBackend, LrcBackend, LrcConfig,
-};
+use crate::backend::{BackendConfig, BackendFactory, ErasureBackend, LrcBackend, LrcConfig};
 use bytes::Bytes;
 use objectio_common::{ErasureConfig, ErasureType, Error as CommonError, Result};
 use std::sync::Arc;
@@ -130,12 +128,13 @@ enum CodecBackend {
 
 /// Erasure codec supporting both MDS Reed-Solomon and LRC
 ///
-/// This is the high-level API for erasure coding. It automatically selects
-/// the best backend based on the configuration and platform.
+/// This is the high-level API for erasure coding. Every build codes a
+/// stripe alike: MDS with ISA-L, LRC's global parity with reed-solomon-simd.
 ///
 /// # MDS Mode (default)
 ///
-/// Standard Reed-Solomon coding where any k shards can reconstruct the data.
+/// Reed-Solomon on ISA-L's Vandermonde matrix: any k shards rebuild the
+/// data, for the profiles [`crate::is_mds`] allows.
 ///
 /// # LRC Mode
 ///
@@ -148,16 +147,7 @@ pub struct ErasureCodec {
 
 impl ErasureCodec {
     /// Create a new erasure codec with the given configuration
-    ///
-    /// Automatically selects the best backend based on the configuration
-    /// and platform (ISA-L on x86 if available, rust_simd otherwise).
     pub fn new(config: ErasureConfig) -> Result<Self> {
-        Self::on_backend(config, BackendType::Auto)
-    }
-
-    /// As [`new`](Self::new), on the backend named: what a node built
-    /// another way would code with.
-    fn on_backend(config: ErasureConfig, backend_type: BackendType) -> Result<Self> {
         if config.data_shards == 0 {
             return Err(ErasureError::InvalidConfig("data_shards must be > 0".into()).into());
         }
@@ -167,8 +157,7 @@ impl ErasureCodec {
 
         let backend = match config.ec_type {
             ErasureType::Mds => {
-                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards)
-                    .with_backend(backend_type);
+                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards);
                 let mds_backend = BackendFactory::create_mds(&backend_config)?;
                 CodecBackend::Mds(mds_backend)
             }
@@ -177,7 +166,7 @@ impl ErasureCodec {
                 global_parity,
             } => {
                 let lrc_config = LrcConfig::new(config.data_shards, local_parity, global_parity);
-                let backend_config = BackendConfig::lrc(lrc_config).with_backend(backend_type);
+                let backend_config = BackendConfig::lrc(lrc_config);
                 let lrc_backend = BackendFactory::create_lrc(&backend_config)?;
                 CodecBackend::Lrc(lrc_backend)
             }
@@ -237,8 +226,9 @@ impl ErasureCodec {
 
     /// Shard size for `len` bytes over `k` data shards.
     ///
-    /// Must be a multiple of 64 for SIMD alignment (reed-solomon-simd
-    /// requires at least a multiple of 2, we use 64 for performance).
+    /// A multiple of 64, and at least 64: ISA-L codes vectors of 32 bytes
+    /// or more, reed-solomon-simd (LRC) needs an even size, and 64 keeps
+    /// every SIMD width aligned. A stripe's layout depends on it.
     /// Bytes per shard when `len` bytes are split over `k` data shards:
     /// data byte `p` is in shard `p / shard` at offset `p % shard`.
     #[must_use]
@@ -726,12 +716,11 @@ impl ErasureCodec {
                     .iter()
                     .map(|s| s.as_ref().map(|v| v.as_slice()))
                     .collect();
-                // The backends do not return what `decode` documents: both
-                // hand back every shard, data first, and rust-simd fills a
-                // missing parity shard with zeros. Taking that output as
+                // The backend does not return what `decode` documents: it
+                // hands back every shard, data first. Taking that output as
                 // "the missing shards, in order" rebuilt the wrong bytes.
-                // Only the data shards are reliable, so take those and
-                // re-encode the stripe for the parity.
+                // Take the data shards and re-encode the stripe for the
+                // parity.
                 let decoded = backend
                     .decode(&shard_refs, shard_size, missing_indices)
                     .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
@@ -955,57 +944,6 @@ mod tests {
         }
     }
 
-    /// ISA-L (GF(2^8)) and reed-solomon-simd (GF(2^16)) lay a stripe out
-    /// alike and agree on its data shards, but not on its parity: a node
-    /// built with the other one rebuilt other bytes from it, and served
-    /// them. Checked, neither returns what it can't show is the data.
-    #[cfg(all(feature = "isal", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[test]
-    fn a_stripe_from_the_other_codec_is_never_decoded_into_wrong_bytes() {
-        let config = ErasureConfig::new(4, 2);
-        let isal = ErasureCodec::on_backend(config, BackendType::IsaL).unwrap();
-        let simd = ErasureCodec::on_backend(config, BackendType::RustSimd).unwrap();
-        let data = body(70_001);
-        let by_isal = isal.encode(&data).unwrap();
-        let by_simd = simd.encode(&data).unwrap();
-        assert_eq!(by_isal[..4], by_simd[..4], "data shards agree");
-        assert_ne!(by_isal[4..], by_simd[4..], "parity does not");
-
-        for (stripe, writer, reader) in [(&by_isal, &isal, &simd), (&by_simd, &simd, &isal)] {
-            let recorded = checksums(stripe);
-            let mut lost = without(stripe, &[1]);
-            assert_ne!(
-                reader.decode(&mut lost, data.len()).unwrap(),
-                data,
-                "the other codec rebuilds other bytes"
-            );
-            assert!(matches!(
-                reader.decode_verified(&lost, data.len(), &recorded),
-                Err(ErasureError::Unverified(_))
-            ));
-            assert_eq!(
-                writer
-                    .decode_verified(&lost, data.len(), &recorded)
-                    .unwrap(),
-                data
-            );
-            // No checksum for the lost shard: the spare parity, from the
-            // writer's codec, does not bear the reader's decode out.
-            let mut unrecorded = recorded.clone();
-            unrecorded[1] = None;
-            assert!(matches!(
-                reader.decode_verified(&lost, data.len(), &unrecorded),
-                Err(ErasureError::Unverified(_))
-            ));
-            assert_eq!(
-                writer
-                    .decode_verified(&lost, data.len(), &unrecorded)
-                    .unwrap(),
-                data
-            );
-        }
-    }
-
     /// An LRC stripe is coded as the PUT path codes it
     /// (`RustSimdLrcBackend`), on every build: an ISA-L LRC backend wrote
     /// its global parity with ISA-L, which other nodes decoded as
@@ -1028,7 +966,6 @@ mod tests {
             stripe == put,
             "LRC coded otherwise than the PUT path codes it"
         );
-        assert!(ErasureCodec::on_backend(ErasureConfig::lrc(6, 2, 2), BackendType::IsaL).is_err());
     }
 
     #[test]

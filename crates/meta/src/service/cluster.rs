@@ -1655,6 +1655,7 @@ impl MetaService {
         if pool.name.is_empty() {
             return Err(Status::invalid_argument("pool name is required"));
         }
+        check_erasure_code(&pool)?;
         if self.pools.read().contains_key(&pool.name) {
             return Err(Status::already_exists(format!(
                 "pool '{}' already exists",
@@ -1796,6 +1797,7 @@ impl MetaService {
             .into_inner()
             .pool
             .ok_or_else(|| Status::invalid_argument("missing pool"))?;
+        check_erasure_code(&pool)?;
         let expected_bytes = {
             let pools = self.pools.read();
             let current = pools
@@ -2265,5 +2267,67 @@ impl MetaService {
         Ok(Response::new(objectio_proto::metadata::HealDoneResponse {
             done,
         }))
+    }
+}
+
+/// Refuse an MDS pool whose stripes some loss of m shards or fewer would
+/// leave undecodable. MDS stripes are coded with ISA-L's Vandermonde
+/// matrix on every build, and it is MDS only for some (k, m)
+/// ([`objectio_erasure::is_mds`]): a pool made with another profile took
+/// writes it could not always read back.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_erasure_code(pool: &PoolConfig) -> Result<(), Status> {
+    if pool.ec_type() != ErasureType::ErasureMds {
+        return Ok(());
+    }
+    let (k, m) = (pool.ec_k as usize, pool.ec_m as usize);
+    let max = objectio_erasure::backend::isal::MAX_SHARDS;
+    if k == 0 || k + m > max {
+        return Err(Status::invalid_argument(format!(
+            "pool '{}': {k}+{m} is not an erasure code: k is at least 1 and k+m at most {max}",
+            pool.name
+        )));
+    }
+    if m > 0 && !objectio_erasure::is_mds(k, m) {
+        return Err(Status::invalid_argument(format!(
+            "pool '{}': {k}+{m} can't rebuild its data after every loss of {m} shards. \
+             MDS profiles: up to 3 parity shards with any k, 4 with k up to 21, and 5+5 \
+             (or, the other way round, k up to 3 with any m, k = 4 with m up to 21)",
+            pool.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(ec_type: ErasureType, k: u32, m: u32) -> PoolConfig {
+        let mut pool = PoolConfig {
+            name: "p".into(),
+            ec_k: k,
+            ec_m: m,
+            ..Default::default()
+        };
+        pool.set_ec_type(ec_type);
+        pool
+    }
+
+    #[test]
+    fn only_mds_profiles_make_a_pool() {
+        for (k, m) in [(4, 2), (8, 3), (21, 4), (5, 5), (3, 20), (1, 0)] {
+            assert!(
+                check_erasure_code(&pool(ErasureType::ErasureMds, k, m)).is_ok(),
+                "{k}+{m}"
+            );
+        }
+        for (k, m) in [(6, 5), (5, 6), (22, 4), (10, 5), (0, 2), (250, 6)] {
+            let e = check_erasure_code(&pool(ErasureType::ErasureMds, k, m)).unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{k}+{m}");
+        }
+        // Not an MDS stripe: not this check's.
+        assert!(check_erasure_code(&pool(ErasureType::ErasureLrc, 10, 5)).is_ok());
+        assert!(check_erasure_code(&pool(ErasureType::ErasureReplication, 0, 0)).is_ok());
     }
 }

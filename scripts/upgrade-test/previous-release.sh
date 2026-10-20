@@ -30,9 +30,18 @@ if [ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" != "$want" ] ||
     mkdir -p "$base"
     git -C "$root" worktree add --detach "$src" "$tag" >&2
 fi
+# Built as that release was released for this machine. Up to 0.1.0-rc.1,
+# MDS stripes were coded with ISA-L only with the `isal` feature, which its
+# x86_64 release had and its arm64 one didn't; this release codes with
+# ISA-L everywhere. Built without it on x86_64, the old nodes would write
+# parity no release ever shipped there.
+features=()
+if [ "$(uname -m)" = x86_64 ] && grep -q '^isal = ' "$src/crates/erasure/Cargo.toml"; then
+    features=(--features objectio-erasure/isal)
+fi
 (
     cd "$src"
-    cargo build -q --target-dir "$base/target" \
+    cargo build -q --target-dir "$base/target" "${features[@]}" \
         --bin objectio-meta --bin objectio-osd --bin objectio-gateway >&2
 )
 for b in objectio-meta objectio-osd objectio-gateway; do

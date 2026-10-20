@@ -21,7 +21,7 @@ documentation is at **[object-io.github.io](https://object-io.github.io)**.
 | Area | State |
 |---|---|
 | **S3** | The most complete part, and the one being made production-ready first: core operations, multipart, versioning, Object Lock, lifecycle, policies, SSE-S3/KMS/C, CORS, presigned and POST uploads, STS, tenancy, audit, bucket logging, bucket replication. Checked against the [ceph s3-tests](https://object-io.github.io/latest/developer-guide/s3-compatibility/) suite on every run. |
-| **Storage core** | Erasure coding (Reed-Solomon 4+2 by default; ISA-L on x86), placement groups across failure domains, repair, drain, small-object packing, a Raft metadata service that survives losing a node. Rolling upgrades from one release to the next. |
+| **Storage core** | Erasure coding (Reed-Solomon 4+2 by default, with ISA-L on x86_64 and arm64), placement groups across failure domains, repair, drain, small-object packing, a Raft metadata service that survives losing a node. Rolling upgrades from one release to the next. |
 | **Data lake** | Iceberg REST Catalog, Unity Catalog API and Delta Sharing are built, but not yet tested end to end against real engines (Spark, Trino, PyIceberg): a preview. |
 | **Block** | Volumes over NBD and gRPC with snapshots, clones and thin provisioning. QoS is not enforced, and iSCSI/NVMe-oF are not built yet: a preview. |
 | **File** | Planned. |
@@ -84,11 +84,11 @@ What each covers: [skills/README.md](skills/README.md).
 
 ```sh
 # macOS
-brew install nasm autoconf automake libtool llvm protobuf
-# Ubuntu / Debian
+brew install autoconf automake libtool llvm protobuf
+# Ubuntu / Debian (nasm on x86_64 only)
 sudo apt-get install build-essential nasm autoconf automake libtool libclang-dev protobuf-compiler
 
-make build            # debug build, with ISA-L (x86_64); on ARM: cargo build --workspace
+make build            # debug build; erasure coding is ISA-L's, built from source
 make test             # all tests (tests/e2e runs real clusters of processes)
 ```
 

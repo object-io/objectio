@@ -26,7 +26,7 @@ end). This skill is the shape of the job and the things that go wrong.
 
 Three ways to run it: **`objectio-aio`**, everything in one process (a
 laptop, a demo, CI; no HA, not for production); **binaries under systemd**
-on Linux (amd64 with ISA-L, arm64 pure Rust; they mix in one cluster); the
+on Linux (amd64 and arm64, both coding with ISA-L; they mix in one cluster); the
 **Helm chart** `oci://ghcr.io/object-io/charts/objectio`, one image
 `ghcr.io/object-io/objectio:<tag>` for every service. A release's
 downloads are `objectio-aio-<tag>-{linux-amd64,linux-arm64,darwin-arm64}`;

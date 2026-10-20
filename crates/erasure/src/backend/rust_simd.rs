@@ -1,8 +1,8 @@
-//! Pure Rust SIMD backend using reed-solomon-simd
+//! LRC on reed-solomon-simd
 //!
-//! This backend provides portable erasure coding using the `reed-solomon-simd`
-//! crate, which automatically uses SIMD instructions where available (SSE, AVX,
-//! NEON).
+//! An LRC stripe's local parity is the XOR of its group; its global parity
+//! is reed-solomon-simd's (GF(2^16)) over all the data shards, on every
+//! build. (MDS stripes are ISA-L's: `super::isal`.)
 
 use super::{
     BackendCapabilities, BackendResult, ErasureBackend, LocalGroup, LrcBackend, LrcConfig,
@@ -10,238 +10,6 @@ use super::{
 };
 use crate::ErasureError;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
-
-/// MDS Reed-Solomon backend using reed-solomon-simd
-///
-/// This provides standard Maximum Distance Separable erasure coding.
-/// Any k shards can reconstruct the original data.
-pub struct RustSimdBackend {
-    data_shards: u8,
-    parity_shards: u8,
-}
-
-impl RustSimdBackend {
-    /// Create a new MDS backend
-    pub fn new(data_shards: u8, parity_shards: u8) -> Result<Self, ErasureError> {
-        if data_shards == 0 {
-            return Err(ErasureError::InvalidConfig(
-                "data_shards must be > 0".into(),
-            ));
-        }
-        if parity_shards == 0 {
-            return Err(ErasureError::InvalidConfig(
-                "parity_shards must be > 0".into(),
-            ));
-        }
-        if data_shards as usize + parity_shards as usize > 255 {
-            return Err(ErasureError::InvalidConfig(
-                "total shards must be <= 255".into(),
-            ));
-        }
-        Ok(Self {
-            data_shards,
-            parity_shards,
-        })
-    }
-}
-
-impl ErasureBackend for RustSimdBackend {
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            name: "rust_simd",
-            supports_lrc: false,
-            supports_simd: true,
-            max_data_shards: 255,
-            max_parity_shards: 255,
-        }
-    }
-
-    fn data_shards(&self) -> usize {
-        self.data_shards as usize
-    }
-
-    fn parity_shards(&self) -> usize {
-        self.parity_shards as usize
-    }
-
-    fn encode(&self, data_shards: &[&[u8]], shard_size: usize) -> BackendResult<Vec<Vec<u8>>> {
-        let k = self.data_shards as usize;
-        let m = self.parity_shards as usize;
-
-        if data_shards.len() != k {
-            return Err(ErasureError::InvalidConfig(format!(
-                "expected {} data shards, got {}",
-                k,
-                data_shards.len()
-            )));
-        }
-
-        // Verify all shards are same size
-        for (i, shard) in data_shards.iter().enumerate() {
-            if shard.len() != shard_size {
-                return Err(ErasureError::InvalidConfig(format!(
-                    "shard {} has size {}, expected {}",
-                    i,
-                    shard.len(),
-                    shard_size
-                )));
-            }
-        }
-
-        let mut parity = vec![vec![0u8; shard_size]; m];
-        let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(Vec::as_mut_slice).collect();
-        self.encode_parity_into(data_shards, &mut parity_refs, shard_size)?;
-
-        let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k + m);
-        shards.extend(data_shards.iter().map(|s| s.to_vec()));
-        shards.extend(parity);
-        Ok(shards)
-    }
-
-    fn encode_parity_into(
-        &self,
-        data_shards: &[&[u8]],
-        parity: &mut [&mut [u8]],
-        shard_size: usize,
-    ) -> BackendResult<()> {
-        let k = self.data_shards as usize;
-        let m = self.parity_shards as usize;
-        super::check_parity_buffers(parity, m, shard_size)?;
-        if data_shards.len() != k || data_shards.iter().any(|s| s.len() != shard_size) {
-            return Err(ErasureError::ShardSizeMismatch);
-        }
-
-        let mut encoder = ReedSolomonEncoder::new(k, m, shard_size)
-            .map_err(|e| ErasureError::InvalidConfig(e.to_string()))?;
-        for shard in data_shards {
-            encoder
-                .add_original_shard(shard)
-                .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
-        }
-        let result = encoder
-            .encode()
-            .map_err(|e| ErasureError::EncodingFailed(e.to_string()))?;
-
-        // reed-solomon-simd computes into its own work buffer, so parity is
-        // copied out once; the data shards are never copied.
-        for (dst, src) in parity.iter_mut().zip(result.recovery_iter()) {
-            dst.copy_from_slice(src);
-        }
-        Ok(())
-    }
-
-    fn decode(
-        &self,
-        shards: &[Option<&[u8]>],
-        shard_size: usize,
-        _missing_indices: &[usize],
-    ) -> BackendResult<Vec<Vec<u8>>> {
-        let k = self.data_shards as usize;
-        let m = self.parity_shards as usize;
-
-        let available = shards.iter().filter(|s| s.is_some()).count();
-        if available < k {
-            return Err(ErasureError::InsufficientShards {
-                available,
-                required: k,
-            });
-        }
-
-        if shards.len() != k + m {
-            return Err(ErasureError::InvalidConfig(format!(
-                "expected {} shards, got {}",
-                k + m,
-                shards.len()
-            )));
-        }
-
-        let mut decoder = ReedSolomonDecoder::new(k, m, shard_size)
-            .map_err(|e| ErasureError::InvalidConfig(e.to_string()))?;
-
-        // Add data shards (indices 0 to k-1) using add_original_shard
-        for (i, shard) in shards.iter().enumerate().take(k) {
-            if let Some(data) = shard {
-                decoder
-                    .add_original_shard(i, data)
-                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
-            }
-        }
-
-        // Add parity shards (indices k to k+m-1) using add_recovery_shard
-        for i in 0..m {
-            if let Some(data) = shards[k + i] {
-                decoder
-                    .add_recovery_shard(i, data)
-                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
-            }
-        }
-
-        let result = decoder
-            .decode()
-            .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
-
-        // Build full shard list, filling in reconstructed shards
-        let mut all_shards: Vec<Vec<u8>> = Vec::with_capacity(k + m);
-
-        // Add data shards (original or reconstructed)
-        for (i, shard) in shards.iter().enumerate().take(k) {
-            if let Some(data) = shard {
-                all_shards.push(data.to_vec());
-            } else if let Some(restored) = result.restored_original(i) {
-                all_shards.push(restored.to_vec());
-            } else {
-                return Err(ErasureError::DecodingFailed(format!(
-                    "failed to restore data shard {}",
-                    i
-                )));
-            }
-        }
-
-        // Add parity shards (original or placeholder)
-        // Note: reed-solomon-simd focuses on restoring original shards
-        // Parity reconstruction would require re-encoding
-        for i in 0..m {
-            if let Some(data) = shards[k + i] {
-                all_shards.push(data.to_vec());
-            } else {
-                // For missing parity, we need to re-encode from data shards
-                // For now, add placeholder - actual parity recovery would need encode
-                all_shards.push(vec![0u8; shard_size]);
-            }
-        }
-
-        Ok(all_shards)
-    }
-
-    fn verify(&self, shards: &[&[u8]]) -> BackendResult<bool> {
-        let k = self.data_shards as usize;
-        let m = self.parity_shards as usize;
-
-        if shards.len() != k + m {
-            return Ok(false);
-        }
-
-        // Check all shards have same size
-        if let Some(first_len) = shards.first().map(|s| s.len()) {
-            if !shards.iter().all(|s| s.len() == first_len) {
-                return Ok(false);
-            }
-
-            // Re-encode data shards and compare parity
-            let data_shards: Vec<&[u8]> = shards[..k].to_vec();
-            let encoded = self.encode(&data_shards, first_len)?;
-
-            // Compare parity shards
-            for i in 0..m {
-                if encoded[k + i] != shards[k + i] {
-                    return Ok(false);
-                }
-            }
-        }
-
-        Ok(true)
-    }
-}
 
 /// LRC backend using reed-solomon-simd with layered encoding
 ///
@@ -446,12 +214,14 @@ impl ErasureBackend for RustSimdLrcBackend {
 
             // Verify global parity
             let data_shards: Vec<&[u8]> = shards[..k].to_vec();
-            let mds_backend = RustSimdBackend::new(k as u8, g as u8)?;
-            let encoded = mds_backend.encode(&data_shards, first_len)?;
-            for i in 0..g {
-                if encoded[k + i] != shards[k + l + i] {
-                    return Ok(false);
-                }
+            let encoded = self.encode_lrc(&data_shards, first_len)?;
+            if encoded
+                .global_parity_shards
+                .iter()
+                .zip(&shards[k + l..k + l + g])
+                .any(|(want, got)| want.as_slice() != *got)
+            {
+                return Ok(false);
             }
         }
 
@@ -638,47 +408,6 @@ impl LrcBackend for RustSimdLrcBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mds_encode_decode() {
-        let backend = RustSimdBackend::new(4, 2).unwrap();
-
-        let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 1024]).collect();
-        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
-
-        let shards = backend.encode(&data_refs, 1024).unwrap();
-        assert_eq!(shards.len(), 6);
-
-        // All shards present - decode should return all 6 shards
-        let shard_refs: Vec<Option<&[u8]>> = shards.iter().map(|s| Some(s.as_slice())).collect();
-        let decoded = backend.decode(&shard_refs, 1024, &[]).unwrap();
-        assert_eq!(decoded.len(), 6);
-        // Data shards should match original
-        for i in 0..4 {
-            assert_eq!(decoded[i], data[i]);
-        }
-    }
-
-    #[test]
-    fn test_mds_decode_with_missing() {
-        let backend = RustSimdBackend::new(4, 2).unwrap();
-
-        let data: Vec<Vec<u8>> = (0..4).map(|i| vec![i as u8; 1024]).collect();
-        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
-
-        let shards = backend.encode(&data_refs, 1024).unwrap();
-
-        // Simulate missing shard 0
-        let mut shard_refs: Vec<Option<&[u8]>> =
-            shards.iter().map(|s| Some(s.as_slice())).collect();
-        shard_refs[0] = None;
-
-        let decoded = backend.decode(&shard_refs, 1024, &[0]).unwrap();
-        // decode returns all shards, not just reconstructed
-        assert_eq!(decoded.len(), 6);
-        // Reconstructed shard should match original
-        assert_eq!(decoded[0], data[0]);
-    }
 
     #[test]
     fn test_lrc_encode() {

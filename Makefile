@@ -31,19 +31,19 @@ all: build
 
 ## Build all binaries in debug mode
 build:
-	cargo build --workspace --features isal
+	cargo build --workspace
 
 ## Build all binaries in release mode
 build-release:
-	cargo build --workspace --release --features isal
+	cargo build --workspace --release
 
 ## Run all tests
 test:
-	cargo test --workspace --features isal
+	cargo test --workspace
 
 ## Run clippy linter
 lint:
-	cargo clippy --workspace --all-targets --features isal -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 ## Check code formatting
 fmt:
@@ -227,7 +227,7 @@ ci: fmt lint test
 
 ## Generate code coverage report
 coverage:
-	cargo llvm-cov --workspace --features isal --html
+	cargo llvm-cov --workspace --html
 
 # =============================================================================
 # Help
@@ -261,9 +261,7 @@ help:
 	@echo "  docker-multiarch       Build & push all images for amd64 + arm64"
 	@echo "  docker-multiarch-local Build for current platform and load locally"
 	@echo ""
-	@echo "  Platform notes:"
-	@echo "    - linux/amd64: Uses ISA-L for ~3-5x faster erasure coding"
-	@echo "    - linux/arm64: Uses pure Rust SIMD (no ISA-L)"
+	@echo "  Both erasure-code with ISA-L: their nodes mix in one cluster."
 	@echo ""
 	@echo "Kind (Kubernetes) Cluster — the supported dev path:"
 	@echo "  kind-up        Create Kind cluster + deploy full stack"

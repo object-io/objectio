@@ -115,11 +115,8 @@ started=$(date -u +%FT%TZ)
 echo "$(date +%T) run $run: $profile soak of ${commit:0:8} $subject"
 
 cd "$repo"
-# ISA-L is x86_64 only: without the release features elsewhere.
-cargo build --release --features isal,io-uring \
+cargo build --release --features io-uring \
     --bin objectio-meta --bin objectio-osd --bin objectio-gateway > "$dir/build.log" 2>&1 ||
-    cargo build --release \
-        --bin objectio-meta --bin objectio-osd --bin objectio-gateway >> "$dir/build.log" 2>&1 ||
     { echo "run $run: the build failed, $dir/build.log" >&2; exit 1; }
 cp target/release/objectio-meta target/release/objectio-osd target/release/objectio-gateway "$home/bin/"
 "$harness/cluster.sh" down > "$dir/cluster-down.log" 2>&1
