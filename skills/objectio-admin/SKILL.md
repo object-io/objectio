@@ -47,13 +47,14 @@ by the admin API (403), by design.
 | Caller | Reaches |
 |---|---|
 | **System admin** (the key meta prints on first boot) | Everything: tenants, pools, nodes, OSDs, PGs, upgrade, stored config, KMS keys; any tenant's identities and buckets with `--tenant` |
-| **Tenant admin** (a user in its tenant's `admin_users`) | Its own tenant only: users, keys, groups, policies, roles, buckets, provision, its Block Public Access, audit and replication targets, its OIDC provider `t-<tenant>`, warehouse create/delete |
+| **Tenant admin** (a user in its tenant's `admin_users`) | Its own tenant only: users, keys, groups, policies, roles, buckets, provision, its Block Public Access, audit and replication targets, its OIDC provider `t-<tenant>`, its warehouses |
 
 Without `--tenant`, a command acts in the caller's own tenant, which is
 system scope for the system admin. A tenant admin cannot name another
 tenant. `user list`, `bucket list` and `warehouse list` have no tenant on
-the server; `--tenant` filters their answer. Cluster, node, pool and PG
-commands answer a tenant admin with 403, and so does `warehouse list`.
+the server: a tenant admin gets its tenant's, the system admin every
+tenant's, and `--tenant` filters their answer. Cluster, node, pool and PG
+commands answer a tenant admin with 403.
 
 **The system admin bypasses every policy**, an explicit Deny included, and
 reaches every tenant's buckets. Its requests still show in the bucket's
@@ -117,6 +118,10 @@ eval "$(obioctl sts assume-role-with-web-identity \
 A tenant role accepts tokens from its tenant's provider only. Sessions
 last from 900 seconds to the role's `--max-session-seconds` (default an
 hour, at most 12). Only the system admin may set a provider's `system_admin`.
+A tenant's `oidc_provider` must name a stored provider (else 400), and a
+provider a tenant names can't be deleted (409, naming the tenants): set
+the tenant's `--oidc-provider` elsewhere, or to `""`, first. A tenant
+admin deleting its own `t-<tenant>` unbinds it.
 
 ## Buckets
 
@@ -257,10 +262,11 @@ obioctl replication resync start photos site-b           # existing objects; sta
 KMS keys are cluster-wide: a tenant admin is refused unless a policy
 allows the `kms:` actions. An audit config is `{"targets": [...]}`. The
 operator's may use `webhook` or `stdout` and lists `allowed_tenant_hosts`;
-a tenant's targets must be `https` webhooks on one of those hosts.
+a tenant's targets must be `https` webhooks on one of those hosts (a
+tenant's `stdout` is refused).
 Replication targets have the same rule for tenant admins: `https`, on a
-host the operator allows (`PUT /_admin/replication/settings`, no `obioctl`
-command); until then the system admin sets them with `--tenant`. A
+host the operator allows (`obioctl replication settings set
+--allowed-tenant-host H`, repeatable; `settings get` reads them); until then the system admin sets them with `--tenant`. A
 bucket's rules are S3's `PutBucketReplication` (an S3 client), naming
 `arn:obio:replication:::<target>`; both buckets must be versioned.
 
