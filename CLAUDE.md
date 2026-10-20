@@ -59,7 +59,7 @@ explanation; if they're wrong, fix them in the same PR.
 make build | build-release | test | lint | fmt | fmt-fix | ci | coverage
 cargo test -p objectio-erasure                          # one crate
 cargo test -p objectio-e2e --test <file>                # e2e: spawns target/debug binaries; build them first
-cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway --bin objectio-install
 ```
 
 - Needs `protoc`, and for ISA-L (every build erasure-codes with it, on

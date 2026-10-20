@@ -36,7 +36,7 @@ every change to the code under test:
 
 ```bash
 cargo build --bin objectio-aio --bin obioctl --bin objectio-meta \
-  --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+  --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway --bin objectio-install
 cargo test -p objectio-e2e --test presigned                  # one file
 cargo test -p objectio-e2e --test pg_recovery -- <test_name>  # one test
 ```
