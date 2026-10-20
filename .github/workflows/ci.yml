@@ -384,19 +384,47 @@ jobs:
           version: v3.16.2
 
       - name: lint
-        run: helm lint deploy/helm/objectio --strict
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/objectio --strict
+          helm lint deploy/helm/objectio --strict --values deploy/helm/objectio/examples/production.yaml
 
-      # Render with the defaults a published install gets, and with the kind
-      # overlay, because the two take different branches of the image helper.
+      # Render with the defaults a published install gets, with the kind
+      # overlay (they take different branches of the image helper), and
+      # with the production example (placement, raw block OSDs, failure
+      # domains from node labels, NetworkPolicy, mTLS).
       - name: render
         run: |
           set -euo pipefail
           helm template objectio deploy/helm/objectio > /tmp/default.yaml
           helm template objectio deploy/helm/objectio \
             --values deploy/kind/values.yaml > /tmp/kind.yaml
-          for f in /tmp/default.yaml /tmp/kind.yaml; do
+          helm template objectio deploy/helm/objectio \
+            --values deploy/helm/objectio/examples/production.yaml \
+            --set blockGateway.enabled=true --set monitoring.enabled=true > /tmp/production.yaml
+          for f in /tmp/default.yaml /tmp/kind.yaml /tmp/production.yaml; do
             echo "$f: $(grep -c '^kind:' "$f") resources"
           done
+
+      # The defaults protect data and require auth, and the chart refuses an
+      # erasure code wider than the OSDs it deploys.
+      - name: safe defaults
+        run: |
+          set -euo pipefail
+          if grep -q -- '--no-auth' /tmp/default.yaml; then
+            echo "::error::the default install runs the gateway without auth"; exit 1
+          fi
+          grep -q -- '--ec-m "2"' /tmp/default.yaml
+          if helm template objectio deploy/helm/objectio --set osd.replicas=5 > /dev/null 2>&1; then
+            echo "::error::rendered 4+2 with 5 OSDs"; exit 1
+          fi
+
+      - name: manifests are valid
+        run: |
+          set -euo pipefail
+          docker run --rm -v /tmp:/m ghcr.io/yannh/kubeconform:v0.6.7 \
+            -summary -strict -ignore-missing-schemas \
+            /m/default.yaml /m/kind.yaml /m/production.yaml
 
       # The check that matters: a default install must only ask for images
       # this project actually publishes. The release pushes exactly one —

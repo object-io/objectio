@@ -20,6 +20,15 @@
 //!   to voters. Writes go through quorum of this new voter set.
 //! - `GET  /status`
 //!   Current leader id, term, membership config, last_log_index.
+//! - `GET  /health`
+//!   200 while this node's Raft runs; 503 once it has stopped (a fatal
+//!   storage error, a panic, a shutdown). What a liveness probe asks:
+//!   the process still answering HTTP is not enough.
+//! - `GET  /ready`
+//!   200 while Raft runs, this node is a member of the cluster and it
+//!   knows a leader; 503 otherwise (before the cluster is initialized,
+//!   before this node is added, during an election). What a readiness
+//!   probe asks.
 
 use std::sync::Arc;
 
@@ -31,7 +40,7 @@ use axum::{
     routing::{get, post},
 };
 use objectio_meta_store::MetaTypeConfig;
-use openraft::{BasicNode, Raft};
+use openraft::{BasicNode, Raft, RaftMetrics, ServerState};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -48,6 +57,8 @@ impl RaftAdminState {
             .route("/add-learner", post(add_learner))
             .route("/change-membership", post(change_membership))
             .route("/status", get(status))
+            .route("/health", get(health))
+            .route("/ready", get(ready))
             .with_state(self)
     }
 }
@@ -231,4 +242,101 @@ async fn status(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
         open_repair: objectio_meta_store::commit_metrics::open_repaired(),
     };
     Json(resp).into_response()
+}
+
+/// Why this node's Raft is not running, if it isn't.
+fn not_running(m: &RaftMetrics<u64, BasicNode>) -> Option<String> {
+    if let Err(fatal) = &m.running_state {
+        return Some(format!("raft stopped: {fatal}"));
+    }
+    (m.state == ServerState::Shutdown).then(|| "raft is shutting down".to_owned())
+}
+
+/// Why this node can't serve, if it can't: Raft must run, the node must
+/// be a member (voter or learner), and a leader must be known (a
+/// follower forwards every call to it).
+fn not_ready(m: &RaftMetrics<u64, BasicNode>, self_id: u64) -> Option<String> {
+    if let Some(why) = not_running(m) {
+        return Some(why);
+    }
+    let membership = m.membership_config.membership();
+    if membership.get_node(&self_id).is_none() {
+        return Some("not a member of a raft cluster (not initialized, or not added yet)".into());
+    }
+    m.current_leader
+        .is_none()
+        .then(|| "no raft leader known".to_owned())
+}
+
+fn answer(problem: Option<String>) -> axum::response::Response {
+    match problem {
+        None => (StatusCode::OK, "ok").into_response(),
+        Some(why) => (StatusCode::SERVICE_UNAVAILABLE, why).into_response(),
+    }
+}
+
+/// GET /health — 200 while Raft runs (a liveness probe).
+async fn health(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
+    answer(not_running(&s.raft.metrics().borrow()))
+}
+
+/// GET /ready — 200 while this node can serve (a readiness probe).
+async fn ready(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
+    answer(not_ready(&s.raft.metrics().borrow(), s.self_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use openraft::error::Fatal;
+    use openraft::{BasicNode, Membership, RaftMetrics, ServerState, StoredMembership};
+
+    use super::{not_ready, not_running};
+
+    fn member_of(voters: &[u64]) -> RaftMetrics<u64, BasicNode> {
+        let mut m = RaftMetrics::new_initial(1);
+        let nodes: BTreeMap<u64, BasicNode> = voters
+            .iter()
+            .map(|id| (*id, BasicNode::new(format!("meta-{id}:9100"))))
+            .collect();
+        let ids: BTreeSet<u64> = voters.iter().copied().collect();
+        m.membership_config = Arc::new(StoredMembership::new(
+            None,
+            Membership::new(vec![ids], nodes),
+        ));
+        m
+    }
+
+    /// A node that was never initialized nor added runs, but can't serve.
+    #[test]
+    fn a_node_outside_any_cluster_is_alive_but_not_ready() {
+        let m = RaftMetrics::<u64, BasicNode>::new_initial(1);
+        assert_eq!(not_running(&m), None);
+        assert!(not_ready(&m, 1).unwrap().contains("not a member"));
+    }
+
+    /// A member that knows its leader is ready; during an election it isn't.
+    #[test]
+    fn a_member_is_ready_while_it_knows_a_leader() {
+        let mut m = member_of(&[1, 2, 3]);
+        m.current_leader = Some(2);
+        assert_eq!(not_ready(&m, 1), None);
+        m.current_leader = None;
+        assert_eq!(not_ready(&m, 1).as_deref(), Some("no raft leader known"));
+    }
+
+    /// Raft stopped: neither alive nor ready, whatever it last knew.
+    #[test]
+    fn a_stopped_raft_is_neither_alive_nor_ready() {
+        let mut m = member_of(&[1]);
+        m.current_leader = Some(1);
+        m.running_state = Err(Fatal::Panicked);
+        assert!(not_running(&m).unwrap().contains("raft stopped"));
+        assert!(not_ready(&m, 1).is_some());
+        m.running_state = Ok(());
+        m.state = ServerState::Shutdown;
+        assert!(not_running(&m).is_some());
+    }
 }

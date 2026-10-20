@@ -20,7 +20,14 @@ spec:
       labels:
         {{- include "objectio.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
+      {{- with .Values.gateway.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "objectio.podPlacement" (dict "root" . "values" .Values.gateway "component" "gateway") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- if and .Values.gateway.hostProvider.enabled (eq .Values.gateway.hostProvider.kind "k8s") }}
       serviceAccountName: {{ include "objectio.gateway.fullname" . }}
       {{- end }}
@@ -66,7 +73,11 @@ spec:
             - "--delta-access-key-id"
             - {{ .Values.gateway.deltaSharing.accessKeyId | quote }}
             - "--delta-secret-key"
+            {{- if .Values.gateway.deltaSharing.existingSecret }}
+            - "$(DELTA_SECRET_KEY)"
+            {{- else }}
             - {{ .Values.gateway.deltaSharing.secretKey | quote }}
+            {{- end }}
             - "--log-level"
             - {{ .Values.gateway.logLevel | quote }}
             {{- with .Values.gateway.endpoints }}
@@ -99,7 +110,11 @@ spec:
             - "--oidc-client-id"
             - {{ .Values.gateway.oidc.clientId | quote }}
             - "--oidc-client-secret"
+            {{- if .Values.gateway.oidc.existingSecret }}
+            - "$(OIDC_CLIENT_SECRET)"
+            {{- else }}
             - {{ .Values.gateway.oidc.clientSecret | quote }}
+            {{- end }}
             {{- if .Values.gateway.oidc.audience }}
             - "--oidc-audience"
             - {{ .Values.gateway.oidc.audience | quote }}
@@ -143,12 +158,33 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Secrets from existing Secrets, into the arguments above
+            # through $(VAR), so they aren't in the pod spec.
+            {{- if .Values.gateway.deltaSharing.existingSecret }}
+            - name: DELTA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.deltaSharing.existingSecret }}
+                  key: {{ .Values.gateway.deltaSharing.existingSecretKey }}
+            {{- end }}
+            {{- if and .Values.gateway.oidc.issuerUrl .Values.gateway.oidc.existingSecret }}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.oidc.existingSecret }}
+                  key: {{ .Values.gateway.oidc.existingSecretKey }}
+            {{- end }}
             {{- if .Values.gateway.sse.enabled }}
             - name: OBJECTIO_MASTER_KEY
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.gateway.sse.existingSecret }}
+                  name: {{ .Values.gateway.sse.existingSecret }}
+                  key: {{ .Values.gateway.sse.existingSecretKey }}
+                  {{- else }}
                   name: {{ include "objectio.gateway.fullname" . }}-sse
                   key: master-key
+                  {{- end }}
             {{- if eq (.Values.gateway.kms.backend | default "local") "vault" }}
             - name: VAULT_ADDR
               value: {{ .Values.gateway.kms.vault.addr | quote }}
@@ -193,24 +229,9 @@ spec:
               containerPort: {{ .Values.gateway.endpoints.external.port }}
               protocol: TCP
             {{- end }}
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: http
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          # /_ready answers 503 until meta is reachable and enough OSDs are
-          # for a write to meet quorum, so a starting gateway takes no
-          # traffic it would fail. It stays 200 once reached (a startup
-          # gate, not a health check); liveness remains /health.
-          readinessProbe:
-            httpGet:
-              path: /_ready
-              port: http
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
+          {{- with (include "objectio.probes" (dict "values" .Values.gateway) | trim) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
           volumeMounts:
             {{- with (include "objectio.tls.volumeMount" .) }}

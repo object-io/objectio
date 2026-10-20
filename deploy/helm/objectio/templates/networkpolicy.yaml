@@ -1,0 +1,118 @@
+{{- /*
+Who may connect to each component (networkPolicy.enabled). Ingress only:
+egress is left open (the OSDs' node-label lookup reaches the API server,
+the gateway an OIDC issuer or Vault). Pods of this release (gateway, meta,
+OSDs, block gateway, the bootstrap Job, the chart's Prometheus) always
+reach each other; from outside, only the peers the values list.
+*/ -}}
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $release := dict "podSelector" (dict "matchLabels" (fromYaml (include "objectio.selectorLabels" .))) }}
+{{- $selector := fromYaml (include "objectio.selectorLabels" .) }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "objectio.meta.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: meta
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml (merge (dict "app.kubernetes.io/component" "meta") $selector) | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- toYaml $release | nindent 10 }}
+    {{- with $np.metricsFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: metrics
+    {{- end }}
+    {{- with $np.adminFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: admin
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "objectio.osd.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml (merge (dict "app.kubernetes.io/component" "osd") $selector) | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- toYaml $release | nindent 10 }}
+    {{- with $np.metricsFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: metrics
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "objectio.gateway.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml (merge (dict "app.kubernetes.io/component" "gateway") $selector) | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- toYaml $release | nindent 10 }}
+    # S3, the console, Iceberg, Delta Sharing and /metrics.
+    - ports:
+        - port: http
+        {{- if .Values.gateway.endpoints.external.port }}
+        - port: http-external
+        {{- end }}
+      {{- with $np.gatewayFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.blockGateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "objectio.blockGateway.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: block-gateway
+spec:
+  podSelector:
+    matchLabels:
+      {{- toYaml (merge (dict "app.kubernetes.io/component" "block-gateway") $selector) | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - {{- toYaml $release | nindent 10 }}
+    - ports:
+        - port: grpc
+        - port: nbd
+      {{- with $np.blockGatewayFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- with $np.metricsFrom }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: metrics
+    {{- end }}
+{{- end }}
+{{- end }}

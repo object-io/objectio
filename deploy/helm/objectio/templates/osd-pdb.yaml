@@ -1,0 +1,17 @@
+{{- if and .Values.osd.podDisruptionBudget.enabled (gt (int .Values.osd.replicas) 1) }}
+# Node drains and upgrades take at most maxUnavailable OSDs at a time, so
+# a stripe keeps enough shards to be read and written.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "objectio.osd.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+spec:
+  maxUnavailable: {{ .Values.osd.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "objectio.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: osd
+{{- end }}

@@ -18,6 +18,10 @@ spec:
         {{- include "objectio.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: grafana
     spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: grafana
           image: {{ .Values.monitoring.grafana.image.repository }}:{{ .Values.monitoring.grafana.image.tag }}
@@ -25,7 +29,10 @@ spec:
             - name: GF_SECURITY_ADMIN_USER
               value: {{ .Values.monitoring.grafana.adminUser | quote }}
             - name: GF_SECURITY_ADMIN_PASSWORD
-              value: {{ .Values.monitoring.grafana.adminPassword | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.monitoring.grafana.existingSecret | default (include "objectio.grafana.fullname" .) }}
+                  key: admin-password
             - name: GF_USERS_ALLOW_SIGN_UP
               value: "false"
             - name: GF_INSTALL_PLUGINS

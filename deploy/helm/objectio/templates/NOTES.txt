@@ -5,6 +5,21 @@ Components:
   - Meta:     {{ .Values.meta.replicas }} replica(s) (Raft cluster)
   - OSD:      {{ .Values.osd.replicas }} replica(s)
   - Default pool: {{ if .Values.replication }}{{ .Values.replication }} cop{{ if eq (int .Values.replication) 1 }}y{{ else }}ies{{ end }} of each object{{ else }}erasure coding {{ .Values.ec.k }}+{{ .Values.ec.m }}{{ end }}
+{{- if .Values.gateway.noAuth }}
+
+WARNING: gateway.noAuth is true: every request is served as the admin,
+without credentials. For a throwaway dev cluster only.
+{{- end }}
+{{- if eq (int .Values.replication) 1 }}
+
+WARNING: replication is 1: one copy of each object, so losing any one
+OSD loses data.
+{{- end }}
+{{- if and .Values.gateway.sse.enabled (not .Values.gateway.sse.existingSecret) }}
+
+The SSE master key is in the Secret {{ include "objectio.gateway.fullname" . }}-sse, kept on
+uninstall. Back it up: without it, encrypted objects can't be read.
+{{- end }}
 
 Access the S3 gateway:
 
@@ -31,7 +46,8 @@ Monitoring:
     kubectl port-forward svc/{{ include "objectio.prometheus.fullname" . }} 9090:{{ .Values.monitoring.prometheus.service.port }} -n {{ .Release.Namespace }}
     # Open http://localhost:9090
 
-  Grafana ({{ .Values.monitoring.grafana.adminUser }}/{{ .Values.monitoring.grafana.adminPassword }}):
+  Grafana (user {{ .Values.monitoring.grafana.adminUser }}; password:
+    kubectl get secret {{ .Values.monitoring.grafana.existingSecret | default (include "objectio.grafana.fullname" .) }} -n {{ .Release.Namespace }} -o jsonpath='{.data.admin-password}' | base64 -d):
     kubectl port-forward svc/{{ include "objectio.grafana.fullname" . }} 3000:{{ .Values.monitoring.grafana.service.port }} -n {{ .Release.Namespace }}
     # Open http://localhost:3000
     # Dashboards are pre-provisioned under the "ObjectIO" folder

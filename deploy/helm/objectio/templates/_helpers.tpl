@@ -159,3 +159,105 @@ what each gRPC component mounts and sets from it.
     secretName: {{ include "objectio.tls.secretName" . }}
 {{- end }}
 {{- end }}
+
+{{/*
+The tools image (sh + curl): the Raft bootstrap Job, the OSDs' node-label
+lookup.
+*/}}
+{{- define "objectio.toolsImage" -}}
+{{- printf "%s:%s" .Values.global.toolsImage.repository (.Values.global.toolsImage.tag | toString) -}}
+{{- end }}
+
+{{/*
+Pod-spec fields every component takes from its values: image pull
+secrets, priority class, nodeSelector, affinity, tolerations and
+topologySpreadConstraints. A spread constraint without a labelSelector
+gets the component's pods' labels.
+Usage: include "objectio.podPlacement" (dict "root" . "values" .Values.osd "component" "osd")
+*/}}
+{{- define "objectio.podPlacement" -}}
+{{- with .root.Values.global.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .values.priorityClassName }}
+priorityClassName: {{ . | quote }}
+{{- end }}
+{{- with .values.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .values.affinity }}
+affinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .values.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- if .values.topologySpreadConstraints }}
+{{- $labels := merge (dict "app.kubernetes.io/component" .component) (fromYaml (include "objectio.selectorLabels" .root)) }}
+topologySpreadConstraints:
+{{- range .values.topologySpreadConstraints }}
+  - {{- toYaml (merge (deepCopy .) (dict "labelSelector" (dict "matchLabels" $labels))) | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+The probes a component's values give (startupProbe, livenessProbe,
+readinessProbe), at the container's indentation.
+*/}}
+{{- define "objectio.probes" -}}
+{{- range $name := list "startupProbe" "livenessProbe" "readinessProbe" }}
+{{- with index $.values $name }}
+{{ $name }}:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Refuse values that would lose data or can't work. Rendered once, from
+validate.yaml.
+*/}}
+{{- define "objectio.validate" -}}
+{{- $k := int .Values.ec.k }}
+{{- $m := int .Values.ec.m }}
+{{- if lt $k 1 }}
+{{- fail (printf "ec.k is %d: a stripe needs at least one data shard" $k) }}
+{{- end }}
+{{- $copies := int .Values.replication }}
+{{- if lt $copies 0 }}
+{{- fail (printf "replication is %d: 0 (erasure coding) or a number of copies" $copies) }}
+{{- end }}
+{{- if and (eq $copies 0) (lt $m 1) }}
+{{- fail "ec.m is 0: an erasure-coded pool needs parity (one unprotected copy is replication: 1)" }}
+{{- end }}
+{{- if and (eq $copies 0) (lt (int .Values.osd.replicas) (add $k $m)) }}
+{{- fail (printf "osd.replicas is %d, fewer than ec.k + ec.m = %d: each shard of a stripe goes to a different OSD. Add OSDs or choose a smaller code." (int .Values.osd.replicas) (add $k $m)) }}
+{{- end }}
+{{- if lt (int .Values.osd.replicas) $copies }}
+{{- fail (printf "osd.replicas is %d, fewer than replication = %d: each copy goes to a different OSD" (int .Values.osd.replicas) $copies) }}
+{{- end }}
+{{- if and .Values.blockGateway.enabled (lt (int .Values.osd.replicas) (add $k $m)) }}
+{{- fail (printf "the block gateway codes volumes ec.k + ec.m = %d, more than osd.replicas = %d" (add $k $m) (int .Values.osd.replicas)) }}
+{{- end }}
+{{- if lt (int .Values.meta.replicas) 1 }}
+{{- fail "meta.replicas must be at least 1 (3 or 5 for a cluster that survives a node)" }}
+{{- end }}
+{{- if not (has .Values.osd.persistence.data.volumeMode (list "Filesystem" "Block")) }}
+{{- fail (printf "osd.persistence.data.volumeMode is %q: Filesystem or Block" .Values.osd.persistence.data.volumeMode) }}
+{{- end }}
+{{- range $level, $label := .Values.osd.failureDomain.nodeLabels }}
+{{- if not (has $level (list "region" "zone" "datacenter" "rack")) }}
+{{- fail (printf "osd.failureDomain.nodeLabels.%s: the levels read from node labels are region, zone, datacenter and rack (host is the node itself)" $level) }}
+{{- end }}
+{{- if not $label }}
+{{- fail (printf "osd.failureDomain.nodeLabels.%s names no label" $level) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.gateway.sse.existingSecret .Values.gateway.sse.masterKey }}
+{{- fail "gateway.sse: set existingSecret or masterKey, not both" }}
+{{- end }}
+{{- end }}

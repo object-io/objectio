@@ -1,35 +1,37 @@
 {{- /*
 Raft cluster bootstrap Job.
 
-Helm runs this once after the meta StatefulSet is up. It:
-  1. Calls POST :9102/init on meta-0 (single-voter cluster with node_id=1)
-  2. For each of meta-1..N: POST :9102/add-learner { node_id, addr }
-  3. POST :9102/change-membership { voters: [1..N] } to promote them
+Created with the meta StatefulSet, on every install and upgrade (its name
+carries the release revision, so each revision runs it once). It:
+  1. Calls POST :9102/init on meta-0 unless the cluster exists (a
+     single-voter cluster with node_id=1);
+  2. waits for every meta pod's admin port;
+  3. on the leader, adds each pod not yet a voter as a learner
+     (POST /add-learner { node_id, addr }), then promotes the full set
+     (POST /change-membership { voters: [1..N] }).
 
-Idempotent: a second /init fails with "already initialized", which we
-swallow. Re-running the Job is safe — useful after a helm upgrade that
-doesn't change replicas but does need to ensure the cluster is live.
+Idempotent: with every pod a voter already, it changes nothing.
 
-Re-run after scaling up replicas: helm re-applies the Job (same manifest)
-and it adds the new learners. Scaling DOWN is not safe via this Job —
-for that operators call /change-membership with the reduced voter set
-manually, then scale the StatefulSet down.
+Not a post-install hook: Helm runs those only after `--wait` has seen every
+resource ready, and no meta pod (nor gateway) is ready before this Job has
+made the cluster, so `helm install --wait` waited out its timeout.
+
+Scaling up: the upgrade's Job adds the new pods. Scaling DOWN is not done
+by this Job (it stops, changing nothing, when the voters include a pod
+past meta.replicas): call /change-membership with the reduced voter set
+first, then scale the StatefulSet down.
 */ -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "objectio.meta.fullname" . }}-raft-bootstrap
+  name: {{ include "objectio.meta.fullname" . }}-raft-bootstrap-{{ .Release.Revision }}
   labels:
     {{- include "objectio.labels" . | nindent 4 }}
     app.kubernetes.io/component: meta-raft-bootstrap
-  annotations:
-    # Runs after the StatefulSet is deployed; a failed Job doesn't
-    # block the install, and `helm uninstall` removes it.
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "5"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: 6
+  # Removed ten minutes after it succeeds; the next revision's Job
+  # replaces it either way.
   ttlSecondsAfterFinished: 600
   template:
     metadata:
@@ -38,9 +40,19 @@ spec:
         app.kubernetes.io/component: meta-raft-bootstrap
     spec:
       restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.meta.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: bootstrap
-          image: curlimages/curl:8.10.1
+          image: {{ include "objectio.toolsImage" . }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           command: ["/bin/sh", "-c"]
           env:
             - name: REPLICAS
@@ -59,70 +71,80 @@ spec:
             - |
               set -u
               FULLNAME='{{ include "objectio.meta.fullname" . }}'
-              META0="${FULLNAME}-0.${HEADLESS}.${NAMESPACE}.svc.cluster.local"
-              echo "Bootstrapping Raft cluster with ${REPLICAS} replicas via ${META0}:${ADMIN_PORT}"
+              host() { echo "${FULLNAME}-$1.${HEADLESS}.${NAMESPACE}.svc.cluster.local"; }
+              status() { curl -sf -m 3 "http://$(host "$1"):${ADMIN_PORT}/status"; }
+              # Fields of /status (compact JSON): leader_id, voters.
+              leader_of() { sed -n 's/.*"leader_id":\([0-9][0-9]*\).*/\1/p'; }
+              voters_of() { sed -n 's/.*"voters":\[\([0-9,]*\)\].*/\1/p'; }
+              echo "Bootstrapping a Raft cluster of ${REPLICAS} via $(host 0):${ADMIN_PORT}"
 
-              # 1. Wait for meta-0 to accept connections on its admin port.
-              #    headless service has publishNotReadyAddresses so we can
-              #    reach it before readiness flips true.
-              i=0
-              until curl -sf -m 3 "http://${META0}:${ADMIN_PORT}/status" > /dev/null 2>&1; do
-                i=$((i+1))
-                if [ $i -gt 120 ]; then
-                  echo "FATAL: meta-0 never became reachable at http://${META0}:${ADMIN_PORT}"
-                  exit 2
-                fi
-                echo "waiting for meta-0 ($i/120)..."
-                sleep 2
+              # 1. Every pod's admin port answers (the headless Service
+              #    publishes pods before they are ready).
+              n=0
+              while [ "$n" -lt "$REPLICAS" ]; do
+                i=0
+                until status "$n" > /dev/null 2>&1; do
+                  i=$((i+1))
+                  if [ $i -gt 150 ]; then
+                    echo "FATAL: $(host "$n") never answered on :${ADMIN_PORT}"
+                    exit 2
+                  fi
+                  echo "waiting for ${FULLNAME}-${n} ($i/150)..."
+                  sleep 2
+                done
+                n=$((n + 1))
               done
 
-              # 2. /init (idempotent: ignore if already initialized).
-              resp=$(curl -s -w "\n%{http_code}" -X POST "http://${META0}:${ADMIN_PORT}/init" || true)
-              code=$(echo "$resp" | tail -n1)
-              body=$(echo "$resp" | sed '$d')
-              if [ "$code" = "200" ]; then
-                echo "meta-0 initialized as single-voter cluster"
-              else
-                case "$body" in
-                  *"already initialized"*|*"not allowed to initialize"*|*NotAllowed*|*"InProgress"*)
-                    echo "meta-0 already initialized (ok): $body"
-                    ;;
-                  *)
-                    echo "FATAL: init failed ($code): $body"
-                    exit 3
-                    ;;
+              # 2. /init on meta-0 unless a cluster exists (409: it does).
+              if [ -z "$(status 0 | voters_of)" ]; then
+                code=$(curl -s -o /tmp/init.out -w "%{http_code}" -X POST "http://$(host 0):${ADMIN_PORT}/init" || true)
+                case "$code" in
+                  200) echo "meta-0 initialized as a single-voter cluster" ;;
+                  409) echo "meta-0 already initialized (ok)" ;;
+                  *) echo "FATAL: init failed ($code): $(cat /tmp/init.out)"; exit 3 ;;
                 esac
               fi
 
-              # 3. For each replica > 0, add as learner, then change-membership
-              #    to promote the full voter set. Single-replica deployments
-              #    skip this loop entirely — the /init above gave us a
-              #    working cluster with voter={1}.
-              voters="1"
-              if [ "$REPLICAS" -gt 1 ]; then
-                n=1
-                while [ "$n" -lt "$REPLICAS" ]; do
-                  node_id=$((n + 1))
-                  addr="${FULLNAME}-${n}.${HEADLESS}.${NAMESPACE}.svc.cluster.local:${GRPC_PORT}"
-                  body="{\"node_id\": ${node_id}, \"addr\": \"${addr}\"}"
-                  echo "Adding learner node_id=${node_id} at ${addr}"
-                  curl -sf -m 30 -X POST -H 'Content-Type: application/json' \
-                    -d "${body}" \
-                    "http://${META0}:${ADMIN_PORT}/add-learner" \
-                    || { echo "add-learner failed for node_id=${node_id}"; exit 4; }
-                  voters="${voters},${node_id}"
-                  n=$((n + 1))
+              # 3. The leader, as every member sees it after an election.
+              i=0
+              until LEADER_ID=$(status 0 | leader_of) && [ -n "$LEADER_ID" ]; do
+                i=$((i+1))
+                [ $i -le 60 ] || { echo "FATAL: no raft leader after 120 s"; exit 4; }
+                sleep 2
+              done
+              LEADER=$(host $((LEADER_ID - 1)))
+              current=$(status $((LEADER_ID - 1)) | voters_of)
+              want=$(seq -s, 1 "$REPLICAS")
+              echo "leader: node ${LEADER_ID}; voters: [${current}], wanted: [${want}]"
+              for id in $(echo "$current" | tr ',' ' '); do
+                if [ "$id" -gt "$REPLICAS" ]; then
+                  echo "voter ${id} is past meta.replicas=${REPLICAS}: scaling down is done by hand (/change-membership), not by this Job. Changing nothing."
+                  exit 0
+                fi
+              done
+              if [ "$current" = "$want" ]; then
+                echo "Every pod is a voter already."
+              else
+                for id in $(echo "$want" | tr ',' ' '); do
+                  case ",${current}," in *",${id},"*) continue ;; esac
+                  addr="$(host $((id - 1))):${GRPC_PORT}"
+                  echo "Adding learner node_id=${id} at ${addr}"
+                  curl -sf -m 60 -X POST -H 'Content-Type: application/json' \
+                    -d "{\"node_id\": ${id}, \"addr\": \"${addr}\"}" \
+                    "http://${LEADER}:${ADMIN_PORT}/add-learner" \
+                    || { echo "add-learner failed for node_id=${id}"; exit 5; }
+                  echo
                 done
-
-                echo "Promoting voters=[${voters}]"
+                echo "Promoting voters=[${want}]"
                 curl -sf -m 60 -X POST -H 'Content-Type: application/json' \
-                  -d "{\"voters\": [${voters}]}" \
-                  "http://${META0}:${ADMIN_PORT}/change-membership" \
-                  || { echo "change-membership failed"; exit 5; }
+                  -d "{\"voters\": [${want}]}" \
+                  "http://${LEADER}:${ADMIN_PORT}/change-membership" \
+                  || { echo "change-membership failed"; exit 6; }
+                echo
               fi
 
               echo "Final cluster status:"
-              curl -s "http://${META0}:${ADMIN_PORT}/status"
+              status $((LEADER_ID - 1))
               echo
               echo "Raft bootstrap complete."
           resources:

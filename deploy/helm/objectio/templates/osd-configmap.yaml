@@ -15,12 +15,15 @@ data:
     weight = 1.0
 
     [osd.failure_domain]
-    region = {{ .Values.osd.failureDomain.region | quote }}
-    {{- if .Values.osd.failureDomain.zone }}
-    zone = {{ .Values.osd.failureDomain.zone | quote }}
+    {{- /* A level read from a node label is filled in per pod (osd-statefulset's init containers). */}}
+    {{- $fd := .Values.osd.failureDomain }}
+    {{- range $level := list "region" "zone" "datacenter" "rack" }}
+    {{- if hasKey $fd.nodeLabels $level }}
+    {{ $level }} = "__FD_{{ upper $level }}__"
+    {{- else if index $fd $level }}
+    {{ $level }} = {{ index $fd $level | quote }}
     {{- end }}
-    datacenter = {{ .Values.osd.failureDomain.datacenter | quote }}
-    rack = {{ .Values.osd.failureDomain.rack | quote }}
+    {{- end }}
     # The k8s worker node the pod is scheduled on — not the pod name.
     # Host failure domain tolerates a machine going down, so "host" must
     # map to the real machine. Multiple OSD pods scheduled on the same
@@ -30,7 +33,11 @@ data:
     host = "__HOST_NAME__"
 
     [storage]
+    {{- if eq .Values.osd.persistence.data.volumeMode "Block" }}
+    disks = ["/dev/objectio/disk0"]
+    {{- else }}
     disks = ["/data/disk0/{{ .Values.osd.storage.diskFile }}"]
+    {{- end }}
     {{- with .Values.osd.storage.blockSize }}
     block_size = {{ . | int }}
     {{- end }}
