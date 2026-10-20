@@ -1121,6 +1121,79 @@ impl Cluster {
         Response::from(req.send().expect("request"))
     }
 
+    /// A request signed before its body exists, as an SDK signs a
+    /// streaming upload: over `payload_hash` (a hex SHA-256, or a
+    /// `STREAMING-*` value) and the headers `signed`, besides host, the
+    /// payload hash and the date. The body is built afterwards, chunk
+    /// signatures chained from the one this returns.
+    pub fn sign(
+        &self,
+        method: &str,
+        path: &str,
+        payload_hash: &str,
+        signed: &[(&str, &str)],
+    ) -> SignedRequest {
+        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+        let escaped_path = escape_path(path_only);
+        let (amz_date, date_stamp) = time_now();
+        let mut headers: Vec<(String, String)> = vec![
+            ("host".into(), host),
+            ("x-amz-content-sha256".into(), payload_hash.to_string()),
+            ("x-amz-date".into(), amz_date.clone()),
+        ];
+        for (k, v) in signed {
+            headers.push((k.to_ascii_lowercase(), (*v).to_string()));
+        }
+        headers.sort();
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+            .collect();
+        let signed_headers = headers
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_request = format!(
+            "{method}\n{escaped_path}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            canonical_query(query),
+        );
+        let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let mut key = hmac(format!("AWS4{}", self.secret_key).as_bytes(), &date_stamp);
+        key = hmac(&key, "us-east-1");
+        key = hmac(&key, "s3");
+        key = hmac(&key, "aws4_request");
+        let signature = hex::encode(hmac(&key, &string_to_sign));
+        headers.retain(|(k, _)| k != "host");
+        headers.push((
+            "authorization".into(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/{scope}, \
+                 SignedHeaders={signed_headers}, Signature={signature}",
+                self.access_key
+            ),
+        ));
+        let url = if query.is_empty() {
+            format!("{}{escaped_path}", self.endpoint)
+        } else {
+            format!("{}{escaped_path}?{}", self.endpoint, canonical_query(query))
+        };
+        SignedRequest {
+            method: method.to_string(),
+            url,
+            headers,
+            signature,
+            amz_date,
+            scope,
+            signing_key: key,
+        }
+    }
+
     /// A call to the IAM or STS query API: `POST /` with `params` as a form
     /// body, signed as aws-cli and boto3 sign it: for `service` (`iam` or
     /// `sts`), over the body's hash, which they don't send. `creds` is
@@ -1319,6 +1392,62 @@ impl Response {
             self.text()
         );
         self
+    }
+}
+
+/// A request [`Cluster::sign`] signed, waiting for its body.
+pub struct SignedRequest {
+    method: String,
+    url: String,
+    /// Every header to send, the authorization included.
+    headers: Vec<(String, String)>,
+    /// The request's signature: a streaming body's first chunk chains
+    /// from it.
+    pub signature: String,
+    amz_date: String,
+    scope: String,
+    signing_key: Vec<u8>,
+}
+
+impl SignedRequest {
+    /// The signature of a chunk of `data`, chained from `previous`.
+    pub fn chunk_signature(&self, previous: &str, data: &[u8]) -> String {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{previous}\n{}\n{}",
+            self.amz_date,
+            self.scope,
+            hex::encode(Sha256::digest(b"")),
+            hex::encode(Sha256::digest(data))
+        );
+        hex::encode(hmac(&self.signing_key, &string_to_sign))
+    }
+
+    /// The signature of the trailing headers `text` (`name:value\n` each),
+    /// chained from the terminal chunk's.
+    pub fn trailer_signature(&self, previous: &str, text: &str) -> String {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{previous}\n{}",
+            self.amz_date,
+            self.scope,
+            hex::encode(Sha256::digest(text.as_bytes()))
+        );
+        hex::encode(hmac(&self.signing_key, &string_to_sign))
+    }
+
+    /// Send it with `body` and the unsigned headers `extra`.
+    pub fn send(&self, body: Vec<u8>, extra: &[(&str, &str)]) -> Response {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        let mut req = client.request(self.method.parse().expect("method"), &self.url);
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        Response::from(req.body(body).send().expect("request"))
     }
 }
 
