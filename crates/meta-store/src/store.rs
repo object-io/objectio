@@ -654,12 +654,19 @@ impl MetaStore {
     }
 
     /// Range scan over `OBJECT_LISTINGS` for one bucket with an optional
-    /// prefix filter. Returns up to `max_keys` entries (bucket/key/ver
+    /// prefix filter, of the entries whose object key sorts after
+    /// `start_after`. Returns up to `max_keys` entries (bucket/key/ver
     /// strings plus raw prost-encoded `ObjectListingEntry` bytes) in
     /// key-sorted order, and a continuation token for the next page.
     /// Keys are stored as `{bucket}\0{key}\0{version_id}` so a range
     /// scan starting at `{bucket}\0{prefix}` stops cleanly when the
     /// next bucket begins.
+    ///
+    /// The scan starts at the first entry after `start_after`, not at the
+    /// prefix: one that started at the prefix and skipped up to the marker
+    /// visited every key before each page again (O(M²) rows to page
+    /// through M keys), and a delimiter listing, which resumes past each
+    /// common prefix, re-read everything before every one of them.
     pub fn list_object_listings(
         &self,
         bucket: &str,
@@ -679,23 +686,38 @@ impl MetaStore {
         let bucket_prefix = format!("{bucket}\0");
         let full_prefix = format!("{bucket_prefix}{prefix}");
 
-        // Range: [full_prefix, bucket\0\xff) — iterate forward, stop on
-        // either max_keys or when the key no longer starts with
-        // full_prefix.
+        // The first entry whose object key sorts after `start_after` is at
+        // or after `{bucket}\0{start_after}\x01`: an entry of `start_after`
+        // itself goes on with the `\0` before its version, so sorts before
+        // it, and a key that extends `start_after` goes on with a character
+        // above `\0` (S3 keys in a listing hold no NUL), so sorts after.
+        let past_marker = format!("{bucket_prefix}{start_after}\u{1}");
+        let start = if !start_after.is_empty() && past_marker > full_prefix {
+            past_marker
+        } else {
+            full_prefix.clone()
+        };
+
+        // Iterate forward from there, stop on either max_keys or when the
+        // key no longer starts with full_prefix.
         let mut results: Vec<(String, Vec<u8>)> = Vec::with_capacity(max_keys.min(1024));
         let mut is_truncated = false;
         let mut next_token = String::new();
 
-        let iter = table.range(full_prefix.as_str()..)?;
+        let iter = table.range(start.as_str()..)?;
         for entry in iter {
             let (k, v) = entry?;
+            #[cfg(test)]
+            listing_tests::ROWS_VISITED.with(|n| n.set(n.get() + 1));
             let k_str = k.value().to_string();
             if !k_str.starts_with(&full_prefix) {
                 break;
             }
             // Entries are `{bucket}\0{key}\0{version}`. Compare the object
             // key alone: against the whole entry, `c\0…` sorts after `c`
-            // and a listing that should start after `c` returned `c`.
+            // and a listing that should start after `c` returned `c`. The
+            // range starts past the marker already; this keeps a listing
+            // right whatever the start.
             let key = listing_object_key(&k_str[bucket_prefix.len()..]);
             if !start_after.is_empty() && key <= start_after {
                 continue;
@@ -1580,6 +1602,197 @@ impl MetaStore {
 /// already removed: `{key}\0{version}` → `{key}`.
 fn listing_object_key(entry: &str) -> &str {
     entry.split('\0').next().unwrap_or(entry)
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Rows `list_object_listings` read on this thread.
+        pub(super) static ROWS_VISITED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn visited() -> u64 {
+        ROWS_VISITED.with(Cell::get)
+    }
+
+    /// A store holding `rows` (`(bucket, key, version)`), written in one
+    /// transaction.
+    fn store_with(rows: &[(&str, String, &str)]) -> (tempfile::TempDir, MetaStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetaStore::open(dir.path().join("meta.redb")).unwrap();
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(tables::OBJECT_LISTINGS).unwrap();
+            for (bucket, key, version) in rows {
+                let entry = format!("{bucket}\0{key}\0{version}");
+                t.insert(entry.as_str(), entry.as_bytes()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        (dir, store)
+    }
+
+    /// `(key, version)` of each entry of a page.
+    fn page(
+        store: &MetaStore,
+        bucket: &str,
+        prefix: &str,
+        after: &str,
+        n: usize,
+    ) -> (Vec<(String, String)>, bool, String) {
+        let (rows, more, token) = store
+            .list_object_listings(bucket, prefix, after, n)
+            .unwrap();
+        let rows = rows
+            .into_iter()
+            .map(|(k, _)| {
+                let mut parts = k.split('\0').skip(1);
+                (
+                    parts.next().unwrap().to_string(),
+                    parts.next().unwrap().to_string(),
+                )
+            })
+            .collect();
+        (rows, more, token)
+    }
+
+    fn keys(rows: &[(String, String)]) -> Vec<&str> {
+        rows.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Paging through a big bucket reads each row about once: the scan
+    /// seeks to the marker rather than walking up to it from the prefix
+    /// on every page.
+    #[test]
+    fn paging_through_a_bucket_reads_each_row_once() {
+        const N: usize = 100_000;
+        const PAGE: usize = 1_000;
+        let rows: Vec<_> = (0..N).map(|i| ("b", format!("k{i:07}"), "v")).collect();
+        let (_dir, store) = store_with(&rows);
+        let before = visited();
+        let (mut after, mut seen, mut pages) = (String::new(), 0, 0);
+        loop {
+            let (rows, more, token) = page(&store, "b", "", &after, PAGE);
+            seen += rows.len();
+            pages += 1;
+            if !more {
+                break;
+            }
+            after = token;
+        }
+        assert_eq!(seen, N);
+        let read = visited() - before;
+        // Each page reads its rows and the one after them (to know there
+        // are more); starting at the prefix, the last page alone read
+        // all 100,000.
+        assert!(
+            read <= (N + 2 * pages) as u64,
+            "{read} rows read over {pages} pages of {N} keys"
+        );
+    }
+
+    /// Resuming past a common prefix (the cursor a delimiter listing
+    /// passes, `{prefix}` + `char::MAX`) skips the rows under it without
+    /// reading them.
+    #[test]
+    fn resuming_past_a_common_prefix_reads_nothing_under_it() {
+        let mut rows: Vec<_> = (0..10_000)
+            .map(|i| ("b", format!("dir/{i:05}"), "v"))
+            .collect();
+        rows.push(("b", "dir0".into(), "v"));
+        rows.push(("b", "e".into(), "v"));
+        let (_dir, store) = store_with(&rows);
+        let before = visited();
+        let (rows, more, _) = page(&store, "b", "", &format!("dir/{}", char::MAX), 10);
+        assert_eq!(keys(&rows), ["dir0", "e"]);
+        assert!(!more);
+        assert!(visited() - before <= 3, "{} rows read", visited() - before);
+    }
+
+    #[test]
+    fn a_marker_skips_every_version_of_its_key_and_nothing_after() {
+        let (_dir, store) = store_with(&[
+            ("a", "x".into(), "v1"),
+            ("b", "a".into(), "v1"),
+            ("b", "a".into(), "v2"),
+            ("b", "a/b".into(), "v1"),
+            ("b", "ab".into(), "v1"),
+            ("b", "ab".into(), "v2"),
+            ("b", "abc".into(), "v1"),
+            ("b", "b".into(), "v1"),
+            ("ba", "a".into(), "v1"),
+        ]);
+        let all = |after: &str| page(&store, "b", "", after, 100).0;
+        assert_eq!(
+            all(""),
+            [
+                ("a".into(), "v1".into()),
+                ("a".into(), "v2".into()),
+                ("a/b".into(), "v1".into()),
+                ("ab".into(), "v1".into()),
+                ("ab".into(), "v2".into()),
+                ("abc".into(), "v1".into()),
+                ("b".into(), "v1".into()),
+            ]
+        );
+        // A key that others extend: its versions go, the longer keys stay.
+        assert_eq!(keys(&all("a")), ["a/b", "ab", "ab", "abc", "b"]);
+        assert_eq!(keys(&all("ab")), ["abc", "b"]);
+        // A marker that is no key: the next keys, from where it sorts.
+        assert_eq!(keys(&all("aa")), ["ab", "ab", "abc", "b"]);
+        assert_eq!(keys(&all("a/")), ["a/b", "ab", "ab", "abc", "b"]);
+        // Past the last key, and past the bucket: nothing, not the next
+        // bucket's.
+        assert!(all("b").is_empty());
+        assert!(all("zzz").is_empty());
+    }
+
+    #[test]
+    fn a_marker_and_a_prefix_together() {
+        let (_dir, store) = store_with(&[
+            ("b", "a".into(), "v"),
+            ("b", "p".into(), "v"),
+            ("b", "p/1".into(), "v"),
+            ("b", "p/2".into(), "v"),
+            ("b", "p/3".into(), "v"),
+            ("b", "q".into(), "v"),
+        ]);
+        let list = |prefix: &str, after: &str| {
+            keys(&page(&store, "b", prefix, after, 100).0)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        // A marker before the prefix: the whole prefix.
+        assert_eq!(list("p/", "a"), ["p/1", "p/2", "p/3"]);
+        // The prefix itself as the marker (a key too): everything under it.
+        assert_eq!(list("p", "p"), ["p/1", "p/2", "p/3"]);
+        // Inside the prefix.
+        assert_eq!(list("p/", "p/1"), ["p/2", "p/3"]);
+        // Past it.
+        assert!(list("p/", "p/3").is_empty());
+        assert!(list("p/", "q").is_empty());
+    }
+
+    #[test]
+    fn pages_end_on_a_key_and_the_next_starts_after_it() {
+        let (_dir, store) = store_with(&[
+            ("b", "a".into(), "v"),
+            ("b", "b".into(), "v"),
+            ("b", "c".into(), "v"),
+        ]);
+        let (rows, more, token) = page(&store, "b", "", "", 2);
+        assert_eq!(keys(&rows), ["a", "b"]);
+        assert!(more);
+        assert_eq!(token, "b");
+        let (rows, more, token) = page(&store, "b", "", &token, 2);
+        assert_eq!(keys(&rows), ["c"]);
+        assert!(!more);
+        assert!(token.is_empty());
+    }
 }
 
 #[cfg(test)]
