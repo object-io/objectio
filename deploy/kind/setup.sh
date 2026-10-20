@@ -260,9 +260,10 @@ Quick tests:
     -H 'Content-Type: application/json' \\
     -d '{"name":"events","schema":{"type":"struct","fields":[{"id":1,"name":"id","type":"long","required":true}]}}' | jq .
 
-  # Delta Sharing (create share + recipient via admin API)
-  curl -s -X POST http://localhost:${PF_PORT}/_admin/delta-sharing/shares \\
-    -d '{"name":"demo"}' | jq .
+  # Delta Sharing (create a share on the admin API, signed with the admin key)
+  curl -s -X POST http://localhost:${PF_PORT}/_admin/shares \\
+    --aws-sigv4 "aws:amz:us-east-1:s3" --user "\$ACCESS_KEY:\$SECRET_KEY" \\
+    -H 'Content-Type: application/json' -d '{"name":"demo"}' | jq .
 
   # Cluster status
   kubectl get pods -n ${NAMESPACE}

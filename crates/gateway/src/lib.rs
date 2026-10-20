@@ -44,6 +44,7 @@ pub mod replication;
 pub mod s3;
 pub mod s3_metrics;
 pub mod scatter_gather;
+pub mod share_admin;
 pub mod stripe;
 pub mod sts_api;
 pub mod test_hooks;
@@ -64,9 +65,7 @@ use axum::{
 use clap::Parser;
 use console_auth::ListenerKind;
 use objectio_auth::policy::PolicyEvaluator;
-use objectio_delta_sharing::{
-    DeltaSharingConfig, admin_router as delta_admin_router, router as delta_router,
-};
+use objectio_delta_sharing::{DeltaSharingConfig, router as delta_router};
 use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
 use osd_pool::OsdPool;
 use s3::AppState;
@@ -901,7 +900,7 @@ pub async fn run(
             req
         });
 
-    let (delta_sharing_router, delta_sharing_admin_router) = {
+    let delta_sharing_router = {
         let external_endpoint = if args.external_endpoint.is_empty() {
             format!("http://{}", args.listen)
         } else {
@@ -913,13 +912,6 @@ pub async fn run(
             None
         };
         let delta_config = DeltaSharingConfig {
-            endpoint: external_endpoint.clone(),
-            region: args.region.clone(),
-            access_key_id: args.delta_access_key_id.clone(),
-            secret_access_key: args.delta_secret_key.clone(),
-            default_url_ttl_seconds: url_ttl,
-        };
-        let delta_admin_config = DeltaSharingConfig {
             endpoint: external_endpoint,
             region: args.region.clone(),
             access_key_id: args.delta_access_key_id.clone(),
@@ -927,11 +919,7 @@ pub async fn run(
             default_url_ttl_seconds: url_ttl,
         };
         info!("Delta Sharing protocol enabled at /delta-sharing/v1/*");
-        info!("Delta Sharing admin API enabled at /_admin/delta-sharing/*");
-        (
-            delta_router(meta_client.clone(), delta_config),
-            delta_admin_router(meta_client.clone(), delta_admin_config),
-        )
+        delta_router(meta_client.clone(), delta_config)
     };
 
     // Clone meta_client for OIDC auto-provisioning before it's moved into AppState
@@ -1374,9 +1362,22 @@ pub async fn run(
         // Tenant-aware Table Sharing admin
         .route("/_admin/shares", get(admin::admin_list_shares_tenant))
         .route("/_admin/shares", post(admin::admin_create_share_tenant))
+        .route("/_admin/shares/{share}", delete(share_admin::drop_share))
+        .route(
+            "/_admin/shares/{share}/tables",
+            get(share_admin::list_share_tables).post(share_admin::add_share_table),
+        )
+        .route(
+            "/_admin/shares/{share}/schemas/{schema}/tables/{table}",
+            delete(share_admin::remove_share_table),
+        )
         .route(
             "/_admin/recipients",
-            get(admin::admin_list_recipients_tenant),
+            get(admin::admin_list_recipients_tenant).post(share_admin::create_recipient),
+        )
+        .route(
+            "/_admin/recipients/{name}",
+            delete(share_admin::drop_recipient),
         )
         .route("/_admin/warehouses", get(admin::admin_list_warehouses))
         .route("/_admin/warehouses", post(admin::admin_create_warehouse))
@@ -1688,7 +1689,6 @@ pub async fn run(
             .nest("/iceberg", iceberg_router.clone())
             .merge(unity_router.clone())
             .nest("/delta-sharing", delta_sharing_router.clone())
-            .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
             // Path-mounted consoles. These are the addressable surfaces:
             // /_console/admin is the operator console, /_console/tenant the
             // self-service one. Each bundle is built with its own base, so the
@@ -1751,7 +1751,6 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .layer(Extension(ListenerKind::AdminApi))
                 .layer(TraceLayer::new_for_http());
             listeners.push((addr, admin_only, "admin API + metrics".into(), None));
@@ -1772,7 +1771,6 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 // Same canonical path as the single-port mount, so one
                 // build serves both modes.
                 .nest_service("/_console/admin", console_service(&ops_console_dir))
@@ -1804,7 +1802,6 @@ pub async fn run(
                 .merge(admin_routes.clone())
                 .merge(console_api_routes.clone())
                 .merge(console_oidc_routes.clone())
-                .nest("/_admin/delta-sharing", delta_sharing_admin_router.clone())
                 .nest_service("/_console/tenant", console_service(&tenant_console_dir))
                 .route(
                     "/",

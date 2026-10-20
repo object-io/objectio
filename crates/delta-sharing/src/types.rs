@@ -140,16 +140,7 @@ pub struct QueryTableRequest {
     pub version: Option<i64>,
 }
 
-// ---- Admin request types ----
-
-#[derive(Debug, Deserialize)]
-pub struct CreateShareRequest {
-    pub name: String,
-    #[serde(default)]
-    pub comment: String,
-    #[serde(default)]
-    pub tenant: String,
-}
+// ---- Admin request types (the gateway's `/_admin/shares` API) ----
 
 #[derive(Debug, Deserialize)]
 pub struct AddTableRequest {
