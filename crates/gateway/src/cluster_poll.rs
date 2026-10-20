@@ -24,6 +24,7 @@ use objectio_proto::metadata::{
 };
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 use objectio_proto::storage::{GetStatusRequest, GetStatusResponse, ObjectSafety};
+use objectio_proto::stripe::Scheme;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::{LazyLock, RwLock};
@@ -525,7 +526,7 @@ struct Readiness {
     ready: bool,
     osds_reachable: usize,
     osds_registered: usize,
-    /// Write quorum: the default scheme's data shards.
+    /// Write quorum: the OSDs a write of the default scheme needs.
     osds_required: usize,
     meta_reachable: bool,
     /// Ready without every registered OSD, after [`DEGRADED_GRACE`].
@@ -550,12 +551,29 @@ pub fn set_stopping() {
     STOPPING.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// OSDs a write needs to reach: the default scheme's data shards (k), the
-/// write quorum. 1 for replication or before the scheme is known.
+/// OSDs a write needs to reach: the default scheme's write quorum
+/// ([`Scheme::quorum`], the rule every stripe write is acknowledged by).
+/// 1 before the scheme is known.
 fn osds_required() -> usize {
     s3_metrics()
         .protection_config()
-        .map_or(1, |p| p.data_shards.max(1) as usize)
+        .map_or(1, |p| scheme(&p).quorum())
+}
+
+/// The default scheme, as the gateway was started with it.
+fn scheme(p: &crate::s3_metrics::ProtectionConfig) -> Scheme {
+    match p.scheme.as_str() {
+        "replication" => Scheme::Replicas(p.total_shards),
+        "lrc" => Scheme::Lrc {
+            k: p.data_shards,
+            l: p.lrc_local_parity,
+            g: p.lrc_global_parity,
+        },
+        _ => Scheme::Mds {
+            k: p.data_shards,
+            m: p.parity_shards,
+        },
+    }
 }
 
 /// (reachable, registered) OSDs: those meta lists and that answer a status
@@ -702,6 +720,25 @@ pub async fn ready_handler() -> axum::response::Response {
 mod tests {
     use super::*;
     use objectio_proto::storage::BucketUsage;
+
+    /// Ready waits for as many OSDs as a write of the default scheme
+    /// needs: k + 1 for MDS, two copies, all but g − 1 for LRC.
+    #[test]
+    fn readiness_waits_for_a_write_quorum() {
+        let p = |scheme: &str, k, m, total, l, g| crate::s3_metrics::ProtectionConfig {
+            scheme: scheme.to_string(),
+            data_shards: k,
+            parity_shards: m,
+            total_shards: total,
+            efficiency: 0.0,
+            lrc_local_parity: l,
+            lrc_global_parity: g,
+        };
+        assert_eq!(scheme(&p("ec", 4, 2, 6, 0, 0)).quorum(), 5);
+        assert_eq!(scheme(&p("replication", 1, 2, 3, 0, 0)).quorum(), 2);
+        assert_eq!(scheme(&p("replication", 1, 0, 1, 0, 0)).quorum(), 1);
+        assert_eq!(scheme(&p("lrc", 6, 4, 10, 2, 2)).quorum(), 9);
+    }
 
     #[test]
     fn an_osd_counting_its_usage_keeps_the_last_or_holds_the_report() {
