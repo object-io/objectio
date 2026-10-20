@@ -170,7 +170,9 @@ objectio-install init --role all --node-id 1 --advertise node1 \
   --meta-endpoint http://node1:9100,http://node2:9100,http://node3:9100 \
   --disks /dev/disk/by-id/nvme-a,/dev/disk/by-id/nvme-b --ec-profile 4+2 --systemd
 systemctl enable --now objectio-meta
-# once, from any host (a lone meta needs it too); safe to repeat
+# once, from any host (a lone meta needs it too); safe to repeat. Under mTLS
+# add --tls-cert admin.pem --tls-key admin.key --tls-ca ca.pem (role admin),
+# and give each unit its certificate with a drop-in (OBJECTIO_TLS_CERT/KEY/CA)
 objectio-install cluster init node1 node2 node3
 systemctl enable --now objectio-osd-0 objectio-osd-1 objectio-gateway
 ```

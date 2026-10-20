@@ -238,7 +238,7 @@ meta:
   service:
     port: 9100          # gRPC (MetadataService + RaftRpc)
     metricsPort: 9101   # Prometheus
-    adminPort: 9102     # Raft bootstrap + membership admin (HTTP)
+    adminPort: 9102     # Raft bootstrap + membership admin (HTTP; HTTPS under tls.enabled)
   logLevel: info
   persistence:
     size: 10Gi
@@ -255,6 +255,8 @@ meta:
   # 503 until the node is a member of the cluster with a leader known
   # (before the bootstrap Job has added it, during an election). The
   # startup probe gives opening the database time before liveness counts.
+  # Under tls.enabled they ask over HTTPS, without a client certificate,
+  # which these two paths don't need.
   startupProbe:
     httpGet:
       path: /health

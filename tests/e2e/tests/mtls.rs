@@ -1,8 +1,9 @@
 //! mTLS between the services (A8a): a node accepts gRPC only from peers
 //! presenting a certificate the cluster's CA signed, and takes each call
 //! only from a peer whose certificate names a role allowed to make it.
-//! Meta's admin port takes membership changes only from role admin; the
-//! all-in-one keeps its internal ports on loopback.
+//! Meta's admin port takes membership changes only from role admin, and
+//! answers its probes without a client certificate; the all-in-one keeps
+//! its internal ports on loopback.
 
 use objectio_e2e::Cluster;
 use objectio_e2e::ha::HaCluster;
@@ -203,10 +204,11 @@ fn each_call_between_the_services_is_checked_against_the_callers_role() {
 
 #[test]
 fn meta_admin_port_changes_membership_only_for_an_admin() {
-    if tls::files().is_none() {
-        return; // plain: the admin port is unauthenticated, by design
-    }
+    tls::files().expect(
+        "OBJECTIO_E2E_PLAIN is set: the cluster runs plain gRPC, and this test is about mTLS",
+    );
     let ha = HaCluster::start(1, 6, 1);
+    let init = serde_json::json!({});
     let learner = serde_json::json!({ "node_id": 99, "addr": "127.0.0.1:1" });
     let voters = serde_json::json!({ "voters": [1] });
 
@@ -233,7 +235,11 @@ fn meta_admin_port_changes_membership_only_for_an_admin() {
         Some(tls::NO_ROLE),
     ] {
         let (c, _) = tls::admin_http(true, identity);
-        for (path, body) in [("/add-learner", &learner), ("/change-membership", &voters)] {
+        for (path, body) in [
+            ("/init", &init),
+            ("/add-learner", &learner),
+            ("/change-membership", &voters),
+        ] {
             let r = c.post(ha.admin_url(0, path)).json(body).send();
             assert_eq!(
                 r.as_ref().map(reqwest::blocking::Response::status).ok(),
@@ -243,8 +249,16 @@ fn meta_admin_port_changes_membership_only_for_an_admin() {
         }
     }
 
-    // Status stays readable, and nothing changed.
+    // Status stays readable, and nothing changed. What kubelet's probes
+    // ask, presenting no certificate, is answered.
     let (c, _) = tls::admin_http(true, None);
+    for path in ["/health", "/ready"] {
+        let r = c
+            .get(ha.admin_url(0, path))
+            .send()
+            .unwrap_or_else(|e| panic!("{path} without a client certificate: {e}"));
+        assert_eq!(r.status(), reqwest::StatusCode::OK, "{path}");
+    }
     let status: serde_json::Value = c
         .get(ha.admin_url(0, "/status"))
         .send()

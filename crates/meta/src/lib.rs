@@ -85,13 +85,16 @@ pub struct Args {
     pub metrics_port: u16,
 
     /// Admin port for Raft bootstrap and membership (/init, /add-learner,
-    /// /change-membership, /status). HTTPS under mTLS, where changing
-    /// membership takes a client certificate of role admin; plain and
-    /// unauthenticated otherwise.
+    /// /change-membership) and this node's state (/status, /health,
+    /// /ready). HTTPS under mTLS, where every call but reading the state
+    /// takes a client certificate of role admin; plain and unauthenticated
+    /// otherwise.
     #[arg(long, default_value = "9102")]
     pub admin_port: u16,
 
-    /// Address the admin port binds. Default: the host of `--listen`.
+    /// Address the admin port binds. Default: the host of `--listen`
+    /// (0.0.0.0 there: every interface, so `objectio-install cluster init`
+    /// and probes reach it from elsewhere; loopback: this host only).
     #[arg(long)]
     pub admin_host: Option<String>,
 

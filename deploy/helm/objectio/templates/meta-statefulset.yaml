@@ -71,7 +71,8 @@ spec:
             - name: admin
               containerPort: {{ .Values.meta.service.adminPort }}
               protocol: TCP
-          {{- with (include "objectio.probes" (dict "values" .Values.meta) | trim) }}
+          {{- $https := ternary (list "admin" (toString .Values.meta.service.adminPort)) (list) .Values.tls.enabled }}
+          {{- with (include "objectio.probes" (dict "values" .Values.meta "httpsPorts" $https) | trim) }}
           {{- . | nindent 10 }}
           {{- end }}
           volumeMounts:

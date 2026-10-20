@@ -221,13 +221,25 @@ topologySpreadConstraints:
 
 {{/*
 The probes a component's values give (startupProbe, livenessProbe,
-readinessProbe), at the container's indentation.
+readinessProbe), at the container's indentation. An httpGet probe of a
+port in httpsPorts (by name or number) asks over HTTPS unless it names
+its scheme: meta's admin port is HTTPS under mTLS. Kubelet presents no
+client certificate and doesn't verify the server's, and the probes'
+paths (/health, /ready) take a client without one.
+Usage: include "objectio.probes" (dict "values" .Values.meta "httpsPorts" (list "admin"))
 */}}
 {{- define "objectio.probes" -}}
+{{- $https := .httpsPorts | default list }}
 {{- range $name := list "startupProbe" "livenessProbe" "readinessProbe" }}
 {{- with index $.values $name }}
+{{- $probe := deepCopy . }}
+{{- if $probe.httpGet }}
+{{- if and (has (toString $probe.httpGet.port) $https) (not $probe.httpGet.scheme) }}
+{{- $_ := set $probe.httpGet "scheme" "HTTPS" }}
+{{- end }}
+{{- end }}
 {{ $name }}:
-  {{- toYaml . | nindent 2 }}
+  {{- toYaml $probe | nindent 2 }}
 {{- end }}
 {{- end }}
 {{- end }}

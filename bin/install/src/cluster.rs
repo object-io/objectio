@@ -5,7 +5,12 @@
 //! node not yet a voter and `/change-membership` with every node. Each
 //! node's id and Raft address come from its own `/status`, so they are
 //! what it was started with. Run again, it changes nothing.
+//!
+//! Under mTLS the admin ports are HTTPS and change membership only for a
+//! client certificate of role admin, which `--tls-cert`, `--tls-key` and
+//! `--tls-ca` give.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -21,12 +26,36 @@ struct Status {
     voters: Vec<u64>,
 }
 
+/// A client certificate for the admin ports, under mTLS: a certificate
+/// of role admin, its key, and the CA that signed the meta nodes'.
+pub struct Tls {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub ca: PathBuf,
+}
+
+impl Tls {
+    fn client(&self, builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+        let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("{}", p.display()));
+        let ca = reqwest::Certificate::from_pem(&read(&self.ca)?).context("--tls-ca")?;
+        let mut pem = read(&self.cert)?;
+        pem.push(b'\n');
+        pem.extend(read(&self.key)?);
+        let identity = reqwest::Identity::from_pem(&pem).context("--tls-cert, --tls-key")?;
+        Ok(builder
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .identity(identity))
+    }
+}
+
 /// `node` as an admin URL: `host`, `host:port` or a URL; `default_port`
-/// when it names none.
-pub fn admin_url(node: &str, default_port: u16) -> String {
+/// when it names none, `default_scheme` when it names no scheme.
+pub fn admin_url(node: &str, default_port: u16, default_scheme: &str) -> String {
     let (scheme, rest) = node
         .split_once("://")
-        .map_or(("http", node), |(s, r)| (s, r));
+        .map_or((default_scheme, node), |(s, r)| (s, r));
     let rest = rest.trim_end_matches('/');
     // An IPv6 literal is bracketed: its port follows the bracket.
     let has_port = match rest.rfind(']') {
@@ -42,6 +71,8 @@ pub fn admin_url(node: &str, default_port: u16) -> String {
 
 struct Admin {
     client: reqwest::Client,
+    /// Whether it presents a certificate (mTLS).
+    tls: bool,
 }
 
 impl Admin {
@@ -65,7 +96,15 @@ impl Admin {
                     info!("waiting for {url}: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                Err(e) => return Err(e).with_context(|| format!("{url} never answered")),
+                Err(e) => {
+                    let hint = if self.tls {
+                        ""
+                    } else {
+                        " (a cluster under mTLS takes HTTPS: pass --tls-cert, --tls-key and \
+                         --tls-ca)"
+                    };
+                    return Err(e).with_context(|| format!("{url} never answered{hint}"));
+                }
             }
         }
     }
@@ -87,24 +126,45 @@ impl Admin {
     async fn post_ok(&self, url: &str, path: &str, body: serde_json::Value) -> Result<()> {
         let (code, text) = self.post(url, path, body).await?;
         if !(200..300).contains(&code) {
-            bail!("{url}{path}: {code} {text}");
+            bail!("{url}{path}: {code} {text}{}", refusal_hint(code));
         }
         Ok(())
+    }
+}
+
+/// What to do about a refusal of the admin port's.
+const fn refusal_hint(code: u16) -> &'static str {
+    if code == 403 {
+        " (under mTLS this takes a certificate of role admin: --tls-cert, --tls-key, --tls-ca)"
+    } else {
+        ""
     }
 }
 
 /// Make `nodes` (admin addresses, the first the one to start the group
 /// from) one Raft group with every node a voter, waiting up to `wait` for
 /// each to answer.
-pub async fn init(nodes: &[String], default_port: u16, wait: Duration) -> Result<()> {
+pub async fn init(
+    nodes: &[String],
+    default_port: u16,
+    tls: Option<&Tls>,
+    wait: Duration,
+) -> Result<()> {
     if nodes.is_empty() {
         bail!("name every meta node's admin address");
     }
-    let urls: Vec<String> = nodes.iter().map(|n| admin_url(n, default_port)).collect();
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let urls: Vec<String> = nodes
+        .iter()
+        .map(|n| admin_url(n, default_port, scheme))
+        .collect();
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+    if let Some(tls) = tls {
+        builder = tls.client(builder)?;
+    }
     let admin = Admin {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?,
+        client: builder.build()?,
+        tls: tls.is_some(),
     };
     let deadline = Instant::now() + wait;
 
@@ -134,7 +194,7 @@ pub async fn init(nodes: &[String], default_port: u16, wait: Duration) -> Result
         match code {
             200 => info!("node {} started the group", statuses[0].self_id),
             409 => info!("node {} has a group already", statuses[0].self_id),
-            _ => bail!("{}/init: {code} {text}", urls[0]),
+            _ => bail!("{}/init: {code} {text}{}", urls[0], refusal_hint(code)),
         }
     }
 
@@ -200,11 +260,26 @@ mod tests {
 
     #[test]
     fn a_node_is_named_by_host_and_port_or_url() {
-        assert_eq!(admin_url("meta1", 9102), "http://meta1:9102");
-        assert_eq!(admin_url("meta1:19102", 9102), "http://meta1:19102");
-        assert_eq!(admin_url("http://meta1/", 9102), "http://meta1:9102");
-        assert_eq!(admin_url("https://meta1:1", 9102), "https://meta1:1");
-        assert_eq!(admin_url("[fd00::1]", 9102), "http://[fd00::1]:9102");
-        assert_eq!(admin_url("[fd00::1]:5", 9102), "http://[fd00::1]:5");
+        assert_eq!(admin_url("meta1", 9102, "http"), "http://meta1:9102");
+        assert_eq!(admin_url("meta1:19102", 9102, "http"), "http://meta1:19102");
+        assert_eq!(
+            admin_url("http://meta1/", 9102, "http"),
+            "http://meta1:9102"
+        );
+        assert_eq!(
+            admin_url("https://meta1:1", 9102, "http"),
+            "https://meta1:1"
+        );
+        assert_eq!(
+            admin_url("[fd00::1]", 9102, "http"),
+            "http://[fd00::1]:9102"
+        );
+        assert_eq!(admin_url("[fd00::1]:5", 9102, "http"), "http://[fd00::1]:5");
+        // Under mTLS (a client certificate given), HTTPS unless named.
+        assert_eq!(admin_url("meta1", 9102, "https"), "https://meta1:9102");
+        assert_eq!(
+            admin_url("http://meta1", 9102, "https"),
+            "http://meta1:9102"
+        );
     }
 }
