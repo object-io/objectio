@@ -320,14 +320,50 @@ fn my_key(c: &Cluster, session: &str) -> (String, String) {
 
 /// Console login with an access key.
 fn key_login(c: &Cluster, ak: &str, sk: &str) -> String {
-    let r = browser()
+    let r = try_key_login(c, ak, sk);
+    assert_eq!(r.status().as_u16(), 200, "login: {}", r.status());
+    set_cookie(&r, "objectio-session").expect("a session")
+}
+
+fn try_key_login(c: &Cluster, ak: &str, sk: &str) -> reqwest::blocking::Response {
+    browser()
         .post(format!("{}/_console/api/login", c.endpoint))
         .header("Content-Type", "application/json")
         .body(json!({"accessKey": ak, "secretKey": sk}).to_string())
         .send()
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 200, "login: {}", r.status());
-    set_cookie(&r, "objectio-session").expect("a session")
+        .unwrap()
+}
+
+/// A user of `tenant` and a key for it, `(user_id, access_key, secret_key)`;
+/// one of the tenant's admins when `admin`.
+fn tenant_user(c: &Cluster, tenant: &str, name: &str, admin: bool) -> (String, String, String) {
+    let user = c.json(
+        "POST",
+        "/_admin/users",
+        json!({"display_name": name, "tenant": tenant}),
+    );
+    user.expect_ok();
+    let id = user.json()["user_id"].as_str().unwrap().to_string();
+    if admin {
+        c.json(
+            "POST",
+            &format!("/_admin/tenants/{tenant}/admins"),
+            json!({"user_id": id}),
+        )
+        .expect_ok();
+    }
+    let k = c.json(
+        "POST",
+        &format!("/_admin/users/{id}/access-keys"),
+        json!({}),
+    );
+    k.expect_ok();
+    let k = k.json();
+    (
+        id,
+        k["access_key_id"].as_str().unwrap().to_string(),
+        k["secret_access_key"].as_str().unwrap().to_string(),
+    )
 }
 
 /// A tenant's provider handing out `preferred_username: admin` signs in as a
@@ -495,4 +531,81 @@ fn a_system_scope_user_is_refused_what_only_administrators_see() {
     let carol = s.session.expect("a session");
     with_session(&c, "GET", "/_admin/warehouses", &carol).expect(200);
     with_session(&c, "GET", "/_admin/cluster-info", &carol).expect(403);
+}
+
+/// A tenant admin changes only a provider no other tenant uses: one that
+/// signs users in to another tenant is the system admin's to change, however
+/// it is bound there (that tenant naming it, or its `t-<tenant>` name).
+#[test]
+fn a_tenant_admin_changes_only_a_provider_no_other_tenant_uses() {
+    let c = Cluster::start();
+    let idp = Idp::start();
+    tenant(&c, "acme");
+    tenant(&c, "other");
+    let (_, ak, sk) = tenant_user(&c, "acme", "acme-admin", true);
+    let doc = idp.provider(&json!({}));
+    let body = doc.to_string().into_bytes();
+    let disabled = idp
+        .provider(&json!({"enabled": false}))
+        .to_string()
+        .into_bytes();
+
+    // One provider, named by both tenants.
+    provider(&c, "shared", &doc);
+    for t in ["acme", "other"] {
+        c.json(
+            "PUT",
+            &format!("/_admin/tenants/{t}"),
+            json!({"oidc_provider": "shared"}),
+        )
+        .expect_ok();
+    }
+    let shared = "/_admin/config/identity/openid/shared";
+    c.request_as("PUT", shared, &body, &ak, &sk).expect(403);
+    c.request_as("PUT", shared, &disabled, &ak, &sk).expect(403);
+    c.request_as("DELETE", shared, &[], &ak, &sk).expect(403);
+    // The system admin still can.
+    c.request("PUT", shared, &body).expect_ok();
+
+    // Its own provider, which no other tenant uses, it can.
+    let own = "/_admin/config/identity/openid/t-acme";
+    c.request_as("PUT", own, &body, &ak, &sk).expect_ok();
+    // A tenant's user who isn't one of its admins can't.
+    let (_, uak, usk) = tenant_user(&c, "acme", "acme-user", false);
+    c.request_as("PUT", own, &body, &uak, &usk).expect(403);
+
+    // Once another tenant names it, it is shared too.
+    c.json(
+        "PUT",
+        "/_admin/tenants/other",
+        json!({"oidc_provider": "t-acme"}),
+    )
+    .expect_ok();
+    c.request_as("PUT", own, &disabled, &ak, &sk).expect(403);
+    c.request_as("DELETE", own, &[], &ak, &sk).expect(403);
+}
+
+/// A disabled tenant's users sign in to nothing: not through its provider,
+/// not with a key.
+#[test]
+fn a_disabled_tenant_signs_in_to_nothing() {
+    let c = Cluster::start();
+    let idp = Idp::start();
+    tenant(&c, "acme");
+    provider(&c, "t-acme", &idp.provider(&json!({})));
+    let (_, ak, sk) = tenant_user(&c, "acme", "acme-user", false);
+    let dave = json!({"sub": "dave-sub", "preferred_username": "dave"});
+    assert!(
+        sign_in(&c, "provider=t-acme&tenant=acme", &dave)
+            .session
+            .is_some()
+    );
+    key_login(&c, &ak, &sk);
+
+    c.json("PUT", "/_admin/tenants/acme", json!({"enabled": false}))
+        .expect_ok();
+    refused(&sign_in(&c, "provider=t-acme&tenant=acme", &dave));
+    let r = try_key_login(&c, &ak, &sk);
+    assert_eq!(r.status().as_u16(), 403);
+    assert!(set_cookie(&r, "objectio-session").is_none());
 }

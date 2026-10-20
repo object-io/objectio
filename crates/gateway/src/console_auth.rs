@@ -649,6 +649,16 @@ pub async fn console_login(
     let (tenant, display_name, email, arn) = (user.tenant, user.display_name, user.email, user.arn);
     // Known by its ARN, as over SigV4: not by having no tenant.
     let system_admin = arn == objectio_auth::SYSTEM_ADMIN_USER_ARN;
+    if !tenant.is_empty() {
+        match tenant_open(&mut client, &tenant).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("console login refused: tenant '{tenant}' is disabled (user={user_id})");
+                return (StatusCode::FORBIDDEN, "This tenant is disabled").into_response();
+            }
+            Err(e) => return crate::admin::meta_failure(&e),
+        }
+    }
 
     // Per-listener audience gate.
     //
@@ -1365,6 +1375,27 @@ async fn provision_federated_user(
     Ok(user)
 }
 
+/// Whether `tenant` (non-empty) may be signed in to: it exists and is
+/// enabled. A disabled tenant's users sign in to nothing.
+///
+/// # Errors
+///
+/// Meta could not say.
+async fn tenant_open(
+    meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+        tonic::transport::Channel,
+    >,
+    tenant: &str,
+) -> Result<bool, tonic::Status> {
+    let r = meta
+        .get_tenant(objectio_proto::metadata::GetTenantRequest {
+            name: tenant.to_string(),
+        })
+        .await?
+        .into_inner();
+    Ok(r.found && r.tenant.is_some_and(|t| t.enabled))
+}
+
 /// Back to the console the flow started on, with `msg` to show.
 fn login_error(base: &str, msg: &str) -> Response {
     Response::builder()
@@ -1599,6 +1630,19 @@ pub async fn oidc_callback(
     };
 
     let mut meta = state.meta_client.clone();
+    if !tenant.is_empty() {
+        match tenant_open(&mut meta, &tenant).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("OIDC sign-in refused: tenant '{tenant}' is disabled");
+                return login_error(base, "This tenant is disabled");
+            }
+            Err(e) => {
+                warn!("OIDC sign-in: tenant lookup failed: {e}");
+                return login_error(base, "Tenant lookup failed");
+            }
+        }
+    }
     let user = match provision_federated_user(&mut meta, &identity, &tenant).await {
         Ok(u) => u,
         Err(e) => return login_error(base, &e),

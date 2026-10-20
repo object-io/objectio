@@ -307,18 +307,10 @@ pub async fn admin_set_config(
     body: Bytes,
 ) -> Response {
     let caller = extract_caller(&auth, &headers);
-    if !is_system_admin(&caller) {
-        if !caller.authenticated {
-            return (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
-        }
-        // Tenant admins can manage ONLY their own tenant's OIDC config —
-        // they cannot wire a different provider name (which would not be
-        // bound to any tenant) or touch non-OIDC config like balancer
-        // tuning.
-        let allowed = caller_tenant_oidc_config_keys(&state, &auth, &headers).await;
-        if !allowed.contains(&section) {
-            return (StatusCode::FORBIDDEN, "System admin access required").into_response();
-        }
+    if !is_system_admin(&caller)
+        && let Some(deny) = deny_tenant_provider_write(&state, &auth, &headers, &section).await
+    {
+        return deny;
     }
 
     // Validate JSON
@@ -444,11 +436,10 @@ pub async fn admin_delete_config(
 ) -> Response {
     let caller = extract_caller(&auth, &headers);
     if !is_system_admin(&caller) {
-        if !caller.authenticated {
-            return (StatusCode::UNAUTHORIZED, "Authentication required").into_response();
+        if let Some(deny) = deny_tenant_provider_write(&state, &auth, &headers, &section).await {
+            return deny;
         }
-        let allowed = caller_tenant_oidc_config_keys(&state, &auth, &headers).await;
-        if !allowed.contains(&section) || is_system_provider(&state, &section).await {
+        if is_system_provider(&state, &section).await {
             return (StatusCode::FORBIDDEN, "System admin access required").into_response();
         }
     }
@@ -803,6 +794,54 @@ async fn caller_tenant_oidc_config_keys(
         }
     }
     keys
+}
+
+/// Why a caller who is not the system admin may not change (write, disable
+/// or delete) the config at `key`, if they may not. Only a tenant admin may,
+/// only one of their own tenant's provider keys, and only a provider bound
+/// to no other tenant (by its `t-<tenant>` name or a tenant's
+/// `oidc_provider`): a provider another tenant uses signs users in to that
+/// tenant too, and what it says (issuer, admin role) would be theirs to set.
+async fn deny_tenant_provider_write(
+    state: &AppState,
+    auth: &Option<Extension<AuthResult>>,
+    headers: &axum::http::HeaderMap,
+    key: &str,
+) -> Option<Response> {
+    let caller = extract_caller(auth, headers);
+    if !caller.authenticated {
+        return Some((StatusCode::UNAUTHORIZED, "Authentication required").into_response());
+    }
+    let allowed = caller_tenant_oidc_config_keys(state, auth, headers).await;
+    if !allowed.iter().any(|k| k == key) {
+        return Some((StatusCode::FORBIDDEN, "System admin access required").into_response());
+    }
+    if let Some(deny) = require_tenant_admin_access(state, auth, headers, &caller.tenant).await {
+        return Some(deny);
+    }
+    let name = key.strip_prefix("identity/openid/").unwrap_or(key);
+    let tenants = match state
+        .meta_client
+        .clone()
+        .list_tenants(ListTenantsRequest {})
+        .await
+    {
+        Ok(r) => r.into_inner().tenants,
+        Err(e) => return Some(meta_failure(&e)),
+    };
+    if tenants
+        .iter()
+        .any(|t| t.name != caller.tenant && crate::console_auth::provider_binds_tenant(name, t))
+    {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                "This identity provider serves other tenants too: only the system admin may change it",
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 /// Tenant slug key for the caller, if they have a tenant scope. Used by
