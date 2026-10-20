@@ -160,7 +160,25 @@ impl DiskManager {
         }
         sb.set_identity(cluster_uuid, osd_node_id);
         let sb = sb.clone();
-        write_superblock(&self.file, &sb)
+        self.counted_write(write_superblock(&self.file, &sb))
+    }
+
+    /// `r`, a read of this disk: a failure counts as a read error, so a
+    /// disk that returns I/O errors is not reported healthy.
+    fn counted_read<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.stats.read_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
+    /// `r`, a write or flush of this disk: a failure counts as a write
+    /// error.
+    fn counted_write<T>(&self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        r
     }
 
     /// Get the disk path
@@ -329,7 +347,7 @@ impl DiskManager {
         drop(sb); // Release read lock
 
         // Write to disk
-        self.file.write_at(offset, block_buf)?;
+        self.counted_write(self.file.write_at(offset, block_buf))?;
 
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -359,7 +377,7 @@ impl DiskManager {
         // Read the first block to learn the payload length, then the whole
         // extent if it runs further.
         let mut probe = AlignedBuffer::new(block_size);
-        self.file.read_at(offset, probe.as_mut_slice())?;
+        self.counted_read(self.file.read_at(offset, probe.as_mut_slice()))?;
         let header = BlockHeader::from_bytes(&probe.as_slice()[..BlockHeader::SIZE])?;
 
         let extent_bytes =
@@ -368,7 +386,7 @@ impl DiskManager {
         let mut whole;
         let block_buf: &[u8] = if extent_bytes > block_size {
             whole = AlignedBuffer::new(extent_bytes);
-            self.file.read_at(offset, whole.as_mut_slice())?;
+            self.counted_read(self.file.read_at(offset, whole.as_mut_slice()))?;
             whole.as_slice()
         } else {
             probe.as_slice()
@@ -487,7 +505,7 @@ impl DiskManager {
 
         // Transfer to disk via IoBackend — frees the reactor and,
         // when uring is compiled in, skips spawn_blocking entirely.
-        let _ = self.disk_io.write_at_owned(buf, offset).await?;
+        let _ = self.counted_write(self.disk_io.write_at_owned(buf, offset).await)?;
 
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -519,14 +537,16 @@ impl DiskManager {
         // which is what makes the extent self-describing — no block count had
         // to be added to the persisted shard index.
         let first = AlignedBuf::new(block_size);
-        let first_owned = self.disk_io.read_at_owned(first, offset).await?;
+        let first_owned = self.counted_read(self.disk_io.read_at_owned(first, offset).await)?;
         // Whatever a backend hands back, never slice past it: an error, so
         // the shard is marked corrupt, not a panic that leaves it "present".
         let header = BlockHeader::from_bytes(
-            first_owned
-                .as_slice()
-                .get(..BlockHeader::SIZE)
-                .ok_or_else(|| Error::Storage(format!("block {block_num}: short read")))?,
+            self.counted_read(
+                first_owned
+                    .as_slice()
+                    .get(..BlockHeader::SIZE)
+                    .ok_or_else(|| Error::Storage(format!("block {block_num}: short read"))),
+            )?,
         )?;
 
         let extent_bytes =
@@ -535,7 +555,7 @@ impl DiskManager {
         let owned;
         let block_buf: &[u8] = if extent_bytes > block_size {
             let whole = AlignedBuf::new(extent_bytes);
-            owned = self.disk_io.read_at_owned(whole, offset).await?;
+            owned = self.counted_read(self.disk_io.read_at_owned(whole, offset).await)?;
             owned.as_slice()
         } else {
             first_owned.as_slice()
@@ -548,6 +568,7 @@ impl DiskManager {
 
         // Parse footer from the end of the extent
         if block_buf.len() != extent_bytes {
+            self.stats.read_errors.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Storage(format!(
                 "block {block_num}: read {} of {extent_bytes} bytes",
                 block_buf.len()
@@ -593,7 +614,8 @@ impl DiskManager {
 
     /// Sync all pending writes to disk
     pub fn sync(&self) -> Result<()> {
-        self.file.sync()
+        // A failed fsync is lost writes: a write error.
+        self.counted_write(self.file.sync())
     }
 
     /// Update superblock on disk
@@ -606,7 +628,7 @@ impl DiskManager {
         // Recompute checksum after modifying fields
         sb.update_checksum();
         let sb = sb.clone();
-        write_superblock(&self.file, &sb)
+        self.counted_write(write_superblock(&self.file, &sb))
     }
 }
 
@@ -897,6 +919,71 @@ mod tests {
         let (header, read_data) = disk.read_block(0).unwrap();
         assert_eq!(header.object_id, object_id);
         assert_eq!(read_data, data);
+    }
+
+    /// A backend whose every read and write fails as a dying disk's do.
+    #[derive(Debug)]
+    struct Eio;
+
+    #[async_trait::async_trait]
+    impl IoBackend for Eio {
+        fn kind(&self) -> crate::io_backend::BackendKind {
+            crate::io_backend::BackendKind::Pread
+        }
+        fn size(&self) -> u64 {
+            0
+        }
+        async fn read_at_owned(
+            &self,
+            _: crate::io_backend::OwnedBuf,
+            _: u64,
+        ) -> Result<crate::io_backend::OwnedBuf> {
+            Err(Error::Storage(
+                "read: Input/output error (os error 5)".into(),
+            ))
+        }
+        async fn write_at_owned(
+            &self,
+            _: crate::io_backend::OwnedBuf,
+            _: u64,
+        ) -> Result<crate::io_backend::OwnedBuf> {
+            Err(Error::Storage(
+                "write: Input/output error (os error 5)".into(),
+            ))
+        }
+        async fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn sync_data(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A disk that returns EIO counts it, per direction: the OSD reports a
+    /// disk with errors as not healthy, and these were never counted.
+    #[tokio::test]
+    async fn io_errors_are_counted() {
+        let dir = tempdir().unwrap();
+        let mut disk = DiskManager::init(dir.path().join("eio.disk"), MIN_TEST_DISK, None).unwrap();
+        disk.write_block_async(0, [1; 16], 0, b"before")
+            .await
+            .unwrap();
+        disk.disk_io = Arc::new(Eio);
+        let errors = |d: &DiskManager| {
+            let s = d.stats();
+            (
+                s.read_errors.load(Ordering::Relaxed),
+                s.write_errors.load(Ordering::Relaxed),
+            )
+        };
+        assert_eq!(errors(&disk), (0, 0));
+
+        assert!(disk.read_block_async(0).await.is_err());
+        assert_eq!(errors(&disk), (1, 0));
+        assert!(disk.write_block_async(1, [2; 16], 0, b"x").await.is_err());
+        assert_eq!(errors(&disk), (1, 1));
+        // A checksum mismatch is not an I/O error: it has its own count.
+        assert_eq!(disk.stats().checksum_errors.load(Ordering::Relaxed), 0);
     }
 
     #[test]
