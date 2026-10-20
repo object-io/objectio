@@ -43,7 +43,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::s3::{AppState, S3Error, build_s3_arn, sse_condition_vars};
 
@@ -416,97 +416,119 @@ impl Default for AuthzCache {
     }
 }
 
+/// Meta could not answer a read an authorization decision rests on. The
+/// request fails (503) rather than being decided on part of the facts: an
+/// unreadable policy is not "no policy", and an unreadable bucket is not a
+/// bucket with no tenant.
+#[derive(Debug)]
+pub(crate) struct Unavailable;
+
+/// The answer to a request whose authorization could not be read.
+fn unavailable() -> Response {
+    S3Error::xml_response(
+        "ServiceUnavailable",
+        "Authorization could not be checked; please retry",
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+}
+
+/// What a bucket's stored policy says: none, a policy, or `Unavailable`
+/// when meta failed or the stored document doesn't parse (it could hold a
+/// Deny, so it can't be treated as absent).
+fn bucket_policy_from(
+    bucket: &str,
+    answer: Result<objectio_proto::metadata::GetBucketPolicyResponse, tonic::Status>,
+) -> Result<Option<Arc<BucketPolicy>>, Unavailable> {
+    match answer {
+        Ok(resp) if resp.has_policy => match BucketPolicy::from_json(&resp.policy_json) {
+            Ok(policy) => Ok(Some(Arc::new(policy))),
+            Err(e) => {
+                error!("Bucket policy for {bucket} does not parse: {e}");
+                Err(Unavailable)
+            }
+        },
+        Ok(_) => Ok(None),
+        Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
+        Err(e) => {
+            error!("Failed to fetch bucket policy for {bucket}: {e}");
+            Err(Unavailable)
+        }
+    }
+}
+
+/// The bucket meta knows, `None` when it says there is no such bucket, or
+/// `Unavailable` when it couldn't say.
+fn bucket_meta_from(
+    bucket: &str,
+    answer: Result<objectio_proto::metadata::GetBucketResponse, tonic::Status>,
+) -> Result<Option<objectio_proto::metadata::BucketMeta>, Unavailable> {
+    match answer {
+        Ok(resp) => Ok(resp.bucket),
+        Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
+        Err(e) => {
+            error!("Failed to fetch bucket meta for {bucket}: {e}");
+            Err(Unavailable)
+        }
+    }
+}
+
 /// Fetch a bucket's policy and owner, via the cache when it is warm.
 ///
-/// Meta errors yield an empty entry rather than propagating. An unreadable
-/// bucket therefore looks unowned and unpoliced, which the chain denies to
-/// everyone but the system admin.
-async fn load_bucket(state: &AppState, bucket: &str) -> BucketEntry {
+/// Any meta error is `Unavailable` and nothing is cached: the next request
+/// reads again.
+async fn load_bucket(state: &AppState, bucket: &str) -> Result<BucketEntry, Unavailable> {
     if let Some(cached) = state.policy_cache.bucket(bucket) {
-        return cached;
+        return Ok(cached);
     }
 
     let mut client = state.meta_client.clone();
 
-    let policy = match client
-        .get_bucket_policy(GetBucketPolicyRequest {
-            bucket: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(response) => {
-            let resp = response.into_inner();
-            if resp.has_policy {
-                match BucketPolicy::from_json(&resp.policy_json) {
-                    Ok(policy) => Some(Arc::new(policy)),
-                    Err(e) => {
-                        error!("Failed to parse bucket policy for {bucket}: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            if e.code() != tonic::Code::NotFound {
-                error!("Failed to fetch bucket policy for {bucket}: {e}");
-            }
-            None
-        }
-    };
-
-    let mut missing = false;
-    let (owner, tenant, found) = match client
-        .get_bucket(GetBucketRequest {
-            name: bucket.to_string(),
-        })
-        .await
-    {
-        Ok(response) => match response.into_inner().bucket {
-            Some(b) => (b.owner, b.tenant, true),
-            None => {
-                missing = true;
-                (String::new(), String::new(), false)
-            }
-        },
-        Err(e) => {
-            if e.code() == tonic::Code::NotFound {
-                missing = true;
-            } else {
-                error!("Failed to fetch bucket meta for {bucket}: {e}");
-            }
-            (String::new(), String::new(), false)
-        }
-    };
-
-    let public_block = if found {
-        crate::public_access::bucket_block(state, bucket)
+    let meta = bucket_meta_from(
+        bucket,
+        client
+            .get_bucket(GetBucketRequest {
+                name: bucket.to_string(),
+            })
             .await
-            .unwrap_or_default()
-    } else {
-        crate::public_access::PublicAccessBlock::ALL
+            .map(tonic::Response::into_inner),
+    )?;
+    let Some(meta) = meta else {
+        // Not cached: `CreateBucket` is authorized *before* the bucket
+        // exists, and a cached miss would stand, tenant-less and owner-less,
+        // for the whole TTL after the bucket is created.
+        return Ok(BucketEntry {
+            policy: None,
+            owner: String::new(),
+            tenant: String::new(),
+            public_block: crate::public_access::PublicAccessBlock::ALL,
+            missing: true,
+            cached_at: Instant::now(),
+        });
     };
+
+    let policy = bucket_policy_from(
+        bucket,
+        client
+            .get_bucket_policy(GetBucketPolicyRequest {
+                bucket: bucket.to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    )?;
+
+    let public_block = crate::public_access::bucket_block(state, bucket)
+        .await
+        .unwrap_or_default();
     let entry = BucketEntry {
         policy,
-        owner,
-        tenant,
+        owner: meta.owner,
+        tenant: meta.tenant,
         public_block,
-        missing,
+        missing: false,
         cached_at: Instant::now(),
     };
-
-    // Only cache a bucket we actually read. `CreateBucket` is authorized
-    // *before* the bucket exists, so caching the miss would leave a
-    // tenant-less, owner-less entry standing for the whole TTL — and during
-    // that window the tenant gate sees no tenant to compare and the ownership
-    // fallback sees no owner, so a freshly created bucket would be reachable
-    // by anyone. A miss from a degraded meta read is left uncached for the
-    // same reason.
-    if found {
-        state.policy_cache.put_bucket(bucket, entry.clone());
-    }
-    entry
+    state.policy_cache.put_bucket(bucket, entry.clone());
+    Ok(entry)
 }
 
 /// How meta names a principal's attachments and inline policies:
@@ -525,16 +547,20 @@ pub(crate) fn principal_key(principal_id: &str, is_group: bool) -> String {
 /// Load and parse every policy of one principal (user, group or role
 /// session): the named ones attached to it, the AWS managed ones attached
 /// to it, and its inline ones.
+///
+/// All or nothing: a list or a document meta couldn't read, or one that
+/// doesn't parse, is `Unavailable`, never "no such policy" (it could hold
+/// a Deny), and nothing is cached.
 pub(crate) async fn load_identity_policies(
     state: &AppState,
     principal_id: &str,
     is_group: bool,
-) -> AttachedPolicies {
+) -> Result<AttachedPolicies, Unavailable> {
     if principal_id.is_empty() {
-        return Arc::new(Vec::new());
+        return Ok(Arc::new(Vec::new()));
     }
     if let Some(cached) = state.policy_cache.identity(principal_id) {
-        return cached;
+        return Ok(cached);
     }
 
     let mut client = state.meta_client.clone();
@@ -560,65 +586,75 @@ pub(crate) async fn load_identity_policies(
         }
     };
 
-    let names = match client.list_attached_policies(request).await {
-        Ok(r) => r.into_inner().policy_names,
-        Err(e) => {
-            // Treated as "no attached policies". Combined with the ownership
-            // fallback this fails closed for non-owners rather than opening up.
+    let names = client
+        .list_attached_policies(request)
+        .await
+        .map_err(|e| {
             error!("list_attached_policies for {principal_id} failed: {e}");
-            Vec::new()
-        }
-    };
+            Unavailable
+        })?
+        .into_inner()
+        .policy_names;
 
-    let mut policies = Vec::with_capacity(names.len());
+    let mut documents = Vec::with_capacity(names.len());
     for name in names {
-        let json = if let Some(doc) = objectio_auth::managed::attached(&name) {
-            doc.to_string()
-        } else {
-            let Ok(resp) = client
-                .get_policy(GetPolicyRequest { name: name.clone() })
-                .await
-            else {
-                continue;
-            };
-            let inner = resp.into_inner();
-            let Some(obj) = inner.policy.filter(|_| inner.found) else {
-                continue;
-            };
-            obj.policy_json
-        };
-        match BucketPolicy::from_json(&json) {
-            Ok(policy) => policies.push((name, Arc::new(policy))),
-            Err(e) => warn!("attached policy '{name}' for {principal_id} failed to parse: {e}"),
+        if let Some(doc) = objectio_auth::managed::attached(&name) {
+            documents.push((name, doc.to_string()));
+            continue;
+        }
+        let inner = client
+            .get_policy(GetPolicyRequest { name: name.clone() })
+            .await
+            .map_err(|e| {
+                error!("get_policy '{name}' for {principal_id} failed: {e}");
+                Unavailable
+            })?
+            .into_inner();
+        // An attachment whose policy was deleted grants and denies nothing.
+        if let Some(obj) = inner.policy.filter(|_| inner.found) {
+            documents.push((name, obj.policy_json));
         }
     }
-    // Inline policies. An unreadable list is treated as none, which fails
-    // closed for an Allow but could miss a Deny: logged, as attachments are.
-    match client
+    let inline = client
         .list_inline_policies(objectio_proto::metadata::ListInlinePoliciesRequest {
             principal: principal_key(principal_id, is_group),
         })
         .await
-    {
-        Ok(r) => {
-            for p in r.into_inner().policies {
-                match BucketPolicy::from_json(&p.policy_json) {
-                    Ok(policy) => policies.push((format!("inline:{}", p.name), Arc::new(policy))),
-                    Err(e) => warn!(
-                        "inline policy '{}' of {principal_id} failed to parse: {e}",
-                        p.name
-                    ),
-                }
-            }
-        }
-        Err(e) => error!("list_inline_policies for {principal_id} failed: {e}"),
-    }
+        .map_err(|e| {
+            error!("list_inline_policies for {principal_id} failed: {e}");
+            Unavailable
+        })?
+        .into_inner()
+        .policies;
+    documents.extend(
+        inline
+            .into_iter()
+            .map(|p| (format!("inline:{}", p.name), p.policy_json)),
+    );
 
-    let policies = Arc::new(policies);
+    let policies = Arc::new(parse_identity_policies(principal_id, documents)?);
     state
         .policy_cache
         .put_identity(principal_id, Arc::clone(&policies));
-    policies
+    Ok(policies)
+}
+
+/// Parse a principal's named policy documents; any that doesn't parse
+/// makes the whole set `Unavailable`.
+fn parse_identity_policies(
+    principal_id: &str,
+    documents: Vec<(String, String)>,
+) -> Result<Vec<(String, Arc<BucketPolicy>)>, Unavailable> {
+    documents
+        .into_iter()
+        .map(|(name, json)| match BucketPolicy::from_json(&json) {
+            Ok(policy) => Ok((name, Arc::new(policy))),
+            Err(e) => {
+                error!("policy '{name}' of {principal_id} does not parse: {e}");
+                Err(Unavailable)
+            }
+        })
+        .collect()
 }
 
 /// The tags of the object at `bucket/key`, if it exists.
@@ -713,17 +749,20 @@ pub async fn authorize(
     if auth.user_arn == crate::admin::SYSTEM_ADMIN_USER_ARN {
         // Its tenant still learns of it: the event goes to the bucket's
         // tenant's audit stream like anyone else's.
-        let bucket = load_bucket(state, req.bucket).await;
-        crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
+        if let Ok(bucket) = load_bucket(state, req.bucket).await {
+            crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
+        }
         return None;
     }
 
-    let bucket = load_bucket(state, req.bucket).await;
+    let Ok(bucket) = load_bucket(state, req.bucket).await else {
+        return Some(unavailable());
+    };
     crate::audit::note_bucket_tenant(req.bucket, &bucket.tenant);
 
     // A bucket that doesn't exist is "no such bucket" to everyone, as in S3:
     // there is nothing in it to protect. Creating it goes on to the
-    // handler. (A bucket meta couldn't read is not `missing`: denied below.)
+    // handler.
     if bucket.missing && !req.bucket.is_empty() && req.action != "s3:CreateBucket" {
         return Some(S3Error::xml_response(
             "NoSuchBucket",
@@ -754,10 +793,10 @@ pub async fn authorize(
     principals.extend(auth.group_ids.iter().map(|g| (g.as_str(), true)));
 
     for (principal, is_group) in principals {
-        for (name, policy) in load_identity_policies(state, principal, is_group)
-            .await
-            .iter()
-        {
+        let Ok(policies) = load_identity_policies(state, principal, is_group).await else {
+            return Some(unavailable());
+        };
+        for (name, policy) in policies.iter() {
             match state.policy_evaluator.evaluate(policy, &context) {
                 PolicyDecision::Deny => {
                     debug!(
@@ -829,6 +868,7 @@ pub async fn authorize(
 /// What a caller's own policies say of `context`: those of the caller
 /// itself (a user, or a role's session) and of every group it is in. An
 /// explicit Deny anywhere wins, then any Allow; else nothing granted it.
+/// Policies meta couldn't read are a Deny: what they say is unknown.
 pub(crate) async fn identity_decision(
     state: &AppState,
     auth: &AuthResult,
@@ -838,10 +878,10 @@ pub(crate) async fn identity_decision(
     principals.extend(auth.group_ids.iter().map(|g| (g.as_str(), true)));
     let mut allowed = false;
     for (principal, is_group) in principals {
-        for (_, policy) in load_identity_policies(state, principal, is_group)
-            .await
-            .iter()
-        {
+        let Ok(policies) = load_identity_policies(state, principal, is_group).await else {
+            return PolicyDecision::Deny;
+        };
+        for (_, policy) in policies.iter() {
             match state.policy_evaluator.evaluate(policy, context) {
                 PolicyDecision::Deny => return PolicyDecision::Deny,
                 PolicyDecision::Allow => allowed = true,
@@ -1121,15 +1161,16 @@ pub async fn authz_layer(
     {
         // Bucket names are one namespace: asking to create one that someone
         // else holds is answered as S3 does, "taken", not "forbidden".
-        if action == "s3:CreateBucket" {
-            let entry = load_bucket(&state, &bucket).await;
-            if !entry.owner.is_empty() && entry.owner != auth.user_id {
-                return crate::s3::S3Error::xml_response(
-                    "BucketAlreadyExists",
-                    "The requested bucket name is not available",
-                    StatusCode::CONFLICT,
-                );
-            }
+        if action == "s3:CreateBucket"
+            && let Ok(entry) = load_bucket(&state, &bucket).await
+            && !entry.owner.is_empty()
+            && entry.owner != auth.user_id
+        {
+            return crate::s3::S3Error::xml_response(
+                "BucketAlreadyExists",
+                "The requested bucket name is not available",
+                StatusCode::CONFLICT,
+            );
         }
         return deny;
     }
@@ -1468,6 +1509,57 @@ mod tests {
         use objectio_auth::AuthMode;
         assert!(tenant_violation("", "acme", AuthMode::Sts).is_none());
         assert!(tenant_violation("acme", "globex", AuthMode::Sts).is_none());
+    }
+
+    #[test]
+    fn a_meta_error_is_never_read_as_no_policy() {
+        for failure in [
+            tonic::Status::unavailable("meta is down"),
+            tonic::Status::internal("boom"),
+            tonic::Status::deadline_exceeded("slow"),
+        ] {
+            assert!(bucket_policy_from("b", Err(failure.clone())).is_err());
+            assert!(bucket_meta_from("b", Err(failure)).is_err());
+        }
+        // "There is none" is an answer.
+        let not_found = || tonic::Status::not_found("no such bucket");
+        assert!(matches!(
+            bucket_policy_from("b", Err(not_found())),
+            Ok(None)
+        ));
+        assert!(matches!(bucket_meta_from("b", Err(not_found())), Ok(None)));
+        assert!(matches!(
+            bucket_policy_from(
+                "b",
+                Ok(objectio_proto::metadata::GetBucketPolicyResponse {
+                    policy_json: String::new(),
+                    has_policy: false,
+                })
+            ),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_stored_policy_that_does_not_parse_is_not_no_policy() {
+        let corrupt = Ok(objectio_proto::metadata::GetBucketPolicyResponse {
+            policy_json: "{not json".to_string(),
+            has_policy: true,
+        });
+        assert!(bucket_policy_from("b", corrupt).is_err());
+        let docs = vec![
+            (
+                "ok".to_string(),
+                r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
+            ),
+            ("broken".to_string(), "{".to_string()),
+        ];
+        assert!(parse_identity_policies("u1", docs).is_err());
+        let docs = vec![(
+            "ok".to_string(),
+            r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
+        )];
+        assert_eq!(parse_identity_policies("u1", docs).unwrap().len(), 1);
     }
 
     #[test]
