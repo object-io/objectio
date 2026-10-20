@@ -162,17 +162,64 @@ jobs:
           cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
             --partition hash:${{ matrix.shard }}/8 --test-threads 1 --no-fail-fast --success-output never --failure-output final
 
-  # The check the main ruleset requires: every shard passed (or, on a pull
-  # request, the suite was left to the merge queue).
+  # The shards above run debug binaries built with no optional features,
+  # so their disk I/O is pread. The release does it through io_uring
+  # (release.yml), and a bug only that path has passes there. This builds
+  # the binaries with the release's feature set and runs the files that
+  # exercise the data path through them: puts and gets, multipart, repair,
+  # restarts, packing, shard checksums and removed disks. Beside the
+  # shards, not after them: ~20 minutes, about the shards' critical path.
+  e2e-release:
+    name: end-to-end (release features)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # release.yml's linux-amd64 aio, and the same on the services'
+      # binaries the multi-process tests start.
+      FEATURES: >-
+        objectio-aio/io-uring,objectio-aio/grep-pcre2,
+        objectio-osd-bin/io-uring,objectio-gateway-bin/pcre2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: protoc, mold, ISA-L's build tools, PCRE2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool \
+            libclang-dev libpcre2-dev pkg-config
+      # Fails if this runner denies io_uring: the OSDs would otherwise fall
+      # back to pread, and the run below test nothing new.
+      - name: io_uring works here
+        run: cargo test -p objectio-storage --features io-uring --lib io_backend::tests::uring_roundtrip
+      - name: build the binaries with the release features
+        run: |
+          cargo build --features "$(echo "$FEATURES" | tr -d ' \n')" \
+            --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd \
+            --bin objectio-gateway --bin objectio-block-gateway
+      # Building the tests leaves the binaries above alone: objectio-e2e
+      # depends on none of their packages.
+      - name: run
+        run: |
+          cargo nextest run -p objectio-e2e --test-threads 1 --no-fail-fast \
+            --success-output never --failure-output final \
+            --test s3_compat --test multipart --test repair --test restart \
+            --test packing --test shard_checksums --test osd_disks
+
+  # The check the main ruleset requires: every shard and the release-features
+  # run passed (or, on a pull request, the suite was left to the merge queue).
   e2e:
     name: end-to-end
-    needs: e2e-shard
+    needs: [e2e-shard, e2e-release]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
-          r="${{ needs.e2e-shard.result }}"
-          test "$r" = success || { test "$r" = skipped && test "${{ github.event_name }}" = pull_request; }
+          ok() { test "$1" = success || { test "$1" = skipped && test "${{ github.event_name }}" = pull_request; }; }
+          ok "${{ needs.e2e-shard.result }}" && ok "${{ needs.e2e-release.result }}"
 
   upgrade:
     name: rolling upgrade

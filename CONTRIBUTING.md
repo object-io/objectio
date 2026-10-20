@@ -178,11 +178,11 @@ recovery, placement or durability, say so in the pull request and we will.
    Expect questions; answer in the thread, push fixes as new commits, and
    don't force-push during review unless asked.
 5. Once approved, a maintainer adds it to the merge queue. The queue runs
-   the heavy jobs (the eight end-to-end shards, the rolling upgrade, the
-   crash-consistency test, the images, a performance check against the
-   base) on your change merged
-   with the latest `main`, and merges it, squashed, if they pass. If the
-   queue fails, we'll tell you why.
+   the heavy jobs (the eight end-to-end shards, one more on the release's
+   features, the rolling upgrade, the crash-consistency test, the images,
+   a performance check against the base) on your change merged with the
+   latest `main`, and merges it, squashed, if they pass. If the queue
+   fails, we'll tell you why.
 
 A pull request that has had no reply from its author for a month may be
 closed; reopening it is always fine.

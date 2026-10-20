@@ -49,8 +49,10 @@ sense, check the binary is newer than your edit.
 the running suite. Use another `git worktree` with its own `--target-dir`.
 
 CI runs the suite with nextest in eight shards, one test at a time per
-shard. Tests marked `#[ignore]` are left out there: measurements, and the
-tests below that need something a plain machine lacks.
+shard, and the data-path files again on binaries built with the release's
+features (`end-to-end (release features)`: io_uring). Tests marked
+`#[ignore]` are left out there: measurements, and the tests below that
+need something a plain machine lacks.
 
 ## Tests that need something
 
@@ -64,7 +66,7 @@ nothing. Each has a CI job that provides what it needs:
 | `crates/osd/tests/crash_consistency.rs` | root through `sudo -n`, loop devices, `dm-log-writes` | `cargo test -p objectio-osd --test crash_consistency -- --ignored --nocapture` | `crash consistency` |
 | `tests/e2e/tests/rolling_upgrade.rs` | the previous release's binaries | below | `rolling upgrade` |
 | `tests/e2e/tests/rdma.rs` | an aio built with `--features rdma` (a Mooncake build), `OBJECTIO_E2E_RDMA=tcp` | `crates/transport-te/ci-test.sh`, in `crates/transport-te/test.Dockerfile`'s image | `rdma (transfer engine, tcp)` |
-| `io_backend::tests::uring_roundtrip` (`objectio-storage`) | a host that allows io_uring (docker's default seccomp denies it) | `cargo test -p objectio-storage --features io-uring` (not ignored: the feature is the opt-in) | `unit tests` |
+| `io_backend::tests::uring_roundtrip` (`objectio-storage`) | a host that allows io_uring (docker's default seccomp denies it) | `cargo test -p objectio-storage --features io-uring` (not ignored: the feature is the opt-in) | `unit tests`, `end-to-end (release features)` |
 | `tests/e2e/tests/mtls.rs` | the suite on mTLS, its default (fails under `OBJECTIO_E2E_PLAIN`) | with the suite | the shards |
 
 CI passes `--include-ignored`, so that dropping an `#[ignore]` can't make
