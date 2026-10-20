@@ -49,8 +49,27 @@ sense, check the binary is newer than your edit.
 the running suite. Use another `git worktree` with its own `--target-dir`.
 
 CI runs the suite with nextest in eight shards, one test at a time per
-shard; tests marked `#[ignore]` are measurements, run by hand with
-`-- --ignored`.
+shard. Tests marked `#[ignore]` are left out there: measurements, and the
+tests below that need something a plain machine lacks.
+
+## Tests that need something
+
+A test that needs root, a kernel feature or another build is
+`#[ignore = "needs …; CI: <job>"]`, and run with `-- --ignored` it
+**fails** when what it needs is missing. It never passes having tested
+nothing. Each has a CI job that provides what it needs:
+
+| Test | Needs | Run it with | CI job |
+|---|---|---|---|
+| `crates/osd/tests/crash_consistency.rs` | root through `sudo -n`, loop devices, `dm-log-writes` | `cargo test -p objectio-osd --test crash_consistency -- --ignored --nocapture` | `crash consistency` |
+| `tests/e2e/tests/rolling_upgrade.rs` | the previous release's binaries | below | `rolling upgrade` |
+| `tests/e2e/tests/rdma.rs` | an aio built with `--features rdma` (a Mooncake build), `OBJECTIO_E2E_RDMA=tcp` | `crates/transport-te/ci-test.sh`, in `crates/transport-te/test.Dockerfile`'s image | `rdma (transfer engine, tcp)` |
+| `io_backend::tests::uring_roundtrip` (`objectio-storage`) | a host that allows io_uring (docker's default seccomp denies it) | `cargo test -p objectio-storage --features io-uring` (not ignored: the feature is the opt-in) | `unit tests` |
+| `tests/e2e/tests/mtls.rs` | the suite on mTLS, its default (fails under `OBJECTIO_E2E_PLAIN`) | with the suite | the shards |
+
+CI passes `--include-ignored`, so that dropping an `#[ignore]` can't make
+its job run nothing. Writing such a test: check the prerequisite first and
+`panic!`/`expect` with what is missing, never `eprintln!("skipped"); return`.
 
 ### Writing one
 
@@ -102,12 +121,15 @@ in a Linux VM.
 
 ```bash
 OBJECTIO_PREVIOUS_RELEASE_BIN=$(scripts/upgrade-test/previous-release.sh) \
-  cargo test -p objectio-e2e --test rolling_upgrade -- --nocapture
+  cargo test -p objectio-e2e --test rolling_upgrade -- --ignored --nocapture
 ```
 
 It builds the last tag in a worktree under `target/previous/`, starts a
 cluster on it, and upgrades one node at a time under traffic. It fails if
-`main` carries a version that is already tagged.
+`main` carries a version that is already tagged, and without
+`OBJECTIO_PREVIOUS_RELEASE_BIN`. The CI job finds the tag itself; before
+the first release it says, as a warning, that there is nothing to upgrade
+from, and fails if tags exist but none is behind the commit.
 
 ## A failure that comes and goes
 

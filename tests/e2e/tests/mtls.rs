@@ -32,9 +32,9 @@ fn call(rt: &tokio::runtime::Runtime, ep: Result<Endpoint, String>) -> Result<()
 
 #[test]
 fn a_node_refuses_a_client_without_the_clusters_certificate() {
-    let Some(files) = objectio_e2e::tls::files() else {
-        return; // the suite runs plain: nothing to refuse
-    };
+    let files = objectio_e2e::tls::files().expect(
+        "OBJECTIO_E2E_PLAIN is set: the cluster runs plain gRPC, and this test is about mTLS",
+    );
     let ha = HaCluster::start(1, 6, 1);
     let addr = ha
         .meta_endpoints()

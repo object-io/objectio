@@ -17,13 +17,17 @@
 //! before the mark must read back intact.
 //!
 //! Needs root through `sudo -n` (device mapper, loop devices, mount) and
-//! the `dm-log-writes` module:
+//! the `dm-log-writes` module, so it is ignored by default; run with
+//! `--ignored`, where a missing prerequisite fails it (CI: the `crash
+//! consistency` job):
 //!
 //! ```text
-//! OBJECTIO_CRASH_TEST=1 cargo test -p objectio-osd --test crash_consistency -- --nocapture
+//! cargo test -p objectio-osd --test crash_consistency -- --ignored --nocapture
 //! ```
 //!
-//! `OBJECTIO_CRASH_SECS` (30) is how long the writers run;
+//! `OBJECTIO_CRASH_DIR` (/tmp) holds the images and logs: sparse, a few GB
+//! written;
+//! `OBJECTIO_CRASH_SECS` (30) how long the writers run;
 //! `OBJECTIO_CRASH_CUTS` (12) how many marks are replayed.
 
 use objectio_osd::service::OsdService;
@@ -374,11 +378,13 @@ async fn check(data: &Path, state: &Path, acked: &[Acked]) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs root through sudo -n, loop devices and dm-log-writes; CI: crash consistency"]
 async fn acknowledged_writes_survive_a_power_cut_anywhere() {
-    if std::env::var("OBJECTIO_CRASH_TEST").is_err() {
-        eprintln!("skipped: set OBJECTIO_CRASH_TEST=1 (needs sudo -n and dm-log-writes)");
-        return;
-    }
+    let root = Command::new("sudo").args(["-n", "true"]).status();
+    assert!(
+        root.as_ref().is_ok_and(std::process::ExitStatus::success),
+        "needs root through sudo -n (passwordless): {root:?}"
+    );
     let secs: u64 = std::env::var("OBJECTIO_CRASH_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
