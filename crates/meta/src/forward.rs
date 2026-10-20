@@ -8,9 +8,13 @@
 //! list of meta addresses, and whichever one answers serves them.
 //!
 //! Forwarding happens at the transport, so every method is covered,
-//! including ones added later, and reads are answered by the leader too:
-//! a client never sees a follower's possibly stale state. Raft's own calls
-//! between metas are never forwarded.
+//! including ones added later, and reads are answered by the leader too,
+//! never from a follower's possibly stale state. And the leader answers
+//! only while a quorum confirms it still leads (`read_gate`): a leader cut
+//! off from its followers believes it leads until it hears otherwise, and
+//! would go on answering from its own state while the others elect a new
+//! leader and move on. Raft's own calls between metas are neither
+//! forwarded nor gated.
 //!
 //! A call forwarded once is not forwarded again: if the node it reached is
 //! no longer the leader (an election in between), it answers UNAVAILABLE,
@@ -33,13 +37,20 @@ use tonic::codegen::http;
 use tonic::transport::Channel;
 use tracing::debug;
 
+use crate::read_gate::ReadGate;
+
 /// Marks a call a follower forwarded, so it is forwarded only once.
 const FORWARDED: &str = "x-objectio-forwarded";
 
 /// Marks a liveness probe from a client's meta channel
 /// (`objectio_proto::transport::meta_channel`): answered here at once,
-/// never forwarded, so it says whether *this* node is up.
+/// never forwarded, so it says whether *this* node is up, and whether it
+/// can serve.
 const PROBE: &str = objectio_proto::transport::META_PROBE_HEADER;
+
+/// The probe's answers: up, or up but unable to serve.
+const ALIVE: &str = objectio_proto::transport::META_PROBE_ALIVE;
+const NOT_SERVING: &str = objectio_proto::transport::META_PROBE_NOT_SERVING;
 
 /// The gRPC path prefix of Raft's own service: never forwarded.
 const RAFT_PREFIX: &str = "/objectio.raft.";
@@ -74,11 +85,15 @@ pub struct ForwardToLeaderLayer {
     raft: Arc<openraft::Raft<MetaTypeConfig>>,
     self_id: u64,
     channels: Arc<Mutex<HashMap<String, Channel>>>,
+    gate: Arc<ReadGate>,
 }
 
 impl ForwardToLeaderLayer {
     pub fn new(raft: Arc<openraft::Raft<MetaTypeConfig>>, self_id: u64) -> Self {
+        let election_timeout_min =
+            std::time::Duration::from_millis(raft.config().election_timeout_min);
         Self {
+            gate: ReadGate::for_raft(raft.clone(), election_timeout_min),
             raft,
             self_id,
             channels: Arc::default(),
@@ -104,7 +119,12 @@ pub struct ForwardToLeader<S> {
 
 /// Where a call goes.
 enum Route {
-    Here,
+    /// Raft's own call: answered here, as it is.
+    Raft,
+    /// This node leads in `term`: answered here once the gate lets it.
+    Here {
+        term: u64,
+    },
     Leader(u64, String),
     Unavailable(&'static str),
 }
@@ -112,11 +132,13 @@ enum Route {
 impl ForwardToLeaderLayer {
     fn route(&self, req: &http::Request<BoxBody>) -> Route {
         if req.uri().path().starts_with(RAFT_PREFIX) {
-            return Route::Here;
+            return Route::Raft;
         }
         let metrics = self.raft.metrics().borrow().clone();
         match metrics.current_leader {
-            Some(leader) if leader == self.self_id => Route::Here,
+            Some(leader) if leader == self.self_id => Route::Here {
+                term: metrics.current_term,
+            },
             Some(_) if req.headers().contains_key(FORWARDED) => Route::Unavailable(
                 "the meta node this was forwarded to is no longer the leader; retry",
             ),
@@ -170,13 +192,33 @@ where
 
     fn call(&mut self, mut req: http::Request<BoxBody>) -> Self::Future {
         if req.headers().contains_key(PROBE) {
-            return Box::pin(async { Ok(tonic::Status::unavailable("alive").into_http()) });
+            let answer = match self.layer.route(&req) {
+                Route::Here { term } if !self.layer.gate.serving(term) => NOT_SERVING,
+                _ => ALIVE,
+            };
+            return Box::pin(async move { Ok(tonic::Status::unavailable(answer).into_http()) });
         }
         if let Some(refusal) = too_old(&req) {
             return Box::pin(async move { Ok(refusal.into_http()) });
         }
         match self.layer.route(&req) {
-            Route::Here => Box::pin(self.inner.call(req)),
+            Route::Raft => Box::pin(self.inner.call(req)),
+            Route::Here { term } => {
+                let gate = self.layer.gate.clone();
+                // The service polled ready is the one that takes the call.
+                let fresh = self.inner.clone();
+                let mut inner = std::mem::replace(&mut self.inner, fresh);
+                Box::pin(async move {
+                    if let Err(why) = gate.check(term).await {
+                        return Ok(tonic::Status::unavailable(format!(
+                            "this meta node can't confirm it is still the raft leader ({why}); \
+                             retry"
+                        ))
+                        .into_http());
+                    }
+                    inner.call(req).await
+                })
+            }
             Route::Unavailable(why) => {
                 Box::pin(async move { Ok(tonic::Status::unavailable(why).into_http()) })
             }

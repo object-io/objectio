@@ -260,10 +260,11 @@ impl MetaService {
         ))
     }
 
-    /// Linearizable listing via a B-tree scan of OBJECT_LISTINGS in
-    /// Meta's redb. Replaces the old scatter-gather-then-merge path
-    /// on the gateway. Continuation token is the bucket-relative
-    /// form of the last key returned.
+    /// A listing from a B-tree scan of OBJECT_LISTINGS in this node's
+    /// redb. Only the Raft leader serves it, and only while a quorum has
+    /// lately confirmed it leads (`crate::read_gate`), so it holds every
+    /// listing change committed before the call. The continuation token
+    /// is the bucket-relative form of the last key returned.
     pub(crate) async fn list_objects(
         &self,
         request: Request<ListObjectsRequest>,
