@@ -217,7 +217,8 @@ spec:
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
       {{- if .Values.gateway.audit.spool.enabled }}
-      # Room to deliver the audit spool on the way out.
+      # Room for the gateway's shutdown: out of the endpoints (5 s), the
+      # requests in flight (up to 20 s), then the audit spool (drainSeconds).
       terminationGracePeriodSeconds: {{ add .Values.gateway.audit.spool.drainSeconds 30 }}
       {{- end }}
       {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}

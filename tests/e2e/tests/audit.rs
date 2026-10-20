@@ -397,3 +397,50 @@ fn spooled_events_survive_a_killed_gateway_and_a_receiver_down() {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+/// A gateway stopped by SIGTERM delivers its audit spool before it exits:
+/// the events of the requests it answered, held back by a receiver that
+/// was down, reach the receiver once it is up, while the gateway stops.
+/// SIGTERM used to kill the gateway where it stood, and the spool (on an
+/// emptyDir in Kubernetes) went with the pod.
+#[test]
+fn a_gateway_stopped_by_sigterm_delivers_its_spool_first() {
+    use objectio_e2e::ha::{HaCluster, Node};
+
+    let (port, events, up) = held_receiver();
+    let mut ha = HaCluster::start(1, 6, 1);
+    let spool = tempfile::tempdir().unwrap();
+    let spool_dir = spool.path().display().to_string();
+    ha.restart_gateway_with_args(
+        0,
+        &["--audit-spool", &spool_dir, "--shutdown-delay-secs", "0"],
+    );
+    let c = &ha.clients[0];
+    c.json("PUT", "/_admin/audit", webhook(port)).expect_ok();
+    c.request("PUT", "/drained", &[]).expect(200);
+    let mut ids = Vec::new();
+    for i in 0..20 {
+        let r = c.request("PUT", &format!("/drained/k{i}"), b"x");
+        r.expect(200);
+        ids.push(r.header("x-amz-request-id").unwrap());
+    }
+
+    ha.sigterm(Node::Gateway(0));
+    up.store(true, Ordering::SeqCst);
+    let status = ha.await_exit(Node::Gateway(0), Duration::from_secs(40));
+    assert!(status.is_some_and(|s| s.success()), "gateway: {status:?}");
+
+    let got: std::collections::HashSet<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["id"].as_str().map(str::to_string))
+        .collect();
+    let missing: Vec<&String> = ids.iter().filter(|id| !got.contains(*id)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {} events not delivered before the gateway exited: {missing:?}",
+        missing.len(),
+        ids.len()
+    );
+}

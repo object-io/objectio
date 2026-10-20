@@ -32,7 +32,7 @@
 )]
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
@@ -130,6 +130,33 @@ pub fn binary(name: &str) -> PathBuf {
          (looked in {})",
         dir.display()
     );
+}
+
+/// Send process `pid` SIGTERM, as Kubernetes, systemd and `docker stop`
+/// stop a service.
+pub fn sigterm(pid: u32) {
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(sent.success(), "kill -TERM {pid}: {sent}");
+}
+
+/// Wait up to `within` for `child` to exit: its exit status, or `None` if
+/// it was still running (it is killed then).
+pub fn await_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Pick a free port by binding :0 and releasing it.
@@ -412,6 +439,21 @@ impl Cluster {
         let path = self.data_dir.path().join(dir);
         std::fs::remove_dir_all(&path).unwrap_or_else(|e| panic!("remove {}: {e}", path.display()));
         self.restart_with_osds(self.osds);
+    }
+
+    /// Stop the cluster with SIGTERM and wait up to `within` for it to
+    /// exit: its exit status, or `None` if it was still running (it is
+    /// killed then).
+    pub fn terminate(&mut self, within: Duration) -> Option<ExitStatus> {
+        let child = self.child_mut();
+        sigterm(child.id());
+        await_exit(child, within)
+    }
+
+    /// What the cluster has logged so far (nothing with
+    /// `OBJECTIO_E2E_LOGS`, which sends it to the terminal instead).
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.data_dir.path().join("aio.log")).unwrap_or_default()
     }
 
     /// OSD `index`'s disk file, for tests that damage it in place.

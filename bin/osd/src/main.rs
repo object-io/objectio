@@ -22,8 +22,5 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    objectio_osd::run(args, async {
-        tokio::signal::ctrl_c().await.ok();
-    })
-    .await
+    objectio_osd::run(args, objectio_common::shutdown_signal()?).await
 }

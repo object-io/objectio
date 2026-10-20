@@ -540,6 +540,16 @@ const DEGRADED_GRACE: Duration = Duration::from_secs(30);
 
 static READINESS: LazyLock<RwLock<Readiness>> = LazyLock::new(|| RwLock::new(Readiness::default()));
 
+/// Set once the gateway is shutting down: `/_ready` answers 503 from then
+/// on, so load balancers stop sending it requests before it stops taking
+/// them.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the gateway as stopping (see [`STOPPING`]).
+pub fn set_stopping() {
+    STOPPING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// OSDs a write needs to reach: the default scheme's data shards (k), the
 /// write quorum. 1 for replication or before the scheme is known.
 fn osds_required() -> usize {
@@ -653,21 +663,27 @@ pub fn spawn_readiness(meta: MetaClient) {
 /// Whether the gateway can serve writes yet.
 #[must_use]
 pub fn is_ready() -> bool {
-    READINESS.read().is_ok_and(|r| r.ready)
+    !STOPPING.load(std::sync::atomic::Ordering::Relaxed) && READINESS.read().is_ok_and(|r| r.ready)
 }
 
 /// `GET /_ready`: 200 once the gateway can serve writes, 503 with the
-/// reason until then. Unauthenticated, like `/health`, and named so it
-/// cannot shadow a bucket (bucket names cannot contain `_`).
+/// reason until then, and 503 again once it is shutting down.
+/// Unauthenticated, like `/health`, and named so it cannot shadow a bucket
+/// (bucket names cannot contain `_`).
 pub async fn ready_handler() -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    let r = READINESS.read().map(|r| *r).unwrap_or_default();
+    let mut r = READINESS.read().map(|r| *r).unwrap_or_default();
+    let stopping = STOPPING.load(std::sync::atomic::Ordering::Relaxed);
+    if stopping {
+        r.ready = false;
+    }
     let body = serde_json::json!({
-        "status": match (r.ready, r.degraded) {
-            (true, false) => "ready",
-            (true, true) => "ready_degraded",
-            _ => "starting",
+        "status": match (stopping, r.ready, r.degraded) {
+            (true, _, _) => "stopping",
+            (false, true, false) => "ready",
+            (false, true, true) => "ready_degraded",
+            (false, false, _) => "starting",
         },
         "meta_reachable": r.meta_reachable,
         "osds_reachable": r.osds_reachable,

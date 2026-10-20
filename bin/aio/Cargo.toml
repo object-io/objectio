@@ -14,12 +14,13 @@ path = "src/main.rs"
 [dependencies]
 # aio links directly against each service crate's lib — they run as
 # tokio tasks in the same process, not as child processes. One
-# tracing subscriber, one Ctrl-C handler, one memory space.
+# tracing subscriber, one signal handler, one memory space.
 objectio-meta = { workspace = true }
 objectio-osd = { workspace = true }
 objectio-gateway = { workspace = true }
 objectio-block-gateway = { workspace = true }
 objectio-proto = { workspace = true }
+objectio-common = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }

@@ -2361,6 +2361,7 @@ dependencies = [
  "clap",
  "include_dir",
  "objectio-block-gateway",
+ "objectio-common",
  "objectio-gateway",
  "objectio-meta",
  "objectio-osd",
@@ -2452,6 +2453,7 @@ dependencies = [
  "anyhow",
  "clap",
  "objectio-block-gateway",
+ "objectio-common",
  "tikv-jemallocator",
  "tokio",
  "tracing-subscriber",
@@ -2493,6 +2495,8 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
  "xxhash-rust",
 ]
@@ -2639,6 +2643,7 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
+ "objectio-common",
  "objectio-gateway",
  "tikv-jemallocator",
  "tokio",
@@ -2750,6 +2755,7 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
+ "objectio-common",
  "objectio-meta",
  "tikv-jemallocator",
  "tokio",
@@ -2819,6 +2825,7 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
+ "objectio-common",
  "objectio-osd",
  "tikv-jemallocator",
  "tokio",

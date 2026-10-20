@@ -357,6 +357,17 @@ pub struct Args {
     #[arg(long, env = "OBJECTIO_AUDIT_DRAIN_SECS", default_value_t = 20)]
     pub audit_drain_secs: u64,
 
+    /// On shutdown (SIGTERM), how long `/_ready` answers 503 while the
+    /// gateway still serves, before it stops taking connections: time for
+    /// load balancers and Kubernetes endpoints to stop sending it requests.
+    #[arg(long, env = "OBJECTIO_SHUTDOWN_DELAY_SECS", default_value_t = 5)]
+    pub shutdown_delay_secs: u64,
+
+    /// On shutdown, how long requests in flight are given to finish once
+    /// the gateway stops taking connections.
+    #[arg(long, env = "OBJECTIO_SHUTDOWN_DRAIN_SECS", default_value_t = 20)]
+    pub shutdown_drain_secs: u64,
+
     /// Keep bucket access-log records here before they are delivered (A12):
     /// a gateway killed loses none. Default: `bucket-logging` inside
     /// `--audit-spool`. Without either, this gateway refuses
@@ -587,8 +598,11 @@ pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// Run the gateway until `shutdown` resolves. Caller owns the tracing
-/// subscriber and the Ctrl-C wiring; we trust args already parsed.
+/// Run the gateway until `shutdown` resolves, then: `/_ready` answers 503
+/// for `--shutdown-delay-secs`, the listeners stop taking connections and
+/// finish the requests in flight, and the audit and bucket-log spools are
+/// delivered. Caller owns the tracing subscriber and the signal wiring; we
+/// trust args already parsed.
 pub async fn run(
     args: Args,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -1868,15 +1882,34 @@ pub async fn run(
 
     // Wait for caller-provided shutdown future, then fan out to all listeners.
     shutdown.await;
+    // Out of the load balancer first: requests still routed here meanwhile
+    // are served, not refused.
+    cluster_poll::set_stopping();
+    if args.shutdown_delay_secs > 0 {
+        info!(
+            "Not ready: serving {} s more while load balancers drop this gateway",
+            args.shutdown_delay_secs
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(args.shutdown_delay_secs)).await;
+    }
     info!("Shutting down all listeners...");
     let _ = shutdown_tx.send(());
 
-    for t in tasks {
-        match t.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!("Listener exited with error: {}", e),
-            Err(e) => warn!("Listener task join error: {}", e),
+    let listeners_closed = async {
+        for t in tasks {
+            match t.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Listener exited with error: {}", e),
+                Err(e) => warn!("Listener task join error: {}", e),
+            }
         }
+    };
+    let drain = std::time::Duration::from_secs(args.shutdown_drain_secs);
+    if tokio::time::timeout(drain, listeners_closed).await.is_err() {
+        warn!(
+            "Requests still in flight after {} s: stopping without them",
+            args.shutdown_drain_secs
+        );
     }
 
     // What the audit spool holds goes out before the gateway does.

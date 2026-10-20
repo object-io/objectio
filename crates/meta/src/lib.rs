@@ -187,7 +187,7 @@ fn raft_config(
 ///   - building `args` (e.g. from `Args::parse()` in the bin, or
 ///     constructed in-process by the aio monolith)
 ///   - installing a tracing subscriber BEFORE calling this
-///   - providing a shutdown future (Ctrl-C in the bin, a
+///   - providing a shutdown future (SIGTERM or SIGINT in the bin, a
 ///     broadcast-channel recv in aio)
 pub async fn run(
     args: Args,
@@ -457,6 +457,13 @@ pub async fn run(
         })
         .await?;
 
+    // The calls in flight have been answered. Raft stops before the last
+    // checkpoint, so that checkpoint holds everything it applied.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), raft.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("raft shutdown: {e}"),
+        Err(_) => tracing::warn!("raft did not stop within 5 s; checkpointing anyway"),
+    }
     // What was applied since the last checkpoint, made durable.
     if let Err(e) =
         tokio::task::spawn_blocking(move || checkpointer.checkpoint().map_err(|e| e.to_string()))

@@ -1,9 +1,9 @@
 //! ObjectIO all-in-one — the real monolith.
 //!
 //! Runs meta + OSD(s) + gateway as tokio tasks inside **one**
-//! process. Shares a single tracing subscriber, a single Ctrl-C
-//! handler, and a single memory space. Built on top of each
-//! service's `lib.rs::run(args, shutdown)` entrypoint.
+//! process. Shares a single tracing subscriber, a single signal
+//! handler (SIGTERM or Ctrl-C), and a single memory space. Built on
+//! top of each service's `lib.rs::run(args, shutdown)` entrypoint.
 //!
 //! Still UX-identical to the supervisor version: one binary, one
 //! command, one log, one Ctrl-C. What changes is:
@@ -322,13 +322,11 @@ fn port_free(addr: &str, port: u16) -> bool {
     StdTcpListener::bind((addr, port)).is_ok()
 }
 
-/// Listen for Ctrl-C on the task that owns main, then broadcast
-/// shutdown to every subsystem. Returns when broadcast fires.
-async fn wait_ctrl_c(tx: broadcast::Sender<()>) {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        info!("shutdown requested");
-        let _ = tx.send(());
-    }
+/// Wait for `signal` (see `objectio_common::shutdown_signal`) on the task
+/// that owns main, then broadcast shutdown to every subsystem.
+async fn wait_signal(signal: impl std::future::Future<Output = ()>, tx: broadcast::Sender<()>) {
+    signal.await;
+    let _ = tx.send(());
 }
 
 /// Build a broadcast-receiver → Output=() future for a subsystem.
@@ -703,7 +701,10 @@ async fn serve() -> Result<()> {
         }
     }
 
-    // Shutdown broadcast — every subsystem subscribes, Ctrl-C fans out.
+    // Shutdown broadcast — every subsystem subscribes, SIGTERM or Ctrl-C
+    // fans out. The handlers go in before anything starts: a signal while
+    // starting is acted on once started, not lost.
+    let signal = objectio_common::shutdown_signal()?;
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
 
     // ------------------------------------------------------------
@@ -1002,6 +1003,8 @@ async fn serve() -> Result<()> {
             args.trusted_proxies.clone(),
         ]);
     }
+    // No load balancer to leave: stop at once.
+    gw_argv.extend(["--shutdown-delay-secs".to_string(), "0".to_string()]);
     let gw_args = <objectio_gateway::Args as clap::Parser>::parse_from(&gw_argv);
     let gw_handle: JoinHandle<Result<()>> = {
         let sd = sub_shutdown(&shutdown_tx);
@@ -1012,6 +1015,7 @@ async fn serve() -> Result<()> {
     // registered or reachable yet, and a PUT then fails with "write quorum
     // not met". Only announce ready once the gateway says it is.
     wait_gateway_ready(gateway_port, 60).await;
+    let mut block_handle: Option<JoinHandle<Result<()>>> = None;
     if args.block_port != 0 {
         let block_data = data_root.join("block");
         let block_args = <objectio_block_gateway::Args as clap::Parser>::parse_from([
@@ -1030,11 +1034,14 @@ async fn serve() -> Result<()> {
             "--metrics-listen".into(),
             String::new(),
         ]);
-        tokio::spawn(async move {
-            if let Err(e) = objectio_block_gateway::run(block_args).await {
+        let sd = sub_shutdown(&shutdown_tx);
+        block_handle = Some(tokio::spawn(async move {
+            let stopped = objectio_block_gateway::run(block_args, sd).await;
+            if let Err(e) = &stopped {
                 tracing::error!("block gateway stopped: {e:#}");
             }
-        });
+            stopped
+        }));
         wait_listening(args.block_port, "block gateway", 20).await?;
         // Listening is not the same as ours: when a port was taken between
         // being picked and being bound, the block gateway exits and the
@@ -1124,18 +1131,11 @@ async fn serve() -> Result<()> {
     }
     eprintln!();
 
-    // Wait for Ctrl-C → broadcast shutdown → join every task.
-    wait_ctrl_c(shutdown_tx.clone()).await;
-
-    // Second Ctrl-C = hard exit. Some background tasks (OSD chunk
-    // flushes, meta raft machinery) occasionally refuse to yield in
-    // under a couple of seconds; the user shouldn't have to wait.
-    tokio::spawn(async {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\n[aio] second Ctrl-C — forcing exit");
-            std::process::exit(130);
-        }
-    });
+    // Wait for SIGTERM or Ctrl-C → broadcast shutdown → join every task.
+    // A second signal exits at once (`shutdown_signal`): some background
+    // tasks (OSD chunk flushes, meta raft machinery) occasionally refuse to
+    // yield in under a couple of seconds; the user shouldn't have to wait.
+    wait_signal(signal, shutdown_tx.clone()).await;
 
     // Collect results under a hard deadline. If a service refuses to
     // shut down within `graceful` seconds, we exit the process anyway
@@ -1144,6 +1144,7 @@ async fn serve() -> Result<()> {
     let join_all = async {
         for (label, handle) in [("meta", meta_handle), ("gateway", gw_handle)]
             .into_iter()
+            .chain(block_handle.map(|h| ("block gateway", h)))
             .chain(
                 osd_handles
                     .into_iter()
