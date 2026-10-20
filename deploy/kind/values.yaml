@@ -91,6 +91,7 @@ osd:
       cpu: "1"
       memory: 1Gi
 
+replication: 0
 ec:
   k: 4
   m: 2

@@ -14,7 +14,7 @@ use serde_json::json;
 const ROLL: &str = "2";
 
 fn cluster() -> Cluster {
-    Cluster::start_with_ec_and_args(1, 1, 0, &["--bucket-log-roll-secs", ROLL])
+    Cluster::start_with_args(1, &["--bucket-log-roll-secs", ROLL])
 }
 
 fn target_policy(target: &str, prefix: &str, source: &str, account: &str) -> Vec<u8> {
@@ -474,7 +474,7 @@ fn turning_logging_off_stops_delivery() {
 /// killed (no drain) with batches open delivers every one when it is back.
 #[test]
 fn records_spooled_before_a_kill_are_delivered_after_the_restart() {
-    let mut c = Cluster::start_with_ec_and_args(1, 1, 0, &["--bucket-log-roll-secs", "8"]);
+    let mut c = Cluster::start_with_args(1, &["--bucket-log-roll-secs", "8"]);
     for b in ["src", "logs"] {
         c.request("PUT", &format!("/{b}"), &[]).expect(200);
     }

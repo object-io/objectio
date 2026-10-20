@@ -1351,36 +1351,18 @@ async fn put_object_placed(
         // Encode this stripe with erasure coding - use LRC if specified
         let shards: Vec<Bytes> = match ec_type {
             ErasureType::ErasureLrc => {
-                // Use LRC backend with local parity groups
-                let lrc_config = LrcConfig::new(
+                // Local parity per group, global parity over all the data,
+                // with the codec's shard sizing: reed-solomon-simd codes
+                // even shard sizes only, and an odd one (half of all
+                // lengths) failed the PUT.
+                let encoded = ErasureCodec::new(ErasureConfig::lrc(
                     ec_k as u8,
                     placement.ec_local_parity as u8,
                     placement.ec_global_parity as u8,
-                );
-                let backend = match RustSimdLrcBackend::new(lrc_config) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!("Failed to create LRC backend: {}", e);
-                        return S3Error::xml_response(
-                            "InternalError",
-                            &format!("LRC codec error: {}", e),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
-                    }
-                };
-
-                // Pad data to shard size
-                let shard_size = stripe_data.len().div_ceil(ec_k as usize);
-                let padded_size = shard_size * ec_k as usize;
-                let mut padded_data = stripe_data.to_vec();
-                padded_data.resize(padded_size, 0);
-
-                // Split into data shards
-                let data_shards: Vec<&[u8]> =
-                    padded_data.chunks(shard_size).take(ec_k as usize).collect();
-
-                match backend.encode_lrc(&data_shards, shard_size) {
-                    Ok(encoded) => encoded.all_shards().into_iter().map(Bytes::from).collect(),
+                ))
+                .and_then(|codec| codec.encode_bytes(stripe_data));
+                match encoded {
+                    Ok(s) => s,
                     Err(e) => {
                         error!("Failed to encode stripe {} with LRC: {}", stripe_idx, e);
                         return S3Error::xml_response(

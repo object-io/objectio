@@ -39,14 +39,19 @@ fn overlay(mut base: serde_json::Value, update: &serde_json::Value) -> serde_jso
 
 /// Convert JSON to PoolConfig (prost types don't implement Deserialize)
 fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
+    // A count too big for the field is kept too big (meta refuses it), not
+    // wrapped into one that looks fine: 2^32 + 4 data shards are not 4.
+    let count = |field: &str, default: u64| {
+        u32::try_from(v[field].as_u64().unwrap_or(default)).unwrap_or(u32::MAX)
+    };
     PoolConfig {
         name: v["name"].as_str().unwrap_or_default().to_string(),
-        ec_type: v["ec_type"].as_i64().unwrap_or_default() as i32,
-        ec_k: v["ec_k"].as_u64().unwrap_or(3) as u32,
-        ec_m: v["ec_m"].as_u64().unwrap_or(2) as u32,
-        ec_local_parity: v["ec_local_parity"].as_u64().unwrap_or_default() as u32,
-        ec_global_parity: v["ec_global_parity"].as_u64().unwrap_or_default() as u32,
-        replication_count: v["replication_count"].as_u64().unwrap_or_default() as u32,
+        ec_type: i32::try_from(v["ec_type"].as_i64().unwrap_or_default()).unwrap_or(-1),
+        ec_k: count("ec_k", 3),
+        ec_m: count("ec_m", 2),
+        ec_local_parity: count("ec_local_parity", 0),
+        ec_global_parity: count("ec_global_parity", 0),
+        replication_count: count("replication_count", 0),
         osd_tags: v["osd_tags"]
             .as_array()
             .map(|a| {

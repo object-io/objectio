@@ -26,6 +26,7 @@
 pub mod backend;
 pub mod codec;
 pub mod metrics;
+pub mod scheme;
 pub mod shard;
 
 // Re-exports from codec
@@ -38,6 +39,7 @@ pub use backend::{
     BackendCapabilities, BackendConfig, BackendFactory, ErasureBackend, IsalBackend, LocalGroup,
     LrcBackend, LrcConfig, LrcEncodedData, RustSimdLrcBackend,
 };
+pub use scheme::{check_lrc, check_mds, check_replicas};
 
 /// Prelude for common imports
 pub mod prelude {

@@ -37,8 +37,12 @@ spec:
                 --admin-port {{ .Values.meta.service.adminPort }} \
                 --peers "{{ include "objectio.metaPeers" . }}" \
                 --data-dir /var/lib/objectio/meta \
+              {{- if .Values.replication }}
+                --replication "{{ .Values.replication }}" \
+              {{- else }}
                 --ec-k "{{ .Values.ec.k }}" \
                 --ec-m "{{ .Values.ec.m }}" \
+              {{- end }}
                 --log-level "{{ .Values.meta.logLevel }}"
           {{- with (include "objectio.tls.env" .) }}
           env:
