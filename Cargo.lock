@@ -2623,18 +2623,15 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
- "nix",
- "objectio-auth",
- "objectio-common",
  "objectio-storage",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

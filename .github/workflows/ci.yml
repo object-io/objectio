@@ -127,9 +127,9 @@ jobs:
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
-          cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+          cargo build --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway --bin objectio-install
           cargo nextest archive --package objectio-e2e --archive-file e2e.tar.zst
-          mkdir -p bins && cp target/debug/objectio-aio target/debug/obioctl target/debug/objectio-meta target/debug/objectio-osd target/debug/objectio-gateway target/debug/objectio-block-gateway bins/
+          mkdir -p bins && cp target/debug/objectio-aio target/debug/obioctl target/debug/objectio-meta target/debug/objectio-osd target/debug/objectio-gateway target/debug/objectio-block-gateway target/debug/objectio-install bins/
       - uses: actions/upload-artifact@v4
         with:
           name: e2e
