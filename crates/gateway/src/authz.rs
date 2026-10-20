@@ -658,12 +658,15 @@ fn parse_identity_policies(
 }
 
 /// The tags of the object at `bucket/key`, if it exists.
+///
+/// An object that doesn't exist has none; one whose metadata can't be read
+/// is `Unavailable`: a Deny conditioned on its tags could be missed.
 async fn existing_object_tags(
     state: &AppState,
     bucket: &str,
     key: &str,
-) -> std::collections::HashMap<String, String> {
-    let Ok(placement) = state
+) -> Result<std::collections::HashMap<String, String>, Unavailable> {
+    let placement = match state
         .meta_client
         .clone()
         .get_placement(objectio_proto::metadata::GetPlacementRequest {
@@ -673,20 +676,38 @@ async fn existing_object_tags(
             storage_class: String::new(),
         })
         .await
-    else {
-        return std::collections::HashMap::new();
+    {
+        Ok(p) => p.into_inner(),
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            return Ok(std::collections::HashMap::new());
+        }
+        Err(e) => {
+            error!("Failed to place {bucket}/{key} to read its tags: {e}");
+            return Err(Unavailable);
+        }
     };
-    crate::osd_pool::get_object_meta_from_any(
-        &state.osd_pool,
-        &placement.into_inner().nodes,
+    tags_from(
         bucket,
         key,
+        crate::osd_pool::get_object_meta_from_any(&state.osd_pool, &placement.nodes, bucket, key)
+            .await,
     )
-    .await
-    .ok()
-    .flatten()
-    .map(|o| o.tags)
-    .unwrap_or_default()
+}
+
+/// An object's tags from the OSDs' answer: none for an object that isn't
+/// there, `Unavailable` when they couldn't say.
+fn tags_from(
+    bucket: &str,
+    key: &str,
+    answer: Result<Option<objectio_proto::metadata::ObjectMeta>, crate::osd_pool::OsdPoolError>,
+) -> Result<std::collections::HashMap<String, String>, Unavailable> {
+    match answer {
+        Ok(meta) => Ok(meta.map(|o| o.tags).unwrap_or_default()),
+        Err(e) => {
+            error!("Failed to read the tags of {bucket}/{key}: {e}");
+            Err(Unavailable)
+        }
+    }
 }
 
 /// Everything one authorization decision needs.
@@ -784,7 +805,9 @@ pub async fn authorize(
     }
 
     let resource = build_s3_arn(req.bucket, req.key);
-    let context = request_context(state, auth, req, &bucket).await;
+    let Ok(context) = request_context(state, auth, req, &bucket).await else {
+        return Some(unavailable());
+    };
 
     let mut any_allow = false;
 
@@ -934,7 +957,7 @@ async fn request_context(
     auth: &AuthResult,
     req: &AuthzRequest<'_>,
     bucket: &BucketEntry,
-) -> RequestContext {
+) -> Result<RequestContext, Unavailable> {
     let resource = build_s3_arn(req.bucket, req.key);
     let mut context = RequestContext::new(&auth.user_arn, req.action, &resource);
     // Where it came from: the client's address, and the named endpoint.
@@ -955,13 +978,13 @@ async fn request_context(
     if let (Some(key), Some(policy)) = (req.key, &bucket.policy)
         && format!("{policy:?}").contains("s3:ExistingObjectTag/")
     {
-        for (k, v) in existing_object_tags(state, req.bucket, key).await {
+        for (k, v) in existing_object_tags(state, req.bucket, key).await? {
             context = context.with_variable(format!("s3:ExistingObjectTag/{k}"), v);
         }
     }
     // Surface credential-type so policies can deny permanent-key direct
     // access while still allowing STS-vended sessions through.
-    with_credential_vars(context, auth)
+    Ok(with_credential_vars(context, auth))
 }
 
 /// An unsigned request: only a bucket policy's grants to everyone can let
@@ -986,7 +1009,9 @@ async fn authorize_anonymous(
     {
         anonymous = anonymous.without_public_grants();
     }
-    let context = request_context(state, auth, req, bucket).await;
+    let Ok(context) = request_context(state, auth, req, bucket).await else {
+        return Some(unavailable());
+    };
     match state.policy_evaluator.evaluate(&anonymous, &context) {
         PolicyDecision::Allow => None,
         _ => Some(refused()),
@@ -1526,6 +1551,22 @@ mod tests {
             ),
             Ok(None)
         ));
+    }
+
+    /// A Deny on an object's tags can't be evaluated without them.
+    #[test]
+    fn tags_the_osds_could_not_read_are_not_no_tags() {
+        let down = Err(crate::osd_pool::OsdPoolError::NoNodesAvailable);
+        assert!(tags_from("b", "k", down).is_err());
+        assert!(tags_from("b", "k", Ok(None)).unwrap().is_empty());
+        let tagged = objectio_proto::metadata::ObjectMeta {
+            tags: [("class".to_string(), "pii".to_string())].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            tags_from("b", "k", Ok(Some(tagged))).unwrap()["class"],
+            "pii"
+        );
     }
 
     #[test]
