@@ -72,9 +72,24 @@ struct RaftPersistentState {
     /// release; always `None` after. Remove in the release after this one.
     last_purged: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, Node>,
-    /// Monotonic counter returned by `MetaCommand::SetConfig` and bumped
-    /// on every config write. Used as the `version` on `ConfigEntry`.
+    /// The previous release's config version counter (the current one is
+    /// `config_version` in [`tables::COUNTERS`], which snapshots carry).
+    /// Still written, and read when it is ahead, so a node can go back to
+    /// that release and forward again. Remove in the release after this
+    /// one.
     config_version: u64,
+}
+
+/// The row of [`tables::COUNTERS`] that numbers config entries.
+const CONFIG_VERSION: &str = "config_version";
+
+fn decode_counter(b: &[u8]) -> Result<u64, StorageError<NodeId>> {
+    <[u8; 8]>::try_from(b).map(u64::from_be_bytes).map_err(|_| {
+        decode_err(
+            "counters",
+            std::io::Error::other(format!("a counter of {} bytes", b.len())),
+        )
+    })
 }
 
 /// The format level from which a node keeps its Raft log in files of its
@@ -259,8 +274,23 @@ impl MetaRaftStorage {
                 updated_by,
                 updated_at,
             } => {
-                state.config_version += 1;
-                let version = state.config_version;
+                // Counted in a state-machine table, not in `raft_state`: a
+                // node that joins by snapshot then numbers the next entry
+                // as the leader does.
+                let version = {
+                    let mut t = txn.open_table(tables::COUNTERS).map_err(write_err)?;
+                    let stored = t
+                        .get(CONFIG_VERSION)
+                        .map_err(write_err)?
+                        .map(|v| decode_counter(v.value()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    let version = stored.max(state.config_version) + 1;
+                    t.insert(CONFIG_VERSION, version.to_be_bytes().as_slice())
+                        .map_err(write_err)?;
+                    version
+                };
+                state.config_version = version;
                 // Encode as the same protobuf shape meta already consumes,
                 // so non-Raft readers (who still read the CONFIG table
                 // directly) don't need migration code.
@@ -778,6 +808,15 @@ impl MetaRaftStorage {
             };
             state.last_applied = meta.last_log_id;
             state.membership = meta.last_membership.clone();
+            // The leader's count, not this node's own.
+            if let Some(v) = txn
+                .open_table(tables::COUNTERS)
+                .map_err(write_err)?
+                .get(CONFIG_VERSION)
+                .map_err(write_err)?
+            {
+                state.config_version = decode_counter(v.value())?;
+            }
             let mut t = txn.open_table(tables::RAFT_STATE).map_err(write_err)?;
             let encoded = serde_json::to_vec(&state).map_err(|e| encode_err("raft_state", e))?;
             t.insert("state", encoded.as_slice()).map_err(write_err)?;
@@ -1326,7 +1365,7 @@ mod tests {
         LogId::new(CommittedLeaderId::new(term, 1), index)
     }
 
-    fn normal_entry(index: u64, cmd: MetaCommand) -> Entry {
+    pub(super) fn normal_entry(index: u64, cmd: MetaCommand) -> Entry {
         Entry {
             log_id: log_id(1, index),
             payload: EntryPayload::Normal(cmd),
@@ -2068,6 +2107,7 @@ mod snapshot_tests {
     //! A snapshot carries the whole state machine to a replica that needs
     //! it, and replaces what that replica had.
 
+    use super::tests::normal_entry;
     use super::*;
     use openraft::{CommittedLeaderId, LogId};
     use redb::ReadableTable;
@@ -2140,6 +2180,50 @@ mod snapshot_tests {
             replica.load_state().unwrap().last_applied.unwrap().index,
             42
         );
+    }
+
+    /// A replica that joins by snapshot numbers the next config entry as
+    /// the leader does, deleted entries counted too.
+    #[tokio::test]
+    async fn a_snapshot_carries_the_config_version() {
+        let set = |key: &str| MetaCommand::SetConfig {
+            key: key.into(),
+            value: b"v".to_vec(),
+            updated_by: "t".into(),
+            updated_at: 0,
+        };
+        let (_a, mut leader) = storage();
+        let entries = [
+            normal_entry(1, set("a")),
+            normal_entry(2, set("b")),
+            normal_entry(3, set("a")),
+            normal_entry(4, MetaCommand::DeleteConfig { key: "a".into() }),
+        ];
+        leader.apply_to_state_machine(&entries).await.unwrap();
+        let snap = leader.build_snapshot().await.unwrap();
+
+        let (_b, mut replica) = storage();
+        replica
+            .apply_to_state_machine(&[normal_entry(1, set("own"))])
+            .await
+            .unwrap();
+        replica
+            .install_snapshot(&at(4), snap.snapshot)
+            .await
+            .unwrap();
+
+        let next = [normal_entry(5, set("c"))];
+        let on_leader = leader.apply_to_state_machine(&next).await.unwrap();
+        let on_replica = replica.apply_to_state_machine(&next).await.unwrap();
+        assert!(matches!(
+            on_leader[..],
+            [MetaResponse::ConfigSet { version: 4 }]
+        ));
+        assert!(matches!(
+            on_replica[..],
+            [MetaResponse::ConfigSet { version: 4 }]
+        ));
+        assert_eq!(rows(&replica, "config"), rows(&leader, "config"));
     }
 
     /// What the replica had that the leader no longer has is gone after.

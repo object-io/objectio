@@ -41,6 +41,11 @@ pub const DELTA_RECIPIENTS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 // Key: hierarchical config path (e.g. "identity/openid/keycloak"), Value: prost-encoded ConfigEntry
 pub const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 
+// Counters the state machine keeps beside its tables, so a snapshot
+// carries them. Key: counter name; value: u64, big-endian.
+// "config_version": the version given to the last `SetConfig`.
+pub const COUNTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("counters");
+
 // ---- Raft consensus tables ----
 // One row per log index → JSON-encoded openraft::Entry<MetaTypeConfig>.
 // Indexes are contiguous; the low watermark moves forward via purge.
