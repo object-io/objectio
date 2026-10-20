@@ -592,7 +592,6 @@ mod tests {
             wal: WalConfig {
                 sync_on_write: false, // Faster tests
                 max_size_bytes: 1024 * 1024,
-                write_buffer_size: 4096,
             },
             cache_bytes: 1 << 20,
             memtable_bytes: 4096,
