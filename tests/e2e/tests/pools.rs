@@ -188,3 +188,35 @@ fn a_pool_made_without_a_count_is_sized_from_its_drives() {
     assert!(r.status < 300, "{}", r.text());
     assert_eq!(pg_count("given"), 16);
 }
+
+/// MDS stripes are coded with ISA-L's Vandermonde matrix on every build,
+/// and for some profiles a loss of m shards leaves a stripe that can't be
+/// decoded: such a pool is refused, before anything about the cluster is
+/// looked at, and not made.
+#[test]
+fn a_pool_whose_code_is_not_mds_is_refused() {
+    let c = Cluster::start_with_osds(3);
+    for (k, m) in [(6, 5), (5, 6), (22, 4), (0, 2), (250, 6)] {
+        let name = format!("ec-{k}-{m}");
+        let r = c.json(
+            "POST",
+            "/_admin/pools",
+            json!({"name": name, "ec_type": 0, "ec_k": k, "ec_m": m, "enabled": true}),
+        );
+        assert_eq!(r.status, 400, "{k}+{m}: {}", r.text());
+        assert!(r.text().contains(&format!("{k}+{m}")), "{}", r.text());
+        let pools: Value = c.request("GET", "/_admin/pools", &[]).json();
+        assert!(!pools.to_string().contains(&name), "{pools}");
+    }
+    // The edges of the set pass the check: on three OSDs they are refused
+    // for the OSDs they need, not for their code.
+    for (k, m) in [(5, 5), (21, 4)] {
+        let r = c.json(
+            "POST",
+            "/_admin/pools",
+            json!({"name": format!("ec-{k}-{m}"), "ec_type": 0, "ec_k": k, "ec_m": m, "enabled": true}),
+        );
+        assert!(!r.text().contains("rebuild"), "{k}+{m}: {}", r.text());
+    }
+    pool(&c, "fine");
+}

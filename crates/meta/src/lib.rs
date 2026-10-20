@@ -210,6 +210,17 @@ pub async fn run(
             "Storage mode: Erasure coding (k={}, m={})",
             args.ec_k, args.ec_m
         );
+        // The default pool would be refused (`check_erasure_code`), at
+        // every try to make it; say so once, at start.
+        if args.ec_m > 0 && !objectio_erasure::is_mds(args.ec_k.into(), args.ec_m.into()) {
+            anyhow::bail!(
+                "--ec-k {} --ec-m {}: some loss of {} shards could not be rebuilt; \
+                 MDS profiles have up to 3 parity shards, 4 with k up to 21, or are 5+5",
+                args.ec_k,
+                args.ec_m,
+                args.ec_m
+            );
+        }
         objectio_meta_store::EcConfig::Mds {
             k: args.ec_k,
             m: args.ec_m,
