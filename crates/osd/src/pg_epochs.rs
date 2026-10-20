@@ -21,6 +21,7 @@ use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
 use objectio_proto::storage::PgRef;
 use parking_lot::RwLock;
 use tonic::Status;
+use tonic::transport::Channel;
 
 /// How long asking meta for an epoch may take.
 const ASK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -67,6 +68,11 @@ pub fn stale(pool: &str, pg_id: u32, current: u64) -> Status {
 pub struct PgEpochs {
     known: RwLock<HashMap<(String, u32), u64>>,
     meta_endpoint: OnceLock<String>,
+    /// The one channel every ask goes over, made at the first. With
+    /// several meta addresses it leaves out the nodes that don't answer,
+    /// which it learns by probing them; a channel made for each ask
+    /// hadn't yet, and sent some asks to a node that was down.
+    meta: tokio::sync::OnceCell<Channel>,
 }
 
 impl PgEpochs {
@@ -122,7 +128,11 @@ impl PgEpochs {
             .get()
             .ok_or_else(|| "not registered with meta yet".to_string())?;
         let ask = async {
-            let channel = objectio_proto::transport::meta_channel(endpoint).await?;
+            let channel = self
+                .meta
+                .get_or_try_init(|| objectio_proto::transport::meta_channel(endpoint))
+                .await?
+                .clone();
             MetadataServiceClient::new(channel)
                 .get_placement_group(GetPlacementGroupRequest {
                     pool: pool.to_string(),
