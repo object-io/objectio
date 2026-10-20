@@ -61,10 +61,9 @@ Every tenant-scoped command takes `--tenant`. Without it, the command acts
 in the caller's own tenant, which is system scope for the system admin.
 An empty `--tenant ""` is rejected rather than sent.
 
-Some endpoints have no tenant parameter: `user list` and `bucket list`
-answer with the caller's tenant, or with everything for the system admin;
-`warehouse list` answers the system admin only. `--tenant` filters the
-answer on the client.
+Some endpoints have no tenant parameter: `user list`, `bucket list` and
+`warehouse list`. A tenant admin gets its own tenant's, the system admin
+every tenant's, and `--tenant` filters that answer on the client.
 
 ## Output
 

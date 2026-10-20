@@ -107,6 +107,44 @@ fn a_tenant_admin_can_list_its_own_buckets() {
     );
 }
 
+/// A tenant admin lists its own tenant's warehouses, as it creates and
+/// deletes them; the system admin lists every tenant's. The list admitted
+/// only the system admin.
+#[test]
+fn a_tenant_admin_lists_its_own_warehouses() {
+    let c = Cluster::start();
+    let (_, ak, sk) = provision_tenant_admin(&c, "acme");
+    let (_, gk, gs) = provision_tenant_admin(&c, "globex");
+    for (key, secret, name) in [(&ak, &sk, "acme-wh"), (&gk, &gs, "globex-wh")] {
+        c.request_as(
+            "POST",
+            "/_admin/warehouses",
+            json!({"name": name}).to_string().as_bytes(),
+            key,
+            secret,
+        )
+        .expect_ok();
+    }
+    let names = |r: &objectio_e2e::Response| -> Vec<String> {
+        r.expect(200);
+        let mut names: Vec<String> = r.json()["warehouses"]
+            .as_array()
+            .expect("warehouses")
+            .iter()
+            .filter_map(|w| w["name"].as_str().map(str::to_string))
+            .collect();
+        names.sort();
+        names
+    };
+
+    let listed = c.request_as("GET", "/_admin/warehouses", &[], &ak, &sk);
+    assert_eq!(names(&listed), ["acme-wh"]);
+    let listed = c.request_as("GET", "/_admin/warehouses", &[], &gk, &gs);
+    assert_eq!(names(&listed), ["globex-wh"]);
+    let all = c.request("GET", "/_admin/warehouses", &[]);
+    assert_eq!(names(&all), ["acme-wh", "globex-wh"]);
+}
+
 /// A tenant admin cannot reach into another tenant.
 #[test]
 fn a_tenant_admin_is_confined_to_its_tenant() {

@@ -2076,10 +2076,16 @@ pub async fn admin_list_warehouses(
     auth: Option<Extension<AuthResult>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(deny) = require_admin_or_session(&auth, &headers) {
+    // As create: the system admin lists every tenant's warehouses, a
+    // tenant admin its own tenant's.
+    let tenant = extract_tenant(&auth, &headers);
+    if tenant.is_empty() {
+        if let Some(deny) = require_system_admin(&auth, &headers) {
+            return deny;
+        }
+    } else if let Some(deny) = require_tenant_admin_access(&state, &auth, &headers, &tenant).await {
         return deny;
     }
-    let tenant = extract_tenant(&auth, &headers);
     let mut client = state.meta_client.clone();
     match client
         .iceberg_list_warehouses(objectio_proto::metadata::IcebergListWarehousesRequest { tenant })
