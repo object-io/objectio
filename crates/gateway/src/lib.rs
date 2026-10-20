@@ -169,10 +169,6 @@ async fn metrics_handler() -> impl IntoResponse {
 #[command(about = "ObjectIO S3 API Gateway")]
 #[command(version)]
 pub struct Args {
-    /// Configuration file path
-    #[arg(short, long, default_value = "/etc/objectio/gateway.toml")]
-    pub config: String,
-
     /// Listen address for the data plane (S3 + Iceberg + Delta Sharing).
     /// In single-port mode (the default), also serves /_admin/* and /_console/*.
     #[arg(short, long, default_value = "0.0.0.0:9000")]
@@ -208,11 +204,11 @@ pub struct Args {
 
     /// Metadata service endpoint: one address, or every meta node's,
     /// comma-separated (any of them serves; one that's down is skipped)
-    #[arg(long, default_value = "http://localhost:9001")]
+    #[arg(long, default_value = "http://localhost:9100")]
     pub meta_endpoint: String,
 
     /// OSD endpoint (initial OSD, more discovered via metadata service)
-    #[arg(long, default_value = "http://localhost:9002")]
+    #[arg(long, default_value = "http://localhost:9200")]
     pub osd_endpoint: String,
 
     /// Erasure coding data shards (k)
