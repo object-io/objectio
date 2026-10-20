@@ -76,14 +76,14 @@ You need:
 - Rust, at the version pinned in [rust-toolchain.toml](rust-toolchain.toml)
   (rustup installs it on first use);
 - `protoc` (`protobuf-compiler`);
-- for ISA-L erasure coding on x86_64 (the `isal` feature): `nasm`,
-  `autoconf`, `automake`, `libtool`, `libclang-dev`.
+- for ISA-L, which every build erasure-codes with (built from source):
+  `autoconf`, `automake`, `libtool`, `libclang-dev`, and `nasm` on x86_64.
 
 ```sh
 sudo apt-get install build-essential protobuf-compiler \
   nasm autoconf automake libtool libclang-dev       # Ubuntu / Debian
 git clone https://github.com/object-io/objectio && cd objectio
-make build        # debug build, with ISA-L; on arm64: cargo build --workspace
+make build        # debug build
 make test
 ```
 

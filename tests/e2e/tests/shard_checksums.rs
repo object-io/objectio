@@ -44,8 +44,8 @@ fn a_shard_stored_wrong_is_never_served() {
 }
 
 /// A parity shard stored wrong under a checksum its object records as well
-/// (what a stripe written by another codec is to this gateway: ISA-L and
-/// reed-solomon-simd agree on data shards, not on parity) passes every
+/// (what a stripe coded by another codec is to this gateway: two
+/// Reed-Solomon codes agree on data shards, not on parity) passes every
 /// read check. A read that rebuilds a data shard through it gets other
 /// bytes, and served them with a 200 (#70). It decodes around it when it
 /// can, and fails when it can't.

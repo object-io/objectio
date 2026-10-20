@@ -5,7 +5,7 @@
 #
 #   BENCH=/data/bench scripts/bench/baseline.sh objectio rustfs seaweedfs
 #
-# Needs in $BENCH/bin: warp, objectio-aio (release, --features isal,io-uring),
+# Needs in $BENCH/bin: warp, objectio-aio (release, --features io-uring),
 # weed; and docker for RustFS. Ports 19000, 19010, 19020 (+ SeaweedFS's
 # 19080, 19333, 19888) must be free.
 set -u

@@ -23,8 +23,6 @@ tikv-jemallocator = { workspace = true }
 
 [features]
 default = []
-# ISA-L erasure coding (x86_64).
-isal = ["objectio-osd/isal"]
 # Shard I/O through io_uring (Linux).
 io-uring = ["objectio-osd/io-uring"]
 # Shard transfers over Mooncake Transfer Engine.

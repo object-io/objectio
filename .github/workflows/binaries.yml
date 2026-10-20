@@ -30,16 +30,8 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            # ISA-L is x86_64 only.
-            features: >-
-              objectio-osd-bin/isal,objectio-osd-bin/io-uring,objectio-osd-bin/rocksdb,
-              objectio-gateway-bin/isal,
-              objectio-aio/isal,objectio-aio/io-uring,objectio-aio/rocksdb
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            features: >-
-              objectio-osd-bin/io-uring,objectio-osd-bin/rocksdb,
-              objectio-aio/io-uring,objectio-aio/rocksdb
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -50,6 +42,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: binaries-${{ matrix.arch }}
+      # ISA-L (every build erasure-codes with it) is built from source:
+      # autotools on both, NASM on x86_64 only (installed on both, unused
+      # on arm64).
       - name: build dependencies
         run: |
           sudo apt-get update
@@ -67,7 +62,7 @@ jobs:
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
-          features=$(echo "${{ matrix.features }}" | tr -d ' \n')
+          features=objectio-osd-bin/io-uring,objectio-osd-bin/rocksdb,objectio-aio/io-uring,objectio-aio/rocksdb
           cargo build --release --features "$features" \
             --bin objectio-meta --bin objectio-osd --bin objectio-gateway --bin objectio-aio --bin obioctl
           mkdir -p out

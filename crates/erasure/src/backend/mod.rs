@@ -1,12 +1,7 @@
-//! Erasure coding backend abstraction
+//! Erasure coding backends
 //!
-//! This module provides a trait-based abstraction for different erasure coding
-//! implementations, allowing runtime or compile-time backend selection.
-//!
-//! # Backends
-//!
-//! - `rust_simd`: Pure Rust using reed-solomon-simd (default, portable)
-//! - `isal`: Intel ISA-L via FFI (x86/x86_64 only, feature-gated)
+//! - `isal`: MDS Reed-Solomon on ISA-L, on every build (x86_64 and aarch64)
+//! - `rust_simd`: LRC, its global parity on reed-solomon-simd
 //!
 //! # Code Types
 //!
@@ -16,10 +11,8 @@
 //!   single-shard repairs by reading only the local group
 
 pub mod factory;
-pub mod rust_simd;
-
-#[cfg(all(feature = "isal", any(target_arch = "x86", target_arch = "x86_64")))]
 pub mod isal;
+pub mod rust_simd;
 
 use crate::ErasureError;
 
@@ -290,5 +283,6 @@ pub trait LrcBackend: ErasureBackend {
 }
 
 // Re-exports
-pub use factory::{BackendConfig, BackendFactory, BackendType};
-pub use rust_simd::{RustSimdBackend, RustSimdLrcBackend};
+pub use factory::{BackendConfig, BackendFactory};
+pub use isal::IsalBackend;
+pub use rust_simd::RustSimdLrcBackend;

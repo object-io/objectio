@@ -24,7 +24,7 @@ services:
     tty: true
     command: bash
 
-  # Build service - builds the workspace with ISA-L
+  # Build service - builds the workspace
   build:
     build:
       context: .
@@ -36,7 +36,7 @@ services:
       - cargo-git:/usr/local/cargo/git
       - target-cache:/build/target
     working_dir: /build
-    command: cargo build --workspace --features isal
+    command: cargo build --workspace
 
   # Release build
   build-release:
@@ -50,7 +50,7 @@ services:
       - cargo-git:/usr/local/cargo/git
       - target-cache:/build/target
     working_dir: /build
-    command: cargo build --workspace --release --features isal
+    command: cargo build --workspace --release
 
   # Test service - runs all tests
   test:
@@ -64,7 +64,7 @@ services:
       - cargo-git:/usr/local/cargo/git
       - target-cache:/build/target
     working_dir: /build
-    command: cargo test --workspace --features isal
+    command: cargo test --workspace
 
   # Clippy linting service
   lint:
@@ -78,7 +78,7 @@ services:
       - cargo-git:/usr/local/cargo/git
       - target-cache:/build/target
     working_dir: /build
-    command: cargo clippy --workspace --all-targets --features isal -- -D warnings
+    command: cargo clippy --workspace --all-targets -- -D warnings
 
   # Format check
   fmt:
