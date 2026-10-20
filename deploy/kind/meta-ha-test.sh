@@ -35,7 +35,7 @@ say "meta: $STS ($REPLICAS replicas), gateway: $GW_SVC:$GW_PORT"
 k delete pod "$POD" --ignore-not-found --wait >/dev/null
 k create configmap "$POD" --from-file="$HERE/meta_ha_load.py" \
     --dry-run=client -o yaml | k apply -f - >/dev/null
-k run "$POD" --image=python:3.12-slim --restart=Never --overrides='{
+k run "$POD" --image=python:3.12-slim --restart=Never --labels=objectio-test=meta-ha-load --overrides='{
   "spec": {
     "containers": [{
       "name": "load",

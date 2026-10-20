@@ -82,7 +82,7 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.meta.resources | nindent 12 }}
-      {{- with (include "objectio.tls.volume" .) }}
+      {{- with (include "objectio.tls.volume" (dict "ctx" . "role" "meta")) }}
       volumes:
         {{- . | nindent 8 }}
       {{- end }}

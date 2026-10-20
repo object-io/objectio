@@ -10,6 +10,10 @@ carries the release revision, so each revision runs it once). It:
      (POST /add-learner { node_id, addr }), then promotes the full set
      (POST /change-membership { voters: [1..N] }).
 
+Under mTLS (tls.enabled) the admin port is HTTPS and the three calls that
+change membership take only a certificate of role admin: the Job mounts
+the admin Secret and presents it.
+
 Idempotent: with every pod a voter already, it changes nothing.
 
 Not a post-install hook: Helm runs those only after `--wait` has seen every
@@ -71,8 +75,17 @@ spec:
             - |
               set -u
               FULLNAME='{{ include "objectio.meta.fullname" . }}'
+              {{- if .Values.tls.enabled }}
+              # mTLS: the admin port is HTTPS, and changes membership only
+              # for a certificate of role admin, this Job's.
+              SCHEME=https
+              TLSOPTS="--cacert /etc/objectio-tls/ca.crt --cert /etc/objectio-tls/tls.crt --key /etc/objectio-tls/tls.key"
+              {{- else }}
+              SCHEME=http
+              TLSOPTS=""
+              {{- end }}
               host() { echo "${FULLNAME}-$1.${HEADLESS}.${NAMESPACE}.svc.cluster.local"; }
-              status() { curl -sf -m 3 "http://$(host "$1"):${ADMIN_PORT}/status"; }
+              status() { curl ${TLSOPTS} -sf -m 3 "${SCHEME}://$(host "$1"):${ADMIN_PORT}/status"; }
               # Fields of /status (compact JSON): leader_id, voters.
               leader_of() { sed -n 's/.*"leader_id":\([0-9][0-9]*\).*/\1/p'; }
               voters_of() { sed -n 's/.*"voters":\[\([0-9,]*\)\].*/\1/p'; }
@@ -97,7 +110,7 @@ spec:
 
               # 2. /init on meta-0 unless a cluster exists (409: it does).
               if [ -z "$(status 0 | voters_of)" ]; then
-                code=$(curl -s -o /tmp/init.out -w "%{http_code}" -X POST "http://$(host 0):${ADMIN_PORT}/init" || true)
+                code=$(curl ${TLSOPTS} -s -o /tmp/init.out -w "%{http_code}" -X POST "${SCHEME}://$(host 0):${ADMIN_PORT}/init" || true)
                 case "$code" in
                   200) echo "meta-0 initialized as a single-voter cluster" ;;
                   409) echo "meta-0 already initialized (ok)" ;;
@@ -129,16 +142,16 @@ spec:
                   case ",${current}," in *",${id},"*) continue ;; esac
                   addr="$(host $((id - 1))):${GRPC_PORT}"
                   echo "Adding learner node_id=${id} at ${addr}"
-                  curl -sf -m 60 -X POST -H 'Content-Type: application/json' \
+                  curl ${TLSOPTS} -sf -m 60 -X POST -H 'Content-Type: application/json' \
                     -d "{\"node_id\": ${id}, \"addr\": \"${addr}\"}" \
-                    "http://${LEADER}:${ADMIN_PORT}/add-learner" \
+                    "${SCHEME}://${LEADER}:${ADMIN_PORT}/add-learner" \
                     || { echo "add-learner failed for node_id=${id}"; exit 5; }
                   echo
                 done
                 echo "Promoting voters=[${want}]"
-                curl -sf -m 60 -X POST -H 'Content-Type: application/json' \
+                curl ${TLSOPTS} -sf -m 60 -X POST -H 'Content-Type: application/json' \
                   -d "{\"voters\": [${want}]}" \
-                  "http://${LEADER}:${ADMIN_PORT}/change-membership" \
+                  "${SCHEME}://${LEADER}:${ADMIN_PORT}/change-membership" \
                   || { echo "change-membership failed"; exit 6; }
                 echo
               fi
@@ -147,6 +160,10 @@ spec:
               status $((LEADER_ID - 1))
               echo
               echo "Raft bootstrap complete."
+          {{- with (include "objectio.tls.volumeMount" .) }}
+          volumeMounts:
+            {{- . | nindent 12 }}
+          {{- end }}
           resources:
             requests:
               cpu: 50m
@@ -154,3 +171,7 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+      {{- with (include "objectio.tls.volume" (dict "ctx" . "role" "admin")) }}
+      volumes:
+        {{- . | nindent 8 }}
+      {{- end }}

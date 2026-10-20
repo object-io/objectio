@@ -125,12 +125,26 @@ Format: meta-0.HEADLESS:9100,meta-1.HEADLESS:9100,...
 {{- end }}
 
 {{/*
-mTLS between the services (A8a): the Secret holding this cluster's
-certificate (tls.crt, tls.key, ca.crt, as cert-manager writes them), and
-what each gRPC component mounts and sets from it.
+mTLS between the services (A8a): the Secret holding a role's certificate
+(tls.crt, tls.key, ca.crt, as cert-manager writes them), and what each
+component mounts and sets from it. Each certificate names its role in a
+SAN URI, spiffe://objectio/<role>: meta, osd, gateway, block-gateway or
+admin. Usage: include "objectio.tls.secretName" (dict "ctx" . "role" "meta")
 */}}
 {{- define "objectio.tls.secretName" -}}
-{{- .Values.tls.secretName | default (printf "%s-tls" (include "objectio.fullname" .)) -}}
+{{- (index .ctx.Values.tls.secrets .role) | default (printf "%s-tls-%s" (include "objectio.fullname" .ctx) .role) -}}
+{{- end }}
+
+{{/*
+The roles there are, each with the names its certificate must carry
+(the addresses peers dial it by).
+*/}}
+{{- define "objectio.tls.roles" -}}
+{{- $roles := dict "meta" (list (include "objectio.meta.fullname" .) (include "objectio.meta.headless" .)) "osd" (list (include "objectio.osd.fullname" .) (include "objectio.osd.headless" .)) "gateway" (list (include "objectio.gateway.fullname" .)) "admin" (list) }}
+{{- if .Values.blockGateway.enabled }}
+{{- $_ := set $roles "block-gateway" (list (include "objectio.blockGateway.fullname" .)) }}
+{{- end }}
+{{- toJson $roles }}
 {{- end }}
 
 {{- define "objectio.tls.env" -}}
@@ -152,8 +166,9 @@ what each gRPC component mounts and sets from it.
 {{- end }}
 {{- end }}
 
+{{- /* Usage: include "objectio.tls.volume" (dict "ctx" . "role" "osd") */ -}}
 {{- define "objectio.tls.volume" -}}
-{{- if .Values.tls.enabled }}
+{{- if .ctx.Values.tls.enabled }}
 - name: tls
   secret:
     secretName: {{ include "objectio.tls.secretName" . }}

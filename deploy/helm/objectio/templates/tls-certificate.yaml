@@ -1,28 +1,37 @@
 {{- /*
-mTLS between the services (A8a): one certificate for the whole cluster,
-from cert-manager, naming every address a component is dialled by (pods
-through the headless services, components through their services).
-Without an issuer, provide the Secret yourself (tls.secretName).
+mTLS between the services (A8a): a certificate per role from cert-manager,
+each naming its role in a SAN URI (spiffe://objectio/<role>), which is
+what the services check each call against, and the addresses that role's
+pods are dialled by (through the headless services and the services).
+`admin` is the Raft bootstrap Job's (and an operator's: obioctl's block
+commands, meta's admin port). Without an issuer, provide the Secrets
+yourself (tls.secrets).
 */ -}}
 {{- if and .Values.tls.enabled .Values.tls.certManager.issuerRef.name }}
+{{- $ns := .Release.Namespace }}
+{{- range $role, $names := (include "objectio.tls.roles" . | fromJson) }}
+---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  name: {{ include "objectio.fullname" . }}-tls
+  name: {{ include "objectio.fullname" $ }}-tls-{{ $role }}
   labels:
-    {{- include "objectio.labels" . | nindent 4 }}
+    {{- include "objectio.labels" $ | nindent 4 }}
 spec:
-  secretName: {{ include "objectio.tls.secretName" . }}
-  duration: {{ .Values.tls.certManager.duration }}
-  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  secretName: {{ include "objectio.tls.secretName" (dict "ctx" $ "role" $role) }}
+  duration: {{ $.Values.tls.certManager.duration }}
+  renewBefore: {{ $.Values.tls.certManager.renewBefore }}
+  commonName: {{ include "objectio.fullname" $ }}-{{ $role }}
   usages:
     - server auth
     - client auth
     - digital signature
     - key encipherment
+  uris:
+    - spiffe://objectio/{{ $role }}
+  {{- if $names }}
   dnsNames:
-    {{- $ns := .Release.Namespace }}
-    {{- range (list (include "objectio.meta.fullname" .) (include "objectio.meta.headless" .) (include "objectio.osd.fullname" .) (include "objectio.osd.headless" .) (include "objectio.gateway.fullname" .) (include "objectio.blockGateway.fullname" .)) }}
+    {{- range $names }}
     - {{ . }}
     - {{ . }}.{{ $ns }}.svc
     - {{ . }}.{{ $ns }}.svc.cluster.local
@@ -33,6 +42,8 @@ spec:
     - localhost
   ipAddresses:
     - 127.0.0.1
+  {{- end }}
   issuerRef:
-    {{- toYaml .Values.tls.certManager.issuerRef | nindent 4 }}
+    {{- toYaml $.Values.tls.certManager.issuerRef | nindent 4 }}
+{{- end }}
 {{- end }}

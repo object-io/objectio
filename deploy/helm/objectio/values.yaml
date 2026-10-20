@@ -442,20 +442,31 @@ ec:
   m: 2
 
 # Who may connect to each component, as NetworkPolicies (ingress only;
-# egress is left open). Pods of this release always reach each other.
-# Kubelet probes are not affected on common CNIs.
+# egress is left open; the cluster's network plugin must enforce them).
+# The internal ports (meta's gRPC and admin port, the OSDs' gRPC, the
+# block gateway's gRPC and NBD) take only ObjectIO's own components and
+# the Raft bootstrap Job: without mTLS (tls.enabled) nothing on them is
+# authenticated, and these policies are what keeps them to ObjectIO. The
+# metrics ports take every pod of this release (the chart's Prometheus).
+# Kubelet's probes come from the pod's own node, which a NetworkPolicy
+# does not filter. Each `...From` is a list of NetworkPolicyPeers
+# (podSelector / namespaceSelector / ipBlock).
 networkPolicy:
-  enabled: false
+  enabled: true
   # `from` peers allowed to the S3 port besides this release's pods
   # (e.g. the ingress controller's namespace). Empty: anyone.
   gatewayFrom: []
-  # Peers allowed to the block gateway's gRPC and NBD ports. Empty: anyone.
+  # Peers allowed to the block gateway's gRPC (volume admin) and NBD
+  # ports besides ObjectIO's own pods: the machines that attach volumes,
+  # an operator's obioctl. NBD has no authentication of its own. Empty:
+  # ObjectIO's pods only.
   blockGatewayFrom: []
-  # Peers allowed to scrape meta's and the OSDs' /metrics (a Prometheus
-  # in another namespace). The chart's own Prometheus is in the release.
+  # Peers allowed to scrape meta's, the OSDs' and the block gateway's
+  # /metrics (a Prometheus in another namespace). The chart's own
+  # Prometheus is in the release.
   metricsFrom: []
-  # Peers allowed to meta's admin port (Raft membership). Empty: only
-  # this release's pods.
+  # Peers allowed to meta's admin port (Raft membership, /status). Empty:
+  # ObjectIO's pods and the bootstrap Job only.
   adminFrom: []
 
 monitoring:
@@ -514,15 +525,27 @@ monitoring:
 
 # mTLS between the services (A8a): gRPC between gateway, meta, OSDs and the
 # block gateway (Raft included) accepts only peers presenting a certificate
-# this cluster's CA signed. Client-facing TLS (S3, console) is the
-# ingress's. Enable it at install: turning it on (or off) later restarts
-# every component at once, as a cluster can't speak both.
+# this cluster's CA signed, and each call only from a peer whose
+# certificate names a role allowed to make it; meta's admin port is HTTPS,
+# and changes Raft membership only for role admin (the bootstrap Job).
+# Without it, nothing between the services is authenticated: keep
+# networkPolicy on, and the pod network to ObjectIO alone. Client-facing
+# TLS (S3, console) is the ingress's. Enable it at install: turning it on
+# (or off) later restarts every component at once, as a cluster can't
+# speak both.
 tls:
   enabled: false
-  # A Secret with tls.crt, tls.key and ca.crt (cert-manager's format).
-  # Default: <release>-objectio-tls. Made by cert-manager when an issuer
-  # is named below; otherwise create it yourself.
-  secretName: ""
+  # A Secret per role, each with tls.crt, tls.key and ca.crt
+  # (cert-manager's format), its certificate naming the role in a SAN URI
+  # spiffe://objectio/<role>. Default: <release>-objectio-tls-<role>.
+  # Made by cert-manager when an issuer is named below; otherwise create
+  # them yourself.
+  secrets:
+    meta: ""
+    osd: ""
+    gateway: ""
+    block-gateway: ""
+    admin: ""
   certManager:
     # e.g. {name: objectio-ca, kind: Issuer}: a CA issuer, so ca.crt is
     # the CA that signs every component's certificate.

@@ -251,7 +251,7 @@ spec:
       {{- end }}
       {{- if or .Values.tls.enabled .Values.gateway.audit.spool.enabled }}
       volumes:
-        {{- with (include "objectio.tls.volume" .) }}
+        {{- with (include "objectio.tls.volume" (dict "ctx" . "role" "gateway")) }}
         {{- . | nindent 8 }}
         {{- end }}
         {{- if .Values.gateway.audit.spool.enabled }}

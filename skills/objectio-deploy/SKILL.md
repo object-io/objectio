@@ -53,7 +53,13 @@ every other binary is in the image. macOS runs aio only.
    the same drive, not the boot disk. Meta on a drive of its own. Leave
    the block size at the OSD's 4 KiB.
 4. **mTLS between services.** `--tls-cert/--tls-key/--tls-ca` (env
-   `OBJECTIO_TLS_CERT/KEY/CA`) everywhere, chart `tls.enabled`. A cluster
+   `OBJECTIO_TLS_CERT/KEY/CA`) everywhere, chart `tls.enabled`. Each
+   certificate names its role in a SAN URI `spiffe://objectio/<role>`
+   (`meta`, `osd`, `gateway`, `block-gateway`, `admin` for obioctl's block
+   commands and meta's admin port; aio's names all five), and each call is
+   checked against it. Without mTLS nothing internal is authenticated:
+   meta 9100-9102, OSD 9200-9201 and block 9300/10809 must be reachable by
+   ObjectIO alone (the chart's `networkPolicy`, on by default). A cluster
    can't run half on TLS: turning it on later restarts everything at once.
    Client TLS ends at the ingress or load balancer.
 5. **The SSE master key.** `OBJECTIO_MASTER_KEY`, base64 of 32 bytes, on
@@ -118,7 +124,9 @@ gateway:
     tls: [{hosts: [s3.example.com], secretName: s3-tls}]
 tls:
   enabled: true
-  certManager: {issuerRef: {name: objectio-ca, kind: Issuer}}   # a CA issuer
+  certManager: {issuerRef: {name: objectio-ca, kind: Issuer}}   # a CA issuer; a certificate per role
+networkPolicy:
+  metricsFrom: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
 monitoring:
   prometheusRule: {enabled: true}   # for a prometheus-operator
 ```
@@ -174,7 +182,9 @@ By hand, the same: meta and the gateway take flags only, the OSD its TOML
 # each meta node (node-id 1, 2, 3)
 objectio-meta --node-id 1 --listen 0.0.0.0:9100 --raft-advertise meta1:9100 \
   --data-dir /var/lib/objectio/meta --ec-k 4 --ec-m 2
-# once, on meta1's admin port, form the group (a lone meta needs /init too)
+# once, on meta1's admin port, form the group (a lone meta needs /init too).
+# With mTLS it is HTTPS and takes a role-admin certificate:
+#   curl --cacert ca.pem --cert admin.pem --key admin.key https://meta1:9102/...
 curl -X POST http://meta1:9102/init
 curl -X POST http://meta1:9102/add-learner -H 'content-type: application/json' -d '{"node_id": 2, "addr": "meta2:9100"}'
 curl -X POST http://meta1:9102/add-learner -H 'content-type: application/json' -d '{"node_id": 3, "addr": "meta3:9100"}'
