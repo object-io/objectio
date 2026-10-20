@@ -61,10 +61,9 @@ Every tenant-scoped command takes `--tenant`. Without it, the command acts
 in the caller's own tenant, which is system scope for the system admin.
 An empty `--tenant ""` is rejected rather than sent.
 
-Some endpoints have no tenant parameter: `user list` and `bucket list`
-answer with the caller's tenant, or with everything for the system admin;
-`warehouse list` answers the system admin only. `--tenant` filters the
-answer on the client.
+Some endpoints have no tenant parameter: `user list`, `bucket list` and
+`warehouse list`. A tenant admin gets its own tenant's, the system admin
+every tenant's, and `--tenant` filters that answer on the client.
 
 ## Output
 
@@ -124,6 +123,7 @@ Secrets are printed only once, when they are created: by `key create`,
 | `replication target list` / `delete N` `[--tenant]` | `GET /_admin/replication/targets`, `DELETE …/targets/N` |
 | `replication target set N --remote-endpoint E --remote-bucket B --remote-access-key A --remote-secret-key S [--remote-region --bandwidth 100M --tenant]` | `POST /_admin/replication/targets` |
 | `replication resync start B T [--again]` / `status B` / `cancel B T` | `POST` / `GET` / `DELETE /_admin/replication/resync` |
+| `replication settings get` / `set [--allowed-tenant-host H ...]` (replaces them; none: tenant admins can't set targets) | `GET` / `PUT /_admin/replication/settings` |
 | `bucket list [--tenant]` / `show B` | `GET /_admin/buckets` |
 | `bucket create B [--pool P --tenant]` / `delete B` | `POST /_admin/buckets`, `DELETE /_admin/buckets/B` |
 | `bucket set-owner B USER` | `PUT /_admin/buckets/B/owner` |

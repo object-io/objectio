@@ -196,3 +196,89 @@ fn a_provider_read_and_written_back_keeps_its_secret() {
     assert_eq!(stored["value"]["client_id"], "objectio-2");
     assert_eq!(stored["value"]["client_secret"], "********");
 }
+
+/// A tenant names only an OIDC provider that exists, and a provider a
+/// tenant names isn't deleted from under it: the delete is refused, naming
+/// the tenants, until none names it.
+#[test]
+fn a_provider_a_tenant_names_is_not_deleted_from_under_it() {
+    let c = Cluster::start();
+    let path = "/_admin/config/identity/openid/corp";
+
+    let r = c.json(
+        "POST",
+        "/_admin/tenants",
+        json!({"name": "acme", "oidc_provider": "corp"}),
+    );
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert!(r.text().contains("'corp' does not exist"), "{}", r.text());
+
+    c.json(
+        "PUT",
+        path,
+        json!({"issuer_url": "https://idp.example", "client_id": "objectio"}),
+    )
+    .expect_ok();
+    for tenant in ["acme", "globex"] {
+        c.json(
+            "POST",
+            "/_admin/tenants",
+            json!({"name": tenant, "oidc_provider": "corp"}),
+        )
+        .expect(201);
+    }
+    let r = c.json(
+        "PUT",
+        "/_admin/tenants/globex",
+        json!({"oidc_provider": "nope"}),
+    );
+    assert_eq!(r.status, 400, "{}", r.text());
+    assert!(r.text().contains("'nope' does not exist"), "{}", r.text());
+
+    let r = c.request("DELETE", path, &[]);
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert!(
+        r.text().contains("acme, globex"),
+        "names the tenants: {}",
+        r.text()
+    );
+    c.request("GET", path, &[]).expect(200);
+
+    // An update that leaves the provider as it is still goes through.
+    c.json("PUT", "/_admin/tenants/acme", json!({"quota_buckets": 3}))
+        .expect(200);
+
+    c.json("PUT", "/_admin/tenants/acme", json!({"oidc_provider": ""}))
+        .expect(200);
+    let r = c.request("DELETE", path, &[]);
+    assert_eq!(r.status, 409, "{}", r.text());
+    assert!(!r.text().contains("acme"), "{}", r.text());
+    c.json(
+        "PUT",
+        "/_admin/tenants/globex",
+        json!({"oidc_provider": ""}),
+    )
+    .expect(200);
+
+    c.request("DELETE", path, &[]).expect(204);
+    c.request("GET", path, &[]).expect(404);
+}
+
+/// A tenant admin's own provider, bound to the tenant when they saved it,
+/// is unbound when they delete it: the delete isn't refused over a binding
+/// only the system admin could undo.
+#[test]
+fn a_tenant_admin_deletes_its_own_provider() {
+    let c = Cluster::start();
+    let (_, ak, sk) = tenant_admin(&c, "acme");
+    let path = "/_admin/config/identity/openid/t-acme";
+    let provider = json!({"issuer_url": "https://idp.example", "client_id": "objectio"});
+    as_user(&c, &ak, &sk, "PUT", path, &provider).expect(200);
+    let t = c.request("GET", "/_admin/tenants/acme", &[]).json();
+    assert_eq!(t["oidc_provider"], "t-acme", "{t}");
+
+    as_user(&c, &ak, &sk, "DELETE", path, &Value::Null).expect(204);
+    let t = c.request("GET", "/_admin/tenants/acme", &[]).json();
+    assert_eq!(t["oidc_provider"], "", "{t}");
+    c.request("GET", path, &[]).expect(404);
+}

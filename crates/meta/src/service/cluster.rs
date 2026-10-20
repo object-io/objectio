@@ -1415,6 +1415,18 @@ impl MetaService {
                 "the active format level is raised only by finalizing an upgrade",
             ));
         }
+        // A provider a tenant still names: deleting it would leave the
+        // tenant pointing at nothing, its users unable to sign in.
+        if let Some(provider) = req.key.strip_prefix(super::tenants::OIDC_PROVIDER_PREFIX) {
+            let users = self.tenants_using_oidc_provider(provider);
+            if !users.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "OIDC provider '{provider}' is in use by tenant {}: set their \
+                     oidc_provider to another provider, or clear it, first",
+                    users.join(", ")
+                )));
+            }
+        }
 
         if let Some(raft) = self.raft_handle() {
             match raft

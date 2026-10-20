@@ -1,7 +1,8 @@
-//! `obioctl replication`: targets, and resyncs of existing objects.
+//! `obioctl replication`: targets, resyncs of existing objects, and the
+//! operator's settings.
 
 use super::{Ctx, parse_size, q, seg, tenant_query};
-use crate::cli::{ReplicationCmd, ReplicationTargetCmd, ResyncCmd};
+use crate::cli::{ReplicationCmd, ReplicationSettingsCmd, ReplicationTargetCmd, ResyncCmd};
 use crate::output::{key_values as kv, rows_of};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -10,7 +11,28 @@ pub async fn replication(cmd: ReplicationCmd, ctx: &mut Ctx<'_, '_>) -> Result<(
     match cmd {
         ReplicationCmd::Target { action } => target(action, ctx).await,
         ReplicationCmd::Resync { action } => resync(action, ctx).await,
+        ReplicationCmd::Settings { action } => settings(action, ctx).await,
     }
+}
+
+async fn settings(cmd: ReplicationSettingsCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {
+    let v = match cmd {
+        ReplicationSettingsCmd::Get => ctx.api.get("/_admin/replication/settings", &[]).await?,
+        ReplicationSettingsCmd::Set {
+            allowed_tenant_hosts,
+        } => {
+            ctx.api
+                .send_json(
+                    "PUT",
+                    "/_admin/replication/settings",
+                    &[],
+                    json!({ "allowed_tenant_hosts": allowed_tenant_hosts }),
+                )
+                .await?
+        }
+    };
+    ctx.out.emit(&v, kv)?;
+    Ok(())
 }
 
 async fn target(cmd: ReplicationTargetCmd, ctx: &mut Ctx<'_, '_>) -> Result<()> {

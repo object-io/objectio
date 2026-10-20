@@ -664,6 +664,24 @@ pub enum ReplicationCmd {
         #[command(subcommand)]
         action: ResyncCmd,
     },
+    /// The operator's settings: where tenants' targets may be (system admin)
+    Settings {
+        #[command(subcommand)]
+        action: ReplicationSettingsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReplicationSettingsCmd {
+    /// GET /_admin/replication/settings
+    Get,
+    /// PUT /_admin/replication/settings — replaces them
+    Set {
+        /// A host tenants' targets may be on: host, host:port or *.domain
+        /// (repeatable). None: tenant admins can't set targets
+        #[arg(long = "allowed-tenant-host")]
+        allowed_tenant_hosts: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -964,7 +982,10 @@ pub enum PoolCmd {
         name: String,
         #[command(flatten)]
         fields: PoolFields,
-        /// Placement groups (fixed at creation; 0 = per-object placement)
+        /// Placement groups, fixed for the pool's life. Left out (or 0),
+        /// meta sizes it from the OSDs in service: about 100 PG members an
+        /// OSD (config pg/members_per_osd) over the copies a PG holds,
+        /// rounded up to a power of two, from 256 to 4096
         #[arg(long)]
         pg_count: Option<u32>,
         /// Domains (at --failure-domain) each placement group's copies are

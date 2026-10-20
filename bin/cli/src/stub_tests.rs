@@ -628,7 +628,9 @@ async fn bucket_public_access_block_is_the_s3_subresource() {
 
 #[tokio::test]
 async fn audit_put_sends_the_file_with_the_tenant() {
-    let (_d, f) = file_with(r#"{"targets":[{"type":"stdout","name":"out"}]}"#);
+    let (_d, f) = file_with(
+        r#"{"targets":[{"type":"webhook","name":"siem","url":"https://siem.acme.example/x"}]}"#,
+    );
     let r = cli(
         &["audit", "put", "--file", &f, "--tenant", "acme"],
         vec![ok(json!({}))],
@@ -638,7 +640,56 @@ async fn audit_put_sends_the_file_with_the_tenant() {
     assert_eq!(r.seen[0].method, "PUT");
     assert_eq!(r.seen[0].path, "/_admin/audit");
     assert_eq!(r.seen[0].query, q(&[("tenant", "acme")]));
-    assert_eq!(r.seen[0].json()["targets"][0]["type"], "stdout");
+    assert_eq!(r.seen[0].json()["targets"][0]["type"], "webhook");
+}
+
+// ── replication ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn replication_settings_set_replaces_the_allowed_hosts() {
+    let r = cli(
+        &[
+            "replication",
+            "settings",
+            "set",
+            "--allowed-tenant-host",
+            "dr.example",
+            "--allowed-tenant-host",
+            "*.backup.example",
+        ],
+        vec![ok(
+            json!({"allowed_tenant_hosts": ["dr.example", "*.backup.example"]}),
+        )],
+    )
+    .await;
+    r.result.unwrap();
+    assert_eq!(r.seen[0].method, "PUT");
+    assert_eq!(r.seen[0].path, "/_admin/replication/settings");
+    assert_eq!(
+        r.seen[0].json(),
+        json!({"allowed_tenant_hosts": ["dr.example", "*.backup.example"]})
+    );
+    assert!(r.out.contains("dr.example"), "{}", r.out);
+
+    // None given: tenants' admins can't set targets.
+    let r = cli(&["replication", "settings", "set"], vec![ok(json!({}))]).await;
+    r.result.unwrap();
+    assert_eq!(r.seen[0].json(), json!({"allowed_tenant_hosts": []}));
+
+    let r = cli(
+        &["-o", "json", "replication", "settings", "get"],
+        vec![ok(json!({"allowed_tenant_hosts": ["dr.example"]}))],
+    )
+    .await;
+    r.result.unwrap();
+    assert_eq!(
+        (r.seen[0].method.as_str(), r.seen[0].path.as_str()),
+        ("GET", "/_admin/replication/settings")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&r.out).unwrap(),
+        json!({"allowed_tenant_hosts": ["dr.example"]})
+    );
 }
 
 // ── buckets / provisioning ──────────────────────────────────────────────
