@@ -964,7 +964,10 @@ pub enum PoolCmd {
         name: String,
         #[command(flatten)]
         fields: PoolFields,
-        /// Placement groups (fixed at creation; 0 = per-object placement)
+        /// Placement groups, fixed for the pool's life. Left out (or 0),
+        /// meta sizes it from the OSDs in service: about 100 PG members an
+        /// OSD (config pg/members_per_osd) over the copies a PG holds,
+        /// rounded up to a power of two, from 256 to 4096
         #[arg(long)]
         pg_count: Option<u32>,
         /// Domains (at --failure-domain) each placement group's copies are

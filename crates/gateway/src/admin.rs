@@ -68,8 +68,8 @@ fn json_to_pool(v: &serde_json::Value) -> PoolConfig {
         enabled: v["enabled"].as_bool().unwrap_or(true),
         created_at: 0,
         updated_at: 0,
-        // Placement groups, fixed for the pool's life; 0 takes meta's
-        // default (256).
+        // Placement groups, fixed for the pool's life; 0: meta sizes it
+        // from the OSDs in service (`sized_pg_count`, 256 to 4096).
         pg_count: v["pg_count"].as_u64().unwrap_or_default() as u32,
         tier: v["tier"].as_str().unwrap_or_default().to_string(),
         // The placement rule (B31 phase 1b); 0 and 0: one copy per domain.
