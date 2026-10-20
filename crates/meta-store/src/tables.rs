@@ -57,6 +57,9 @@ pub const RAFT_VOTE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_v
 // recovery after crash never re-applies committed commands.
 pub const RAFT_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_state");
 
+/// Raft's own tables: never written by a command.
+pub const RAFT_TABLES: [&str; 3] = ["raft_logs", "raft_vote", "raft_state"];
+
 // Server pools
 // Key: pool name, Value: prost-encoded PoolConfig
 pub const POOLS: TableDefinition<&str, &[u8]> = TableDefinition::new("pools");

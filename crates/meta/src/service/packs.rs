@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Stripe ids one release command takes: each is two writes at most.
+const RELEASE_BATCH: usize = objectio_meta_store::MAX_OPS / 2;
+
 impl MetaService {
     /// Mirror a committed change to the shared-stripe registry.
     pub(super) fn apply_stripe_refs_event(&self, key: &str, new_value: Option<&[u8]>) {
@@ -216,6 +219,16 @@ impl MetaService {
         if req.owner.is_empty() || req.sharer.is_empty() {
             return Err(Status::invalid_argument("owner and sharer are required"));
         }
+        // All in one command, so the copy holds all of them or none. A
+        // gateway shares more in batches of this many; one that doesn't
+        // copies the bytes instead, as it does on any FailedPrecondition.
+        if req.stripe_ids.len() > objectio_meta_store::MAX_OPS {
+            return Err(Status::failed_precondition(format!(
+                "{} stripes to share at once; at most {}",
+                req.stripe_ids.len(),
+                objectio_meta_store::MAX_OPS
+            )));
+        }
         for attempt in 0..CAS_ATTEMPTS {
             if attempt > 0 {
                 contention_backoff(attempt).await;
@@ -264,8 +277,36 @@ impl MetaService {
         &self,
         request: Request<objectio_proto::metadata::ReleaseStripesRequest>,
     ) -> Result<Response<objectio_proto::metadata::ReleaseStripesResponse>, Status> {
-        use objectio_meta_store::{CasOp, CasTable};
         let req = request.into_inner();
+        // Each id is two writes at most (its entry, and its pack's record
+        // when it held the pack's last object), so a command takes half as
+        // many ids as it does writes. Each batch lands whole; a failure
+        // part way is retried from the start by the caller, and the
+        // batches already done have nothing left to release.
+        let mut freeable = Vec::new();
+        let mut freed_packs = Vec::new();
+        for ids in req.stripe_ids.chunks(RELEASE_BATCH) {
+            let (f, p) = self.release_stripe_batch(ids, &req.referrer).await?;
+            freeable.extend(f);
+            freed_packs.extend(p);
+        }
+        Ok(Response::new(
+            objectio_proto::metadata::ReleaseStripesResponse {
+                freeable,
+                freed_packs,
+            },
+        ))
+    }
+
+    /// Release `referrer`'s references to `stripe_ids` (at most
+    /// [`RELEASE_BATCH`]) in one command: the ids no object references any
+    /// more, and the packs whose last object let go.
+    async fn release_stripe_batch(
+        &self,
+        stripe_ids: &[Vec<u8>],
+        referrer: &[u8],
+    ) -> Result<(Vec<Vec<u8>>, Vec<objectio_proto::metadata::StripeMeta>), Status> {
+        use objectio_meta_store::{CasOp, CasTable};
         for attempt in 0..CAS_ATTEMPTS {
             if attempt > 0 {
                 contention_backoff(attempt).await;
@@ -277,7 +318,7 @@ impl MetaService {
             let mut freed_packs = Vec::new();
             {
                 let map = self.stripe_refs.read();
-                for id in &req.stripe_ids {
+                for id in stripe_ids {
                     let key = hex::encode(id);
                     let pack = self.pack_record(id);
                     match map.get(&key) {
@@ -287,9 +328,9 @@ impl MetaService {
                         None if pack.is_some() => {}
                         // Never shared: its only referrer is letting it go.
                         None => freeable.push(id.clone()),
-                        Some(r) if r.referrers.contains(&req.referrer) => {
+                        Some(r) if r.referrers.iter().any(|x| x == referrer) => {
                             let mut refs = r.clone();
-                            refs.referrers.retain(|x| x != &req.referrer);
+                            refs.referrers.retain(|x| x != referrer);
                             if refs.referrers.is_empty() {
                                 changes.push((key.clone(), None));
                                 if let Some((record, bytes)) = pack {
@@ -354,12 +395,7 @@ impl MetaService {
                 ok
             };
             if ok {
-                return Ok(Response::new(
-                    objectio_proto::metadata::ReleaseStripesResponse {
-                        freeable,
-                        freed_packs,
-                    },
-                ));
+                return Ok((freeable, freed_packs));
             }
         }
         Err(Status::aborted("stripe references kept changing; retry"))

@@ -196,6 +196,45 @@ pub enum MetaResponse {
     MultiCasConflict { failed_indices: Vec<u32> },
     /// `Batch` applied: each command's answer, in its order.
     Batch(Vec<MetaResponse>),
+    /// The command was refused and wrote nothing: it can never apply,
+    /// whatever the state (too many operations, a table it may not write,
+    /// a record that doesn't decode). Every node answers the same, and the
+    /// entry still counts as applied, so a node never stops on it. Meta
+    /// refuses such a command before proposing it
+    /// ([`MetaCommand::refusal`]); this is for one that reached the log
+    /// anyway. Only ever answered to the local caller, never sent to
+    /// another node.
+    Rejected { reason: String },
+}
+
+/// The most operations one [`MetaCommand::MultiCas`] carries.
+pub const MAX_OPS: usize = objectio_common::META_MAX_OPS;
+
+impl MetaCommand {
+    /// Why this command can never apply, whatever the state, or `None`.
+    /// Meta checks it before proposing a command, and the state machine
+    /// again as it applies one, answering [`MetaResponse::Rejected`].
+    /// A [`MetaCommand::Batch`] is not looked into here: the state machine
+    /// checks each of its commands as it applies it.
+    #[must_use]
+    pub fn refusal(&self) -> Option<String> {
+        let Self::MultiCas { ops, .. } = self else {
+            return None;
+        };
+        if ops.len() > MAX_OPS {
+            return Some(format!(
+                "a compare-and-set of {} operations; at most {MAX_OPS}",
+                ops.len()
+            ));
+        }
+        ops.iter().find_map(|op| match &op.table {
+            CasTable::Named(name) if name.is_empty() => Some("a table with no name".to_string()),
+            CasTable::Named(name) if crate::tables::RAFT_TABLES.contains(&name.as_str()) => {
+                Some(format!("table {name} is Raft's own"))
+            }
+            _ => None,
+        })
+    }
 }
 
 declare_raft_types!(

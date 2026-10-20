@@ -483,10 +483,13 @@ impl MetaService {
         let req = request.into_inner();
 
         // Snapshot current user + access-key state under read locks so we
-        // can build the CAS batch atomically. The user's status flips to
-        // Deleted; every owned access key flips to Inactive — all in one
-        // MultiCas so followers see the compound change at the same log
-        // position (can't observe "user deleted but keys still active").
+        // can build the CAS batch. The user's status flips to Deleted;
+        // every owned access key flips to Inactive. In one MultiCas when it
+        // fits, so followers see the compound change at the same log
+        // position; a user with more keys, groups and policies than one
+        // command carries loses them first, in several, and is marked
+        // deleted last: never "user deleted but keys still active", and a
+        // delete cut short is retried from what it left.
         let (old_user_bytes, new_user_bytes, user_snapshot) = {
             let users = self.users.read();
             let user = users
@@ -544,15 +547,9 @@ impl MetaService {
             }
         }
 
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        if self.raft_handle().is_some() {
+            use objectio_meta_store::{CasOp, CasTable};
             let mut ops = Vec::with_capacity(1 + key_transitions.len());
-            ops.push(CasOp {
-                table: CasTable::Users,
-                key: req.user_id.clone(),
-                expected: Some(old_user_bytes),
-                new_value: Some(new_user_bytes),
-            });
             for (kid, old_b, new_b, _) in &key_transitions {
                 ops.push(CasOp {
                     table: CasTable::AccessKeys,
@@ -570,24 +567,16 @@ impl MetaService {
                 });
             }
             ops.extend(self.principal_cleanup_ops(&principal));
-            let cmd = MetaCommand::MultiCas {
-                ops,
-                requested_by: "delete-user".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(resp) => match resp.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { failed_indices } => {
-                        return Err(Status::aborted(format!(
-                            "user or access-key changed mid-delete; retry (conflicts at ops {failed_indices:?})"
-                        )));
-                    }
-                    other => {
-                        error!("unexpected raft response for delete_user: {:?}", other);
-                        return Err(Status::internal("raft commit returned wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
+            ops.push(CasOp {
+                table: CasTable::Users,
+                key: req.user_id.clone(),
+                expected: Some(old_user_bytes),
+                new_value: Some(new_user_bytes),
+            });
+            if !self.cas_in_order(ops, "delete-user").await? {
+                return Err(Status::aborted(
+                    "user, access key, group or policy changed mid-delete; retry",
+                ));
             }
         } else if let Some(store) = &self.store {
             store.put_user(&req.user_id, &user_snapshot);
@@ -1026,33 +1015,20 @@ impl MetaService {
                 .map_err(|e| Status::internal(format!("group encode: {e}")))?
         };
 
-        // Its inline policies and attachments go with it.
+        // Its inline policies and attachments go with it, before it (see
+        // `cas_in_order`).
         let principal = format!("group:{}", req.group_id);
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
-            let mut ops = vec![CasOp {
+        if self.raft_handle().is_some() {
+            use objectio_meta_store::{CasOp, CasTable};
+            let mut ops = self.principal_cleanup_ops(&principal);
+            ops.push(CasOp {
                 table: CasTable::Groups,
                 key: req.group_id.clone(),
                 expected: Some(expected_bytes),
                 new_value: None,
-            }];
-            ops.extend(self.principal_cleanup_ops(&principal));
-            let cmd = MetaCommand::MultiCas {
-                ops,
-                requested_by: "delete-group".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { .. } => {
-                        return Err(Status::aborted("group changed since read; retry delete"));
-                    }
-                    other => {
-                        error!("unexpected raft response for delete_group: {:?}", other);
-                        return Err(Status::internal("raft commit wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
+            });
+            if !self.cas_in_order(ops, "delete-group").await? {
+                return Err(Status::aborted("group changed since read; retry delete"));
             }
         } else if let Some(store) = &self.store {
             store.delete_group(&req.group_id);
@@ -1583,7 +1559,9 @@ impl MetaService {
         let name = request.into_inner().name;
         // Snapshot current state: policy row + every attachment row that
         // references this policy. The whole mutation lands as one atomic
-        // MultiCas — a crash mid-delete can't leave orphan attachments.
+        // MultiCas when it fits; attached to more principals than that, it
+        // is detached from them first, in several, and deleted last, so a
+        // delete cut short leaves no attachment to a policy that's gone.
         let (expected_policy_bytes, attachment_transitions) = {
             let policies = self.iam_policies.read();
             let Some(current) = policies.get(&name) else {
@@ -1613,15 +1591,9 @@ impl MetaService {
             (expected, transitions)
         };
 
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        if self.raft_handle().is_some() {
+            use objectio_meta_store::{CasOp, CasTable};
             let mut ops = Vec::with_capacity(1 + attachment_transitions.len());
-            ops.push(CasOp {
-                table: CasTable::IamPolicies,
-                key: name.clone(),
-                expected: Some(expected_policy_bytes),
-                new_value: None,
-            });
             for (key, old, new, _) in &attachment_transitions {
                 ops.push(CasOp {
                     table: CasTable::PolicyAttachments,
@@ -1630,24 +1602,16 @@ impl MetaService {
                     new_value: new.clone(),
                 });
             }
-            let cmd = MetaCommand::MultiCas {
-                ops,
-                requested_by: "delete-iam-policy".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { failed_indices } => {
-                        return Err(Status::aborted(format!(
-                            "policy or attachment changed mid-delete; retry (conflicts at ops {failed_indices:?})"
-                        )));
-                    }
-                    other => {
-                        error!("unexpected raft response for delete_policy: {:?}", other);
-                        return Err(Status::internal("raft commit wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
+            ops.push(CasOp {
+                table: CasTable::IamPolicies,
+                key: name.clone(),
+                expected: Some(expected_policy_bytes),
+                new_value: None,
+            });
+            if !self.cas_in_order(ops, "delete-iam-policy").await? {
+                return Err(Status::aborted(
+                    "policy or attachment changed mid-delete; retry",
+                ));
             }
         } else if let Some(store) = &self.store {
             store.delete_iam_policy(&name);
@@ -2187,17 +2151,18 @@ impl MetaService {
         let old = self
             .role(&name)
             .ok_or_else(|| Status::not_found(format!("role '{name}' not found")))?;
-        // Its inline policies and attachments go with it: a role created
-        // later under the same name must not inherit them.
+        // Its inline policies and attachments go with it, before it (see
+        // `cas_in_order`): a role created later under the same name must
+        // not inherit them.
         let principal = format!("role:{name}");
-        let mut ops = vec![objectio_meta_store::CasOp {
+        let mut ops = self.principal_cleanup_ops(&principal);
+        ops.push(objectio_meta_store::CasOp {
             table: objectio_meta_store::CasTable::Named(ROLES_TABLE.into()),
             key: name.clone(),
             expected: Some(old.encode_to_vec()),
             new_value: None,
-        }];
-        ops.extend(self.principal_cleanup_ops(&principal));
-        if !self.cas_many(ops, "delete-role").await? {
+        });
+        if !self.cas_in_order(ops, "delete-role").await? {
             return Err(Status::aborted("role changed since read; retry delete"));
         }
         self.forget_principal(&principal);

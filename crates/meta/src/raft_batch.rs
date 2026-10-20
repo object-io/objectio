@@ -18,6 +18,13 @@
 //!
 //! An older meta node can't decode a batch, so writes are batched only once
 //! the cluster is finalized at [`version::BATCHED_WRITES_LEVEL`].
+//!
+//! A command that could never apply ([`MetaCommand::refusal`]: too many
+//! operations, a table it may not write) is refused here, before it is
+//! proposed, and so never joins a batch: it fails its own caller alone.
+//! One the state machine refuses all the same (what the store holds) is
+//! answered `MetaResponse::Rejected`, which reaches its caller as
+//! [`WriteError::Refused`], and the other commands of its entry apply.
 
 use std::ops::Deref;
 use std::sync::Arc;
@@ -32,9 +39,30 @@ use tracing::error;
 
 type Raft = openraft::Raft<MetaTypeConfig>;
 
-/// What `Raft::client_write` answers.
-pub type WriteResult =
-    Result<ClientWriteResponse<MetaTypeConfig>, RaftError<u64, ClientWriteError<u64, BasicNode>>>;
+/// Why a write was not made.
+#[derive(Debug, Clone)]
+pub enum WriteError {
+    /// Raft's own error, for the entry that held the command.
+    Raft(RaftError<u64, ClientWriteError<u64, BasicNode>>),
+    /// The command can never apply: refused before it was proposed, or
+    /// answered `MetaResponse::Rejected` by the state machine. Nothing was
+    /// written.
+    Refused(String),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raft(e) => e.fmt(f),
+            Self::Refused(reason) => write!(f, "refused: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// What [`MetaRaft::client_write`] answers.
+pub type WriteResult = Result<ClientWriteResponse<MetaTypeConfig>, WriteError>;
 
 /// Raft writes under way at once: a second lets the leader's log sync of
 /// one overlap the replication of the other.
@@ -84,16 +112,35 @@ impl MetaRaft {
     /// once the cluster allows it.
     ///
     /// # Errors
-    /// As `Raft::client_write`, for the entry that held `cmd`.
+    /// [`WriteError::Refused`] for a command that can never apply (checked
+    /// before it is proposed, and by the state machine); otherwise as
+    /// `Raft::client_write`, for the entry that held `cmd`.
     pub async fn client_write(&self, cmd: MetaCommand) -> WriteResult {
-        if !version::allows(version::BATCHED_WRITES_LEVEL) {
-            return self.raft.client_write(cmd).await;
+        if matches!(cmd, MetaCommand::Batch(_)) {
+            return Err(WriteError::Refused(
+                "a batch is made by the batcher, never proposed".into(),
+            ));
         }
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send((cmd, tx)).is_err() {
-            return Err(RaftError::Fatal(Fatal::Stopped));
+        if let Some(reason) = cmd.refusal() {
+            return Err(WriteError::Refused(reason));
         }
-        rx.await.unwrap_or(Err(RaftError::Fatal(Fatal::Stopped)))
+        let answer = if version::allows(version::BATCHED_WRITES_LEVEL) {
+            let (tx, rx) = oneshot::channel();
+            if self.tx.send((cmd, tx)).is_err() {
+                return Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped)));
+            }
+            rx.await
+                .unwrap_or(Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped))))
+        } else {
+            self.raft.client_write(cmd).await.map_err(WriteError::Raft)
+        };
+        match answer {
+            Ok(r) => match r.data {
+                MetaResponse::Rejected { reason } => Err(WriteError::Refused(reason)),
+                _ => Ok(r),
+            },
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -143,7 +190,7 @@ async fn batcher(raft: Arc<Raft>, mut rx: mpsc::UnboundedReceiver<Pending>) {
 async fn commit(raft: &Raft, mut batch: Vec<Pending>) {
     if batch.len() == 1 {
         let (cmd, tx) = batch.pop().expect("one");
-        let _ = tx.send(raft.client_write(cmd).await);
+        let _ = tx.send(raft.client_write(cmd).await.map_err(WriteError::Raft));
         return;
     }
     let (cmds, txs): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
@@ -164,13 +211,13 @@ async fn commit(raft: &Raft, mut batch: Vec<Pending>) {
                 // per command. Fatal for the callers rather than a guess.
                 error!("a batch of {count} commands answered {other:?}");
                 for tx in txs {
-                    let _ = tx.send(Err(RaftError::Fatal(Fatal::Panicked)));
+                    let _ = tx.send(Err(WriteError::Raft(RaftError::Fatal(Fatal::Panicked))));
                 }
             }
         },
         Err(e) => {
             for tx in txs {
-                let _ = tx.send(Err(e.clone()));
+                let _ = tx.send(Err(WriteError::Raft(e.clone())));
             }
         }
     }
@@ -185,7 +232,16 @@ mod tests {
 
     /// A single-voter meta Raft in `dir`, leading.
     async fn single_node(dir: &std::path::Path) -> Arc<Raft> {
+        single_node_with(dir, |_| {}).await
+    }
+
+    /// As [`single_node`], `prepare` given the database first.
+    async fn single_node_with(
+        dir: &std::path::Path,
+        prepare: impl FnOnce(&redb::Database),
+    ) -> Arc<Raft> {
         let db = redb::Database::create(dir.join("meta.db")).unwrap();
+        prepare(&db);
         let storage =
             MetaRaftStorage::open(Arc::new(db), dir.join("snapshots"), &dir.join("raft-log"))
                 .unwrap();
@@ -259,6 +315,125 @@ mod tests {
         assert_eq!((ok, conflicts), (200, 200));
         let entries = raft.metrics().borrow().last_log_index.unwrap_or(0) - before;
         assert!(entries < 100, "{entries} entries for 400 writes");
+    }
+
+    /// More operations than one command may carry: refused before it is
+    /// proposed, so nothing reaches the log, Raft keeps running, and the
+    /// next write commits. (Proposed, it used to stop Raft on every node.)
+    #[tokio::test]
+    async fn an_oversized_write_is_refused_and_raft_goes_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raft = single_node(dir.path()).await;
+        let meta = MetaRaft::new(Arc::clone(&raft));
+        let before = raft.metrics().borrow().last_log_index;
+        let ops = (0..=objectio_meta_store::raft::MAX_OPS)
+            .map(|i| CasOp {
+                table: CasTable::IcebergTables,
+                key: format!("k{i}"),
+                expected: None,
+                new_value: Some(vec![1]),
+            })
+            .collect();
+        let r = meta
+            .client_write(MetaCommand::MultiCas {
+                ops,
+                requested_by: "test".into(),
+            })
+            .await;
+        assert!(matches!(r, Err(WriteError::Refused(_))), "{r:?}");
+        assert_eq!(raft.metrics().borrow().last_log_index, before);
+        // Nor a table of Raft's own.
+        let r = meta
+            .client_write(MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::Named("raft_vote".into()),
+                    key: "vote".into(),
+                    expected: None,
+                    new_value: Some(vec![1]),
+                }],
+                requested_by: "test".into(),
+            })
+            .await;
+        assert!(matches!(r, Err(WriteError::Refused(_))), "{r:?}");
+
+        assert!(raft.metrics().borrow().running_state.is_ok());
+        let r = meta.client_write(create("after")).await.unwrap();
+        assert!(matches!(r.data, MetaResponse::MultiCasOk));
+    }
+
+    /// A command the state machine refuses (here: a table of other types)
+    /// that shares an entry with others fails its own caller alone, and
+    /// the others commit; a command refused before it is proposed never
+    /// joins the batch.
+    #[tokio::test]
+    async fn a_refused_command_fails_only_its_own_caller() {
+        version::set_active_level(version::BATCHED_WRITES_LEVEL);
+        let dir = tempfile::TempDir::new().unwrap();
+        let raft = single_node_with(dir.path(), |db| {
+            let txn = db.begin_write().unwrap();
+            {
+                let def: redb::TableDefinition<u64, u64> = redb::TableDefinition::new("numbers");
+                txn.open_table(def).unwrap().insert(1, 1).unwrap();
+            }
+            txn.commit().unwrap();
+        })
+        .await;
+        let meta = Arc::new(MetaRaft::new(Arc::clone(&raft)));
+        let before = raft.metrics().borrow().last_log_index.unwrap_or(0);
+
+        let writes: Vec<_> = (0..300)
+            .map(|i| {
+                let meta = Arc::clone(&meta);
+                tokio::spawn(async move {
+                    let cmd = match i % 100 {
+                        // Refused as it applies.
+                        7 => MetaCommand::MultiCas {
+                            ops: vec![CasOp {
+                                table: CasTable::Named("numbers".into()),
+                                key: format!("n{i}"),
+                                expected: None,
+                                new_value: Some(vec![1]),
+                            }],
+                            requested_by: "test".into(),
+                        },
+                        // Refused before it is proposed.
+                        9 => MetaCommand::MultiCas {
+                            ops: (0..=objectio_meta_store::raft::MAX_OPS)
+                                .map(|j| CasOp {
+                                    table: CasTable::IcebergTables,
+                                    key: format!("big{i}-{j}"),
+                                    expected: None,
+                                    new_value: Some(vec![1]),
+                                })
+                                .collect(),
+                            requested_by: "test".into(),
+                        },
+                        _ => create(&format!("k{i}")),
+                    };
+                    (i, meta.client_write(cmd).await)
+                })
+            })
+            .collect();
+        let mut ok = 0;
+        for w in writes {
+            let (i, r) = w.await.unwrap();
+            match i % 100 {
+                7 | 9 => assert!(matches!(r, Err(WriteError::Refused(_))), "{i}: {r:?}"),
+                _ => {
+                    assert!(matches!(r.unwrap().data, MetaResponse::MultiCasOk));
+                    ok += 1;
+                }
+            }
+        }
+        assert_eq!(ok, 294);
+        let entries = raft.metrics().borrow().last_log_index.unwrap_or(0) - before;
+        assert!(
+            entries < 150,
+            "{entries} entries: the writes were not batched"
+        );
+        assert!(raft.metrics().borrow().running_state.is_ok());
+        let r = meta.client_write(create("after")).await.unwrap();
+        assert!(matches!(r.data, MetaResponse::MultiCasOk));
     }
 
     /// A write that finds nothing in flight goes at once, as itself: an

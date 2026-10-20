@@ -9,7 +9,7 @@ pub mod store;
 pub mod tables;
 pub mod types;
 
-pub use raft::{ApplyEvent, CasOp, CasTable, MetaCommand, MetaResponse, MetaTypeConfig};
+pub use raft::{ApplyEvent, CasOp, CasTable, MAX_OPS, MetaCommand, MetaResponse, MetaTypeConfig};
 pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
 pub use raft_storage::{MetaRaftStorage, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};

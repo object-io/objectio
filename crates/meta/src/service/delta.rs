@@ -101,8 +101,9 @@ impl MetaService {
     ) -> Result<Response<DeltaDropShareResponse>, Status> {
         let req = request.into_inner();
         // Multi-op MultiCas: the share row + every DeltaShareTableEntry
-        // whose key prefix matches. All removed atomically — no orphan
-        // table rows pointing at a dropped share.
+        // whose key prefix matches, all removed atomically when they fit
+        // in one; a share of more tables loses them first, in several, and
+        // goes last, so no table row is left pointing at a dropped share.
         let share_prefix = format!("{}\x00", req.name);
         let (expected_share_bytes, table_deletes) = {
             let shares = self.delta_shares.read();
@@ -119,15 +120,9 @@ impl MetaService {
             (share_bytes, deletes)
         };
 
-        if let Some(raft) = self.raft_handle() {
-            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        if self.raft_handle().is_some() {
+            use objectio_meta_store::{CasOp, CasTable};
             let mut ops = Vec::with_capacity(1 + table_deletes.len());
-            ops.push(CasOp {
-                table: CasTable::DeltaShares,
-                key: req.name.clone(),
-                expected: Some(expected_share_bytes),
-                new_value: None,
-            });
             for (tk, tb) in &table_deletes {
                 ops.push(CasOp {
                     table: CasTable::DeltaTables,
@@ -136,24 +131,14 @@ impl MetaService {
                     new_value: None,
                 });
             }
-            let cmd = MetaCommand::MultiCas {
-                ops,
-                requested_by: "delta-drop-share".into(),
-            };
-            match raft.client_write(cmd).await {
-                Ok(r) => match r.data {
-                    MetaResponse::MultiCasOk => {}
-                    MetaResponse::MultiCasConflict { failed_indices } => {
-                        return Err(Status::aborted(format!(
-                            "share or table changed mid-drop; retry (conflicts at {failed_indices:?})"
-                        )));
-                    }
-                    other => {
-                        error!("unexpected raft response for delta_drop_share: {:?}", other);
-                        return Err(Status::internal("raft commit wrong variant"));
-                    }
-                },
-                Err(e) => return Err(raft_write_to_status(&e)),
+            ops.push(CasOp {
+                table: CasTable::DeltaShares,
+                key: req.name.clone(),
+                expected: Some(expected_share_bytes),
+                new_value: None,
+            });
+            if !self.cas_in_order(ops, "delta-drop-share").await? {
+                return Err(Status::aborted("share or table changed mid-drop; retry"));
             }
         } else if let Some(store) = &self.store {
             store.delete_delta_share(&req.name);
