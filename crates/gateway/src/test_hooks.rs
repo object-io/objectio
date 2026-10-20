@@ -16,12 +16,18 @@ pub struct RewriteShard {
     bucket: String,
     key: String,
     position: u32,
+    /// Record the wrong bytes' checksum in the object as well, as their
+    /// writer would have: what a parity shard written by another codec is
+    /// to this gateway, which every read check then passes.
+    #[serde(default)]
+    record: bool,
 }
 
 /// `POST /_admin/test/rewrite-shard`: store wrong bytes for one shard of
 /// an object's first stripe, on the OSD that holds it, as a bad rebuild
 /// would: the OSD takes them with a checksum of their own, so its checks
-/// pass (B23).
+/// pass (B23). With `record`, the object's checksum of the shard is theirs
+/// too.
 pub async fn rewrite_shard(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthResult>>,
@@ -82,8 +88,19 @@ pub async fn rewrite_shard(
         Ok(b) => b,
         Err(e) => return fail(e.to_string()),
     };
-    let wrong: bytes::Bytes = shard.iter().map(|b| !b).collect::<Vec<u8>>().into();
-    match write_shard_to_osd(
+    // Every byte wrong, and wrong differently at each position: two parity
+    // shards off by one same pattern cancel out in some decodes, which
+    // another codec's parity does not.
+    let mut x = 0x9E37_79B9_u32 ^ loc.position;
+    let wrong: bytes::Bytes = shard
+        .iter()
+        .map(|b| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b ^ (u8::try_from(x >> 24).unwrap_or(0) | 1)
+        })
+        .collect::<Vec<u8>>()
+        .into();
+    let crc = match write_shard_to_osd(
         &state.osd_pool,
         &target,
         &stripe.object_id,
@@ -97,8 +114,35 @@ pub async fn rewrite_shard(
     )
     .await
     {
+        Ok((_, crc)) => crc,
+        Err(e) => return fail(e.to_string()),
+    };
+    if !req.record {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let position = loc.position;
+    let expected = object.object_id.clone();
+    let mut object = object;
+    if let Some(l) = object.stripes[0]
+        .shards
+        .iter_mut()
+        .find(|l| l.position == position)
+    {
+        l.crc32c = Some(crc);
+    }
+    match crate::osd_pool::put_object_meta_to_all(
+        &state.osd_pool,
+        &placement.nodes,
+        &req.bucket,
+        &req.key,
+        object,
+        false,
+        &expected,
+    )
+    .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => fail(e.to_string()),
+        Err(e) => fail(e.error.to_string()),
     }
 }
 

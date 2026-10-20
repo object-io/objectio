@@ -173,52 +173,69 @@ pub async fn read_stripe(
     let total = k + m;
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
     let mut read_count = 0usize;
+    // What each shard was written as, by position (B23).
+    let mut recorded: Vec<Option<u32>> = vec![None; total];
+    for loc in &stripe.shards {
+        if let Some(slot) = recorded.get_mut(loc.position as usize) {
+            *slot = loc.crc32c;
+        }
+    }
+    let codec = ErasureCodec::new(ErasureConfig::new(k as u8, m as u8))
+        .map_err(|e| anyhow!("erasure codec init: {e}"))?;
 
     // Data shards first; a parity shard only for one that fails.
     let mut locations: Vec<&ShardLocation> = stripe.shards.iter().collect();
     locations.sort_by_key(|l| l.position);
-    for loc in locations {
-        if read_count >= k {
-            break;
-        }
-        let pos = loc.position as usize;
-        if pos >= total {
-            continue;
-        }
-        let result = async {
-            let target = shard_target(meta, loc).await?;
-            read_shard_from_osd(
-                osd_pool,
-                &target,
-                &stripe.object_id,
-                stripe.stripe_id,
-                loc.position,
-                loc.crc32c,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-        }
-        .await;
-        match result {
-            Ok(data) => {
-                shards[pos] = Some(data);
-                read_count += 1;
+    let mut locations = locations.into_iter();
+    let mut want = k;
+    loop {
+        while read_count < want {
+            let Some(loc) = locations.next() else { break };
+            let pos = loc.position as usize;
+            if pos >= total || shards[pos].is_some() {
+                continue;
             }
-            Err(e) => warn!("Failed to read shard {pos} of stripe {id}: {e}"),
+            let result = async {
+                let target = shard_target(meta, loc).await?;
+                read_shard_from_osd(
+                    osd_pool,
+                    &target,
+                    &stripe.object_id,
+                    stripe.stripe_id,
+                    loc.position,
+                    loc.crc32c,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+            }
+            .await;
+            match result {
+                Ok(data) => {
+                    shards[pos] = Some(data);
+                    read_count += 1;
+                }
+                Err(e) => warn!("Failed to read shard {pos} of stripe {id}: {e}"),
+            }
+        }
+
+        if read_count < k {
+            return Err(anyhow!(
+                "insufficient shards for stripe {id}: have {read_count}, need {k}"
+            ));
+        }
+
+        // A rebuilt data shard is returned only once it checks out against
+        // what the stripe records; one that does not may from other shards,
+        // so read one more while there are any.
+        match codec.decode_verified(&shards, stripe.data_size as usize, &recorded) {
+            Ok(data) => return Ok(data),
+            Err(e) if read_count == want && read_count < total => {
+                warn!("stripe {id}: {e}; reading one more shard");
+                want += 1;
+            }
+            Err(e) => return Err(anyhow!("erasure decode of stripe {id}: {e}")),
         }
     }
-
-    if read_count < k {
-        return Err(anyhow!(
-            "insufficient shards for stripe {id}: have {read_count}, need {k}"
-        ));
-    }
-
-    let codec = ErasureCodec::new(ErasureConfig::new(k as u8, m as u8))
-        .map_err(|e| anyhow!("erasure codec init: {e}"))?;
-    codec
-        .decode(&mut shards, stripe.data_size as usize)
-        .map_err(|e| anyhow!("erasure decode: {e}"))
 }
 
 /// Delete the shards of stripes nothing uses any more, each on the node
