@@ -13,13 +13,19 @@
 //! | 4B     | 8B   | 4B     | var  | 4B     |
 //! +--------+------+--------+------+--------+
 //! ```
+//!
+//! Fail-stop: a write or sync that fails leaves the log refusing every
+//! write after it until it is opened again, and an open refuses a log
+//! damaged anywhere but at its end (objectio-docs `core/storage-engine.md`).
 
 use super::types::{MetadataEntry, MetadataOp};
+use objectio_common::log_tail::whole_record_after;
 use objectio_common::{Error, Result};
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// WAL record magic number
@@ -28,6 +34,9 @@ const WAL_MAGIC: u32 = 0x4D57414C; // "MWAL"
 /// Record header size (magic + lsn + length)
 const RECORD_HEADER_SIZE: usize = 16;
 
+/// A record's bytes besides its data: the header and the checksum.
+const RECORD_OVERHEAD: usize = RECORD_HEADER_SIZE + 4;
+
 /// Metadata WAL configuration
 #[derive(Clone, Debug)]
 pub struct WalConfig {
@@ -35,8 +44,6 @@ pub struct WalConfig {
     pub sync_on_write: bool,
     /// Maximum WAL size before triggering snapshot
     pub max_size_bytes: u64,
-    /// Buffer size for writes
-    pub write_buffer_size: usize,
 }
 
 impl Default for WalConfig {
@@ -44,7 +51,6 @@ impl Default for WalConfig {
         Self {
             sync_on_write: true,
             max_size_bytes: 64 * 1024 * 1024, // 64MB
-            write_buffer_size: 64 * 1024,     // 64KB
         }
     }
 }
@@ -138,14 +144,48 @@ impl Default for WalSyncStats {
     }
 }
 
+/// The file appends go to, written unbuffered: a record is handed to the
+/// OS in the append that makes it, whole or not at all as far as the log
+/// is concerned. (Behind a `BufWriter`, a write that failed left its bytes
+/// in the buffer, to go out ahead of the next record: the "failed" record
+/// landed after all, and the log's size, which hadn't counted it, no
+/// longer matched the file.)
+struct LogFile {
+    file: File,
+    /// Failures to inject, shared with the log's other handles.
+    #[cfg(test)]
+    faults: std::sync::Arc<Faults>,
+}
+
+impl LogFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(after) = self.faults.write.lock().take() {
+            self.file.write_all(&bytes[..after.min(bytes.len())])?;
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        self.file.write_all(bytes)
+    }
+}
+
+/// Disk failures a test makes the log meet.
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    /// The next write fails after writing this many bytes.
+    write: Mutex<Option<usize>>,
+    /// The next sync fails.
+    sync: std::sync::atomic::AtomicBool,
+}
+
 pub struct MetadataWal {
     /// fsync latency and how many records each fsync covered.
     sync_stats: WalSyncStats,
     /// WAL file path
     path: PathBuf,
     /// File handle for writing
-    writer: Mutex<BufWriter<File>>,
-    /// Current file size
+    writer: Mutex<LogFile>,
+    /// Bytes in the file: what the appends so far wrote.
     size: AtomicU64,
     /// Next LSN to assign
     next_lsn: AtomicU64,
@@ -169,6 +209,16 @@ pub struct MetadataWal {
     /// Truncations so far: a [`WalMark`] is only good in the file it was
     /// taken in.
     file: AtomicU64,
+    /// The first write or sync that failed, if one has: the log takes no
+    /// write after it. What a failed write left in the file is unknown (part
+    /// of the record, or all of it), and after a failed `fdatasync` Linux
+    /// marks the pages it couldn't write clean, so the next one can return
+    /// success with them still not on disk: a record acknowledged then
+    /// would sit behind a hole. Opening the log again finds where it really
+    /// ends.
+    failed: OnceLock<String>,
+    #[cfg(test)]
+    faults: std::sync::Arc<Faults>,
 }
 
 /// Where the log ends at some moment: the last LSN written, and the byte
@@ -195,7 +245,8 @@ pub(super) fn sync_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// The whole records of a WAL file, in order. Ends at the end of the file
-/// or at the first record that is torn or corrupt, whatever its size.
+/// or at the first record that is torn or corrupt, whatever its size;
+/// `end` then says where that record starts.
 struct Records {
     reader: BufReader<File>,
     /// Bytes in the file.
@@ -241,6 +292,14 @@ impl Iterator for Records {
     }
 }
 
+/// Where a WAL file's records end, found by [`MetadataWal::scan_wal`].
+struct Scanned {
+    /// The last LSN in it, or 0.
+    last_lsn: u64,
+    /// Where its last whole record ends.
+    end: u64,
+}
+
 impl MetadataWal {
     /// Create a new WAL file
     pub fn create(path: impl AsRef<Path>, config: WalConfig) -> Result<Self> {
@@ -253,22 +312,40 @@ impl MetadataWal {
             .open(&path)
             .map_err(|e| Error::Storage(format!("failed to create WAL: {}", e)))?;
 
+        Self::with_file(path, file, config, 0, 0)
+    }
+
+    fn with_file(
+        path: PathBuf,
+        file: File,
+        config: WalConfig,
+        last_lsn: u64,
+        size: u64,
+    ) -> Result<Self> {
         let sync_handle = file
             .try_clone()
             .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {}", e)))?;
-        let writer = BufWriter::with_capacity(config.write_buffer_size, file);
-
+        #[cfg(test)]
+        let faults = std::sync::Arc::new(Faults::default());
         Ok(Self {
             path,
-            writer: Mutex::new(writer),
-            size: AtomicU64::new(0),
-            next_lsn: AtomicU64::new(1),
+            writer: Mutex::new(LogFile {
+                file,
+                #[cfg(test)]
+                faults: std::sync::Arc::clone(&faults),
+            }),
+            size: AtomicU64::new(size),
+            next_lsn: AtomicU64::new(last_lsn + 1),
             config,
-            written_lsn: AtomicU64::new(0),
-            synced_lsn: AtomicU64::new(0),
+            // Everything already on disk is durable by definition.
+            written_lsn: AtomicU64::new(last_lsn),
+            synced_lsn: AtomicU64::new(last_lsn),
             sync_stats: WalSyncStats::default(),
             sync_handle: Mutex::new(sync_handle),
             file: AtomicU64::new(0),
+            failed: OnceLock::new(),
+            #[cfg(test)]
+            faults,
         })
     }
 
@@ -281,6 +358,12 @@ impl MetadataWal {
     /// the pass that finds where it ends: a start reads the log once, not
     /// once to find its end and again to replay it (a 64 MiB log was read
     /// twice on every OSD start).
+    ///
+    /// # Errors
+    /// I/O; a record that is whole but doesn't decode; records missing (a
+    /// log that starts after `from_lsn`, or LSNs that skip one); or a
+    /// damaged record with a whole one after it, which is damage, not the
+    /// torn end of an append a crash interrupted.
     pub fn open_replaying<F>(
         path: impl AsRef<Path>,
         config: WalConfig,
@@ -294,7 +377,7 @@ impl MetadataWal {
 
         // The last LSN and where the last whole record ends, the entries
         // from `from_lsn` replayed on the way.
-        let (last_lsn, file_size) = Self::scan_wal(&path, from_lsn, |lsn, op| {
+        let Scanned { last_lsn, end } = Self::scan_wal(&path, from_lsn, |lsn, op| {
             entries_of(lsn, op, &mut callback)
         })?;
 
@@ -308,64 +391,147 @@ impl MetadataWal {
         // sit between the log and them, and the next scan, stopping at the
         // tail, would never reach them.
         let on_disk = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if on_disk > file_size {
+        if on_disk > end {
             tracing::warn!(
                 "WAL {}: cutting off {} bytes after the last whole record (LSN {last_lsn})",
                 path.display(),
-                on_disk - file_size
+                on_disk - end
             );
-            file.set_len(file_size)
+            file.set_len(end)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| Error::Storage(format!("failed to cut off WAL tail: {}", e)))?;
         }
 
-        let sync_handle = file
-            .try_clone()
-            .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {}", e)))?;
-        let writer = BufWriter::with_capacity(config.write_buffer_size, file);
-
-        Ok(Self {
-            path,
-            writer: Mutex::new(writer),
-            size: AtomicU64::new(file_size),
-            next_lsn: AtomicU64::new(last_lsn + 1),
-            config,
-            // Everything already on disk is durable by definition.
-            written_lsn: AtomicU64::new(last_lsn),
-            synced_lsn: AtomicU64::new(last_lsn),
-            sync_stats: WalSyncStats::default(),
-            sync_handle: Mutex::new(sync_handle),
-            file: AtomicU64::new(0),
-        })
+        Self::with_file(path, file, config, last_lsn, end)
     }
 
     /// Scan the WAL for its last LSN and where its last whole record ends,
     /// calling `callback` for each operation from `from_lsn`.
     ///
-    /// Anything after that — a record torn by a crash mid-append, or bytes
-    /// that are not a record — is not part of the log.
-    fn scan_wal<F>(path: &Path, from_lsn: u64, mut callback: F) -> Result<(u64, u64)>
+    /// What follows the last whole record is the torn end of an append a
+    /// crash interrupted, never acknowledged, unless a whole record follows
+    /// it: then it is damage, and the log is refused (objectio-common
+    /// `log_tail`).
+    fn scan_wal<F>(path: &Path, from_lsn: u64, mut callback: F) -> Result<Scanned>
     where
         F: FnMut(u64, MetadataOp) -> Result<()>,
     {
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((0, 0));
+                return Ok(Scanned {
+                    last_lsn: 0,
+                    end: 0,
+                });
             }
             Err(e) => {
                 return Err(Error::Storage(format!("failed to open WAL: {}", e)));
             }
         };
+        let damaged = |what: String| {
+            Error::Storage(format!(
+                "metadata log {}: {what}; refusing to open rather than drop or \
+                 misplace acknowledged changes",
+                path.display()
+            ))
+        };
+        let probe_file = file
+            .try_clone()
+            .map_err(|e| Error::Storage(format!("failed to clone WAL handle: {e}")))?;
         let mut records = Records::new(file);
         let mut last_lsn = 0u64;
-        for record in &mut records {
+        loop {
+            let at = records.end;
+            let Some(record) = records.next() else {
+                break;
+            };
+            if last_lsn == 0 {
+                // The log holds every record from the replay's start on: a
+                // first record past it means some are missing.
+                if record.lsn > from_lsn {
+                    return Err(damaged(format!(
+                        "it starts at record {}, but the index needs it from {from_lsn}: \
+                         records are missing",
+                        record.lsn
+                    )));
+                }
+            } else if record.lsn != last_lsn + 1 {
+                return Err(damaged(format!(
+                    "record {} at byte {at} follows record {last_lsn}: records are missing",
+                    record.lsn
+                )));
+            }
             if record.lsn >= from_lsn {
                 callback(record.lsn, decode(path, &record)?)?;
             }
             last_lsn = record.lsn;
         }
-        Ok((last_lsn, records.end))
+        let (end, len) = (records.end, records.len);
+        if end < len {
+            let mut found = 0u64;
+            let after = whole_record_after(
+                &probe_file,
+                end,
+                len,
+                RECORD_HEADER_SIZE,
+                |at, head| {
+                    if head.len() < RECORD_HEADER_SIZE
+                        || u32::from_le_bytes(head[0..4].try_into().unwrap()) != WAL_MAGIC
+                    {
+                        return None;
+                    }
+                    // Records after it number on from the last whole one,
+                    // one per at least `RECORD_OVERHEAD` bytes.
+                    let lsn = u64::from_le_bytes(head[4..12].try_into().unwrap());
+                    let most = last_lsn.saturating_add((len - at) / RECORD_OVERHEAD as u64 + 1);
+                    if last_lsn > 0 && (lsn <= last_lsn || lsn > most) {
+                        return None;
+                    }
+                    let data_len = u32::from_le_bytes(head[12..16].try_into().unwrap());
+                    Some(RECORD_OVERHEAD as u64 + u64::from(data_len))
+                },
+                |_, bytes| match WalRecord::from_bytes(bytes) {
+                    Ok((record, _)) => {
+                        found = record.lsn;
+                        true
+                    }
+                    Err(_) => false,
+                },
+            )
+            .map_err(|e| Error::Storage(format!("failed to read WAL: {e}")))?;
+            if let Some(at) = after {
+                return Err(damaged(format!(
+                    "the record at byte {end} (after record {last_lsn}) is damaged, and \
+                     record {found} follows it whole at byte {at}: damage, not a torn append"
+                )));
+            }
+        }
+        Ok(Scanned { last_lsn, end })
+    }
+
+    /// The error for a write or sync that failed, which from now on fails
+    /// every write: see `failed`.
+    fn fail(&self, what: &str, e: impl std::fmt::Display) -> Error {
+        let cause = format!("{what} failed: {e}");
+        if self.failed.set(cause.clone()).is_ok() {
+            tracing::error!(
+                "metadata log {}: {cause}; refusing every write until it is reopened",
+                self.path.display()
+            );
+        }
+        Error::Storage(format!("metadata log {}: {cause}", self.path.display()))
+    }
+
+    /// Refuse if a write or sync has failed.
+    fn check(&self) -> Result<()> {
+        match self.failed.get() {
+            None => Ok(()),
+            Some(cause) => Err(Error::Storage(format!(
+                "metadata log {}: takes no writes after an earlier failure ({cause}) \
+                 until it is reopened",
+                self.path.display()
+            ))),
+        }
     }
 
     /// Append a metadata operation to the WAL.
@@ -382,30 +548,32 @@ impl MetadataWal {
     /// with one OSD. Measured on that NVMe, `fdatasync` is 0.75 ms at one
     /// stream and the device sustains ~2400/s across twelve, so the ceiling
     /// was the serialization, not the hardware.
+    ///
+    /// # Errors
+    /// The write or the sync failed, now or earlier (`failed`).
     pub fn append(&self, op: &MetadataOp) -> Result<u64> {
         let data = op.to_bytes();
+        if u32::try_from(data.len()).is_err() {
+            return Err(Error::Storage(format!(
+                "metadata log record of {} bytes is too large",
+                data.len()
+            )));
+        }
 
         let lsn = {
             let mut writer = self.writer.lock();
+            self.check()?;
             // Assigned under the lock so LSN order matches write order, which
-            // is what lets `written_lsn` be a watermark rather than a guess.
-            let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
-            let record = WalRecord { lsn, data };
-            let bytes = record.to_bytes();
-
+            // is what lets `written_lsn` be a watermark rather than a guess;
+            // taken only once the record is written, so a failed write
+            // leaves no number behind.
+            let lsn = self.next_lsn.load(Ordering::SeqCst);
+            let bytes = WalRecord { lsn, data }.to_bytes();
             writer
                 .write_all(&bytes)
-                .map_err(|e| Error::Storage(format!("WAL write failed: {}", e)))?;
-
-            if self.config.sync_on_write {
-                // Hand the bytes to the OS while still holding the lock, so
-                // anything this watermark claims really is syncable.
-                writer
-                    .flush()
-                    .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
-            }
-
-            self.size.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                .map_err(|e| self.fail("write", e))?;
+            self.next_lsn.store(lsn + 1, Ordering::SeqCst);
+            self.size.fetch_add(bytes.len() as u64, Ordering::SeqCst);
             self.written_lsn.store(lsn, Ordering::SeqCst);
             lsn
         };
@@ -436,12 +604,17 @@ impl MetadataWal {
         if self.synced_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
         }
+        // A sync that failed while this one waited was reported once, to
+        // its caller: one now could succeed without this record on disk.
+        self.check()?;
 
         let covered = self.written_lsn.load(Ordering::SeqCst);
         let started = std::time::Instant::now();
-        handle
-            .sync_data()
-            .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))?;
+        #[cfg(test)]
+        if self.faults.sync.swap(false, Ordering::SeqCst) {
+            return Err(self.fail("sync", "injected sync failure"));
+        }
+        handle.sync_data().map_err(|e| self.fail("sync", e))?;
         self.sync_stats.seconds.observe_duration(started.elapsed());
         let previous = self.synced_lsn.fetch_max(covered, Ordering::SeqCst);
         self.sync_stats.syncs.fetch_add(1, Ordering::Relaxed);
@@ -467,16 +640,13 @@ impl MetadataWal {
         &self.sync_stats
     }
 
-    /// Sync WAL to disk
+    /// Make every record appended so far durable.
+    ///
+    /// # Errors
+    /// The sync failed, now or a write or sync earlier (`failed`).
     pub fn sync(&self) -> Result<()> {
-        let mut writer = self.writer.lock();
-        writer
-            .flush()
-            .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|e| Error::Storage(format!("WAL sync failed: {}", e)))
+        self.check()?;
+        self.sync_through(self.written_lsn.load(Ordering::SeqCst))
     }
 
     /// Replay WAL from a given LSN, calling the callback for each operation
@@ -488,11 +658,11 @@ impl MetadataWal {
             .map_err(|e| Error::Storage(format!("failed to open WAL for replay: {}", e)))?;
 
         let mut last_lsn = from_lsn.saturating_sub(1);
-        // `Records` ends at the first damaged frame: a write torn by a
-        // crash, which was never acknowledged. A whole, checksummed record
-        // that doesn't decode is different: a newer release wrote it, or
-        // the decoder broke. Skipping it would silently drop a change this
-        // OSD acknowledged, so the replay stops instead.
+        // `Records` ends at the first damaged frame: the open checked the
+        // log, so that is an append still being written. A whole,
+        // checksummed record that doesn't decode is different: a newer
+        // release wrote it, or the decoder broke. Skipping it would silently
+        // drop a change this OSD acknowledged, so the replay stops instead.
         for record in Records::new(file) {
             if record.lsn >= from_lsn {
                 callback(record.lsn, decode(&self.path, &record)?)?;
@@ -512,16 +682,31 @@ impl MetadataWal {
     }
 
     /// Where the log ends now (see [`WalMark`]).
+    ///
+    /// # Errors
+    /// A write or sync failed earlier (`failed`): where the log ends is
+    /// then not known.
     pub fn mark(&self) -> Result<WalMark> {
-        let mut writer = self.writer.lock();
-        writer
-            .flush()
-            .map_err(|e| Error::Storage(format!("WAL flush failed: {}", e)))?;
+        let writer = self.writer.lock();
+        self.check()?;
         Ok(WalMark {
             lsn: self.current_lsn(),
-            offset: self.size.load(Ordering::SeqCst),
+            offset: self.file_len(&writer)?,
             file: self.file.load(Ordering::SeqCst),
         })
+    }
+
+    /// The length of the file appends go to: with `writer` held, where the
+    /// last record written ends. Taken from the file, not counted, so a
+    /// compaction copies from where a record really starts.
+    fn file_len(&self, writer: &LogFile) -> Result<u64> {
+        let len = writer
+            .file
+            .metadata()
+            .map_err(|e| Error::Storage(format!("WAL stat failed: {e}")))?
+            .len();
+        self.size.store(len, Ordering::SeqCst);
+        Ok(len)
     }
 
     /// Drop the records up to `mark`, which a durable snapshot now holds:
@@ -536,6 +721,12 @@ impl MetadataWal {
     /// covers nothing the new one holds. Held across the whole copy, the
     /// locks stalled every write for as long as the copy took: hundreds of
     /// milliseconds once B21's small shards went through the log.
+    ///
+    /// # Errors
+    /// I/O, a stale mark, or a write or sync that failed earlier. Up to the
+    /// rename the old file is left as the log; once the new file is renamed
+    /// over it, appends go to the new one, and a failure to make the rename
+    /// durable fails the log (`failed`).
     pub fn truncate_through(&self, mark: WalMark) -> Result<()> {
         let storage =
             |what: &str, e: std::io::Error| Error::Storage(format!("WAL truncation: {what}: {e}"));
@@ -545,9 +736,9 @@ impl MetadataWal {
 
         // Pass one: what is in the file now, copied without holding appends.
         let first = {
-            let mut writer = self.writer.lock();
-            writer.flush().map_err(|e| storage("flush", e))?;
-            let len = self.size.load(Ordering::SeqCst);
+            let writer = self.writer.lock();
+            self.check()?;
+            let len = self.file_len(&writer)?;
             if mark.file != self.file.load(Ordering::SeqCst) || mark.offset > len {
                 return Err(stale());
             }
@@ -569,21 +760,28 @@ impl MetadataWal {
         // Pass two: the rest, with appends and syncs held.
         let mut writer = self.writer.lock();
         let mut sync_handle = self.sync_handle.lock();
-        writer.flush().map_err(|e| storage("flush", e))?;
-        let len = self.size.load(Ordering::SeqCst);
+        self.check()?;
+        let len = self.file_len(&writer)?;
         if mark.file != self.file.load(Ordering::SeqCst) || first > len {
             return Err(stale());
         }
         kept +=
             std::io::copy(&mut old.take(len - first), &mut new).map_err(|e| storage("copy", e))?;
         new.sync_all().map_err(|e| storage("sync", e))?;
+        let new_sync = new.try_clone().map_err(|e| storage("clone", e))?;
         std::fs::rename(&new_path, &self.path).map_err(|e| storage("rename", e))?;
-        sync_parent_dir(&self.path)?;
 
-        *sync_handle = new.try_clone().map_err(|e| storage("clone", e))?;
-        *writer = BufWriter::with_capacity(self.config.write_buffer_size, new);
+        // The log is the new file from here: appends and syncs go to it
+        // whatever happens next. One left on the old file would write an
+        // inode nothing reads any more.
+        *sync_handle = new_sync;
+        writer.file = new;
         self.size.store(kept, Ordering::SeqCst);
         self.file.fetch_add(1, Ordering::SeqCst);
+        // Until the directory is synced a power cut can bring the old file
+        // back, without whatever reached it unsynced: nothing is taken as
+        // durable before then.
+        sync_parent_dir(&self.path).map_err(|e| self.fail("sync of the replaced log", e))?;
         // Everything written is in the new file, and it was synced.
         self.synced_lsn
             .fetch_max(self.written_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -594,6 +792,7 @@ impl MetadataWal {
     /// compaction left empty would otherwise restart at LSN 1, below the
     /// snapshot, and the next replay — which starts after it — skip them.
     pub fn advance_past(&self, lsn: u64) {
+        let _writer = self.writer.lock();
         self.next_lsn.fetch_max(lsn + 1, Ordering::SeqCst);
         self.written_lsn.fetch_max(lsn, Ordering::SeqCst);
         self.synced_lsn.fetch_max(lsn, Ordering::SeqCst);
@@ -617,6 +816,18 @@ impl MetadataWal {
     /// Get the path of the WAL file
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Make the next write fail after writing `after` bytes of it.
+    #[cfg(test)]
+    fn fail_next_write(&self, after: usize) {
+        *self.faults.write.lock() = Some(after);
+    }
+
+    /// Make the next sync fail.
+    #[cfg(test)]
+    fn fail_next_sync(&self) {
+        self.faults.sync.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1253,5 +1464,201 @@ mod group_commit_tests {
         })
         .unwrap();
         assert_eq!(n, 8);
+    }
+}
+
+/// What the log does when the disk fails it: at open, damage in the middle
+/// of the log stops it; while running, a failed write or sync stops every
+/// write after it.
+#[cfg(test)]
+mod fail_stop_tests {
+    use super::super::types::MetadataKey;
+    use super::*;
+
+    fn put(n: u64) -> MetadataOp {
+        MetadataOp::Put {
+            key: MetadataKey::block(n),
+            value: format!("value {n}").into_bytes(),
+        }
+    }
+
+    fn lsns(path: &Path) -> Vec<u64> {
+        let wal = MetadataWal::open(path, WalConfig::default()).unwrap();
+        let mut out = Vec::new();
+        wal.replay(0, |lsn, _| {
+            out.push(lsn);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    fn raw(lsn: u64) -> Vec<u8> {
+        WalRecord {
+            lsn,
+            data: put(lsn).to_bytes(),
+        }
+        .to_bytes()
+    }
+
+    /// A damaged record with whole ones after it is not a torn append: the
+    /// open refuses, and the file is left as it was. It was cut there, the
+    /// records after it (acknowledged) with it.
+    #[test]
+    fn damage_with_whole_records_after_it_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        let second;
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            wal.append(&put(1)).unwrap();
+            second = wal.size();
+            wal.append(&put(2)).unwrap();
+            wal.append(&put(3)).unwrap();
+        }
+        let mut data = std::fs::read(&path).unwrap();
+        data[usize::try_from(second).unwrap() + RECORD_HEADER_SIZE + 2] ^= 0xff;
+        std::fs::write(&path, &data).unwrap();
+        let len = data.len() as u64;
+
+        let err = MetadataWal::open(&path, WalConfig::default())
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("damage"), "{err}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+    }
+
+    /// The same with bytes that are no record at all between two whole
+    /// records.
+    #[test]
+    fn garbage_between_whole_records_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        MetadataWal::create(&path, WalConfig::default())
+            .unwrap()
+            .append(&put(1))
+            .unwrap();
+        append_raw(&path, &[0xAB; 37]);
+        append_raw(&path, &raw(3));
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(MetadataWal::open(&path, WalConfig::default()).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+    }
+
+    /// Whole records whose LSNs skip one: a record is missing, and the log
+    /// can't say what it was.
+    #[test]
+    fn a_gap_in_the_lsns_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        std::fs::write(&path, [raw(1), raw(2), raw(4)].concat()).unwrap();
+        let err = MetadataWal::open(&path, WalConfig::default())
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("record 4"), "{err}");
+    }
+
+    /// A log that starts after the LSN the replay must start from is missing
+    /// the records in between.
+    #[test]
+    fn a_log_starting_past_the_replay_point_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        std::fs::write(&path, [raw(5), raw(6)].concat()).unwrap();
+        let open =
+            |from| MetadataWal::open_replaying(&path, WalConfig::default(), from, |_| Ok(()));
+        assert!(open(3).is_err());
+        assert!(open(5).is_ok());
+        assert!(open(6).is_ok());
+    }
+
+    /// A write that fails part way: that append fails, and so does every
+    /// later one, and a sync. Reopened, the log holds every record
+    /// acknowledged, the torn one cut off, and takes appends again.
+    #[test]
+    fn after_a_failed_write_every_append_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            assert_eq!(wal.append(&put(1)).unwrap(), 1);
+            wal.fail_next_write(7);
+            assert!(wal.append(&put(2)).is_err());
+            assert!(
+                wal.append(&put(3)).is_err(),
+                "an append after a failed write"
+            );
+            assert!(wal.sync().is_err());
+            assert!(wal.mark().is_err());
+        }
+        assert_eq!(lsns(&path), vec![1]);
+        let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+        assert_eq!(wal.append(&put(2)).unwrap(), 2);
+        drop(wal);
+        assert_eq!(lsns(&path), vec![1, 2]);
+    }
+
+    /// A failed fsync: on Linux the pages it didn't write are marked clean,
+    /// and the next fsync may succeed without writing them. So every append
+    /// after it is refused, though a sync would now "succeed".
+    #[test]
+    fn after_a_failed_sync_every_append_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = MetadataWal::create(dir.path().join("m.wal"), WalConfig::default()).unwrap();
+        wal.append(&put(1)).unwrap();
+        wal.fail_next_sync();
+        assert!(wal.append(&put(2)).is_err());
+        assert!(
+            wal.append(&put(3)).is_err(),
+            "an append after a failed sync"
+        );
+        assert!(wal.sync().is_err());
+    }
+
+    /// A write that fails whole, then more appends, a compaction and a
+    /// reopen: every record acknowledged is in the log. (The buffered
+    /// writer kept the failed record and wrote it with the next one, the
+    /// log's size not counting it; the compaction then copied from the
+    /// middle of a record, and the reopen lost every record after it.)
+    #[test]
+    fn a_failed_write_loses_nothing_acknowledged_through_a_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.wal");
+        let mut acked = Vec::new();
+        {
+            let wal = MetadataWal::create(&path, WalConfig::default()).unwrap();
+            for n in 1..=3 {
+                acked.push(wal.append(&put(n)).unwrap());
+            }
+            wal.fail_next_write(0);
+            assert!(wal.append(&put(4)).is_err());
+            for n in 5..=8 {
+                if let Ok(lsn) = wal.append(&put(n)) {
+                    acked.push(lsn);
+                }
+            }
+            if let Ok(mark) = wal.mark() {
+                for n in 9..=10 {
+                    if let Ok(lsn) = wal.append(&put(n)) {
+                        acked.push(lsn);
+                    }
+                }
+                acked.retain(|lsn| *lsn > mark.lsn);
+                let _ = wal.truncate_through(mark);
+            }
+        }
+        let held = lsns(&path);
+        for lsn in &acked {
+            assert!(held.contains(lsn), "acknowledged {lsn} lost: {held:?}");
+        }
     }
 }
