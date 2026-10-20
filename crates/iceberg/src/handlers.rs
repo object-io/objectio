@@ -420,7 +420,7 @@ impl Scope<'_> {
     /// credentials are scoped to it, so a table pointed at another bucket
     /// would hand out credentials for that bucket.
     fn confine(&self, location: &str) -> Result<()> {
-        if location_within(location, self.location()) {
+        if objectio_common::location::within(location, self.location()) {
             Ok(())
         } else {
             Err(IcebergError::bad_request(format!(
@@ -430,21 +430,6 @@ impl Scope<'_> {
             )))
         }
     }
-}
-
-/// Whether `location` is `root` itself or a path under it. `..` segments
-/// are refused: they would let a path that starts under the warehouse
-/// leave it.
-fn location_within(location: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    if root.is_empty() || location.split('/').any(|seg| seg == ".." || seg == ".") {
-        return false;
-    }
-    let location = location.trim_end_matches('/');
-    location == root
-        || location
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---- Config ----
@@ -2062,25 +2047,6 @@ fn last_column_id(schema: &serde_json::Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_table_location_stays_inside_its_warehouse() {
-        let root = "s3://iceberg-wh";
-        assert!(location_within("s3://iceberg-wh", root));
-        assert!(location_within("s3://iceberg-wh/", root));
-        assert!(location_within("s3://iceberg-wh/db/t", root));
-        assert!(location_within("s3://iceberg-wh/db/t/", "s3://iceberg-wh/"));
-        // Another bucket, including one whose name starts the same.
-        assert!(!location_within("s3://other/db/t", root));
-        assert!(!location_within("s3://iceberg-wh2/db/t", root));
-        assert!(!location_within("s3://iceberg-wh-other/t", root));
-        // Climbing out.
-        assert!(!location_within("s3://iceberg-wh/../other/t", root));
-        assert!(!location_within("s3://iceberg-wh/db/./t", root));
-        // No root, no location.
-        assert!(!location_within("s3://iceberg-wh/db", ""));
-        assert!(!location_within("", root));
-    }
 
     fn auth(user_arn: &str, groups: &[&str]) -> AuthResult {
         AuthResult {
