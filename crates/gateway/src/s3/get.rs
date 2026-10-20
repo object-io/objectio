@@ -1220,6 +1220,10 @@ pub(crate) async fn get_object_version_once(
             }
         };
 
+        // What each shard was written as, by position (B23).
+        let recorded: Vec<Option<u32>> = (0..total_shards as u32)
+            .map(|p| shard_map.get(&p).and_then(|l| l.crc32c))
+            .collect();
         let mut candidates = ranked_positions.into_iter();
         let mut in_flight = futures::stream::FuturesUnordered::new();
         // Read the nearest k, then (an LRC stripe whose k don't decode)
@@ -1327,24 +1331,41 @@ pub(crate) async fn get_object_version_once(
                     stripe.ec_k,
                 );
             }
-            match codec.decode(&mut shards, stripe_data_size) {
+            // A rebuilt data shard is served only once it checks out
+            // against what its stripe records: a parity shard from another
+            // codec, or stored wrong under a checksum of its own, passes the
+            // read checks and decodes into other bytes.
+            match codec.decode_verified(&shards, stripe_data_size, &recorded) {
                 Ok(d) => break d,
-                // Not every k shards of an LRC stripe decode (a local parity
-                // with its whole group, say, adds nothing): read one more,
-                // while there are any.
-                Err(e)
-                    if stripe_ec_type == ErasureType::ErasureLrc
-                        && read_count > had
-                        && read_count < total_shards =>
-                {
-                    debug!(
-                        "stripe {stripe_idx}: {read_count} shards don't decode ({e}); reading one more"
-                    );
+                // Not every k shards decode (an LRC stripe's local parity
+                // with its whole group adds nothing), and a decode that does
+                // not verify may from other shards: read one more, while
+                // there are any.
+                Err(e) if read_count > had && read_count < total_shards => {
+                    if matches!(e, objectio_erasure::ErasureError::Unverified(_)) {
+                        warn!("stripe {stripe_idx} of {bucket}/{key}: {e}; reading one more shard");
+                    } else {
+                        debug!(
+                            "stripe {stripe_idx}: {read_count} shards don't decode ({e}); reading one more"
+                        );
+                    }
                     had = read_count;
                     want = read_count + 1;
                 }
                 Err(e) => {
                     error!("Failed to decode stripe {}: {}", stripe_idx, e);
+                    if matches!(e, objectio_erasure::ErasureError::Unverified(_)) {
+                        crate::heal::report_degraded(
+                            &state,
+                            &bucket,
+                            &key,
+                            &object.object_id,
+                            stripe.stripe_id,
+                            &unreadable,
+                            read_count,
+                            stripe.ec_k,
+                        );
+                    }
                     return S3Error::xml_response(
                         "InternalError",
                         &format!("Erasure decoding failed for stripe {}: {}", stripe_idx, e),

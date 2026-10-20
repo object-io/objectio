@@ -25,7 +25,9 @@
 //! let backend = BackendFactory::create_mds(&config).unwrap();
 //! ```
 
-use crate::backend::{BackendConfig, BackendFactory, ErasureBackend, LrcBackend};
+use crate::backend::{
+    BackendConfig, BackendFactory, BackendType, ErasureBackend, LrcBackend, LrcConfig,
+};
 use bytes::Bytes;
 use objectio_common::{ErasureConfig, ErasureType, Error as CommonError, Result};
 use std::sync::Arc;
@@ -51,6 +53,67 @@ pub enum ErasureError {
 
     #[error("LRC configuration required")]
     LrcConfigRequired,
+
+    /// A decode rebuilt data shards that are not shown to be the ones
+    /// written (see [`ErasureCodec::decode_verified`]).
+    #[error("rebuilt data not verified: {0}")]
+    Unverified(String),
+}
+
+/// Most decodes [`ErasureCodec::decode_verified`] tries before giving up.
+const MAX_DECODE_ATTEMPTS: usize = 256;
+
+/// What checking a decode's rebuilt data shards found.
+enum Check {
+    Verified,
+    Mismatch,
+    /// Nothing to check them against.
+    Unchecked,
+}
+
+/// The data shards, in order, cut to `original_size`.
+fn join_data<'a>(data: impl IntoIterator<Item = &'a [u8]>, original_size: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(original_size);
+    for shard in data {
+        output.extend_from_slice(shard);
+    }
+    output.truncate(original_size);
+    output
+}
+
+/// Every choice of `r` of `0..n`, in lexicographic order.
+struct Combinations {
+    n: usize,
+    next: Option<Vec<usize>>,
+}
+
+impl Combinations {
+    fn new(n: usize, r: usize) -> Self {
+        Self {
+            n,
+            next: (r <= n).then(|| (0..r).collect()),
+        }
+    }
+}
+
+impl Iterator for Combinations {
+    type Item = Vec<usize>;
+
+    fn next(&mut self) -> Option<Vec<usize>> {
+        let current = self.next.take()?;
+        let r = current.len();
+        // The rightmost index that can still move right, and those after
+        // it packed in behind.
+        if let Some(i) = (0..r).rev().find(|&i| current[i] < self.n - r + i) {
+            let mut following = current.clone();
+            following[i] += 1;
+            for j in i + 1..r {
+                following[j] = following[j - 1] + 1;
+            }
+            self.next = Some(following);
+        }
+        Some(current)
+    }
 }
 
 impl From<ErasureError> for CommonError {
@@ -89,6 +152,12 @@ impl ErasureCodec {
     /// Automatically selects the best backend based on the configuration
     /// and platform (ISA-L on x86 if available, rust_simd otherwise).
     pub fn new(config: ErasureConfig) -> Result<Self> {
+        Self::on_backend(config, BackendType::Auto)
+    }
+
+    /// As [`new`](Self::new), on the backend named: what a node built
+    /// another way would code with.
+    fn on_backend(config: ErasureConfig, backend_type: BackendType) -> Result<Self> {
         if config.data_shards == 0 {
             return Err(ErasureError::InvalidConfig("data_shards must be > 0".into()).into());
         }
@@ -98,7 +167,8 @@ impl ErasureCodec {
 
         let backend = match config.ec_type {
             ErasureType::Mds => {
-                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards);
+                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards)
+                    .with_backend(backend_type);
                 let mds_backend = BackendFactory::create_mds(&backend_config)?;
                 CodecBackend::Mds(mds_backend)
             }
@@ -106,9 +176,8 @@ impl ErasureCodec {
                 local_parity,
                 global_parity,
             } => {
-                let lrc_config =
-                    crate::backend::LrcConfig::new(config.data_shards, local_parity, global_parity);
-                let backend_config = BackendConfig::lrc(lrc_config);
+                let lrc_config = LrcConfig::new(config.data_shards, local_parity, global_parity);
+                let backend_config = BackendConfig::lrc(lrc_config).with_backend(backend_type);
                 let lrc_backend = BackendFactory::create_lrc(&backend_config)?;
                 CodecBackend::Lrc(lrc_backend)
             }
@@ -294,31 +363,236 @@ impl ErasureCodec {
     ///
     /// For LRC mode, this will attempt local recovery first (using only the
     /// local parity group) before falling back to global recovery.
+    ///
+    /// A data shard rebuilt here is not checked: what is served to a
+    /// client goes through [`decode_verified`](Self::decode_verified).
     pub fn decode<S: AsRef<[u8]>>(
         &self,
         shards: &mut [Option<S>],
         original_size: usize,
     ) -> Result<Vec<u8>> {
-        // "reconstruct" when a data shard is missing and parity has to be
-        // used — the slow path, and a sign of a degraded read.
-        let k = self.data_shards();
-        let path = if shards.iter().take(k).all(Option::is_some) {
-            "path=\"fast\""
-        } else {
-            "path=\"reconstruct\""
-        };
+        let refs: Vec<Option<&[u8]>> = shards
+            .iter()
+            .map(|s| s.as_ref().map(AsRef::as_ref))
+            .collect();
+        let path = self.decode_path(&refs);
         let started = std::time::Instant::now();
-        let res = self.decode_inner(shards, original_size);
+        let k = self.data_shards();
+        let res = if self.data_present(&refs) {
+            Ok(join_data(
+                refs[..k].iter().flatten().copied(),
+                original_size,
+            ))
+        } else {
+            self.rebuild_data(&refs)
+                .map(|data| join_data(data.iter().map(Vec::as_slice), original_size))
+                .map_err(Into::into)
+        };
         crate::metrics::DECODE_SECONDS.observe_duration(path, started.elapsed());
         res
     }
 
-    fn decode_inner<S: AsRef<[u8]>>(
+    /// Decode, serving a data shard it had to rebuild only once that shard
+    /// is shown to be the one written.
+    ///
+    /// `recorded[i]` is the crc32c the stripe records for shard `i` (`None`
+    /// where it records none, as for a position never written). The shards
+    /// given are the caller's to have checked against it when it read
+    /// them. A decode is only as right as its codec: one with parity from
+    /// another codec, or a parity shard stored wrong under a checksum of its
+    /// own, rebuilds other bytes, and nothing else would notice.
+    ///
+    /// Each rebuilt data shard must match its recorded checksum. One with
+    /// none recorded must instead be borne out by a parity shard the decode
+    /// did not use: re-encoded, the stripe gives that shard's bytes. A
+    /// decode that fails either check is tried again from another choice
+    /// of the shards given, when there are more than k; with none
+    /// verifying, the result is [`ErasureError::Unverified`], and the
+    /// caller reads more shards or fails the read.
+    ///
+    /// # Errors
+    /// [`ErasureError::InsufficientShards`] with fewer than k shards;
+    /// [`ErasureError::Unverified`] when no choice of them rebuilds data
+    /// that checks out.
+    pub fn decode_verified<S: AsRef<[u8]>>(
         &self,
-        shards: &mut [Option<S>],
+        shards: &[Option<S>],
         original_size: usize,
-    ) -> Result<Vec<u8>> {
+        recorded: &[Option<u32>],
+    ) -> std::result::Result<Vec<u8>, ErasureError> {
+        let refs: Vec<Option<&[u8]>> = shards
+            .iter()
+            .map(|s| s.as_ref().map(AsRef::as_ref))
+            .collect();
+        let path = self.decode_path(&refs);
+        let started = std::time::Instant::now();
+        let res = self.decode_verified_inner(&refs, original_size, recorded);
+        crate::metrics::DECODE_SECONDS.observe_duration(path, started.elapsed());
+        if matches!(res, Err(ErasureError::Unverified(_))) {
+            crate::metrics::REBUILDS_REJECTED.inc("");
+        }
+        res
+    }
+
+    fn decode_verified_inner(
+        &self,
+        shards: &[Option<&[u8]>],
+        original_size: usize,
+        recorded: &[Option<u32>],
+    ) -> std::result::Result<Vec<u8>, ErasureError> {
         let k = self.data_shards();
+        let n = self.total_shards();
+        if shards.len() != n {
+            return Err(ErasureError::InvalidConfig(format!(
+                "expected {n} shard slots, got {}",
+                shards.len()
+            )));
+        }
+        // Nothing to rebuild: every data shard is one the caller checked.
+        if self.data_present(shards) {
+            return Ok(join_data(
+                shards[..k].iter().flatten().copied(),
+                original_size,
+            ));
+        }
+        let available = shards.iter().filter(|s| s.is_some()).count();
+        if available < k {
+            return Err(ErasureError::InsufficientShards {
+                available,
+                required: k,
+            });
+        }
+
+        let rebuilt: Vec<usize> = (0..k).filter(|&i| shards[i].is_none()).collect();
+        let parity: Vec<usize> = (k..n).filter(|&i| shards[i].is_some()).collect();
+        let mut tried = 0usize;
+        let mut mismatched = 0usize;
+        // The fewest parity shards first: what the decode leaves out is
+        // what can bear out a shard with no checksum recorded.
+        for used in rebuilt.len()..=parity.len() {
+            for choice in Combinations::new(parity.len(), used) {
+                if tried == MAX_DECODE_ATTEMPTS {
+                    break;
+                }
+                tried += 1;
+                let chosen: Vec<usize> = choice.iter().map(|&c| parity[c]).collect();
+                let subset: Vec<Option<&[u8]>> = (0..n)
+                    .map(|i| {
+                        if i < k || chosen.contains(&i) {
+                            shards[i]
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // Not every choice determines an LRC stripe's data.
+                let Ok(data) = self.rebuild_data(&subset) else {
+                    continue;
+                };
+                match self.check_rebuilt(shards, &data, &rebuilt, &chosen, recorded) {
+                    Check::Verified => {
+                        return Ok(join_data(data.iter().map(Vec::as_slice), original_size));
+                    }
+                    Check::Mismatch => mismatched += 1,
+                    Check::Unchecked => {}
+                }
+            }
+        }
+        Err(ErasureError::Unverified(if mismatched > 0 {
+            format!(
+                "data shards {rebuilt:?} rebuilt from {available} shards do not match \
+                 the checksums their stripe records ({mismatched} of {tried} decodes)"
+            )
+        } else {
+            format!(
+                "data shards {rebuilt:?} rebuilt from {available} shards: no checksum \
+                 recorded and no unused parity shard to check them against"
+            )
+        }))
+    }
+
+    /// Whether data shards `rebuilt` of `data`, decoded using the parity
+    /// shards `chosen`, are the ones written.
+    fn check_rebuilt(
+        &self,
+        shards: &[Option<&[u8]>],
+        data: &[Vec<u8>],
+        rebuilt: &[usize],
+        chosen: &[usize],
+        recorded: &[Option<u32>],
+    ) -> Check {
+        let mut unrecorded = false;
+        for &i in rebuilt {
+            match recorded.get(i).copied().flatten() {
+                Some(crc) if crc32c::crc32c(&data[i]) == crc => {}
+                Some(_) => return Check::Mismatch,
+                None => unrecorded = true,
+            }
+        }
+        if !unrecorded {
+            return Check::Verified;
+        }
+        let unused: Vec<usize> = (self.data_shards()..self.total_shards())
+            .filter(|i| shards[*i].is_some() && !chosen.contains(i))
+            .collect();
+        if unused.is_empty() {
+            return Check::Unchecked;
+        }
+        let refs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+        let Ok(stripe) = self.encode_shards(&refs) else {
+            return Check::Unchecked;
+        };
+        if unused
+            .iter()
+            .any(|&p| shards[p].is_some_and(|s| s == stripe[p].as_slice()))
+        {
+            Check::Verified
+        } else {
+            Check::Mismatch
+        }
+    }
+
+    /// The decode-time label: "reconstruct" when a data shard is missing
+    /// and parity has to be used — the slow path, and a sign of a degraded
+    /// read.
+    fn decode_path(&self, shards: &[Option<&[u8]>]) -> &'static str {
+        if self.data_present(shards) {
+            "path=\"fast\""
+        } else {
+            "path=\"reconstruct\""
+        }
+    }
+
+    /// Whether every data shard is present.
+    fn data_present(&self, shards: &[Option<&[u8]>]) -> bool {
+        shards.len() >= self.data_shards()
+            && shards[..self.data_shards()].iter().all(Option::is_some)
+    }
+
+    /// Every shard of the stripe whose data shards are `data`.
+    fn encode_shards(&self, data: &[&[u8]]) -> std::result::Result<Vec<Vec<u8>>, ErasureError> {
+        let shard_size = data.first().map_or(0, |s| s.len());
+        match &self.backend {
+            CodecBackend::Mds(backend) => backend.encode(data, shard_size),
+            CodecBackend::Lrc(backend) => {
+                backend.encode_lrc(data, shard_size).map(|e| e.all_shards())
+            }
+        }
+    }
+
+    /// The k data shards, rebuilding those missing from the shards given.
+    fn rebuild_data(
+        &self,
+        shards: &[Option<&[u8]>],
+    ) -> std::result::Result<Vec<Vec<u8>>, ErasureError> {
+        let k = self.data_shards();
+        if shards.len() != self.total_shards() {
+            return Err(ErasureError::InvalidConfig(format!(
+                "expected {} shard slots, got {}",
+                self.total_shards(),
+                shards.len()
+            )));
+        }
 
         // Count available shards
         let available = shards.iter().filter(|s| s.is_some()).count();
@@ -326,28 +600,19 @@ impl ErasureCodec {
             return Err(ErasureError::InsufficientShards {
                 available,
                 required: k,
-            }
-            .into());
+            });
         }
 
         // Get shard size from first available shard
-        let shard_size = shards
-            .iter()
-            .find_map(|s| s.as_ref().map(|v| v.as_ref().len()))
-            .ok_or(ErasureError::InsufficientShards {
+        let shard_size = shards.iter().find_map(|s| s.map(<[u8]>::len)).ok_or(
+            ErasureError::InsufficientShards {
                 available: 0,
                 required: k,
-            })?;
+            },
+        )?;
 
-        // If all data shards are present, just concatenate them
-        let data_shards_ok = shards[..k].iter().all(|s| s.is_some());
-        if data_shards_ok {
-            let mut result = Vec::with_capacity(k * shard_size);
-            for data in shards.iter().take(k).flatten() {
-                result.extend_from_slice(data.as_ref());
-            }
-            result.truncate(original_size);
-            return Ok(result);
+        if self.data_present(shards) {
+            return Ok(shards[..k].iter().flatten().map(|s| s.to_vec()).collect());
         }
 
         // Find missing indices
@@ -357,16 +622,19 @@ impl ErasureCodec {
             .filter_map(|(i, s)| if s.is_none() { Some(i) } else { None })
             .collect();
 
-        // Decode using backend
-        let decoded = match &self.backend {
+        match &self.backend {
             CodecBackend::Mds(backend) => {
-                let shard_refs: Vec<Option<&[u8]>> = shards
-                    .iter()
-                    .map(|s| s.as_ref().map(AsRef::as_ref))
-                    .collect();
-                backend
-                    .decode(&shard_refs, shard_size, &missing_indices)
-                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?
+                let mut decoded = backend
+                    .decode(shards, shard_size, &missing_indices)
+                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()))?;
+                if decoded.len() < k {
+                    return Err(ErasureError::DecodingFailed(format!(
+                        "decode returned {} shards, need the {k} data shards",
+                        decoded.len()
+                    )));
+                }
+                decoded.truncate(k);
+                Ok(decoded)
             }
             CodecBackend::Lrc(backend) => {
                 // Data shards first from their own group (a member and the
@@ -377,11 +645,7 @@ impl ErasureCodec {
                 let mut recovered: Vec<Option<Vec<u8>>> = vec![None; self.total_shards()];
                 for &idx in missing_indices.iter().filter(|&&i| i < k) {
                     let refs: Vec<Option<&[u8]>> = (0..self.total_shards())
-                        .map(|i| {
-                            recovered[i]
-                                .as_deref()
-                                .or_else(|| shards[i].as_ref().map(AsRef::as_ref))
-                        })
+                        .map(|i| recovered[i].as_deref().or(shards[i]))
                         .collect();
                     if let Ok(Some(shard)) = backend.decode_local(&refs, shard_size, idx) {
                         recovered[idx] = Some(shard);
@@ -392,11 +656,7 @@ impl ErasureCodec {
                     .collect();
                 if !still.is_empty() {
                     let refs: Vec<Option<&[u8]>> = (0..self.total_shards())
-                        .map(|i| {
-                            recovered[i]
-                                .as_deref()
-                                .or_else(|| shards[i].as_ref().map(AsRef::as_ref))
-                        })
+                        .map(|i| recovered[i].as_deref().or(shards[i]))
                         .collect();
                     // The backend's shards come back in the order asked.
                     let global = backend
@@ -408,24 +668,16 @@ impl ErasureCodec {
                 }
                 (0..k)
                     .map(|i| {
-                        recovered[i].take().unwrap_or_else(|| {
-                            shards[i]
-                                .as_ref()
-                                .map_or_else(Vec::new, |s| s.as_ref().to_vec())
-                        })
+                        recovered[i]
+                            .take()
+                            .or_else(|| shards[i].map(<[u8]>::to_vec))
+                            .ok_or_else(|| {
+                                ErasureError::DecodingFailed(format!("data shard {i} not rebuilt"))
+                            })
                     })
                     .collect()
             }
-        };
-
-        // Build output from data shards
-        let mut output = Vec::with_capacity(k * shard_size);
-        for shard in decoded.iter().take(k) {
-            output.extend_from_slice(shard);
         }
-
-        output.truncate(original_size);
-        Ok(output)
     }
 
     /// Verify that shards are consistent
@@ -582,6 +834,202 @@ impl Default for ErasureCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    fn checksums(stripe: &[Vec<u8>]) -> Vec<Option<u32>> {
+        stripe.iter().map(|s| Some(crc32c::crc32c(s))).collect()
+    }
+
+    fn without(stripe: &[Vec<u8>], lost: &[usize]) -> Vec<Option<Vec<u8>>> {
+        (0..stripe.len())
+            .map(|i| (!lost.contains(&i)).then(|| stripe[i].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn combinations_are_every_choice_once() {
+        let all: Vec<Vec<usize>> = Combinations::new(4, 2).collect();
+        assert_eq!(
+            all,
+            vec![
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![1, 2],
+                vec![1, 3],
+                vec![2, 3]
+            ]
+        );
+        assert_eq!(Combinations::new(3, 0).count(), 1);
+        assert_eq!(Combinations::new(3, 3).count(), 1);
+        assert_eq!(Combinations::new(2, 3).count(), 0);
+    }
+
+    /// A parity shard stored wrong under a checksum of its own wrong bytes
+    /// (what a writer with another codec leaves, to this one) passes every
+    /// read check; a decode through it rebuilds other bytes. The rebuilt
+    /// shard's recorded checksum catches it, and the decode goes around it
+    /// when there is a way.
+    #[test]
+    fn a_parity_shard_stored_wrong_is_never_decoded_into_the_data() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data = body(70_001);
+        let mut stripe = codec.encode(&data).unwrap();
+        for b in &mut stripe[4] {
+            *b = !*b;
+        }
+        let recorded = checksums(&stripe);
+
+        // Data shard 1 lost, decoded through parity 4: other bytes.
+        let mut through_bad = without(&stripe, &[1, 5]);
+        assert_ne!(codec.decode(&mut through_bad, data.len()).unwrap(), data);
+        assert!(matches!(
+            codec.decode_verified(&through_bad, data.len(), &recorded),
+            Err(ErasureError::Unverified(_))
+        ));
+        // With parity 5 read too, the decode goes through it instead.
+        let both = without(&stripe, &[1]);
+        assert_eq!(
+            codec.decode_verified(&both, data.len(), &recorded).unwrap(),
+            data
+        );
+    }
+
+    /// A data shard never written (the write met its quorum without it) has
+    /// no checksum recorded: rebuilt, it is borne out by a parity shard the
+    /// decode did not use, and with none it is not returned.
+    #[test]
+    fn a_rebuilt_shard_with_no_checksum_needs_a_spare_shard() {
+        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
+        let data = body(50_051);
+        let stripe = codec.encode(&data).unwrap();
+        let mut recorded = checksums(&stripe);
+        recorded[2] = None;
+
+        let exactly_k = without(&stripe, &[2, 4]);
+        assert!(matches!(
+            codec.decode_verified(&exactly_k, data.len(), &recorded),
+            Err(ErasureError::Unverified(_))
+        ));
+        let spare = without(&stripe, &[2]);
+        assert_eq!(
+            codec
+                .decode_verified(&spare, data.len(), &recorded)
+                .unwrap(),
+            data
+        );
+        // All data present: nothing rebuilt, nothing to check.
+        let healthy = without(&stripe, &[4, 5]);
+        assert_eq!(
+            codec
+                .decode_verified(&healthy, data.len(), &recorded)
+                .unwrap(),
+            data
+        );
+        assert!(matches!(
+            codec.decode_verified(&without(&stripe, &[0, 1, 2]), data.len(), &recorded),
+            Err(ErasureError::InsufficientShards { .. })
+        ));
+    }
+
+    #[test]
+    fn lrc_decodes_verified() {
+        let codec = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
+        let data = body(60_000);
+        let stripe = codec.encode(&data).unwrap();
+        let recorded = checksums(&stripe);
+        // One from its group; two of group 0 and its local parity, and
+        // one of each group with one global parity, from the global code.
+        for lost in [vec![1], vec![0, 1, 6], vec![0, 4, 8]] {
+            let shards = without(&stripe, &lost);
+            assert_eq!(
+                codec
+                    .decode_verified(&shards, data.len(), &recorded)
+                    .unwrap(),
+                data,
+                "lost {lost:?}"
+            );
+        }
+    }
+
+    /// ISA-L (GF(2^8)) and reed-solomon-simd (GF(2^16)) lay a stripe out
+    /// alike and agree on its data shards, but not on its parity: a node
+    /// built with the other one rebuilt other bytes from it, and served
+    /// them. Checked, neither returns what it can't show is the data.
+    #[cfg(all(feature = "isal", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[test]
+    fn a_stripe_from_the_other_codec_is_never_decoded_into_wrong_bytes() {
+        let config = ErasureConfig::new(4, 2);
+        let isal = ErasureCodec::on_backend(config, BackendType::IsaL).unwrap();
+        let simd = ErasureCodec::on_backend(config, BackendType::RustSimd).unwrap();
+        let data = body(70_001);
+        let by_isal = isal.encode(&data).unwrap();
+        let by_simd = simd.encode(&data).unwrap();
+        assert_eq!(by_isal[..4], by_simd[..4], "data shards agree");
+        assert_ne!(by_isal[4..], by_simd[4..], "parity does not");
+
+        for (stripe, writer, reader) in [(&by_isal, &isal, &simd), (&by_simd, &simd, &isal)] {
+            let recorded = checksums(stripe);
+            let mut lost = without(stripe, &[1]);
+            assert_ne!(
+                reader.decode(&mut lost, data.len()).unwrap(),
+                data,
+                "the other codec rebuilds other bytes"
+            );
+            assert!(matches!(
+                reader.decode_verified(&lost, data.len(), &recorded),
+                Err(ErasureError::Unverified(_))
+            ));
+            assert_eq!(
+                writer
+                    .decode_verified(&lost, data.len(), &recorded)
+                    .unwrap(),
+                data
+            );
+            // No checksum for the lost shard: the spare parity, from the
+            // writer's codec, does not bear the reader's decode out.
+            let mut unrecorded = recorded.clone();
+            unrecorded[1] = None;
+            assert!(matches!(
+                reader.decode_verified(&lost, data.len(), &unrecorded),
+                Err(ErasureError::Unverified(_))
+            ));
+            assert_eq!(
+                writer
+                    .decode_verified(&lost, data.len(), &unrecorded)
+                    .unwrap(),
+                data
+            );
+        }
+    }
+
+    /// An LRC stripe is coded as the PUT path codes it
+    /// (`RustSimdLrcBackend`), on every build: an ISA-L LRC backend wrote
+    /// its global parity with ISA-L, which other nodes decoded as
+    /// reed-solomon-simd's.
+    #[test]
+    fn lrc_is_coded_alike_on_every_build() {
+        let codec = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
+        let data = body(60_000);
+        let stripe = codec.encode(&data).unwrap();
+        let size = ErasureCodec::shard_size_for(data.len(), 6);
+        let mut padded = data.clone();
+        padded.resize(size * 6, 0);
+        let refs: Vec<&[u8]> = padded.chunks(size).collect();
+        let put = crate::RustSimdLrcBackend::new(LrcConfig::new(6, 2, 2))
+            .unwrap()
+            .encode_lrc(&refs, size)
+            .unwrap()
+            .all_shards();
+        assert!(
+            stripe == put,
+            "LRC coded otherwise than the PUT path codes it"
+        );
+        assert!(ErasureCodec::on_backend(ErasureConfig::lrc(6, 2, 2), BackendType::IsaL).is_err());
+    }
 
     #[test]
     fn encode_bytes_matches_encode() {

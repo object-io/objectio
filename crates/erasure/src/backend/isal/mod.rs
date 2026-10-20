@@ -22,7 +22,7 @@
 mod backend;
 
 #[cfg(feature = "isal")]
-pub use backend::{IsalBackend, IsalLrcBackend};
+pub use backend::IsalBackend;
 
 /// Check if ISA-L is available at runtime
 ///

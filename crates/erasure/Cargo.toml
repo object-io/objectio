@@ -19,6 +19,9 @@ isal = ["erasure-isa-l"]
 [dependencies]
 objectio-common = { workspace = true }
 bytes = { workspace = true }
+# A data shard a decode rebuilds is checked against the crc32c its stripe
+# records for it before it is returned.
+crc32c = { workspace = true }
 thiserror = { workspace = true }
 
 # Optional: Pure Rust SIMD backend (default)
