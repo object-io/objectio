@@ -31,9 +31,9 @@ app = Client.from_env()
 | | |
 |---|---|
 | `OBJECTIO_ENDPOINT` or `OBJECTIO_URL` | gateway base URL — **required** |
-| `OBJECTIO_ACCESS_KEY` · `OBJECTIO_ACCESS_KEY_FILE` · `AWS_ACCESS_KEY_ID` | |
-| `OBJECTIO_SECRET_KEY` · `OBJECTIO_SECRET_KEY_FILE` · `AWS_SECRET_ACCESS_KEY` | |
-| `OBJECTIO_REGION` · `AWS_REGION` · `AWS_DEFAULT_REGION` | default `us-east-1` |
+| `OBJECTIO_ACCESS_KEY_FILE` · `OBJECTIO_ACCESS_KEY` · `AWS_ACCESS_KEY_ID` | the first set |
+| `OBJECTIO_SECRET_KEY_FILE` · `OBJECTIO_SECRET_KEY` · `AWS_SECRET_ACCESS_KEY` | the first set |
+| `OBJECTIO_REGION` · `AWS_REGION` · `AWS_DEFAULT_REGION` | the first set; default `us-east-1` |
 | `OBJECTIO_PROVISIONER_USER_ID` | the user bucket-scoped keys are minted on |
 
 Prefer the `_FILE` forms in Kubernetes — that is how a Secret is projected, and

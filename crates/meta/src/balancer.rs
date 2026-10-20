@@ -8,13 +8,14 @@
 //!
 //! # What a move moves
 //!
-//! Nothing, yet (B31 phase 1). A PG's `acting` set is where its objects
-//! are and where writes go; it changes only with an epoch, and only once
-//! the data is where the new set says (recovery, a later phase). Moving
-//! `acting` without copying would hide every object the PG holds: a key's
-//! copies are its PG's acting set, with no per-key record of where else
-//! they might be. So the balancer plans: it writes `up`, which recovery will
-//! follow. Below format level 7 it does not run at all.
+//! The data, through recovery. A PG's `acting` set is where its objects
+//! are and where writes go; it changes only with an epoch. Moving `acting`
+//! without copying would hide every object the PG holds: a key's copies
+//! are its PG's acting set, with no per-key record of where else they
+//! might be. So the balancer writes only `up`, and recovery
+//! (`service/recovery.rs`) moves the PG: at each position where `up`
+//! differs, acting takes the up member, filled from the member it
+//! replaces. Below format level 7 it does not run at all.
 //!
 //! # Tuning knobs (config keys, all optional)
 //!

@@ -90,9 +90,10 @@ pub struct Args {
     #[arg(long)]
     pub data_dir: Option<String>,
 
-    /// Log level
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
+    /// Log level; without it, the config file's `[logging] level` (info by
+    /// default). `RUST_LOG`, when set, overrides both.
+    #[arg(long)]
+    pub log_level: Option<String>,
 
     /// Prometheus `/metrics` port; 0 serves none (the gateway re-exports
     /// these metrics either way)
@@ -287,6 +288,27 @@ fn default_data_dir() -> String {
     "./osd-data".to_string()
 }
 
+/// The configuration file at `path`, or the defaults when there is none.
+/// A file that doesn't parse is an error, not the defaults: an OSD started
+/// on the default disks instead of the configured ones is worse than one
+/// that doesn't start.
+fn load_config(path: &str) -> Result<Config> {
+    if !std::path::Path::new(path).exists() {
+        return Ok(Config::default());
+    }
+    let text = std::fs::read_to_string(path)?;
+    toml::from_str(&text).map_err(|e| anyhow::anyhow!("config file {path}: {e}"))
+}
+
+/// The log level the OSD's tracing is installed with: `--log-level`, else
+/// the config file's `[logging] level`.
+pub fn log_level(args: &Args) -> Result<String> {
+    match &args.log_level {
+        Some(level) => Ok(level.clone()),
+        None => Ok(load_config(&args.config)?.logging.level),
+    }
+}
+
 /// Run the OSD until `shutdown` resolves. Caller installs tracing
 /// subscriber and builds `args` (via CLI parse in the bin, or direct
 /// construction in aio).
@@ -295,16 +317,7 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
-    // Load config file if it exists
-    let config: Config = if std::path::Path::new(&args.config).exists() {
-        let config_str = std::fs::read_to_string(&args.config)?;
-        toml::from_str(&config_str).unwrap_or_else(|e| {
-            eprintln!("Warning: Failed to parse config file: {}", e);
-            Config::default()
-        })
-    } else {
-        Config::default()
-    };
+    let config = load_config(&args.config)?;
 
     // Merge CLI args with config file (CLI takes precedence)
     let listen = args.listen.unwrap_or(config.osd.listen);
@@ -316,16 +329,6 @@ pub async fn run(
     };
     let block_size = config.storage.block_size;
     let data_dir = args.data_dir.unwrap_or(config.storage.data_dir);
-    let log_level = if args.log_level != "info" {
-        args.log_level
-    } else {
-        config.logging.level
-    };
-
-    // Tracing subscriber is installed by the caller (bin/main.rs or
-    // aio). We just consume log_level from config so the bin's CLI
-    // override path still records what it wanted.
-    let _ = log_level;
 
     info!("Starting ObjectIO OSD");
 
@@ -1074,4 +1077,30 @@ fn host_of(addr: &str) -> &str {
         .or_else(|| addr.strip_prefix("https://"))
         .unwrap_or(addr);
     rest.rsplit_once(':').map_or(rest, |(host, _)| host)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every example OSD config parses: an OSD refuses a config that doesn't.
+    #[test]
+    fn the_example_configs_parse() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/config");
+        let mut parsed = 0;
+        for set in std::fs::read_dir(dir).unwrap() {
+            let set = set.unwrap().path();
+            if !set.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(set).unwrap() {
+                let path = file.unwrap().path();
+                if path.file_name().unwrap().to_string_lossy().contains("osd") {
+                    let config = super::load_config(path.to_str().unwrap())
+                        .unwrap_or_else(|e| panic!("{e}"));
+                    assert!(!config.storage.disks.is_empty(), "{}", path.display());
+                    parsed += 1;
+                }
+            }
+        }
+        assert!(parsed >= 5, "found {parsed} example OSD configs");
+    }
 }

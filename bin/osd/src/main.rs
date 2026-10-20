@@ -13,11 +13,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = objectio_osd::Args::parse();
+    let level = objectio_osd::log_level(&args)?;
 
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| args.log_level.clone().into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

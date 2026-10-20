@@ -61,9 +61,10 @@ Every tenant-scoped command takes `--tenant`. Without it, the command acts
 in the caller's own tenant, which is system scope for the system admin.
 An empty `--tenant ""` is rejected rather than sent.
 
-Some endpoints have no tenant parameter: `user list`, `bucket list` and
-`warehouse list`. They answer with the caller's tenant, or with everything
-for the system admin, and `--tenant` filters that answer on the client.
+Some endpoints have no tenant parameter: `user list` and `bucket list`
+answer with the caller's tenant, or with everything for the system admin;
+`warehouse list` answers the system admin only. `--tenant` filters the
+answer on the client.
 
 ## Output
 
@@ -126,6 +127,7 @@ Secrets are printed only once, when they are created: by `key create`,
 | `bucket list [--tenant]` / `show B` | `GET /_admin/buckets` |
 | `bucket create B [--pool P --tenant]` / `delete B` | `POST /_admin/buckets`, `DELETE /_admin/buckets/B` |
 | `bucket set-owner B USER` | `PUT /_admin/buckets/B/owner` |
+| `bucket set-quota B [--bytes 500G --objects N]` (0 = unlimited) | `PUT /_admin/buckets/B/quota` |
 | `bucket policy get` / `put --file` / `delete B` | `/_admin/buckets/B/policy` |
 | `bucket dedup get` / `set [--mode --scope]` / `delete B` | `/_admin/buckets/B/dedup` |
 | `bucket lifecycle get` / `put --file` / `delete B` | `/{B}?lifecycle` (XML) |
@@ -136,6 +138,7 @@ Secrets are printed only once, when they are created: by `key create`,
 | `cluster info` / `topology` / `usage` / `drain-status` | `GET /_admin/cluster-info`, `/topology`, `/usage`, `/drain-status` |
 | `cluster validate-placement POOL` | `GET /_admin/placement/validate?pool=` |
 | `cluster rebalance status` / `pause` / `resume` | `GET /_admin/rebalance-status`, `POST /_admin/rebalance/{pause,resume}` |
+| `upgrade status` / `finalize` | `GET /_admin/upgrade`, `POST /_admin/upgrade/finalize` |
 | `node list` / `show ID\|NAME` | `GET /_admin/nodes` |
 | `osd set-state ID in\|out\|draining` | `PUT /_admin/osds/ID/admin-state` |
 | `pool list` / `show` / `create` / `update` (only the fields given) / `delete` | `/_admin/pools[/N]` |
