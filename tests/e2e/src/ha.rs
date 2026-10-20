@@ -761,12 +761,25 @@ impl HaCluster {
     /// Bootstrap the first node as a one-voter group, add the rest as
     /// learners, then make every node a voter.
     fn form_raft_group(&self) {
+        // Each step is safe to repeat (a second /init answers
+        // already_initialized), so one that times out on a loaded host is
+        // sent again rather than failing the test.
         let admin = |path: &str, body: serde_json::Value| {
-            let r = http()
-                .post(format!("http://127.0.0.1:{}{path}", self.metas[0].admin))
-                .json(&body)
-                .send()
-                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let r = loop {
+                match http()
+                    .post(format!("http://127.0.0.1:{}{path}", self.metas[0].admin))
+                    .json(&body)
+                    .send()
+                {
+                    Ok(r) => break r,
+                    Err(e) if Instant::now() < deadline => {
+                        eprintln!("{path}: {e}; sending it again");
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Err(e) => panic!("{path}: {e}"),
+                }
+            };
             assert!(
                 r.status().is_success(),
                 "{path}: {}",
