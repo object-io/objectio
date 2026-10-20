@@ -50,13 +50,14 @@ pub struct UnityPolicyCheck<'a> {
 
 /// Evaluate a single Unity policy.
 ///
-/// Returns `Ok(())` for explicit Allow, implicit deny (no matching
-/// statement), and missing/empty/invalid policy (owner-implicit-allow,
-/// matches S3 and Iceberg). Returns `Err` only on explicit Deny.
+/// No policy, an empty one, or one with no statement matching the request
+/// is `ImplicitDeny`: it grants nothing, and the rest of the chain and who
+/// the caller is decide (see [`grant`]), as with an S3 bucket policy.
 ///
 /// # Errors
-/// Returns `UnityError::forbidden` on explicit Deny.
-pub fn check_unity_policy(check: &UnityPolicyCheck<'_>) -> Result<(), UnityError> {
+/// `UnityError::forbidden` on an explicit Deny, and on a stored policy that
+/// doesn't parse: it could hold a Deny, so it can't be read as silent.
+pub fn check_unity_policy(check: &UnityPolicyCheck<'_>) -> Result<PolicyDecision, UnityError> {
     let UnityPolicyCheck {
         evaluator,
         policy_json,
@@ -68,30 +69,17 @@ pub fn check_unity_policy(check: &UnityPolicyCheck<'_>) -> Result<(), UnityError
         table,
         policy_source,
     } = check;
-    let Some(json) = policy_json else {
-        tracing::debug!(
-            catalog = %catalog,
-            schema = schema.unwrap_or(""),
-            table = table.unwrap_or(""),
-            user = %user_arn,
-            action = %action,
-            decision = "allow",
-            policy_source = %policy_source,
-            "unity.policy.decision: no policy"
-        );
-        return Ok(());
+    let Some(json) = policy_json.filter(|j| !j.is_empty()) else {
+        return Ok(PolicyDecision::ImplicitDeny);
     };
-    if json.is_empty() {
-        return Ok(());
-    }
 
     let policy = match BucketPolicy::from_json(json) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("Failed to parse unity policy at {policy_source}: {e}");
-            // Same as Iceberg/S3: invalid policy doesn't block — admin already
-            // owns implicit access via /policy PUT.
-            return Ok(());
+            tracing::error!("unity policy at {policy_source} does not parse: {e}");
+            return Err(UnityError::forbidden(format!(
+                "Access denied: the {policy_source} policy could not be read"
+            )));
         }
     };
 
@@ -127,17 +115,59 @@ pub fn check_unity_policy(check: &UnityPolicyCheck<'_>) -> Result<(), UnityError
             );
             Err(UnityError::forbidden("Access denied by unity policy"))
         }
-        PolicyDecision::Allow | PolicyDecision::ImplicitDeny => Ok(()),
+        decision => Ok(decision),
     }
+}
+
+/// Whether a request the policy chain has decided on goes ahead.
+///
+/// Mirrors S3 authorization: an explicit Deny anywhere has already refused
+/// it; an Allow anywhere grants it; with neither, only the catalog's
+/// administrators (`administers`) go ahead, as only a bucket's owner does
+/// with no policy.
+///
+/// # Errors
+/// `UnityError::forbidden` when nothing grants the request.
+pub fn grant(
+    decision: PolicyDecision,
+    administers: bool,
+    action: &str,
+    resource_arn: &str,
+) -> Result<(), UnityError> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::ImplicitDeny if administers => Ok(()),
+        PolicyDecision::ImplicitDeny => Err(UnityError::forbidden(format!(
+            "No policy allows {action} on {resource_arn}"
+        ))),
+        PolicyDecision::Deny => Err(UnityError::forbidden("Access denied by unity policy")),
+    }
+}
+
+/// Fold a further level's decision into a chain's: Deny wins (as an
+/// error), then Allow.
+///
+/// # Errors
+/// The level's error, a Deny or an unreadable policy.
+pub fn and_then(
+    chain: PolicyDecision,
+    level: Result<PolicyDecision, UnityError>,
+) -> Result<PolicyDecision, UnityError> {
+    Ok(match (chain, level?) {
+        (PolicyDecision::Deny, _) | (_, PolicyDecision::Deny) => PolicyDecision::Deny,
+        (PolicyDecision::Allow, _) | (_, PolicyDecision::Allow) => PolicyDecision::Allow,
+        _ => PolicyDecision::ImplicitDeny,
+    })
 }
 
 /// Walk catalog → schema → table policies in order. Any explicit Deny short-circuits.
 ///
 /// `levels` should be ordered most-general → most-specific. The walk
-/// returns `Ok(())` if every level allows (or is silent).
+/// returns `Allow` if any level allows, else `ImplicitDeny`.
 ///
 /// # Errors
-/// Returns `UnityError::forbidden` on the first explicit Deny.
+/// Returns `UnityError::forbidden` on the first explicit Deny or a policy
+/// that doesn't parse.
 #[allow(clippy::too_many_arguments)]
 pub fn check_three_level(
     evaluator: &PolicyEvaluator,
@@ -148,21 +178,25 @@ pub fn check_three_level(
     schema: Option<&str>,
     table: Option<&str>,
     levels: &[PolicyLevel<'_>],
-) -> Result<(), UnityError> {
+) -> Result<PolicyDecision, UnityError> {
+    let mut decision = PolicyDecision::ImplicitDeny;
     for level in levels {
-        check_unity_policy(&UnityPolicyCheck {
-            evaluator,
-            policy_json: level.policy_json,
-            user_arn,
-            action,
-            resource_arn,
-            catalog,
-            schema,
-            table,
-            policy_source: level.label,
-        })?;
+        decision = and_then(
+            decision,
+            check_unity_policy(&UnityPolicyCheck {
+                evaluator,
+                policy_json: level.policy_json,
+                user_arn,
+                action,
+                resource_arn,
+                catalog,
+                schema,
+                table,
+                policy_source: level.label,
+            }),
+        )?;
     }
-    Ok(())
+    Ok(decision)
 }
 
 /// Validate a policy JSON string is shaped correctly for Unity:
@@ -207,7 +241,7 @@ mod tests {
         catalog: &str,
         schema: Option<&str>,
         table: Option<&str>,
-    ) -> Result<(), UnityError> {
+    ) -> Result<PolicyDecision, UnityError> {
         let evaluator = PolicyEvaluator::new();
         check_unity_policy(&UnityPolicyCheck {
             evaluator: &evaluator,
@@ -235,8 +269,10 @@ mod tests {
         );
     }
 
+    /// No policy grants nothing: only the catalog's administrators go
+    /// ahead.
     #[test]
-    fn no_policy_allows() {
+    fn no_policy_grants_nothing() {
         let r = check(
             None,
             "arn:objectio:iam::user/alice",
@@ -246,7 +282,26 @@ mod tests {
             Some("sales"),
             Some("events"),
         );
-        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), PolicyDecision::ImplicitDeny);
+        let arn = "arn:obio:unity:::prod/sales/events";
+        assert!(grant(PolicyDecision::ImplicitDeny, false, "unity:GetTable", arn).is_err());
+        assert!(grant(PolicyDecision::ImplicitDeny, true, "unity:GetTable", arn).is_ok());
+        assert!(grant(PolicyDecision::Allow, false, "unity:GetTable", arn).is_ok());
+    }
+
+    /// A stored policy that doesn't parse could hold a Deny: it refuses.
+    #[test]
+    fn an_unreadable_policy_refuses() {
+        let r = check(
+            Some("{not json"),
+            "arn:objectio:iam::user/alice",
+            "unity:GetTable",
+            "arn:obio:unity:::prod/sales/events",
+            "prod",
+            Some("sales"),
+            Some("events"),
+        );
+        assert_eq!(r.unwrap_err().status, axum::http::StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -273,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_deny_allows() {
+    fn a_policy_that_names_someone_else_grants_nothing() {
         let policy = r#"{
             "Version": "2012-10-17",
             "Statement": [{
@@ -292,8 +347,7 @@ mod tests {
             Some("sales"),
             Some("events"),
         );
-        // Implicit deny → owner-implicit-allow per shared semantics.
-        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), PolicyDecision::ImplicitDeny);
     }
 
     #[test]
@@ -383,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn three_level_no_policies_allows() {
+    fn three_level_no_policies_grants_nothing() {
         let evaluator = PolicyEvaluator::new();
         let levels = vec![
             PolicyLevel {
@@ -409,7 +463,7 @@ mod tests {
             Some("events"),
             &levels,
         );
-        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), PolicyDecision::ImplicitDeny);
     }
 
     #[test]

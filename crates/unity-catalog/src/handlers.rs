@@ -7,8 +7,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 use crate::access::{
-    PolicyLevel, UnityPolicyCheck, build_unity_arn, check_three_level, check_unity_policy,
-    validate_unity_policy,
+    PolicyLevel, and_then, build_unity_arn, check_three_level, grant, validate_unity_policy,
 };
 use crate::catalog::UnityCatalogClient;
 use crate::error::UnityError;
@@ -45,6 +44,9 @@ pub struct UnityState {
     pub sts_provider: Option<objectio_auth::sts::StsProvider>,
     /// S3 endpoint URL surfaced alongside vended credentials.
     pub s3_endpoint: String,
+    /// Authentication is on (the gateway runs without `--no-auth`): a
+    /// request with no identity is refused, never run as if unchecked.
+    pub auth_required: bool,
 }
 
 // ---- full_name parsers ----
@@ -85,40 +87,126 @@ fn parse_table_full_name(full_name: &str) -> Result<(String, String, String)> {
     ))
 }
 
+// ---- Who is asking ----
+
+/// Who is asking.
+#[derive(Clone, Copy)]
+enum Caller<'a> {
+    /// `--no-auth`: there is no identity, and nothing is checked.
+    Unchecked,
+    Identity(&'a AuthResult),
+}
+
+/// The caller of a request. No identity is refused when authentication is
+/// on: it means the auth layer didn't run, not that the caller may do
+/// anything.
+fn caller<'a>(state: &UnityState, auth: Option<&'a Extension<AuthResult>>) -> Result<Caller<'a>> {
+    match auth {
+        Some(Extension(a)) if a.auth_mode != objectio_auth::AuthMode::Anonymous => {
+            Ok(Caller::Identity(a))
+        }
+        _ if state.auth_required => Err(UnityError::unauthorized("Authentication required")),
+        _ => Ok(Caller::Unchecked),
+    }
+}
+
+/// Whether `auth` is listed among `tenant`'s admins.
+async fn is_tenant_admin(state: &UnityState, tenant: &str, auth: &AuthResult) -> Result<bool> {
+    if tenant.is_empty() || auth.tenant != tenant {
+        return Ok(false);
+    }
+    let resp = state
+        .catalog
+        .meta_client()
+        .get_tenant(objectio_proto::metadata::GetTenantRequest {
+            name: tenant.to_string(),
+        })
+        .await
+        .map_err(|e| UnityError::unavailable(format!("cannot read tenant '{tenant}': {e}")))?
+        .into_inner();
+    Ok(resp.tenant.filter(|_| resp.found).is_some_and(|t| {
+        t.admin_users
+            .iter()
+            .any(|u| *u == auth.user_id || *u == auth.user_arn)
+    }))
+}
+
+/// A catalog, as the caller of a request may use it.
+struct CatalogAccess<'a> {
+    caller: Caller<'a>,
+    /// The catalog's tenant (empty = the system tenant). Vended sessions
+    /// are held to it.
+    tenant: String,
+    /// The caller administers the catalog: a catalog admin, or an admin of
+    /// its tenant. With no policy granting a request, only they go ahead.
+    administers: bool,
+}
+
+/// The catalog `name`, for this caller: one of another tenant is "not
+/// found", exactly as one that doesn't exist.
+async fn catalog_access<'a>(
+    state: &UnityState,
+    auth: Option<&'a Extension<AuthResult>>,
+    name: &str,
+) -> Result<CatalogAccess<'a>> {
+    let caller = caller(state, auth)?;
+    let tenant = state.catalog.catalog_tenant(name).await?;
+    let (visible, administers) = match caller {
+        Caller::Unchecked => (true, true),
+        Caller::Identity(a) if is_admin(a, state) => (true, true),
+        Caller::Identity(a) => {
+            let visible = a.tenant == tenant;
+            (
+                visible,
+                visible && is_tenant_admin(state, &tenant, a).await?,
+            )
+        }
+    };
+    if !visible {
+        return Err(UnityError::not_found(format!("catalog '{name}' not found")));
+    }
+    Ok(CatalogAccess {
+        caller,
+        tenant,
+        administers,
+    })
+}
+
 // ---- Policy walk helpers ----
 
-/// Load (catalog/schema/table) policies from meta in a single async pass.
+/// One entity policy: `None` when none is set or the entity doesn't exist
+/// (the handler answers 404 for that). Any other meta error fails the
+/// request rather than being read as "no policy".
+async fn entity_policy(
+    read: impl std::future::Future<Output = Result<Vec<u8>>>,
+) -> Result<Option<String>> {
+    match read.await {
+        Ok(bytes) => Ok(decode_policy(bytes)),
+        Err(e) if e.status == StatusCode::NOT_FOUND => Ok(None),
+        Err(e) => Err(UnityError::unavailable(format!(
+            "cannot read policy: {}",
+            e.message
+        ))),
+    }
+}
+
+/// Load (catalog/schema/table) policies from meta.
 async fn load_policies(
     state: &UnityState,
     catalog: &str,
     schema: Option<&str>,
     table: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let cat_policy = state
-        .catalog
-        .get_catalog_policy(catalog)
-        .await
-        .ok()
-        .and_then(decode_policy);
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    let cat_policy = entity_policy(state.catalog.get_catalog_policy(catalog)).await?;
     let sch_policy = match schema {
-        Some(s) => state
-            .catalog
-            .get_schema_policy(catalog, s)
-            .await
-            .ok()
-            .and_then(decode_policy),
+        Some(s) => entity_policy(state.catalog.get_schema_policy(catalog, s)).await?,
         None => None,
     };
     let tbl_policy = match (schema, table) {
-        (Some(s), Some(t)) => state
-            .catalog
-            .get_table_policy(catalog, s, t)
-            .await
-            .ok()
-            .and_then(decode_policy),
+        (Some(s), Some(t)) => entity_policy(state.catalog.get_table_policy(catalog, s, t)).await?,
         _ => None,
     };
-    (cat_policy, sch_policy, tbl_policy)
+    Ok((cat_policy, sch_policy, tbl_policy))
 }
 
 fn decode_policy(bytes: Vec<u8>) -> Option<String> {
@@ -128,17 +216,19 @@ fn decode_policy(bytes: Vec<u8>) -> Option<String> {
     String::from_utf8(bytes).ok().filter(|s| !s.is_empty())
 }
 
-/// Evaluate the user's attached IAM managed policies against
-/// (action, resource). Returns `Err` on the first explicit Deny.
+/// What the user's attached IAM managed policies say of (action,
+/// resource): those of the user and of every IAM group it is in.
 ///
 /// This is the bridge that lets workspace IAM policies grant or deny
 /// `unity:*` actions the same way they grant or deny `s3:*` and
 /// `kms:*`. Same `PolicyEvaluator`, same JSON shape — Unity actions
 /// ride on the existing IAM plane instead of a parallel one.
 ///
-/// Empty attached-set returns Ok (matches the catalog/schema/table
-/// "no policy = implicit allow" semantics already used elsewhere).
-async fn check_iam_policies(
+/// # Errors
+/// `forbidden` on an explicit Deny or an attached policy that doesn't
+/// parse; `unavailable` when meta can't list or read them: what they say
+/// is unknown, so the request can't be decided.
+async fn iam_decision(
     state: &UnityState,
     auth_result: &AuthResult,
     action: &str,
@@ -146,82 +236,61 @@ async fn check_iam_policies(
     catalog: &str,
     schema: Option<&str>,
     table: Option<&str>,
-) -> Result<()> {
-    // The admin user gets a free pass at the IAM layer — same as KMS and
-    // the entity-policy admin gate. Without this, an admin who has zero
-    // IAM policies attached would still be allowed (because empty set is
-    // implicit-allow), but a Deny statement attached to "*" would block
-    // them by accident. The admin short-circuit avoids that footgun.
-    if auth_result.is_system_admin() {
-        return Ok(());
-    }
+) -> Result<PolicyDecision> {
     let mut client = state.catalog.meta_client();
-    // Collect policies from the user AND every IAM group they're a member
-    // of. The OIDC bridge populates `group_ids` by mapping claim names to
-    // local IAM groups; SigV4/cookie callers currently leave it empty (a
-    // future enhancement can call GetUserGroups in those branches).
-    // Dedup across user + groups so a policy attached to both isn't
-    // evaluated twice.
-    let mut attached: Vec<String> = Vec::new();
-    let user_lookup = client
-        .list_attached_policies(ListAttachedPoliciesRequest {
-            user_id: auth_result.user_id.clone(),
-            group_id: String::new(),
-            role_name: String::new(),
-        })
-        .await;
-    match user_lookup {
-        Ok(r) => attached.extend(r.into_inner().policy_names),
-        Err(e) => {
-            // Treat lookup failures as "no IAM opinion" — entity policies
-            // still apply. Logging surfaces the misconfiguration without
-            // breaking the request.
-            tracing::warn!(
-                "unity: list_attached_policies for {} failed: {e}",
-                auth_result.user_id
-            );
-            return Ok(());
-        }
-    }
-    for gid in &auth_result.group_ids {
-        if let Ok(r) = client
-            .list_attached_policies(ListAttachedPoliciesRequest {
+    let unavailable = |e: tonic::Status| {
+        UnityError::unavailable(format!("cannot read attached policies: {}", e.message()))
+    };
+    let mut lookups = vec![ListAttachedPoliciesRequest {
+        user_id: auth_result.user_id.clone(),
+        group_id: String::new(),
+        role_name: String::new(),
+    }];
+    lookups.extend(
+        auth_result
+            .group_ids
+            .iter()
+            .map(|gid| ListAttachedPoliciesRequest {
                 user_id: String::new(),
                 group_id: gid.clone(),
                 role_name: String::new(),
-            })
+            }),
+    );
+    // Dedup across user + groups so a policy attached to both isn't
+    // evaluated twice.
+    let mut attached: Vec<String> = Vec::new();
+    for lookup in lookups {
+        let names = client
+            .list_attached_policies(lookup)
             .await
-        {
-            for name in r.into_inner().policy_names {
-                if !attached.contains(&name) {
-                    attached.push(name);
-                }
+            .map_err(unavailable)?
+            .into_inner()
+            .policy_names;
+        for name in names {
+            if !attached.contains(&name) {
+                attached.push(name);
             }
         }
     }
-    if attached.is_empty() {
-        return Ok(());
-    }
+    let mut decision = PolicyDecision::ImplicitDeny;
     for name in attached {
-        let Ok(resp) = client
+        let inner = client
             .get_policy(GetPolicyRequest { name: name.clone() })
             .await
-        else {
-            continue;
-        };
-        let inner = resp.into_inner();
-        if !inner.found {
-            continue;
-        }
-        let Some(policy_obj) = inner.policy else {
+            .map_err(unavailable)?
+            .into_inner();
+        // An attachment whose policy was deleted says nothing.
+        let Some(policy_obj) = inner.policy.filter(|_| inner.found) else {
             continue;
         };
         let Ok(policy) = BucketPolicy::from_json(&policy_obj.policy_json) else {
             tracing::warn!(
-                "unity: attached policy '{name}' for {} failed to parse — skipping",
+                "unity: attached policy '{name}' for {} does not parse",
                 auth_result.user_id
             );
-            continue;
+            return Err(UnityError::forbidden(format!(
+                "Access denied: attached policy {name} could not be read"
+            )));
         };
         let mut ctx = RequestContext::new(&auth_result.user_arn, action, resource_arn);
         ctx.variables
@@ -249,34 +318,37 @@ async fn check_iam_policies(
                     "Action {action} on {resource_arn} denied by attached IAM policy {name}"
                 )));
             }
-            PolicyDecision::Allow | PolicyDecision::ImplicitDeny => {}
+            PolicyDecision::Allow => decision = PolicyDecision::Allow,
+            PolicyDecision::ImplicitDeny => {}
         }
     }
-    Ok(())
+    Ok(decision)
 }
 
-/// Walk attached IAM policies → catalog → schema → table policies for an
-/// authenticated request. Skips evaluation entirely when auth is None
-/// (--no-auth mode).
+/// Authorize `action` on a catalog, schema or table: its tenant first,
+/// then attached IAM policies and the catalog → schema → table policies.
 ///
-/// Semantics: any explicit Deny at any layer rejects. Implicit-allow at
-/// every layer = permit (matches the existing "owner has implicit
-/// access" model already used by S3 bucket policies and Iceberg).
-async fn check_policy_chain(
+/// Semantics, as for S3: a Deny anywhere refuses; an Allow anywhere
+/// grants; with neither, only the catalog's administrators go ahead. The
+/// system admin is not subject to the chain, so no policy can lock the
+/// operator out.
+async fn check_policy_chain<'a>(
     state: &UnityState,
-    auth: Option<&Extension<AuthResult>>,
+    auth: Option<&'a Extension<AuthResult>>,
     catalog: &str,
     schema: Option<&str>,
     table: Option<&str>,
     action: &str,
-) -> Result<()> {
-    let Some(Extension(auth_result)) = auth else {
-        return Ok(());
+) -> Result<CatalogAccess<'a>> {
+    let access = catalog_access(state, auth, catalog).await?;
+    let Caller::Identity(auth_result) = access.caller else {
+        return Ok(access);
     };
+    if auth_result.is_system_admin() {
+        return Ok(access);
+    }
     let resource_arn = build_unity_arn(catalog, schema, table);
-    // IAM-attached policies first — any Deny here short-circuits before
-    // we even bother loading the entity policies.
-    check_iam_policies(
+    let decision = iam_decision(
         state,
         auth_result,
         action,
@@ -286,7 +358,7 @@ async fn check_policy_chain(
         table,
     )
     .await?;
-    let (cat, sch, tbl) = load_policies(state, catalog, schema, table).await;
+    let (cat, sch, tbl) = load_policies(state, catalog, schema, table).await?;
     let levels = [
         PolicyLevel {
             label: "catalog",
@@ -301,57 +373,33 @@ async fn check_policy_chain(
             policy_json: tbl.as_deref(),
         },
     ];
-    check_three_level(
-        &state.policy_evaluator,
-        &auth_result.user_arn,
-        action,
-        &resource_arn,
-        catalog,
-        schema,
-        table,
-        &levels,
-    )
+    let decision = and_then(
+        decision,
+        check_three_level(
+            &state.policy_evaluator,
+            &auth_result.user_arn,
+            action,
+            &resource_arn,
+            catalog,
+            schema,
+            table,
+            &levels,
+        ),
+    )?;
+    grant(decision, access.administers, action, &resource_arn)?;
+    Ok(access)
 }
 
 /// Single-level policy check for catalog-only operations (`CreateSchema` etc.).
-/// Same IAM-then-entity ordering as `check_policy_chain`.
 async fn check_catalog_only(
     state: &UnityState,
     auth: Option<&Extension<AuthResult>>,
     catalog: &str,
     action: &str,
 ) -> Result<()> {
-    let Some(Extension(auth_result)) = auth else {
-        return Ok(());
-    };
-    let resource_arn = build_unity_arn(catalog, None, None);
-    check_iam_policies(
-        state,
-        auth_result,
-        action,
-        &resource_arn,
-        catalog,
-        None,
-        None,
-    )
-    .await?;
-    let cat_policy = state
-        .catalog
-        .get_catalog_policy(catalog)
+    check_policy_chain(state, auth, catalog, None, None, action)
         .await
-        .ok()
-        .and_then(decode_policy);
-    check_unity_policy(&UnityPolicyCheck {
-        evaluator: &state.policy_evaluator,
-        policy_json: cat_policy.as_deref(),
-        user_arn: &auth_result.user_arn,
-        action,
-        resource_arn: &resource_arn,
-        catalog,
-        schema: None,
-        table: None,
-        policy_source: "catalog",
-    })
+        .map(drop)
 }
 
 // ---- Admin gate ----
@@ -362,6 +410,8 @@ fn arn_short_name(arn: &str) -> &str {
     arn.rsplit_once('/').map_or(arn, |(_, name)| name)
 }
 
+/// A catalog admin: the system admin, or a principal (user or group)
+/// named by `--oidc-admin-roles`.
 fn is_admin(auth: &AuthResult, state: &UnityState) -> bool {
     if auth.is_system_admin() {
         return true;
@@ -382,17 +432,16 @@ fn is_admin(auth: &AuthResult, state: &UnityState) -> bool {
 /// `is_account_group_member()`).
 ///
 /// In `--no-auth` mode the response is the wildcard "anonymous" principal
-/// with no groups and `is_admin: true` so engines see a permissive context.
+/// with no groups and `is_admin: true`: nothing is checked in that mode.
 ///
 /// # Errors
-/// Infallible — auth failures are surfaced by the auth middleware before
-/// the handler runs.
+/// 401 with no identity while authentication is on.
 #[allow(clippy::unused_async)]
 pub async fn current_caller_identity(
     State(state): State<Arc<UnityState>>,
     auth: Option<Extension<AuthResult>>,
 ) -> Result<Json<CallerIdentity>> {
-    let Some(Extension(auth_result)) = auth else {
+    let Caller::Identity(auth_result) = caller(&state, auth.as_ref())? else {
         return Ok(Json(CallerIdentity {
             user_name: "anonymous".to_string(),
             user_id: String::new(),
@@ -413,49 +462,59 @@ pub async fn current_caller_identity(
         .iter()
         .map(|g| arn_short_name(g).to_string())
         .collect();
-    let admin = is_admin(&auth_result, &state);
+    let admin = is_admin(auth_result, &state);
     Ok(Json(CallerIdentity {
         user_name,
         user_id: auth_result.user_id.clone(),
         user_arn: auth_result.user_arn.clone(),
         groups,
-        group_arns: auth_result.group_arns,
-        tenant: auth_result.tenant,
+        group_arns: auth_result.group_arns.clone(),
+        tenant: auth_result.tenant.clone(),
         is_admin: admin,
     }))
 }
 
-fn require_admin(auth: Option<&Extension<AuthResult>>, state: &UnityState) -> Result<()> {
-    let Some(Extension(auth_result)) = auth else {
-        return Ok(());
-    };
-    if auth_result.is_system_admin() {
-        return Ok(());
+/// Policy management on a catalog and what is in it is its
+/// administrators'.
+async fn require_admin(
+    state: &UnityState,
+    auth: Option<&Extension<AuthResult>>,
+    catalog: &str,
+) -> Result<()> {
+    if catalog_access(state, auth, catalog).await?.administers {
+        Ok(())
+    } else {
+        Err(UnityError::forbidden(
+            "Admin access required for Unity policy management.",
+        ))
     }
-    let arns = std::iter::once(auth_result.user_arn.as_str())
-        .chain(auth_result.group_arns.iter().map(String::as_str));
-    for arn in arns {
-        if state.admin_principals.iter().any(|p| p == arn) {
-            return Ok(());
-        }
-    }
-    Err(UnityError::forbidden(
-        "Admin access required for Unity policy management.",
-    ))
 }
 
 // ---- Catalog handlers ----
 
 /// `GET /api/2.1/unity-catalog/catalogs`
 ///
+/// A caller sees its own tenant's catalogs; a catalog admin sees all.
+///
 /// # Errors
 /// Returns `UnityError` if the catalog list call fails.
 pub async fn list_catalogs(
     State(state): State<Arc<UnityState>>,
-    _auth: Option<Extension<AuthResult>>,
+    auth: Option<Extension<AuthResult>>,
     Query(_params): Query<ListCatalogsParams>,
 ) -> Result<Json<ListCatalogsResponse>> {
-    let catalogs = state.catalog.list_catalogs(String::new()).await?;
+    let caller = caller(&state, auth.as_ref())?;
+    let catalogs = state
+        .catalog
+        .list_catalogs_with_tenant()
+        .await?
+        .into_iter()
+        .filter(|(tenant, _)| match caller {
+            Caller::Unchecked => true,
+            Caller::Identity(a) => is_admin(a, &state) || a.tenant == *tenant,
+        })
+        .map(|(_, c)| c)
+        .collect();
     Ok(Json(ListCatalogsResponse {
         catalogs,
         next_page_token: None,
@@ -464,6 +523,9 @@ pub async fn list_catalogs(
 
 /// `POST /api/2.1/unity-catalog/catalogs`
 ///
+/// A catalog belongs to its creator's tenant. A catalog admin creates one
+/// in its own (usually the system) tenant; a tenant admin in its tenant.
+///
 /// # Errors
 /// Returns `UnityError` on validation, conflict, or backend failure.
 pub async fn create_catalog(
@@ -471,17 +533,20 @@ pub async fn create_catalog(
     auth: Option<Extension<AuthResult>>,
     Json(req): Json<CreateCatalogRequest>,
 ) -> Result<(StatusCode, Json<CatalogInfo>)> {
-    require_admin(auth.as_ref(), &state)?;
+    let tenant = match caller(&state, auth.as_ref())? {
+        Caller::Unchecked => String::new(),
+        Caller::Identity(a) if is_admin(a, &state) => a.tenant.clone(),
+        Caller::Identity(a) if is_tenant_admin(&state, &a.tenant, a).await? => a.tenant.clone(),
+        Caller::Identity(_) => {
+            return Err(UnityError::forbidden(
+                "Creating a catalog takes a catalog admin or a tenant admin.",
+            ));
+        }
+    };
     let name = req.name.clone();
     let catalog = state
         .catalog
-        .create_catalog(
-            req.name,
-            req.comment,
-            req.owner,
-            String::new(),
-            req.properties,
-        )
+        .create_catalog(req.name, req.comment, req.owner, tenant, req.properties)
         .await?;
     // Auto-attach a default deny-direct-S3 bucket policy on the backing
     // bucket. Forces all reads/writes through Unity-vended STS sessions
@@ -1409,7 +1474,7 @@ pub async fn temporary_table_credentials(
     // table_id is opaque server-side — resolve by scanning catalogs/schemas.
     // For v1 we look up by linear scan; future: indexed lookup table in meta.
     let table = find_table_by_id(&state, &req.table_id).await?;
-    check_policy_chain(
+    let access = check_policy_chain(
         &state,
         auth.as_ref(),
         &table.catalog_name,
@@ -1418,12 +1483,10 @@ pub async fn temporary_table_credentials(
         "unity:GenerateTemporaryCredentials",
     )
     .await?;
-    let user_arn = auth
-        .as_ref()
-        .map_or("anonymous", |Extension(a)| a.user_arn.as_str());
-    let tenant = auth
-        .as_ref()
-        .map_or("", |Extension(a)| a.tenant.as_str());
+    let user_arn = match access.caller {
+        Caller::Identity(a) => a.user_arn.as_str(),
+        Caller::Unchecked => "anonymous",
+    };
     // Map the Databricks-spec operation string ("READ" | "READ_WRITE")
     // onto our internal enum. Anything unrecognised is treated as the
     // safer Read — never silently widen.
@@ -1431,7 +1494,9 @@ pub async fn temporary_table_credentials(
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
-    let creds = sts.issue(user_arn, tenant, &table.storage_location, operation);
+    // Held to the catalog's tenant: a location in another tenant's bucket
+    // gets nothing there.
+    let creds = sts.issue(user_arn, &access.tenant, &table.storage_location, operation);
     Ok(Json(TemporaryTableCredentialsResponse {
         aws_temp_credentials: AwsCredentials {
             access_key_id: creds.access_key_id,
@@ -1466,7 +1531,7 @@ pub async fn temporary_volume_credentials(
         return Err(UnityError::bad_request("volume_id is required"));
     }
     let volume = find_volume_by_id(&state, &req.volume_id).await?;
-    check_policy_chain(
+    let access = check_policy_chain(
         &state,
         auth.as_ref(),
         &volume.catalog_name,
@@ -1475,17 +1540,20 @@ pub async fn temporary_volume_credentials(
         "unity:GenerateTemporaryCredentials",
     )
     .await?;
-    let user_arn = auth
-        .as_ref()
-        .map_or("anonymous", |Extension(a)| a.user_arn.as_str());
-    let tenant = auth
-        .as_ref()
-        .map_or("", |Extension(a)| a.tenant.as_str());
+    let user_arn = match access.caller {
+        Caller::Identity(a) => a.user_arn.as_str(),
+        Caller::Unchecked => "anonymous",
+    };
     let operation = match req.operation.to_ascii_uppercase().as_str() {
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
-    let creds = sts.issue(user_arn, tenant, &volume.storage_location, operation);
+    let creds = sts.issue(
+        user_arn,
+        &access.tenant,
+        &volume.storage_location,
+        operation,
+    );
     Ok(Json(TemporaryVolumeCredentialsResponse {
         aws_temp_credentials: AwsCredentials {
             access_key_id: creds.access_key_id,
@@ -1555,7 +1623,7 @@ pub async fn set_catalog_policy(
     Path(name): Path<String>,
     Json(req): Json<SetPolicyRequest>,
 ) -> Result<StatusCode> {
-    require_admin(auth.as_ref(), &state)?;
+    require_admin(&state, auth.as_ref(), &name).await?;
     let json = serde_json::to_string(&req.policy)
         .map_err(|e| UnityError::bad_request(format!("invalid policy JSON: {e}")))?;
     validate_unity_policy(&json).map_err(UnityError::bad_request)?;
@@ -1575,7 +1643,7 @@ pub async fn get_catalog_policy(
     auth: Option<Extension<AuthResult>>,
     Path(name): Path<String>,
 ) -> Result<Json<GetPolicyResponse>> {
-    require_admin(auth.as_ref(), &state)?;
+    require_admin(&state, auth.as_ref(), &name).await?;
     let bytes = state.catalog.get_catalog_policy(&name).await?;
     let policy = bytes_to_policy(&bytes);
     Ok(Json(GetPolicyResponse { policy }))
@@ -1591,8 +1659,8 @@ pub async fn set_schema_policy(
     Path(full_name): Path<String>,
     Json(req): Json<SetPolicyRequest>,
 ) -> Result<StatusCode> {
-    require_admin(auth.as_ref(), &state)?;
     let (catalog, schema) = parse_schema_full_name(&full_name)?;
+    require_admin(&state, auth.as_ref(), &catalog).await?;
     let json = serde_json::to_string(&req.policy)
         .map_err(|e| UnityError::bad_request(format!("invalid policy JSON: {e}")))?;
     validate_unity_policy(&json).map_err(UnityError::bad_request)?;
@@ -1612,8 +1680,8 @@ pub async fn get_schema_policy(
     auth: Option<Extension<AuthResult>>,
     Path(full_name): Path<String>,
 ) -> Result<Json<GetPolicyResponse>> {
-    require_admin(auth.as_ref(), &state)?;
     let (catalog, schema) = parse_schema_full_name(&full_name)?;
+    require_admin(&state, auth.as_ref(), &catalog).await?;
     let bytes = state.catalog.get_schema_policy(&catalog, &schema).await?;
     Ok(Json(GetPolicyResponse {
         policy: bytes_to_policy(&bytes),
@@ -1630,8 +1698,8 @@ pub async fn set_table_policy(
     Path(full_name): Path<String>,
     Json(req): Json<SetPolicyRequest>,
 ) -> Result<StatusCode> {
-    require_admin(auth.as_ref(), &state)?;
     let (catalog, schema, table) = parse_table_full_name(&full_name)?;
+    require_admin(&state, auth.as_ref(), &catalog).await?;
     let json = serde_json::to_string(&req.policy)
         .map_err(|e| UnityError::bad_request(format!("invalid policy JSON: {e}")))?;
     validate_unity_policy(&json).map_err(UnityError::bad_request)?;
@@ -1703,8 +1771,8 @@ pub async fn get_table_policy(
     auth: Option<Extension<AuthResult>>,
     Path(full_name): Path<String>,
 ) -> Result<Json<GetPolicyResponse>> {
-    require_admin(auth.as_ref(), &state)?;
     let (catalog, schema, table) = parse_table_full_name(&full_name)?;
+    require_admin(&state, auth.as_ref(), &catalog).await?;
     let bytes = state
         .catalog
         .get_table_policy(&catalog, &schema, &table)

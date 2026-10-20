@@ -27,13 +27,17 @@ use tonic::transport::Channel;
 /// The returned router should be nested at the root of the gateway and will
 /// register paths beginning with `/api/2.1/unity-catalog/`. Auth must be
 /// applied externally; handlers expect `Option<Extension<AuthResult>>` so
-/// `--no-auth` mode works the same as for Iceberg.
+/// `--no-auth` mode works the same as for Iceberg. `auth_required` is false
+/// only under `--no-auth`: otherwise a request reaching a handler with no
+/// identity is refused.
+#[allow(clippy::too_many_lines)] // one route table
 pub fn router(
     meta_client: MetadataServiceClient<Channel>,
     policy_evaluator: PolicyEvaluator,
     admin_principals: Vec<String>,
     sts_provider: Option<objectio_auth::sts::StsProvider>,
     s3_endpoint: String,
+    auth_required: bool,
 ) -> Router {
     let catalog = UnityCatalogClient::new(meta_client);
     let state = Arc::new(UnityState {
@@ -42,6 +46,7 @@ pub fn router(
         admin_principals,
         sts_provider,
         s3_endpoint,
+        auth_required,
     });
 
     Router::new()

@@ -807,6 +807,7 @@ pub async fn run(
             admin_principals.clone(),
             Some(sts_provider.clone()),
             s3_endpoint.clone(),
+            !args.no_auth,
         );
         info!(
             "Iceberg REST Catalog at /iceberg/v1/* ({})",
@@ -819,6 +820,7 @@ pub async fn run(
         let iceberg_auth_state = Arc::new(iceberg_auth::IcebergAuthState {
             sigv4_state: Arc::clone(&auth_state),
             oidc_provider: oidc_provider.clone(),
+            required: !args.no_auth,
         });
         if let Some(ref oidc) = oidc_provider {
             let oauth_router = Router::new()
@@ -852,6 +854,7 @@ pub async fn run(
             admin_principals,
             Some(sts_provider),
             s3_endpoint,
+            !args.no_auth,
         );
         info!(
             "Unity Catalog REST API at /api/2.1/unity-catalog/* ({})",
@@ -864,6 +867,7 @@ pub async fn run(
         let unity_auth_state = Arc::new(iceberg_auth::IcebergAuthState {
             sigv4_state: Arc::clone(&auth_state),
             oidc_provider: oidc_provider.clone(),
+            required: !args.no_auth,
         });
         router.layer(middleware::from_fn_with_state(
             unity_auth_state,
@@ -878,6 +882,9 @@ pub async fn run(
             if let Some(rest) = path.strip_prefix("/iceberg/v1/ws/")
                 && let Some(slash_pos) = rest.find('/')
             {
+                // The client signed the URI it sent, not this one.
+                let sent = iceberg_auth::ClientUri(req.uri().clone());
+                req.extensions_mut().insert(sent);
                 let warehouse = &rest[..slash_pos];
                 let remaining = &rest[slash_pos..];
                 let new_path = format!("/iceberg/v1{remaining}");
@@ -1535,7 +1542,7 @@ pub async fn run(
     if !args.no_auth {
         info!("Authentication is ENABLED (credentials from metadata service)");
         info!("Admin API is ENABLED (requires 'admin' user credentials)");
-        info!("Iceberg REST Catalog: /iceberg/v1/* (no SigV4, use OAuth/bearer)");
+        info!("Iceberg REST Catalog: /iceberg/v1/* (SigV4, OIDC bearer or console session)");
     } else {
         info!("Authentication is DISABLED (development mode)");
         info!("Admin API is ENABLED (no auth required in dev mode)");

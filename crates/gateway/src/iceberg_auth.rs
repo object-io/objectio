@@ -25,10 +25,55 @@ use tracing::{debug, warn};
 pub struct IcebergAuthState {
     pub sigv4_state: Arc<AuthState>,
     pub oidc_provider: Option<Arc<OidcProvider>>,
+    /// Authentication is on (no `--no-auth`): a request goes on only with
+    /// an identity that checks out.
+    pub required: bool,
+}
+
+/// The URI a request arrived with, before the warehouse prefix rewrite
+/// (`/iceberg/v1/ws/{wh}/...` → `/iceberg/v1/...?warehouse={wh}`) changed
+/// it: the one its client signed.
+#[derive(Clone)]
+pub struct ClientUri(pub axum::http::Uri);
+
+/// The URI the client signed: as it arrived, before the prefix rewrite and
+/// before the router stripped its nesting prefix.
+fn signed_uri(request: &Request<Body>) -> axum::http::Uri {
+    request
+        .extensions()
+        .get::<ClientUri>()
+        .map(|u| u.0.clone())
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<axum::extract::OriginalUri>()
+                .map(|u| u.0.clone())
+        })
+        .unwrap_or_else(|| request.uri().clone())
+}
+
+/// Why a presented or missing credential gets no further.
+fn refuse(status: StatusCode, message: &str) -> Response {
+    crate::gateway_metrics::record_auth_failure("lake");
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": match status {
+                StatusCode::UNAUTHORIZED => "NotAuthorizedException",
+                StatusCode::FORBIDDEN => "ForbiddenException",
+                _ => "ServiceUnavailableException",
+            },
+            "code": status.as_u16(),
+        }
+    });
+    (status, axum::Json(body)).into_response()
 }
 
 /// Unified Iceberg auth middleware — tries SigV4, then OIDC, then session cookie.
-/// If none succeed, passes through unauthenticated (handlers check `Option<Extension<AuthResult>>`).
+///
+/// With authentication on, a credential that doesn't check out is a 401,
+/// and so is none at all: the handlers never see a request with no
+/// identity. Under `--no-auth` a request without one goes on as it is.
 pub async fn iceberg_unified_auth_layer(
     State(state): State<Arc<IcebergAuthState>>,
     mut request: Request<Body>,
@@ -46,11 +91,29 @@ pub async fn iceberg_unified_auth_layer(
     {
         match crate::auth_middleware::parse_authorization_header(header) {
             Ok(parsed) => {
-                if let Ok(cred) = state
+                let cred = match state
                     .sigv4_state
                     .lookup_credential(parsed.access_key_id())
                     .await
                 {
+                    Ok(cred) => Some(cred),
+                    Err(crate::auth_middleware::AuthError::Unavailable(msg)) if state.required => {
+                        warn!("Iceberg SigV4 credential lookup: {msg}");
+                        return refuse(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Credentials could not be checked; retry",
+                        );
+                    }
+                    Err(e) => {
+                        debug!("Iceberg SigV4 credential refused: {e:?}");
+                        None
+                    }
+                };
+                if let Some(cred) = cred {
+                    // Checked against the request as signed: the router
+                    // sees it under a stripped (and maybe rewritten) path.
+                    let sent = signed_uri(&request);
+                    let routed = std::mem::replace(request.uri_mut(), sent);
                     let verify_result = crate::auth_middleware::verify_request_v4(
                         &request,
                         &parsed.signed_headers,
@@ -58,7 +121,20 @@ pub async fn iceberg_unified_auth_layer(
                         &cred,
                         &state.sigv4_state.region,
                     );
+                    *request.uri_mut() = routed;
                     if let Ok(mut auth_result) = verify_result {
+                        // A key confined to a bucket or prefix is for that
+                        // data, as on the admin API: catalog operations
+                        // don't fall inside it.
+                        if state.required
+                            && cred.scope.as_ref().is_some_and(|s| !s.scope.is_empty())
+                        {
+                            return refuse(
+                                StatusCode::FORBIDDEN,
+                                "This access key is scoped to a bucket or prefix \
+                                 and cannot be used on the catalog APIs",
+                            );
+                        }
                         // Stitch group memberships so policies attached to
                         // an IAM group cascade to its members on the Unity/
                         // Iceberg path too. (Auth-middleware does the same
@@ -81,6 +157,12 @@ pub async fn iceberg_unified_auth_layer(
             Err(e) => {
                 debug!("Iceberg SigV4 parse failed: {:?}", e);
             }
+        }
+        if state.required {
+            return refuse(
+                StatusCode::UNAUTHORIZED,
+                "The request signature does not check out",
+            );
         }
     }
 
@@ -149,6 +231,18 @@ pub async fn iceberg_unified_auth_layer(
                 warn!("Iceberg OIDC auth failed: {}", e);
             }
         }
+    }
+    // A bearer token we couldn't accept, or one with no identity provider
+    // configured to check it.
+    if state.required
+        && auth_header
+            .as_deref()
+            .is_some_and(|h| h.starts_with("Bearer "))
+    {
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "The bearer token was not accepted",
+        );
     }
 
     // 3. Try console session cookie. The cookie payload only carries the
@@ -248,7 +342,11 @@ pub async fn iceberg_unified_auth_layer(
         return next.run(request).await;
     }
 
-    // 4. No auth — pass through unauthenticated
+    // 4. No credential: refused with auth on; under --no-auth it goes on
+    // with no identity, which the handlers read as "nothing is checked".
+    if state.required {
+        return refuse(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
     next.run(request).await
 }
 

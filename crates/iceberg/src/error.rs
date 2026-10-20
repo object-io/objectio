@@ -96,6 +96,26 @@ impl IcebergError {
             message: message.into(),
         }
     }
+
+    #[must_use]
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            code: StatusCode::UNAUTHORIZED,
+            error_type: "NotAuthorizedException".to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// Meta couldn't answer a read a decision rests on: retry, rather than
+    /// a decision made on part of the facts.
+    #[must_use]
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            code: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "ServiceUnavailableException".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for IcebergError {
@@ -125,6 +145,7 @@ impl From<tonic::Status> for IcebergError {
                     Self::commit_failed(msg)
                 }
             }
+            tonic::Code::Unavailable => Self::unavailable(status.message()),
             _ => Self::internal(status.message()),
         }
     }
