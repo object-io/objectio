@@ -164,24 +164,34 @@ struct Config {
     logging: LoggingConfig,
 }
 
-#[derive(Debug, Deserialize, Default)]
+/// `[osd]`. A field left out, or the whole table, takes its value from
+/// `Default`, so a file without the table and no file at all mean the same.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 #[allow(dead_code)]
 struct OsdConfig {
-    #[serde(default)]
     node_id: Option<String>,
-    #[serde(default)]
     node_name: Option<String>,
-    #[serde(default = "default_listen")]
     listen: String,
     /// Address to advertise to metadata service (how other services reach this OSD)
-    #[serde(default)]
     advertise_addr: Option<String>,
-    #[serde(default = "default_meta_endpoint")]
     meta_endpoint: String,
-    #[serde(default)]
     failure_domain: FailureDomainConfig,
-    #[serde(default = "default_weight")]
     weight: f64,
+}
+
+impl Default for OsdConfig {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            node_name: None,
+            listen: default_listen(),
+            advertise_addr: None,
+            meta_endpoint: default_meta_endpoint(),
+            failure_domain: FailureDomainConfig::default(),
+            weight: default_weight(),
+        }
+    }
 }
 
 /// Failure domain configuration — defines where this OSD sits in the
@@ -253,18 +263,26 @@ impl Default for StorageConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 struct LoggingConfig {
-    #[serde(default = "default_log_level")]
     level: String,
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
+}
+
 fn default_listen() -> String {
-    "0.0.0.0:9002".to_string()
+    "0.0.0.0:9200".to_string()
 }
 
 fn default_meta_endpoint() -> String {
-    "http://localhost:9001".to_string()
+    "http://localhost:9100".to_string()
 }
 
 /// Disk allocation granularity.
@@ -1102,5 +1120,35 @@ mod tests {
             }
         }
         assert!(parsed >= 5, "found {parsed} example OSD configs");
+    }
+
+    /// What a config leaves out is the default, the cluster's conventions,
+    /// however much it leaves out: a file without `[logging]` once set the
+    /// OSD's log level to nothing, and so logged nothing.
+    #[test]
+    fn a_setting_left_out_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("osd.toml");
+        let none = dir.path().join("none.toml");
+        for text in [
+            "",
+            "[storage]\ndisks = [\"/dev/sdb\"]\n",
+            "[osd]\n[logging]\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            for config in [
+                super::load_config(path.to_str().unwrap()).unwrap(),
+                super::load_config(none.to_str().unwrap()).unwrap(),
+            ] {
+                assert_eq!(config.osd.listen, "0.0.0.0:9200", "{text:?}");
+                assert_eq!(config.osd.meta_endpoint, "http://localhost:9100");
+                assert!((config.osd.weight - 1.0).abs() < f64::EPSILON);
+                assert_eq!(config.logging.level, "info");
+                assert_eq!(
+                    config.storage.block_size,
+                    objectio_storage::DEFAULT_BLOCK_SIZE as usize
+                );
+            }
+        }
     }
 }

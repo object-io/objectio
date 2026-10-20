@@ -4,8 +4,8 @@
 
 [osd]
 node_name = "osd-node3"
-listen = "0.0.0.0:9002"
-meta_endpoint = "http://meta.objectio.local:9001"
+listen = "0.0.0.0:9200"
+meta_endpoint = "http://meta.objectio.local:9100"
 weight = 1.0
 
 # Node 3 is in rack-03
@@ -29,7 +29,6 @@ disks = [
     "/mnt/nvme10",
     "/mnt/nvme11",
 ]
-block_size = 4194304
 data_dir = "/var/lib/objectio/osd"
 
 [logging]

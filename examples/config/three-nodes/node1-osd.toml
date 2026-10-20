@@ -1,19 +1,17 @@
 # ObjectIO OSD Configuration - Three Node Deployment (Node 1)
 #
-# Three-node deployment with each node in a different rack.
-# Failure domain at NODE level - shards spread across nodes.
-#
-# Recommended EC: 6+3 (survives 1 full node failure)
-# Alternative EC: 4+2 (survives 2 disk failures per node)
+# Three-node deployment with each node in a different rack, one OSD per
+# node: EC 2+1 survives one node or rack. Wider codes need more OSDs (one
+# per drive).
 
 [osd]
 node_name = "osd-node1"
-listen = "0.0.0.0:9002"
-meta_endpoint = "http://meta.objectio.local:9001"
+listen = "0.0.0.0:9200"
+meta_endpoint = "http://meta.objectio.local:9100"
 weight = 1.0
 
 # Node 1 is in rack-01
-# CRUSH spreads shards across different RACKS (and thus nodes)
+# A pool spread over racks puts each shard in a different one
 [osd.failure_domain]
 region = "us-east"
 datacenter = "dc1"
@@ -35,7 +33,6 @@ disks = [
     "/mnt/nvme10",
     "/mnt/nvme11",
 ]
-block_size = 4194304
 data_dir = "/var/lib/objectio/osd"
 
 [logging]
