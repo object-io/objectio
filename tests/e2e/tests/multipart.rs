@@ -625,3 +625,52 @@ fn a_completion_whose_answer_was_lost_completes_on_the_retry() {
         assert!(!open.contains("<Upload>"), "versioned {versioned}: {open}");
     }
 }
+
+/// A part in a replicated pool is acknowledged as a replicated PUT is:
+/// with two copies on disk (of three), and 503 short of that. It was
+/// acknowledged with one copy, its data on one disk.
+#[test]
+fn a_replicated_part_is_acknowledged_with_the_replica_quorum() {
+    use objectio_e2e::ha::HaCluster;
+    use std::time::Duration;
+
+    // Three OSDs, all three the pool's one placement group: none to stand
+    // in for one stopped.
+    let mut ha = HaCluster::start(1, 3, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "rep3", "ec_type": 2, "replication_count": 3, "pg_count": 1,
+            "failure_domain": "osd", "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    c.request_with_headers("PUT", "/rep", &[], &[("x-objectio-pool", "rep3")])
+        .expect(200);
+    let body: Vec<u8> = (0..PART).map(|i| u8::try_from(i % 251).unwrap()).collect();
+    c.request("PUT", "/rep/whole", &body).expect(200);
+    let upload = initiate(c, "rep", "parts");
+    let part = |c: &Cluster, n: u32| {
+        c.request(
+            "PUT",
+            &format!("/rep/parts?partNumber={n}&uploadId={upload}"),
+            &body,
+        )
+    };
+    part(c, 1).expect(200);
+
+    // One copy short: both still have two.
+    ha.stop_osd(0);
+    let c = &ha.clients[0];
+    c.request("PUT", "/rep/one-down", &body).expect(200);
+    part(c, 2).expect(200);
+
+    // Two short: one copy is no acknowledgement, for either.
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    let put = c.request("PUT", "/rep/two-down", &body);
+    assert_eq!(put.status, 503, "PUT with one copy: {}", put.text());
+    let got = part(c, 3);
+    assert_eq!(got.status, 503, "UploadPart with one copy: {}", got.text());
+}
