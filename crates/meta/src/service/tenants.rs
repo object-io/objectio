@@ -2,7 +2,44 @@
 
 use super::*;
 
+/// Where OIDC providers are kept in config: `identity/openid/<name>`. A
+/// tenant's `oidc_provider` names one.
+pub(super) const OIDC_PROVIDER_PREFIX: &str = "identity/openid/";
+
 impl MetaService {
+    /// The tenants whose `oidc_provider` is `provider`, by name.
+    pub(super) fn tenants_using_oidc_provider(&self, provider: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tenants
+            .read()
+            .values()
+            .filter(|t| t.oidc_provider == provider)
+            .map(|t| t.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A tenant may name only an OIDC provider that exists: one it named
+    /// that didn't would sign nobody in, and fail only at the first login.
+    #[allow(clippy::result_large_err)] // the Status the RPC returns, as is
+    fn check_oidc_provider(&self, tenant: &TenantConfig) -> Result<(), Status> {
+        let provider = &tenant.oidc_provider;
+        if provider.is_empty()
+            || self
+                .config
+                .read()
+                .contains_key(&format!("{OIDC_PROVIDER_PREFIX}{provider}"))
+        {
+            return Ok(());
+        }
+        Err(Status::invalid_argument(format!(
+            "tenant '{}': OIDC provider '{provider}' does not exist; create it first \
+             (PUT /_admin/config/{OIDC_PROVIDER_PREFIX}{provider}), or leave oidc_provider empty",
+            tenant.name
+        )))
+    }
+
     /// Mirror a committed tenant write, so every replica — not only the
     /// leader that served it — sees a tenant's settings (its dedup policy
     /// among them) change.
@@ -39,6 +76,7 @@ impl MetaService {
                 tenant.name
             )));
         }
+        self.check_oidc_provider(&tenant)?;
         let mut tenant = tenant;
         tenant.created_at = Self::current_timestamp();
         tenant.updated_at = tenant.created_at;
@@ -117,13 +155,19 @@ impl MetaService {
             .into_inner()
             .tenant
             .ok_or_else(|| Status::invalid_argument("missing tenant"))?;
-        let expected_bytes = {
+        let (expected_bytes, provider_changed) = {
             let tenants = self.tenants.read();
-            tenants
+            let current = tenants
                 .get(&tenant.name)
-                .ok_or_else(|| Status::not_found(format!("tenant '{}' not found", tenant.name)))?
-                .encode_to_vec()
+                .ok_or_else(|| Status::not_found(format!("tenant '{}' not found", tenant.name)))?;
+            (
+                current.encode_to_vec(),
+                current.oidc_provider != tenant.oidc_provider,
+            )
         };
+        if provider_changed {
+            self.check_oidc_provider(&tenant)?;
+        }
         tenant.updated_at = Self::current_timestamp();
         let new_bytes = tenant.encode_to_vec();
 

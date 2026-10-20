@@ -454,6 +454,33 @@ pub async fn admin_delete_config(
     }
 
     let mut client = state.meta_client.clone();
+
+    // A tenant admin deleting the tenant's own provider: undo the binding
+    // that saving it made (`admin_set_config`), or meta refuses the delete
+    // while the tenant names it, and only the system admin could unbind.
+    if !is_system_admin(&caller)
+        && let Some((tenant_name, slug_key)) = caller_tenant_slug_key(&auth, &headers)
+        && section == slug_key
+        && let Ok(t_resp) = client
+            .get_tenant(GetTenantRequest {
+                name: tenant_name.clone(),
+            })
+            .await
+        && let Some(mut tenant) = t_resp.into_inner().tenant
+        && tenant.oidc_provider == tenant_oidc_slug(&tenant_name)
+    {
+        tenant.oidc_provider.clear();
+        if let Err(e) = client
+            .update_tenant(UpdateTenantRequest {
+                tenant: Some(tenant),
+            })
+            .await
+        {
+            warn!("Unbinding tenant '{tenant_name}' from its OIDC provider failed: {e}");
+            return meta_failure(&e);
+        }
+    }
+
     match client
         .delete_config(DeleteConfigRequest {
             key: section.clone(),
@@ -467,6 +494,18 @@ pub async fn admin_delete_config(
             } else {
                 (StatusCode::NOT_FOUND, "Config not found").into_response()
             }
+        }
+        // Still in use: an OIDC provider a tenant names. Meta names the
+        // tenants, which only the system admin may see.
+        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+            let why = if is_system_admin(&caller) {
+                e.message().to_string()
+            } else {
+                "this OIDC provider is in use by a tenant; the system admin must set that \
+                 tenant's oidc_provider to another provider, or clear it, first"
+                    .to_string()
+            };
+            (StatusCode::CONFLICT, why).into_response()
         }
         Err(e) => {
             warn!("Failed to delete config '{}': {}", section, e);
