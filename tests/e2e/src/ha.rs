@@ -119,11 +119,17 @@ fn log_target() -> Stdio {
     }
 }
 
-fn http() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("http client")
+/// A client for the meta nodes' admin ports, built once (see
+/// [`crate::http_client`]).
+fn http() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("http client")
+    })
 }
 
 /// A meta node's Raft view, from its admin port.

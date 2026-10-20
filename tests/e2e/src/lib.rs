@@ -60,6 +60,25 @@ pub struct Cluster {
     extra_args: Vec<String>,
 }
 
+/// The HTTP client every request of the harness goes through, built once.
+///
+/// Building one loads and parses the system's root certificates (rustls
+/// with native roots), tens of milliseconds in a debug build. Built per
+/// request, that made the rolling upgrade, which reads back every object
+/// at every step, outrun its CI limit. It keeps no idle connection, so each
+/// request opens its own, as before: never one to a node a test restarted
+/// since.
+pub fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("http client")
+    })
+}
+
 impl Drop for Cluster {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -809,10 +828,7 @@ impl Cluster {
     }
 
     fn fetch_raw(method: &str, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Response {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
+        let client = http_client();
         let mut req = client.request(method.parse().expect("method"), url);
         for (name, value) in headers {
             req = req.header(*name, *value);
@@ -981,10 +997,7 @@ impl Cluster {
         key = hmac(&key, "aws4_request");
         let signature = hex::encode(hmac(&key, &string_to_sign));
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
+        let client = http_client();
         let mut req = client
             .request(
                 method.parse().expect("method"),
@@ -1080,10 +1093,7 @@ impl Cluster {
         key = hmac(&key, "aws4_request");
         let signature = hex::encode(hmac(&key, &string_to_sign));
 
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
+        let client = http_client();
         let url = if query.is_empty() {
             format!("{}{escaped_path}", self.endpoint)
         } else {
@@ -1163,10 +1173,7 @@ impl Cluster {
         key = hmac(&key, service);
         key = hmac(&key, "aws4_request");
         let signature = hex::encode(hmac(&key, &string_to_sign));
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap();
+        let client = http_client();
         let mut req = client
             .post(format!("{}/", self.endpoint))
             .header(
