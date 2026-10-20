@@ -139,18 +139,21 @@ pub async fn run(
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind metrics on {addr}"))?;
-        let app = axum::Router::new().route(
-            "/metrics",
-            axum::routing::get(|| async {
-                // Erasure coding and process stats too: under aio the
-                // gateway exports these for the whole process already.
-                let mut out = objectio_common::metrics_registry::render_registered();
-                objectio_erasure::metrics::render(&mut out);
-                out.push_str(&objectio_common::process_metrics::render(""));
-                out
-            }),
-        );
-        info!("Block gateway metrics on {addr}/metrics");
+        let app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(|| async {
+                    // Erasure coding and process stats too: under aio the
+                    // gateway exports these for the whole process already.
+                    let mut out = objectio_common::metrics_registry::render_registered();
+                    objectio_erasure::metrics::render(&mut out);
+                    out.push_str(&objectio_common::process_metrics::render(""));
+                    out
+                }),
+            )
+            // Liveness, as meta's: the process is up and serving HTTP.
+            .route("/health", axum::routing::get(|| async { "OK" }));
+        info!("Block gateway metrics on {addr}/metrics, liveness on /health");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("block gateway metrics server stopped: {e}");

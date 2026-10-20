@@ -168,11 +168,15 @@ RUN groupadd -r objectio && useradd -r -g objectio objectio
 RUN mkdir -p /etc/objectio /var/lib/objectio /var/log/objectio \
     && chown -R objectio:objectio /var/lib/objectio /var/log/objectio
 
-# Health check script
+# Health check: `healthcheck.sh PORT [PATH]` is healthy when
+# http://127.0.0.1:PORT/PATH (/health by default) answers 200. Bash's
+# /dev/tcp, so the image needs no HTTP client.
 COPY --chmod=755 <<'EOF' /usr/local/bin/healthcheck.sh
-#!/bin/sh
-# Generic health check - services should override
-exit 0
+#!/bin/bash
+exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+printf 'GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' "${2:-/health}" >&3
+read -r _ code _ <&3
+[ "$code" = 200 ]
 EOF
 
 # =============================================================================
@@ -197,7 +201,7 @@ USER objectio
 EXPOSE 9000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9000/health || exit 1
+    CMD ["/usr/local/bin/healthcheck.sh", "9000"]
 
 ENTRYPOINT ["objectio-gateway"]
 CMD ["--listen", "0.0.0.0:9000"]
@@ -217,15 +221,15 @@ COPY --from=builder /build/target/release/objectio-meta /usr/local/bin/
 
 USER objectio
 
-# 9100: gRPC API and Raft
-# 9101: Prometheus metrics
-# 9102: admin (Raft bootstrap and membership, status)
+# 9100: gRPC, for clients and Raft between metas
+# 9101: /metrics and /health
+# 9102: Raft admin (/init, /add-learner, /change-membership, /status)
 EXPOSE 9100 9101 9102
 
 VOLUME ["/var/lib/objectio"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD /usr/local/bin/healthcheck.sh
+    CMD ["/usr/local/bin/healthcheck.sh", "9101"]
 
 ENTRYPOINT ["objectio-meta"]
 CMD ["--listen", "0.0.0.0:9100", "--data-dir", "/var/lib/objectio/meta"]
@@ -245,14 +249,14 @@ COPY --from=builder /build/target/release/objectio-osd /usr/local/bin/
 
 USER objectio
 
-# 9200: gRPC API
-# 9201: Prometheus metrics
+# 9200: gRPC
+# 9201: /metrics and /health (503 while a disk has had I/O or checksum errors)
 EXPOSE 9200 9201
 
 VOLUME ["/var/lib/objectio"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD /usr/local/bin/healthcheck.sh
+    CMD ["/usr/local/bin/healthcheck.sh", "9201"]
 
 ENTRYPOINT ["objectio-osd"]
 CMD ["--listen", "0.0.0.0:9200", "--data-dir", "/var/lib/objectio/osd"]
@@ -291,13 +295,14 @@ COPY --from=builder /build/target/release/objectio-block-gateway /usr/local/bin/
 USER objectio
 
 # 9300: gRPC BlockService
+# 9301: /metrics and /health
 # 10809: NBD TCP server
-EXPOSE 9300 10809
+EXPOSE 9300 9301 10809
 
 VOLUME ["/var/lib/objectio"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD /usr/local/bin/healthcheck.sh
+    CMD ["/usr/local/bin/healthcheck.sh", "9301"]
 
 ENTRYPOINT ["objectio-block-gateway"]
 CMD ["--listen", "0.0.0.0:9300", "--nbd-listen", "0.0.0.0:10809", "--data-dir", "/var/lib/objectio/block-gw"]

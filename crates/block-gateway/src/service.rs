@@ -20,7 +20,7 @@ use objectio_proto::block::{
     ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesRequest, ListVolumesResponse,
     ReadRequest, ReadResponse, ResizeVolumeRequest, ResizeVolumeResponse, TargetType, TrimRequest,
     TrimResponse, UpdateVolumeQosRequest, UpdateVolumeQosResponse, Volume as ProtoVolume,
-    VolumeState as ProtoVolumeState, VolumeStats, WriteRequest, WriteResponse,
+    VolumeQos, VolumeState as ProtoVolumeState, WriteRequest, WriteResponse,
 };
 use objectio_proto::metadata::{
     BlockCloneVolumeRequest, BlockCreateSnapshotRequest, BlockCreateVolumeRequest,
@@ -245,6 +245,9 @@ impl BlockService for BlockGatewayService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let req = request.into_inner();
+        if req.qos.is_some_and(|q| q != VolumeQos::default()) {
+            return Err(unimplemented(QOS));
+        }
         let chunk_size = valid_chunk_size(req.chunk_size_bytes, self.state.ec_k)
             .map_err(Status::invalid_argument)?;
         let vol = some(
@@ -394,42 +397,18 @@ impl BlockService for BlockGatewayService {
 
     async fn update_volume_qos(
         &self,
-        request: Request<UpdateVolumeQosRequest>,
+        _request: Request<UpdateVolumeQosRequest>,
     ) -> Result<Response<UpdateVolumeQosResponse>, Status> {
-        let req = request.into_inner();
-        let vol = self
-            .state
-            .meta
-            .client()
-            .await
-            .block_get_volume(BlockGetVolumeRequest {
-                volume_id: req.volume_id,
-                name: String::new(),
-            })
-            .await?
-            .into_inner()
-            .volume;
-        Ok(Response::new(UpdateVolumeQosResponse { volume: vol }))
+        Err(unimplemented(QOS))
     }
 
     async fn get_volume_stats(
         &self,
-        request: Request<GetVolumeStatsRequest>,
+        _request: Request<GetVolumeStatsRequest>,
     ) -> Result<Response<GetVolumeStatsResponse>, Status> {
-        let req = request.into_inner();
-
-        // Validate volume exists
-        self.state
-            .volume_manager
-            .get_volume(&req.volume_id)
-            .map_err(block_err_to_status)?;
-
-        Ok(Response::new(GetVolumeStatsResponse {
-            stats: Some(VolumeStats {
-                volume_id: req.volume_id,
-                ..Default::default()
-            }),
-        }))
+        Err(unimplemented(
+            "per-volume stats (the block gateway's /metrics has its I/O)",
+        ))
     }
 
     // ── Snapshot CRUD ─────────────────────────────────────────────────────────
@@ -754,35 +733,48 @@ impl BlockService for BlockGatewayService {
         Ok(Response::new(TrimResponse { success: true }))
     }
 
-    // ── Metrics (stubs) ───────────────────────────────────────────────────────
+    // ── Metrics: not implemented; the cluster's are on /metrics ──────────────
 
     async fn get_osd_metrics(
         &self,
         _request: Request<GetOsdMetricsRequest>,
     ) -> Result<Response<GetOsdMetricsResponse>, Status> {
-        Ok(Response::new(GetOsdMetricsResponse { metrics: None }))
+        Err(unimplemented(METRICS))
     }
 
     async fn list_osd_metrics(
         &self,
         _request: Request<ListOsdMetricsRequest>,
     ) -> Result<Response<ListOsdMetricsResponse>, Status> {
-        Ok(Response::new(ListOsdMetricsResponse { osds: vec![] }))
+        Err(unimplemented(METRICS))
     }
 
     async fn get_cluster_metrics(
         &self,
         _request: Request<GetClusterMetricsRequest>,
     ) -> Result<Response<GetClusterMetricsResponse>, Status> {
-        Ok(Response::new(GetClusterMetricsResponse { metrics: None }))
+        Err(unimplemented(METRICS))
     }
 
     async fn get_io_trace(
         &self,
         _request: Request<GetIoTraceRequest>,
     ) -> Result<Response<GetIoTraceResponse>, Status> {
-        Ok(Response::new(GetIoTraceResponse { traces: vec![] }))
+        Err(unimplemented("I/O tracing"))
     }
+}
+
+/// Volume QoS: neither stored nor enforced.
+const QOS: &str = "volume QoS (it is not enforced)";
+
+/// The OSD and cluster metrics calls: Prometheus has them, from each
+/// service's /metrics.
+const METRICS: &str = "OSD and cluster metrics over gRPC (scrape /metrics)";
+
+/// A call this gateway does not implement fails as UNIMPLEMENTED, never
+/// OK with nothing done or with zeros for figures.
+fn unimplemented(what: &str) -> Status {
+    Status::unimplemented(format!("{what}: not implemented by the block gateway"))
 }
 
 #[cfg(test)]

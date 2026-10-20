@@ -21,22 +21,16 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use objectio_auth::presign::presign_get;
-use objectio_proto::metadata::{
-    DeltaShareTableEntry, IcebergLoadTableRequest, metadata_service_client::MetadataServiceClient,
-};
+use objectio_proto::metadata::DeltaShareTableEntry;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::Channel;
-use tracing::error;
 
 type Result<T> = std::result::Result<T, DeltaError>;
 
 /// Shared state for Delta Sharing handlers.
 pub struct DeltaState {
     pub catalog: DeltaCatalog,
-    /// Meta client for Iceberg table lookups
-    pub meta_client: MetadataServiceClient<Channel>,
     /// Gateway public endpoint (e.g. `http://localhost:9000`)
     pub endpoint: String,
     /// AWS region for presigned URL credential scope
@@ -50,46 +44,6 @@ pub struct DeltaState {
     /// Default lifetime of presigned data-file URLs returned in /query responses.
     /// Operators can tune this for long-running Spark/Databricks queries.
     pub default_url_ttl: Duration,
-}
-
-impl DeltaState {
-    fn presign(&self, bucket: &str, key: &str, expires_in: Duration) -> String {
-        presign_get(
-            &self.endpoint,
-            &self.region,
-            &self.access_key_id,
-            &self.secret_access_key,
-            bucket,
-            key,
-            expires_in,
-        )
-    }
-
-    /// Load an Iceberg table's metadata JSON.
-    async fn load_iceberg_table_meta(
-        &self,
-        namespace: &str,
-        table_name: &str,
-    ) -> Result<Option<serde_json::Value>> {
-        let resp = self
-            .meta_client
-            .clone()
-            .iceberg_load_table(IcebergLoadTableRequest {
-                namespace_levels: vec![namespace.to_string()],
-                table_name: table_name.to_string(),
-                warehouse: String::new(),
-            })
-            .await
-            .map_err(DeltaError::from)?;
-
-        let bytes = resp.into_inner().metadata_json;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let val: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| DeltaError::internal(format!("invalid iceberg metadata: {e}")))?;
-        Ok(Some(val))
-    }
 }
 
 // ---- Delta Sharing protocol endpoints ----
@@ -234,13 +188,8 @@ pub async fn get_table_version(
 
     let entry = find_share_table(&state, &share, &schema, &table).await?;
 
-    let version = match table_kind(&entry)? {
-        TableKind::Delta => {
-            let snapshot = build_delta_snapshot(&state, &entry).await?;
-            snapshot.version
-        }
-        TableKind::Iceberg => get_snapshot_id(&state, &schema, &table).await?,
-    };
+    delta_only(&entry.table_type, &schema, &table)?;
+    let version = build_delta_snapshot(&state, &entry).await?.version;
 
     Ok(Json(TableVersionResponse {
         delta_table_version: version,
@@ -259,21 +208,9 @@ pub async fn get_table_metadata(
     authenticate_request(&headers, &state.catalog, Some(&share)).await?;
     let entry = find_share_table(&state, &share, &schema, &table).await?;
 
-    let (protocol_line, metadata_line) = match table_kind(&entry)? {
-        TableKind::Delta => {
-            let snapshot = build_delta_snapshot(&state, &entry).await?;
-            build_delta_metadata_lines(&table, &snapshot)
-        }
-        TableKind::Iceberg => {
-            let meta = state
-                .load_iceberg_table_meta(&schema, &table)
-                .await?
-                .ok_or_else(|| {
-                    DeltaError::not_found(format!("table {schema}.{table} has no metadata"))
-                })?;
-            build_metadata_lines(&table, &meta)
-        }
-    };
+    delta_only(&entry.table_type, &schema, &table)?;
+    let snapshot = build_delta_snapshot(&state, &entry).await?;
+    let (protocol_line, metadata_line) = build_delta_metadata_lines(&table, &snapshot);
 
     let body = format!(
         "{}\n{}\n",
@@ -300,25 +237,10 @@ pub async fn query_table(
     authenticate_request(&headers, &state.catalog, Some(&share)).await?;
     let entry = find_share_table(&state, &share, &schema, &table).await?;
 
-    let (protocol_line, metadata_line, file_lines) = match table_kind(&entry)? {
-        TableKind::Delta => {
-            let snapshot = build_delta_snapshot(&state, &entry).await?;
-            let (p, m) = build_delta_metadata_lines(&table, &snapshot);
-            let files = build_delta_file_lines(&state, &entry, &snapshot);
-            (p, m, files)
-        }
-        TableKind::Iceberg => {
-            let meta = state
-                .load_iceberg_table_meta(&schema, &table)
-                .await?
-                .ok_or_else(|| {
-                    DeltaError::not_found(format!("table {schema}.{table} has no metadata"))
-                })?;
-            let (p, m) = build_metadata_lines(&table, &meta);
-            let files = extract_file_lines(&state, &schema, &meta);
-            (p, m, files)
-        }
-    };
+    delta_only(&entry.table_type, &schema, &table)?;
+    let snapshot = build_delta_snapshot(&state, &entry).await?;
+    let (protocol_line, metadata_line) = build_delta_metadata_lines(&table, &snapshot);
+    let file_lines = build_delta_file_lines(&state, &entry, &snapshot);
 
     let mut body = String::new();
     body.push_str(&serde_json::to_string(&protocol_line).unwrap_or_default());
@@ -357,19 +279,22 @@ async fn find_share_table(
         })
 }
 
-/// Backing-table dispatch kind. Determined by `entry.table_type`.
-#[derive(Debug)]
-enum TableKind {
-    /// Native Delta Lake table (`_delta_log/` JSON commits in `bucket`/`path`)
-    Delta,
-    /// Iceberg table loaded via the warehouse meta service
-    Iceberg,
-}
-
-fn table_kind(entry: &DeltaShareTableEntry) -> Result<TableKind> {
-    match entry.table_type.as_str() {
-        "delta" => Ok(TableKind::Delta),
-        "" | "iceberg" | "uniform" => Ok(TableKind::Iceberg),
+/// A share serves Delta tables only (`table_type` "delta").
+///
+/// What it returns are the files of a `_delta_log`. An Iceberg table (`iceberg`,
+/// `uniform`, or no type) is refused: there is no Delta log to serve, and
+/// what was sent instead (its manifest list, as a Parquet file) no client
+/// can read. Iceberg tables are read through the Iceberg REST catalog.
+///
+/// # Errors
+/// A 400 naming the table, for any type but "delta".
+pub fn delta_only(table_type: &str, schema: &str, table: &str) -> Result<()> {
+    match table_type {
+        "delta" => Ok(()),
+        "" | "iceberg" | "uniform" => Err(DeltaError::bad_request(format!(
+            "table '{schema}.{table}' is an Iceberg table: Delta Sharing serves Delta tables \
+             only (table_type \"delta\"); read Iceberg tables through the Iceberg REST catalog"
+        ))),
         other => Err(DeltaError::bad_request(format!(
             "unknown share table_type: '{other}'"
         ))),
@@ -502,165 +427,12 @@ fn file_key(table_root: &str, file_path: &str) -> String {
     }
 }
 
-/// Get the current snapshot ID from Iceberg table metadata.
-async fn get_snapshot_id(state: &DeltaState, schema: &str, table: &str) -> Result<i64> {
-    let meta = state
-        .load_iceberg_table_meta(schema, table)
-        .await?
-        .ok_or_else(|| DeltaError::not_found(format!("table {schema}.{table} has no metadata")))?;
-
-    Ok(meta
-        .get("current-snapshot-id")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0))
-}
-
-/// Build NDJSON protocol + metadata lines from Iceberg table metadata JSON.
-fn build_metadata_lines(
-    table_name: &str,
-    meta: &serde_json::Value,
-) -> (ProtocolLine, MetadataLine) {
-    let schema_string =
-        meta.get("schema")
-            .or_else(|| {
-                // Iceberg v2: schemas array + current-schema-id
-                let schema_id = meta.get("current-schema-id")?.as_i64()?;
-                meta.get("schemas")?.as_array()?.iter().find(|s| {
-                    s.get("schema-id").and_then(serde_json::Value::as_i64) == Some(schema_id)
-                })
-            })
-            .map_or_else(
-                || "{}".to_string(),
-                |s| serde_json::to_string(s).unwrap_or_default(),
-            );
-
-    let partition_columns: Vec<String> = meta
-        .get("partition-specs")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.first())
-        .and_then(|spec| spec.get("fields"))
-        .and_then(serde_json::Value::as_array)
-        .map(|fields| {
-            fields
-                .iter()
-                .filter_map(|f| {
-                    f.get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(std::string::ToString::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let table_id = meta
-        .get("table-uuid")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(table_name)
-        .to_string();
-
-    let created_time = meta
-        .get("last-updated-ms")
-        .and_then(serde_json::Value::as_i64);
-
-    let protocol = ProtocolLine {
-        protocol: Protocol {
-            min_reader_version: 1,
-        },
-    };
-    let metadata = MetadataLine {
-        metadata: TableMetadata {
-            id: table_id,
-            format: Format {
-                provider: "parquet".to_string(),
-            },
-            schema_string,
-            partition_columns,
-            configuration: None,
-            created_time,
-            name: Some(table_name.to_string()),
-            description: None,
-            num_files: None,
-            size: None,
-            num_records: None,
-        },
-    };
-
-    (protocol, metadata)
-}
-
-/// Extract file entries from Iceberg metadata for the current snapshot.
-///
-/// Phase 1: Returns presigned URLs for data files referenced in the snapshot summary.
-/// Full manifest/Avro reading is not implemented; this is a best-effort stub that
-/// returns an empty file list when manifests are not readable inline.
-fn extract_file_lines(
-    state: &DeltaState,
-    _schema: &str,
-    meta: &serde_json::Value,
-) -> Vec<FileLine> {
-    // Get current snapshot
-    let current_snapshot_id = match meta
-        .get("current-snapshot-id")
-        .and_then(serde_json::Value::as_i64)
-    {
-        Some(id) if id > 0 => id,
-        _ => return vec![],
-    };
-
-    let Some(snapshots) = meta.get("snapshots").and_then(serde_json::Value::as_array) else {
-        return vec![];
-    };
-
-    let Some(snapshot) = snapshots.iter().find(|s| {
-        s.get("snapshot-id").and_then(serde_json::Value::as_i64) == Some(current_snapshot_id)
-    }) else {
-        return vec![];
-    };
-
-    // The manifest-list is an Avro file — we can return a presigned URL for it.
-    // Full clients will read manifests themselves; we return a presigned manifest-list URL
-    // using the `added-data-files` summary count if available.
-    let Some(manifest_list) = snapshot
-        .get("manifest-list")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return vec![];
-    };
-
-    // Parse S3 URL: s3://bucket/key
-    let Some(without_scheme) = manifest_list.strip_prefix("s3://") else {
-        error!("unexpected manifest-list scheme: {}", manifest_list);
-        return vec![];
-    };
-    let Some((bucket, key)) = without_scheme.split_once('/') else {
-        return vec![];
-    };
-
-    let size = snapshot
-        .get("summary")
-        .and_then(|s| s.get("total-files-size"))
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-
-    let presigned_url = state.presign(bucket, key, Duration::from_secs(3600));
-    let file_id = format!("manifest-list-{current_snapshot_id}");
-
-    vec![FileLine {
-        file: FileEntry {
-            url: presigned_url,
-            id: file_id,
-            partition_values: std::collections::HashMap::default(),
-            size,
-            stats: None,
-        },
-    }]
-}
-
 #[cfg(test)]
 #[allow(clippy::significant_drop_tightening)] // test fixtures intentionally hold state across asserts
 mod tests {
     use super::*;
     use crate::delta_log::{AddAction, MetadataAction, ProtocolAction};
+    use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
     use std::collections::HashMap;
 
     fn delta_entry() -> DeltaShareTableEntry {
@@ -677,23 +449,21 @@ mod tests {
         }
     }
 
+    /// Only Delta tables are served: an Iceberg one is refused, saying
+    /// why, rather than answered with its manifest list as a data file.
     #[test]
-    fn table_kind_dispatches_known_types() {
-        let mut e = delta_entry();
-        assert!(matches!(table_kind(&e).unwrap(), TableKind::Delta));
-        e.table_type = String::new();
-        assert!(matches!(table_kind(&e).unwrap(), TableKind::Iceberg));
-        e.table_type = "iceberg".into();
-        assert!(matches!(table_kind(&e).unwrap(), TableKind::Iceberg));
-        e.table_type = "uniform".into();
-        assert!(matches!(table_kind(&e).unwrap(), TableKind::Iceberg));
+    fn a_share_serves_delta_tables_only() {
+        assert!(delta_only("delta", "sc", "t").is_ok());
+        for iceberg in ["", "iceberg", "uniform"] {
+            let err = delta_only(iceberg, "sc", "t").unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{iceberg:?}");
+            assert!(err.message.contains("Iceberg table"), "{}", err.message);
+        }
     }
 
     #[test]
     fn table_kind_rejects_unknown_type() {
-        let mut e = delta_entry();
-        e.table_type = "hudi".into();
-        let err = table_kind(&e).unwrap_err();
+        let err = delta_only("hudi", "sc", "t").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("hudi"));
     }
@@ -787,8 +557,7 @@ mod tests {
         // the rest can be defaults / dummies.
         let (channel, _) = tonic::transport::Channel::balance_channel::<u32>(1);
         DeltaState {
-            catalog: DeltaCatalog::new(MetadataServiceClient::new(channel.clone())),
-            meta_client: MetadataServiceClient::new(channel),
+            catalog: DeltaCatalog::new(MetadataServiceClient::new(channel)),
             endpoint: "http://localhost:9000".into(),
             region: "us-east-1".into(),
             access_key_id: "AKID".into(),

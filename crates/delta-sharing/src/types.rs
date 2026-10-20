@@ -146,7 +146,8 @@ pub struct QueryTableRequest {
 pub struct AddTableRequest {
     pub schema: String,
     pub name: String,
-    /// Table type: "delta" for Delta Lake tables, "uniform" for Iceberg tables
+    /// Table type: "delta", a Delta Lake table, the only kind a share
+    /// serves (an Iceberg table is refused)
     #[serde(default)]
     pub table_type: String,
     /// For delta tables: S3 bucket containing Delta Lake files

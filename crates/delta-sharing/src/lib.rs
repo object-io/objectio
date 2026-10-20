@@ -57,7 +57,7 @@ pub struct DeltaSharingConfig {
 /// Shares and recipients are managed on the gateway's admin API
 /// (`/_admin/shares`, `/_admin/recipients`), behind its authentication.
 pub fn router(meta_client: MetadataServiceClient<Channel>, config: DeltaSharingConfig) -> Router {
-    let catalog = DeltaCatalog::new(meta_client.clone());
+    let catalog = DeltaCatalog::new(meta_client);
     let http = reqwest::Client::new();
     let default_url_ttl = Duration::from_secs(
         config
@@ -66,7 +66,6 @@ pub fn router(meta_client: MetadataServiceClient<Channel>, config: DeltaSharingC
     );
     let state = Arc::new(DeltaState {
         catalog,
-        meta_client,
         endpoint: config.endpoint,
         region: config.region,
         access_key_id: config.access_key_id,
