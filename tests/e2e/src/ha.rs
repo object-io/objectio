@@ -7,7 +7,7 @@
 //! serves any call (a follower forwards it to the leader).
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,14 @@ struct Gateway {
 /// A binary from `bins` (another release's), or from this build.
 fn bin(bins: Option<&Path>, name: &str) -> PathBuf {
     bins.map_or_else(|| binary(name), |dir| dir.join(name))
+}
+
+/// One process of a [`HaCluster`], by index.
+#[derive(Clone, Copy, Debug)]
+pub enum Node {
+    Meta(usize),
+    Osd(usize),
+    Gateway(usize),
 }
 
 pub struct HaCluster {
@@ -620,6 +628,29 @@ impl HaCluster {
             let _ = c.kill();
             let _ = c.wait();
         }
+    }
+
+    /// Send `node` SIGTERM, as Kubernetes and systemd stop a service.
+    pub fn sigterm(&self, node: Node) {
+        let pid = match node {
+            Node::Meta(i) => self.metas[i].child.lock().unwrap().as_ref().map(Child::id),
+            Node::Osd(i) => self.osds[i].child.as_ref().map(Child::id),
+            Node::Gateway(i) => self.gateways[i].child.as_ref().map(Child::id),
+        };
+        crate::sigterm(pid.unwrap_or_else(|| panic!("{node:?} is not running")));
+    }
+
+    /// Wait up to `within` for `node` to exit (after [`Self::sigterm`]):
+    /// its exit status, or `None` if it was still running (it is killed
+    /// then). Stopped either way.
+    pub fn await_exit(&mut self, node: Node, within: Duration) -> Option<ExitStatus> {
+        let child = match node {
+            Node::Meta(i) => self.metas[i].child.lock().unwrap().take(),
+            Node::Osd(i) => self.osds[i].child.take(),
+            Node::Gateway(i) => self.gateways[i].child.take(),
+        };
+        let mut child = child.unwrap_or_else(|| panic!("{node:?} is not running"));
+        crate::await_exit(&mut child, within)
     }
 
     /// Freeze meta node `i` (SIGSTOP): it holds its connections but answers

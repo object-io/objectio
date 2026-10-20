@@ -24,7 +24,7 @@ use objectio_block::chunk::ChunkMapper;
 use objectio_block::{CacheConfig, VolumeManager, WriteCache};
 use objectio_proto::block::block_service_server::BlockServiceServer;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::meta_blocks::MetaBlocks;
 use crate::osd_pool::OsdPool;
@@ -94,12 +94,18 @@ pub struct Args {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Run the block gateway until its gRPC server stops.
+/// How long a stop waits for a flush already under way to finish.
+const STOP_FLUSH_WAIT: Duration = Duration::from_secs(10);
+
+/// Run the block gateway until `shutdown` resolves.
 ///
 /// # Errors
 /// If the data directory, store, meta connection or listeners cannot be
 /// set up, or the gRPC server fails.
-pub async fn run(args: Args) -> Result<()> {
+pub async fn run(
+    args: Args,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Block Gateway");
 
@@ -280,9 +286,30 @@ pub async fn run(args: Args) -> Result<()> {
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
         )
-        .serve(grpc_addr)
+        .serve_with_shutdown(grpc_addr, async move {
+            shutdown.await;
+            info!("Shutting down...");
+        })
         .await
         .context("gRPC server error")?;
+
+    // Every acknowledged write is already in the journal, synced. A flush
+    // under way is let finish rather than cut off halfway (one cut off is
+    // redone from the journal at the next start, as after a crash).
+    let _flushing = match tokio::time::timeout(STOP_FLUSH_WAIT, state.flush_lock.lock()).await {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            warn!(
+                "a flush still running after {}s: stopping without it (its writes stay in the journal)",
+                STOP_FLUSH_WAIT.as_secs()
+            );
+            None
+        }
+    };
+    if let Err(e) = state.cache.sync_durable().await {
+        warn!("block journal sync at shutdown: {e}");
+    }
+    info!("Block gateway shut down gracefully");
 
     Ok(())
 }

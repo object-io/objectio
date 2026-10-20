@@ -17,5 +17,5 @@ async fn main() -> Result<()> {
             EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    objectio_block_gateway::run(args).await
+    objectio_block_gateway::run(args, objectio_common::shutdown_signal()?).await
 }

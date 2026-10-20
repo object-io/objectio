@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 objectio-meta = { workspace = true }
+objectio-common = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
