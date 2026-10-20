@@ -124,3 +124,43 @@ fn a_copy_to_sse_c_is_encrypted() {
     assert_eq!(got.status, 200);
     assert!(got.bytes == body);
 }
+
+/// A single-PUT object of several stripes is encrypted as one stream,
+/// stripe after stripe: each stripe has to be decrypted at its own place in
+/// it. A whole-object GET used to decrypt every stripe from the start of
+/// the stream, serving all but the first as garbage with 200.
+#[test]
+fn an_encrypted_object_of_several_stripes_reads_back_whole() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    c.json("POST", "/_admin/buckets", json!({"name": "enc"}))
+        .expect_ok();
+    let key = key_headers(&[5; 32]);
+    // Three stripes of a 4+2 scheme (16 MiB each, less a little).
+    let body: Vec<u8> = (0..40u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    c.request_with_headers("PUT", "/enc/big", &body, &with(&key))
+        .expect(200);
+
+    let got = c.request_with_headers("GET", "/enc/big", &[], &with(&key));
+    assert_eq!(got.status, 200);
+    assert_eq!(got.bytes.len(), body.len());
+    let first_wrong = got.bytes.iter().zip(&body).position(|(a, b)| a != b);
+    assert_eq!(first_wrong, None, "the whole object read back other bytes");
+
+    // A range across the first stripe boundary, and the last bytes.
+    for (from, to) in [
+        (16_000_000_usize, 17_000_000_usize),
+        (body.len() - 100, body.len() - 1),
+    ] {
+        let range = format!("bytes={from}-{to}");
+        let mut headers = with(&key);
+        headers.push(("range", &range));
+        let got = c.request_with_headers("GET", "/enc/big", &[], &headers);
+        assert_eq!(got.status, 206, "{range}");
+        assert!(
+            got.bytes == body[from..=to],
+            "{range} read back other bytes"
+        );
+    }
+}
