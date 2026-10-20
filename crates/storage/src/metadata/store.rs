@@ -248,6 +248,14 @@ impl MetadataStore {
         self.index.get(&key.0).unwrap_or_else(|e| fatal(&e))
     }
 
+    /// [`Self::get`], an unreadable index an error rather than a stop.
+    ///
+    /// # Errors
+    /// The index could not be read.
+    pub fn try_get(&self, key: &MetadataKey) -> Result<Option<Vec<u8>>> {
+        self.index.get(&key.0)
+    }
+
     /// Check if a key exists
     pub fn contains(&self, key: &MetadataKey) -> bool {
         self.get(key).is_some()

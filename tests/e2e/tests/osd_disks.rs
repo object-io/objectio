@@ -130,6 +130,18 @@ fn an_osd_without_one_of_its_disks_refuses_to_start() {
     );
 
     osd.start_and_stop(&["d2", "d0", "d1"]);
+
+    // A disk file gone (a mount that failed) is a missing disk too: no new
+    // file is made in its place to be taken for a replacement.
+    std::fs::remove_file(osd.disk("d1")).expect("remove d1");
+    let status = osd.start_refused(&["d0", "d1", "d2"]);
+    assert!(!status.success(), "exited {status}");
+    assert!(!osd.disk("d1").exists(), "a disk file was made for d1");
+    assert!(
+        osd.log_text().contains("does not exist"),
+        "the refusal doesn't say the disk is gone:\n{}",
+        osd.log_text()
+    );
 }
 
 /// A disk named with --disks that can't be claimed (neither blank nor

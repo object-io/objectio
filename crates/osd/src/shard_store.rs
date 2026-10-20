@@ -329,6 +329,20 @@ struct DiskSlotRecord {
     path: String,
 }
 
+/// The disks recorded in `meta`, or none (the OSD's first start). A record
+/// that can't be read or decoded is an error, never "none": taken for a
+/// first start, the disks would be recorded again in whatever order they
+/// were named.
+fn read_disk_set(meta: &dyn MetaIndex) -> Result<Option<DiskSetRecord>, String> {
+    meta.try_get(&MetadataKey::from_bytes(DISK_SET_KEY.to_vec()))
+        .map_err(|e| format!("the record of this OSD's disks can't be read: {e}"))?
+        .map(|v| {
+            <DiskSetRecord as prost::Message>::decode(v.as_slice())
+                .map_err(|e| format!("the record of this OSD's disks is unreadable: {e}"))
+        })
+        .transpose()
+}
+
 /// A disk as [`Disks::open`] found it, for [`arrange_disks`].
 struct OpenedDisk {
     id: [u8; 16],
@@ -787,10 +801,14 @@ pub struct Disks {
 }
 
 impl Disks {
-    /// Open each disk at `paths`, formatting one only when it is blank (or a
-    /// file not there yet), with blocks of `block_size`. Existing disks
-    /// keep the block size in their superblock.
-    pub fn open(paths: &[String], block_size: u32) -> Result<Self, String> {
+    /// Open each disk at `paths` for the store whose locations are in
+    /// `meta`, formatting one only when it is blank, with blocks of
+    /// `block_size`. Existing disks keep the block size in their
+    /// superblock. A file not there yet is created only on the OSD's first
+    /// start (no disks recorded in `meta`): after that it is a disk gone,
+    /// and a file made in its place would be taken for its replacement.
+    pub fn open(paths: &[String], block_size: u32, meta: &dyn MetaIndex) -> Result<Self, String> {
+        let create_missing = read_disk_set(meta)?.is_none();
         let mut disks = Vec::new();
         let mut formatted_now = Vec::new();
 
@@ -839,6 +857,18 @@ impl Disks {
                         return Err(format!(
                             "disk {path} does not exist: no such device (a file is created \
                              for a disk only outside /dev)"
+                        ));
+                    }
+                    // Nor is one an OSD that has run had: its disk is gone (a
+                    // mount that failed, a volume detached). Formatted, it
+                    // would replace the lost disk, and the shards there be
+                    // forgotten while the disk may yet come back.
+                    if !std::path::Path::new(path).exists() && !create_missing {
+                        return Err(format!(
+                            "disk {path} does not exist, and this OSD has run on its disks \
+                             (a file is created for a disk only on an OSD's first start). \
+                             Attach the disk again; to replace it, put a blank disk or file \
+                             there (for a file: truncate -s <size> {path})"
                         ));
                     }
                     // Get device/file size - for block devices we need to check
@@ -1104,13 +1134,7 @@ impl BlockStore {
             formatted_now,
         } = disks;
         let set_key = MetadataKey::from_bytes(DISK_SET_KEY.to_vec());
-        let recorded = meta
-            .get(&set_key)
-            .map(|v| {
-                <DiskSetRecord as prost::Message>::decode(v.as_slice())
-                    .map_err(|e| format!("the record of this OSD's disks is unreadable: {e}"))
-            })
-            .transpose()?;
+        let recorded = read_disk_set(meta.as_ref())?;
         let opened: Vec<OpenedDisk> = disks
             .iter()
             .zip(&formatted_now)
@@ -2216,10 +2240,15 @@ mod tests {
     const BLOCK: u32 = 64 * 1024;
 
     fn open(dir: &Path) -> conformance::Opened {
-        let disks = Disks::open(&[dir.join("disk.raw").display().to_string()], BLOCK).unwrap();
         let meta_dir = dir.join("state");
         let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(&meta_dir))
             .unwrap();
+        let disks = Disks::open(
+            &[dir.join("disk.raw").display().to_string()],
+            BLOCK,
+            meta.as_ref(),
+        )
+        .unwrap();
         let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir).unwrap();
         (Arc::new(store), meta)
     }
@@ -2301,8 +2330,12 @@ mod tests {
             let mut config = MetadataStoreConfig::with_data_dir(&meta_dir);
             config.background_compaction = false;
             let meta = Arc::new(MetadataStore::open_or_create(config).unwrap());
-            let disks =
-                Disks::open(&[dir.path().join("disk.raw").display().to_string()], BLOCK).unwrap();
+            let disks = Disks::open(
+                &[dir.path().join("disk.raw").display().to_string()],
+                BLOCK,
+                meta.as_ref(),
+            )
+            .unwrap();
             let store = BlockStore::new(disks, Arc::clone(&meta) as _, meta_dir.clone()).unwrap();
             let data = vec![7u8; 5_000];
             for i in 0..n {
@@ -2538,6 +2571,18 @@ mod tests {
     /// A store on the disk files `names` in `dir` (each made, 1 GiB, if not
     /// there), its metadata in `dir/state`.
     fn open_disks(dir: &Path, names: &[&str]) -> Result<(BlockStore, Arc<dyn MetaIndex>), String> {
+        let meta =
+            objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(dir.join("state")))
+                .unwrap();
+        open_disks_on(dir, names, meta)
+    }
+
+    /// [`open_disks`], its metadata in `meta`.
+    fn open_disks_on(
+        dir: &Path,
+        names: &[&str],
+        meta: Arc<dyn MetaIndex>,
+    ) -> Result<(BlockStore, Arc<dyn MetaIndex>), String> {
         let paths: Vec<String> = names
             .iter()
             .map(|n| {
@@ -2548,11 +2593,8 @@ mod tests {
                 path.display().to_string()
             })
             .collect();
-        let disks = Disks::open(&paths, BLOCK)?;
-        let meta_dir = dir.join("state");
-        let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(&meta_dir))
-            .unwrap();
-        let store = BlockStore::new(disks, Arc::clone(&meta), meta_dir)?;
+        let disks = Disks::open(&paths, BLOCK, meta.as_ref())?;
+        let store = BlockStore::new(disks, Arc::clone(&meta), dir.join("state"))?;
         Ok((store, meta))
     }
 
@@ -2809,5 +2851,117 @@ mod tests {
             .err()
             .expect("opened short a disk");
         assert!(err.contains("on disk 1, and this OSD has 1 disks"), "{err}");
+    }
+
+    /// A metadata index whose disk-set record can't be read: `get` answers
+    /// "none", as a store hiding its errors would; `try_get` the error.
+    struct UnreadableDiskSet(Arc<dyn MetaIndex>);
+
+    impl MetaIndex for UnreadableDiskSet {
+        fn get(&self, key: &MetadataKey) -> Option<Vec<u8>> {
+            if key.0 == DISK_SET_KEY {
+                return None;
+            }
+            self.0.get(key)
+        }
+        fn try_get(&self, key: &MetadataKey) -> objectio_common::Result<Option<Vec<u8>>> {
+            if key.0 == DISK_SET_KEY {
+                return Err(objectio_common::Error::Storage(
+                    "injected: page unreadable".into(),
+                ));
+            }
+            self.0.try_get(key)
+        }
+        fn write(&self, ops: Vec<MetadataOp>) -> objectio_common::Result<()> {
+            self.0.write(ops)
+        }
+        fn for_each_prefix(
+            &self,
+            prefix: &MetadataKey,
+            after: Option<&MetadataKey>,
+            f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+        ) {
+            self.0.for_each_prefix(prefix, after, f);
+        }
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+        fn render_metrics(&self, out: &mut String, labels: &str) {
+            self.0.render_metrics(out, labels);
+        }
+    }
+
+    /// A record of the disks that can't be read, or doesn't decode, stops
+    /// the store: it isn't a first start, which would record the disks
+    /// again in the order named.
+    #[tokio::test]
+    async fn an_unreadable_disk_set_record_refuses_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        write_shards(dir.path(), &["a", "b", "c"], 0..9).await;
+        let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(
+            dir.path().join("state"),
+        ))
+        .unwrap();
+        let unreadable: Arc<dyn MetaIndex> = Arc::new(UnreadableDiskSet(Arc::clone(&meta)));
+        let err = open_disks_on(dir.path(), &["c", "a", "b"], unreadable)
+            .err()
+            .expect("opened on an unreadable record");
+        assert!(err.contains("can't be read"), "{err}");
+
+        meta.put(
+            MetadataKey::from_bytes(DISK_SET_KEY.to_vec()),
+            b"\xff\xff not a record".to_vec(),
+        )
+        .unwrap();
+        let err = open_disks_on(dir.path(), &["a", "b", "c"], meta)
+            .err()
+            .expect("opened on an undecodable record");
+        assert!(err.contains("unreadable"), "{err}");
+    }
+
+    /// A disk file not there is created on the OSD's first start only;
+    /// after that it is a disk gone, refused, not made anew and taken for
+    /// a blank replacement.
+    #[tokio::test]
+    async fn a_missing_disk_file_is_created_only_on_a_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |n: &str| dir.path().join(n).display().to_string();
+        let open = |names: &[&str]| {
+            let meta = objectio_storage::metadata::open(MetadataStoreConfig::with_data_dir(
+                dir.path().join("state"),
+            ))
+            .unwrap();
+            let paths: Vec<String> = names.iter().map(|n| path(n)).collect();
+            let disks = Disks::open(&paths, BLOCK, meta.as_ref())?;
+            BlockStore::new(disks, Arc::clone(&meta), dir.path().join("state")).map(|s| (s, meta))
+        };
+        {
+            // First start: the files are made.
+            let (store, _meta) = open(&["a", "b"]).unwrap();
+            for o in 0..4 {
+                let data = bytes_of(o);
+                store
+                    .write(&shard(o), &data, crc32c::crc32c(&data), false)
+                    .await
+                    .unwrap();
+            }
+        }
+        std::fs::remove_file(dir.path().join("b")).unwrap();
+        let err = open(&["a", "b"])
+            .err()
+            .expect("opened with a disk file gone");
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(
+            !dir.path().join("b").exists(),
+            "a file made in the gone disk's place"
+        );
+        // A blank file put there by the operator is a replacement.
+        std::fs::File::create(dir.path().join("b"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        let (store, _meta) = open(&["a", "b"]).unwrap();
+        assert_eq!(store.dropped_at_open(), 2);
+        assert!(store.read(&shard(0)).await.unwrap().0 == bytes_of(0));
     }
 }
