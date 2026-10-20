@@ -1509,8 +1509,12 @@ impl MetaService {
         // holds stale copies of metadata (objects deleted since would
         // reappear) and shards nothing refers to.
         let purge = self.purge_state(node_id);
+        // After a restore, a purge the restored state holds as pending may
+        // be long done, the OSD back in: the operator says which.
+        let confirming = self.osd_to_confirm(&node_id);
         if state != objectio_common::OsdAdminState::Out
             && purge.as_deref() == Some(crate::drain_observer::PURGE_PENDING)
+            && !confirming
         {
             return Err(Status::failed_precondition(
                 "this OSD was drained and is still being purged; it can rejoin once that's done",
@@ -1579,6 +1583,17 @@ impl MetaService {
             && let Err(e) = self.set_purge_state(node_id, None).await
         {
             warn!("clearing purge state for {}: {e}", hex::encode(node_id));
+        }
+
+        // Set by an operator after a restore: in service means not to be
+        // purged, and the drain observer acts on it again.
+        if found && confirming {
+            if state != objectio_common::OsdAdminState::Out
+                && purge.as_deref() == Some(crate::drain_observer::PURGE_PENDING)
+            {
+                self.set_purge_state(node_id, None).await?;
+            }
+            self.confirm_osd(&node_id, &req.requested_by).await?;
         }
 
         Ok(Response::new(SetOsdAdminStateResponse {

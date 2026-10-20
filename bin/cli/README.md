@@ -148,6 +148,7 @@ Secrets are printed only once, when they are created: by `key create`,
 | `kms status`, `kms keys list` / `create [--key-id --description]` / `show K` | `/_admin/kms/status`, `/_admin/kms/keys[/K]` |
 | `warehouse list [--tenant]` / `create N [--property k=v --tenant]` / `delete N` | `/_admin/warehouses[/N]` |
 | `config list [--prefix]` / `get K` / `set K --value J \| --file F` / `delete K` | `/_admin/config[/K]` |
+| `meta export [--file F]` (checked as it downloads; to stdout without `--file`) | `GET /_admin/meta/export` |
 | `metrics query Q [--time]` / `query-range Q --start --end --step` | `GET /_admin/metrics/query[_range]` |
 | `volume list` / `create N --size 10G [--pool]` / `show ID` / `resize ID --size` / `delete ID [--force]` | gRPC `BlockService` at `--block-endpoint` |
 | `volume attach ID [--read-only]` / `detach ID [--force]` / `attachments [--volume-id]` | gRPC: exports the volume over NBD (export name = volume id); detach disconnects its clients first |

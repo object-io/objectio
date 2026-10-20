@@ -927,6 +927,7 @@ pub fn spawn(meta: Arc<MetaService>) {
             }
             meta.ensure_default_pool(&mut ready_since).await;
             meta.keep_acting_sets(&mut down_since).await;
+            meta.push_restored_epochs().await;
         }
     });
 }

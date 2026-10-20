@@ -237,12 +237,18 @@ for 4+2), every PG of the drained OSD goes `Undersized` and the drain never
 finishes. A drained OSD can rejoin only once its purge is done. Do not set
 an OSD that went straight to `out` back `in` with its old data on it.
 
-## Upgrades (system admin)
+## Upgrades and meta backups (system admin)
 
 ```bash
+obioctl meta export --file meta-$(date +%F).backup   # meta's whole state, checked as it downloads
 obioctl upgrade status     # each node's release and format level, and what blocks finalize
 obioctl upgrade finalize   # irreversible: the new formats start
 ```
+
+Take a meta backup before every finalize, and on a schedule: it is what a
+cluster that lost a meta majority is restored from (`objectio-meta restore`,
+run by whoever runs the deployment: `objectio-deploy`). A restore goes back
+to the backup's point: users and keys deleted since are valid again.
 
 Rolling the binaries is `objectio-deploy`. `status` lists nodes heard from
 in the last 90 seconds: check every gateway you run is there.

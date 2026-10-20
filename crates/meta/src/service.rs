@@ -15,6 +15,7 @@ mod packs;
 pub(crate) mod peering;
 pub(crate) mod pgs;
 pub(crate) mod recovery;
+pub mod restored;
 pub(crate) mod scrub;
 mod tenants;
 mod unity;

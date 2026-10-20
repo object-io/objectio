@@ -58,6 +58,9 @@ use crate::raft::{ApplyEvent, CasOp, CasTable, MetaCommand, MetaResponse, MetaTy
 use crate::raft_log::RaftLog;
 use crate::tables;
 
+mod backup;
+pub use backup::{BackupHeader, Edit, Forced, Voter, rows};
+
 type NodeId = u64;
 type Node = openraft::BasicNode;
 type Entry = openraft::Entry<MetaTypeConfig>;
@@ -729,19 +732,34 @@ impl MetaRaftStorage {
         db: &Database,
         out: &mut impl Write,
     ) -> Result<RaftPersistentState, StorageError<NodeId>> {
-        use redb::ReadableTableMetadata as _;
-        let io = |e: std::io::Error| encode_err("snapshot", e);
         let txn = db.begin_read().map_err(read_err)?;
-        let state = match txn.open_table(tables::RAFT_STATE) {
+        let state = Self::state_in(&txn)?;
+        Self::write_tables(&txn, out)?;
+        Ok(state)
+    }
+
+    /// The Raft state as `txn` sees it.
+    fn state_in(txn: &redb::ReadTransaction) -> Result<RaftPersistentState, StorageError<NodeId>> {
+        match txn.open_table(tables::RAFT_STATE) {
             Ok(t) => match t.get("state").map_err(read_err)? {
                 Some(v) => {
-                    serde_json::from_slice(v.value()).map_err(|e| decode_err("raft_state", e))?
+                    serde_json::from_slice(v.value()).map_err(|e| decode_err("raft_state", e))
                 }
-                None => RaftPersistentState::default(),
+                None => Ok(RaftPersistentState::default()),
             },
-            Err(redb::TableError::TableDoesNotExist(_)) => RaftPersistentState::default(),
-            Err(e) => return Err(read_err(e)),
-        };
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(RaftPersistentState::default()),
+            Err(e) => Err(read_err(e)),
+        }
+    }
+
+    /// Every state-machine table as `txn` sees it, as a snapshot carries
+    /// them.
+    fn write_tables(
+        txn: &redb::ReadTransaction,
+        out: &mut impl Write,
+    ) -> Result<(), StorageError<NodeId>> {
+        use redb::ReadableTableMetadata as _;
+        let io = |e: std::io::Error| encode_err("snapshot", e);
         let mut names: Vec<String> = txn
             .list_tables()
             .map_err(read_err)?
@@ -765,7 +783,7 @@ impl MetaRaftStorage {
             }
         }
         out.flush().map_err(io)?;
-        Ok(state)
+        Ok(())
     }
 
     /// Replace every state-machine table with the snapshot read from `src`,

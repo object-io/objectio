@@ -273,6 +273,11 @@ service MetadataService {
     rpc ReportVersion(ReportVersionRequest) returns (ReportVersionResponse);
     rpc GetUpgradeStatus(GetUpgradeStatusRequest) returns (GetUpgradeStatusResponse);
     rpc FinalizeUpgrade(FinalizeUpgradeRequest) returns (FinalizeUpgradeResponse);
+    // A backup of the whole state machine (objectio-docs core/meta.md,
+    // "Backup, restore and losing a majority"): the leader's, from one read
+    // transaction, in `objectio_common::meta_backup`'s container, streamed
+    // as it is read.
+    rpc ExportMeta(ExportMetaRequest) returns (stream ExportMetaChunk);
     rpc PutBucketSetting(PutBucketSettingRequest) returns (PutBucketSettingResponse);
 
     // KMS key management (for SSE-KMS). Key material is wrapped by the
@@ -3435,6 +3440,15 @@ message FinalizeUpgradeRequest {
 
 message FinalizeUpgradeResponse {
     uint32 active_level = 1;
+}
+
+message ExportMetaRequest {
+    string requested_by = 1;
+}
+
+// The next bytes of the backup file, in order.
+message ExportMetaChunk {
+    bytes data = 1;
 }
 
 // ============================================================

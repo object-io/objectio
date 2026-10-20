@@ -27,6 +27,7 @@ pub mod iam_api;
 pub mod iceberg_auth;
 pub mod kms;
 pub mod lifecycle;
+pub mod meta_backup;
 pub mod meta_reads;
 pub mod metrics_middleware;
 pub mod node_cache;
@@ -1245,6 +1246,7 @@ pub async fn run(
         )
         .route("/_admin/upgrade", get(upgrade::status))
         .route("/_admin/upgrade/finalize", post(upgrade::finalize))
+        .route("/_admin/meta/export", get(meta_backup::export))
         .route(
             "/_admin/replication/settings",
             get(replication::admin_get_settings).put(replication::admin_put_settings),

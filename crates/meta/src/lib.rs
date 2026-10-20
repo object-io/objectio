@@ -15,6 +15,7 @@ pub mod raft_batch;
 pub mod raft_rpc;
 pub mod read_gate;
 pub mod repair;
+pub mod restore;
 pub mod service;
 
 use anyhow::Result;
@@ -156,6 +157,10 @@ pub struct Args {
     /// mTLS between services (A8a).
     #[command(flatten)]
     pub tls: objectio_proto::transport::TlsArgs,
+
+    /// An offline tool to run instead of the service.
+    #[command(subcommand)]
+    pub tool: Option<restore::Tool>,
 }
 
 /// Where the admin port binds: `host` when given, else the host meta's
@@ -219,6 +224,7 @@ pub async fn run(
 ) -> Result<()> {
     // From here to serving is what a node costs after a crash (B25).
     let process_started = std::time::Instant::now();
+    restore::refuse_incomplete(&args.data_dir)?;
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Metadata Service");
 
@@ -651,6 +657,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     // Block volumes and snapshots, and the shared-stripe registry, from
     // the Raft tables.
     state.meta_service.render_block_metrics(&mut output);
+    state.meta_service.render_restore_metrics(&mut output);
     op_metrics::render_raft(&state.meta_service, &mut output);
     objectio_erasure::metrics::render(&mut output);
 

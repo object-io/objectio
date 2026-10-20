@@ -126,6 +126,9 @@ impl Reply {
 pub struct ApiClient {
     pub settings: Settings,
     http: reqwest::Client,
+    /// For answers read as they arrive (a meta backup): no limit on the
+    /// whole, only on each wait for more.
+    streaming: reqwest::Client,
 }
 
 impl ApiClient {
@@ -136,7 +139,16 @@ impl ApiClient {
             .timeout(Duration::from_secs(60))
             .build()
             .context("building the HTTP client")?;
-        Ok(Self { settings, http })
+        let streaming = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(120))
+            .build()
+            .context("building the HTTP client")?;
+        Ok(Self {
+            settings,
+            http,
+            streaming,
+        })
     }
 
     /// Send a signed request. `path` must already be escaped (see
@@ -163,6 +175,24 @@ impl ApiClient {
         self.send(method, path, query, body, false).await
     }
 
+    /// A signed GET whose answer is read as it arrives: the response, once
+    /// its status is a success.
+    pub async fn download(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+    ) -> Result<reqwest::Response> {
+        let resp = self
+            .request(&self.streaming, "GET", path, query, Body::Empty, true)
+            .await?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let raw = resp.bytes().await.context("reading the response")?;
+            return Err(api_error(status, "GET", path, &raw).into());
+        }
+        Ok(resp)
+    }
+
     async fn send(
         &self,
         method: &str,
@@ -171,6 +201,26 @@ impl ApiClient {
         body: Body,
         sign: bool,
     ) -> Result<Reply> {
+        let resp = self
+            .request(&self.http, method, path, query, body, sign)
+            .await?;
+        let status = resp.status().as_u16();
+        let raw = resp.bytes().await.context("reading the response")?.to_vec();
+        if !(200..300).contains(&status) {
+            return Err(api_error(status, method, path, &raw).into());
+        }
+        Ok(Reply { bytes: raw })
+    }
+
+    async fn request(
+        &self,
+        http: &reqwest::Client,
+        method: &str,
+        path: &str,
+        query: &[(String, String)],
+        body: Body,
+        sign: bool,
+    ) -> Result<reqwest::Response> {
         let (bytes, content_type) = match body {
             Body::Empty => (Vec::new(), None),
             Body::Json(v) => (
@@ -196,7 +246,7 @@ impl ApiClient {
         };
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|_| anyhow!("bad method {method}"))?;
-        let mut req = self.http.request(m, url);
+        let mut req = http.request(m, url);
         if let Some(ct) = &content_type {
             req = req.header("content-type", ct);
         }
@@ -224,17 +274,10 @@ impl ApiClient {
                 req = req.header(k, v);
             }
         }
-        let resp = req
-            .body(bytes)
+        req.body(bytes)
             .send()
             .await
-            .with_context(|| format!("{method} {}{path}", self.settings.endpoint))?;
-        let status = resp.status().as_u16();
-        let raw = resp.bytes().await.context("reading the response")?.to_vec();
-        if !(200..300).contains(&status) {
-            return Err(api_error(status, method, path, &raw).into());
-        }
-        Ok(Reply { bytes: raw })
+            .with_context(|| format!("{method} {}{path}", self.settings.endpoint))
     }
 
     pub async fn get(&self, path: &str, query: &[(String, String)]) -> Result<Value> {

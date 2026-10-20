@@ -230,6 +230,13 @@ pub(crate) enum ListingFix {
     Remove,
 }
 
+/// Whether a key's newest write, or its listing entry, is too recent for a
+/// listing peering to judge (see [`listing_fix`]).
+fn within_grace(auth: &PgEntry, listed: Option<(&[u8], u64)>, now_ms: u64, grace_ms: u64) -> bool {
+    now_ms.saturating_sub(auth.stamp >> 16) < grace_ms
+        || listed.is_some_and(|(_, at)| now_ms.saturating_sub(at) < grace_ms)
+}
+
 pub(crate) fn listing_fix(
     auth: &PgEntry,
     listed: Option<(&[u8], u64)>,
@@ -534,6 +541,15 @@ impl MetaService {
             .count();
         OSDS_DOWN.store(down as u64, Ordering::Relaxed);
         let dirty: HashSet<(String, u32)> = std::mem::take(&mut *DIRTY.lock());
+        // After a restore: every PG listed once, so meta's listing index
+        // takes in what was written after the backup.
+        let relist: HashMap<String, Vec<u8>> = self
+            .store
+            .as_ref()
+            .map(|s| s.list_named(super::restored::PG_RELIST_TABLE))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let last = LAST.lock().clone();
         let mut due: Vec<(u8, Option<Instant>, PlacementGroup)> = Vec::new();
         for pool in pools.keys() {
@@ -549,7 +565,9 @@ impl MetaService {
                     continue;
                 }
                 let peered = last.get(&id).copied();
-                let rank = if dirty.contains(&id) {
+                let rank = if dirty.contains(&id)
+                    || relist.contains_key(&MetaStore::pg_key(&pg.pool, pg.pg_id))
+                {
                     0
                 } else if states.get(&pg.pg_id).is_none_or(|s| s.epoch != pg.epoch) {
                     1
@@ -574,6 +592,7 @@ impl MetaService {
             .take(per_look)
             .map(|(rank, _, pg)| (rank == 0, pg))
             .collect();
+        let relist = &relist;
         futures::stream::iter(due)
             .map(|(marked, pg)| {
                 let pools = &pools;
@@ -583,11 +602,17 @@ impl MetaService {
                     };
                     // Marked by a report of something missing: listed, as
                     // a summary can't see a shard lost under its metadata.
-                    let state = self.peer(&pg, pool, marked).await;
+                    let (state, pending) = self.peer_listing(&pg, pool, marked).await;
                     LAST.lock()
                         .insert((pg.pool.clone(), pg.pg_id), Instant::now());
                     PEERED.fetch_add(1, Ordering::Relaxed);
                     self.record_pg_state(state).await;
+                    let key = MetaStore::pg_key(&pg.pool, pg.pg_id);
+                    if pending == Some(0)
+                        && let Some(row) = relist.get(&key)
+                    {
+                        self.relisted(&key, row.clone()).await;
+                    }
                 }
             })
             .buffer_unordered(AT_ONCE)
@@ -601,6 +626,19 @@ impl MetaService {
     /// it holds, so a shard lost or rotted under intact metadata (a wiped
     /// disk, rot the scrubber found) shows only in a listing.
     pub(crate) async fn peer(&self, pg: &PlacementGroup, pool: &PoolConfig, list: bool) -> PgState {
+        self.peer_listing(pg, pool, list).await.0
+    }
+
+    /// [`Self::peer`], and, when it brought meta's listing index in line
+    /// with the members (a listing with a read quorum), how many keys it
+    /// left for a later listing: written, or listed, within the grace.
+    async fn peer_listing(
+        &self,
+        pg: &PlacementGroup,
+        pool: &PoolConfig,
+        list: bool,
+    ) -> (PgState, Option<usize>) {
+        let mut pending = None;
         let members: Vec<Member> = pg
             .acting
             .iter()
@@ -745,7 +783,7 @@ impl MetaService {
                     .filter(|(_, a)| a.summary.is_some())
                     .filter_map(|(m, a)| Some((m.address.as_deref()?, &a.entries)))
                     .collect();
-                self.sync_listings(&newest, &holders).await;
+                pending = Some(self.sync_listings(&newest, &holders).await);
             }
             state.members_down = u32::try_from(copies - answered).unwrap_or(u32::MAX);
             state.objects = merged.objects;
@@ -804,7 +842,27 @@ impl MetaService {
             };
         }
         state.last_error = last_error;
-        state
+        (state, pending)
+    }
+
+    /// A restore's listing of `key`'s PG is done: its `pg_relist` row
+    /// (`row`, as read) goes.
+    async fn relisted(&self, key: &str, row: Vec<u8>) {
+        let op = objectio_meta_store::CasOp {
+            table: CasTable::Named(super::restored::PG_RELIST_TABLE.into()),
+            key: key.to_string(),
+            expected: Some(row),
+            new_value: None,
+        };
+        match self.cas_many(vec![op], "pg-relisted").await {
+            Ok(true) => debug!("pg {}: listed after the restore", key.replace('\0', "/")),
+            // Changed meanwhile (another leader's listing): looked at again.
+            Ok(false) => {}
+            Err(e) => debug!(
+                "pg {}: recording its listing after the restore: {e}",
+                key.replace('\0', "/")
+            ),
+        }
     }
 
     /// Bring meta's listing entries of the current objects in `newest` in
@@ -817,7 +875,8 @@ impl MetaService {
         &self,
         newest: &HashMap<(String, String), PgEntry>,
         holders: &[(&str, &Entries)],
-    ) {
+    ) -> usize {
+        let mut pending = 0;
         let now_ms = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -840,16 +899,17 @@ impl MetaService {
                 .and_then(|b| {
                     objectio_proto::metadata::ObjectListingEntry::decode(b.as_slice()).ok()
                 });
-            let fix = listing_fix(
-                auth,
-                listed
-                    .as_ref()
-                    .map(|l| (l.object_id.as_slice(), l.modified_at.saturating_mul(1000))),
-                now_ms,
-                grace_ms,
-            );
+            let listed_at = listed
+                .as_ref()
+                .map(|l| (l.object_id.as_slice(), l.modified_at.saturating_mul(1000)));
+            let fix = listing_fix(auth, listed_at, now_ms, grace_ms);
             let remove = match fix {
-                ListingFix::Leave => continue,
+                ListingFix::Leave => {
+                    if within_grace(auth, listed_at, now_ms, grace_ms) {
+                        pending += 1;
+                    }
+                    continue;
+                }
                 ListingFix::Remove => true,
                 ListingFix::Add => {
                     // The object as a holder of it has it, whole.
@@ -865,7 +925,10 @@ impl MetaService {
                             break;
                         }
                     }
-                    let Some(o) = object else { continue };
+                    let Some(o) = object else {
+                        pending += 1; // no holder answered with it whole: next time
+                        continue;
+                    };
                     if o.is_delete_marker {
                         if listed.is_none() {
                             continue;
@@ -893,7 +956,19 @@ impl MetaService {
                                 LISTINGS_ADDED.fetch_add(1, Ordering::Relaxed);
                                 info!("pg peering: listed {bucket}/{key}, which its copies hold");
                             }
-                            Err(e) => debug!("pg peering: listing {bucket}/{key}: {e}"),
+                            // Its bucket is gone (made after the backup a
+                            // restore went back to): nothing to list it in.
+                            Err(e) if e.code() == tonic::Code::NotFound => {
+                                warn!(
+                                    "pg peering: {bucket}/{key} is held by its copies, and meta \
+                                     knows no bucket {bucket}: {}",
+                                    e.message()
+                                );
+                            }
+                            Err(e) => {
+                                pending += 1;
+                                debug!("pg peering: listing {bucket}/{key}: {e}");
+                            }
                         }
                         continue;
                     }
@@ -914,10 +989,14 @@ impl MetaService {
                         LISTINGS_REMOVED.fetch_add(1, Ordering::Relaxed);
                         info!("pg peering: unlisted {bucket}/{key}, which its copies hold deleted");
                     }
-                    Err(e) => debug!("pg peering: unlisting {bucket}/{key}: {e}"),
+                    Err(e) => {
+                        pending += 1;
+                        debug!("pg peering: unlisting {bucket}/{key}: {e}");
+                    }
                 }
             }
         }
+        pending
     }
 
     /// The address of OSD `id`, if it can be a member: registered, `In`,

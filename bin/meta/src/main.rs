@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = objectio_meta::Args::parse();
+    let mut args = objectio_meta::Args::parse();
 
     tracing_subscriber::registry()
         .with(
@@ -23,5 +23,8 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    if let Some(tool) = args.tool.take() {
+        return objectio_meta::restore::run(tool).await;
+    }
     objectio_meta::run(args, objectio_common::shutdown_signal()?).await
 }
