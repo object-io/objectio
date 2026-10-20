@@ -105,7 +105,9 @@ pub trait IoBackend: Send + Sync + std::fmt::Debug {
 /// Pick the best backend the current build + host supports.
 ///
 /// Priority: `UringBackend` if compiled in AND we're on Linux AND
-/// `io_uring_setup` succeeds, otherwise `PreadBackend`.
+/// `io_uring_setup` succeeds, otherwise `PreadBackend`, with a warning
+/// (the host denies io_uring: a seccomp profile, or
+/// `kernel.io_uring_disabled`).
 ///
 /// `direct_io: true` (production default) asks the kernel to skip the
 /// page cache — O_DIRECT on Linux, F_NOCACHE on macOS. The caller
@@ -120,19 +122,30 @@ pub fn best_available<P: AsRef<Path>>(
 ) -> Result<Arc<dyn IoBackend>> {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     {
-        if let Ok(backend) = uring_backend::UringBackend::open(path.as_ref(), read_only, direct_io)
-        {
-            return Ok(Arc::new(backend));
-        }
-        tracing::warn!(
-            "io_uring open failed (kernel too old or feature disabled); falling back to pread"
-        );
+        best_available_with(path, read_only, direct_io, uring_backend::RING_ENTRIES)
     }
-    Ok(Arc::new(pread_backend::PreadBackend::open(
-        path.as_ref(),
-        read_only,
-        direct_io,
-    )?))
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    {
+        pread(path, read_only, direct_io)
+    }
+}
+
+/// [`best_available`] with a ring of `ring_entries` (a test asks for one
+/// the kernel refuses, to take the fallback).
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn best_available_with<P: AsRef<Path>>(
+    path: P,
+    read_only: bool,
+    direct_io: bool,
+    ring_entries: u32,
+) -> Result<Arc<dyn IoBackend>> {
+    match uring_backend::UringBackend::open(path.as_ref(), read_only, direct_io, ring_entries) {
+        Ok(backend) => Ok(Arc::new(backend)),
+        Err(e) => {
+            tracing::warn!("{e}; falling back to pread");
+            pread(path, read_only, direct_io)
+        }
+    }
 }
 
 /// Always-available pread / pwrite backend.
@@ -288,7 +301,7 @@ mod pread_backend {
 mod uring_backend {
     use super::*;
     use std::fs::OpenOptions;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Mutex;
 
@@ -333,8 +346,16 @@ mod uring_backend {
         Shutdown,
     }
 
+    /// tokio-uring's default submission queue size.
+    pub const RING_ENTRIES: u32 = 256;
+
     impl UringBackend {
-        pub fn open(path: &Path, read_only: bool, direct_io: bool) -> Result<Self> {
+        /// Opens `path` and sets up its ring of `entries`: an error if the
+        /// host denies io_uring. The worker says whether its ring was set
+        /// up before this returns, so `best_available` can still fall back
+        /// (it used to set the ring up after `open` had returned, and a
+        /// failure there killed the worker: every later I/O failed).
+        pub fn open(path: &Path, read_only: bool, direct_io: bool, entries: u32) -> Result<Self> {
             let mut opts = OpenOptions::new();
             opts.read(true).write(!read_only);
             if direct_io {
@@ -352,12 +373,21 @@ mod uring_backend {
             let fd = unsafe { OwnedFd::from_raw_fd(std_file.into_raw_fd()) };
 
             let (tx, rx) = crossbeam_channel::unbounded::<Op>();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let path_str = path.display().to_string();
             let worker_path = path_str.clone();
             let join = std::thread::Builder::new()
                 .name(format!("obio-uring:{}", path.display()))
-                .spawn(move || run_worker(fd, worker_path, rx))
+                .spawn(move || run_worker(fd, worker_path, entries, rx, ready_tx))
                 .map_err(|e| Error::Storage(format!("spawn uring worker: {e}")))?;
+            let ready = ready_rx.recv();
+            if !matches!(ready, Ok(Ok(()))) {
+                let _ = join.join();
+                return Err(Error::Storage(match ready {
+                    Ok(Err(e)) => format!("io_uring setup for {}: {e}", path.display()),
+                    _ => format!("io_uring worker for {} exited", path.display()),
+                }));
+            }
 
             Ok(Self {
                 path: path_str,
@@ -378,13 +408,28 @@ mod uring_backend {
         }
     }
 
-    fn run_worker(fd: OwnedFd, path: String, rx: crossbeam_channel::Receiver<Op>) {
-        // tokio-uring owns the current thread for its reactor.
-        let raw = fd.as_raw_fd();
-        // Don't let OwnedFd drop close the fd — tokio-uring takes over.
-        std::mem::forget(fd);
+    fn run_worker(
+        fd: OwnedFd,
+        path: String,
+        entries: u32,
+        rx: crossbeam_channel::Receiver<Op>,
+        ready: std::sync::mpsc::SyncSender<std::io::Result<()>>,
+    ) {
+        // tokio-uring owns the current thread for its reactor. Its
+        // `start` panics when the ring can't be set up; this reports it.
+        let rt = match tokio_uring::Runtime::new(tokio_uring::builder().entries(entries)) {
+            Ok(rt) => rt,
+            Err(e) => {
+                // `fd` is closed as it drops here.
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
+        let _ = ready.send(Ok(()));
+        // tokio-uring's File takes the fd over, and closes it.
+        let raw = fd.into_raw_fd();
 
-        tokio_uring::start(async move {
+        rt.block_on(async move {
             let file = unsafe { tokio_uring::fs::File::from_raw_fd(raw) };
             loop {
                 // The crossbeam receiver is sync; hop through
@@ -560,44 +605,72 @@ mod tests {
         }
     }
 
-    // io_uring test requires CAP_SYS_NICE / IO_URING_ALLOW_POLL — runs
-    // fine on bare-metal or a --privileged container but fails inside
-    // sandboxed CI runners with "Operation not permitted". Gated behind
-    // an explicit env var so normal `cargo test` doesn't fail on
-    // machines without the capability.
+    /// A write that reads back, whole-buffer reads, and an error (not a
+    /// short buffer) past the end, through `backend` on a
+    /// `make_test_file` of 64 KiB.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    #[test]
-    fn uring_roundtrip() {
-        // The best backend here: io_uring where the kernel allows it, else
-        // pread. Either must read whole buffers or fail.
+    async fn round_trip(backend: &dyn IoBackend) {
+        use crate::aligned_buf::AlignedBuf;
+        let mut block = AlignedBuf::new(4096);
+        block.as_mut_slice().fill(0xa5);
+        backend.write_at_owned(block, 8192).await.unwrap();
+        backend.sync_data().await.unwrap();
+        let got = backend
+            .read_at_owned(AlignedBuf::new(4096), 8192)
+            .await
+            .unwrap();
+        assert!(got.as_slice().iter().all(|b| *b == 0xa5), "write lost");
+
+        let got = backend
+            .read_at_owned(AlignedBuf::new(4096), 4096)
+            .await
+            .unwrap();
+        for (i, b) in got.as_slice().iter().enumerate() {
+            assert_eq!(*b, ((4096 + i) & 0xff) as u8, "byte {i} mismatched");
+        }
+
+        // Past the end, as a removed device reads: an error, not a
+        // short buffer (which a caller then sliced, and panicked).
+        let short = backend
+            .read_at_owned(AlignedBuf::new(4096), 62 * 1024)
+            .await;
+        assert!(short.is_err(), "a short read came back as data");
+    }
+
+    /// A build with the io-uring feature does its I/O through io_uring.
+    /// The release is built so, for hosts that allow it, so a host that
+    /// denies it fails here instead of passing on the pread fallback.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[tokio::test]
+    async fn uring_roundtrip() {
         let dir = tempdir().unwrap();
         let path = make_test_file(dir.path(), 64 * 1024);
+        if let Err(e) =
+            uring_backend::UringBackend::open(&path, false, false, uring_backend::RING_ENTRIES)
+        {
+            panic!(
+                "io_uring is not usable here ({e}): a seccomp profile (docker's default) \
+                 or kernel.io_uring_disabled denies it"
+            );
+        }
+        let backend = best_available(&path, false, false).unwrap();
+        assert_eq!(backend.kind(), BackendKind::Uring);
+        round_trip(backend.as_ref()).await;
+    }
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let backend = best_available(&path, true, false).unwrap();
-            assert!(matches!(
-                backend.kind(),
-                BackendKind::Uring | BackendKind::Pread
-            ));
-
-            let got = backend
-                .read_at_owned(crate::aligned_buf::AlignedBuf::new(4096), 4096)
-                .await
-                .unwrap();
-            for (i, b) in got.as_slice().iter().enumerate() {
-                assert_eq!(*b, ((4096 + i) & 0xff) as u8, "byte {i} mismatched");
-            }
-
-            // Past the end, as a removed device reads: an error, not a
-            // short buffer (which a caller then sliced, and panicked).
-            let short = backend
-                .read_at_owned(crate::aligned_buf::AlignedBuf::new(4096), 62 * 1024)
-                .await;
-            assert!(short.is_err(), "a short read came back as data");
-        });
+    /// When the ring can't be set up, `best_available` falls back to
+    /// pread, which works: the failure surfaces at open, not as a dead
+    /// worker under every later I/O.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[tokio::test]
+    async fn without_a_ring_best_available_falls_back_to_pread() {
+        let dir = tempdir().unwrap();
+        let path = make_test_file(dir.path(), 64 * 1024);
+        // More entries than the kernel allows (IORING_MAX_ENTRIES, 32768):
+        // io_uring_setup fails with EINVAL.
+        assert!(uring_backend::UringBackend::open(&path, false, false, 1 << 20).is_err());
+        let backend = best_available_with(&path, false, false, 1 << 20).unwrap();
+        assert_eq!(backend.kind(), BackendKind::Pread);
+        round_trip(backend.as_ref()).await;
     }
 }
