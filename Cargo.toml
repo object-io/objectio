@@ -91,8 +91,14 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Config
 config = "0.14"
 
-# HTTP client (used by Vault KMS provider and other outbound integrations)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# HTTP client (used by Vault KMS provider and other outbound integrations).
+# TLS is rustls, never the default native-tls: native-tls links the host's
+# OpenSSL (libssl.so.3), which a release binary cannot count on. The roots
+# are Mozilla's (webpki) plus the system store (native), so a private CA an
+# operator installed (an OIDC provider's, say) is still trusted.
+# Every crate takes reqwest from here: one crate asking for its default
+# features brings native-tls back for the whole binary.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 
 # Unix-specific
 nix = { version = "0.29", features = ["fs", "ioctl"] }

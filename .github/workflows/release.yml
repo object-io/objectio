@@ -25,7 +25,11 @@
 #        linux-x86_64
 #        linux-aarch64
 #        macos-aarch64
-#      (every one erasure-codes with ISA-L, built from source)
+#      (every one erasure-codes with ISA-L, built from source; the Linux
+#      ones in an AlmaLinux 8 container, so they need only glibc 2.28)
+#      Checks each Linux binary links only glibc 2.28 and the libraries
+#      every Linux has, and runs it on Ubuntu 22.04, Debian 12, Rocky 9
+#      and Amazon Linux 2023; the release is not published otherwise.
 #      Tarball / zip each, with LICENSE + NOTICE + README.
 #   3. Builds the universal multi-arch image (Dockerfile target `all`,
 #      linux/amd64 + linux/arm64) and pushes to
@@ -152,6 +156,16 @@ jobs:
   # unix-only APIs — ioctl BLKGETSIZE64, O_DIRECT,
   # std::os::unix::fs::FileTypeExt. A windows port would be real
   # work, not a cfg-gate.
+  #
+  # The Linux builds run in an AlmaLinux 8 container, not on the
+  # runner. A binary needs the glibc it was linked against or newer,
+  # and 0.1.0-rc.1, linked on ubuntu-24.04, needed glibc 2.39: it
+  # did not start on Ubuntu 22.04, Debian 12, RHEL / Rocky 9 or
+  # Amazon Linux 2023, which is most production hosts. AlmaLinux 8
+  # has glibc 2.28 and is supported until 2029, so it stays
+  # installable while it is the floor; RHEL 8 and everything newer
+  # runs what it builds. Its own C compiler (GCC 8) is enough for
+  # every C dependency (ISA-L, PCRE2, ring, jemalloc, zstd).
   # ------------------------------------------------------------
   build-binaries:
     name: Build aio ${{ matrix.platform }}
@@ -178,18 +192,43 @@ jobs:
             # is worse than one without an optional accelerator;
             # Hyperscan is still available when building from source.
             features: "io-uring,grep-pcre2"
+            container: almalinux:8
           - platform: linux-arm64
             target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             # io-uring is Linux-only; hyperscan needs Vectorscan on
             # arm (follow-up — validate crate support first).
             features: "io-uring,grep-pcre2"
+            container: almalinux:8
           - platform: darwin-arm64
             target: aarch64-apple-darwin
             os: macos-14
             features: ""
     runs-on: ${{ matrix.os }}
+    # null (macOS) runs on the runner itself.
+    container: ${{ matrix.container || null }}
     steps:
+      # First, so actions/checkout finds git in the container (without
+      # it, checkout downloads a tarball and there is no .git).
+      - name: Install Linux build deps
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          # NASM is in PowerTools.
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled powertools
+          # git, tar and gzip for the checkout and the caches; shasum
+          # (perl-Digest-SHA) for the checksum below.
+          dnf install -y git tar gzip unzip perl-Digest-SHA
+          # ISA-L, built from source on every platform: a C compiler,
+          # autotools and libclang (bindgen); NASM on amd64 only, which
+          # must be 2.14.01 or later (PowerTools has 2.15).
+          dnf install -y gcc gcc-c++ make autoconf automake libtool clang-devel
+          if [ "${{ matrix.platform }}" = "linux-amd64" ]; then
+            dnf install -y nasm
+          fi
+          # No libpcre2-devel: PCRE2 is built from pcre2-sys's bundled
+          # source and linked statically (PCRE2_SYS_STATIC below).
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.tag }}
@@ -216,21 +255,6 @@ jobs:
           npm ci --no-audit --no-fund --prefer-offline
           npm run build
 
-      - name: Install Linux build deps
-        if: startsWith(matrix.platform, 'linux-')
-        run: |
-          sudo apt-get update
-          # pcre2 + hyperscan system libraries for the grep engines.
-          # libhyperscan-dev is Intel-only on Debian arm64 the package
-          # might be absent — conditional install further down.
-          sudo apt-get install -y libpcre2-dev pkg-config
-          # ISA-L, built from source on every platform: autotools and
-          # libclang; NASM on amd64 only.
-          sudo apt-get install -y autoconf automake libtool libclang-dev
-          if [ "${{ matrix.platform }}" = "linux-amd64" ]; then
-            sudo apt-get install -y nasm libhyperscan-dev
-          fi
-
       - name: Install macOS build deps
         if: startsWith(matrix.platform, 'darwin-')
         # ISA-L's autogen.sh runs autoreconf, which wants automake and
@@ -253,6 +277,9 @@ jobs:
         env:
           OBJECTIO_VERSION: ${{ inputs.version }}
           OBJECTIO_GIT_COMMIT: ${{ github.sha }}
+          # Build PCRE2 from the crate's bundled source and link it in,
+          # rather than the host's libpcre2-8.so.0, which rc.1 needed.
+          PCRE2_SYS_STATIC: "1"
         run: |
           FEAT=""
           if [ -n "${{ matrix.features }}" ]; then FEAT="--features ${{ matrix.features }}"; fi
@@ -275,6 +302,47 @@ jobs:
           name: aio-${{ matrix.platform }}
           path: dist/objectio-aio-*
           if-no-files-found: error
+
+  # ------------------------------------------------------------
+  # 2b. Check each Linux binary runs where it will be downloaded to.
+  #
+  # The build passing says nothing about that: rc.1 built fine and
+  # then needed glibc 2.39 and libpcre2-8.so.0, and v0.0.1 needed
+  # libhs.so.5. scripts/release/check-portable.sh fails the release
+  # unless every GLIBC_ symbol version the binary needs is 2.28 or
+  # older, it NEEDs nothing beyond glibc's libraries, libgcc_s and
+  # the loader, and `--version` runs (all symbols bound at startup)
+  # in containers of Ubuntu 22.04, Debian 12, Rocky Linux 9 and
+  # Amazon Linux 2023, on the binary's own architecture. On the
+  # runner, not in the build container: it needs docker.
+  # ------------------------------------------------------------
+  check-binaries:
+    name: Check aio ${{ matrix.platform }} runs on other distributions
+    needs: [prepare, build-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-24.04
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aio-${{ matrix.platform }}
+          path: dist
+
+      - name: glibc, NEEDED, and a run on each distribution
+        run: |
+          # Artifacts lose the executable bit.
+          chmod +x dist/objectio-aio-*-${{ matrix.platform }}
+          scripts/release/check-portable.sh dist/objectio-aio-*-${{ matrix.platform }}
 
   # ------------------------------------------------------------
   # 3a. Build the per-arch image on its native runner.
@@ -439,7 +507,7 @@ jobs:
   # ------------------------------------------------------------
   release:
     name: Create GitHub release
-    needs: [prepare, build-binaries, build-image-manifest, publish-chart]
+    needs: [prepare, build-binaries, check-binaries, build-image-manifest, publish-chart]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

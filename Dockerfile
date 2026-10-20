@@ -155,10 +155,10 @@ RUN F="$(cat /build/.features)"; \
 # =============================================================================
 FROM debian:bookworm-slim AS runtime-base
 
-# Install minimal runtime dependencies
+# Install minimal runtime dependencies. No libssl: every HTTPS client is
+# rustls, and ca-certificates is the system store it trusts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for running services

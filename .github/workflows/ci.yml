@@ -465,12 +465,15 @@ jobs:
       - name: build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libpcre2-dev \
+          sudo apt-get install -y protobuf-compiler \
             nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist; build.rs creates it empty when absent, which
       # is enough to compile. Debug profile: this links, which is the point,
       # and the linkage is the same as release without paying for optimisation.
+      # PCRE2 linked statically, as the release links it.
       - name: build with the release feature set
+        env:
+          PCRE2_SYS_STATIC: "1"
         run: |
           cargo build --bin objectio-aio \
             --features io-uring,grep-pcre2
@@ -481,21 +484,11 @@ jobs:
       #   error while loading shared libraries: libhs.so.5
       # because --features grep-hyperscan links Hyperscan dynamically and
       # nothing ships it. A build that passes is not the same as an artifact
-      # that runs, and only this distinguishes them.
+      # that runs, and only this distinguishes them. The NEEDED half of the
+      # release's check: this runner's glibc is not the release's (the
+      # release builds in AlmaLinux 8 and checks the glibc there).
       - name: the binary links nothing exotic
-        run: |
-          set -euo pipefail
-          ALLOWED='libc|libm|libgcc_s|libpthread|libdl|librt|ld-linux|linux-vdso|libpcre2-8|libssl|libcrypto'
-          echo "--- ldd ---"; ldd target/debug/objectio-aio
-          bad=$(ldd target/debug/objectio-aio \
-                | awk '{print $1}' \
-                | grep -vE "^($ALLOWED)" \
-                | grep -E '^lib|^ld-' || true)
-          if [ -n "$bad" ]; then
-            echo "::error::the release binary needs libraries a user will not have: $bad"
-            exit 1
-          fi
-          echo "only portable libraries — ok"
+        run: scripts/release/check-portable.sh --needed-only target/debug/objectio-aio
 
   perf:
     name: performance

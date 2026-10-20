@@ -154,7 +154,10 @@ pub async fn query_range(
 /// reporting a generic gateway error for something that went wrong elsewhere.
 async fn forward(base: &str, path: &str, params: &[(&str, String)]) -> Response {
     let url = format!("{}{path}", base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    // One client for every query: building one loads the system's root
+    // certificates.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
     match client.get(&url).query(params).send().await {
         Ok(resp) => {
             let status =
