@@ -27,9 +27,9 @@
 //! its index written. So an open reads at most one segment and the indexes,
 //! however long the log (B25: the reopen time bound). A torn record in the
 //! last segment (a crash during an append, which was never acknowledged)
-//! is cut off with everything after it; any other damage, or a gap in the
-//! indexes, fails the open (or the read) with its position: a record is
-//! never skipped.
+//! is cut off with everything after it, if no whole record follows it; any
+//! other damage, or a gap in the indexes, fails the open (or the read) with
+//! its position: a record is never skipped.
 //!
 //! The log knows indexes and terms, not openraft: entries are opaque bytes
 //! here, encoded by the caller.
@@ -216,6 +216,41 @@ fn never_written(data: &[u8], from: usize, to: usize) -> bool {
     false
 }
 
+/// The first whole record in `data` (a segment) after the bad one at
+/// `bad`, where record `expect` should have been: its offset and index.
+/// Records after it number on from `expect`, one per at least [`HEADER`]
+/// bytes.
+fn whole_record_after(data: &[u8], bad: usize, expect: u64) -> Option<(u64, u64)> {
+    let len = data.len() as u64;
+    let mut found = 0;
+    let at = objectio_common::log_tail::whole_record_after(
+        data,
+        bad as u64,
+        len,
+        HEADER,
+        |at, head| {
+            if head.len() < HEADER {
+                return None;
+            }
+            let entry_len = u32::from_le_bytes(head[0..4].try_into().unwrap());
+            let index = u64::from_le_bytes(head[8..16].try_into().unwrap());
+            let most = expect.saturating_add((len - at) / HEADER as u64);
+            (entry_len <= MAX_ENTRY && (expect..=most).contains(&index))
+                .then(|| HEADER as u64 + u64::from(entry_len))
+        },
+        |_, record| {
+            let crc = u32::from_le_bytes(record[4..8].try_into().unwrap());
+            let index = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            let term = u64::from_le_bytes(record[16..24].try_into().unwrap());
+            found = index;
+            checksum(index, term, &record[HEADER..]) == crc
+        },
+    )
+    .ok()
+    .flatten()?;
+    Some((at, found))
+}
+
 fn checksum(index: u64, term: u64, entry: &[u8]) -> u32 {
     let crc = crc32c::crc32c(&index.to_le_bytes());
     let crc = crc32c::crc32c_append(crc, &term.to_le_bytes());
@@ -272,8 +307,10 @@ impl RaftLog {
     /// written after it: none of it was acknowledged. A record is torn when
     /// it is cut short by the end of the file, or fails its checksum and
     /// either ends the file or has a piece that reads as zeros (what a
-    /// crash leaves of the sectors it didn't write). A record that fails
-    /// its checksum otherwise is damage, and stops the open.
+    /// crash leaves of the sectors it didn't write), and no whole record
+    /// follows it: a record after it that was acknowledged was synced, and
+    /// so was the bad one, which is then damage. A record that fails its
+    /// checksum otherwise is damage, and stops the open.
     fn load_segment(&mut self, first: u64, last: bool) -> Result<(), LogError> {
         let path = self.dir.join(segment_name(first));
         let file = OpenOptions::new()
@@ -323,15 +360,25 @@ impl RaftLog {
         let mut offset = 0usize;
         let mut good_len = data.len();
         while offset < data.len() {
+            // A torn record ends the log, only in the last segment, and only
+            // with no whole record after it: one after it was synced, and so
+            // was this one, which is then damage (objectio-common
+            // `log_tail`).
             let torn = |what: &str| -> Result<(), LogError> {
-                if last {
-                    Ok(())
-                } else {
-                    Err(LogError::Corrupt {
-                        path: path.clone(),
-                        offset: offset as u64,
-                        what: what.to_string(),
-                    })
+                let corrupt = |what: String| LogError::Corrupt {
+                    path: path.clone(),
+                    offset: offset as u64,
+                    what,
+                };
+                if !last {
+                    return Err(corrupt(what.to_string()));
+                }
+                match whole_record_after(&data, offset, expect) {
+                    None => Ok(()),
+                    Some((at, index)) => Err(corrupt(format!(
+                        "{what}, and record {index} follows it whole at byte {at}: damage, \
+                         not a torn append"
+                    ))),
                 }
             };
             let rest = &data[offset..];
@@ -357,6 +404,7 @@ impl RaftLog {
                 if last
                     && (offset + end == data.len() || never_written(&data, offset, offset + end))
                 {
+                    torn(&format!("record {index} fails its checksum"))?;
                     good_len = offset;
                     break;
                 }
@@ -1089,5 +1137,52 @@ mod tests {
             err.to_string().contains("record 2 fails its checksum"),
             "{err}"
         );
+    }
+
+    /// A record of the last segment with a piece of zeros, as a crash
+    /// leaves one, but whole records after it: it was synced (they were),
+    /// so the zeros are damage. It was cut as torn, and the records after
+    /// it with it.
+    #[test]
+    fn zeros_in_a_record_with_whole_records_after_it_stop_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1), (2, 1, vec![b'x'; 3 * SECTOR])])
+            .unwrap();
+        log.append(&[rec(3, 1)]).unwrap();
+        log.append(&[rec(4, 1)]).unwrap();
+        let path = log.segments[0].path.clone();
+        let record2 = usize::try_from(log.pos(2).unwrap().offset).unwrap();
+        drop(log);
+        let mut data = fs::read(&path).unwrap();
+        let sector = (record2 / SECTOR + 2) * SECTOR;
+        data[sector..sector + SECTOR].fill(0);
+        fs::write(&path, &data).unwrap();
+
+        let err = RaftLog::open(dir.path()).err().expect("refused");
+        assert!(matches!(err, LogError::Corrupt { .. }), "{err}");
+        assert!(err.to_string().contains("record 3"), "{err}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
+    }
+
+    /// The same for a length damaged to run past the end of the segment,
+    /// with whole records after it.
+    #[test]
+    fn a_length_past_the_end_with_whole_records_after_it_stops_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1)]).unwrap();
+        log.append(&[rec(2, 1)]).unwrap();
+        log.append(&[rec(3, 1)]).unwrap();
+        let path = log.segments[0].path.clone();
+        let record2 = usize::try_from(log.pos(2).unwrap().offset).unwrap();
+        drop(log);
+        let mut data = fs::read(&path).unwrap();
+        data[record2..record2 + 4].copy_from_slice(&(MAX_ENTRY - 1).to_le_bytes());
+        fs::write(&path, &data).unwrap();
+
+        let err = RaftLog::open(dir.path()).err().expect("refused");
+        assert!(matches!(err, LogError::Corrupt { .. }), "{err}");
+        assert_eq!(fs::metadata(&path).unwrap().len(), data.len() as u64);
     }
 }
