@@ -318,15 +318,16 @@ impl OsdService {
         //   3. Fresh UUID on genuine first boot; persisted to (1) by
         //      writing every disk's superblock, and to (2) as a
         //      fallback.
-        let disks = Disks::open(&disk_paths, block_size)?;
-        let node_id = disks.identity(&data_dir.join("node_id"))?;
-
-        // Initialize metadata store for persistent object metadata
+        //
+        // The metadata store first: whether it records disks decides
+        // whether a disk file not there yet may be created.
         let mut meta_config = MetadataStoreConfig::with_data_dir(&data_dir);
         tune(&mut meta_config);
         let meta_dir = meta_config.data_dir.clone();
         let meta_store = objectio_storage::metadata::open(meta_config)
             .map_err(|e| format!("Failed to open metadata store: {}", e))?;
+        let disks = Disks::open(&disk_paths, block_size, meta_store.as_ref())?;
+        let node_id = disks.identity(&data_dir.join("node_id"))?;
         // Every write goes through the placement-group index (B31 phase 2),
         // the shard store's included.
         let pg_index = Arc::new(
@@ -349,7 +350,7 @@ impl OsdService {
         // Every block a shard holds is marked used before the OSD serves:
         // nothing is allocated over a live shard.
         let shards: Arc<dyn ShardStore> =
-            Arc::new(BlockStore::new(disks, Arc::clone(&meta_store), meta_dir));
+            Arc::new(BlockStore::new(disks, Arc::clone(&meta_store), meta_dir)?);
         let (usage_counted, counter) = count_after_start(&pg_index, &usage, &meta_store);
 
         Ok(Self {
@@ -1451,8 +1452,9 @@ impl StorageService for OsdService {
             Status::invalid_argument("missing shard_id")
         })?;
 
-        // Checked by the store against the checksum it recorded; one that
-        // fails is reported for rebuilding.
+        // Checked by the store: the block names this shard's object and
+        // stripe, and its bytes have the length and checksum recorded with
+        // the location. One that fails is reported for rebuilding.
         let (data, location) = self.shards.read(&shard_id).await.inspect_err(|_| {
             self.grpc_metrics.read_shard.record(
                 false,

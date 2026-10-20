@@ -643,7 +643,18 @@ pub fn is_blank(path: impl AsRef<Path>) -> Result<bool> {
     Ok(true)
 }
 
-fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
+/// The superblock of the disk at `path`, read without changing anything:
+/// the primary, or the backup when the primary can't be read. Discovery
+/// uses it to tell a disk of this OSD's from a foreign or blank one; a disk
+/// whose primary is torn is still one of ours.
+pub fn probe_superblock(path: impl AsRef<Path>) -> Result<Superblock> {
+    let file = RawFile::open(path.as_ref(), true)?;
+    superblock_copy(&file).map(|(sb, _)| sb)
+}
+
+/// The primary superblock, or else the backup (`true` with it), each read
+/// and validated.
+fn superblock_copy(file: &RawFile) -> Result<(Superblock, bool)> {
     let read_at = |offset: u64| -> Result<Superblock> {
         let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
         file.read_at(offset, buf.as_mut_slice())?;
@@ -652,20 +663,27 @@ fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
         Ok(sb)
     };
     match read_at(0) {
-        Ok(sb) => Ok(sb),
+        Ok(sb) => Ok((sb, false)),
         Err(primary) => match read_at(crate::layout::BACKUP_SUPERBLOCK_OFFSET) {
             Ok(sb) if sb.features_compat & crate::layout::FEATURE_BACKUP_SUPERBLOCK != 0 => {
-                tracing::warn!(
-                    "{}: primary superblock unreadable ({primary}); mounted from the backup \
-                     and rewrote the primary",
-                    path.display()
-                );
-                write_superblock(file, &sb)?;
-                Ok(sb)
+                tracing::warn!("{}: primary superblock unreadable ({primary})", file.path());
+                Ok((sb, true))
             }
             _ => Err(primary),
         },
     }
+}
+
+fn read_superblock(file: &RawFile, path: &Path) -> Result<Superblock> {
+    let (sb, from_backup) = superblock_copy(file)?;
+    if from_backup {
+        tracing::warn!(
+            "{}: mounted from the backup superblock; rewriting the primary",
+            path.display()
+        );
+        write_superblock(file, &sb)?;
+    }
+    Ok(sb)
 }
 
 impl Drop for DiskManager {
@@ -710,6 +728,34 @@ mod tests {
             f.read_exact(&mut buf).unwrap();
         }
         assert!(crate::layout::Superblock::from_bytes(&buf).is_ok());
+    }
+
+    /// A probe finds a disk whose primary superblock is torn by its backup,
+    /// and leaves the disk as it was.
+    #[test]
+    fn a_probe_reads_the_backup_and_writes_nothing() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        let id = super::DiskManager::init(&path, MIN_TEST_DISK, None)
+            .unwrap()
+            .id();
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            f.write_all(&[0xAA; 64]).unwrap();
+        }
+        let sb = super::probe_superblock(&path).expect("found by its backup");
+        assert_eq!(sb.disk_id, id);
+        let mut buf = vec![0u8; 4096];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut buf)
+            .unwrap();
+        assert!(
+            crate::layout::Superblock::from_bytes(&buf).is_err(),
+            "a probe repairs nothing"
+        );
     }
 
     #[test]

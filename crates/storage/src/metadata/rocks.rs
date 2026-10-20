@@ -85,6 +85,12 @@ impl MetaIndex for RocksIndex {
         self.db.get(&key.0).unwrap_or_else(|e| fatal(&e))
     }
 
+    fn try_get(&self, key: &MetadataKey) -> Result<Option<Vec<u8>>> {
+        self.db
+            .get(&key.0)
+            .map_err(|e| Error::Storage(format!("metadata index (rocksdb) read: {e}")))
+    }
+
     fn write(&self, ops: Vec<MetadataOp>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());

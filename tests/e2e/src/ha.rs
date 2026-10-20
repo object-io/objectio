@@ -442,6 +442,18 @@ impl HaCluster {
         &self.osds[i].disk
     }
 
+    /// Replace OSD `i`'s disk while it is stopped with a blank one of the
+    /// same size; its identity and metadata (its state directory) stay.
+    pub fn replace_osd_disk(&self, i: usize) {
+        let o = &self.osds[i];
+        assert!(o.child.is_none(), "stop OSD {i} first");
+        let size = std::fs::metadata(&o.disk).expect("disk").len();
+        std::fs::remove_file(&o.disk).expect("remove disk");
+        std::fs::File::create(&o.disk)
+            .and_then(|f| f.set_len(size))
+            .expect("blank disk");
+    }
+
     /// Replace OSD `i`'s drive while it is stopped: its disk and its state
     /// directory (its metadata and identity, on the same drive in
     /// production) are gone. Started again, it is a new, empty OSD at the

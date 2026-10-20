@@ -34,8 +34,17 @@ pub trait MetaSnapshot: Send + Sync {
 }
 
 pub trait MetaIndex: Send + Sync {
-    /// The value under `key`, if any.
+    /// The value under `key`, if any. An index that can't be read stops
+    /// the process: the callers on the I/O paths have no better answer.
     fn get(&self, key: &MetadataKey) -> Option<Vec<u8>>;
+
+    /// The value under `key`, if any, or why it can't be read: for a caller
+    /// that must tell "absent" from "unreadable" and stop cleanly, saying
+    /// why.
+    ///
+    /// # Errors
+    /// The index could not be read.
+    fn try_get(&self, key: &MetadataKey) -> Result<Option<Vec<u8>>>;
 
     /// Apply `ops` (puts and deletes, in order) atomically and durably. An
     /// empty `ops` is a no-op.
@@ -208,6 +217,10 @@ where
 impl MetaIndex for MetadataStore {
     fn get(&self, key: &MetadataKey) -> Option<Vec<u8>> {
         Self::get(self, key)
+    }
+
+    fn try_get(&self, key: &MetadataKey) -> Result<Option<Vec<u8>>> {
+        Self::try_get(self, key)
     }
 
     fn snapshot(&self, from: &[u8], below: &[u8]) -> Option<Arc<dyn MetaSnapshot>> {

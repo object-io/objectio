@@ -366,9 +366,9 @@ impl Cluster {
         );
     }
 
-    /// Restart with OSD `index`'s disk destroyed but its identity kept: it
-    /// comes back registered, reachable and empty, so every read of a shard
-    /// it held fails. With erasure coding that leaves each affected stripe
+    /// Restart with OSD `index`'s disk destroyed and a blank one of the same
+    /// size in its place, its identity kept: it comes back registered,
+    /// reachable and empty, so every read of a shard it held fails. With erasure coding that leaves each affected stripe
     /// one shard short — a degraded read, which [`Self::restart_with_osds`]
     /// cannot produce because aio refuses to run fewer OSDs than k+m.
     ///
@@ -392,8 +392,18 @@ impl Cluster {
         let _ = self.child_mut().wait();
         for &index in indexes {
             let disk = self.data_dir.path().join(format!("osd-{index}/disk0"));
+            let file = disk.join("disk.raw");
+            let size = std::fs::metadata(&file)
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()))
+                .len();
             std::fs::remove_dir_all(&disk)
                 .unwrap_or_else(|e| panic!("remove {}: {e}", disk.display()));
+            // The replacement: an OSD that has run makes no disk file of its
+            // own, as one that isn't there is a disk gone.
+            std::fs::create_dir_all(&disk).expect("disk dir");
+            std::fs::File::create(&file)
+                .and_then(|f| f.set_len(size))
+                .unwrap_or_else(|e| panic!("blank {}: {e}", file.display()));
         }
         self.restart_with_osds(self.osds);
     }

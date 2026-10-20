@@ -697,8 +697,8 @@ fn an_evacuation_records_a_lost_object_and_finishes() {
     // Two OSDs down with their disks gone, and a third lost for good.
     ha.stop_osd(0);
     ha.stop_osd(1);
-    std::fs::remove_file(ha.osd_disk(0)).unwrap();
-    std::fs::remove_file(ha.osd_disk(1)).unwrap();
+    ha.replace_osd_disk(0);
+    ha.replace_osd_disk(1);
     ha.stop_osd(5);
     ha.lose_osd_drive(5);
     ha.start_osd(5, None);
@@ -764,7 +764,7 @@ fn a_read_that_finds_a_shard_missing_has_it_rebuilt() {
     // nothing says so.
     let holder = holder_of_position(&ha, "heal", "k", 0);
     ha.stop_osd(holder);
-    std::fs::remove_file(ha.osd_disk(holder)).unwrap();
+    ha.replace_osd_disk(holder);
     ha.start_osd(holder, None);
 
     // A read decodes around it, and reports it.
@@ -1091,7 +1091,7 @@ fn a_replaced_disk_is_rebuilt_without_waiting_for_the_walk() {
     // The disk pulled and a blank one put in; the OSD's identity and
     // metadata (its state directory) stay.
     ha.stop_osd(2);
-    std::fs::remove_file(ha.osd_disk(2)).unwrap();
+    ha.replace_osd_disk(2);
     ha.start_osd(2, None);
 
     // Rebuilt in place: one shard of each object on it again.

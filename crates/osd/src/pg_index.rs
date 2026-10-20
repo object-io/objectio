@@ -706,6 +706,10 @@ impl MetaIndex for PgIndexed {
         self.inner.get(key)
     }
 
+    fn try_get(&self, key: &MetadataKey) -> Result<Option<Vec<u8>>> {
+        self.inner.try_get(key)
+    }
+
     fn write(&self, ops: Vec<MetadataOp>) -> Result<()> {
         let mut flat = Vec::with_capacity(ops.len());
         flatten(ops, &mut flat);

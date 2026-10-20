@@ -37,7 +37,7 @@ fn a_replaced_disk_is_rebuilt_at_this_rate() {
     }
     // Every object has a shard on each of the six OSDs: replace one's disk.
     ha.stop_osd(5);
-    std::fs::remove_file(ha.osd_disk(5)).unwrap();
+    ha.replace_osd_disk(5);
     let before = rebuilt(&ha);
     let started = Instant::now();
     ha.start_osd(5, None);

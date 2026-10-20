@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use objectio_storage::layout::{MAGIC, SUPERBLOCK_SIZE, Superblock};
+use objectio_storage::layout::{MAGIC, SUPERBLOCK_SIZE};
 use objectio_storage::raw_io::{AlignedBuffer, RawFile};
 use tracing::{debug, info, warn};
 
@@ -388,6 +388,18 @@ fn classify(path: &Path) -> DiskState {
             reason: "unable to open read-only".into(),
         };
     };
+    // Either copy of the superblock will do: a disk whose primary is torn
+    // (a power cut mid-write) is still this OSD's, and mounting it repairs
+    // the primary from the backup.
+    let probe = match objectio_storage::probe_superblock(path) {
+        Ok(sb) => {
+            return DiskState::Claimed {
+                cluster_uuid: sb.cluster_uuid,
+                node_id: sb.osd_node_id,
+            };
+        }
+        Err(e) => e,
+    };
     let mut buf = AlignedBuffer::new(SUPERBLOCK_SIZE as usize);
     if let Err(e) = rf.read_at(0, buf.as_mut_slice()) {
         return DiskState::Foreign {
@@ -395,31 +407,25 @@ fn classify(path: &Path) -> DiskState {
         };
     }
     let head = &buf.as_slice()[..8];
-    if head != MAGIC {
-        // Unformatted or non-ObjectIO device. Peek at a few common
-        // headers so the operator log is useful.
-        if head.starts_with(b"LUKS") {
-            return DiskState::Foreign {
-                reason: "LUKS-encrypted volume".into(),
-            };
-        }
-        // Blank only if the backup copy is empty too: a disk whose primary
-        // superblock was zeroed still holds shards.
-        if objectio_storage::is_blank(path).unwrap_or(false) {
-            return DiskState::Blank;
-        }
+    if head == MAGIC {
         return DiskState::Foreign {
-            reason: format!("unknown header {head:02x?}"),
+            reason: format!("corrupt ObjectIO superblock, backup too: {probe}"),
         };
     }
-    match Superblock::from_bytes(buf.as_slice()) {
-        Ok(sb) => DiskState::Claimed {
-            cluster_uuid: sb.cluster_uuid,
-            node_id: sb.osd_node_id,
-        },
-        Err(e) => DiskState::Foreign {
-            reason: format!("corrupt ObjectIO superblock: {e}"),
-        },
+    // Unformatted or non-ObjectIO device. Peek at a few common headers so
+    // the operator log is useful.
+    if head.starts_with(b"LUKS") {
+        return DiskState::Foreign {
+            reason: "LUKS-encrypted volume".into(),
+        };
+    }
+    // Blank only if the backup copy is empty too: a disk whose primary
+    // superblock was zeroed still holds shards.
+    if objectio_storage::is_blank(path).unwrap_or(false) {
+        return DiskState::Blank;
+    }
+    DiskState::Foreign {
+        reason: format!("unknown header {head:02x?}"),
     }
 }
 
@@ -452,6 +458,25 @@ mod tests {
             vec![PathBuf::from("/no/such/path")]
         );
     }
+    /// A disk whose primary superblock is torn is claimed by its backup;
+    /// one with neither copy is foreign, never blank.
+    #[test]
+    fn a_disk_is_claimed_by_its_backup_superblock() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.raw");
+        drop(objectio_storage::DiskManager::init(&path, 1 << 30, None).unwrap());
+        let tear = |offset: u64| {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(offset + 100)).unwrap();
+            f.write_all(&[0xAA; 64]).unwrap();
+        };
+        tear(0);
+        assert!(matches!(classify(&path), DiskState::Claimed { .. }));
+        tear(objectio_storage::layout::BACKUP_SUPERBLOCK_OFFSET);
+        assert!(matches!(classify(&path), DiskState::Foreign { .. }));
+    }
+
     #[test]
     fn glob_match_star() {
         let g = shell_glob_to_regex("wwn-*");
