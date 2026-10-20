@@ -105,10 +105,14 @@ pub async fn list_shares(
     let ctx = authenticate_request(&headers, &state.catalog, None).await?;
 
     let all_shares = state.catalog.list_shares_filtered("").await?;
-
-    let items: Vec<Share> = all_shares
+    let theirs = all_shares
         .into_iter()
         .filter(|s| ctx.has_share(&s.name))
+        .collect();
+
+    let items: Vec<Share> = crate::access::open_shares(&state.catalog, theirs)
+        .await?
+        .into_iter()
         .map(|s| Share {
             name: s.name.clone(),
             id: Some(s.name),

@@ -7,7 +7,9 @@
 use crate::catalog::DeltaCatalog;
 use crate::error::DeltaError;
 use axum::http::HeaderMap;
+use objectio_proto::metadata::DeltaShareEntry;
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 /// Extract the raw bearer token from the Authorization header.
 #[must_use]
@@ -62,16 +64,60 @@ pub async fn authenticate_request(
         shares: recipient.shares,
     };
 
-    if let Some(share) = required_share
-        && !ctx.has_share(share)
-    {
-        return Err(DeltaError::forbidden(format!(
-            "Recipient '{}' does not have access to share '{share}'",
-            ctx.name
-        )));
+    if let Some(share) = required_share {
+        if !ctx.has_share(share) {
+            return Err(DeltaError::forbidden(format!(
+                "Recipient '{}' does not have access to share '{share}'",
+                ctx.name
+            )));
+        }
+        // A share of a disabled tenant is shared with no one. One that
+        // doesn't exist is the handler's to answer.
+        match catalog.get_share(share).await {
+            Ok(entry) => {
+                if !catalog.tenant_open(&entry.tenant).await? {
+                    warn!(
+                        "refused recipient '{}' on share '{share}': tenant '{}' is disabled or \
+                         does not exist",
+                        ctx.name, entry.tenant
+                    );
+                    return Err(DeltaError::forbidden(format!(
+                        "share '{share}' belongs to a disabled tenant"
+                    )));
+                }
+            }
+            Err(e) if e.status == axum::http::StatusCode::NOT_FOUND => {}
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(ctx)
+}
+
+/// `shares` without those of a disabled tenant, which are shared with no
+/// one.
+///
+/// # Errors
+/// Returns `DeltaError` if a tenant could not be looked up.
+pub async fn open_shares(
+    catalog: &DeltaCatalog,
+    shares: Vec<DeltaShareEntry>,
+) -> Result<Vec<DeltaShareEntry>, DeltaError> {
+    let mut open: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(shares.len());
+    for share in shares {
+        let ok = if let Some(ok) = open.get(&share.tenant) {
+            *ok
+        } else {
+            let ok = catalog.tenant_open(&share.tenant).await?;
+            open.insert(share.tenant.clone(), ok);
+            ok
+        };
+        if ok {
+            out.push(share);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -88,5 +134,23 @@ mod tests {
             panic!("a request without a token was let in");
         };
         assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// The system's shares are open without asking; a tenant's is open only
+    /// once meta says its tenant is (here meta can't be reached).
+    #[tokio::test]
+    async fn only_a_tenants_shares_wait_on_its_tenant() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let catalog = DeltaCatalog::new(MetadataServiceClient::new(channel));
+        let share = |name: &str, tenant: &str| DeltaShareEntry {
+            name: name.into(),
+            tenant: tenant.into(),
+            ..Default::default()
+        };
+        let system = open_shares(&catalog, vec![share("s1", ""), share("s2", "")]).await;
+        let mixed = open_shares(&catalog, vec![share("s1", ""), share("a1", "acme")]).await;
+        drop(catalog);
+        assert_eq!(system.unwrap().len(), 2);
+        assert!(mixed.is_err());
     }
 }

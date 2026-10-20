@@ -4,7 +4,7 @@ use crate::error::DeltaError;
 use objectio_proto::metadata::{
     DeltaGetRecipientByTokenRequest, DeltaGetShareRequest, DeltaListSharesRequest,
     DeltaListTablesRequest, DeltaRecipientEntry, DeltaShareEntry, DeltaShareTableEntry,
-    metadata_service_client::MetadataServiceClient,
+    GetTenantRequest, metadata_service_client::MetadataServiceClient,
 };
 use tonic::transport::Channel;
 
@@ -81,6 +81,26 @@ impl DeltaCatalog {
         share: &str,
     ) -> Result<Vec<DeltaShareTableEntry>, DeltaError> {
         self.list_tables(share, "").await
+    }
+
+    /// Whether a share of `tenant` may be read: the system's always, a
+    /// tenant's while the tenant exists and is enabled.
+    ///
+    /// # Errors
+    /// Returns `DeltaError` if the gRPC call fails.
+    pub async fn tenant_open(&self, tenant: &str) -> Result<bool, DeltaError> {
+        if tenant.is_empty() {
+            return Ok(true);
+        }
+        let r = self
+            .client
+            .clone()
+            .get_tenant(GetTenantRequest {
+                name: tenant.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(r.found && r.tenant.is_some_and(|t| t.enabled))
     }
 
     /// # Errors

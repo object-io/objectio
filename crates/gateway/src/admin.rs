@@ -1293,6 +1293,7 @@ pub async fn admin_create_tenant(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
     let tenant = json_to_tenant(&body);
+    let name = tenant.name.clone();
     let mut client = state.meta_client.clone();
     match client
         .create_tenant(CreateTenantRequest {
@@ -1300,11 +1301,14 @@ pub async fn admin_create_tenant(
         })
         .await
     {
-        Ok(resp) => (
-            StatusCode::CREATED,
-            Json(resp.into_inner().tenant.map(|t| tenant_to_json(&t))),
-        )
-            .into_response(),
+        Ok(resp) => {
+            state.auth_state.forget_tenant(&name);
+            (
+                StatusCode::CREATED,
+                Json(resp.into_inner().tenant.map(|t| tenant_to_json(&t))),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
     }
 }
@@ -1369,7 +1373,7 @@ pub async fn admin_update_tenant(
         return (StatusCode::NOT_FOUND, "Tenant not found").into_response();
     };
     let mut tenant = json_to_tenant(&overlay(tenant_to_json(&existing), &body));
-    tenant.name = name;
+    tenant.name.clone_from(&name);
     tenant.created_at = existing.created_at;
     match client
         .update_tenant(UpdateTenantRequest {
@@ -1377,7 +1381,11 @@ pub async fn admin_update_tenant(
         })
         .await
     {
-        Ok(resp) => Json(resp.into_inner().tenant.map(|t| tenant_to_json(&t))).into_response(),
+        Ok(resp) => {
+            // Disabling (or enabling) holds on this gateway at once.
+            state.auth_state.forget_tenant(&name);
+            Json(resp.into_inner().tenant.map(|t| tenant_to_json(&t))).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
     }
 }
@@ -1392,8 +1400,12 @@ pub async fn admin_delete_tenant(
         return deny;
     }
     let mut client = state.meta_client.clone();
-    match client.delete_tenant(DeleteTenantRequest { name }).await {
+    match client
+        .delete_tenant(DeleteTenantRequest { name: name.clone() })
+        .await
+    {
         Ok(resp) => {
+            state.auth_state.forget_tenant(&name);
             if resp.into_inner().success {
                 StatusCode::NO_CONTENT.into_response()
             } else {
