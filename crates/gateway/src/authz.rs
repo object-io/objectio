@@ -775,7 +775,7 @@ pub async fn authorize(
         return authorize_anonymous(state, auth, req, &bucket).await;
     }
 
-    if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant, auth.auth_mode) {
+    if let Some(reason) = tenant_violation(&auth.tenant, &bucket.tenant) {
         debug!(
             "Tenant boundary denied {} ({}) on {} ({})",
             auth.user_arn, auth.tenant, req.bucket, bucket.tenant
@@ -820,7 +820,6 @@ pub async fn authorize(
     let mut bucket_policy = bucket.policy.as_deref();
     if let Some(policy) = bucket_policy
         && auth.tenant != bucket.tenant
-        && auth.auth_mode != objectio_auth::AuthMode::Sts
         && policy.is_public()
         && crate::public_access::effective(state, &bucket.tenant, bucket.public_block)
             .await
@@ -1006,27 +1005,11 @@ pub const ANONYMOUS_PRINCIPAL: &str = "anonymous";
 /// the difference between tenancy as a real boundary and tenancy as a label
 /// that a stray `Principal: "*"` can undo.
 ///
-/// Two deliberate exemptions:
-///
-/// * A bucket with **no tenant** is in the system tenant, which is also where
-///   every bucket created before tenancy landed. Those stay policy-governed
-///   rather than becoming unreachable, so enabling this does not strand an
-///   existing deployment — exactly the migration cliff the ownership work
-///   needed a flag for.
-/// * **STS sessions** carry no tenant today (`auth_middleware` sets it empty
-///   when it validates a session token), so comparing would deny every
-///   Iceberg and Unity vended credential whose warehouse belongs to a tenant.
-///   They are already pinned to a single bucket and prefix by their scope,
-///   which is a narrower guarantee than the tenant check would add. Carrying
-///   the tenant in the session token would let this exemption go away.
-fn tenant_violation(
-    caller_tenant: &str,
-    bucket_tenant: &str,
-    auth_mode: objectio_auth::AuthMode,
-) -> Option<String> {
-    if auth_mode == objectio_auth::AuthMode::Sts {
-        return None;
-    }
+/// A bucket with **no tenant** is in the system tenant: it stays
+/// policy-governed for every caller. Vended (STS) sessions carry the tenant
+/// of the caller they were vended to, and are held to it like any other
+/// credential.
+fn tenant_violation(caller_tenant: &str, bucket_tenant: &str) -> Option<String> {
     if bucket_tenant.is_empty() || caller_tenant == bucket_tenant {
         return None;
     }
@@ -1476,39 +1459,44 @@ mod tests {
 
     #[test]
     fn tenants_cannot_reach_each_others_buckets() {
-        use objectio_auth::AuthMode;
         // The case this exists for.
-        assert!(tenant_violation("acme", "globex", AuthMode::Permanent).is_some());
+        assert!(tenant_violation("acme", "globex").is_some());
         // Same tenant is fine.
-        assert!(tenant_violation("acme", "acme", AuthMode::Permanent).is_none());
+        assert!(tenant_violation("acme", "acme").is_none());
     }
 
     #[test]
     fn system_tenant_buckets_stay_policy_governed() {
-        use objectio_auth::AuthMode;
         // Every bucket created before tenancy carries an empty tenant. Denying
         // those would strand an existing deployment, so they fall through to
         // ownership and policy instead.
-        assert!(tenant_violation("acme", "", AuthMode::Permanent).is_none());
-        assert!(tenant_violation("", "", AuthMode::Permanent).is_none());
+        assert!(tenant_violation("acme", "").is_none());
+        assert!(tenant_violation("", "").is_none());
     }
 
     #[test]
     fn a_system_user_cannot_reach_into_a_tenant() {
-        use objectio_auth::AuthMode;
         // Not the system *admin* — that bypasses the chain earlier. An
         // ordinary account outside any tenant gets no implicit reach in.
-        assert!(tenant_violation("", "acme", AuthMode::Permanent).is_some());
+        assert!(tenant_violation("", "acme").is_some());
     }
 
-    /// STS sessions carry no tenant, so gating them would deny every vended
-    /// Iceberg/Unity credential whose warehouse belongs to a tenant. Their
-    /// scope already pins them to one bucket and prefix.
+    /// A vended session is held to the tenant it was vended in: a table
+    /// pointed at another tenant's bucket gets credentials that can't
+    /// reach it.
     #[test]
-    fn sts_sessions_are_exempt_until_tokens_carry_a_tenant() {
-        use objectio_auth::AuthMode;
-        assert!(tenant_violation("", "acme", AuthMode::Sts).is_none());
-        assert!(tenant_violation("acme", "globex", AuthMode::Sts).is_none());
+    fn a_vended_session_stays_in_its_tenant() {
+        let session = objectio_auth::sts::StsProvider::new(b"k").issue(
+            "arn:u",
+            "acme",
+            "s3://globex-data/",
+            objectio_auth::Operation::Read,
+        );
+        let info = objectio_auth::sts::StsProvider::new(b"k")
+            .validate(&session.session_token)
+            .unwrap();
+        assert!(tenant_violation(&info.tenant, "globex").is_some());
+        assert!(tenant_violation(&info.tenant, "acme").is_none());
     }
 
     #[test]
@@ -1564,10 +1552,9 @@ mod tests {
 
     #[test]
     fn denial_reason_names_both_sides() {
-        use objectio_auth::AuthMode;
-        let r = tenant_violation("acme", "globex", AuthMode::Permanent).unwrap();
+        let r = tenant_violation("acme", "globex").unwrap();
         assert!(r.contains("acme") && r.contains("globex"));
-        let r = tenant_violation("", "globex", AuthMode::Permanent).unwrap();
+        let r = tenant_violation("", "globex").unwrap();
         assert!(r.contains("globex"));
     }
 }

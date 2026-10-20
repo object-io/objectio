@@ -493,7 +493,7 @@ pub(crate) async fn resolve_session(
 /// secret is derived from the key, so the caller still has to verify a
 /// signature with it: the token alone proves nothing. A role's session gets
 /// the role as its principal and the role's tenant; any other session is a
-/// scoped STS credential with no tenant.
+/// scoped STS credential in the tenant it was vended to.
 pub(crate) fn sts_session(
     auth_state: &AuthState,
     access_key_id: &str,
@@ -535,7 +535,7 @@ pub(crate) fn sts_session(
         secret_access_key: sts.derive_secret(access_key_id),
         user_id: session_info.user_arn.clone(),
         user_arn: session_info.user_arn.clone(),
-        tenant: String::new(),
+        tenant: session_info.tenant.clone(),
         scope: Some(CredentialScope {
             scope: session_info.scope.clone(),
             operation: session_info.operation,
@@ -568,7 +568,7 @@ pub(crate) fn sts_session(
             access_key_id: access_key_id.to_string(),
             group_arns: Vec::new(),
             group_ids: Vec::new(),
-            tenant: String::new(),
+            tenant: session_info.tenant,
             auth_mode: objectio_auth::AuthMode::Sts,
             scope: cred.scope.clone(),
             source_ip: None,

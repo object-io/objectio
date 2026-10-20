@@ -1421,6 +1421,9 @@ pub async fn temporary_table_credentials(
     let user_arn = auth
         .as_ref()
         .map_or("anonymous", |Extension(a)| a.user_arn.as_str());
+    let tenant = auth
+        .as_ref()
+        .map_or("", |Extension(a)| a.tenant.as_str());
     // Map the Databricks-spec operation string ("READ" | "READ_WRITE")
     // onto our internal enum. Anything unrecognised is treated as the
     // safer Read — never silently widen.
@@ -1428,7 +1431,7 @@ pub async fn temporary_table_credentials(
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
-    let creds = sts.issue(user_arn, &table.storage_location, operation);
+    let creds = sts.issue(user_arn, tenant, &table.storage_location, operation);
     Ok(Json(TemporaryTableCredentialsResponse {
         aws_temp_credentials: AwsCredentials {
             access_key_id: creds.access_key_id,
@@ -1475,11 +1478,14 @@ pub async fn temporary_volume_credentials(
     let user_arn = auth
         .as_ref()
         .map_or("anonymous", |Extension(a)| a.user_arn.as_str());
+    let tenant = auth
+        .as_ref()
+        .map_or("", |Extension(a)| a.tenant.as_str());
     let operation = match req.operation.to_ascii_uppercase().as_str() {
         "READ_WRITE" => objectio_auth::sts::Operation::ReadWrite,
         _ => objectio_auth::sts::Operation::Read,
     };
-    let creds = sts.issue(user_arn, &volume.storage_location, operation);
+    let creds = sts.issue(user_arn, tenant, &volume.storage_location, operation);
     Ok(Json(TemporaryVolumeCredentialsResponse {
         aws_temp_credentials: AwsCredentials {
             access_key_id: creds.access_key_id,

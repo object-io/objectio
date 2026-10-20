@@ -692,6 +692,9 @@ pub async fn load_table(
         let user_arn = auth
             .as_ref()
             .map_or("anonymous", |Extension(a)| a.user_arn.as_str());
+        let tenant = auth
+            .as_ref()
+            .map_or("", |Extension(a)| a.tenant.as_str());
         // Scope to the table base directory, not the metadata file. The
         // metadata location is `s3://warehouse/db/table/metadata/00001-…json`
         // — Spark/PyIceberg need to read/write `data/` under the same table
@@ -699,6 +702,7 @@ pub async fn load_table(
         let table_base = iceberg_table_base_from_metadata_location(&metadata_location);
         let creds = sts.issue(
             user_arn,
+            tenant,
             &table_base,
             objectio_auth::sts::Operation::ReadWrite,
         );

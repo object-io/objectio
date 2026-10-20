@@ -390,6 +390,7 @@ async fn assume_role_with_web_identity(state: &StsState, p: &HashMap<String, Str
     let session_arn = format!("arn:obio:sts::{account}:assumed-role/{role_name}/{session}");
     let creds = state.sts.issue_for(
         &session_arn,
+        &tenant,
         "",
         objectio_auth::Operation::ReadWrite,
         Duration::from_secs(duration),

@@ -11,12 +11,14 @@
 //! The session token is an HMAC-signed payload of the form:
 //!
 //! ```text
-//! sts|{user_arn}|{scope}|{operation}|{expires_at}
+//! sts|{user_arn}|{scope}|{operation}|{tenant}|{expires_at}
 //! ```
 //!
-//! Where `scope` is an `s3://bucket/prefix/` URI and `operation` is `R` (read
-//! only) or `RW` (read + write). The signing key never leaves the gateway,
-//! so the token is the only proof needed.
+//! Where `scope` is an `s3://bucket/prefix/` URI, `operation` is `R` (read
+//! only) or `RW` (read + write), and `tenant` is the tenant of the caller it
+//! was vended to (empty for the system tenant): the session stays inside
+//! that tenant, as its holder does. The signing key never leaves the
+//! gateway, so the token is the only proof needed.
 //!
 //! ## Secret derivation
 //!
@@ -62,6 +64,9 @@ pub struct StsSessionInfo {
     /// `s3://bucket/prefix/` URI the holder is scoped to.
     pub scope: String,
     pub operation: Operation,
+    /// Tenant of the caller the session was vended to; empty = the system
+    /// tenant.
+    pub tenant: String,
     pub parent_access_key: String,
     pub expires_at: u64,
 }
@@ -82,18 +87,26 @@ impl StsProvider {
         }
     }
 
-    /// Issue temporary credentials for a user, scope and operation.
+    /// Issue temporary credentials for a user of `tenant`, a scope and an
+    /// operation.
     ///
     /// `scope` should be an `s3://bucket/prefix/` URI — only requests
     /// against that bucket+prefix will be accepted by the auth middleware.
-    pub fn issue(&self, user_arn: &str, scope: &str, operation: Operation) -> TemporaryCredentials {
-        self.issue_for(user_arn, scope, operation, self.default_duration)
+    pub fn issue(
+        &self,
+        user_arn: &str,
+        tenant: &str,
+        scope: &str,
+        operation: Operation,
+    ) -> TemporaryCredentials {
+        self.issue_for(user_arn, tenant, scope, operation, self.default_duration)
     }
 
     /// As [`Self::issue`], valid for `duration`.
     pub fn issue_for(
         &self,
         user_arn: &str,
+        tenant: &str,
         scope: &str,
         operation: Operation,
         duration: Duration,
@@ -111,10 +124,11 @@ impl StsProvider {
         let secret_access_key = self.derive_secret(&access_key_id);
 
         let payload = format!(
-            "sts|{}|{}|{}|{}",
+            "sts|{}|{}|{}|{}|{}",
             user_arn,
             scope,
             operation.as_token_str(),
+            tenant,
             expires_at
         );
         let signature = self.sign(&payload);
@@ -159,16 +173,17 @@ impl StsProvider {
             return None;
         }
 
-        // Payload: "sts|{user_arn}|{scope}|{operation}|{expires_at}"
-        let parts: Vec<&str> = payload.splitn(5, '|').collect();
-        if parts.len() != 5 || parts[0] != "sts" {
+        // Payload: "sts|{user_arn}|{scope}|{operation}|{tenant}|{expires_at}"
+        let parts: Vec<&str> = payload.splitn(6, '|').collect();
+        if parts.len() != 6 || parts[0] != "sts" {
             return None;
         }
 
         let user_arn = parts[1].to_string();
         let scope = parts[2].to_string();
         let operation = Operation::from_token_str(parts[3])?;
-        let expires_at: u64 = parts[4].parse().ok()?;
+        let tenant = parts[4].to_string();
+        let expires_at: u64 = parts[5].parse().ok()?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -182,6 +197,7 @@ impl StsProvider {
             user_arn,
             scope,
             operation,
+            tenant,
             parent_access_key: String::new(),
             expires_at,
         })
@@ -231,6 +247,7 @@ mod tests {
         let provider = StsProvider::new(b"test-key-12345");
         let creds = provider.issue(
             "arn:objectio:iam::user/alice",
+            "acme",
             "s3://warehouse/db/table/",
             Operation::Read,
         );
@@ -243,12 +260,13 @@ mod tests {
         assert_eq!(info.user_arn, "arn:objectio:iam::user/alice");
         assert_eq!(info.scope, "s3://warehouse/db/table/");
         assert_eq!(info.operation, Operation::Read);
+        assert_eq!(info.tenant, "acme");
     }
 
     #[test]
     fn test_issue_and_validate_read_write() {
         let provider = StsProvider::new(b"test-key-12345");
-        let creds = provider.issue("arn:test", "s3://b/p/", Operation::ReadWrite);
+        let creds = provider.issue("arn:test", "", "s3://b/p/", Operation::ReadWrite);
         let info = provider.validate(&creds.session_token).unwrap();
         assert_eq!(info.operation, Operation::ReadWrite);
     }
@@ -256,13 +274,26 @@ mod tests {
     #[test]
     fn test_secret_is_recoverable() {
         let provider = StsProvider::new(b"k");
-        let creds = provider.issue("u", "s3://b/", Operation::Read);
+        let creds = provider.issue("u", "", "s3://b/", Operation::Read);
         // The secret returned at issue time matches what derive_secret
         // produces — proving the middleware can recover it from just the
         // access_key_id.
         assert_eq!(
             provider.derive_secret(&creds.access_key_id),
             creds.secret_access_key
+        );
+    }
+
+    #[test]
+    fn the_tenant_is_signed() {
+        let provider = StsProvider::new(b"k");
+        let creds = provider.issue("u", "acme", "s3://b/", Operation::Read);
+        let raw = base64_decode(&creds.session_token).unwrap();
+        let forged = base64_encode(&raw.replacen("|acme|", "|globex|", 1));
+        assert!(provider.validate(&forged).is_none());
+        assert_eq!(
+            provider.validate(&creds.session_token).unwrap().tenant,
+            "acme"
         );
     }
 
@@ -276,7 +307,7 @@ mod tests {
     fn test_wrong_key() {
         let provider1 = StsProvider::new(b"key-1");
         let provider2 = StsProvider::new(b"key-2");
-        let creds = provider1.issue("arn:test", "s3://b/", Operation::Read);
+        let creds = provider1.issue("arn:test", "", "s3://b/", Operation::Read);
         assert!(provider2.validate(&creds.session_token).is_none());
     }
 
