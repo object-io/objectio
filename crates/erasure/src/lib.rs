@@ -27,11 +27,9 @@ pub mod backend;
 pub mod codec;
 pub mod metrics;
 pub mod scheme;
-pub mod shard;
 
 // Re-exports from codec
 pub use codec::{ErasureCodec, ErasureError};
-pub use shard::Shard;
 
 // Re-exports from backend for convenience
 pub use backend::isal::is_mds;

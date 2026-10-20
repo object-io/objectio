@@ -1944,6 +1944,108 @@ mod sigv4_tests {
     fn signature_comparison_is_case_sensitive() {
         assert!(!constant_time_eq("deadbeef", "DEADBEEF"));
     }
+
+    /// What this verifier accepts — not just what the SDK vectors say — of
+    /// what `objectio_auth::signer` (the CLI's and the replicator's signer)
+    /// signs: a query string, a subresource, an escaped segment, a JSON body.
+    #[test]
+    fn the_verifier_accepts_what_the_signer_signs() {
+        use super::{CachedCredential, verify_request_v4};
+        use objectio_auth::signer::{Request, Signer, canonical_query, escape_segment};
+        type Case<'a> = (
+            &'a str,
+            String,
+            Vec<(String, String)>,
+            Option<&'a str>,
+            &'a [u8],
+        );
+        let cred = CachedCredential {
+            access_key_id: "AKIACLITEST".into(),
+            secret_access_key: SECRET.into(),
+            user_id: "u1".into(),
+            user_arn: "arn:obio:iam::acme:user/cli-test".into(),
+            tenant: "acme".into(),
+            scope: None,
+            cached_at: std::time::Instant::now(),
+        };
+        let s = Signer {
+            access_key: &cred.access_key_id,
+            secret_key: &cred.secret_access_key,
+            region: "us-east-1",
+        };
+        let cases: Vec<Case> = vec![
+            (
+                "GET",
+                "/_admin/policies".into(),
+                vec![("tenant".into(), "acme corp".into())],
+                None,
+                b"",
+            ),
+            (
+                "PUT",
+                "/bkt".into(),
+                vec![("lifecycle".into(), String::new())],
+                Some("application/xml"),
+                b"<LifecycleConfiguration/>",
+            ),
+            (
+                "DELETE",
+                format!(
+                    "/_admin/tenants/acme/admins/{}",
+                    escape_segment("arn:obio:iam::acme:user/u1")
+                ),
+                vec![],
+                None,
+                b"",
+            ),
+            (
+                "POST",
+                "/_admin/users".into(),
+                vec![],
+                Some("application/json"),
+                br#"{"display_name":"x"}"#,
+            ),
+        ];
+        for (method, path, query, ct, body) in cases {
+            let headers = s.sign(
+                &Request {
+                    method,
+                    host: "127.0.0.1:9000",
+                    path: &path,
+                    query: &query,
+                    content_type: ct,
+                    body,
+                },
+                chrono::Utc::now(),
+            );
+            let qs = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", canonical_query(&query))
+            };
+            let mut b = http::Request::builder()
+                .method(method)
+                .uri(format!("http://127.0.0.1:9000{path}{qs}"))
+                .header("host", "127.0.0.1:9000");
+            if let Some(ct) = ct {
+                b = b.header("content-type", ct);
+            }
+            for (k, v) in &headers {
+                b = b.header(*k, v);
+            }
+            let req = b.body(()).unwrap();
+            let header = req.headers()["authorization"].to_str().unwrap();
+            let parsed = parse_authorization_header(header).unwrap();
+            verify_request_v4(
+                &req,
+                &parsed.signed_headers,
+                &parsed.signature,
+                &cred,
+                "us-east-1",
+            )
+            .unwrap_or_else(|e| panic!("{method} {path}{qs} rejected: {e:?}"));
+        }
+    }
 }
 
 #[cfg(test)]

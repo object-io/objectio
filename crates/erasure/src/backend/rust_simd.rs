@@ -185,48 +185,6 @@ impl ErasureBackend for RustSimdLrcBackend {
 
         Ok(reconstructed)
     }
-
-    fn verify(&self, shards: &[&[u8]]) -> BackendResult<bool> {
-        let k = self.config.data_shards as usize;
-        let l = self.config.local_parity_shards as usize;
-        let g = self.config.global_parity_shards as usize;
-
-        if shards.len() != k + l + g {
-            return Ok(false);
-        }
-
-        // Check all shards have same size
-        if let Some(first_len) = shards.first().map(|s| s.len()) {
-            if !shards.iter().all(|s| s.len() == first_len) {
-                return Ok(false);
-            }
-
-            // Verify local parity groups
-            let group_size = self.config.local_group_size as usize;
-            for group_idx in 0..l {
-                let start = group_idx * group_size;
-                let group_data: Vec<&[u8]> = shards[start..start + group_size].to_vec();
-                let expected_local = Self::xor_slices(&group_data, first_len);
-                if expected_local != shards[k + group_idx] {
-                    return Ok(false);
-                }
-            }
-
-            // Verify global parity
-            let data_shards: Vec<&[u8]> = shards[..k].to_vec();
-            let encoded = self.encode_lrc(&data_shards, first_len)?;
-            if encoded
-                .global_parity_shards
-                .iter()
-                .zip(&shards[k + l..k + l + g])
-                .any(|(want, got)| want.as_slice() != *got)
-            {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
 }
 
 impl LrcBackend for RustSimdLrcBackend {
@@ -385,24 +343,6 @@ impl LrcBackend for RustSimdLrcBackend {
             local_parity_index,
         })
     }
-
-    fn can_recover_locally(&self, available: &[bool], missing_index: usize) -> bool {
-        if let Some(group) = self.local_group(missing_index) {
-            // Check all other members of the local group are available
-            for &idx in &group.data_shard_indices {
-                if idx != missing_index && !available.get(idx).copied().unwrap_or(false) {
-                    return false;
-                }
-            }
-            // Check local parity is available
-            available
-                .get(group.local_parity_index)
-                .copied()
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    }
 }
 
 #[cfg(test)]
@@ -440,9 +380,6 @@ mod tests {
         shard_refs[1] = None;
 
         // Should be able to recover locally
-        let available: Vec<bool> = shard_refs.iter().map(|s| s.is_some()).collect();
-        assert!(backend.can_recover_locally(&available, 1));
-
         let recovered = backend.decode_local(&shard_refs, 1024, 1).unwrap();
         assert!(recovered.is_some());
         assert_eq!(recovered.unwrap(), data[1]);
@@ -473,19 +410,5 @@ mod tests {
         assert_eq!(backend.decode_local(&shard_refs, 1024, 0).unwrap(), None);
         let recovered = backend.decode(&shard_refs, 1024, &[0, 1]).unwrap();
         assert_eq!(recovered, vec![data[0].clone(), data[1].clone()]);
-    }
-
-    #[test]
-    fn test_lrc_verify() {
-        let config = LrcConfig::new(6, 2, 2);
-        let backend = RustSimdLrcBackend::new(config).unwrap();
-
-        let data: Vec<Vec<u8>> = (0..6).map(|i| vec![i as u8; 1024]).collect();
-        let data_refs: Vec<&[u8]> = data.iter().map(|d| d.as_slice()).collect();
-
-        let all_shards = backend.encode(&data_refs, 1024).unwrap();
-        let shard_refs: Vec<&[u8]> = all_shards.iter().map(|s| s.as_slice()).collect();
-
-        assert!(backend.verify(&shard_refs).unwrap());
     }
 }

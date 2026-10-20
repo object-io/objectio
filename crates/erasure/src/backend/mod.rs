@@ -110,11 +110,6 @@ pub trait ErasureBackend: Send + Sync {
         shard_size: usize,
         missing_indices: &[usize],
     ) -> BackendResult<Vec<Vec<u8>>>;
-
-    /// Verify that parity shards are consistent with data shards
-    ///
-    /// Re-encodes the data shards and compares with provided parity shards.
-    fn verify(&self, shards: &[&[u8]]) -> BackendResult<bool>;
 }
 
 /// Check that `parity` is m buffers of `shard_size` bytes.
@@ -274,12 +269,6 @@ pub trait LrcBackend: ErasureBackend {
     ///
     /// Returns `None` for global parity shards (they have no local group)
     fn local_group(&self, shard_index: usize) -> Option<LocalGroup>;
-
-    /// Check if a shard can be recovered using local parity only
-    ///
-    /// Returns true if all other shards in the local group (including
-    /// the local parity) are available.
-    fn can_recover_locally(&self, available: &[bool], missing_index: usize) -> bool;
 }
 
 // Re-exports

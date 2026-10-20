@@ -2401,7 +2401,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha1",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -2413,15 +2412,11 @@ dependencies = [
 name = "objectio-block"
 version = "0.1.0-dev"
 dependencies = [
- "async-trait",
  "bytes",
  "chrono",
  "crc32c",
  "objectio-common",
- "objectio-proto",
  "parking_lot",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2777,7 +2772,6 @@ version = "0.1.0-dev"
 dependencies = [
  "crc32c",
  "objectio-common",
- "objectio-placement",
  "objectio-proto",
  "openraft",
  "parking_lot",
@@ -2806,7 +2800,6 @@ dependencies = [
  "gethostname",
  "hex",
  "nix",
- "objectio-block",
  "objectio-common",
  "objectio-erasure",
  "objectio-proto",
@@ -2846,11 +2839,9 @@ name = "objectio-placement"
 version = "0.1.0-dev"
 dependencies = [
  "objectio-common",
- "parking_lot",
  "rand 0.8.5",
  "serde",
  "thiserror 2.0.18",
- "uuid",
  "xxhash-rust",
 ]
 
