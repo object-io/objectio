@@ -37,6 +37,9 @@ tower-http = { version = "0.6", features = ["full"] }
 
 # gRPC
 tonic = { version = "0.12", features = ["tls"] }
+# tonic's TLS stack, used directly for HTTPS from the same certificate as
+# gRPC (meta's admin port).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 prost = { version = "0.13" }
 prost-types = { version = "0.13" }
 

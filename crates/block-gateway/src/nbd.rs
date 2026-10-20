@@ -47,9 +47,9 @@ const NBD_OPT_GO: u32 = 7;
 
 // Reply types
 const NBD_REP_ACK: u32 = 1;
-const NBD_REP_SERVER: u32 = 2;
 const NBD_REP_INFO: u32 = 3;
 const NBD_REP_ERR_UNSUP: u32 = 0x8000_0001;
+const NBD_REP_ERR_POLICY: u32 = 0x8000_0002;
 const NBD_REP_ERR_INVALID: u32 = 0x8000_0003;
 const NBD_REP_ERR_UNKNOWN: u32 = 0x8000_0006;
 const NBD_REP_ERR_TOO_BIG: u32 = 0x8000_0009;
@@ -454,15 +454,16 @@ impl NbdServer {
                         .await?;
                         continue;
                     }
-                    let mut names: Vec<String> = self.exports.read().keys().cloned().collect();
-                    names.sort();
-                    for name in &names {
-                        let mut reply = Vec::with_capacity(4 + name.len());
-                        reply.extend_from_slice(&(name.len() as u32).to_be_bytes());
-                        reply.extend_from_slice(name.as_bytes());
-                        send_option_reply(stream, option, NBD_REP_SERVER, &reply).await?;
-                    }
-                    send_option_reply(stream, option, NBD_REP_ACK, &[]).await?;
+                    // NBD has no authentication: anyone who reaches the
+                    // port would learn every attached volume's name, the
+                    // one thing that stands for a credential here.
+                    send_option_reply(
+                        stream,
+                        option,
+                        NBD_REP_ERR_POLICY,
+                        b"listing exports is not allowed",
+                    )
+                    .await?;
                 }
 
                 NBD_OPT_INFO | NBD_OPT_GO => {
@@ -974,19 +975,10 @@ mod tests {
         send_option(&mut client, 99, &vec![0u8; MAX_OPTION_DATA as usize + 1]).await;
         assert_eq!(option_reply(&mut client).await.1, NBD_REP_ERR_TOO_BIG);
 
+        // Listing exports is refused: no names, and the session goes on.
         send_option(&mut client, NBD_OPT_LIST, &[]).await;
-        let mut names = Vec::new();
-        loop {
-            let (_, kind, data) = option_reply(&mut client).await;
-            if kind == NBD_REP_ACK {
-                break;
-            }
-            assert_eq!(kind, NBD_REP_SERVER);
-            let len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-            assert_eq!(data.len(), 4 + len);
-            names.push(String::from_utf8(data[4..].to_vec()).unwrap());
-        }
-        assert_eq!(names, ["ro", "vol"]);
+        let (option, kind, _) = option_reply(&mut client).await;
+        assert_eq!((option, kind), (NBD_OPT_LIST, NBD_REP_ERR_POLICY));
 
         send_option(&mut client, NBD_OPT_ABORT, &[]).await;
         assert_eq!(

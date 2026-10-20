@@ -279,6 +279,12 @@ struct Args {
     #[arg(long, default_value_t = 10809)]
     nbd_port: u16,
 
+    /// Address the block gateway's gRPC and NBD ports bind. Loopback by
+    /// default, whatever --listen-addr: NBD has no authentication, and
+    /// without mTLS neither has the gRPC port.
+    #[arg(long, default_value = "127.0.0.1")]
+    block_listen_addr: String,
+
     /// mTLS between the services (A8a): with these, even the all-in-one's
     /// own gRPC hops go over mutual TLS.
     #[command(flatten)]
@@ -475,7 +481,7 @@ async fn wait_osd_addr(path: &std::path::Path, i: usize, max: u64) -> Result<u16
 /// become usable, and the banner is how the user finds out where it is.
 async fn wait_gateway_ready(port: u16, max: u64) {
     for i in 0..(max * 4) {
-        if let Ok((status, _)) = http_oneshot(port, "GET", "/_ready", b"").await
+        if let Ok((status, _)) = http_oneshot(port, "GET", "/_ready", b"", None).await
             && status.contains(" 200 ")
         {
             return;
@@ -491,12 +497,17 @@ async fn wait_gateway_ready(port: u16, max: u64) {
     );
 }
 
-/// Minimal HTTP GET/POST over a one-shot TCP connection. Returns (status_line, body).
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
+/// Minimal HTTP GET/POST over a one-shot TCP connection, over TLS with
+/// `tls`. Returns (status_line, body).
 async fn http_oneshot(
     port: u16,
     method: &str,
     path: &str,
     body: &[u8],
+    tls: Option<std::sync::Arc<tokio_rustls::rustls::ClientConfig>>,
 ) -> Result<(String, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let req = format!(
@@ -504,13 +515,28 @@ async fn http_oneshot(
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
-        .context("raft admin connect")?;
+        .context("connect")?;
+    let mut s: Box<dyn Stream> = match tls {
+        None => Box::new(s),
+        Some(config) => {
+            let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            );
+            Box::new(
+                tokio_rustls::TlsConnector::from(config)
+                    .connect(name, s)
+                    .await
+                    .context("TLS")?,
+            )
+        }
+    };
     s.write_all(req.as_bytes()).await?;
     if !body.is_empty() {
         s.write_all(body).await?;
     }
+    s.flush().await?;
     let mut resp = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
@@ -542,7 +568,10 @@ async fn bootstrap_raft(port: u16) -> Result<()> {
     // Warm-restart shortcut: if /status reports any voters, the cluster
     // is already initialized — skip /init to avoid openraft's internal
     // "Can not initialize" ERROR log on every restart.
-    if let Ok((status, body)) = http_oneshot(port, "GET", "/status", &[]).await
+    // Under mTLS the admin port is HTTPS, and /init takes the admin role,
+    // which aio's certificate carries with the others.
+    let tls = objectio_proto::transport::https_client_config().map_err(anyhow::Error::msg)?;
+    if let Ok((status, body)) = http_oneshot(port, "GET", "/status", &[], tls.clone()).await
         && status.starts_with("HTTP/1.1 200")
         && body.contains("\"voters\"")
         && !body.contains("\"voters\":[]")
@@ -550,7 +579,9 @@ async fn bootstrap_raft(port: u16) -> Result<()> {
         info!("raft already initialized — skipping /init");
         return Ok(());
     }
-    let (status, _body) = http_oneshot(port, "POST", "/init", b"{}").await?;
+    let (status, _body) = http_oneshot(port, "POST", "/init", b"{}", tls)
+        .await
+        .context("raft admin")?;
     if status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.1 409") {
         info!("raft bootstrap: {}", status);
         Ok(())
@@ -1031,9 +1062,9 @@ async fn serve() -> Result<()> {
         let block_args = <objectio_block_gateway::Args as clap::Parser>::parse_from([
             "objectio-block-gateway".to_string(),
             "--listen".into(),
-            format!("{}:{}", args.listen_addr, args.block_port),
+            format!("{}:{}", args.block_listen_addr, args.block_port),
             "--nbd-listen".into(),
-            format!("{}:{}", args.listen_addr, args.nbd_port),
+            format!("{}:{}", args.block_listen_addr, args.nbd_port),
             "--meta-endpoint".into(),
             format!("http://127.0.0.1:{meta_grpc}"),
             "--data-dir".into(),

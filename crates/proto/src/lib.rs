@@ -70,6 +70,10 @@ pub mod raft {
 pub mod rpc_metrics;
 pub mod transport;
 
+/// Which roles may make each call between the services, under mTLS.
+#[warn(clippy::pedantic, clippy::nursery)]
+pub mod peer_auth;
+
 /// Deduplication policy resolution, shared by meta and the gateway.
 #[warn(clippy::pedantic, clippy::nursery)]
 pub mod dedup;

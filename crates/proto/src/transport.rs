@@ -14,6 +14,10 @@
 //! The windows are credit the receiver extends, not memory it allocates up
 //! front: a connection only buffers what is actually in flight.
 
+use std::sync::Arc;
+
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tonic::transport::Server;
 
 /// Per-stream window: one whole shard (at most 4 MiB) arrives without the
@@ -35,8 +39,10 @@ pub const PENDING_RESETS: usize = 1024;
 /// mTLS between the services (A8a), every gRPC hop: gateway, meta, OSD
 /// and block gateway, and the CLI's block commands. With these set, a
 /// server accepts only clients presenting a certificate the CA signed, and
-/// a client accepts only servers that do; without them, gRPC is plain
-/// (development, tests that say so).
+/// a client accepts only servers that do; and each call is checked against
+/// the role the caller's certificate names ([`crate::peer_auth`]). Without
+/// them, gRPC is plain and unauthenticated (development, tests that say
+/// so, a network nothing else can reach).
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct TlsArgs {
     /// This node's certificate (PEM), presented to peers both as a server
@@ -55,6 +61,11 @@ pub struct TlsArgs {
 struct Tls {
     client: tonic::transport::ClientTlsConfig,
     server: tonic::transport::ServerTlsConfig,
+    /// The same, for HTTPS (meta's admin port): the certificate chain, its
+    /// key and the CA, as PEM.
+    cert: Vec<u8>,
+    key: Vec<u8>,
+    ca: Vec<u8>,
 }
 
 static TLS: std::sync::OnceLock<Tls> = std::sync::OnceLock::new();
@@ -72,18 +83,94 @@ pub fn configure_tls(args: &TlsArgs) -> Result<(), String> {
     let read = |p: &std::path::Path| {
         std::fs::read(p).map_err(|e| format!("TLS: cannot read {}: {e}", p.display()))
     };
-    let identity = tonic::transport::Identity::from_pem(read(cert)?, read(key)?);
-    let ca = tonic::transport::Certificate::from_pem(read(ca)?);
+    let (cert, key, ca) = (read(cert)?, read(key)?, read(ca)?);
+    let identity = tonic::transport::Identity::from_pem(&cert, &key);
+    let ca_cert = tonic::transport::Certificate::from_pem(&ca);
+    let roles = rustls::pki_types::CertificateDer::pem_slice_iter(&cert)
+        .next()
+        .and_then(Result::ok)
+        .map_or(crate::peer_auth::Roles::NONE, |der| {
+            crate::peer_auth::roles_of_cert(&der)
+        });
     let _ = TLS.set(Tls {
         client: tonic::transport::ClientTlsConfig::new()
-            .ca_certificate(ca.clone())
+            .ca_certificate(ca_cert.clone())
             .identity(identity.clone()),
         server: tonic::transport::ServerTlsConfig::new()
             .identity(identity)
-            .client_ca_root(ca),
+            .client_ca_root(ca_cert),
+        cert,
+        key,
+        ca,
     });
-    tracing::info!("gRPC between services: mutual TLS");
+    if roles.is_empty() {
+        tracing::warn!(
+            "gRPC between services: mutual TLS, but this process's certificate names no role \
+             (a SAN URI spiffe://objectio/<role>): once the cluster's upgrade is finalized, \
+             its peers refuse it"
+        );
+    } else {
+        tracing::info!("gRPC between services: mutual TLS, as role {roles}");
+    }
     Ok(())
+}
+
+/// A rustls configuration for an HTTPS server with this process's
+/// certificate, when mTLS is on: a client may present a certificate the
+/// CA signed (its roles are then known) or none.
+///
+/// # Errors
+/// The certificate or key doesn't parse.
+pub fn https_server_config() -> Result<Option<Arc<rustls::ServerConfig>>, String> {
+    let Some(tls) = TLS.get() else {
+        return Ok(None);
+    };
+    let roots = Arc::new(root_store(&tls.ca)?);
+    let verifier = rustls::server::WebPkiClientVerifier::builder(roots)
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| format!("TLS: client verifier: {e}"))?;
+    let config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain(&tls.cert)?, key(&tls.key)?)
+        .map_err(|e| format!("TLS: server certificate: {e}"))?;
+    Ok(Some(Arc::new(config)))
+}
+
+/// A rustls configuration for an HTTPS client presenting this process's
+/// certificate and trusting only the CA, when mTLS is on.
+///
+/// # Errors
+/// The certificate or key doesn't parse.
+pub fn https_client_config() -> Result<Option<Arc<rustls::ClientConfig>>, String> {
+    let Some(tls) = TLS.get() else {
+        return Ok(None);
+    };
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store(&tls.ca)?)
+        .with_client_auth_cert(chain(&tls.cert)?, key(&tls.key)?)
+        .map_err(|e| format!("TLS: client certificate: {e}"))?;
+    Ok(Some(Arc::new(config)))
+}
+
+fn chain(pem: &[u8]) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    rustls::pki_types::CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("TLS: certificate: {e}"))
+}
+
+fn key(pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    rustls::pki_types::PrivateKeyDer::from_pem_slice(pem).map_err(|e| format!("TLS: key: {e}"))
+}
+
+fn root_store(pem: &[u8]) -> Result<rustls::RootCertStore, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in chain(pem)? {
+        roots
+            .add(cert)
+            .map_err(|e| format!("TLS: CA certificate: {e}"))?;
+    }
+    Ok(roots)
 }
 
 /// Whether gRPC in this process uses mTLS.
@@ -129,8 +216,25 @@ pub fn server() -> Server {
         Some(tls) => builder
             .tls_config(tls.server.clone())
             .expect("gRPC server TLS configuration"),
-        None => builder,
+        None => {
+            warn_unauthenticated();
+            builder
+        }
     }
+}
+
+/// Say, once per process, that its internal ports take calls from anyone
+/// who can reach them.
+pub fn warn_unauthenticated() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "mTLS is off: this process's internal ports (gRPC; meta's admin port) are \
+             unauthenticated, and anyone who can reach them can read and change everything in \
+             the cluster, users' secret keys included. Isolate the internal network, or turn \
+             mTLS on (--tls-cert, --tls-key, --tls-ca)"
+        );
+    });
 }
 
 /// Header marking a meta liveness probe (see [`meta_channel`]).

@@ -702,6 +702,9 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("OSD listener: {e}"))?;
     let server_future = objectio_proto::transport::server()
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(&RPC_METRICS))
+        .layer(objectio_proto::peer_auth::PeerAuthLayer::new(&[
+            objectio_proto::peer_auth::STORAGE_SERVICE,
+        ]))
         .add_service(storage_service)
         .serve_with_incoming_shutdown(incoming, async move {
             shutdown.await;

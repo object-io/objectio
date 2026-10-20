@@ -30,20 +30,39 @@
 //!   knows a leader; 503 otherwise (before the cluster is initialized,
 //!   before this node is added, during an election). What a readiness
 //!   probe asks.
+//!
+//! ## Who may call them
+//!
+//! A learner is sent the whole log, so whoever may add one may read every
+//! record in the cluster. With mTLS on, the port is HTTPS with the node's
+//! certificate, and the three that change membership take only a client
+//! presenting a certificate of role `admin` (the Helm bootstrap Job's,
+//! an operator's). `/status`, `/health` and `/ready` only read state and
+//! take any client, with or without a certificate: kubelet's probes
+//! present none. With mTLS off it is plain HTTP and unauthenticated, like
+//! the rest of the internal network: it binds the host meta listens on
+//! (loopback in the all-in-one) and the node says at startup that the
+//! network must be isolated.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{ConnectInfo, Request, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use objectio_meta_store::MetaTypeConfig;
+use objectio_proto::peer_auth::Roles;
 use openraft::{BasicNode, Raft, RaftMetrics, ServerState};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::server::TlsStream;
+use tracing::{debug, info, warn};
 
 pub struct RaftAdminState {
     pub raft: Arc<Raft<MetaTypeConfig>>,
@@ -57,10 +76,145 @@ impl RaftAdminState {
             .route("/init", post(init))
             .route("/add-learner", post(add_learner))
             .route("/change-membership", post(change_membership))
+            .route_layer(middleware::from_fn(require_admin))
             .route("/status", get(status))
             .route("/health", get(health))
             .route("/ready", get(ready))
             .with_state(self)
+    }
+}
+
+/// A client of the admin port, over TLS: its address and the roles its
+/// certificate names (none without one).
+#[derive(Clone, Debug)]
+pub struct Peer {
+    pub addr: SocketAddr,
+    pub roles: Roles,
+}
+
+/// Under mTLS, a call that changes membership needs a client certificate
+/// of role `admin`.
+async fn require_admin(req: Request, next: Next) -> Response {
+    if !objectio_proto::transport::tls_enabled() {
+        return next.run(req).await;
+    }
+    let peer = req.extensions().get::<ConnectInfo<Peer>>().map(|c| &c.0);
+    match peer {
+        Some(p) if p.roles.intersects(Roles::ADMIN) => next.run(req).await,
+        _ => {
+            let (who, roles) = peer.map_or_else(
+                || ("an unknown peer".to_string(), Roles::NONE),
+                |p| (p.addr.to_string(), p.roles),
+            );
+            warn!(
+                "raft admin: refused {} from {who} (role {roles}): needs a certificate of role admin",
+                req.uri().path()
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "this call needs a client certificate of role admin"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Serve the admin API on `listener` until the process ends: over TLS with
+/// this node's certificate when mTLS is on, plain HTTP otherwise. The
+/// caller binds it, so a port that can't be had fails startup.
+///
+/// # Errors
+/// The TLS configuration doesn't apply.
+pub async fn serve(state: Arc<RaftAdminState>, listener: TcpListener) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
+    let router = state.router();
+    match objectio_proto::transport::https_server_config().map_err(anyhow::Error::msg)? {
+        Some(config) => {
+            info!("Raft admin API on https://{addr}/ (membership changes: role admin)");
+            let tls = TlsListener::spawn(listener, tokio_rustls::TlsAcceptor::from(config));
+            axum::serve(tls, router.into_make_service_with_connect_info::<Peer>()).await?;
+        }
+        None => {
+            objectio_proto::transport::warn_unauthenticated();
+            info!("Raft admin API on http://{addr}/ (unauthenticated: mTLS is off)");
+            axum::serve(listener, router).await?;
+        }
+    }
+    Ok(())
+}
+
+/// How long a client has to finish its TLS handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections that completed their TLS handshake, each with its peer.
+/// Handshakes run on tasks of their own, so a slow one holds up no other.
+struct TlsListener {
+    local: SocketAddr,
+    ready: tokio::sync::mpsc::Receiver<(TlsStream<TcpStream>, Peer)>,
+}
+
+impl TlsListener {
+    fn spawn(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+        let local = listener
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let (tx, ready) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                let (tcp, addr) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        debug!("raft admin: accept: {e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let tls =
+                        match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(e)) => {
+                                debug!("raft admin: TLS handshake from {addr}: {e}");
+                                return;
+                            }
+                            Err(_) => return,
+                        };
+                    let roles =
+                        objectio_proto::peer_auth::peer_roles(tls.get_ref().1.peer_certificates());
+                    let _ = tx.send((tls, Peer { addr, roles })).await;
+                });
+            }
+        });
+        Self { local, ready }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = Peer;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.ready.recv().await {
+            Some(conn) => conn,
+            // The accepting task never ends while the listener lives.
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(Peer {
+            addr: self.local,
+            roles: Roles::NONE,
+        })
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsListener>> for Peer {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
+        stream.remote_addr().clone()
     }
 }
 

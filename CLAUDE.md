@@ -96,7 +96,7 @@ prefix; packages and binaries keep it: `crates/gateway` is the package
 | `bin/cli` | | `obioctl`, the admin CLI: a SigV4 client of the gateway's admin API only (`bin/cli/README.md`) |
 | `bin/{install,io-bench,s3-bench,dedup-estimate}` | | Tools |
 | `crates/common` | | `Error`/`Result`, shared types, metrics, format levels (`version`) |
-| `crates/proto` | | gRPC definitions (`proto/*.proto`, built by its `build.rs`); meta channel (`transport`) |
+| `crates/proto` | | gRPC definitions (`proto/*.proto`, built by its `build.rs`); meta channel and mTLS (`transport`); which role may make each call (`peer_auth`) |
 | `crates/storage` | | The OSD's disk engine and metadata store |
 | `crates/erasure` | | Erasure coding: MDS on ISA-L, LRC on reed-solomon-simd |
 | `crates/placement` | | CRUSH placement, topology |

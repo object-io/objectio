@@ -31,7 +31,7 @@ impl<'a> Cli<'a> {
             .env("OBJECTIO_ENDPOINT", &self.c.endpoint);
         // Its block commands speak gRPC to the block gateway, as the
         // cluster's nodes do (mTLS unless the suite runs plain).
-        objectio_e2e::tls::apply(&mut cmd);
+        objectio_e2e::tls::apply(&mut cmd, objectio_e2e::tls::ADMIN);
         cmd
     }
 
