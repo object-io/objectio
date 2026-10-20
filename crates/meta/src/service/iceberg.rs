@@ -1049,18 +1049,60 @@ impl MetaService {
         request: Request<IcebergSetTablePolicyRequest>,
     ) -> Result<Response<IcebergSetTablePolicyResponse>, Status> {
         let req = request.into_inner();
-        let table_key = Self::iceberg_table_key(&req.namespace_levels, &req.table_name);
+        let table_key =
+            Self::iceberg_table_key_wh(&req.warehouse, &req.namespace_levels, &req.table_name);
 
-        let mut tables = self.iceberg_tables.write();
-        let entry = tables
-            .get_mut(&table_key)
-            .ok_or_else(|| Status::not_found("table not found"))?;
+        // A CAS against the entry as read, through Raft like every other
+        // table write: a policy written only here would be lost to the
+        // followers and overwritten by the next commit.
+        let (old_bytes, new_entry) = {
+            let tables = self.iceberg_tables.read();
+            let entry = tables
+                .get(&table_key)
+                .ok_or_else(|| Status::not_found("table not found"))?;
+            let mut new_entry = entry.clone();
+            new_entry.policy_json = req.policy_json;
+            new_entry.updated_at = Self::current_timestamp();
+            (entry.encode_to_vec(), new_entry)
+        };
+        let new_bytes = new_entry.encode_to_vec();
 
-        entry.policy_json = req.policy_json;
-
-        if let Some(store) = &self.store {
-            store.put_iceberg_table(&table_key, &entry.encode_to_vec());
+        if let Some(raft) = self.raft_handle() {
+            use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+            let cmd = MetaCommand::MultiCas {
+                ops: vec![CasOp {
+                    table: CasTable::IcebergTables,
+                    key: table_key.clone(),
+                    expected: Some(old_bytes),
+                    new_value: Some(new_bytes),
+                }],
+                requested_by: "iceberg-set-table-policy".into(),
+            };
+            match raft.client_write(cmd).await {
+                Ok(resp) => match resp.data {
+                    MetaResponse::MultiCasOk => {}
+                    MetaResponse::MultiCasConflict { .. } => {
+                        return Err(Status::aborted("table changed since read; retry"));
+                    }
+                    other => {
+                        error!("unexpected raft response for set_table_policy: {:?}", other);
+                        return Err(Status::internal("raft commit returned wrong variant"));
+                    }
+                },
+                Err(e) => return Err(raft_write_to_status(&e)),
+            }
+        } else if let Some(store) = &self.store {
+            match store.cas_iceberg_table(&table_key, &old_bytes, &new_bytes) {
+                Ok(true) => {}
+                Ok(false) => return Err(Status::aborted("table changed since read; retry")),
+                Err(e) => {
+                    error!("Failed to CAS iceberg table '{}': {}", table_key, e);
+                    return Err(Status::internal("failed to set the table policy"));
+                }
+            }
         }
+
+        self.iceberg_tables.write().insert(table_key, new_entry);
 
         info!(
             "Set policy on iceberg table: {:?}.{}",
@@ -1077,7 +1119,8 @@ impl MetaService {
         request: Request<IcebergGetTablePolicyRequest>,
     ) -> Result<Response<IcebergGetTablePolicyResponse>, Status> {
         let req = request.into_inner();
-        let table_key = Self::iceberg_table_key(&req.namespace_levels, &req.table_name);
+        let table_key =
+            Self::iceberg_table_key_wh(&req.warehouse, &req.namespace_levels, &req.table_name);
 
         let entry = self
             .iceberg_tables
@@ -1292,5 +1335,85 @@ impl MetaService {
         Ok(Response::new(IcebergDeleteWarehouseResponse {
             success: true,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> (tempfile::TempDir, MetaService) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MetaStore::open(dir.path().join("meta.redb")).unwrap());
+        (dir, MetaService::with_store(EcConfig::default(), store))
+    }
+
+    async fn warehouse(svc: &MetaService, name: &str) -> IcebergWarehouse {
+        svc.iceberg_create_warehouse(Request::new(IcebergCreateWarehouseRequest {
+            name: name.to_string(),
+            tenant: "acme".to_string(),
+            properties: std::collections::HashMap::default(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .warehouse
+        .unwrap()
+    }
+
+    /// A table's policy is the one of the table in its warehouse, and it is
+    /// stored: keyed without the warehouse it named no table at all.
+    #[tokio::test]
+    async fn a_table_policy_is_stored_on_the_warehouse_table() {
+        let (_dir, svc) = service();
+        warehouse(&svc, "wh").await;
+        let ns = vec!["db".to_string()];
+        svc.iceberg_create_namespace(Request::new(IcebergCreateNamespaceRequest {
+            namespace_levels: ns.clone(),
+            properties: std::collections::HashMap::default(),
+            warehouse: "wh".to_string(),
+        }))
+        .await
+        .unwrap();
+        svc.iceberg_create_table(Request::new(IcebergCreateTableRequest {
+            namespace_levels: ns.clone(),
+            table_name: "t".to_string(),
+            metadata_location: "s3://iceberg-wh/db/t/metadata/0.json".to_string(),
+            metadata_json: b"{}".to_vec(),
+            warehouse: "wh".to_string(),
+        }))
+        .await
+        .unwrap();
+
+        svc.iceberg_set_table_policy(Request::new(IcebergSetTablePolicyRequest {
+            namespace_levels: ns.clone(),
+            table_name: "t".to_string(),
+            policy_json: b"{\"p\":1}".to_vec(),
+            warehouse: "wh".to_string(),
+        }))
+        .await
+        .unwrap();
+        let got = svc
+            .iceberg_get_table_policy(Request::new(IcebergGetTablePolicyRequest {
+                namespace_levels: ns.clone(),
+                table_name: "t".to_string(),
+                warehouse: "wh".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.policy_json, b"{\"p\":1}");
+
+        // Written to the store, not only the cache.
+        let key = MetaService::iceberg_table_key_wh("wh", &ns, "t");
+        let stored = svc
+            .store
+            .as_ref()
+            .unwrap()
+            .get_iceberg_table(&key)
+            .unwrap()
+            .map(|v| IcebergTableEntry::decode(v.as_slice()).unwrap())
+            .expect("table row");
+        assert_eq!(stored.policy_json, b"{\"p\":1}");
     }
 }
