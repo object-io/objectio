@@ -683,7 +683,7 @@ pub(crate) async fn delete_object_to_the_end(
     // When the replicas removed different objects, a racing write may yet
     // be stamped again and written over the delete: what it removed is
     // freed once that has settled (`MetaDeleted::agreed`).
-    let pg = crate::osd_pool::pg_ref(&placement);
+    let pg = objectio_proto::stripe::fence(&placement);
     let deleted = delete_meta_from_all(
         &state.osd_pool,
         &placement.nodes,

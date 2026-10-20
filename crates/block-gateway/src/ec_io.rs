@@ -12,7 +12,8 @@ use futures::future::join_all;
 use objectio_common::ErasureConfig;
 use objectio_erasure::ErasureCodec;
 use objectio_proto::metadata::{GetPlacementRequest, NodePlacement, ShardLocation, StripeMeta};
-use tracing::{error, warn};
+use objectio_proto::stripe::{self, Scheme};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::meta_blocks::MetaBlocks;
@@ -50,12 +51,15 @@ pub async fn write_chunk(
         .map_err(|e| anyhow!("GetPlacement failed: {e}"))?
         .into_inner();
 
-    if placement.nodes.is_empty() {
-        return Err(anyhow!("no placement nodes returned for chunk {chunk_id}"));
-    }
-
-    let codec = ErasureCodec::new(ErasureConfig::new(ec_k as u8, ec_m as u8))
-        .map_err(|e| anyhow!("erasure codec init: {e}"))?;
+    // Coded with the volume's profile, not the pool's; placed, fenced by
+    // the placement group's epoch and held to its quorum as every stripe
+    // is. Short of it, the chunk stays dirty (and journaled) for the next
+    // flush to place and write again.
+    let scheme = Scheme::Mds { k: ec_k, m: ec_m };
+    let config = scheme
+        .erasure()
+        .ok_or_else(|| anyhow!("no code for {scheme:?}"))?;
+    let codec = ErasureCodec::new(config).map_err(|e| anyhow!("erasure codec init: {e}"))?;
     let shards = codec
         .encode_bytes(data)
         .map_err(|e| anyhow!("erasure encode: {e}"))?;
@@ -64,68 +68,29 @@ pub async fn write_chunk(
     // stays intact until meta has recorded this one, and is freed only
     // once nothing (a snapshot, a clone) uses it.
     let object_id = Uuid::new_v4().as_bytes().to_vec();
-    let total_shards = (ec_k + ec_m) as usize;
-
-    let results = join_all(shards.iter().enumerate().map(|(i, shard_data)| {
-        let node = placement.nodes[i % placement.nodes.len()].clone();
-        let oid = object_id.clone();
-        let sdata = shard_data.clone();
-        let pool = Arc::clone(osd_pool);
-        async move {
-            let result =
-                write_shard_to_osd(&pool, &node, &oid, 0, i as u32, sdata, ec_k, ec_m).await;
-            (i as u32, node, result)
-        }
-    }))
+    let pg = stripe::fence(&placement);
+    let written = stripe::write(scheme, &placement.nodes, shards, |position, node, shard| {
+        write_shard_to_osd(
+            osd_pool,
+            node,
+            &object_id,
+            0,
+            position,
+            shard,
+            ec_k,
+            ec_m,
+            pg.as_ref(),
+        )
+    })
     .await;
-
-    // Only shards actually written are recorded, each where it went.
-    let mut stripe_shards: Vec<ShardLocation> = Vec::with_capacity(total_shards);
-    for (position, node, result) in results {
-        match result {
-            Ok((location, crc32c)) => stripe_shards.push(ShardLocation {
-                position,
-                node_id: node.node_id.clone(),
-                disk_id: location.disk_id,
-                offset: location.offset,
-                shard_type: node.shard_type,
-                local_group: node.local_group,
-                crc32c: Some(crc32c),
-            }),
-            Err(e) => error!("Failed to write shard {position} for chunk {chunk_id}: {e}"),
+    match written {
+        Ok(shards) => Ok(scheme.stripe(0, data.len() as u64, object_id, shards)),
+        Err(short) => {
+            let partial = scheme.stripe(0, data.len() as u64, object_id, short.written.clone());
+            free_stripes(meta, osd_pool, std::slice::from_ref(&partial)).await;
+            Err(anyhow!("chunk {chunk_id}: {short}"))
         }
     }
-
-    let stripe = StripeMeta {
-        stripe_id: 0,
-        ec_k,
-        ec_m,
-        shards: stripe_shards,
-        ec_type: 0, // ErasureMds
-        data_size: data.len() as u64,
-        object_id,
-        ..Default::default()
-    };
-
-    // A spare shard beyond k before the chunk counts as stored: with only k
-    // it would have no redundancy left. Failing here leaves the chunk dirty
-    // (and journaled) for the next flush to retry.
-    let quorum = write_quorum(ec_k, ec_m);
-    if stripe.shards.len() < quorum {
-        let written = stripe.shards.len();
-        free_stripes(meta, osd_pool, std::slice::from_ref(&stripe)).await;
-        return Err(anyhow!(
-            "only {written}/{total_shards} shards written for chunk {chunk_id}, need {quorum}"
-        ));
-    }
-    Ok(stripe)
-}
-
-/// Shards of a k+m chunk that must be written for it to count as stored:
-/// k+1, so it still has redundancy (k when there is no parity).
-const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
-    let k = ec_k as usize;
-    if ec_m == 0 { k } else { k + 1 }
 }
 
 /// Where a shard is: enough to reach its OSD.
@@ -272,16 +237,4 @@ pub async fn free_stripes(meta: &MetaBlocks, pool: &OsdPool, stripes: &[StripeMe
         }
     }
     failed
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_chunk_keeps_a_spare_shard() {
-        assert_eq!(write_quorum(4, 2), 5);
-        assert_eq!(write_quorum(2, 1), 3);
-        assert_eq!(write_quorum(1, 0), 1);
-    }
 }

@@ -73,3 +73,7 @@ pub mod transport;
 /// Deduplication policy resolution, shared by meta and the gateway.
 #[warn(clippy::pedantic, clippy::nursery)]
 pub mod dedup;
+
+// How a stripe is written, shared by the gateway and the block gateway.
+#[warn(clippy::pedantic, clippy::nursery)]
+pub mod stripe;

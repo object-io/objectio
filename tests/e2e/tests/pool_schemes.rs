@@ -4,7 +4,8 @@
 //! and not made, and meta refuses one for its default pool at start. An
 //! LRC pool takes objects of every length, odd ones too (reed-solomon-simd
 //! codes even shard sizes only: an LRC PUT of an odd shard size failed),
-//! PUT or multipart, and reads them back, a drive lost too.
+//! PUT or multipart, and reads them back, a drive lost too; it
+//! acknowledges a write with all but g − 1 shards on disk.
 
 use std::fmt::Write as _;
 use std::process::Command;
@@ -290,4 +291,65 @@ fn stripes_of(c: &Cluster, bucket: &str, key: &str) -> Vec<objectio_proto::metad
         }
     }
     panic!("no OSD holds {bucket}/{key}");
+}
+
+/// An LRC stripe is acknowledged with all but g − 1 of its shards (9 of
+/// LRC 6+2+2), a PUT and a part alike, and 503 short of that. Only a loss
+/// of g is sure to decode: acknowledged at k + 1 (7), as it was, a stripe
+/// could be missing shards no decode rebuilds.
+#[test]
+fn an_lrc_write_is_acknowledged_with_all_but_g_minus_one_shards() {
+    use objectio_e2e::ha::HaCluster;
+    use std::time::Duration;
+
+    // Ten OSDs, all ten the pool's one placement group: none to stand in
+    // for one stopped.
+    let mut ha = HaCluster::start(1, 10, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    let c = &ha.clients[0];
+    let r = c.json(
+        "POST",
+        "/_admin/pools",
+        json!({"name": "lrc622", "ec_type": 1, "ec_k": 6, "ec_local_parity": 2,
+            "ec_global_parity": 2, "pg_count": 1, "failure_domain": "osd", "enabled": true}),
+    );
+    assert!(r.status < 300, "pool: {}", r.text());
+    c.request_with_headers("PUT", "/lrcq", &[], &[("x-objectio-pool", "lrc622")])
+        .expect(200);
+    let body = payload(5 * 1024 * 1024, 7);
+    let r = c.request("POST", "/lrcq/parts?uploads", &[]);
+    assert!(r.status < 300, "initiate: {}", r.text());
+    let text = r.text();
+    let upload = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|t| t.split("</UploadId>").next())
+        .expect("an upload id")
+        .to_string();
+    let part = |c: &Cluster, n: u32| {
+        c.request(
+            "PUT",
+            &format!("/lrcq/parts?partNumber={n}&uploadId={upload}"),
+            &body,
+        )
+    };
+
+    // One shard short: nine, the quorum.
+    ha.stop_osd(0);
+    let c = &ha.clients[0];
+    c.request("PUT", "/lrcq/one-down", &body).expect(200);
+    part(c, 1).expect(200);
+
+    // Two short: eight, more than k + 1, less than the quorum.
+    ha.stop_osd(1);
+    let c = &ha.clients[0];
+    let put = c.request("PUT", "/lrcq/two-down", &body);
+    assert_eq!(put.status, 503, "PUT with eight shards: {}", put.text());
+    let got = part(c, 2);
+    assert_eq!(
+        got.status,
+        503,
+        "UploadPart with eight shards: {}",
+        got.text()
+    );
 }

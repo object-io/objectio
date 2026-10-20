@@ -11,6 +11,8 @@ tower = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# A stripe's shard writes run at once (`stripe::write`).
+futures = { workspace = true }
 # tonic 0.12's balanced channel takes tower 0.4's `Change`.
 tower04 = { package = "tower", version = "0.4", default-features = false, features = ["discover"] }
 prost = { workspace = true }

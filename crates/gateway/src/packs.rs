@@ -19,10 +19,8 @@ use axum::{
 };
 use bytes::Bytes;
 use objectio_auth::AuthResult;
-use objectio_common::ErasureConfig;
-use objectio_erasure::ErasureCodec;
 use objectio_proto::metadata::{
-    AbortPackRequest, ErasureType, GetBucketVersioningRequest, GetPackRequest, GetPlacementRequest,
+    AbortPackRequest, GetBucketVersioningRequest, GetPackRequest, GetPlacementRequest,
     IntendPackRequest, ListPacksRequest, NodePlacement, ObjectMeta, PackMember, PackRecord,
     PackSettleRequest, SealPackRequest, ShardLocation, SseAlgorithm, StripeMeta, VersioningState,
 };
@@ -33,7 +31,7 @@ use uuid::Uuid;
 
 use crate::osd_pool::{
     Reclaim, ShardTarget, get_object_meta_from_any, get_object_version_meta_from_osd,
-    put_object_meta_to_all, stripe_targets, stripe_targets_of, write_shard_to_osd,
+    put_object_meta_to_all, stripe_targets, stripe_targets_of,
 };
 use crate::s3::{AppState, spawn_reclaim};
 
@@ -417,6 +415,7 @@ pub async fn pack_objects(
         data.extend_from_slice(&c.bytes);
         data.resize(data.len().next_multiple_of(SLICE_ALIGN), 0);
     }
+    let data = Bytes::from(data);
     let pack_id = Uuid::now_v7().as_bytes().to_vec();
     let placement = meta
         .get_placement(GetPlacementRequest {
@@ -428,11 +427,14 @@ pub async fn pack_objects(
         .await
         .map_err(|e| format!("placement: {e}"))?
         .into_inner();
-    let (k, m) = (placement.ec_k, placement.ec_m);
-    let total = (k + m) as usize;
-    if ErasureType::try_from(placement.ec_type) != Ok(ErasureType::ErasureMds) || m == 0 {
-        return Err("packs are written with Reed-Solomon (MDS) erasure codes only".into());
-    }
+    // Written as any stripe is (crate::stripe): k + 1 shards on disk, or
+    // no pack, each fenced by the placement group's epoch.
+    let placed = crate::stripe::Placed::new(&placement);
+    let total = placed.scheme.width();
+    let (k, m) = match placed.scheme {
+        crate::stripe::Scheme::Mds { k, m } if m > 0 => (k, m),
+        _ => return Err("packs are written with Reed-Solomon (MDS) erasure codes only".into()),
+    };
     if placement.nodes.len() < total {
         return Err(format!(
             "placement has {} OSDs, the pack needs {total}",
@@ -440,14 +442,11 @@ pub async fn pack_objects(
         ));
     }
     let nodes: Vec<NodePlacement> = placement.nodes[..total].to_vec();
-    let intended = StripeMeta {
-        stripe_id: 0,
-        ec_k: k,
-        ec_m: m,
-        ec_type: placement.ec_type,
-        data_size: data.len() as u64,
-        object_id: pack_id.clone(),
-        shards: nodes
+    let intended = placed.scheme.stripe(
+        0,
+        data.len() as u64,
+        pack_id.clone(),
+        nodes
             .iter()
             .enumerate()
             .map(|(i, n)| ShardLocation {
@@ -458,8 +457,7 @@ pub async fn pack_objects(
                 ..Default::default()
             })
             .collect(),
-        ..Default::default()
-    };
+    );
 
     // From here, the pack exists: past SWITCH_DEADLINE no object is
     // switched into it, so reconciliation (which waits longer) never races
@@ -485,55 +483,33 @@ pub async fn pack_objects(
     }
 
     // 2. Write.
-    let codec = ErasureCodec::new(ErasureConfig::new(
-        u8::try_from(k).unwrap_or(u8::MAX),
-        u8::try_from(m).unwrap_or(u8::MAX),
-    ))
-    .map_err(|e| format!("codec: {e}"))?;
-    let shards = match codec.encode_bytes(&data) {
+    let shards = match crate::stripe::Coder::new(placed.scheme)
+        .and_then(|coder| coder.shards(data.clone()))
+    {
         Ok(s) => s,
         Err(e) => {
             abort(state, &pack_id).await;
             return Err(format!("encode: {e}"));
         }
     };
-    let writes = shards
-        .into_iter()
-        .zip(&nodes)
-        .enumerate()
-        .map(|(i, (shard, node))| {
-            let pool = state.osd_pool.clone();
-            let id = pack_id.clone();
-            async move {
-                let position = u32::try_from(i).unwrap_or(u32::MAX);
-                let r = write_shard_to_osd(&pool, node, &id, 0, position, shard, k, m, None, None)
-                    .await;
-                (position, r, node)
-            }
-        });
-    let mut written = Vec::new();
-    for (position, result, node) in futures::future::join_all(writes).await {
-        match result {
-            Ok((loc, crc32c)) => written.push(ShardLocation {
-                position,
-                node_id: loc.node_id,
-                disk_id: loc.disk_id,
-                offset: loc.offset,
-                shard_type: node.shard_type,
-                local_group: node.local_group,
-                crc32c: Some(crc32c),
-            }),
-            Err(e) => warn!("pack {}: shard {position}: {e}", hex::encode(&pack_id)),
+    let written = match crate::stripe::write_stripe(
+        &state.osd_pool,
+        &placed,
+        &pack_id,
+        0,
+        shards,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(written) => written,
+        Err(short) => {
+            warn!("pack {}: {short}", hex::encode(&pack_id));
+            abort(state, &pack_id).await;
+            return Err(format!("write quorum not met: {short}"));
         }
-    }
-    // As a PUT: k + 1 shards on disk, or no pack.
-    if written.len() < k as usize + 1 {
-        abort(state, &pack_id).await;
-        return Err(format!(
-            "write quorum not met: {} of {total} shards written",
-            written.len()
-        ));
-    }
+    };
     if stop_after == Some(StopAfter::Write) {
         return Ok(report);
     }

@@ -224,7 +224,7 @@ pub(crate) async fn commit_replica(
     small: Option<&SmallShards>,
 ) -> Result<(), CommitRefused> {
     let (bucket, key) = (object_meta.bucket.clone(), object_meta.key.clone());
-    let pg = crate::osd_pool::pg_ref(placement);
+    let pg = objectio_proto::stripe::fence(placement);
     let written = crate::osd_pool::put_object_meta_with(
         &state.osd_pool,
         &placement.nodes,
@@ -322,7 +322,7 @@ pub(crate) async fn commit_new(
 ) -> Result<(), CommitRefused> {
     // Small shards travel with the metadata (B21): each copy is a shard
     // too, so the write needs the shard quorum (k + 1) as well.
-    let pg = crate::osd_pool::pg_ref(placement);
+    let pg = objectio_proto::stripe::fence(placement);
     let write = crate::osd_pool::MetaWrite {
         versioning_enabled,
         small_shards: small.map(|s| &s.shards),
@@ -655,25 +655,9 @@ pub(crate) fn settle_commit(
     }
 }
 
-/// The 503 for a stripe whose writes OSDs refused as placed under an old
-/// epoch of its placement group (B31): marked, so the PUT is placed again.
-fn stale_placement(stripe: usize) -> Response {
-    let mut resp = S3Error::xml_response(
-        "ServiceUnavailable",
-        &format!(
-            "stripe {stripe}: the placement group's acting set changed while it was written; retry"
-        ),
-        StatusCode::SERVICE_UNAVAILABLE,
-    );
-    resp.extensions_mut()
-        .insert(crate::osd_pool::StalePlacement);
-    resp
-}
-
 /// PUT, placed again once when an OSD refused it as placed under an older
-/// epoch of its placement group than it knows (B31): the acting set changed
-/// between placing and writing, and nothing was stored. The client never
-/// sees that.
+/// epoch of its placement group than it knows (B31;
+/// [`crate::stripe::placed_again`]).
 pub async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -681,26 +665,17 @@ pub async fn put_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let first = put_object_placed(
-        Arc::clone(&state),
-        bucket.clone(),
-        key.clone(),
-        auth.clone(),
-        headers.clone(),
-        body.clone(),
-    )
-    .await;
-    if first
-        .extensions()
-        .get::<crate::osd_pool::StalePlacement>()
-        .is_none()
-    {
-        return first;
-    }
-    crate::gateway_metrics::record_stale_placement();
-    crate::placement_cache::forget(&bucket, &key);
-    tracing::info!("{bucket}/{key}: placed under an old epoch; placed again");
-    put_object_placed(state, bucket, key, auth, headers, body).await
+    crate::stripe::placed_again(&bucket, &key, || {
+        put_object_placed(
+            Arc::clone(&state),
+            bucket.clone(),
+            key.clone(),
+            auth.clone(),
+            headers.clone(),
+            body.clone(),
+        )
+    })
+    .await
 }
 
 async fn put_object_placed(
@@ -972,9 +947,6 @@ async fn put_object_placed(
         }
     };
     crate::test_hooks::held_after_placement(&bucket, &key).await;
-    // Every write below names the placement group and epoch it was placed
-    // under (B31): an OSD that knows a newer one refuses it.
-    let pg = crate::osd_pool::pg_ref(&placement);
     phases.mark("meta_lookup");
 
     // If-Match / If-None-Match: refused now if the current object already
@@ -991,315 +963,21 @@ async fn put_object_placed(
         }
     }
 
-    let ec_k = placement.ec_k;
-    let ec_m = placement.ec_m;
-    let ec_type = ErasureType::try_from(placement.ec_type).unwrap_or(ErasureType::ErasureMds);
-    let replication_count = placement.replication_count;
+    // Where and how the stripes go, and the placement group epoch every
+    // shard is written under (B31): an OSD that knows a newer one refuses
+    // it, and the PUT is placed again.
+    let placed = crate::stripe::Placed::new(&placement);
+    let scheme = placed.scheme;
+    let total_shards = scheme.width();
 
     // A small object goes into its ObjectMeta, whole, on every OSD in the
-    // placement: no stripes, no shard writes. It takes the EC path below
-    // with zero stripes, whatever the protection scheme — replicating the
+    // placement: no stripes, no shard writes. It takes the path below with
+    // zero stripes, whatever the protection scheme — replicating the
     // record is what protects it.
     let inline = !body.is_empty() && body.len() <= state.inline_max_size;
 
-    // Replication mode: no EC, just write raw data to each replica
-    // For large files, split into multiple stripes (each stripe <= MAX_SHARD_SIZE)
-    if ec_type == ErasureType::ErasureReplication && !inline {
-        let total_replicas = replication_count.max(1) as usize;
-
-        // Split data into stripes (each stripe must fit in a block)
-        let stripe_size = MAX_SHARD_SIZE;
-        let num_stripes = body.len().div_ceil(stripe_size);
-
-        debug!(
-            "Replication mode: writing {} replicas x {} stripes for {}/{} (total size={})",
-            total_replicas,
-            num_stripes,
-            bucket,
-            key,
-            body.len()
-        );
-
-        let mut all_stripes = Vec::with_capacity(num_stripes);
-        let mut total_success = 0;
-        let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
-
-        for stripe_idx in 0..num_stripes {
-            let stripe_start = stripe_idx * stripe_size;
-            let stripe_end = std::cmp::min(stripe_start + stripe_size, body.len());
-            let stripe_data = body.slice(stripe_start..stripe_end);
-            let stripe_data_size = stripe_data.len() as u64;
-
-            // Write this stripe to all replicas
-            let mut write_futures = Vec::with_capacity(total_replicas);
-            for i in 0..total_replicas {
-                let placement_node = if i < placement.nodes.len() {
-                    placement.nodes[i].clone()
-                } else if !placement.nodes.is_empty() {
-                    placement.nodes[i % placement.nodes.len()].clone()
-                } else {
-                    error!("No placement nodes available");
-                    return S3Error::xml_response(
-                        "InternalError",
-                        "No storage nodes available",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                    );
-                };
-
-                let pool = state.osd_pool.clone();
-                let obj_id = object_id;
-                let shard_data = stripe_data.clone();
-                let pos = i as u32;
-                let s_idx = stripe_idx as u64;
-                let pg = pg.clone();
-                pending.sent(&placement_node, &obj_id, s_idx, pos);
-
-                write_futures.push(async move {
-                    let result = write_shard_to_osd(
-                        &pool,
-                        &placement_node,
-                        &obj_id,
-                        s_idx, // stripe_id
-                        pos,
-                        shard_data,
-                        1,    // ec_k=1 for replication (full data)
-                        0,    // ec_m=0 for replication (no parity)
-                        None, // Replicated stripes go over gRPC.
-                        pg.as_ref(),
-                    )
-                    .await;
-                    (pos, result, placement_node)
-                });
-            }
-
-            let results = futures::future::join_all(write_futures).await;
-
-            let mut success_count = 0;
-            let mut shard_locs = Vec::with_capacity(total_replicas);
-
-            let mut full = false;
-            let mut stale = false;
-            for (pos, result, placement_node) in results {
-                match result {
-                    Ok((location, crc32c)) => {
-                        success_count += 1;
-                        shard_locs.push(ShardLocation {
-                            position: pos,
-                            node_id: location.node_id,
-                            disk_id: location.disk_id,
-                            offset: location.offset,
-                            shard_type: placement_node.shard_type,
-                            local_group: placement_node.local_group,
-                            crc32c: Some(crc32c),
-                        });
-                        debug!(
-                            "Wrote stripe {} replica {} to {}",
-                            stripe_idx, pos, placement_node.node_address
-                        );
-                    }
-                    Err(e) => {
-                        full |= e.is_full();
-                        stale |= e.is_stale_epoch();
-                        warn!(
-                            "Failed to write stripe {} replica {} to {}: {}",
-                            stripe_idx, pos, placement_node.node_address, e
-                        );
-                        // Do NOT add failed replica locations to metadata —
-                        // reading from an unwritten location returns garbage.
-                    }
-                }
-            }
-
-            let quorum = replica_quorum(total_replicas);
-            if success_count < quorum {
-                error!(
-                    "Replication failed for stripe {}: {} successful writes, need {}",
-                    stripe_idx, success_count, quorum
-                );
-                if full {
-                    return S3Error::storage_full();
-                }
-                if stale {
-                    return stale_placement(stripe_idx);
-                }
-                return S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!(
-                        "Replication failed for stripe {}: {} successful writes, need {}",
-                        stripe_idx, success_count, quorum
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
-            }
-
-            total_success += success_count;
-            shard_locs.sort_by_key(|l| l.position);
-
-            all_stripes.push(StripeMeta {
-                stripe_id: stripe_idx as u64,
-                // A copy per position: the width is every copy (one to
-                // read, the rest to spare), so recovery and the PG index
-                // see a stripe short of a copy as they do an EC one.
-                ec_k: 1,
-                ec_m: u32::try_from(total_replicas.saturating_sub(1)).unwrap_or(0),
-                shards: shard_locs,
-                ec_type: ErasureType::ErasureReplication.into(),
-                ec_local_parity: 0,
-                ec_global_parity: 0,
-                local_group_size: 0,
-                data_size: stripe_data_size,
-                object_id: object_id.to_vec(), // Store object_id used for shards
-                ..Default::default()
-            });
-        }
-        phases.mark("shards");
-
-        // Store object metadata on primary OSD
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        // The ETag has been computing alongside the stripes; collect it.
-        let etag = match etag_task.await {
-            Ok(etag) => etag,
-            Err(e) => {
-                error!("ETag computation failed: {e}");
-                return S3Error::xml_response(
-                    "InternalError",
-                    "ETag computation failed",
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
-        };
-        phases.mark("etag");
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let etag = replica.as_ref().map_or(etag, |r| r.etag.clone());
-        let object_meta = ObjectMeta {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            object_id: object_id.to_vec(),
-            size: original_size,
-            content_type: content_type.clone(),
-            etag: etag.clone(),
-            created_at: timestamp,
-            modified_at: timestamp,
-            stripes: all_stripes,
-            user_metadata: extract_user_metadata(&headers),
-            version_id: version_id.clone(),
-            storage_class: "STANDARD".to_string(),
-            is_delete_marker: false,
-            retention: lock_retention,
-            legal_hold: lock_hold,
-            encryption_algorithm: sse_algorithm as i32,
-            kms_key_id: sse_kms_key_id.clone(),
-            encrypted_dek: sse_encrypted_dek.clone(),
-            encryption_iv: sse_iv.clone(),
-            encryption_context: sse_encryption_context.clone(),
-            usage_owner: Vec::new(), // filled in by put_object_meta_to_all
-            inline_data: Vec::new(),
-            checksum: stored_checksum.clone(),
-            tags: tags.clone(),
-            part_checksums: Vec::new(),
-            replication: HashMap::new(),
-            replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
-            required_level: 0,
-            stamp: 0, // stamped when stored
-            update_stamp: 0,
-            pg_pool: placement.pool.clone(),
-            pg_id: placement.pg_id,
-        };
-
-        // Listed as well: this path used to write only the ObjectMeta, so a
-        // replicated object never appeared in ListObjects.
-        // What lifecycle filters on, for x-amz-expiration once it's stored.
-        let expiration_of = ObjectMeta {
-            key: object_meta.key.clone(),
-            size: object_meta.size,
-            tags: object_meta.tags.clone(),
-            ..ObjectMeta::default()
-        };
-        let sent = pending.disarm();
-        if let Err(resp) = commit_put(
-            &state,
-            &placement,
-            object_meta,
-            versioning_enabled,
-            sent,
-            &condition,
-            None,
-        )
-        .await
-        {
-            return resp;
-        }
-        phases.mark("object_meta");
-
-        dedup_dry_run(
-            &state,
-            &bucket,
-            &placement,
-            &body,
-            sse_algorithm != SseAlgorithm::SseNone,
-        );
-        debug!(
-            "Created object (replication): {}/{}, size={}, stripes={}, replicas_written={}",
-            bucket, key, original_size, num_stripes, total_success,
-        );
-
-        let expiration = crate::lifecycle::expiration_header(
-            &state,
-            &bucket,
-            &expiration_of,
-            crate::lifecycle::now_ms(),
-        )
-        .await;
-        let mut resp = Response::builder()
-            .status(StatusCode::OK)
-            .header("ETag", etag);
-        if let Some(c) = &checksums.flexible {
-            resp = resp.header(c.algorithm.header_name(), c.value_b64());
-        }
-        if !version_id.is_empty() {
-            resp = resp.header("x-amz-version-id", &version_id);
-        }
-        if let Some(v) = expiration {
-            resp = resp.header("x-amz-expiration", v);
-        }
-        if let Some(v) = sse_response_header {
-            resp = resp.header("x-amz-server-side-encryption", v);
-            if v == "aws:kms" && !sse_kms_key_id.is_empty() {
-                resp = resp.header(
-                    "x-amz-server-side-encryption-aws-kms-key-id",
-                    &sse_kms_key_id,
-                );
-            }
-        }
-        if sse_algorithm == SseAlgorithm::SseC {
-            resp = resp
-                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                .header(
-                    "x-amz-server-side-encryption-customer-key-md5",
-                    &sse_c_key_md5,
-                );
-        }
-        return resp.body(Body::empty()).unwrap();
-    }
-
-    // EC mode: encode data with erasure coding
-    // For large files, split into multiple stripes (each shard <= MAX_SHARD_SIZE)
-    let total_shards = (ec_k + ec_m) as usize;
-
-    // Calculate max stripe data size: each encoded shard must fit in MAX_SHARD_SIZE
-    // shard_size = stripe_data_size / ec_k (approximately)
-    // So max_stripe_data_size = MAX_SHARD_SIZE * ec_k
-    let max_stripe_data_size = MAX_SHARD_SIZE * ec_k as usize;
+    // Split into stripes whose shards each fit in an OSD block.
+    let max_stripe_data_size = MAX_SHARD_SIZE * scheme.data_shards();
     let num_stripes = if inline {
         0
     } else {
@@ -1307,125 +985,92 @@ async fn put_object_placed(
     };
 
     debug!(
-        "EC mode: encoding {}/{} ({} bytes) into {} stripes with {}+{} shards each",
+        "{}/{} ({} bytes): {} stripes of {:?}",
         bucket,
         key,
         body.len(),
         num_stripes,
-        ec_k,
-        ec_m
+        scheme
     );
 
+    let coder = match crate::stripe::Coder::new(scheme) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to create erasure codec: {}", e);
+            return S3Error::xml_response(
+                "InternalError",
+                &format!("Erasure coding error: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
     let mut all_stripes = Vec::with_capacity(num_stripes);
     let mut total_shards_written = 0;
     let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
     // A small object (B21): one stripe whose shards each fit in an OSD's
-    // metadata record, on as many OSDs as shards, once the cluster allows
+    // metadata record, each on an OSD of its own, once the cluster allows
     // it. Its shards go with its metadata, in the commit: one call and one
     // flush per OSD.
     let mut small: Option<SmallShards> = None;
     let small_object = num_stripes == 1
-        && ec_type == ErasureType::ErasureMds
+        && matches!(scheme, crate::stripe::Scheme::Mds { .. })
         && state.rdma.is_none()
-        && body.len().div_ceil(ec_k as usize) <= state.small_shard_max
+        && body.len().div_ceil(scheme.data_shards()) <= state.small_shard_max
         && objectio_common::version::allows(objectio_common::version::SMALL_SHARDS_LEVEL)
         && placement.nodes.len() == total_shards
-        && placement
-            .nodes
+        && objectio_proto::stripe::targets(&placement.nodes, total_shards)
             .iter()
-            .map(|n| n.node_id.as_slice())
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            == total_shards;
+            .all(Option::is_some);
 
     for stripe_idx in 0..num_stripes {
         let stripe_start = stripe_idx * max_stripe_data_size;
         let stripe_end = std::cmp::min(stripe_start + max_stripe_data_size, body.len());
-        let stripe_data = &body[stripe_start..stripe_end];
+        let stripe_data = body.slice(stripe_start..stripe_end);
         let stripe_data_size = stripe_data.len() as u64;
 
-        // Where the encoded stripe starts in registered memory, when it was
-        // encoded into a Transfer Engine stripe slot.
+        // With Transfer Engine, an MDS stripe is encoded straight into a
+        // registered stripe slot: OSDs then read their shards out of it.
+        // Copies and LRC stripes go over gRPC.
+        let rdma = state
+            .rdma
+            .as_deref()
+            .filter(|_| matches!(scheme, crate::stripe::Scheme::Mds { .. }));
         let mut rdma_base: Option<u64> = None;
-
-        // Encode this stripe with erasure coding - use LRC if specified
-        let shards: Vec<Bytes> = match ec_type {
-            ErasureType::ErasureLrc => {
-                // Local parity per group, global parity over all the data,
-                // with the codec's shard sizing: reed-solomon-simd codes
-                // even shard sizes only, and an odd one (half of all
-                // lengths) failed the PUT.
-                let encoded = ErasureCodec::new(ErasureConfig::lrc(
-                    ec_k as u8,
-                    placement.ec_local_parity as u8,
-                    placement.ec_global_parity as u8,
-                ))
-                .and_then(|codec| codec.encode_bytes(stripe_data));
-                match encoded {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to encode stripe {} with LRC: {}", stripe_idx, e);
-                        return S3Error::xml_response(
-                            "InternalError",
-                            &format!("LRC encoding failed for stripe {}: {}", stripe_idx, e),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
-                    }
-                }
+        let slot = rdma.zip(coder.codec()).and_then(|(r, codec)| {
+            r.stripe_slot(codec.stripe_len(stripe_data.len()))
+                .map(|slot| (slot, codec))
+        });
+        let encoded = match slot {
+            Some((mut slot, codec)) => {
+                let base = slot.addr();
+                codec
+                    .encode_into(&stripe_data, slot.as_mut_slice())
+                    .map(|shard_size| {
+                        rdma_base = Some(base);
+                        let stripe = slot.into_bytes(shard_size * total_shards);
+                        (0..total_shards)
+                            .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
+                            .collect()
+                    })
             }
-            _ => {
-                // Use standard MDS Reed-Solomon
-                let codec = match ErasureCodec::new(ErasureConfig::new(ec_k as u8, ec_m as u8)) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to create erasure codec: {}", e);
-                        return S3Error::xml_response(
-                            "InternalError",
-                            &format!("Erasure coding error: {}", e),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
-                    }
-                };
-
-                // With Transfer Engine, encode straight into a registered
-                // stripe slot: OSDs then read their shards out of it.
-                let slot = state
-                    .rdma
-                    .as_deref()
-                    .and_then(|r| r.stripe_slot(codec.stripe_len(stripe_data.len())));
-                let encoded = match slot {
-                    Some(mut slot) => {
-                        let base = slot.addr();
-                        codec
-                            .encode_into(stripe_data, slot.as_mut_slice())
-                            .map(|shard_size| {
-                                rdma_base = Some(base);
-                                let stripe = slot.into_bytes(shard_size * total_shards);
-                                (0..total_shards)
-                                    .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
-                                    .collect()
-                            })
-                    }
-                    None => codec.encode_bytes(stripe_data),
-                };
-                match encoded {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to encode stripe {}: {}", stripe_idx, e);
-                        return S3Error::xml_response(
-                            "InternalError",
-                            &format!("Erasure encoding failed for stripe {}: {}", stripe_idx, e),
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        );
-                    }
-                }
+            None => coder.shards(stripe_data),
+        };
+        let shards: Vec<Bytes> = match encoded {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to encode stripe {}: {}", stripe_idx, e);
+                return S3Error::xml_response(
+                    "InternalError",
+                    &format!("Erasure encoding failed for stripe {}: {}", stripe_idx, e),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
             }
         };
 
         debug!(
-            "Stripe {}: encoded {} bytes into {} shards of {} bytes each",
+            "Stripe {}: {} bytes into {} shards of {} bytes each",
             stripe_idx,
-            stripe_data.len(),
+            stripe_data_size,
             shards.len(),
             shards.first().map(|s| s.len()).unwrap_or(0)
         );
@@ -1462,166 +1107,47 @@ async fn put_object_placed(
             total_shards_written += total_shards;
             small = Some(SmallShards {
                 shards: shards_by_node,
-                quorum: write_quorum(ec_k, ec_m),
+                quorum: scheme.quorum(),
             });
             all_stripes.push(StripeMeta {
-                stripe_id: stripe_idx as u64,
-                ec_k,
-                ec_m,
-                shards: shard_locs,
-                ec_type: placement.ec_type,
-                ec_local_parity: placement.ec_local_parity,
-                ec_global_parity: placement.ec_global_parity,
-                local_group_size: placement.local_group_size,
-                data_size: stripe_data_size,
-                object_id: object_id.to_vec(),
                 shards_in_metadata: true,
-                ..Default::default()
+                ..scheme.stripe(
+                    stripe_idx as u64,
+                    stripe_data_size,
+                    object_id.to_vec(),
+                    shard_locs,
+                )
             });
             continue;
         }
 
-        // Write shards to OSDs in parallel
-        let mut write_futures = Vec::with_capacity(total_shards);
-
-        // Use placements from metadata service, or fall back to round-robin if not enough
-        for (i, shard) in shards.iter().enumerate() {
-            let placement_node = if i < placement.nodes.len() {
-                placement.nodes[i].clone()
-            } else if !placement.nodes.is_empty() {
-                // Round-robin if not enough placements
-                placement.nodes[i % placement.nodes.len()].clone()
-            } else {
-                error!("No placement nodes available");
-                return S3Error::xml_response(
-                    "InternalError",
-                    "No storage nodes available",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
-            };
-
-            let pool = state.osd_pool.clone();
-            let obj_id = object_id;
-            let shard_data = shard.clone();
-            let pos = i as u32;
-            let s_idx = stripe_idx as u64;
-            let pg = pg.clone();
-            pending.sent(&placement_node, &obj_id, s_idx, pos);
-            let rdma = state.rdma.clone();
-            let shard_addr = rdma_base.map(|base| base + (i * shard_data.len()) as u64);
-            // Transfer Engine was on offer, but no stripe slot was free.
-            if rdma.is_some() && shard_addr.is_none() && !placement_node.te_segment.is_empty() {
-                crate::gateway_metrics::record_rdma_fallback(
-                    "write",
-                    crate::rdma::Fallback::NoSlot,
-                );
+        let shard_locs = match crate::stripe::write_stripe(
+            &state.osd_pool,
+            &placed,
+            &object_id,
+            stripe_idx as u64,
+            shards,
+            rdma.map(|rdma| crate::stripe::RdmaStripe {
+                rdma,
+                base: rdma_base,
+            }),
+            Some(&mut pending),
+        )
+        .await
+        {
+            Ok(locs) => locs,
+            Err(short) => {
+                error!("{bucket}/{key}: stripe {stripe_idx}: {short}");
+                return crate::stripe::refused(&short, stripe_idx as u64);
             }
-
-            write_futures.push(async move {
-                let source = rdma
-                    .as_deref()
-                    .zip(shard_addr)
-                    .map(|(rdma, addr)| crate::osd_pool::RdmaSource { rdma, addr });
-                let result = write_shard_to_osd(
-                    &pool,
-                    &placement_node,
-                    &obj_id,
-                    s_idx, // stripe_id
-                    pos,
-                    shard_data,
-                    ec_k,
-                    ec_m,
-                    source,
-                    pg.as_ref(),
-                )
-                .await;
-                (pos, result, placement_node)
-            });
-        }
-
-        // Wait for all writes and collect results
-        let results = futures::future::join_all(write_futures).await;
-
-        let mut success_count = 0;
-        let mut shard_locs = Vec::with_capacity(total_shards);
-
-        let mut full = false;
-        let mut stale = false;
-        for (pos, result, placement_node) in results {
-            match result {
-                Ok((location, crc32c)) => {
-                    success_count += 1;
-                    shard_locs.push(ShardLocation {
-                        position: pos,
-                        node_id: location.node_id,
-                        disk_id: location.disk_id,
-                        offset: location.offset,
-                        // Use shard type from placement, or default to data/parity based on position
-                        shard_type: placement_node.shard_type,
-                        local_group: placement_node.local_group,
-                        crc32c: Some(crc32c),
-                    });
-                    debug!(
-                        "Wrote stripe {} shard {} to {}",
-                        stripe_idx, pos, placement_node.node_address
-                    );
-                }
-                Err(e) => {
-                    full |= e.is_full();
-                    stale |= e.is_stale_epoch();
-                    warn!(
-                        "Failed to write stripe {} shard {} to {}: {}",
-                        stripe_idx, pos, placement_node.node_address, e
-                    );
-                    // Do NOT add failed shard locations to metadata — the shard
-                    // was never written, so reading from this location would
-                    // return unrelated data and corrupt EC reconstruction.
-                }
-            }
-        }
-
-        let quorum = write_quorum(ec_k, ec_m);
-        if success_count < quorum {
-            error!(
-                "Write quorum not met for stripe {}: {} successful, need {} (ec_k={}, ec_m={}, total_shards={})",
-                stripe_idx, success_count, quorum, ec_k, ec_m, total_shards
-            );
-            if full {
-                return S3Error::storage_full();
-            }
-            if stale {
-                return stale_placement(stripe_idx);
-            }
-            return S3Error::xml_response(
-                "ServiceUnavailable",
-                &format!(
-                    "Write quorum not met for stripe {}: {} successful writes, need {}",
-                    stripe_idx, success_count, quorum
-                ),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
-
-        total_shards_written += success_count;
-
-        // Sort shard locations by position
-        shard_locs.sort_by_key(|l| l.position);
-
-        // Add stripe metadata
-        all_stripes.push(StripeMeta {
-            stripe_id: stripe_idx as u64,
-            ec_k,
-            ec_m,
-            shards: shard_locs,
-            // Use the EC type from placement response
-            ec_type: placement.ec_type,
-            ec_local_parity: placement.ec_local_parity,
-            ec_global_parity: placement.ec_global_parity,
-            local_group_size: placement.local_group_size,
-            data_size: stripe_data_size, // Store this stripe's data size for decoding
-            object_id: object_id.to_vec(), // Store object_id used for shards
-            ..Default::default()
-        });
+        };
+        total_shards_written += shard_locs.len();
+        all_stripes.push(scheme.stripe(
+            stripe_idx as u64,
+            stripe_data_size,
+            object_id.to_vec(),
+            shard_locs,
+        ));
     }
 
     // Store object metadata on primary OSD (position 0)

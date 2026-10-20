@@ -171,7 +171,8 @@ impl Default for OsdPool {
     }
 }
 
-/// Write a shard to the appropriate OSD
+/// Write a shard to the OSD in `placement`, under the placement group
+/// epoch `pg` it was placed by: an OSD that knows a newer one refuses it.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_shard_to_osd(
     pool: &OsdPool,
@@ -182,6 +183,7 @@ pub async fn write_shard_to_osd(
     data: Bytes,
     ec_k: u32,
     ec_m: u32,
+    pg: Option<&objectio_proto::storage::PgRef>,
 ) -> Result<(objectio_proto::storage::BlockLocation, u32), OsdPoolError> {
     use objectio_proto::storage::{Checksum, ShardId, WriteShardRequest};
 
@@ -204,7 +206,7 @@ pub async fn write_shard_to_osd(
         data,
         rdma: None,
         use_reserve: false,
-        pg: None,
+        pg: pg.cloned(),
     };
 
     let write_future = client.write_shard(request);

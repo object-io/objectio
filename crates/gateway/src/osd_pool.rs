@@ -61,19 +61,6 @@ pub fn is_stale_epoch(status: &tonic::Status) -> bool {
         .is_some()
 }
 
-/// The placement group and epoch a placement is, for the requests that
-/// write by it (B31). None for one made without a placement group.
-#[must_use]
-pub fn pg_ref(
-    placement: &objectio_proto::metadata::GetPlacementResponse,
-) -> Option<objectio_proto::storage::PgRef> {
-    (placement.pg_epoch > 0).then(|| objectio_proto::storage::PgRef {
-        pool: placement.pool.clone(),
-        pg_id: placement.pg_id,
-        epoch: placement.pg_epoch,
-    })
-}
-
 /// Node identifier (16-byte UUID)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId([u8; 16]);

@@ -283,3 +283,73 @@ fn a_write_placed_under_an_old_epoch_is_refused_and_placed_again() {
         .sum();
     assert!(placed_again >= 1, "the PUT was not placed again");
 }
+
+/// A part (`UploadPart`) placed under an epoch that changes before it writes
+/// is refused by the OSDs and placed again, as a PUT is: the client gets a
+/// 200, and the completed object is on the new acting set. A part was
+/// written unfenced, onto whatever acting set it was placed by.
+#[test]
+fn a_part_placed_under_an_old_epoch_is_refused_and_placed_again() {
+    let ha = HaCluster::start(1, OSDS, 1);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let c = &ha.clients[0];
+    c.request("PUT", "/pgs", &[]).expect(200);
+    let ids = node_ids(&ha);
+
+    let r = c.request("POST", "/pgs/mpu?uploads", &[]);
+    assert!(r.status < 300, "initiate: {}", r.text());
+    let text = r.text();
+    let upload = text
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|t| t.split("</UploadId>").next())
+        .expect("an upload id")
+        .to_string();
+
+    let before = placement(&rt, &ha, "pgs", "mpu");
+    let member = hex::encode(&before.nodes[0].node_id);
+    let body = payload(300_000, 2);
+    let held = c.json(
+        "POST",
+        "/_admin/test/hold-placed",
+        json!({ "bucket": "pgs", "key": "mpu", "millis": 8000 }),
+    );
+    assert!(held.status < 300, "hold: {}", held.text());
+
+    let part = std::thread::scope(|s| {
+        let writer = s.spawn(|| {
+            c.request(
+                "PUT",
+                &format!("/pgs/mpu?partNumber=1&uploadId={upload}"),
+                &body,
+            )
+        });
+        // Placed, then held: the acting set changes under it.
+        std::thread::sleep(Duration::from_secs(1));
+        set_out(c, &member);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while placement(&rt, &ha, "pgs", "mpu").pg_epoch <= before.pg_epoch {
+            assert!(
+                Instant::now() < deadline,
+                "no stand-in committed for {member}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        writer.join().unwrap()
+    });
+    assert_eq!(part.status, 200, "{}", part.text());
+    let etag = part.header("etag").expect("a part's etag");
+    let done = c.request(
+        "POST",
+        &format!("/pgs/mpu?uploadId={upload}"),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+             <ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        )
+        .as_bytes(),
+    );
+    assert_eq!(done.status, 200, "complete: {}", done.text());
+
+    let acting = assert_on_acting_set(&rt, &ha, &ids, "pgs", "mpu", &body);
+    assert!(!acting.contains(&member));
+}
