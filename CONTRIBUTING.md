@@ -151,7 +151,8 @@ End-to-end tests run the binaries in `target/debug`, so build them first:
 
 ```sh
 cargo build --bin objectio-aio --bin obioctl --bin objectio-meta \
-  --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway
+  --bin objectio-osd --bin objectio-gateway --bin objectio-block-gateway \
+  --bin objectio-install
 ```
 
 Don't rebuild while an end-to-end run is going in the same checkout: the

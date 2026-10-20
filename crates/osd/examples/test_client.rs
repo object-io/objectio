@@ -10,7 +10,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "http://localhost:9002".to_string());
+        .unwrap_or_else(|| "http://localhost:9200".to_string());
 
     println!("Connecting to OSD at {}...", endpoint);
 

@@ -1,12 +1,14 @@
-# ObjectIO Configuration Examples
+# ObjectIO OSD Configuration Examples
 
-This directory contains example configurations for different deployment topologies.
+Example `osd.toml` files for different deployment topologies. Only the OSD
+reads a config file; meta and the gateway are configured by flags (see the
+operations guide's configuration reference). `objectio-install init` writes
+these files for a host, one OSD per disk.
 
 ## Topology Overview
 
-ObjectIO uses CRUSH (Controlled Replication Under Scalable Hashing) for data placement.
-Each OSD reports its **failure domain** on registration, and CRUSH spreads shards across
-different failure domains to maximize fault tolerance.
+Each OSD reports its **failure domain** on registration, and placement
+spreads each object's shards (or copies) across different failure domains.
 
 ### Failure Domain Hierarchy
 
@@ -14,33 +16,35 @@ different failure domains to maximize fault tolerance.
 region (us-east)
 └── datacenter (dc1)
     └── rack (rack-01)
-        └── node (osd-node1)
-            └── disk (/mnt/nvme0)
+        └── host (osd-node1)
+            └── OSD
 ```
+
+An OSD is the smallest failure domain: it holds at most one shard of a
+stripe, however many disks it has. A k+m erasure code needs k+m OSDs.
 
 ### How Placement Works
 
 1. OSD starts and reads its `[osd.failure_domain]` from config
 2. OSD registers with metadata service, reporting its failure domain
 3. Metadata service builds the cluster topology
-4. When placing object shards, CRUSH ensures:
-   - Each shard lands on a different failure domain (at the configured level)
-   - If `failure_domain = "rack"`, no two shards of the same object share a rack
+4. The default pool spreads each placement group's shards over hosts when
+   there are k+m of them, else over OSDs; a pool made with
+   `failure_domain = "rack"` puts no two shards of an object in one rack.
 
 ## Directory Structure
 
 ```
 config/
-├── single-node/          # Single server with multiple disks
+├── single-node/          # One server, one OSD with several disks
 │   └── osd.toml
 │
 ├── three-nodes/          # Three servers in different racks
 │   ├── node1-osd.toml
 │   ├── node2-osd.toml
-│   ├── node3-osd.toml
-│   └── gateway.toml
+│   └── node3-osd.toml
 │
-└── multi-rack-lrc/       # 6+ nodes for LRC codes
+└── multi-rack-lrc/       # Servers across racks, for LRC codes
     └── osd-rack1-node1.toml
 ```
 
@@ -48,7 +52,7 @@ config/
 
 ### Single Node (Development / Small Scale)
 
-**Hardware:** 1 server with 6-12 NVMe drives
+**Hardware:** 1 server with several NVMe drives
 
 **Config:** `single-node/osd.toml`
 
@@ -59,16 +63,14 @@ datacenter = "dc1"
 rack = "rack1"
 ```
 
-**Recommended EC:** `4+2` (disk-level fault tolerance)
-
-- All disks share the same failure domain
-- CRUSH spreads shards across different **disks**
-- Survives: 2 disk failures
-- Cannot survive: node failure
+One OSD with all the drives holds one copy of each object: run meta with
+`--replication 1`. To erasure-code on one server (`4+2` survives two drive
+failures, not the server's), run one OSD per drive, each with its own
+config, port and data directory, as `objectio-install init` sets up.
 
 ### Three Nodes (Production Small)
 
-**Hardware:** 3 servers, each with 12 NVMe drives, in different racks
+**Hardware:** 3 servers, in different racks
 
 **Config:** `three-nodes/node{1,2,3}-osd.toml`
 
@@ -92,24 +94,18 @@ datacenter = "dc1"
 rack = "rack-03"
 ```
 
-**Recommended EC:** `6+3` (node-level fault tolerance)
-
-- Each node is in a different rack
-- CRUSH spreads 9 shards across 3 racks (3 per rack)
-- Survives: 1 full node/rack failure
-- Math: With 3 parity shards, can lose any 3 shards
+With one OSD per node: `2+1`, which survives one node or rack. Wider codes
+need more OSDs (one per drive): a code of k+m shards across three hosts
+puts several shards on a host.
 
 ### Multi-Rack LRC (Large Scale)
 
-**Hardware:** 6+ servers across multiple racks
+**Hardware:** servers across multiple racks
 
 **Config:** `multi-rack-lrc/osd-*.toml`
 
-**Recommended EC:** LRC `6+2+2`
-
-- 6 data shards, 2 local parity, 2 global parity
-- Faster single-failure repair (only read 3 shards vs 6)
-- Survives: 1 full rack + 1 additional disk
+**LRC** `6+2+2`: 6 data shards, 2 local parity, 2 global parity, on at
+least 10 OSDs. A single lost shard is rebuilt from 3 others rather than 6.
 
 ## Key Configuration Fields
 
@@ -118,16 +114,14 @@ rack = "rack-03"
 | Field        | Description                          | Example        |
 |--------------|--------------------------------------|----------------|
 | `region`     | Geographic region                    | `us-east`      |
-| `datacenter` | Data center or availability zone     | `us-east-1a`   |
+| `zone`       | Availability zone                    | `us-east-1a`   |
+| `datacenter` | Data center                          | `dc1`          |
 | `rack`       | Physical rack or network segment     | `rack-01`      |
+| `host`       | The machine; its hostname when unset | `osd-node1`    |
 
 ### `weight`
 
-Placement weight for this OSD. Higher weight = more data assigned.
-
-Use this to balance data when mixing different disk sizes:
-- 8TB disk: `weight = 1.0`
-- 16TB disk: `weight = 2.0`
+Read, but placement doesn't use it yet: every OSD weighs the same.
 
 ## Quick Start
 

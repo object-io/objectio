@@ -1,6 +1,6 @@
 [package]
 name = "objectio-install"
-description = "ObjectIO installation and deployment tool"
+description = "Sets a host up to run ObjectIO's services under systemd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,20 +10,17 @@ name = "objectio-install"
 path = "src/main.rs"
 
 [dependencies]
-objectio-common = { workspace = true }
 objectio-storage = { workspace = true }
-objectio-auth = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
-uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `cluster init` calls the meta nodes' admin ports.
+reqwest = { workspace = true }
 toml = "0.8"
 
-# Unix-specific
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
-libc = { workspace = true }
+[dev-dependencies]
+tempfile = { workspace = true }

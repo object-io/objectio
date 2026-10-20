@@ -150,14 +150,30 @@ kubectl -n objectio exec objectio-meta-0 -- cat /var/lib/objectio/meta/admin-cre
 
 ### Linux binaries under systemd
 
-Pass flags: `objectio-meta` and `objectio-gateway` take `--config` but
-read nothing from it (only the OSD reads its TOML). Run as a non-root
-user; OSDs need `CAP_SYS_RAWIO`.
+`objectio-install` sets a host up: units carrying the flags the chart
+passes, one OSD per disk (each with its TOML), and `cluster init` forms
+meta's Raft group over the admin ports. As root, binaries in
+`/usr/local/bin`:
+
+```bash
+# each host: its meta node id (1, 2, 3), the address the others reach it at,
+# every meta node, its disks (blank: each OSD formats its own on first start)
+objectio-install init --role all --node-id 1 --advertise node1 \
+  --meta-endpoint http://node1:9100,http://node2:9100,http://node3:9100 \
+  --disks /dev/disk/by-id/nvme-a,/dev/disk/by-id/nvme-b --ec-profile 4+2 --systemd
+systemctl enable --now objectio-meta
+# once, from any host (a lone meta needs it too); safe to repeat
+objectio-install cluster init node1 node2 node3
+systemctl enable --now objectio-osd-0 objectio-osd-1 objectio-gateway
+```
+
+By hand, the same: meta and the gateway take flags only, the OSD its TOML
+(and flags, which win). Run as a non-root user; OSDs need raw-disk access.
 
 ```bash
 # each meta node (node-id 1, 2, 3)
 objectio-meta --node-id 1 --listen 0.0.0.0:9100 --raft-advertise meta1:9100 \
-  --peers meta1:9100,meta2:9100,meta3:9100 --data-dir /var/lib/objectio/meta --ec-k 4 --ec-m 2
+  --data-dir /var/lib/objectio/meta --ec-k 4 --ec-m 2
 # once, on meta1's admin port, form the group (a lone meta needs /init too)
 curl -X POST http://meta1:9102/init
 curl -X POST http://meta1:9102/add-learner -H 'content-type: application/json' -d '{"node_id": 2, "addr": "meta2:9100"}'
@@ -179,9 +195,9 @@ objectio-gateway --listen 0.0.0.0:9000 --meta-endpoint http://meta1:9100,http://
 - Without `--advertise-addr` an OSD on `0.0.0.0` advertises `127.0.0.1`. A
   second OSD on a host needs its own `--listen` port and `--metrics-port`.
 - A new master key: `openssl rand -base64 32`, kept outside the cluster.
-- `objectio-install disk list` / `disk check <dev>` show drives. Its `init`
-  writes meta and gateway TOML the services never read, and `disk prepare`
-  formats with 4 MiB blocks: use neither.
+- `objectio-install disk list` / `disk check <dev>` show drives. The
+  gateway's unit reads `/etc/objectio/gateway.env` if present: put
+  `OBJECTIO_MASTER_KEY` there, the same on every gateway.
 
 Smoke test: `aws --endpoint-url <gateway> s3 mb s3://demo`, put and get an
 object, then `obioctl node list` and `obioctl cluster validate-placement default`.
@@ -302,9 +318,8 @@ Runbooks per alert (OSD down, disk swap, disks full, meta, repair) are in
   `out` while objects are unreadable: bring every intact OSD back first.
 - Do not run an even number of meta nodes, or scale meta down by lowering
   `meta.replicas`: change the membership first (`/change-membership`).
-- Do not assume port 9000, or that a gateway on it is this cluster's. Code
-  defaults differ from the convention (meta listens on 9001 unless told
-  9100; the gateway looks for meta at `localhost:9001`): pass every address.
+- Do not assume port 9000, or that a gateway on it is this cluster's: pass
+  every address.
 - Do not delete PVCs or `--data-dir`s, or edit `meta.redb`, unless the
   cluster is meant to be gone.
 - Do not restart a gateway for clock skew; fix the clock.

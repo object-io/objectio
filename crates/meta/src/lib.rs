@@ -40,16 +40,12 @@ use tracing::{error, info};
 #[command(about = "ObjectIO Metadata Service")]
 #[command(version)]
 pub struct Args {
-    /// Configuration file path
-    #[arg(short, long, default_value = "/etc/objectio/meta.toml")]
-    pub config: String,
-
     /// Node ID (for Raft)
     #[arg(long)]
     pub node_id: Option<u64>,
 
     /// Listen address for gRPC
-    #[arg(short, long, default_value = "0.0.0.0:9001")]
+    #[arg(short, long, default_value = "0.0.0.0:9100")]
     pub listen: String,
 
     /// Peer addresses for Raft cluster
