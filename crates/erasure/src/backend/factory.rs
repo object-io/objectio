@@ -147,27 +147,13 @@ impl BackendFactory {
             ErasureError::InvalidConfig("LRC config required for LRC backend".into())
         })?;
 
-        let backend_type = match config.backend_type {
-            BackendType::Auto => Self::detect_best_backend(),
-            other => other,
-        };
-
-        match backend_type {
-            BackendType::IsaL => {
-                #[cfg(all(feature = "isal", any(target_arch = "x86", target_arch = "x86_64")))]
-                {
-                    Ok(Arc::new(super::isal::IsalLrcBackend::new(lrc_config)?))
-                }
-                #[cfg(not(all(
-                    feature = "isal",
-                    any(target_arch = "x86", target_arch = "x86_64")
-                )))]
-                {
-                    Err(ErasureError::InvalidConfig(
-                        "ISA-L LRC backend not available on this platform".into(),
-                    ))
-                }
-            }
+        // LRC is coded with reed-solomon-simd on every build: the PUT path
+        // and meta's recovery code it so, and a stripe decodes only with
+        // the code that wrote its parity.
+        match config.backend_type {
+            BackendType::IsaL => Err(ErasureError::InvalidConfig(
+                "LRC is coded with reed-solomon-simd only".into(),
+            )),
             BackendType::RustSimd | BackendType::Auto => {
                 Ok(Arc::new(RustSimdLrcBackend::new(lrc_config)?))
             }
@@ -209,7 +195,7 @@ impl BackendFactory {
         {
             caps.push(BackendCapabilities {
                 name: "isal",
-                supports_lrc: true,
+                supports_lrc: false,
                 supports_simd: true,
                 max_data_shards: 255,
                 max_parity_shards: 255,

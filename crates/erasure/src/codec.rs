@@ -25,7 +25,9 @@
 //! let backend = BackendFactory::create_mds(&config).unwrap();
 //! ```
 
-use crate::backend::{BackendConfig, BackendFactory, ErasureBackend, LrcBackend};
+use crate::backend::{
+    BackendConfig, BackendFactory, BackendType, ErasureBackend, LrcBackend, LrcConfig,
+};
 use bytes::Bytes;
 use objectio_common::{ErasureConfig, ErasureType, Error as CommonError, Result};
 use std::sync::Arc;
@@ -89,6 +91,12 @@ impl ErasureCodec {
     /// Automatically selects the best backend based on the configuration
     /// and platform (ISA-L on x86 if available, rust_simd otherwise).
     pub fn new(config: ErasureConfig) -> Result<Self> {
+        Self::on_backend(config, BackendType::Auto)
+    }
+
+    /// As [`new`](Self::new), on the backend named: what a node built
+    /// another way would code with.
+    fn on_backend(config: ErasureConfig, backend_type: BackendType) -> Result<Self> {
         if config.data_shards == 0 {
             return Err(ErasureError::InvalidConfig("data_shards must be > 0".into()).into());
         }
@@ -98,7 +106,8 @@ impl ErasureCodec {
 
         let backend = match config.ec_type {
             ErasureType::Mds => {
-                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards);
+                let backend_config = BackendConfig::mds(config.data_shards, config.parity_shards)
+                    .with_backend(backend_type);
                 let mds_backend = BackendFactory::create_mds(&backend_config)?;
                 CodecBackend::Mds(mds_backend)
             }
@@ -106,9 +115,8 @@ impl ErasureCodec {
                 local_parity,
                 global_parity,
             } => {
-                let lrc_config =
-                    crate::backend::LrcConfig::new(config.data_shards, local_parity, global_parity);
-                let backend_config = BackendConfig::lrc(lrc_config);
+                let lrc_config = LrcConfig::new(config.data_shards, local_parity, global_parity);
+                let backend_config = BackendConfig::lrc(lrc_config).with_backend(backend_type);
                 let lrc_backend = BackendFactory::create_lrc(&backend_config)?;
                 CodecBackend::Lrc(lrc_backend)
             }
@@ -582,6 +590,35 @@ impl Default for ErasureCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// An LRC stripe is coded as the PUT path codes it
+    /// (`RustSimdLrcBackend`), on every build: an ISA-L LRC backend wrote
+    /// its global parity with ISA-L, which other nodes decoded as
+    /// reed-solomon-simd's.
+    #[test]
+    fn lrc_is_coded_alike_on_every_build() {
+        let codec = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
+        let data = body(60_000);
+        let stripe = codec.encode(&data).unwrap();
+        let size = ErasureCodec::shard_size_for(data.len(), 6);
+        let mut padded = data.clone();
+        padded.resize(size * 6, 0);
+        let refs: Vec<&[u8]> = padded.chunks(size).collect();
+        let put = crate::RustSimdLrcBackend::new(LrcConfig::new(6, 2, 2))
+            .unwrap()
+            .encode_lrc(&refs, size)
+            .unwrap()
+            .all_shards();
+        assert!(
+            stripe == put,
+            "LRC coded otherwise than the PUT path codes it"
+        );
+        assert!(ErasureCodec::on_backend(ErasureConfig::lrc(6, 2, 2), BackendType::IsaL).is_err());
+    }
 
     #[test]
     fn encode_bytes_matches_encode() {
