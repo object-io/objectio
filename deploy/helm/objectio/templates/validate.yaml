@@ -1,0 +1,2 @@
+{{- /* Renders nothing: fails the render on values that would lose data. */ -}}
+{{- include "objectio.validate" . }}

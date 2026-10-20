@@ -19,6 +19,10 @@ spec:
         app.kubernetes.io/component: prometheus
     spec:
       serviceAccountName: {{ include "objectio.prometheus.fullname" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: prometheus
           image: {{ .Values.monitoring.prometheus.image.repository }}:{{ .Values.monitoring.prometheus.image.tag }}

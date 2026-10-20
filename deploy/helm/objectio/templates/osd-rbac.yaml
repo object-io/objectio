@@ -1,0 +1,45 @@
+{{- /*
+Read access to nodes, for OSDs that take failure-domain levels from their
+node's labels (osd.failureDomain.nodeLabels). Nodes are cluster-scoped, so
+this is a ClusterRole; it allows `get` on nodes and nothing else, and only
+the OSDs' node-topology init container holds the token.
+*/ -}}
+{{- if .Values.osd.failureDomain.nodeLabels }}
+{{- $name := printf "%s-%s-osd-nodes" .Release.Namespace (include "objectio.osd.fullname" .) | trunc 63 | trimSuffix "-" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "objectio.osd.fullname" . }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "objectio.labels" . | nindent 4 }}
+    app.kubernetes.io/component: osd
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "objectio.osd.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+{{- end }}

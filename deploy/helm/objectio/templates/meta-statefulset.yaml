@@ -8,6 +8,11 @@ metadata:
 spec:
   serviceName: {{ include "objectio.meta.headless" . }}
   replicas: {{ .Values.meta.replicas }}
+  # All pods start together: a pod is ready only with a quorum (a leader
+  # known), so starting them one after another, each waiting for the last
+  # to be ready, would never get past the first after a full restart.
+  # Updates still roll one pod at a time, each waiting for readiness.
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "objectio.selectorLabels" . | nindent 6 }}
@@ -17,7 +22,14 @@ spec:
       labels:
         {{- include "objectio.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: meta
+      {{- with .Values.meta.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "objectio.podPlacement" (dict "root" . "values" .Values.meta "component" "meta") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       containers:
         - name: meta
           image: {{ include "objectio.image" (dict "global" .Values.global "component" .Values.meta) }}
@@ -35,6 +47,7 @@ spec:
                 --listen "0.0.0.0:{{ .Values.meta.service.port }}" \
                 --raft-advertise "$ADVERTISE" \
                 --admin-port {{ .Values.meta.service.adminPort }} \
+                --metrics-port {{ .Values.meta.service.metricsPort }} \
                 --peers "{{ include "objectio.metaPeers" . }}" \
                 --data-dir /var/lib/objectio/meta \
               {{- if .Values.replication }}
@@ -58,18 +71,9 @@ spec:
             - name: admin
               containerPort: {{ .Values.meta.service.adminPort }}
               protocol: TCP
-          livenessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          readinessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
+          {{- with (include "objectio.probes" (dict "values" .Values.meta) | trim) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/objectio

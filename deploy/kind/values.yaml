@@ -5,6 +5,10 @@
 #
 # Full stack: S3 + Iceberg REST + Delta Sharing + Monitoring
 # EC scheme: 4+2 (4 data + 2 parity shards, 6 OSDs required)
+#
+# The chart's defaults are for production (auth on, a random Grafana
+# password); this throwaway cluster sets the convenient ones itself:
+# no auth, Grafana admin/objectio, one gateway, small volumes.
 
 global:
   imageRegistry: ghcr.io/object-io
@@ -18,7 +22,7 @@ gateway:
   image:
     tag: latest
   replicas: 1
-  noAuth: true                             # no SigV4 required for testing
+  noAuth: true                             # dev only: every request served as the admin, unsigned
   region: us-east-1
   logLevel: info
   # Public URL for OIDC callback / Iceberg vended creds / Delta Sharing
@@ -124,7 +128,7 @@ monitoring:
       repository: grafana/grafana
       tag: "10.2.2"
     adminUser: admin
-    adminPassword: objectio
+    adminPassword: objectio                # dev only (default: a random one in a Secret)
     service:
       type: ClusterIP
       port: 3000

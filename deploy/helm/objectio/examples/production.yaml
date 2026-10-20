@@ -1,0 +1,155 @@
+# A production install, as a starting point: copy it, change what is
+# marked, and install with
+#
+#   helm install objectio oci://ghcr.io/object-io/charts/objectio \
+#     --version <release> -n objectio --create-namespace \
+#     -f production.yaml
+#
+# What it assumes about the cluster:
+#   - nodes for OSDs labelled objectio.io/storage=true and tainted
+#     objectio.io/storage=true:NoSchedule, at least 8 of them, each
+#     labelled with its zone (topology.kubernetes.io/zone, set by most
+#     clouds) and its rack (topology.objectio.io/rack, set by you);
+#   - a storage class giving raw block volumes for the OSDs ("local-block"
+#     here: local disks through a local-volume provisioner, or a SAN) and
+#     an SSD-backed one for meta ("fast-ssd");
+#   - cert-manager with a CA issuer "objectio-ca" (mTLS between the
+#     services), an ingress controller in namespace ingress-nginx, a
+#     prometheus-operator in namespace monitoring;
+#   - a Secret objectio-sse with the SSE master key, made once and backed up:
+#       kubectl -n objectio create secret generic objectio-sse \
+#         --from-literal=master-key="$(openssl rand -base64 32)"
+
+gateway:
+  replicas: 3
+  # The public URL (Iceberg vended credentials, Delta Sharing, the console).
+  externalUrl: https://s3.example.com            # change
+  # Auth stays on (gateway.noAuth defaults to false).
+  sse:
+    enabled: true
+    existingSecret: objectio-sse
+  # The ingress controller's pods, so aws:SourceIp sees the client.
+  trustedProxies: 10.244.0.0/16                  # change: the pod CIDR
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-body-size: "0"
+      nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    hosts:
+      - host: s3.example.com                     # change
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: s3-example-com-tls           # change
+        hosts: [s3.example.com]
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+  # One gateway per zone where possible, never two on one node.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+
+meta:
+  replicas: 3
+  persistence:
+    size: 20Gi
+    storageClass: fast-ssd                       # change
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # The three voters on three nodes, in three zones where there are three.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+osd:
+  # More than k+m, so a stripe is rebuilt elsewhere while an OSD is down.
+  replicas: 8
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+  persistence:
+    data:
+      size: 4Ti                                  # change
+      storageClass: local-block                  # change
+      volumeMode: Block
+    state:
+      size: 20Gi
+      storageClass: fast-ssd                     # change
+  # host is the node; zone and rack come from each node's labels.
+  failureDomain:
+    region: region-1                             # change
+    datacenter: dc-1                             # change
+    nodeLabels:
+      zone: topology.kubernetes.io/zone
+      rack: topology.objectio.io/rack
+  nodeSelector:
+    objectio.io/storage: "true"
+  tolerations:
+    - key: objectio.io/storage
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  # One OSD per node.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+# The default pool erasure-coded 4+2: any two OSDs can be lost at once.
+replication: 0
+ec:
+  k: 4
+  m: 2
+
+networkPolicy:
+  enabled: true
+  gatewayFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+
+tls:
+  enabled: true
+  certManager:
+    issuerRef:
+      name: objectio-ca
+      kind: Issuer
+
+monitoring:
+  # The alert rules, for the prometheus-operator in the cluster.
+  prometheusRule:
+    enabled: true

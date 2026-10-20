@@ -15,6 +15,27 @@ global:
   image:
     repository: objectio
     tag: latest
+  # Secrets for pulling the images, e.g. [{name: ghcr-secret}]. Every pod
+  # of the chart gets them.
+  imagePullSecrets: []
+  # A small image with sh and curl, for the Raft bootstrap Job and the
+  # OSDs' failure-domain lookup (osd.failureDomain.nodeLabels). Point it at
+  # a mirror for an air-gapped cluster.
+  toolsImage:
+    repository: curlimages/curl
+    tag: "8.10.1"
+
+# Where each component's pods run: nodeSelector, affinity, tolerations,
+# topologySpreadConstraints, priorityClassName and podAnnotations are
+# accepted under gateway, meta, osd and blockGateway alike, as in a pod
+# spec. A topologySpreadConstraints entry without a labelSelector gets the
+# component's own pods' labels, so
+#   osd:
+#     topologySpreadConstraints:
+#       - maxSkew: 1
+#         topologyKey: kubernetes.io/hostname
+#         whenUnsatisfiable: DoNotSchedule
+# spreads the OSDs one per node. See examples/production.yaml.
 
 gateway:
   # The system always audits (A8c): every request is an event, kept in the
@@ -68,7 +89,10 @@ gateway:
   service:
     type: ClusterIP
     port: 9000
-  noAuth: true
+  # Every request is authenticated (SigV4, or OIDC/STS). `true` serves
+  # every request as the admin, unauthenticated: for a throwaway dev
+  # cluster only (deploy/kind sets it).
+  noAuth: false
   logLevel: info
   region: us-east-1
   # Gateway's own topological position. Feeds locality-aware read routing:
@@ -102,22 +126,38 @@ gateway:
     externalEndpoint: ""
     accessKeyId: ""
     secretKey: ""
+    # Or the secret key from an existing Secret (takes precedence).
+    existingSecret: ""
+    existingSecretKey: secret-key
   oidc:
     issuerUrl: ""
     clientId: ""
     clientSecret: ""
+    # Or the client secret from an existing Secret (takes precedence).
+    existingSecret: ""
+    existingSecretKey: client-secret
     audience: ""
     groupsClaim: "groups"
     scopes: "openid profile email"
     adminRoles: ""
   # Server-side encryption (SSE-S3) master key. When enabled, the gateway
-  # gets OBJECTIO_MASTER_KEY mounted from a Secret; buckets with default
-  # encryption will encrypt at rest. The Secret is generated once on first
-  # install and preserved across `helm upgrade` — rotating it would make
-  # existing encrypted objects unreadable.
+  # gets OBJECTIO_MASTER_KEY from a Secret; buckets with default
+  # encryption are encrypted at rest. Losing or changing the key makes
+  # every object encrypted under it unreadable, so:
+  #   - existingSecret: a Secret you create and back up (the way for
+  #     GitOps tools that render with `helm template`, where the chart
+  #     can't see the cluster and would make a new key on every render);
+  #   - otherwise the chart makes `<release>-gateway-sse` once, reuses it
+  #     on every `helm upgrade`, and keeps it on `helm uninstall`
+  #     (helm.sh/resource-policy: keep). Back it up.
   sse:
     enabled: false
-    # Optional: pin the 32-byte base64 key. Leave empty to auto-generate.
+    # A Secret holding base64(32 random bytes) under existingSecretKey,
+    # e.g. kubectl create secret generic objectio-sse \
+    #   --from-literal=master-key="$(openssl rand -base64 32)"
+    existingSecret: ""
+    existingSecretKey: master-key
+    # Or the key itself, base64(32 bytes), into the chart's Secret.
     masterKey: ""
   # KMS backend. `local` is self-contained and uses the service master key
   # above to wrap per-KMS-key material. `vault` points at an external
@@ -157,6 +197,29 @@ gateway:
     annotations: {}
     hosts: []
     tls: []
+  # /health: the process answers. /_ready: 503 until meta is reachable and
+  # enough OSDs are up for a write to meet quorum, and from the start of a
+  # shutdown; then 200.
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: http
+    initialDelaySeconds: 15
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    httpGet:
+      path: /_ready
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podAnnotations: {}
 
 meta:
   image:
@@ -187,12 +250,52 @@ meta:
     limits:
       cpu: "1"
       memory: 1Gi
+  # On the admin port: /health is 503 once this node's Raft has stopped
+  # (a fatal storage error, a panic), so the pod is restarted; /ready is
+  # 503 until the node is a member of the cluster with a leader known
+  # (before the bootstrap Job has added it, during an election). The
+  # startup probe gives opening the database time before liveness counts.
+  startupProbe:
+    httpGet:
+      path: /health
+      port: admin
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: admin
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: admin
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podAnnotations: {}
 
 osd:
   image:
     repository: objectio-osd
     tag: latest
-  replicas: 1
+  # At least ec.k + ec.m (or `replication` copies): the chart refuses to
+  # render with fewer, as each shard of a stripe needs its own OSD. More
+  # than that lets a stripe be rebuilt elsewhere while one is down.
+  replicas: 6
+  # Voluntary disruptions (node drains, upgrades) take at most this many
+  # OSDs at a time. Keep it at or below ec.m.
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
   service:
     port: 9200
     metricsPort: 9201
@@ -201,13 +304,30 @@ osd:
     data:
       size: 50Gi
       storageClass: ""
+      # Filesystem: the OSD's disk is a file (storage.diskFile) on the
+      # volume. Block: the volume is a raw block device the OSD writes
+      # directly (a local-disk or SAN storage class that supports it).
+      volumeMode: Filesystem
     state:
       size: 5Gi
       storageClass: ""
+  # Where each OSD sits, for placement: no two shards of a stripe go to
+  # the same failure domain at the level the pool spreads over. `host` is
+  # always the Kubernetes node the pod runs on. The other levels are the
+  # fixed values below, the same for every OSD, unless nodeLabels names a
+  # node label to read them from, per pod, e.g.
+  #   nodeLabels:
+  #     zone: topology.kubernetes.io/zone
+  #     rack: topology.objectio.io/rack
+  # An OSD on a node without a label it is told to read does not start
+  # (rather than land in a wrong domain). Reading labels takes a
+  # ClusterRole allowing `get` on nodes, which the chart creates.
   failureDomain:
     region: default
+    zone: ""
     datacenter: default
     rack: rack1
+    nodeLabels: {}
   storage:
     # Allocation unit for a new disk; unset, the OSD's own (4 KiB). A
     # shard takes whole blocks, so a larger one wastes space on every
@@ -221,13 +341,45 @@ osd:
     limits:
       cpu: "2"
       memory: 2Gi
+  # /health on the metrics port is 503 while a disk is unhealthy. The
+  # startup probe waits for the disk to be opened (the metrics server
+  # starts after); liveness is the gRPC port, so a failed disk takes the
+  # OSD out of readiness without restarting it.
+  startupProbe:
+    httpGet:
+      path: /health
+      port: metrics
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 120
+  livenessProbe:
+    tcpSocket:
+      port: grpc
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: metrics
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podAnnotations: {}
 
+# One block gateway pod, a StatefulSet of one: its write journal (on its
+# own volume) is used by one process at a time, and a replacement starts
+# only once the old pod is gone.
 blockGateway:
   enabled: false
   image:
     repository: objectio-block-gateway
     tag: latest
-  replicas: 1
   advertiseHost: ""   # Hostname/IP advertised in NBD attachment URLs; defaults to service ClusterIP
   cacheBytes: 268435456   # 256 MB write cache
   flushIntervalS: 5
@@ -236,8 +388,11 @@ blockGateway:
     type: ClusterIP
     grpcPort: 9300
     nbdPort: 10809
+    metricsPort: 9301
+  # The write journal: an acknowledged write is in it before it reaches
+  # the OSDs, so it is always on a volume. The claim is kept on
+  # `helm uninstall` (helm.sh/resource-policy: keep).
   persistence:
-    enabled: true
     size: 5Gi
     storageClass: ""
   resources:
@@ -247,16 +402,61 @@ blockGateway:
     limits:
       cpu: "2"
       memory: 2Gi
+  # The block gateway has no health endpoint; its gRPC port opens only
+  # once the journal is replayed and the volumes are loaded from meta,
+  # so the port answering means it serves. The startup probe gives the
+  # replay time.
+  startupProbe:
+    tcpSocket:
+      port: grpc
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 120
+  livenessProbe:
+    tcpSocket:
+      port: grpc
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    tcpSocket:
+      port: grpc
+    periodSeconds: 5
+    timeoutSeconds: 3
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podAnnotations: {}
 
-# The default pool's protection (buckets that name no pool). With
-# `replication` set, that many copies of each object: 1 keeps one copy,
-# no protection, for a one-OSD cluster. Set to 0 to erasure-code k+m
-# instead (m at least 1, on k+m OSDs at least). The block gateway codes
-# volumes k+m either way.
-replication: 1
+# The default pool's protection (buckets that name no pool). 0: erasure
+# coding, k data + m parity shards per stripe (m at least 1), each on a
+# different OSD; 4+2 survives two OSDs lost at once. n: n copies of each
+# object instead (1 keeps one copy, no protection: a one-OSD dev cluster
+# only). The chart refuses to render with fewer OSDs (osd.replicas) than
+# k+m, or than the copies. The block gateway codes volumes k+m either way.
+replication: 0
 ec:
   k: 4
   m: 2
+
+# Who may connect to each component, as NetworkPolicies (ingress only;
+# egress is left open). Pods of this release always reach each other.
+# Kubelet probes are not affected on common CNIs.
+networkPolicy:
+  enabled: false
+  # `from` peers allowed to the S3 port besides this release's pods
+  # (e.g. the ingress controller's namespace). Empty: anyone.
+  gatewayFrom: []
+  # Peers allowed to the block gateway's gRPC and NBD ports. Empty: anyone.
+  blockGatewayFrom: []
+  # Peers allowed to scrape meta's and the OSDs' /metrics (a Prometheus
+  # in another namespace). The chart's own Prometheus is in the release.
+  metricsFrom: []
+  # Peers allowed to meta's admin port (Raft membership). Empty: only
+  # this release's pods.
+  adminFrom: []
 
 monitoring:
   enabled: false
@@ -293,7 +493,11 @@ monitoring:
       repository: grafana/grafana
       tag: "10.2.2"
     adminUser: admin
-    adminPassword: objectio
+    # Empty: a random password, in the Secret `<release>-grafana` (kept
+    # across upgrades and on uninstall). Or name your own Secret, with the
+    # password under `admin-password`.
+    adminPassword: ""
+    existingSecret: ""
     service:
       type: ClusterIP
       port: 3000

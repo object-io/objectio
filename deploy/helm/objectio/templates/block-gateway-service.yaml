@@ -17,6 +17,10 @@ spec:
       port: {{ .Values.blockGateway.service.nbdPort }}
       targetPort: nbd
       protocol: TCP
+    - name: metrics
+      port: {{ .Values.blockGateway.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
   selector:
     {{- include "objectio.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: block-gateway

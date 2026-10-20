@@ -1,13 +1,18 @@
 {{- if .Values.blockGateway.enabled }}
+# One pod: its write journal is used by one process at a time. A
+# StatefulSet starts a replacement only once the old pod is gone (a
+# Deployment may start one while the old pod is still running, on a node
+# that stopped answering), and updates stop the old pod first.
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "objectio.blockGateway.fullname" . }}
   labels:
     {{- include "objectio.labels" . | nindent 4 }}
     app.kubernetes.io/component: block-gateway
 spec:
-  replicas: {{ .Values.blockGateway.replicas }}
+  serviceName: {{ include "objectio.blockGateway.fullname" . }}
+  replicas: 1
   selector:
     matchLabels:
       {{- include "objectio.selectorLabels" . | nindent 6 }}
@@ -17,7 +22,14 @@ spec:
       labels:
         {{- include "objectio.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: block-gateway
+      {{- with .Values.blockGateway.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "objectio.podPlacement" (dict "root" . "values" .Values.blockGateway "component" "block-gateway") | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       containers:
         - name: block-gateway
           image: {{ include "objectio.image" (dict "global" .Values.global "component" .Values.blockGateway) }}
@@ -28,6 +40,8 @@ spec:
             - "0.0.0.0:{{ .Values.blockGateway.service.grpcPort }}"
             - "--nbd-listen"
             - "0.0.0.0:{{ .Values.blockGateway.service.nbdPort }}"
+            - "--metrics-listen"
+            - "0.0.0.0:{{ .Values.blockGateway.service.metricsPort }}"
             - "--advertise-host"
             - {{ .Values.blockGateway.advertiseHost | quote }}
             - "--meta-endpoint"
@@ -39,7 +53,7 @@ spec:
             - "--ec-m"
             - {{ .Values.ec.m | quote }}
             - "--cache-bytes"
-            - {{ .Values.blockGateway.cacheBytes | quote }}
+            - {{ .Values.blockGateway.cacheBytes | int64 | quote }}
             - "--flush-interval-s"
             - {{ .Values.blockGateway.flushIntervalS | quote }}
             - "--log-level"
@@ -51,18 +65,12 @@ spec:
             - name: nbd
               containerPort: {{ .Values.blockGateway.service.nbdPort }}
               protocol: TCP
-          livenessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          readinessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
+            - name: metrics
+              containerPort: {{ .Values.blockGateway.service.metricsPort }}
+              protocol: TCP
+          {{- with (include "objectio.probes" (dict "values" .Values.blockGateway) | trim) }}
+          {{- . | nindent 10 }}
+          {{- end }}
           {{- with (include "objectio.tls.env" .) }}
           env:
             {{- . | nindent 12 }}
@@ -77,12 +85,8 @@ spec:
             {{- toYaml .Values.blockGateway.resources | nindent 12 }}
       volumes:
         - name: data
-          {{- if .Values.blockGateway.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "objectio.blockGateway.fullname" . }}
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
         {{- with (include "objectio.tls.volume" .) }}
         {{- . | nindent 8 }}
         {{- end }}

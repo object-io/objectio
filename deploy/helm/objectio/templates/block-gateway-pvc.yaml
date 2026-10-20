@@ -1,4 +1,4 @@
-{{- if and .Values.blockGateway.enabled .Values.blockGateway.persistence.enabled }}
+{{- if .Values.blockGateway.enabled }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "objectio.labels" . | nindent 4 }}
     app.kubernetes.io/component: block-gateway
+  annotations:
+    # The journal holds acknowledged writes not yet on the OSDs: kept on
+    # `helm uninstall`.
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
