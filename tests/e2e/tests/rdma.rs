@@ -1,17 +1,19 @@
 //! The erasure-coded data path over Mooncake Transfer Engine.
 //!
 //! Needs an `objectio-aio` built with `--features rdma`, which needs a
-//! Mooncake build, so these run only when `OBJECTIO_E2E_RDMA` names the
-//! protocol aio is given (`tcp` in CI — no RDMA hardware). CI's `rdma` job
-//! runs them in a Mooncake image; everywhere else they pass as no-ops.
+//! Mooncake build, and `OBJECTIO_E2E_RDMA` naming the protocol aio is
+//! given (`tcp` in CI: no RDMA hardware). So these are ignored by default;
+//! with `--ignored` they fail without it. CI's `rdma` job runs them in a
+//! Mooncake image (`crates/transport-te/ci-test.sh`).
 
 use objectio_e2e::Cluster;
 use serde_json::json;
 
-fn protocol() -> Option<String> {
+fn protocol() -> String {
     std::env::var("OBJECTIO_E2E_RDMA")
         .ok()
         .filter(|p| !p.is_empty())
+        .expect("OBJECTIO_E2E_RDMA: the protocol (tcp or rdma) of an aio built with rdma")
 }
 
 /// Sum of every sample of `name` whose labels contain all of `labels`.
@@ -35,11 +37,9 @@ fn payload(len: usize, seed: u32) -> Vec<u8> {
 /// Every shard of every object moves over Transfer Engine, and every object
 /// comes back byte for byte — from one byte up to two stripes.
 #[test]
+#[ignore = "needs an aio built with rdma, and OBJECTIO_E2E_RDMA; CI: rdma"]
 fn objects_round_trip_with_every_shard_over_transfer_engine() {
-    let Some(protocol) = protocol() else {
-        eprintln!("skipped: set OBJECTIO_E2E_RDMA to run against an aio built with rdma");
-        return;
-    };
+    let protocol = protocol();
     let c = Cluster::start_with_ec_and_args(6, 4, 2, &["--rdma", &protocol]);
     c.json("POST", "/_admin/buckets", json!({"name": "rdma"}))
         .expect_ok();
@@ -78,11 +78,9 @@ fn objects_round_trip_with_every_shard_over_transfer_engine() {
 /// failed rdma read of the missing shard falls back, and the stripe is
 /// rebuilt from the others.
 #[test]
+#[ignore = "needs an aio built with rdma, and OBJECTIO_E2E_RDMA; CI: rdma"]
 fn a_degraded_read_over_transfer_engine_still_returns_the_object() {
-    let Some(protocol) = protocol() else {
-        eprintln!("skipped: set OBJECTIO_E2E_RDMA to run against an aio built with rdma");
-        return;
-    };
+    let protocol = protocol();
     let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--rdma", &protocol]);
     c.json("POST", "/_admin/buckets", json!({"name": "rdma-degraded"}))
         .expect_ok();

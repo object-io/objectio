@@ -19,10 +19,10 @@ name: CI
 on:
   # A pull request runs the fast checks only (format, lints, unit tests,
   # console, chart: ~9 minutes); the heavy jobs (end-to-end, docker image,
-  # rolling upgrade, rdma, aio release build) are skipped there, which the
-  # ruleset counts as passed. They run once, in the merge queue, on the
-  # tree that lands. Running everything on both doubled the time to merge
-  # (~16 minutes, twice) for the same answer.
+  # rolling upgrade, crash consistency, rdma, aio release build) are
+  # skipped there, which the ruleset counts as passed. They run once, in
+  # the merge queue, on the tree that lands. Running everything on both
+  # doubled the time to merge (~16 minutes, twice) for the same answer.
   pull_request:
   # The merge queue tests each batch of queued PRs on top of main: the one
   # full run every change gets before it lands.
@@ -162,25 +162,75 @@ jobs:
           cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
             --partition hash:${{ matrix.shard }}/8 --test-threads 1 --no-fail-fast --success-output never --failure-output final
 
-  # The check the main ruleset requires: every shard passed (or, on a pull
-  # request, the suite was left to the merge queue).
+  # The shards above run debug binaries built with no optional features,
+  # so their disk I/O is pread. The release does it through io_uring
+  # (release.yml), and a bug only that path has passes there. This builds
+  # the binaries with the release's feature set and runs the files that
+  # exercise the data path through them: puts and gets, multipart, repair,
+  # restarts, packing, shard checksums and removed disks. Beside the
+  # shards, not after them: ~20 minutes, about the shards' critical path.
+  e2e-release:
+    name: end-to-end (release features)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # release.yml's linux-amd64 aio, and the same on the services'
+      # binaries the multi-process tests start.
+      FEATURES: >-
+        objectio-aio/io-uring,objectio-aio/grep-pcre2,
+        objectio-osd-bin/io-uring,objectio-gateway-bin/pcre2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: protoc, mold, ISA-L's build tools, PCRE2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool \
+            libclang-dev libpcre2-dev pkg-config
+      # Fails if this runner denies io_uring: the OSDs would otherwise fall
+      # back to pread, and the run below test nothing new.
+      - name: io_uring works here
+        run: cargo test -p objectio-storage --features io-uring --lib io_backend::tests::uring_roundtrip
+      - name: build the binaries with the release features
+        run: |
+          cargo build --features "$(echo "$FEATURES" | tr -d ' \n')" \
+            --bin objectio-aio --bin obioctl --bin objectio-meta --bin objectio-osd \
+            --bin objectio-gateway --bin objectio-block-gateway
+      # Building the tests leaves the binaries above alone: objectio-e2e
+      # depends on none of their packages.
+      - name: run
+        run: |
+          cargo nextest run -p objectio-e2e --test-threads 1 --no-fail-fast \
+            --success-output never --failure-output final \
+            --test s3_compat --test multipart --test repair --test restart \
+            --test packing --test shard_checksums --test osd_disks
+
+  # The check the main ruleset requires: every shard and the release-features
+  # run passed (or, on a pull request, the suite was left to the merge queue).
   e2e:
     name: end-to-end
-    needs: e2e-shard
+    needs: [e2e-shard, e2e-release]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
-          r="${{ needs.e2e-shard.result }}"
-          test "$r" = success || { test "$r" = skipped && test "${{ github.event_name }}" = pull_request; }
+          ok() { test "$1" = success || { test "$1" = skipped && test "${{ github.event_name }}" = pull_request; }; }
+          ok "${{ needs.e2e-shard.result }}" && ok "${{ needs.e2e-release.result }}"
 
   upgrade:
     name: rolling upgrade
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # A cluster on the previous release, rolled node by node to this one
-    # under traffic (objectio-docs core/upgrade-path.md). The e2e job skips
-    # this test: it needs the previous release's binaries, built here.
+    # under traffic (objectio-docs core/upgrade-path.md). The test is
+    # #[ignore]d, so the e2e shards leave it out: it needs the previous
+    # release's binaries, built here, and fails without them. Whether there
+    # is a release to upgrade from is decided here, in the log, not by the
+    # test passing with nothing to do.
     timeout-minutes: 40
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -195,10 +245,15 @@ jobs:
       - name: find the previous release
         id: previous
         run: |
-          if tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null); then
+          if tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null); then
+            echo "upgrading from $tag"
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          elif [ -z "$(git tag --list 'v[0-9]*')" ]; then
+            # Only before the first release: nothing to upgrade from.
+            echo "::warning::no release yet, so no rolling upgrade to test: not run"
           else
-            echo "::notice::no release before this commit, nothing to upgrade from"
+            echo "::error::release tags exist, but none is before this commit: $(git tag --list 'v[0-9]*' | xargs)"
+            exit 1
           fi
       - name: build this release
         if: steps.previous.outputs.tag
@@ -210,7 +265,50 @@ jobs:
           echo "OBJECTIO_PREVIOUS_RELEASE_BIN=$bins" >> "$GITHUB_ENV"
       - name: run
         if: steps.previous.outputs.tag
-        run: cargo test --package objectio-e2e --test rolling_upgrade -- --nocapture
+        # --include-ignored, not --ignored: were the #[ignore] ever dropped,
+        # --ignored would run nothing, and pass.
+        run: cargo test --package objectio-e2e --test rolling_upgrade -- --include-ignored --nocapture
+
+  crash:
+    name: crash consistency
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Every write the OSD acknowledged survives a power cut at any point
+    # (crates/osd/tests/crash_consistency.rs): its devices on dm-log-writes,
+    # the logs replayed to cut points. The test is #[ignore]d: it needs root
+    # (the runner's passwordless sudo), loop devices and the dm-log-writes
+    # module, which this job provides. A missing one fails the job.
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      # The runner's second disk: the images, logs and replays are sparse,
+      # but a few GB are written, and / is short of room.
+      OBJECTIO_CRASH_DIR: /mnt/objectio-crash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: protoc, mold, device mapper, ISA-L's build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler mold dmsetup e2fsprogs \
+            nasm autoconf automake libtool libclang-dev
+      - name: dm-log-writes
+        run: |
+          # In linux-modules on Ubuntu's generic kernels; a cloud kernel may
+          # keep it in linux-modules-extra.
+          if ! sudo modprobe dm-log-writes; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe dm-log-writes
+          fi
+          sudo dmsetup targets | grep -w log-writes
+      - name: a directory for the images
+        run: |
+          sudo mkdir -p "$OBJECTIO_CRASH_DIR"
+          sudo chown "$(id -u):$(id -g)" "$OBJECTIO_CRASH_DIR"
+          df -h "$OBJECTIO_CRASH_DIR"
+      - name: run
+        run: cargo test -p objectio-osd --test crash_consistency -- --include-ignored --nocapture
 
   image:
     name: docker image

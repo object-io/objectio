@@ -128,6 +128,24 @@ Every change is tested, at the level where its behaviour shows:
 | Behaviour across processes: the S3 API, failover, repair, upgrades | An end-to-end test in `tests/e2e`, against real processes | `cargo test -p objectio-e2e --test <file>` (build the binaries first, below) |
 | S3 compatibility | ceph s3-tests | `scripts/s3-tests/run.sh` ([README](scripts/s3-tests/README.md)) |
 | A rolling upgrade | The upgrade test, from the last release | `scripts/upgrade-test/previous-release.sh` (see its header) |
+| What the OSD keeps through a power cut | The crash-consistency test, on `dm-log-writes` devices | `cargo test -p objectio-osd --test crash_consistency -- --ignored` (needs `sudo -n`) |
+
+Tests that need something a plain machine lacks (root, a kernel module,
+the previous release, a Mooncake build) are marked
+`#[ignore = "needs …"]`: `cargo test` leaves them out, and
+`cargo test … -- --ignored` runs them and **fails** if what they need is
+missing; none passes having tested nothing. CI runs each in a job that
+provides it:
+
+| Test | Needs | CI job |
+|---|---|---|
+| `crates/osd/tests/crash_consistency.rs` | root through `sudo -n`, loop devices, the `dm-log-writes` module | crash consistency |
+| `tests/e2e/tests/rolling_upgrade.rs` | `OBJECTIO_PREVIOUS_RELEASE_BIN`, the previous release's binaries | rolling upgrade |
+| `tests/e2e/tests/rdma.rs` | an aio built with `--features rdma`, `OBJECTIO_E2E_RDMA` | rdma (`crates/transport-te/ci-test.sh`) |
+
+`cargo test -p objectio-storage --features io-uring` needs a host that
+allows io_uring (a container under docker's default seccomp profile
+doesn't): with the feature on, the I/O must go through it.
 
 End-to-end tests run the binaries in `target/debug`, so build them first:
 
@@ -160,10 +178,11 @@ recovery, placement or durability, say so in the pull request and we will.
    Expect questions; answer in the thread, push fixes as new commits, and
    don't force-push during review unless asked.
 5. Once approved, a maintainer adds it to the merge queue. The queue runs
-   the heavy jobs (the eight end-to-end shards, the rolling upgrade, the
-   images, a performance check against the base) on your change merged
-   with the latest `main`, and merges it, squashed, if they pass. If the
-   queue fails, we'll tell you why.
+   the heavy jobs (the eight end-to-end shards, one more on the release's
+   features, the rolling upgrade, the crash-consistency test, the images,
+   a performance check against the base) on your change merged with the
+   latest `main`, and merges it, squashed, if they pass. If the queue
+   fails, we'll tell you why.
 
 A pull request that has had no reply from its author for a month may be
 closed; reopening it is always fine.

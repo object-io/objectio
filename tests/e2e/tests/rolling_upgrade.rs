@@ -1,14 +1,14 @@
 //! A rolling upgrade from the previous release, node by node, under
 //! traffic (objectio-docs core/upgrade-path.md, "How it is tested").
 //!
-//! Needs the previous release's binaries (a release with format levels):
+//! Needs the previous release's binaries (a release with format levels),
+//! so it is ignored by default; run with `--ignored`, where it fails
+//! without them (CI: the `rolling upgrade` job):
 //!
 //! ```text
 //! OBJECTIO_PREVIOUS_RELEASE_BIN=$(scripts/upgrade-test/previous-release.sh) \
-//!   cargo test -p objectio-e2e --test rolling_upgrade
+//!   cargo test -p objectio-e2e --test rolling_upgrade -- --ignored
 //! ```
-//!
-//! Without them the test says so and does nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,8 +27,18 @@ const OSDS: usize = 6;
 const GATEWAYS: usize = 2;
 const MASTER_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
 
-fn previous_release() -> Option<PathBuf> {
-    std::env::var_os("OBJECTIO_PREVIOUS_RELEASE_BIN").map(PathBuf::from)
+fn previous_release() -> PathBuf {
+    let bin = std::env::var_os("OBJECTIO_PREVIOUS_RELEASE_BIN").map(PathBuf::from);
+    let bin = bin.expect(
+        "OBJECTIO_PREVIOUS_RELEASE_BIN: the previous release's binaries \
+         (scripts/upgrade-test/previous-release.sh)",
+    );
+    assert!(
+        bin.join("objectio-meta").is_file(),
+        "OBJECTIO_PREVIOUS_RELEASE_BIN={}: no objectio-meta there",
+        bin.display()
+    );
+    bin
 }
 
 fn payload(len: usize, seed: u64) -> Vec<u8> {
@@ -424,14 +434,9 @@ fn roll_back_and_forward(ha: &mut HaCluster, prev: &Path, prev_level: u32, store
 }
 
 #[test]
+#[ignore = "needs the previous release's binaries in OBJECTIO_PREVIOUS_RELEASE_BIN; CI: rolling upgrade"]
 fn a_rolling_upgrade_from_the_previous_release_loses_nothing() {
-    let Some(prev) = previous_release() else {
-        eprintln!(
-            "skipped: set OBJECTIO_PREVIOUS_RELEASE_BIN \
-             (scripts/upgrade-test/previous-release.sh)"
-        );
-        return;
-    };
+    let prev = previous_release();
     let mut ha = HaCluster::start_from(Some(&prev), METAS, OSDS, GATEWAYS);
     let _ = ha.await_leader(Duration::from_secs(30));
     let (ak, sk) = (ha.access_key.clone(), ha.secret_key.clone());

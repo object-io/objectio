@@ -4,7 +4,8 @@
 //! test process, that every node presents and trusts. On by default, as
 //! production should run; `OBJECTIO_E2E_PLAIN=1` runs plain gRPC instead,
 //! and so does a node from another release (rolling-upgrade tests: before
-//! TLS).
+//! TLS). `tests/mtls.rs` fails when the suite runs plain: it has nothing
+//! to test.
 
 use std::path::PathBuf;
 use std::process::Command;
