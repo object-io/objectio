@@ -359,6 +359,7 @@ pub async fn run(
     .await
     .map_err(|e| anyhow::anyhow!("raft init: {e}"))?;
     let raft = Arc::new(raft);
+    tokio::spawn(exit_when_raft_stops(raft.metrics()));
     // Hand the handle to MetaService so set_config / delete_config
     // route through Raft (R1.5).
     meta_service.set_raft(raft.clone());
@@ -625,9 +626,60 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     output
 }
 
-/// Health check handler
-async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+/// Why this node's Raft has stopped for good, if it has: a storage error or
+/// a panic in its core. It answers nothing after that, while the process,
+/// with its gRPC server and caches, would go on.
+fn raft_fatal(m: &openraft::RaftMetrics<u64, openraft::BasicNode>) -> Option<String> {
+    m.running_state.as_ref().err().map(ToString::to_string)
+}
+
+type RaftMetricsWatch =
+    tokio::sync::watch::Receiver<openraft::RaftMetrics<u64, openraft::BasicNode>>;
+
+/// Exit the process when this node's Raft stops for good, so whatever runs
+/// it (Kubernetes, systemd, the aio wrapper) starts it again: a restart
+/// reopens the store and applies the log from the last checkpoint, which a
+/// stopped core never would. Not on a deliberate shutdown.
+async fn exit_when_raft_stops(metrics: RaftMetricsWatch) {
+    if let Some(why) = raft_stopped(metrics).await {
+        error!("Raft stopped: {why}; exiting so this node is restarted");
+        std::process::exit(1);
+    }
+}
+
+/// Once this node's Raft has stopped for good: why. `None` when it was
+/// shut down on purpose.
+async fn raft_stopped(mut metrics: RaftMetricsWatch) -> Option<String> {
+    loop {
+        {
+            let m = metrics.borrow_and_update();
+            match &m.running_state {
+                Err(openraft::error::Fatal::Stopped) => return None,
+                Err(fatal) => return Some(fatal.to_string()),
+                Ok(()) => {}
+            }
+        }
+        metrics.changed().await.ok()?;
+    }
+}
+
+/// Health check: 503 once this node's Raft has stopped for good (it is
+/// about to exit, see [`exit_when_raft_stops`]); OK otherwise, including
+/// while it starts.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetaMetricsState>>,
+) -> impl IntoResponse {
+    let fatal = state
+        .meta_service
+        .raft_handle()
+        .and_then(|r| raft_fatal(&r.metrics().borrow()));
+    match fatal {
+        Some(why) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("raft stopped: {why}"),
+        ),
+        None => (StatusCode::OK, "OK".to_string()),
+    }
 }
 
 /// Start the metrics HTTP server
@@ -644,6 +696,29 @@ async fn start_metrics_server(port: u16, state: Arc<MetaMetricsState>) -> Result
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod raft_stopped_tests {
+    use super::raft_stopped;
+
+    /// A Raft that stops for good is noticed, with why; one shut down on
+    /// purpose is not, and the process goes on to exit as it chose.
+    #[tokio::test]
+    async fn a_raft_stopped_for_good_is_noticed_and_a_shutdown_is_not() {
+        use openraft::error::Fatal;
+        let (tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
+        let watching = tokio::spawn(raft_stopped(rx));
+        tokio::task::yield_now().await;
+        assert!(!watching.is_finished());
+        tx.send_modify(|m| m.running_state = Err(Fatal::Panicked));
+        let why = watching.await.unwrap();
+        assert!(why.is_some_and(|w| w.contains("panicked")));
+
+        let (tx, rx) = tokio::sync::watch::channel(openraft::RaftMetrics::new_initial(1));
+        tx.send_modify(|m| m.running_state = Err(Fatal::Stopped));
+        assert_eq!(raft_stopped(rx).await, None);
+    }
 }
 
 #[cfg(test)]

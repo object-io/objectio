@@ -261,12 +261,21 @@ impl MetaRaftStorage {
     /// transaction, which also moves `last_applied` forward: atomic from
     /// the perspective of a restart. Events for the listener go to
     /// `events`, sent once the batch has committed.
+    ///
+    /// A command that can't apply because of what it says or what the
+    /// store holds is answered [`MetaResponse::Rejected`], having written
+    /// nothing, on every node alike: an error here stops the node's Raft,
+    /// and every node applies the same entry, so it stopped them all, and
+    /// again at each restart. Only the storage failing is an error.
     fn apply_command(
         txn: &redb::WriteTransaction,
         state: &mut RaftPersistentState,
         cmd: &MetaCommand,
         events: &mut Vec<ApplyEvent>,
     ) -> Result<MetaResponse, StorageError<NodeId>> {
+        if let Some(reason) = cmd.refusal() {
+            return Ok(rejected(reason));
+        }
         match cmd {
             MetaCommand::SetConfig {
                 key,
@@ -342,8 +351,12 @@ impl MetaRaftStorage {
                         .map(|v| v.value().to_vec());
                     match current {
                         Some(bytes) => {
-                            let mut node = <crate::types::OsdNode as crate::types::record::Record>::from_bytes(&bytes)
-                                .map_err(|e| decode_err("OsdNode", e))?;
+                            let mut node = match <crate::types::OsdNode as crate::types::record::Record>::from_bytes(&bytes) {
+                                Ok(node) => node,
+                                Err(e) => {
+                                    return Ok(rejected(format!("OSD record {key} doesn't decode: {e}")));
+                                }
+                            };
                             let changed = node.admin_state != *new_state;
                             if changed {
                                 node.admin_state = *new_state;
@@ -377,22 +390,26 @@ impl MetaRaftStorage {
                 requested_by: _,
             } => apply_multi_cas(txn, ops, events),
             // Each in turn, against what the one before it left, as
-            // consecutive entries would be. A conflict answers that
-            // command alone; an error (storage) fails the whole entry,
+            // consecutive entries would be. A conflict or a refusal answers
+            // that command alone; an error (storage) fails the whole entry,
             // as it would fail the entry holding the command that met it.
             MetaCommand::Batch(cmds) => cmds
                 .iter()
                 .map(|cmd| match cmd {
-                    MetaCommand::Batch(_) => Err(decode_err(
-                        "MetaCommand",
-                        std::io::Error::other("a batch inside a batch"),
-                    )),
+                    MetaCommand::Batch(_) => Ok(rejected("a batch inside a batch".into())),
                     cmd => Self::apply_command(txn, state, cmd, events),
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map(MetaResponse::Batch),
         }
     }
+}
+
+/// A command refused as it applied ([`MetaResponse::Rejected`]): logged, as
+/// it is on every node, since a proposer should have refused it first.
+fn rejected(reason: String) -> MetaResponse {
+    tracing::warn!("a committed command was refused, and wrote nothing: {reason}");
+    MetaResponse::Rejected { reason }
 }
 
 /// The event a config key's change sends the service, as a MultiCas on the
@@ -496,22 +513,12 @@ fn apply_multi_cas(
     ops: &[CasOp],
     events: &mut Vec<ApplyEvent>,
 ) -> Result<MetaResponse, StorageError<NodeId>> {
-    // Guardrail: keep log-entry apply latency bounded. Callers that need
-    // thousands of conditional writes should chunk and retry.
-    const MAX_OPS: usize = 256;
-    if ops.len() > MAX_OPS {
-        return Err(StorageError::IO {
-            source: StorageIOError::write_state_machine(AnyError::error(format!(
-                "MultiCas too many ops: {} > {MAX_OPS}",
-                ops.len()
-            ))),
-        });
-    }
-
+    // The operation count and the tables were checked by the caller
+    // (`MetaCommand::refusal`): at most `MAX_OPS`, each table named.
     let mut failed_indices: Vec<u32> = Vec::new();
 
-    // Pass 1: verify every expected. Redb tables are scoped to the txn,
-    // so we re-open per op to keep the lifetimes simple.
+    // Pass 1: verify every expected, writing nothing yet. Redb tables are
+    // scoped to the txn, so we re-open per op to keep the lifetimes simple.
     for (idx, op) in ops.iter().enumerate() {
         let name = cas_table_name(&op.table);
         let tdef: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(name);
@@ -521,6 +528,16 @@ fn apply_multi_cas(
                 .map_err(read_err)?
                 .map(|v| v.value().to_vec()),
             Err(redb::TableError::TableDoesNotExist(_)) => None,
+            // A table of other types than `&str -> &[u8]` (a `Named` one):
+            // what the store holds, the same on every node, not a failure.
+            Err(
+                e @ (redb::TableError::TableTypeMismatch { .. }
+                | redb::TableError::TableIsMultimap(_)
+                | redb::TableError::TableIsNotMultimap(_)
+                | redb::TableError::TypeDefinitionChanged { .. }),
+            ) => {
+                return Ok(rejected(format!("table {name}: {e}")));
+            }
             Err(e) => return Err(read_err(e)),
         };
         if current.as_deref() != op.expected.as_deref() {
@@ -697,7 +714,7 @@ impl RaftLogReader<MetaTypeConfig> for MetaRaftStorage {
 
 /// Tables Raft keeps for itself. Every other table in the database is
 /// state-machine state and goes into a snapshot.
-const RAFT_TABLES: [&str; 3] = ["raft_logs", "raft_vote", "raft_state"];
+use crate::tables::RAFT_TABLES;
 
 const SNAPSHOT_MAGIC: &[u8] = b"OBIO-META-SNAPSHOT-1\n";
 
@@ -1345,6 +1362,7 @@ fn test_snapshot_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::MAX_OPS;
     use openraft::{CommittedLeaderId, EntryPayload, LogId};
     use tempfile::TempDir;
 
@@ -1713,17 +1731,159 @@ mod tests {
         assert_eq!(last.unwrap().index, 1);
     }
 
-    /// A batch inside a batch is never written; one in the log fails the
-    /// entry rather than being applied some way.
+    /// A batch inside a batch is never written; one in the log is answered
+    /// as refused, alone, rather than applied some way or stopping Raft.
     #[tokio::test]
     async fn a_batch_inside_a_batch_is_refused() {
         let (_d, mut s) = storage();
-        let nested = MetaCommand::Batch(vec![MetaCommand::Batch(vec![])]);
-        assert!(
-            s.apply_to_state_machine(&[normal_entry(1, nested)])
-                .await
-                .is_err()
+        let nested = MetaCommand::Batch(vec![
+            MetaCommand::Batch(vec![]),
+            MetaCommand::DeleteConfig { key: "k".into() },
+        ]);
+        let r = s
+            .apply_to_state_machine(&[normal_entry(1, nested)])
+            .await
+            .unwrap();
+        let MetaResponse::Batch(answers) = &r[0] else {
+            panic!("expected a batch's answers, got {:?}", r[0]);
+        };
+        assert!(matches!(answers[0], MetaResponse::Rejected { .. }));
+        assert!(matches!(
+            answers[1],
+            MetaResponse::ConfigDeleted { existed: false }
+        ));
+        assert_eq!(s.last_applied_state().await.unwrap().0, Some(log_id(1, 1)));
+    }
+
+    fn create(table: CasTable, key: &str) -> CasOp {
+        CasOp {
+            table,
+            key: key.into(),
+            expected: None,
+            new_value: Some(key.as_bytes().to_vec()),
+        }
+    }
+
+    fn multi_cas(ops: Vec<CasOp>) -> MetaCommand {
+        MetaCommand::MultiCas {
+            ops,
+            requested_by: "test".into(),
+        }
+    }
+
+    /// A command that can never apply, already in the log: every node
+    /// answers it as refused, writes none of it, and counts the entry as
+    /// applied, so neither it nor a restart re-applying it stops Raft. The
+    /// entries applied with it are applied as ever. (An oversized
+    /// compare-and-set used to fail the apply: Raft stopped on every node,
+    /// and each restart stopped again at the same entry.)
+    #[tokio::test]
+    async fn a_command_that_can_never_apply_is_refused_and_the_log_goes_on() {
+        let (_d, mut s) = storage();
+        // A table of other types, as a `Named` op could meet.
+        {
+            let txn = s.db.begin_write().unwrap();
+            txn.open_table(redb::TableDefinition::<u64, u64>::new("numbers"))
+                .unwrap()
+                .insert(1, 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let oversized = multi_cas(
+            (0..=MAX_OPS)
+                .map(|i| create(CasTable::IcebergTables, &format!("big{i}")))
+                .collect(),
         );
+        let raft_own = multi_cas(vec![
+            create(CasTable::IcebergTables, "beside-raft"),
+            CasOp {
+                table: CasTable::Named("raft_state".into()),
+                key: "state".into(),
+                expected: None,
+                new_value: Some(b"{}".to_vec()),
+            },
+        ]);
+        let unnamed = multi_cas(vec![create(CasTable::Named(String::new()), "x")]);
+        let other_types = multi_cas(vec![
+            create(CasTable::IcebergTables, "beside-numbers"),
+            create(CasTable::Named("numbers".into()), "x"),
+        ]);
+        let entries = vec![
+            normal_entry(
+                1,
+                multi_cas(vec![create(CasTable::IcebergTables, "before")]),
+            ),
+            normal_entry(2, oversized),
+            normal_entry(3, raft_own),
+            normal_entry(4, unnamed),
+            normal_entry(5, other_types),
+            normal_entry(6, multi_cas(vec![create(CasTable::IcebergTables, "after")])),
+        ];
+        let r = s.apply_to_state_machine(&entries).await.unwrap();
+        assert!(matches!(r[0], MetaResponse::MultiCasOk));
+        for (i, answer) in r.iter().enumerate().take(5).skip(1) {
+            assert!(
+                matches!(answer, MetaResponse::Rejected { .. }),
+                "entry {}: {answer:?}",
+                i + 1
+            );
+        }
+        assert!(matches!(r[5], MetaResponse::MultiCasOk));
+        assert_eq!(s.last_applied_state().await.unwrap().0, Some(log_id(1, 6)));
+
+        let txn = s.db.begin_read().unwrap();
+        let t = txn
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new("iceberg_tables"))
+            .unwrap();
+        assert!(t.get("before").unwrap().is_some());
+        assert!(t.get("after").unwrap().is_some());
+        for refused in ["big0", "beside-raft", "beside-numbers"] {
+            assert!(t.get(refused).unwrap().is_none(), "{refused} was written");
+        }
+        drop(t);
+        drop(txn);
+        // Raft's own state is its own still.
+        assert!(s.load_state().unwrap().last_applied.is_some());
+
+        // Applied again, as after a restart that rolled back to an earlier
+        // checkpoint: the same answers.
+        let again = s.apply_to_state_machine(&entries[1..5]).await.unwrap();
+        assert!(
+            again
+                .iter()
+                .all(|a| matches!(a, MetaResponse::Rejected { .. }))
+        );
+    }
+
+    /// An OSD record that doesn't decode refuses the admin-state change on
+    /// it, the same on every node, rather than stopping Raft.
+    #[tokio::test]
+    async fn an_admin_state_change_on_a_damaged_osd_record_is_refused() {
+        let (_d, mut s) = storage();
+        {
+            let txn = s.db.begin_write().unwrap();
+            txn.open_table(tables::OSD_NODES)
+                .unwrap()
+                .insert(
+                    hex_encode_16(&[3; 16]).as_str(),
+                    b"\xffnot a record".as_slice(),
+                )
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let r = s
+            .apply_to_state_machine(&[normal_entry(
+                1,
+                MetaCommand::SetOsdAdminState {
+                    node_id: [3; 16],
+                    state: objectio_common::OsdAdminState::Out,
+                    requested_by: "test".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(r[0], MetaResponse::Rejected { .. }), "{:?}", r[0]);
+        assert_eq!(s.last_applied_state().await.unwrap().0, Some(log_id(1, 1)));
     }
 
     /// Setting an OSD's admin state tells every node's listener, not only
@@ -1898,30 +2058,6 @@ mod tests {
             rx.try_recv().is_err(),
             "conflict should not emit apply events"
         );
-    }
-
-    #[tokio::test]
-    async fn multi_cas_rejects_oversized_batch() {
-        let (_d, mut s) = storage();
-        let ops: Vec<CasOp> = (0..300)
-            .map(|i| CasOp {
-                table: CasTable::Config,
-                key: format!("k{i}"),
-                expected: None,
-                new_value: Some(vec![0u8; 8]),
-            })
-            .collect();
-        let big = normal_entry(
-            1,
-            MetaCommand::MultiCas {
-                ops,
-                requested_by: "bulk".into(),
-            },
-        );
-        // Too large → apply returns the underlying storage error; the raft
-        // runtime surfaces that to the caller as a propose failure.
-        let err = s.apply_to_state_machine(&[big]).await.err();
-        assert!(err.is_some(), "oversized MultiCas should fail apply");
     }
 
     fn set_config(index: u64, value: &str) -> Entry {

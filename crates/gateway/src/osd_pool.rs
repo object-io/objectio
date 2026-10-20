@@ -2641,27 +2641,38 @@ async fn freeable(
     let mut free = std::collections::HashSet::new();
     let mut packs = Vec::new();
     for (owner, ids) in by_owner {
-        let req = objectio_proto::metadata::ReleaseStripesRequest {
-            stripe_ids: ids.into_iter().collect(),
-            referrer: owner.clone(),
-        };
-        // Meta answers Aborted when the entry kept changing under it (many
-        // releases of one pack at once): try again, a little later.
-        let mut attempt = 0u32;
-        let resp = loop {
-            match meta.release_stripes(req.clone()).await {
-                Err(e) if e.code() == tonic::Code::Aborted && attempt < 4 => {
-                    attempt += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+        let ids: Vec<Vec<u8>> = ids.into_iter().collect();
+        // A batch meta commits whole (an object shared by many parts has
+        // more): each stripe id is two writes at most.
+        for ids in ids.chunks(RELEASE_BATCH) {
+            let req = objectio_proto::metadata::ReleaseStripesRequest {
+                stripe_ids: ids.to_vec(),
+                referrer: owner.clone(),
+            };
+            // Meta answers Aborted when the entry kept changing under it
+            // (many releases of one pack at once): try again, a little
+            // later.
+            let mut attempt = 0u32;
+            let resp = loop {
+                match meta.release_stripes(req.clone()).await {
+                    Err(e) if e.code() == tonic::Code::Aborted && attempt < 4 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                    }
+                    other => break other?.into_inner(),
                 }
-                other => break other?.into_inner(),
-            }
-        };
-        free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
-        packs.extend(resp.freed_packs);
+            };
+            free.extend(resp.freeable.into_iter().map(|id| (owner.clone(), id)));
+            packs.extend(resp.freed_packs);
+        }
     }
     Ok((free, packs))
 }
+
+/// Stripe ids in one `ReleaseStripes` call: meta commits each call as one
+/// command of [`objectio_common::META_MAX_OPS`] writes at most, and a
+/// stripe is two (its references, and its pack's record).
+const RELEASE_BATCH: usize = objectio_common::META_MAX_OPS / 2;
 
 /// Drop `owner`'s reference to `stripe_ids` without deleting anything: an
 /// object replaced by one that still uses these stripes (a copy onto
@@ -2674,14 +2685,16 @@ pub async fn release_only(
     if owner.is_empty() || stripe_ids.is_empty() {
         return;
     }
-    if let Err(e) = meta
-        .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
-            stripe_ids,
-            referrer: owner.to_vec(),
-        })
-        .await
-    {
-        warn!("could not release a replaced object's shared stripes: {e}");
+    for ids in stripe_ids.chunks(RELEASE_BATCH) {
+        if let Err(e) = meta
+            .release_stripes(objectio_proto::metadata::ReleaseStripesRequest {
+                stripe_ids: ids.to_vec(),
+                referrer: owner.to_vec(),
+            })
+            .await
+        {
+            warn!("could not release a replaced object's shared stripes: {e}");
+        }
     }
 }
 

@@ -190,6 +190,13 @@ pub(crate) async fn upload_part_copy_internal(
 /// still the same object, its delete has not happened yet, and when it
 /// does, meta's registry keeps the stripes for the copy. If it is not, the
 /// source's stripes may already be freed, so the copy backs out.
+///
+/// Meta registers at most [`objectio_common::META_MAX_OPS`] stripes in one call, all or
+/// none: an object of more (a multipart upload of many parts) is shared in
+/// batches of that many, and the check above follows the last. A batch
+/// refused part way (the source let go meanwhile) backs out of the batches
+/// before it, and only those: releasing a stripe the copy never shared
+/// would free the source's own bytes.
 pub(crate) async fn copy_by_reference(
     state: &Arc<AppState>,
     dest_bucket: &str,
@@ -198,6 +205,7 @@ pub(crate) async fn copy_by_reference(
     source_key: &str,
     copy_headers: &HeaderMap,
 ) -> Option<Response> {
+    use objectio_common::META_MAX_OPS;
     use objectio_proto::metadata::ShareStripesRequest;
     let mut meta_client = state.meta_client.clone();
 
@@ -250,34 +258,48 @@ pub(crate) async fn copy_by_reference(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    // On the way out after sharing: the copy lets go again. If the source
-    // has gone meanwhile this frees the stripes, as its delete would have.
-    let back_out = |state: &Arc<AppState>, what: String| {
-        let mut targets = stripe_targets(&stripes);
+    // On the way out after sharing `shared`: the copy lets go again. If
+    // the source has gone meanwhile this frees the stripes, as its delete
+    // would have.
+    let back_out_of = |state: &Arc<AppState>, shared: &[Vec<u8>], what: String| {
+        let shared: std::collections::HashSet<&[u8]> = shared.iter().map(Vec::as_slice).collect();
+        let held: Vec<_> = stripes
+            .iter()
+            .filter(|s| shared.contains(s.object_id.as_slice()))
+            .cloned()
+            .collect();
+        let mut targets = stripe_targets(&held);
         for t in &mut targets {
             t.owner.clone_from(&new_id);
         }
         spawn_reclaim(state, targets, Reclaim::FailedWrite, what);
     };
+    let back_out = |state: &Arc<AppState>, what: String| back_out_of(state, &stripe_ids, what);
 
     if !stripe_ids.is_empty() {
-        match meta_client
-            .share_stripes(ShareStripesRequest {
-                stripe_ids: stripe_ids.clone(),
-                owner: source.object_id.clone(),
-                sharer: new_id.clone(),
-            })
-            .await
-        {
-            Ok(_) => {}
-            Err(e) if e.code() == tonic::Code::FailedPrecondition => return None,
-            Err(e) => {
-                return Some(S3Error::xml_response(
+        for (i, batch) in stripe_ids.chunks(META_MAX_OPS).enumerate() {
+            let refused = match meta_client
+                .share_stripes(ShareStripesRequest {
+                    stripe_ids: batch.to_vec(),
+                    owner: source.object_id.clone(),
+                    sharer: new_id.clone(),
+                })
+                .await
+            {
+                Ok(_) => continue,
+                Err(e) if e.code() == tonic::Code::FailedPrecondition => None,
+                Err(e) => Some(S3Error::xml_response(
                     "ServiceUnavailable",
                     &format!("could not register the copy: {}", e.message()),
                     StatusCode::SERVICE_UNAVAILABLE,
-                ));
+                )),
+            };
+            // Not the batch that failed: whether it landed is unknown.
+            let done = &stripe_ids[..i * META_MAX_OPS];
+            if !done.is_empty() {
+                back_out_of(state, done, format!("copy of {source_bucket}/{source_key}"));
             }
+            return refused;
         }
         let still = get_object_meta_from_any(
             &state.osd_pool,

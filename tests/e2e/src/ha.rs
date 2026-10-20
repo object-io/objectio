@@ -146,6 +146,8 @@ pub struct RaftStatus {
     pub voters: Vec<u64>,
     /// Whether the node's database open at start walked all of it (B25).
     pub open_repair: bool,
+    /// Why the node's Raft has stopped for good, if it has.
+    pub fatal: Option<String>,
 }
 
 impl HaCluster {
@@ -702,6 +704,34 @@ impl HaCluster {
             .expect("kill");
     }
 
+    /// The HTTP status meta node `i`'s `/health` answers (on its metrics
+    /// port); `None` if it doesn't answer.
+    #[must_use]
+    pub fn meta_health(&self, i: usize) -> Option<u16> {
+        http()
+            .get(format!("http://127.0.0.1:{}/health", self.metas[i].metrics))
+            .send()
+            .ok()
+            .map(|r| r.status().as_u16())
+    }
+
+    /// Whether meta node `i`'s process has exited since it was started.
+    #[must_use]
+    pub fn meta_exited(&self, i: usize) -> bool {
+        self.metas[i]
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+    }
+
+    /// How many meta nodes the cluster has.
+    #[must_use]
+    pub const fn meta_count(&self) -> usize {
+        self.metas.len()
+    }
+
     /// Meta node `i`'s Raft view; `None` if it doesn't answer.
     #[must_use]
     pub fn status(&self, i: usize) -> Option<RaftStatus> {
@@ -723,6 +753,7 @@ impl HaCluster {
                 .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
                 .unwrap_or_default(),
             open_repair: v["open_repair"].as_bool().unwrap_or(false),
+            fatal: v["fatal"].as_str().map(str::to_string),
         })
     }
 

@@ -841,6 +841,14 @@ pub async fn commit_transaction(
     if req.table_changes.is_empty() {
         return Err(IcebergError::bad_request("table-changes is empty"));
     }
+    // Meta commits a transaction as one command, of one write per table.
+    if req.table_changes.len() > objectio_common::META_MAX_OPS {
+        return Err(IcebergError::bad_request(format!(
+            "{} table changes in one transaction; at most {}",
+            req.table_changes.len(),
+            objectio_common::META_MAX_OPS
+        )));
+    }
 
     let catalog = state.catalog.with_warehouse(&wh.warehouse);
 

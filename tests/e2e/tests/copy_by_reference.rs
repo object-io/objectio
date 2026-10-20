@@ -3,6 +3,8 @@
 //! last object using it is gone. Both halves matter — the copy costs no
 //! space, and deleting either side never takes the other's data.
 
+use std::fmt::Write as _;
+
 use objectio_e2e::Cluster;
 use serde_json::json;
 
@@ -131,5 +133,106 @@ fn a_copy_onto_itself_changes_metadata_and_leaks_nothing() {
         c.await_total_used_bytes(0),
         0,
         "the replaced version left a reference behind"
+    );
+}
+
+/// Part `n` of the many-part object below: 5 MiB (S3's least for all
+/// parts but the last), the last one smaller.
+fn part(n: u32, parts: u32) -> Vec<u8> {
+    let len = if n == parts { 1 << 20 } else { 5 << 20 };
+    let mut x = 0x9E37_79B9_7F4A_7C15_u64 ^ u64::from(n);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// Whether `got` is the many-part object, part by part.
+fn is_whole(got: &[u8], parts: u32) -> bool {
+    let mut at = 0;
+    for n in 1..=parts {
+        let want = part(n, parts);
+        if got.get(at..at + want.len()) != Some(want.as_slice()) {
+            return false;
+        }
+        at += want.len();
+    }
+    at == got.len()
+}
+
+fn xml_tag(xml: &str, name: &str) -> String {
+    xml.split(&format!("<{name}>"))
+        .nth(1)
+        .and_then(|s| s.split(&format!("</{name}>")).next())
+        .unwrap_or_else(|| panic!("no <{name}> in {xml}"))
+        .to_string()
+}
+
+/// An object of more parts than meta registers in one call (a multipart
+/// upload of 257: every part has stripes of its own) is shared in batches:
+/// the copies take no space, read back whole, and deleting any of them,
+/// the source included, keeps the others'. One call of them all used to
+/// stop meta.
+#[test]
+fn an_object_of_more_parts_than_one_share_takes_is_copied_by_reference() {
+    let parts = u32::try_from(objectio_common::META_MAX_OPS).unwrap() + 1;
+    let c = Cluster::start_with_ec(6, 4, 2);
+    c.json("POST", "/_admin/buckets", json!({"name": "b"}))
+        .expect_ok();
+    let r = c.request("POST", "/b/src?uploads", &[]);
+    r.expect(200);
+    let upload = xml_tag(&r.text(), "UploadId");
+    let mut completion = String::from("<CompleteMultipartUpload>");
+    for n in 1..=parts {
+        let r = c.request(
+            "PUT",
+            &format!("/b/src?partNumber={n}&uploadId={upload}"),
+            &part(n, parts),
+        );
+        r.expect(200);
+        let etag = r.header("etag").unwrap();
+        let _ = write!(
+            completion,
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"
+        );
+    }
+    completion.push_str("</CompleteMultipartUpload>");
+    c.request(
+        "POST",
+        &format!("/b/src?uploadId={upload}"),
+        completion.as_bytes(),
+    )
+    .expect(200);
+    let one_object = c.await_total_used_bytes(c.total_used_bytes());
+    assert!(one_object > 0);
+
+    copy(&c, "/b/src", "/b/a", &[]);
+    copy(&c, "/b/src", "/b/b", &[]);
+    assert_eq!(
+        c.total_used_bytes(),
+        one_object,
+        "a copy stored bytes of its own"
+    );
+    assert!(is_whole(&c.request("GET", "/b/a", &[]).bytes, parts));
+
+    c.request("DELETE", "/b/a", &[]).expect(204);
+    assert!(is_whole(&c.request("GET", "/b/src", &[]).bytes, parts));
+    c.request("DELETE", "/b/src", &[]).expect(204);
+    assert!(is_whole(&c.request("GET", "/b/b", &[]).bytes, parts));
+    assert_eq!(
+        c.await_total_used_bytes(one_object),
+        one_object,
+        "the last copy's data was freed"
+    );
+    c.request("DELETE", "/b/b", &[]).expect(204);
+    assert_eq!(
+        c.await_total_used_bytes(0),
+        0,
+        "the last copy did not free the data"
     );
 }

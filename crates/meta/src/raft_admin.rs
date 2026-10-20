@@ -19,7 +19,8 @@
 //!   Promote the given set of node ids (which must already be learners)
 //!   to voters. Writes go through quorum of this new voter set.
 //! - `GET  /status`
-//!   Current leader id, term, membership config, last_log_index.
+//!   Current leader id, term, membership config, last_log_index; `fatal`
+//!   when this node's Raft has stopped for good.
 //! - `GET  /health`
 //!   200 while this node's Raft runs; 503 once it has stopped (a fatal
 //!   storage error, a panic, a shutdown). What a liveness probe asks:
@@ -214,6 +215,10 @@ struct StatusResponse {
     /// Index the log is purged up to.
     purged: Option<u64>,
     state: String,
+    /// Why this node's Raft has stopped for good, if it has (it exits
+    /// then); absent while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fatal: Option<String>,
     voters: Vec<u64>,
     learners: Vec<u64>,
     /// Whether opening the database at start had to walk all of it (B25:
@@ -237,6 +242,7 @@ async fn status(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
         snapshot: m.snapshot.map(|l| l.index),
         purged: m.purged.map(|l| l.index),
         state: format!("{:?}", m.state),
+        fatal: m.running_state.as_ref().err().map(ToString::to_string),
         voters,
         learners,
         open_repair: objectio_meta_store::commit_metrics::open_repaired(),

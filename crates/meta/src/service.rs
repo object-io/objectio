@@ -429,19 +429,17 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Map an openraft `client_write` error to a tonic status the gateway /
-/// CLI can interpret. ForwardToLeader becomes `FailedPrecondition` with
-/// a message the caller can parse for the leader id; all other errors
-/// become `Internal`. Concrete to the types used by `MetaTypeConfig`.
-fn raft_write_to_status(
-    err: &openraft::error::RaftError<
-        u64,
-        openraft::error::ClientWriteError<u64, openraft::BasicNode>,
-    >,
-) -> tonic::Status {
+/// Map a meta write's error to a tonic status the gateway / CLI can
+/// interpret. A refused command (it can never apply) is
+/// `InvalidArgument`; ForwardToLeader becomes `FailedPrecondition` with a
+/// message the caller can parse for the leader id; all other errors become
+/// `Internal`.
+fn raft_write_to_status(err: &crate::raft_batch::WriteError) -> tonic::Status {
+    use crate::raft_batch::WriteError;
     use openraft::error::{ClientWriteError, RaftError};
     match err {
-        RaftError::APIError(ClientWriteError::ForwardToLeader(f)) => {
+        WriteError::Refused(reason) => tonic::Status::invalid_argument(reason.clone()),
+        WriteError::Raft(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
             let leader = f
                 .leader_id
                 .map_or_else(|| "unknown".to_string(), |id| id.to_string());
@@ -453,7 +451,7 @@ fn raft_write_to_status(
                 "not the raft leader — forward to node {leader}{addr}"
             ))
         }
-        other => tonic::Status::internal(format!("raft client_write: {other}")),
+        WriteError::Raft(other) => tonic::Status::internal(format!("raft client_write: {other}")),
     }
 }
 
@@ -1110,11 +1108,115 @@ impl MetaService {
         }
     }
 
+    /// Commit `ops` as compare-and-set writes: in one command when they
+    /// fit ([`objectio_meta_store::MAX_OPS`]), so they land together; else
+    /// in order, that many at a time, each command landing whole. A caller
+    /// that may have more puts what must land last at the end (the record
+    /// the others hang off): a failure part way leaves the first ones
+    /// done and that record still there, and a retry reads what is stored
+    /// and finishes. Each command's ops, once committed, are mirrored into
+    /// the caches the apply stream doesn't keep ([`Self::mirror_landed`]).
+    /// `Ok(false)` on a conflict, for the caller to re-read and retry.
+    pub(crate) async fn cas_in_order(
+        &self,
+        ops: Vec<objectio_meta_store::CasOp>,
+        what: &str,
+    ) -> Result<bool, Status> {
+        for chunk in ops.chunks(objectio_meta_store::MAX_OPS) {
+            if !self.cas_many(chunk.to_vec(), what).await? {
+                return Ok(false);
+            }
+            self.mirror_landed(chunk);
+        }
+        Ok(true)
+    }
+
+    /// Mirror committed writes into this node's caches of the tables the
+    /// apply stream doesn't refresh (groups, policies and their
+    /// attachments, Delta shares): what a write split over several
+    /// commands ([`Self::cas_in_order`]) has landed when a later one fails,
+    /// so a retry starts from what is stored.
+    fn mirror_landed(&self, ops: &[objectio_meta_store::CasOp]) {
+        use objectio_meta_store::CasTable;
+        for op in ops {
+            let value = op.new_value.as_deref();
+            match &op.table {
+                CasTable::Groups => {
+                    let mut groups = self.groups.write();
+                    match value.map(objectio_meta_store::record::deserialize::<StoredGroup>) {
+                        Some(Ok(g)) => {
+                            groups.insert(op.key.clone(), g);
+                        }
+                        Some(Err(e)) => warn!("mirror: decode group '{}': {e}", op.key),
+                        None => {
+                            groups.remove(&op.key);
+                        }
+                    }
+                }
+                CasTable::PolicyAttachments => {
+                    let mut atts = self.policy_attachments.write();
+                    match value {
+                        Some(csv) => {
+                            let names = String::from_utf8_lossy(csv)
+                                .split(',')
+                                .filter(|n| !n.is_empty())
+                                .map(String::from)
+                                .collect();
+                            atts.insert(op.key.clone(), names);
+                        }
+                        None => {
+                            atts.remove(&op.key);
+                        }
+                    }
+                }
+                CasTable::IamPolicies => {
+                    let mut policies = self.iam_policies.write();
+                    match value.map(PolicyObject::decode) {
+                        Some(Ok(p)) => {
+                            policies.insert(op.key.clone(), p);
+                        }
+                        Some(Err(e)) => warn!("mirror: decode policy '{}': {e}", op.key),
+                        None => {
+                            policies.remove(&op.key);
+                        }
+                    }
+                }
+                CasTable::DeltaShares => {
+                    let mut shares = self.delta_shares.write();
+                    match value.map(DeltaShareEntry::decode) {
+                        Some(Ok(e)) => {
+                            shares.insert(op.key.clone(), e);
+                        }
+                        Some(Err(e)) => warn!("mirror: decode share '{}': {e}", op.key),
+                        None => {
+                            shares.remove(&op.key);
+                        }
+                    }
+                }
+                CasTable::DeltaTables => {
+                    let mut tables = self.delta_tables.write();
+                    match value.map(DeltaShareTableEntry::decode) {
+                        Some(Ok(e)) => {
+                            tables.insert(op.key.clone(), e);
+                        }
+                        Some(Err(e)) => warn!("mirror: decode share table '{}': {e}", op.key),
+                        None => {
+                            tables.remove(&op.key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Write `writes` — `(table, key, value)`, `None` to delete — through
     /// Raft, so every meta node holds them, not just this one. Each is
     /// set over whatever the store holds now (last writer wins), as one
-    /// compare-and-set retried on conflict. Without Raft (in-memory tests,
-    /// store-only mode) they go to the store directly.
+    /// compare-and-set retried on conflict ([`objectio_meta_store::MAX_OPS`]
+    /// writes at most in each: more go in several, each landing whole).
+    /// Without Raft (in-memory tests, store-only mode) they go to the store
+    /// directly.
     pub(crate) async fn replicate(
         &self,
         writes: Vec<(&'static str, String, Option<Vec<u8>>)>,
@@ -1129,24 +1231,27 @@ impl MetaService {
             }
             return Ok(());
         }
-        for attempt in 0..CAS_ATTEMPTS {
-            if attempt > 0 {
-                contention_backoff(attempt).await;
+        'chunks: for writes in writes.chunks(objectio_meta_store::MAX_OPS) {
+            for attempt in 0..CAS_ATTEMPTS {
+                if attempt > 0 {
+                    contention_backoff(attempt).await;
+                }
+                let ops = writes
+                    .iter()
+                    .map(|(table, key, value)| objectio_meta_store::CasOp {
+                        table: CasTable::Named((*table).into()),
+                        key: key.clone(),
+                        expected: store.read_named(table, key),
+                        new_value: value.clone(),
+                    })
+                    .collect();
+                if self.cas_many(ops, what).await? {
+                    continue 'chunks;
+                }
             }
-            let ops = writes
-                .iter()
-                .map(|(table, key, value)| objectio_meta_store::CasOp {
-                    table: CasTable::Named((*table).into()),
-                    key: key.clone(),
-                    expected: store.read_named(table, key),
-                    new_value: value.clone(),
-                })
-                .collect();
-            if self.cas_many(ops, what).await? {
-                return Ok(());
-            }
+            return Err(Status::aborted(format!("{what}: kept changing; retry")));
         }
-        Err(Status::aborted(format!("{what}: kept changing; retry")))
+        Ok(())
     }
 
     /// True iff this replica is the current Raft leader. Used by

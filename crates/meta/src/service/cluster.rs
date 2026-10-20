@@ -262,9 +262,8 @@ impl MetaService {
             });
         }
 
-        // Commit in batches. MAX_OPS in raft_storage is 256 — stay
-        // well under to leave headroom for other MultiCas calls that
-        // land in the same raft entry.
+        // Commit in batches, under the operations one command carries
+        // (`objectio_meta_store::MAX_OPS`).
         const CHUNK: usize = 128;
         let raft = self.raft_handle();
         for chunk in pgs.chunks(CHUNK) {

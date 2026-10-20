@@ -671,6 +671,14 @@ impl MetaService {
         if req.table_changes.is_empty() {
             return Err(Status::invalid_argument("table_changes is empty"));
         }
+        // One compare-and-set per table, all in one command.
+        if req.table_changes.len() > objectio_meta_store::MAX_OPS {
+            return Err(Status::invalid_argument(format!(
+                "{} table changes in one transaction; at most {}",
+                req.table_changes.len(),
+                objectio_meta_store::MAX_OPS
+            )));
+        }
 
         // Stage 1 — validate every change's expected location and encode the
         // new entries. Held behind a read-lock so concurrent single-table
