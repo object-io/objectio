@@ -664,6 +664,24 @@ pub enum ReplicationCmd {
         #[command(subcommand)]
         action: ResyncCmd,
     },
+    /// The operator's settings: where tenants' targets may be (system admin)
+    Settings {
+        #[command(subcommand)]
+        action: ReplicationSettingsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReplicationSettingsCmd {
+    /// GET /_admin/replication/settings
+    Get,
+    /// PUT /_admin/replication/settings — replaces them
+    Set {
+        /// A host tenants' targets may be on: host, host:port or *.domain
+        /// (repeatable). None: tenant admins can't set targets
+        #[arg(long = "allowed-tenant-host")]
+        allowed_tenant_hosts: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
