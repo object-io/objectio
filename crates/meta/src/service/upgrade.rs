@@ -4,9 +4,11 @@
 //! Each process reports its release and format level every 30 s
 //! (`objectio_proto::transport::spawn_version_reporter`); the leader keeps
 //! the reports in memory (a new leader hears from everyone again within
-//! 30 s). The active level lives in config, through Raft. Finalize raises
-//! it to the lowest level among the nodes that must take part, and refuses
-//! while any of them hasn't reported or runs an older release.
+//! 30 s). The leader counts itself as reported whenever it is asked: it is
+//! running, this binary. The active level lives in config, through Raft.
+//! Finalize raises it to the lowest level among the nodes that must take
+//! part, and refuses while any of them hasn't reported or runs an older
+//! release.
 
 use std::time::{Duration, Instant};
 
@@ -75,8 +77,38 @@ impl MetaService {
         self.active_level()
     }
 
+    /// This node's own report, made here when it leads: the plan is asked
+    /// of the leader, which is running this binary. Its reporter goes
+    /// through the leader like any node's, and on a new cluster the first
+    /// report is sent before there is a leader to take it, so a healthy
+    /// cluster listed its only meta as down until the next report.
+    fn record_own_version(&self) {
+        let Some(raft) = self.raft_handle() else {
+            return;
+        };
+        let m = raft.metrics().borrow().clone();
+        if m.current_leader != Some(m.id) {
+            return;
+        }
+        let address = m
+            .membership_config
+            .membership()
+            .get_node(&m.id)
+            .map(|n| n.addr.clone())
+            .unwrap_or_default();
+        self.record_version(ReportVersionRequest {
+            kind: "meta".to_string(),
+            id: m.id.to_string(),
+            release: version::RELEASE.to_string(),
+            format_level: version::FORMAT_LEVEL,
+            min_level: version::MIN_LEVEL,
+            address,
+        });
+    }
+
     /// Who must have reported, and what finalize would raise the level to.
     pub(super) fn upgrade_plan(&self) -> Plan {
+        self.record_own_version();
         let active = self.active_level();
         let now = Instant::now();
         let reports = self.versions.read();

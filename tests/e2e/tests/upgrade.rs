@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use objectio_common::version::{FORMAT_LEVEL, RELEASE};
+use objectio_e2e::Cluster;
 use objectio_e2e::ha::HaCluster;
 use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
 use objectio_proto::metadata::{DeleteConfigRequest, GetUpgradeStatusRequest, SetConfigRequest};
@@ -71,6 +72,58 @@ fn a_new_cluster_starts_at_this_releases_level_and_every_node_reports() {
 
     // Finalizing with nothing to do changes nothing.
     let r = ha.clients[0].request("POST", "/_admin/upgrade/finalize", &[]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["active_level"], FORMAT_LEVEL);
+}
+
+/// A fresh aio is healthy from the start: every node has reported, the
+/// one meta included, with nothing blocking. Its meta's first report goes
+/// out before there is a leader to take it, and meta used to be listed as
+/// down ("has not reported in the last 90s") until its next report, 30 s
+/// later; the deadline here is well inside that.
+#[test]
+fn a_fresh_single_process_cluster_has_every_node_reported() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let v = loop {
+        let r = c.request("GET", "/_admin/upgrade", &[]);
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        let kinds: Vec<String> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["kind"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let count = |kind: &str| kinds.iter().filter(|k| *k == kind).count();
+        if v["blockers"] == serde_json::json!([])
+            && count("meta") == 1
+            && count("osd") == 6
+            && count("gateway") == 1
+        {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "not every node reported: {v}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(v["active_level"], FORMAT_LEVEL, "{v}");
+    assert_eq!(v["finalize_to"], FORMAT_LEVEL, "{v}");
+    assert_eq!(v["can_finalize"], false, "nothing to finalize: {v}");
+    let meta = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "meta")
+        .unwrap();
+    assert_eq!(meta["id"], "1", "{v}");
+    assert_eq!(meta["release"], RELEASE, "{v}");
+    assert!(
+        !meta["address"].as_str().unwrap_or_default().is_empty(),
+        "{v}"
+    );
+
+    // Finalize, which the old blocker refused, goes through.
+    let r = c.request("POST", "/_admin/upgrade/finalize", &[]);
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(r.json()["active_level"], FORMAT_LEVEL);
 }

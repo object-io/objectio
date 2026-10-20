@@ -275,8 +275,13 @@ async fn probe(ep: &tonic::transport::Endpoint) -> bool {
 /// How often each process reports its version to meta.
 pub const VERSION_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How soon a report meta did not take (no leader yet, an election) is
+/// sent again.
+pub const VERSION_REPORT_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Report this process's release and format level to meta now and every
-/// [`VERSION_REPORT_EVERY`], and learn the cluster's active level from the
+/// [`VERSION_REPORT_EVERY`] (a failed report again after
+/// [`VERSION_REPORT_RETRY`]), and learn the cluster's active level from the
 /// answer (`objectio_common::version::set_active_level`). A process too old
 /// or too new for the cluster stops here with a message that says which,
 /// rather than run and misread what the others write.
@@ -324,7 +329,11 @@ pub fn spawn_version_reporter(endpoints: String, kind: &'static str, id: String,
                     std::process::exit(78);
                 }
                 Err(status) => {
+                    // Soon, not at the next round: until it lands, the
+                    // node counts as down and finalize waits for it.
                     tracing::debug!("{kind} {id}: version report failed ({status}); will retry");
+                    tokio::time::sleep(VERSION_REPORT_RETRY).await;
+                    continue;
                 }
             }
             tokio::time::sleep(VERSION_REPORT_EVERY).await;
