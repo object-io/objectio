@@ -2798,6 +2798,7 @@ name = "objectio-proto"
 version = "0.1.0-dev"
 dependencies = [
  "clap",
+ "futures",
  "objectio-common",
  "prost",
  "prost-types",

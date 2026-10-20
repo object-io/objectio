@@ -8,7 +8,7 @@ use crate::osd_pool::{
     Displaced, MetaWriteError, OsdPool, PendingShards, Reclaim, ShardTarget, Unread,
     delete_meta_from_all, get_object_meta_from_any, get_object_version_meta_from_any,
     put_object_meta_to_all, read_shard_from_osd, reclaim_shards, reclaimable_after_overwrite,
-    referenced_object_ids, stripe_targets, stripe_targets_of, unreferenced, write_shard_to_osd,
+    referenced_object_ids, stripe_targets, stripe_targets_of, unreferenced,
 };
 use crate::scatter_gather::ScatterGatherEngine;
 use axum::{
@@ -411,25 +411,6 @@ pub(crate) fn build_s3_arn(bucket: &str, key: Option<&str>) -> String {
 // ============================================================================
 // DeleteObjects XML Types
 // ============================================================================
-
-/// Shards of a k+m stripe that must be on disk before a write is
-/// acknowledged: k+1, or all of them when there is no parity.
-///
-/// k is enough to read the stripe back, but an object acknowledged with
-/// exactly k has no redundancy left: one more failure loses it. One spare
-/// shard means a write still succeeds with an OSD down, and what it stores
-/// survives one further failure until the repairer restores the rest.
-const fn write_quorum(ec_k: u32, ec_m: u32) -> usize {
-    let k = ec_k as usize;
-    if ec_m == 0 { k } else { k + 1 }
-}
-
-/// Replicas that must be written before a replicated write is
-/// acknowledged: two — the copy and a spare — or one in a pool that keeps
-/// only one. Same reasoning as [`write_quorum`].
-const fn replica_quorum(replicas: usize) -> usize {
-    if replicas < 2 { replicas } else { 2 }
-}
 
 // ── ACLs: bucket owner enforced ──────────────────────────────────────────
 //
@@ -1461,30 +1442,7 @@ mod commit_tests {
 }
 
 #[cfg(test)]
-mod write_quorum_tests {
-    use super::write_quorum;
-
-    #[test]
-    fn a_write_keeps_one_spare_shard() {
-        assert_eq!(write_quorum(4, 2), 5);
-        assert_eq!(write_quorum(8, 3), 9);
-        assert_eq!(write_quorum(2, 1), 3, "with m = 1 that is every shard");
-    }
-
-    #[test]
-    fn a_replicated_write_keeps_one_spare_copy() {
-        use super::replica_quorum;
-        assert_eq!(replica_quorum(3), 2);
-        assert_eq!(replica_quorum(2), 2);
-        assert_eq!(replica_quorum(1), 1);
-    }
-
-    #[test]
-    fn without_parity_every_shard_is_needed() {
-        assert_eq!(write_quorum(1, 0), 1);
-        assert_eq!(write_quorum(4, 0), 4);
-    }
-
+mod completion_tests {
     #[test]
     fn a_completion_answer_carries_its_checksum() {
         use super::*;

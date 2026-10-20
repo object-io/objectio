@@ -382,8 +382,33 @@ pub(crate) async fn initiate_multipart_upload_internal(
     }
 }
 
-/// Upload part - internal implementation
+/// UploadPart, placed again once when an OSD refused it as placed under
+/// an older epoch of its placement group than it knows, as a PUT is
+/// ([`crate::stripe::placed_again`]).
 pub(crate) async fn upload_part_internal(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    crate::stripe::placed_again(&bucket, &key, || {
+        upload_part_placed(
+            Arc::clone(&state),
+            bucket.clone(),
+            key.clone(),
+            upload_id.clone(),
+            part_number,
+            headers.clone(),
+            body.clone(),
+        )
+    })
+    .await
+}
+
+async fn upload_part_placed(
     state: Arc<AppState>,
     bucket: String,
     key: String,
@@ -577,11 +602,25 @@ pub(crate) async fn upload_part_internal(
             return meta_failure(&e, "Failed to get placement");
         }
     };
+    crate::test_hooks::held_after_placement(&bucket, &key).await;
 
-    let ec_k = placement.ec_k;
-    let ec_m = placement.ec_m;
-    let ec_type = ErasureType::try_from(placement.ec_type).unwrap_or(ErasureType::ErasureMds);
-    let replication_count = placement.replication_count;
+    // Written as a PUT to the pool is (crate::stripe): the same coding (an
+    // LRC pool's parts are LRC stripes), the same quorum and answers short
+    // of it, fenced by the placement group's epoch and placed again once
+    // when an OSD knew a newer one.
+    let placed = crate::stripe::Placed::new(&placement);
+    let scheme = placed.scheme;
+    let coder = match crate::stripe::Coder::new(scheme) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to create erasure codec: {}", e);
+            return S3Error::xml_response(
+                "InternalError",
+                &format!("Erasure coding error: {}", e),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
 
     // Generate a unique object ID for this part
     let part_object_id = *Uuid::now_v7().as_bytes();
@@ -590,355 +629,84 @@ pub(crate) async fn upload_part_internal(
         format!("{bucket}/{key} upload {upload_id} part {part_number}"),
     );
 
-    // Replication mode: no EC, just write raw data to each replica
-    // For large parts, split into multiple stripes (each stripe <= MAX_SHARD_SIZE)
-    let (all_stripes, total_success, used_ec_type) = if ec_type == ErasureType::ErasureReplication {
-        let total_replicas = replication_count.max(1) as usize;
+    // Split into stripes whose shards each fit in an OSD block.
+    let max_stripe_data_size = MAX_SHARD_SIZE * scheme.data_shards();
+    let num_stripes = body.len().div_ceil(max_stripe_data_size);
+    debug!(
+        "Part {}: {} stripes of {:?}, part_size={}",
+        part_number,
+        num_stripes,
+        scheme,
+        body.len()
+    );
 
-        // Split data into stripes (each stripe must fit in a block)
-        let stripe_size = MAX_SHARD_SIZE;
-        let num_stripes = body.len().div_ceil(stripe_size);
-
-        debug!(
-            "Replication mode for part {}: writing {} replicas x {} stripes (size={})",
-            part_number,
-            total_replicas,
-            num_stripes,
-            body.len()
-        );
-
-        let mut all_stripes = Vec::with_capacity(num_stripes);
-        let mut total_success = 0;
-
-        for stripe_idx in 0..num_stripes {
-            let stripe_start = stripe_idx * stripe_size;
-            let stripe_end = std::cmp::min(stripe_start + stripe_size, body.len());
-            // Copy this stripe's bytes out; encrypt in place if the MPU is
-            // SSE-S3. A fresh IV per stripe means on GET each stripe can
-            // decrypt independently starting from its own offset zero.
-            let mut stripe_bytes = body[stripe_start..stripe_end].to_vec();
-            let stripe_iv: Vec<u8> = if let Some(dek) = mpu_dek.as_ref() {
-                let iv = objectio_kms::generate_iv();
-                objectio_kms::encrypt_in_place(dek, &iv, &mut stripe_bytes);
-                iv.to_vec()
-            } else {
-                Vec::new()
-            };
-            let stripe_bytes = Bytes::from(stripe_bytes);
-            let stripe_data_size = stripe_bytes.len() as u64;
-
-            let mut write_futures = Vec::with_capacity(total_replicas);
-
-            for i in 0..total_replicas {
-                let placement_node = if i < placement.nodes.len() {
-                    placement.nodes[i].clone()
-                } else if !placement.nodes.is_empty() {
-                    placement.nodes[i % placement.nodes.len()].clone()
-                } else {
-                    error!("No placement nodes available");
-                    return S3Error::xml_response(
-                        "InternalError",
-                        "No storage nodes available",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                    );
-                };
-
-                let pool = state.osd_pool.clone();
-                let obj_id = part_object_id;
-                let shard_data = stripe_bytes.clone();
-                let pos = i as u32;
-                let s_idx = stripe_idx as u64;
-                pending.sent(&placement_node, &obj_id, s_idx, pos);
-
-                write_futures.push(async move {
-                    let result = write_shard_to_osd(
-                        &pool,
-                        &placement_node,
-                        &obj_id,
-                        s_idx, // stripe_id
-                        pos,
-                        shard_data,
-                        1,    // ec_k=1 for replication
-                        0,    // ec_m=0 for replication
-                        None, // Replicated stripes go over gRPC.
-                        // A part is placed by its upload, not fenced (B31
-                        // phase 1): its object's metadata is, at completion.
-                        None,
-                    )
-                    .await;
-                    (pos, result, placement_node)
-                });
-            }
-
-            let results = futures::future::join_all(write_futures).await;
-
-            let mut success = 0;
-            let mut locs = Vec::with_capacity(total_replicas);
-
-            let mut full = false;
-            for (pos, result, placement_node) in results {
-                match result {
-                    Ok((location, crc32c)) => {
-                        success += 1;
-                        locs.push(ShardLocation {
-                            position: pos,
-                            node_id: location.node_id,
-                            disk_id: location.disk_id,
-                            offset: location.offset,
-                            shard_type: placement_node.shard_type,
-                            local_group: placement_node.local_group,
-                            crc32c: Some(crc32c),
-                        });
-                    }
-                    Err(e) => {
-                        full |= e.is_full();
-                        warn!(
-                            "Failed to write stripe {} replica {} for part: {}",
-                            stripe_idx, pos, e
-                        );
-                    }
-                }
-            }
-
-            // As a PUT's: a part acknowledged with one copy would have its
-            // data on one disk.
-            let quorum = replica_quorum(total_replicas);
-            if success < quorum {
-                error!(
-                    "Replication failed for part stripe {}: {} successful writes, need {}",
-                    stripe_idx, success, quorum
-                );
-                if full {
-                    return S3Error::storage_full();
-                }
-                return S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!(
-                        "Replication failed for stripe {}: {} successful writes, need {}",
-                        stripe_idx, success, quorum
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
-            }
-
-            total_success += success;
-            locs.sort_by_key(|l| l.position);
-
-            all_stripes.push(StripeMeta {
-                stripe_id: stripe_idx as u64,
-                // A copy per position: the width is every copy (one to
-                // read, the rest to spare), so recovery and the PG index
-                // see a stripe short of a copy as they do an EC one.
-                ec_k: 1,
-                ec_m: u32::try_from(total_replicas.saturating_sub(1)).unwrap_or(0),
-                shards: locs,
-                ec_type: ErasureType::ErasureReplication.into(),
-                ec_local_parity: 0,
-                ec_global_parity: 0,
-                local_group_size: 0,
-                data_size: stripe_data_size,
-                object_id: part_object_id.to_vec(), // Store object_id used for shards
-                encryption_iv: stripe_iv.clone(),
-                ..Default::default()
-            });
-        }
-
-        (all_stripes, total_success, ErasureType::ErasureReplication)
-    } else {
-        // EC mode: encode data with erasure coding
-        // For large parts, split into multiple stripes (each stripe's shards must fit in a block)
-        let total_shards_per_stripe = (ec_k + ec_m) as usize;
-
-        // Calculate max raw data per stripe: each shard is data_size/k bytes
-        // To keep each shard <= MAX_SHARD_SIZE, raw data must be <= MAX_SHARD_SIZE * k
-        let max_stripe_data_size = MAX_SHARD_SIZE * ec_k as usize;
-        let num_stripes = body.len().div_ceil(max_stripe_data_size);
-
-        debug!(
-            "EC mode for part {}: {} stripes, {} shards/stripe (ec_k={}, ec_m={}), part_size={}",
-            part_number,
-            num_stripes,
-            total_shards_per_stripe,
-            ec_k,
-            ec_m,
-            body.len()
-        );
-
-        // Coded as a PUT to the pool is: an LRC pool's parts are LRC
-        // stripes, not MDS ones of k + (l + g) on ISA-L, which for some
-        // profiles isn't MDS.
-        let lrc = ec_type == ErasureType::ErasureLrc;
-        let config = if lrc {
-            ErasureConfig::lrc(
-                ec_k as u8,
-                placement.ec_local_parity as u8,
-                placement.ec_global_parity as u8,
-            )
+    let mut all_stripes = Vec::with_capacity(num_stripes);
+    let mut total_success = 0;
+    for stripe_idx in 0..num_stripes {
+        let stripe_start = stripe_idx * max_stripe_data_size;
+        let stripe_end = std::cmp::min(stripe_start + max_stripe_data_size, body.len());
+        // Copy this stripe's bytes out; encrypt in place if the MPU is
+        // SSE-S3. A fresh IV per stripe means on GET each stripe can
+        // decrypt independently starting from its own offset zero.
+        let mut stripe_bytes = body[stripe_start..stripe_end].to_vec();
+        let stripe_iv: Vec<u8> = if let Some(dek) = mpu_dek.as_ref() {
+            let iv = objectio_kms::generate_iv();
+            objectio_kms::encrypt_in_place(dek, &iv, &mut stripe_bytes);
+            iv.to_vec()
         } else {
-            ErasureConfig::new(ec_k as u8, ec_m as u8)
+            Vec::new()
         };
-        let codec = match ErasureCodec::new(config) {
-            Ok(c) => c,
+        let stripe_data_size = stripe_bytes.len() as u64;
+
+        let shards = match coder.shards(Bytes::from(stripe_bytes)) {
+            Ok(s) => s,
             Err(e) => {
-                error!("Failed to create erasure codec: {}", e);
+                error!("Failed to encode stripe {} data: {}", stripe_idx, e);
                 return S3Error::xml_response(
                     "InternalError",
-                    &format!("Erasure coding error: {}", e),
+                    &format!("Erasure encoding failed for stripe {}: {}", stripe_idx, e),
                     StatusCode::INTERNAL_SERVER_ERROR,
                 );
             }
         };
 
-        let mut all_stripes = Vec::with_capacity(num_stripes);
-        let mut total_success = 0;
-
-        for stripe_idx in 0..num_stripes {
-            let stripe_start = stripe_idx * max_stripe_data_size;
-            let stripe_end = std::cmp::min(stripe_start + max_stripe_data_size, body.len());
-            // Copy this stripe's bytes out; encrypt in place if the MPU is
-            // SSE-S3. A fresh IV per stripe means on GET each stripe can
-            // decrypt independently starting from its own offset zero.
-            let mut stripe_bytes = body[stripe_start..stripe_end].to_vec();
-            let stripe_iv: Vec<u8> = if let Some(dek) = mpu_dek.as_ref() {
-                let iv = objectio_kms::generate_iv();
-                objectio_kms::encrypt_in_place(dek, &iv, &mut stripe_bytes);
-                iv.to_vec()
-            } else {
-                Vec::new()
-            };
-            let stripe_data_size = stripe_bytes.len() as u64;
-
-            let shards: Vec<Bytes> = match codec.encode_bytes(&stripe_bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to encode stripe {} data: {}", stripe_idx, e);
-                    return S3Error::xml_response(
-                        "InternalError",
-                        &format!("Erasure encoding failed for stripe {}: {}", stripe_idx, e),
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                    );
-                }
-            };
-
-            let mut write_futures = Vec::with_capacity(total_shards_per_stripe);
-            for (i, shard) in shards.iter().enumerate() {
-                let placement_node = if i < placement.nodes.len() {
-                    placement.nodes[i].clone()
-                } else if !placement.nodes.is_empty() {
-                    placement.nodes[i % placement.nodes.len()].clone()
-                } else {
-                    error!("No placement nodes available");
-                    return S3Error::xml_response(
-                        "InternalError",
-                        "No storage nodes available",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                    );
-                };
-
-                let pool = state.osd_pool.clone();
-                let obj_id = part_object_id;
-                let shard_data = shard.clone();
-                let pos = i as u32;
-                let s_idx = stripe_idx as u64;
-                pending.sent(&placement_node, &obj_id, s_idx, pos);
-
-                write_futures.push(async move {
-                    let result = write_shard_to_osd(
-                        &pool,
-                        &placement_node,
-                        &obj_id,
-                        s_idx, // stripe_id
-                        pos,
-                        shard_data,
-                        ec_k,
-                        ec_m,
-                        None, // Multipart parts go over gRPC (for now).
-                        // A part is placed by its upload, not fenced (B31
-                        // phase 1): its object's metadata is, at completion.
-                        None,
-                    )
-                    .await;
-                    (pos, result, placement_node)
-                });
-            }
-
-            let results = futures::future::join_all(write_futures).await;
-
-            let mut success = 0;
-            let mut locs = Vec::with_capacity(total_shards_per_stripe);
-
-            let mut full = false;
-            for (pos, result, placement_node) in results {
-                match result {
-                    Ok((location, crc32c)) => {
-                        success += 1;
-                        locs.push(ShardLocation {
-                            position: pos,
-                            node_id: location.node_id,
-                            disk_id: location.disk_id,
-                            offset: location.offset,
-                            shard_type: placement_node.shard_type,
-                            local_group: placement_node.local_group,
-                            crc32c: Some(crc32c),
-                        });
-                    }
-                    Err(e) => {
-                        full |= e.is_full();
-                        warn!(
-                            "Failed to write shard {} for part stripe {}: {}",
-                            pos, stripe_idx, e
-                        );
-                    }
-                }
-            }
-
-            let quorum = write_quorum(ec_k, ec_m);
-            if success < quorum {
+        // Parts go over gRPC (for now).
+        let locs = match crate::stripe::write_stripe(
+            &state.osd_pool,
+            &placed,
+            &part_object_id,
+            stripe_idx as u64,
+            shards,
+            None,
+            Some(&mut pending),
+        )
+        .await
+        {
+            Ok(locs) => locs,
+            Err(short) => {
                 error!(
-                    "Write quorum not met for part stripe {}: {} successful, need {} (ec_k={}, ec_m={})",
-                    stripe_idx, success, quorum, ec_k, ec_m
+                    "{bucket}/{key} upload {upload_id} part {part_number}: stripe {stripe_idx}: {short}"
                 );
-                if full {
-                    return S3Error::storage_full();
-                }
-                return S3Error::xml_response(
-                    "ServiceUnavailable",
-                    &format!(
-                        "Write quorum not met for stripe {}: {} successful writes, need {}",
-                        stripe_idx, success, quorum
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                return crate::stripe::refused(&short, stripe_idx as u64);
             }
-
-            total_success += success;
-            locs.sort_by_key(|l| l.position);
-
-            all_stripes.push(StripeMeta {
-                stripe_id: stripe_idx as u64,
-                ec_k,
-                ec_m,
-                shards: locs,
-                ec_type: ec_type.into(),
-                ec_local_parity: if lrc { placement.ec_local_parity } else { 0 },
-                ec_global_parity: if lrc { placement.ec_global_parity } else { 0 },
-                local_group_size: if lrc { placement.local_group_size } else { 0 },
-                data_size: stripe_data_size,
-                object_id: part_object_id.to_vec(),
-                encryption_iv: stripe_iv.clone(),
-                ..Default::default()
-            });
-        }
-
-        (all_stripes, total_success, ec_type)
-    };
+        };
+        total_success += locs.len();
+        all_stripes.push(StripeMeta {
+            encryption_iv: stripe_iv,
+            ..scheme.stripe(
+                stripe_idx as u64,
+                stripe_data_size,
+                part_object_id.to_vec(),
+                locs,
+            )
+        });
+    }
 
     debug!(
-        "Part {} uploaded: {} stripes, {} shards written, mode={:?}",
+        "Part {} uploaded: {} stripes, {} shards written",
         part_number,
         all_stripes.len(),
         total_success,
-        used_ec_type
     );
 
     // Register the part with metadata service (using all stripes)

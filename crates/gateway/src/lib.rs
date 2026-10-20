@@ -44,6 +44,7 @@ pub mod replication;
 pub mod s3;
 pub mod s3_metrics;
 pub mod scatter_gather;
+pub mod stripe;
 pub mod sts_api;
 pub mod test_hooks;
 pub mod upgrade;
