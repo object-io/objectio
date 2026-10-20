@@ -4,7 +4,7 @@ Components:
   - Gateway:  {{ .Values.gateway.replicas }} replica(s)
   - Meta:     {{ .Values.meta.replicas }} replica(s) (Raft cluster)
   - OSD:      {{ .Values.osd.replicas }} replica(s)
-  - EC scheme: {{ .Values.ec.k }}+{{ .Values.ec.m }}
+  - Default pool: {{ if .Values.replication }}{{ .Values.replication }} cop{{ if eq (int .Values.replication) 1 }}y{{ else }}ies{{ end }} of each object{{ else }}erasure coding {{ .Values.ec.k }}+{{ .Values.ec.m }}{{ end }}
 
 Access the S3 gateway:
 

@@ -225,6 +225,12 @@ impl Cluster {
         Self::boot(osds, None, Vec::new())
     }
 
+    /// One copy of each object (no erasure coding), with further aio
+    /// flags, as [`Self::start_with_ec_and_args`] takes them.
+    pub fn start_with_args(osds: usize, args: &[&str]) -> Self {
+        Self::boot(osds, None, args.iter().map(ToString::to_string).collect())
+    }
+
     /// How many times a cluster is started before giving up, when aio
     /// exits during startup. Covers losing the port race in [`free_port`].
     const START_ATTEMPTS: usize = 5;

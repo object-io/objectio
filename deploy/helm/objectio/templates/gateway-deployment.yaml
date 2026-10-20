@@ -34,10 +34,17 @@ spec:
             - "0.0.0.0:{{ .Values.gateway.service.port }}"
             - "--meta-endpoint"
             - "http://{{ include "objectio.meta.fullname" . }}:{{ .Values.meta.service.port }}"
+            {{- if .Values.replication }}
+            - "--protection"
+            - "replication"
+            - "--replicas"
+            - {{ .Values.replication | quote }}
+            {{- else }}
             - "--ec-k"
             - {{ .Values.ec.k | quote }}
             - "--ec-m"
             - {{ .Values.ec.m | quote }}
+            {{- end }}
             - "--region"
             - {{ .Values.gateway.region | quote }}
             {{- if .Values.gateway.noAuth }}

@@ -722,6 +722,16 @@ async fn serve() -> Result<()> {
     // mutually exclusive here: ask for EC and we simply do not pass
     // `--replication`.
     let use_ec = args.ec_k > 0 && args.ec_m > 0;
+    // One of the two alone is not a scheme: 1+0, say, keeps no parity,
+    // and meta refuses it. Without both, a cluster keeps one copy.
+    if !use_ec && (args.ec_k > 0 || args.ec_m > 0) {
+        return Err(anyhow!(
+            "--ec-k {} --ec-m {}: erasure coding takes both, m at least 1; leave both \
+             out for one copy of each object (replication 1)",
+            args.ec_k,
+            args.ec_m
+        ));
+    }
     let mut meta_argv: Vec<String> = vec![
         "objectio-meta".into(),
         "--node-id".into(),

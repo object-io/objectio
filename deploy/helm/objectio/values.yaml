@@ -248,9 +248,15 @@ blockGateway:
       cpu: "2"
       memory: 2Gi
 
+# The default pool's protection (buckets that name no pool). With
+# `replication` set, that many copies of each object: 1 keeps one copy,
+# no protection, for a one-OSD cluster. Set to 0 to erasure-code k+m
+# instead (m at least 1, on k+m OSDs at least). The block gateway codes
+# volumes k+m either way.
+replication: 1
 ec:
-  k: 1
-  m: 0
+  k: 4
+  m: 2
 
 monitoring:
   enabled: false

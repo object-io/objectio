@@ -25,10 +25,7 @@ use objectio_auth::{
     policy::{BucketPolicy, PolicyEvaluator},
 };
 use objectio_common::ErasureConfig;
-use objectio_erasure::{
-    ErasureCodec,
-    backend::{LrcBackend, LrcConfig, RustSimdLrcBackend},
-};
+use objectio_erasure::ErasureCodec;
 use objectio_proto::metadata::{
     AbortMultipartUploadRequest,
     BucketSseConfiguration,

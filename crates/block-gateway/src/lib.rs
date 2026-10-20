@@ -108,17 +108,11 @@ pub async fn run(
 ) -> Result<()> {
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
     info!("Starting ObjectIO Block Gateway");
-    // Volumes are coded with this profile, not a pool's: one that some
-    // loss of m shards leaves undecodable is refused as meta refuses
-    // such a pool.
-    if args.ec_m > 0 && !objectio_erasure::is_mds(args.ec_k as usize, args.ec_m as usize) {
-        anyhow::bail!(
-            "--ec-k {} --ec-m {}: some loss of {} shards could not be rebuilt; \
-             MDS profiles have up to 3 parity shards, 4 with k up to 21, or are 5+5",
-            args.ec_k,
-            args.ec_m,
-            args.ec_m
-        );
+    // Volumes are coded with this profile, not a pool's: one meta would
+    // refuse for a pool (no parity, or some loss of m shards it can't
+    // decode) is refused here too.
+    if let Err(why) = objectio_erasure::check_mds(args.ec_k as usize, args.ec_m as usize) {
+        anyhow::bail!("--ec-k {} --ec-m {}: {why}", args.ec_k, args.ec_m);
     }
 
     // ── Data directory ────────────────────────────────────────────────────────

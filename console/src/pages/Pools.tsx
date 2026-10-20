@@ -412,7 +412,8 @@ function PoolWizard({
           },
           {
             label: "Fault Tolerance",
-            value: `${form.ec_type === 2 ? form.replication_count - 1 : form.ec_m} failures`,
+            // LRC: every loss of g shards decodes; more depend on where.
+            value: `${form.ec_type === 2 ? form.replication_count - 1 : form.ec_type === 1 ? form.ec_global_parity : form.ec_m} failures`,
           },
         ]}
         footer={

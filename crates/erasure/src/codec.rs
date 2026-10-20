@@ -165,6 +165,14 @@ impl ErasureCodec {
                 local_parity,
                 global_parity,
             } => {
+                // Checked first: a profile that isn't one (no local
+                // groups, groups of unequal size) has no LrcConfig.
+                crate::check_lrc(
+                    config.data_shards.into(),
+                    local_parity.into(),
+                    global_parity.into(),
+                )
+                .map_err(ErasureError::InvalidConfig)?;
                 let lrc_config = LrcConfig::new(config.data_shards, local_parity, global_parity);
                 let backend_config = BackendConfig::lrc(lrc_config);
                 let lrc_backend = BackendFactory::create_lrc(&backend_config)?;
@@ -745,14 +753,26 @@ impl ErasureCodec {
                     })
                     .collect()
             }
-            CodecBackend::Lrc(backend) => {
+            CodecBackend::Lrc(_) => {
+                // The data shards (from their groups, then the global
+                // code), and the stripe encoded again for any parity: the
+                // backend's own decode rebuilds data shards only.
                 let shard_refs: Vec<Option<&[u8]>> = shards
                     .iter()
                     .map(|s| s.as_ref().map(|v| v.as_slice()))
                     .collect();
-                backend
-                    .decode(&shard_refs, shard_size, missing_indices)
-                    .map_err(|e| ErasureError::DecodingFailed(e.to_string()).into())
+                let data = self.rebuild_data(&shard_refs)?;
+                let data: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let mut stripe = self.encode_shards(&data)?;
+                missing_indices
+                    .iter()
+                    .map(|&i| {
+                        stripe.get_mut(i).map(std::mem::take).ok_or_else(|| {
+                            ErasureError::InvalidConfig(format!("no shard {i} in the stripe"))
+                                .into()
+                        })
+                    })
+                    .collect()
             }
         }
     }
@@ -1041,6 +1061,29 @@ mod tests {
             assert_eq!(rebuilt.len(), lost.len(), "lost {lost:?}");
             for (i, shard) in lost.iter().zip(&rebuilt) {
                 assert_eq!(shard, &stripe[*i], "shard {i} wrong after losing {lost:?}");
+            }
+        }
+    }
+
+    /// As for MDS, for an LRC stripe: data, local and global parity each
+    /// come back as encoded, for every loss of up to g shards (the
+    /// backend's decode alone rebuilt data shards only, and refused a
+    /// global parity).
+    #[test]
+    fn reconstruct_shards_rebuilds_any_lrc_position() {
+        let codec = ErasureCodec::new(ErasureConfig::lrc(6, 2, 2)).unwrap();
+        let data: Vec<u8> = (0..60_001u32).map(|i| (i * 11 % 251) as u8).collect();
+        let stripe = codec.encode(&data).unwrap();
+        for a in 0..10 {
+            for b in a..10 {
+                let lost: Vec<usize> = if a == b { vec![a] } else { vec![a, b] };
+                let survivors: Vec<Option<Vec<u8>>> = (0..10)
+                    .map(|i| (!lost.contains(&i)).then(|| stripe[i].clone()))
+                    .collect();
+                let rebuilt = codec.reconstruct_shards(&survivors, &lost).unwrap();
+                for (i, shard) in lost.iter().zip(&rebuilt) {
+                    assert_eq!(shard, &stripe[*i], "shard {i} wrong after losing {lost:?}");
+                }
             }
         }
     }

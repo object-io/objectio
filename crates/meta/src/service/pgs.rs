@@ -128,6 +128,71 @@ pub(crate) fn copy_count(pool: &PoolConfig) -> usize {
     }
 }
 
+/// An LRC pool's `ec_m` is its parity, local and global: set from them,
+/// whatever was asked, so the pool reads as the stripes it makes.
+pub(crate) fn normalize_scheme(pool: &mut PoolConfig) {
+    if pool.ec_type == ErasureType::ErasureLrc as i32 {
+        pool.ec_m = pool.ec_local_parity.saturating_add(pool.ec_global_parity);
+    }
+}
+
+/// Refuse a pool whose protection the codecs can't keep: an MDS profile
+/// some loss of m shards leaves undecodable, or with no parity at all
+/// (one unprotected copy is replication of 1); an LRC profile whose
+/// groups aren't one size, or with no local or global parity; a
+/// replication count of 0 or past a stripe's width; a scheme that is none
+/// of these. Checked wherever a pool is made or changed, its default pool
+/// included, and for that one at meta's start too.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_scheme(pool: &PoolConfig) -> Result<(), Status> {
+    let wide = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+    let why = match ErasureType::try_from(pool.ec_type) {
+        Ok(ErasureType::ErasureMds) => {
+            objectio_erasure::check_mds(wide(pool.ec_k), wide(pool.ec_m))
+        }
+        Ok(ErasureType::ErasureLrc) => objectio_erasure::check_lrc(
+            wide(pool.ec_k),
+            wide(pool.ec_local_parity),
+            wide(pool.ec_global_parity),
+        ),
+        Ok(ErasureType::ErasureReplication) => {
+            objectio_erasure::check_replicas(wide(pool.replication_count))
+        }
+        Err(_) => Err(format!(
+            "ec_type {} is none of 0 (erasure coding), 1 (LRC) and 2 (replication)",
+            pool.ec_type
+        )),
+    };
+    why.map_err(|why| Status::invalid_argument(format!("pool '{}': {why}", pool.name)))
+}
+
+/// A pool named `name` with the protection `ec` (meta's default).
+pub(crate) fn pool_with_scheme(name: &str, ec: &EcConfig) -> PoolConfig {
+    let mut pool = PoolConfig {
+        name: name.to_string(),
+        ..Default::default()
+    };
+    match ec {
+        EcConfig::Mds { k, m } => {
+            pool.set_ec_type(ErasureType::ErasureMds);
+            pool.ec_k = u32::from(*k);
+            pool.ec_m = u32::from(*m);
+        }
+        EcConfig::Lrc { k, l, g } => {
+            pool.set_ec_type(ErasureType::ErasureLrc);
+            pool.ec_k = u32::from(*k);
+            pool.ec_local_parity = u32::from(*l);
+            pool.ec_global_parity = u32::from(*g);
+            pool.ec_m = u32::from(*l) + u32::from(*g);
+        }
+        EcConfig::Replication { count } => {
+            pool.set_ec_type(ErasureType::ErasureReplication);
+            pool.replication_count = u32::from(*count);
+        }
+    }
+    pool
+}
+
 /// A pool's placement rule (B31 phase 1b): its copies over
 /// `spread_domains` domains at its failure-domain level, at most
 /// `per_domain` in one; an LRC pool with `lrc_groups_per_domain` keeps each
@@ -328,33 +393,13 @@ impl MetaService {
     /// The default pool's row: the cluster's default protection, spread
     /// over `failure_domain`.
     fn default_pool_config(&self, failure_domain: &str) -> PoolConfig {
-        let mut pool = PoolConfig {
-            name: DEFAULT_POOL.to_string(),
+        PoolConfig {
             failure_domain: failure_domain.to_string(),
             description: "Buckets that name no pool".to_string(),
             enabled: true,
             pg_count: DEFAULT_PG_COUNT,
-            ..Default::default()
-        };
-        match &self.default_ec {
-            EcConfig::Mds { k, m } => {
-                pool.set_ec_type(ErasureType::ErasureMds);
-                pool.ec_k = u32::from(*k);
-                pool.ec_m = u32::from(*m);
-            }
-            EcConfig::Lrc { k, l, g } => {
-                pool.set_ec_type(ErasureType::ErasureLrc);
-                pool.ec_k = u32::from(*k);
-                pool.ec_local_parity = u32::from(*l);
-                pool.ec_global_parity = u32::from(*g);
-                pool.ec_m = u32::from(*l) + u32::from(*g);
-            }
-            EcConfig::Replication { count } => {
-                pool.set_ec_type(ErasureType::ErasureReplication);
-                pool.replication_count = u32::from(*count);
-            }
+            ..pool_with_scheme(DEFAULT_POOL, &self.default_ec)
         }
-        pool
     }
 
     /// Make the default pool and its placement groups (leader, level 7),
@@ -919,6 +964,77 @@ mod tests {
 
     use super::*;
     use objectio_proto::metadata::metadata_service_server::MetadataService;
+
+    fn scheme(ec_type: ErasureType, k: u32, m: u32, l: u32, g: u32, n: u32) -> PoolConfig {
+        let mut pool = PoolConfig {
+            name: "p".into(),
+            ec_k: k,
+            ec_m: m,
+            ec_local_parity: l,
+            ec_global_parity: g,
+            replication_count: n,
+            ..Default::default()
+        };
+        pool.set_ec_type(ec_type);
+        pool
+    }
+
+    /// Only schemes the codecs keep make a pool: MDS profiles with parity
+    /// (ISA-L's matrix decodes every loss of m), LRC profiles of equal
+    /// groups with local and global parity, 1 copy or more.
+    #[test]
+    fn only_schemes_the_codecs_keep_make_a_pool() {
+        use ErasureType::{ErasureLrc as Lrc, ErasureMds as Mds, ErasureReplication as Rep};
+        let ok = [
+            scheme(Mds, 4, 2, 0, 0, 0),
+            scheme(Mds, 21, 4, 0, 0, 0),
+            scheme(Mds, 5, 5, 0, 0, 0),
+            scheme(Mds, 3, 20, 0, 0, 0),
+            scheme(Lrc, 6, 4, 2, 2, 0),
+            scheme(Lrc, 4, 3, 2, 1, 0),
+            scheme(Rep, 0, 0, 0, 0, 1),
+            scheme(Rep, 0, 0, 0, 0, 3),
+        ];
+        for pool in ok {
+            assert!(check_scheme(&pool).is_ok(), "{pool:?}");
+        }
+        let refused = [
+            scheme(Mds, 1, 0, 0, 0, 0),
+            scheme(Mds, 4, 0, 0, 0, 0),
+            scheme(Mds, 0, 2, 0, 0, 0),
+            scheme(Mds, 6, 5, 0, 0, 0),
+            scheme(Mds, 22, 4, 0, 0, 0),
+            scheme(Mds, 250, 6, 0, 0, 0),
+            // Far past a stripe: nothing on the way wraps it into one.
+            scheme(Mds, u32::MAX, 2, 0, 0, 0),
+            scheme(Lrc, 5, 3, 2, 1, 0),
+            scheme(Lrc, 6, 2, 0, 2, 0),
+            scheme(Lrc, 6, 2, 2, 0, 0),
+            scheme(Lrc, 0, 2, 1, 1, 0),
+            scheme(Lrc, 240, 20, 10, 10, 0),
+            scheme(Rep, 0, 0, 0, 0, 0),
+            scheme(Rep, 0, 0, 0, 0, 300),
+        ];
+        for pool in refused {
+            let e = check_scheme(&pool).unwrap_err();
+            assert_eq!(e.code(), tonic::Code::InvalidArgument, "{pool:?}");
+            assert!(e.message().starts_with("pool 'p': "), "{}", e.message());
+        }
+        let mut unknown = scheme(Mds, 4, 2, 0, 0, 0);
+        unknown.ec_type = 7;
+        assert!(check_scheme(&unknown).is_err());
+    }
+
+    /// An LRC pool's m is its local and global parity, whatever was asked.
+    #[test]
+    fn an_lrc_pools_m_is_its_parity() {
+        let mut pool = scheme(ErasureType::ErasureLrc, 6, 2, 2, 2, 0);
+        normalize_scheme(&mut pool);
+        assert_eq!(pool.ec_m, 4);
+        let mut pool = scheme(ErasureType::ErasureMds, 4, 2, 0, 0, 0);
+        normalize_scheme(&mut pool);
+        assert_eq!(pool.ec_m, 2);
+    }
     use objectio_proto::metadata::{FailureDomainInfo, RegisterOsdRequest};
 
     fn id(n: u8) -> Vec<u8> {

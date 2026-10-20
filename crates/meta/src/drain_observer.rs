@@ -1299,7 +1299,23 @@ async fn rebuild_shard(
         let expected = loc.crc32c;
         reads.push(async move { (id.position, read_shard(&addr, &id, expected).await) });
     }
-    let mut survivors: Vec<Option<Vec<u8>>> = vec![None; k + m];
+    // Decoded with the stripe's own code: an LRC stripe's shards through
+    // an MDS codec rebuild other bytes. Any k shards of an MDS stripe
+    // decode; an LRC stripe's k may not (a local parity among them), so
+    // it reads every one it can.
+    let lrc = stripe.ec_type == objectio_proto::metadata::ErasureType::ErasureLrc as i32;
+    let config = if lrc {
+        objectio_common::ErasureConfig::lrc(
+            k as u8,
+            stripe.ec_local_parity as u8,
+            stripe.ec_global_parity as u8,
+        )
+    } else {
+        objectio_common::ErasureConfig::new(k as u8, m as u8)
+    };
+    let codec =
+        objectio_erasure::ErasureCodec::new(config).map_err(|e| anyhow::anyhow!("codec: {e}"))?;
+    let mut survivors: Vec<Option<Vec<u8>>> = vec![None; codec.total_shards()];
     let mut have = 0;
     while let Some((pos, r)) = reads.next().await {
         if let Ok(bytes) = r
@@ -1307,7 +1323,7 @@ async fn rebuild_shard(
         {
             *slot = Some(bytes.to_vec());
             have += 1;
-            if have == k {
+            if have == k && !lrc {
                 break;
             }
         }
@@ -1315,9 +1331,6 @@ async fn rebuild_shard(
     if have < k {
         return Err(TooFewShards { have, k }.into());
     }
-    let codec =
-        objectio_erasure::ErasureCodec::new(objectio_common::ErasureConfig::new(k as u8, m as u8))
-            .map_err(|e| anyhow::anyhow!("codec: {e}"))?;
     let mut rebuilt = codec
         .reconstruct_shards(&survivors, &[shard.position as usize])
         .map_err(|e| anyhow::anyhow!("rebuild: {e}"))?;
