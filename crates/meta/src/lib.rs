@@ -265,11 +265,14 @@ pub async fn run(
     // Start metrics server
     // Port 0 turns it off: the same text is served over gRPC GetMetrics,
     // which the gateway re-exports (aio runs it this way).
+    // Bound here, not in the task that serves it: a port that can't be bound
+    // is a failed start, not a node running on without its health endpoint.
     let metrics_port = args.metrics_port;
     if metrics_port != 0 {
+        let listener = bind_http(metrics_port, "metrics").await?;
         let metrics_state_clone = metrics_state.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
+            if let Err(e) = serve_metrics(listener, metrics_state_clone).await {
                 error!("Metrics server error: {}", e);
             }
         });
@@ -414,16 +417,12 @@ pub async fn run(
         self_addr: self_addr.clone(),
     });
     let admin_port = args.admin_port;
+    let admin_listener = bind_http(admin_port, "admin").await?;
+    info!("Raft admin API on http://0.0.0.0:{}/", admin_port);
     tokio::spawn(async move {
         let router = admin_state.router();
-        let addr: SocketAddr = format!("0.0.0.0:{admin_port}")
-            .parse()
-            .expect("admin port valid");
-        info!("Raft admin API on http://0.0.0.0:{}/", admin_port);
-        if let Ok(l) = TcpListener::bind(addr).await {
-            let _ = axum::serve(l, router).await;
-        } else {
-            error!("Raft admin server failed to bind {admin_port}");
+        if let Err(e) = axum::serve(admin_listener, router).await {
+            error!("Raft admin server error: {e}");
         }
     });
 
@@ -682,19 +681,22 @@ async fn health_handler(
     }
 }
 
-/// Start the metrics HTTP server
-async fn start_metrics_server(port: u16, state: Arc<MetaMetricsState>) -> Result<()> {
+/// Bind an HTTP server's port on every address, or say which could not be.
+async fn bind_http(port: u16, what: &str) -> Result<TcpListener> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind the {what} port {addr}: {e}"))
+}
+
+/// Serve the metrics HTTP server on `listener`.
+async fn serve_metrics(listener: TcpListener, state: Arc<MetaMetricsState>) -> Result<()> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .with_state(state);
-
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    info!("Starting metrics server on {}", addr);
-
-    let listener = TcpListener::bind(addr).await?;
+    info!("Starting metrics server on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 

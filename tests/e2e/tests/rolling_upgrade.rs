@@ -124,10 +124,7 @@ fn on_release(v: &Value, kind: &str, release: &str) -> usize {
 /// A gateway from `bins`, against a cluster finalized past its level: it
 /// must not serve.
 fn old_gateway_is_refused(ha: &HaCluster, bins: &Path, path: &str) {
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    let port = objectio_e2e::free_port();
     let mut child = Command::new(bins.join("objectio-gateway"))
         .env("OBJECTIO_MASTER_KEY", MASTER_KEY)
         .args([

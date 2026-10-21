@@ -178,19 +178,64 @@ pub fn await_exit(child: &mut Child, within: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// Pick a free port by binding :0 and releasing it.
+/// The first port the kernel hands out on its own (`ip_local_port_range`):
+/// to an outgoing connection's source port, or to a listener on port 0.
+fn ephemeral_floor() -> u16 {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32_768)
+}
+
+/// A free port `p`, with `p + 2i` free too for `n` services (an OSD's port
+/// and its metrics port side by side, say), from below the range the
+/// kernel picks ports from.
 ///
-/// Racy: between the release and aio binding it, another cluster starting
-/// in parallel — or one of its own internal meta/OSD listeners, which also
-/// take ephemeral ports — can grab it. aio takes `--strict-port`, so that
-/// shows up as aio exiting during startup ("in use and --strict-port set")
-/// rather than landing on a port the test is not talking to, and
-/// [`Cluster::boot`] retries on a fresh port.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
+/// A port taken by binding :0 and releasing it is one the kernel may give
+/// out again at any moment: as the source port of any outgoing connection,
+/// or to a listener on port 0 (the OSDs' metrics). A service restarted on
+/// its ports (a meta node, known to its peers by them) once found its
+/// metrics port held by another process, which answered its health checks
+/// with 404. Below that range only another listener can take one, and none
+/// of this process's is given a port twice. Another test process starting
+/// a cluster meanwhile still can; the harness's retries cover that
+/// ([`Cluster::boot`], `aio --strict-port`, and the `ha` harness's).
+///
+/// # Panics
+/// When the kernel's range starts too low to leave ports below it.
+#[must_use]
+pub fn free_ports(n: u16) -> u16 {
+    use std::hash::{BuildHasher, RandomState};
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let ceiling = ephemeral_floor();
+    let floor = if ceiling > 25_000 { 20_000 } else { 1_024 };
+    let span = ceiling.saturating_sub(floor).saturating_sub(2 * n.max(1));
+    assert!(
+        span > 1_000,
+        "ip_local_port_range starts at {ceiling}: no ports below it for the tests"
+    );
+    loop {
+        let r = RandomState::new().hash_one(Instant::now());
+        let p = floor + u16::try_from(r % u64::from(span)).unwrap();
+        let ports: Vec<u16> = (0..n.max(1)).map(|i| p + 2 * i).collect();
+        let mut given = GIVEN.lock().unwrap();
+        let free = ports
+            .iter()
+            .all(|q| !given.contains(q) && std::net::TcpListener::bind(("0.0.0.0", *q)).is_ok());
+        if free {
+            given.extend(&ports);
+        }
+        drop(given);
+        if free {
+            return p;
+        }
+    }
+}
+
+/// A free port, as [`free_ports`] picks them.
+#[must_use]
+pub fn free_port() -> u16 {
+    free_ports(1)
 }
 
 impl Cluster {

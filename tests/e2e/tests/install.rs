@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use objectio_e2e::{Cluster, binary};
+use objectio_e2e::{Cluster, binary, free_port, free_ports};
 
 /// The processes started from units, killed on drop. A failing test prints
 /// the end of each one's log.
@@ -135,39 +135,6 @@ fn disk(root: &Path, name: &str) -> String {
         .and_then(|f| f.set_len(2 << 30))
         .expect("disk file");
     path.display().to_string()
-}
-
-/// A free port, and `p + 2i` free too for `n` OSDs, below the range the
-/// kernel picks ports from (`ip_local_port_range`, 32768 up by default).
-///
-/// A unit names its ports, so a service can't be moved to another one
-/// that's free, as the `ha` harness does when a port it picked was taken
-/// before its process bound it: an outgoing connection, which takes a port
-/// from that range, once took an OSD's. Below it only another listener can
-/// take one, and none of this binary's tests is given a port twice.
-fn free_ports(n: u16) -> u16 {
-    use std::hash::{BuildHasher, RandomState};
-    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    loop {
-        let r = RandomState::new().hash_one(Instant::now());
-        let p = 20_000 + u16::try_from(r % 12_000).unwrap();
-        let ports: Vec<u16> = (0..n.max(1)).map(|i| p + 2 * i).collect();
-        let mut given = GIVEN.lock().unwrap();
-        let free = ports
-            .iter()
-            .all(|q| !given.contains(q) && std::net::TcpListener::bind(("0.0.0.0", *q)).is_ok());
-        if free {
-            given.extend(&ports);
-        }
-        drop(given);
-        if free {
-            return p;
-        }
-    }
-}
-
-fn free_port() -> u16 {
-    free_ports(1)
 }
 
 fn await_listening(port: u16, what: &str) {

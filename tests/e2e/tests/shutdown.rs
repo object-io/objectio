@@ -8,15 +8,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use objectio_e2e::ha::{HaCluster, Node};
-use objectio_e2e::{Cluster, await_exit, binary, sigterm, tls};
+use objectio_e2e::{Cluster, await_exit, binary, free_port, sigterm, tls};
 
 /// Ample for a clean stop: the services take well under a second here.
 const STOP_WITHIN: Duration = Duration::from_secs(20);
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 /// `GET /_ready` on `endpoint`: its status and `status` field.
 fn ready(endpoint: &str) -> Option<(u16, String)> {
