@@ -264,7 +264,7 @@ pub async fn auth_layer(
                 source_endpoint: None,
             },
         );
-        return Ok(next.run(request).await);
+        return Ok(crate::payload_hash::run_checked(request, next).await);
     };
     let auth_header = auth_header
         .to_str()
@@ -285,7 +285,7 @@ pub async fn auth_layer(
             resolve_session(&auth_state, access_key_id, session_token.as_deref()).await?;
         // The SAME SigV4 verify path as permanent keys — without this the
         // session token is the only proof, which is replayable.
-        verify_request_v4(
+        let (_, seed) = verify_request_v4_seeded(
             &request,
             &parsed.signed_headers,
             &parsed.signature,
@@ -293,21 +293,28 @@ pub async fn auth_layer(
             signing_region(auth_header, &auth_state.region),
         )?;
         debug!("STS auth ok: user_arn={}", auth_result.user_arn);
+        if has_signed_chunks(&request) {
+            request.extensions_mut().insert(seed);
+        }
         crate::audit::attach(&mut request, auth_result);
-        return Ok(next.run(request).await);
+        return Ok(crate::payload_hash::run_checked(request, next).await);
     }
 
     // Fetch credentials from metadata service (permanent keys)
     let cred = auth_state.lookup_credential(access_key_id).await?;
 
     // Verify the signature based on auth version
-    let mut auth_result = verify_request_v4(
+    let (mut auth_result, seed) = verify_request_v4_seeded(
         &request,
         &parsed.signed_headers,
         &parsed.signature,
         &cred,
         signing_region(auth_header, &auth_state.region),
     )?;
+    // The chunked decoder checks each chunk's signature from this one.
+    if has_signed_chunks(&request) {
+        request.extensions_mut().insert(seed);
+    }
 
     // Stitch IAM group memberships onto the AuthResult so policies attached
     // to a group cascade to its members. Mirrors the OIDC bridge — same
@@ -325,7 +332,8 @@ pub async fn auth_layer(
 
     // Store auth result in request extensions for handlers to access
     crate::audit::attach(&mut request, auth_result);
-    Ok(next.run(request).await)
+    // The signature covers the body's hash; the body is held to it.
+    Ok(crate::payload_hash::run_checked(request, next).await)
 }
 
 /// The region an S3 request's signature is checked for: the gateway's, or
@@ -375,11 +383,19 @@ pub(crate) async fn authenticate_query<B>(
             "credentials for {service} were used to call iam or sts"
         )));
     }
+    let body_hash = hex_sha256(body);
     let payload_hash = request
         .headers()
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
-        .map_or_else(|| hex_sha256(body), str::to_string);
+        .map_or_else(|| body_hash.clone(), str::to_string);
+    // A hash that is sent is held to the body, or a signed call could be
+    // replayed with other parameters.
+    if crate::payload_hash::declared_sha256(request.headers())
+        .is_some_and(|declared| hex::encode(declared) != body_hash)
+    {
+        return Err(AuthError::PayloadHashMismatch);
+    }
     let signed = Signed {
         signed_headers: &parsed.signed_headers,
         signature: &parsed.signature,
@@ -596,7 +612,7 @@ async fn run_presigned(
     // used to make every session a tenant-less STS credential, so a URL
     // presigned with a role's keys skipped the tenant boundary and the
     // role's policies alike.
-    let auth_result = if presigned.access_key_id.starts_with("ASIA") {
+    let (auth_result, seed) = if presigned.access_key_id.starts_with("ASIA") {
         let (cred, session) = resolve_session(
             &auth_state,
             &presigned.access_key_id,
@@ -604,17 +620,17 @@ async fn run_presigned(
         )
         .await?;
         // The signature proves the caller holds the session's secret.
-        verify_presigned_v4(&request, &presigned, &cred)?;
-        session
+        let (_, seed) = verify_presigned_v4(&request, &presigned, &cred)?;
+        (session, seed)
     } else {
         let cred = auth_state
             .lookup_credential(&presigned.access_key_id)
             .await?;
-        let mut auth_result = verify_presigned_v4(&request, &presigned, &cred)?;
+        let (mut auth_result, seed) = verify_presigned_v4(&request, &presigned, &cred)?;
         let (g_arns, g_ids) = auth_state.lookup_user_groups(&auth_result.user_id).await;
         auth_result.group_arns = g_arns;
         auth_result.group_ids = g_ids;
-        auth_result
+        (auth_result, seed)
     };
 
     debug!(
@@ -622,8 +638,19 @@ async fn run_presigned(
         auth_result.user_id, auth_result.access_key_id
     );
 
+    // A URL signs its payload hash only when it names x-amz-content-sha256
+    // in its signed headers; otherwise the body, chunked or not, is
+    // unsigned.
+    if presigned
+        .signed_headers
+        .iter()
+        .any(|h| h == "x-amz-content-sha256")
+        && has_signed_chunks(&request)
+    {
+        request.extensions_mut().insert(seed);
+    }
     crate::audit::attach(&mut request, auth_result);
-    Ok(next.run(request).await)
+    Ok(crate::payload_hash::run_checked(request, next).await)
 }
 
 /// A request authenticated by SigV4 query parameters — a presigned URL.
@@ -778,12 +805,13 @@ fn build_canonical_query_string_presigned(query: &str) -> String {
     build_canonical_query_string(&filtered.join("&"))
 }
 
-/// Verify a presigned URL's signature and its expiry window.
-pub fn verify_presigned_v4<B>(
+/// Verify a presigned URL's signature and its expiry window. With the
+/// result, what a streaming body's chunk signatures would chain from.
+pub(crate) fn verify_presigned_v4<B>(
     request: &Request<B>,
     presigned: &PresignedAuth,
     cred: &CachedCredential,
-) -> Result<AuthResult, AuthError> {
+) -> Result<(AuthResult, ChunkSigningSeed), AuthError> {
     let signed_at = parse_date_v4(&presigned.date_str)?;
     let now = Utc::now();
 
@@ -875,29 +903,37 @@ pub fn verify_presigned_v4<B>(
     let calculated = calculate_signature_v4(&signing_key, &string_to_sign);
 
     if !constant_time_eq(&calculated, &presigned.signature) {
-        warn!(
+        debug!(
             method = %request.method(),
-            uri = %request.uri(),
+            uri = %redacted_uri(request.uri()),
             calculated = %calculated,
             provided = %presigned.signature,
-            canonical_request = %canonical_request,
+            canonical_request = %redacted_canonical_request(&canonical_request),
             "presigned SigV4 mismatch"
         );
         return Err(AuthError::SignatureDoesNotMatch);
     }
 
-    Ok(AuthResult {
-        user_id: cred.user_id.clone(),
-        user_arn: cred.user_arn.clone(),
-        access_key_id: cred.access_key_id.clone(),
-        group_arns: Vec::new(),
-        group_ids: Vec::new(),
-        tenant: cred.tenant.clone(),
-        auth_mode: objectio_auth::AuthMode::Permanent,
-        scope: cred.scope.clone(),
-        source_ip: None,
-        source_endpoint: None,
-    })
+    Ok((
+        AuthResult {
+            user_id: cred.user_id.clone(),
+            user_arn: cred.user_arn.clone(),
+            access_key_id: cred.access_key_id.clone(),
+            group_arns: Vec::new(),
+            group_ids: Vec::new(),
+            tenant: cred.tenant.clone(),
+            auth_mode: objectio_auth::AuthMode::Permanent,
+            scope: cred.scope.clone(),
+            source_ip: None,
+            source_endpoint: None,
+        },
+        ChunkSigningSeed {
+            signing_key,
+            date: presigned.date_str.clone(),
+            scope: presigned.credential_scope.clone(),
+            signature: presigned.signature.clone(),
+        },
+    ))
 }
 
 /// A parsed SigV4 Authorization header.
@@ -954,8 +990,20 @@ pub fn verify_request_v4<B>(
     cred: &CachedCredential,
     region: &str,
 ) -> Result<AuthResult, AuthError> {
+    verify_request_v4_seeded(request, signed_headers, signature, cred, region).map(|(r, _)| r)
+}
+
+/// As [`verify_request_v4`], with what a streaming body's chunk signatures
+/// chain from.
+pub(crate) fn verify_request_v4_seeded<B>(
+    request: &Request<B>,
+    signed_headers: &[String],
+    signature: &str,
+    cred: &CachedCredential,
+    region: &str,
+) -> Result<(AuthResult, ChunkSigningSeed), AuthError> {
     let payload_hash = header_payload_hash(request);
-    verify_signature_v4(
+    check_signature_v4(
         request,
         &Signed {
             signed_headers,
@@ -966,6 +1014,35 @@ pub fn verify_request_v4<B>(
         },
         cred,
     )
+}
+
+/// What the chunk signatures of a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
+/// body are made with: the request's signing key, date and scope, and its
+/// signature, which the first chunk's chains from. The auth layer puts it
+/// on the request for the chunked decoder; a request without one was not
+/// signed (anonymous, or `--no-auth`), and its chunk signatures prove
+/// nothing.
+#[derive(Clone)]
+pub(crate) struct ChunkSigningSeed {
+    pub signing_key: Vec<u8>,
+    /// The request time, `20130524T000000Z`.
+    pub date: String,
+    /// `20130524/us-east-1/s3/aws4_request`.
+    pub scope: String,
+    pub signature: String,
+}
+
+/// The payload hash of a body whose chunks are signed, with or without
+/// `-TRAILER`.
+pub(crate) const STREAMING_SIGNED: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/// Whether the request's payload hash says its chunks are signed.
+fn has_signed_chunks<B>(request: &Request<B>) -> bool {
+    request
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().starts_with(STREAMING_SIGNED))
 }
 
 /// What a SigV4 signature covers beyond the request itself.
@@ -985,6 +1062,14 @@ pub(crate) fn verify_signature_v4<B>(
     signed: &Signed<'_>,
     cred: &CachedCredential,
 ) -> Result<AuthResult, AuthError> {
+    check_signature_v4(request, signed, cred).map(|(r, _)| r)
+}
+
+fn check_signature_v4<B>(
+    request: &Request<B>,
+    signed: &Signed<'_>,
+    cred: &CachedCredential,
+) -> Result<(AuthResult, ChunkSigningSeed), AuthError> {
     let Signed {
         signed_headers,
         signature,
@@ -1017,41 +1102,113 @@ pub(crate) fn verify_signature_v4<B>(
 
     // Compare signatures using constant-time comparison
     if !constant_time_eq(&calculated_signature, signature) {
-        // Temporarily elevated from debug → warn while we diagnose proxy
-        // interference (Cloudflare/nginx rewriting path/host for some verbs).
-        // Dump the canonical request we computed alongside the raw incoming
-        // headers so we can spot exactly what doesn't match.
-        let incoming: Vec<String> = request
-            .headers()
-            .iter()
-            .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<non-utf8>")))
-            .collect();
-        warn!(
+        // What we computed beside what arrived, to tell a proxy rewriting
+        // the request from a client signing it wrong. Debug only, and with
+        // credentials and keys taken out: this runs on every bad request,
+        // and the headers carry session tokens and SSE-C keys.
+        debug!(
             method = %request.method(),
-            uri = %request.uri(),
+            uri = %redacted_uri(request.uri()),
             calculated = %calculated_signature,
             provided = %signature,
             signed_headers = %signed_headers.join(";"),
-            incoming_headers = ?incoming,
-            canonical_request = %canonical_request,
+            incoming_headers = ?redacted_headers(request.headers()),
+            canonical_request = %redacted_canonical_request(&canonical_request),
             string_to_sign = %string_to_sign,
             "SigV4 mismatch"
         );
         return Err(AuthError::SignatureDoesNotMatch);
     }
 
-    Ok(AuthResult {
-        user_id: cred.user_id.clone(),
-        user_arn: cred.user_arn.clone(),
-        access_key_id: cred.access_key_id.clone(),
-        group_arns: Vec::new(),
-        group_ids: Vec::new(),
-        tenant: cred.tenant.clone(),
-        auth_mode: objectio_auth::AuthMode::Permanent,
-        scope: cred.scope.clone(),
-        source_ip: None,
-        source_endpoint: None,
-    })
+    Ok((
+        AuthResult {
+            user_id: cred.user_id.clone(),
+            user_arn: cred.user_arn.clone(),
+            access_key_id: cred.access_key_id.clone(),
+            group_arns: Vec::new(),
+            group_ids: Vec::new(),
+            tenant: cred.tenant.clone(),
+            auth_mode: objectio_auth::AuthMode::Permanent,
+            scope: cred.scope.clone(),
+            source_ip: None,
+            source_endpoint: None,
+        },
+        ChunkSigningSeed {
+            signing_key,
+            date: date_str,
+            scope: credential_scope,
+            signature: signature.to_string(),
+        },
+    ))
+}
+
+/// Whether a header's value is a secret: credentials, session tokens,
+/// cookies, SSE-C keys. Diagnostics print `<redacted>` in its place.
+fn is_secret_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "x-amz-security-token" | "cookie"
+    ) || name.contains("server-side-encryption-customer-key")
+}
+
+/// A request's headers for a diagnostic log, secrets redacted.
+fn redacted_headers(headers: &http::HeaderMap) -> Vec<String> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            if is_secret_header(k.as_str()) {
+                format!("{}=<redacted>", k.as_str())
+            } else {
+                format!("{}={}", k.as_str(), v.to_str().unwrap_or("<non-utf8>"))
+            }
+        })
+        .collect()
+}
+
+/// A canonical request for a diagnostic log: the signed headers that are
+/// secrets (SDKs sign the session token) and the query's session token
+/// redacted.
+fn redacted_canonical_request(canonical: &str) -> String {
+    canonical
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            // The method, the path, then the canonical query string.
+            if i == 2 {
+                return redacted_query(line);
+            }
+            match line.split_once(':') {
+                Some((name, _)) if i > 2 && is_secret_header(name) => {
+                    format!("{name}:<redacted>")
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A query string with a presigned URL's session token redacted.
+fn redacted_query(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k.eq_ignore_ascii_case("X-Amz-Security-Token") => {
+                format!("{k}=<redacted>")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// A URI for a diagnostic log, its query's session token redacted.
+fn redacted_uri(uri: &http::Uri) -> String {
+    match uri.query() {
+        Some(q) => format!("{}?{}", uri.path(), redacted_query(q)),
+        None => uri.path().to_string(),
+    }
 }
 
 /// Get the request date from headers
@@ -1115,17 +1272,12 @@ fn build_canonical_request<B>(
                 // full SignedHeaders list and every header actually on the
                 // arriving request so we can tell whether a proxy/CDN (CF,
                 // nginx ingress) stripped it in flight.
-                let incoming: Vec<String> = request
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<non-utf8>")))
-                    .collect();
-                warn!(
+                debug!(
                     method = %method,
                     path = %path,
                     missing = %header_name,
                     signed_headers = %signed_headers.join(";"),
-                    incoming_headers = ?incoming,
+                    incoming_headers = ?redacted_headers(request.headers()),
                     "SigV4: signed header missing from arriving request — a proxy likely stripped it"
                 );
                 return Err(AuthError::AccessDenied(format!(
@@ -1211,7 +1363,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// Calculate SHA256 and return hex string
-fn hex_sha256(data: &[u8]) -> String {
+pub(crate) fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
@@ -1313,6 +1465,8 @@ pub enum AuthError {
     ExpiredToken(String),
     /// Signed with SigV2 (header or presigned URL), which is not accepted.
     UnsupportedSigV2,
+    /// The body is not the one whose SHA-256 the request was signed with.
+    PayloadHashMismatch,
     /// Internal error
     #[allow(dead_code)]
     InternalError,
@@ -1343,6 +1497,7 @@ impl AuthError {
             AuthError::RequestTimeTooSkewed => "clock_skew",
             AuthError::ExpiredToken(_) => "expired",
             AuthError::UnsupportedSigV2 => "sigv2",
+            AuthError::PayloadHashMismatch => "payload_hash",
             AuthError::InternalError => "internal",
             AuthError::Unavailable(_) => "unavailable",
         }
@@ -1383,6 +1538,12 @@ impl IntoResponse for AuthError {
                 "The authorization mechanism you have provided is not supported. Please use \
                  AWS4-HMAC-SHA256 (Signature Version 4). For boto3 presigned URLs, create the \
                  client with botocore.config.Config(signature_version=\"s3v4\")."
+                    .to_string(),
+            ),
+            AuthError::PayloadHashMismatch => (
+                StatusCode::BAD_REQUEST,
+                "XAmzContentSHA256Mismatch",
+                "The provided 'x-amz-content-sha256' header does not match what was computed."
                     .to_string(),
             ),
             AuthError::InternalError => (
@@ -1671,5 +1832,140 @@ mod sigv4_tests {
     #[test]
     fn signature_comparison_is_case_sensitive() {
         assert!(!constant_time_eq("deadbeef", "DEADBEEF"));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::{CachedCredential, Signed, redacted_canonical_request, redacted_headers};
+    use std::sync::{Arc, Mutex};
+
+    const TOKEN: &str = "FQoGZXIvYXdzEXAMPLESESSIONTOKEN";
+    const SSE_KEY: &str = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+
+    #[test]
+    fn secrets_are_left_out_of_the_header_dump() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-amz-security-token", TOKEN.parse().unwrap());
+        h.insert(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=x".parse().unwrap(),
+        );
+        h.insert("cookie", "obio_session=abc".parse().unwrap());
+        h.insert(
+            "x-amz-server-side-encryption-customer-key",
+            SSE_KEY.parse().unwrap(),
+        );
+        h.insert(
+            "x-amz-copy-source-server-side-encryption-customer-key",
+            SSE_KEY.parse().unwrap(),
+        );
+        h.insert("x-amz-date", "20261020T000000Z".parse().unwrap());
+        let dump = redacted_headers(&h).join(" ");
+        for secret in [TOKEN, SSE_KEY, "obio_session", "Credential"] {
+            assert!(!dump.contains(secret), "{secret} in {dump}");
+        }
+        assert!(dump.contains("x-amz-security-token=<redacted>"));
+        assert!(dump.contains("x-amz-date=20261020T000000Z"));
+
+        let canonical = format!(
+            "GET\n/b/k\nX-Amz-Security-Token={TOKEN}&a=1\nhost:h\nx-amz-security-token:{TOKEN}\n\nhost;x-amz-security-token\nUNSIGNED-PAYLOAD"
+        );
+        let shown = redacted_canonical_request(&canonical);
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(shown.contains("x-amz-security-token:<redacted>"));
+        assert!(shown.contains("host:h"));
+        assert!(shown.contains("a=1"));
+    }
+
+    /// A tracing writer into a buffer the test reads back.
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    fn mismatch_logs(level: tracing::Level) -> String {
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let request = http::Request::builder()
+            .method("PUT")
+            .uri(format!("/b/k?X-Amz-Security-Token={TOKEN}"))
+            .header("host", "localhost:9000")
+            .header("x-amz-date", &now)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-security-token", TOKEN)
+            .header("x-amz-server-side-encryption-customer-key", SSE_KEY)
+            .body(())
+            .unwrap();
+        let cred = CachedCredential {
+            access_key_id: "ASIAEXAMPLE".into(),
+            secret_access_key: "secret".into(),
+            user_id: "u".into(),
+            user_arn: "arn".into(),
+            tenant: String::new(),
+            scope: None,
+            cached_at: std::time::Instant::now(),
+        };
+        let signed_headers: Vec<String> = [
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-security-token",
+            "x-amz-server-side-encryption-customer-key",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            super::verify_signature_v4(
+                &request,
+                &Signed {
+                    signed_headers: &signed_headers,
+                    signature: &"0".repeat(64),
+                    region: "us-east-1",
+                    service: "s3",
+                    payload_hash: "UNSIGNED-PAYLOAD",
+                },
+                &cred,
+            )
+        });
+        assert!(matches!(
+            result,
+            Err(super::AuthError::SignatureDoesNotMatch)
+        ));
+        let out = buf.0.lock().unwrap().clone();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A bad signature is logged at debug, not warn, and never with the
+    /// session token or an SSE-C key, though both are signed headers.
+    #[test]
+    fn a_signature_mismatch_logs_no_secrets() {
+        assert_eq!(mismatch_logs(tracing::Level::WARN), "");
+        let debug = mismatch_logs(tracing::Level::DEBUG);
+        assert!(debug.contains("SigV4 mismatch"), "{debug}");
+        assert!(debug.contains("x-amz-date"), "{debug}");
+        assert!(!debug.contains(TOKEN), "{debug}");
+        assert!(!debug.contains(SSE_KEY), "{debug}");
     }
 }

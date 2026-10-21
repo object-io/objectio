@@ -294,6 +294,11 @@ fn auth_error(e: &crate::auth_middleware::AuthError) -> IamError {
             "InvalidRequest",
             "Use AWS4-HMAC-SHA256 (Signature Version 4).",
         ),
+        AuthError::PayloadHashMismatch => IamError::new(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "The provided 'x-amz-content-sha256' header does not match what was computed.",
+        ),
         AuthError::Unavailable(m) => {
             IamError::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", m)
         }

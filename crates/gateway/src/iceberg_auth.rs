@@ -74,7 +74,9 @@ pub async fn iceberg_unified_auth_layer(
                             auth_result.user_id, auth_result.group_ids
                         );
                         crate::audit::attach(&mut request, auth_result);
-                        return next.run(request).await;
+                        // The signature covers the body's hash only if
+                        // the body is held to it.
+                        return crate::payload_hash::run_checked(request, next).await;
                     }
                 }
             }

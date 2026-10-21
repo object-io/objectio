@@ -34,6 +34,7 @@ pub mod origin;
 pub mod osd_pool;
 pub mod packer;
 pub mod packs;
+pub mod payload_hash;
 pub mod placement_cache;
 pub mod post_object;
 pub mod prom;
@@ -77,6 +78,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
+
+/// The largest request body a handler takes (larger objects need
+/// multipart).
+pub(crate) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 
 /// Prometheus metrics endpoint handler
 /// Join the per-OSD usage with meta's buckets and tenants. `None` when meta
@@ -1167,7 +1172,7 @@ pub async fn run(
 
     // Build router
     // Allow up to 100MB for single-part uploads (larger objects need multipart)
-    let body_limit = DefaultBodyLimit::max(100 * 1024 * 1024);
+    let body_limit = DefaultBodyLimit::max(MAX_BODY_BYTES);
     info!("Max single-part upload size: 100 MB");
 
     // Bucket operations (including ?policy and ?uploads query params;
@@ -1579,7 +1584,9 @@ pub async fn run(
             .layer(middleware::from_fn(chunked_decode::s3_chunked_decode_layer))
             .layer(body_limit);
         let r = if args.no_auth {
-            r
+            // Nothing signed, but a body is still held to the hash it
+            // declares; with auth on, the auth layer does it.
+            r.layer(middleware::from_fn(payload_hash::payload_hash_layer))
         } else {
             // Layers wrap in reverse application order, so the authorization
             // layer is applied first and runs second: auth_layer puts the
