@@ -160,12 +160,12 @@ impl ForwardToLeaderLayer {
         if let Some(c) = channels.get(addr) {
             return Ok(c.clone());
         }
-        let channel = objectio_proto::transport::endpoint(addr)
+        // A leader that stopped answering (frozen, cut off) must not hold
+        // the call forever: the client retries elsewhere. Its answer is
+        // passed on as it arrives, so one that stopped after its headers
+        // is noticed by the pings (`meta_endpoint`), not the call timeout.
+        let channel = objectio_proto::transport::meta_endpoint(addr)
             .map_err(|e| tonic::Status::internal(format!("leader address {addr}: {e}")))?
-            .connect_timeout(std::time::Duration::from_secs(3))
-            // A leader that stopped answering (frozen, cut off) must not
-            // hold the call forever: the client retries elsewhere.
-            .timeout(objectio_proto::transport::META_CALL_TIMEOUT)
             .initial_stream_window_size(objectio_proto::transport::STREAM_WINDOW)
             .initial_connection_window_size(objectio_proto::transport::CONNECTION_WINDOW)
             .connect_lazy();
