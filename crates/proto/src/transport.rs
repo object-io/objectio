@@ -153,7 +153,37 @@ pub const META_PROBE_NOT_SERVING: &str = "alive, not serving";
 /// clients). A call a follower forwarded to a leader that stopped
 /// answering is given up sooner, as soon as the follower learns of a new
 /// leader (`objectio-meta`'s `forward`).
+///
+/// It covers the wait for the answer's headers only: the rest of the answer
+/// is read after them. A node that stops between the two would still hold
+/// the call, so every meta connection is also kept alive by pings
+/// ([`META_KEEPALIVE_EVERY`]) and closed when its node stops answering
+/// them, failing whatever it carries.
 pub const META_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a meta connection that hears nothing waits before it pings its
+/// node, and how long the node then has to answer before the connection is
+/// closed: a node frozen or cut off part way through an answer fails the
+/// calls on it within about 5 s, not never. A node too busy to answer a
+/// ping in 3 s only has its calls retried.
+pub const META_KEEPALIVE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+pub const META_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// An endpoint for calls to the meta node at `addr`: connecting gives up
+/// after 3 s, a call after [`META_CALL_TIMEOUT`] without an answer, and the
+/// connection when its node stops answering pings
+/// ([`META_KEEPALIVE_EVERY`]).
+///
+/// # Errors
+/// An address that doesn't parse.
+pub fn meta_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, String> {
+    Ok(endpoint(addr)?
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(META_CALL_TIMEOUT)
+        .http2_keep_alive_interval(META_KEEPALIVE_EVERY)
+        .keep_alive_timeout(META_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true))
+}
 
 /// How often each meta address is probed, and how long a probe may take.
 const PROBE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -169,7 +199,8 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// already sent to it fails UNAVAILABLE, and the caller's retry goes to
 /// another). With one, the connection is made now, as
 /// before, so a wrong address fails at startup. Every call times out after
-/// [`META_CALL_TIMEOUT`].
+/// [`META_CALL_TIMEOUT`], and a connection whose node stops answering
+/// pings is closed ([`meta_endpoint`]).
 ///
 /// # Errors
 /// An address that doesn't parse, or (with one address) can't be reached.
@@ -179,13 +210,11 @@ pub async fn meta_channel(endpoints: &str) -> Result<tonic::transport::Channel, 
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(|e| {
-            endpoint(e)
+            meta_endpoint(e)
                 .and_then(|ep| {
                     // The user-agent carries this binary's format level:
                     // meta refuses a client too old for the cluster.
-                    ep.connect_timeout(std::time::Duration::from_secs(3))
-                        .timeout(META_CALL_TIMEOUT)
-                        .user_agent(objectio_common::version::user_agent())
+                    ep.user_agent(objectio_common::version::user_agent())
                         .map_err(|err| err.to_string())
                 })
                 .map_err(|err| format!("meta endpoint {e}: {err}"))
@@ -360,6 +389,113 @@ mod tests {
             ("https-gw:9200", "http://https-gw:9200/"),
         ] {
             assert_eq!(endpoint(addr).unwrap().uri().to_string(), want, "{addr}");
+        }
+    }
+
+    /// A meta node that accepts connections and answers nothing, as a
+    /// frozen process does (its kernel still accepts): `n` of them, held
+    /// open until the test ends. With `headers`, each call is answered with
+    /// its response headers first, and nothing after them, as from a node
+    /// frozen part way through an answer.
+    async fn frozen_nodes(n: usize, headers: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut addrs = Vec::new();
+        for _ in 0..n {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(l.local_addr().unwrap().to_string());
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                loop {
+                    let (mut s, _) = l.accept().await.unwrap();
+                    if !headers {
+                        held.push(s);
+                        continue;
+                    }
+                    // Just enough HTTP/2: the client's preface and frames
+                    // read, an empty SETTINGS and the ACK of the client's
+                    // sent, and to a request (HEADERS) `:status 200` and
+                    // `content-type: application/grpc`; then silence, PINGs
+                    // included.
+                    tokio::spawn(async move {
+                        let mut preface = [0u8; 24];
+                        if s.read_exact(&mut preface).await.is_err() {
+                            return;
+                        }
+                        let _ = s.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await;
+                        loop {
+                            let mut head = [0u8; 9];
+                            if s.read_exact(&mut head).await.is_err() {
+                                return;
+                            }
+                            let len = (usize::from(head[0]) << 16)
+                                | (usize::from(head[1]) << 8)
+                                | usize::from(head[2]);
+                            let mut payload = vec![0u8; len];
+                            if s.read_exact(&mut payload).await.is_err() {
+                                return;
+                            }
+                            match head[3] {
+                                4 if head[4] & 1 == 0 => {
+                                    let _ = s.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await;
+                                }
+                                1 => {
+                                    let mut block = vec![0x88, 0x0f, 0x10, 16];
+                                    block.extend_from_slice(b"application/grpc");
+                                    let mut frame =
+                                        vec![0, 0, u8::try_from(block.len()).unwrap(), 1, 4];
+                                    frame.extend_from_slice(&head[5..9]);
+                                    frame.extend_from_slice(&block);
+                                    let _ = s.write_all(&frame).await;
+                                    std::future::pending::<()>().await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        addrs.join(",")
+    }
+
+    /// How long a call to the meta node(s) at `endpoints` takes to fail,
+    /// up to 30 s.
+    async fn time_to_fail(endpoints: &str) -> std::time::Duration {
+        let channel = super::meta_channel(endpoints).await.unwrap();
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::metadata::metadata_service_client::MetadataServiceClient::new(channel)
+                .get_metrics(crate::metadata::GetMetricsRequest::default()),
+        )
+        .await
+        .expect("the call was never given up");
+        assert!(answer.is_err(), "a frozen node answered");
+        started.elapsed()
+    }
+
+    /// A node that answers nothing fails the call at the call timeout, with
+    /// one address or several.
+    #[tokio::test]
+    async fn a_call_to_a_node_that_never_answers_fails_at_the_call_timeout() {
+        for n in [1, 3] {
+            let took = time_to_fail(&frozen_nodes(n, false).await).await;
+            assert!(took < super::META_CALL_TIMEOUT * 2, "{n} nodes: {took:?}");
+        }
+    }
+
+    /// A node that stops after an answer's headers, before its body: the
+    /// call timeout is over once the headers are in, and only the pings
+    /// give the call up. Without them it was held for good (a gateway's PUT
+    /// through a meta leader frozen at that moment never answered).
+    #[tokio::test]
+    async fn a_call_to_a_node_that_stops_after_its_headers_fails_in_seconds() {
+        for n in [1, 3] {
+            let took = time_to_fail(&frozen_nodes(n, true).await).await;
+            assert!(
+                took < super::META_KEEPALIVE_EVERY + super::META_KEEPALIVE_TIMEOUT * 2,
+                "{n} nodes: {took:?}"
+            );
         }
     }
 }
