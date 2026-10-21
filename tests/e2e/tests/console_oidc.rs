@@ -520,17 +520,29 @@ fn a_system_scope_user_is_refused_what_only_administrators_see() {
     c.request_as("GET", "/_admin/cluster-info", &[], &key.0, &key.1)
         .expect(403);
 
-    // A tenant's session lists its own tenant's warehouses, and no more.
+    // A tenant admin's session lists its own tenant's warehouses, and no
+    // more; a tenant user's lists none.
     let idp = Idp::start();
-    provider(&c, "t-acme", &idp.provider(&json!({})));
+    provider(
+        &c,
+        "t-acme",
+        &idp.provider(&json!({"tenant_admin_role": "acme-admins"})),
+    );
     let s = sign_in(
         &c,
         "provider=t-acme&tenant=acme",
-        &json!({"sub": "carol-sub", "preferred_username": "carol"}),
+        &json!({"sub": "carol-sub", "preferred_username": "carol", "groups": ["acme-admins"]}),
     );
     let carol = s.session.expect("a session");
     with_session(&c, "GET", "/_admin/warehouses", &carol).expect(200);
     with_session(&c, "GET", "/_admin/cluster-info", &carol).expect(403);
+    let s = sign_in(
+        &c,
+        "provider=t-acme&tenant=acme",
+        &json!({"sub": "dave-sub", "preferred_username": "dave"}),
+    );
+    let dave = s.session.expect("a session");
+    with_session(&c, "GET", "/_admin/warehouses", &dave).expect(403);
 }
 
 /// A tenant admin changes only a provider no other tenant uses: one that
