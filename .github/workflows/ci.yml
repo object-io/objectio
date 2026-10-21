@@ -161,6 +161,13 @@ jobs:
           mkdir -p target/debug && cp bins/* target/debug/ && chmod +x target/debug/*
           cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
             --partition hash:${{ matrix.shard }}/8 --test-threads 1 --no-fail-fast --success-output never --failure-output final
+      # A failing test's cluster logs (target/e2e-logs), to see why.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-logs-${{ matrix.shard }}
+          path: target/e2e-logs/
+          if-no-files-found: ignore
 
   # The shards above run debug binaries built with no optional features,
   # so their disk I/O is pread. The release does it through io_uring
@@ -208,6 +215,12 @@ jobs:
             --success-output never --failure-output final \
             --test s3_compat --test multipart --test repair --test restart \
             --test packing --test shard_checksums --test osd_disks
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-logs-release
+          path: target/e2e-logs/
+          if-no-files-found: ignore
 
   # The check the main ruleset requires: every shard and the release-features
   # run passed (or, on a pull request, the suite was left to the merge queue).
@@ -268,6 +281,12 @@ jobs:
         # --include-ignored, not --ignored: were the #[ignore] ever dropped,
         # --ignored would run nothing, and pass.
         run: cargo test --package objectio-e2e --test rolling_upgrade -- --include-ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-logs-upgrade
+          path: target/e2e-logs/
+          if-no-files-found: ignore
 
   crash:
     name: crash consistency
