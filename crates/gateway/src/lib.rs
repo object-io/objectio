@@ -1481,6 +1481,12 @@ pub async fn run(
     };
     let admin_routes = admin_routes
         .with_state(Arc::clone(&state))
+        // A console session of a disabled tenant goes no further. Inside
+        // the SigV4 layer below, so it sees what that layer authenticated.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&auth_state),
+            console_auth::session_tenant_gate,
+        ))
         // Layer SigV4 verification that is optional — if a request carries
         // `Authorization: AWS4-HMAC-SHA256 ...`, verify it and inject
         // `Extension<AuthResult>`. Cookie-only console requests pass through
@@ -1509,7 +1515,11 @@ pub async fn run(
             "/_console/api/me/keys/{key_id}",
             delete(console_auth::my_delete_key),
         )
-        .with_state(Arc::clone(&state));
+        .with_state(Arc::clone(&state))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&auth_state),
+            console_auth::session_tenant_gate,
+        ));
 
     let console_oidc_routes = Router::new()
         .route(

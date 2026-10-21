@@ -658,6 +658,13 @@ async fn authenticate(
             fields.get("x-amz-security-token"),
         )
         .map_err(IntoResponse::into_response)?;
+        auth_state
+            .admit_tenant(
+                &auth.tenant,
+                &format!("session {access_key_id} of {}", auth.user_arn),
+            )
+            .await
+            .map_err(IntoResponse::into_response)?;
         (cred.secret_access_key, auth)
     } else {
         let cred = auth_state

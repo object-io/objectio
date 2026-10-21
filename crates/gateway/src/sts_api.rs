@@ -282,6 +282,28 @@ async fn assume_role_with_web_identity(state: &StsState, p: &HashMap<String, Str
         }
     };
 
+    // No session is made for a role of a disabled tenant. Refused as a
+    // token is, so the answer says nothing of the tenant.
+    if !tenant.is_empty() {
+        match crate::console_auth::tenant_open(&mut meta, &tenant).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    "AssumeRoleWithWebIdentity of {role_arn} refused: tenant '{tenant}' is \
+                     disabled or does not exist"
+                );
+                return denied("Not authorized to perform sts:AssumeRoleWithWebIdentity");
+            }
+            Err(e) => {
+                return sts_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    e.message(),
+                );
+            }
+        }
+    }
+
     // A token from one of the providers allowed for this role's scope.
     let mut accepted = None;
     for c in candidates(state, &tenant).await {

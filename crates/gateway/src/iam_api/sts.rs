@@ -261,6 +261,21 @@ async fn assume_role(call: &Call<'_>) -> IamResult<Response> {
     if identity == PolicyDecision::Deny || (needs_identity && identity != PolicyDecision::Allow) {
         return Err(denied());
     }
+    // No session is made for a role of a disabled tenant: it would be
+    // refused at its first use.
+    call.app
+        .auth_state
+        .admit_tenant(
+            &role.tenant,
+            &format!("AssumeRole of {role_arn} by {}", auth.user_arn),
+        )
+        .await
+        .map_err(|e| match e {
+            crate::auth_middleware::AuthError::Unavailable(msg) => {
+                IamError::new(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", msg)
+            }
+            _ => denied(),
+        })?;
 
     // How long: asked for, within the role's limit; a session assuming a
     // role (chaining) gets at most an hour, as in AWS.

@@ -69,6 +69,17 @@ fn refuse(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
+/// A refusal from the auth layer's checks, as the catalog APIs answer one.
+fn refuse_auth(e: &crate::auth_middleware::AuthError) -> Response {
+    match e {
+        crate::auth_middleware::AuthError::Unavailable(msg) => {
+            refuse(StatusCode::SERVICE_UNAVAILABLE, msg)
+        }
+        crate::auth_middleware::AuthError::AccessDenied(msg) => refuse(StatusCode::FORBIDDEN, msg),
+        _ => refuse(StatusCode::FORBIDDEN, "Access denied"),
+    }
+}
+
 /// Unified Iceberg auth middleware — tries SigV4, then OIDC, then session cookie.
 ///
 /// With authentication on, a credential that doesn't check out is a 401,
@@ -91,9 +102,10 @@ pub async fn iceberg_unified_auth_layer(
     {
         match crate::auth_middleware::parse_authorization_header(header) {
             Ok(parsed) => {
+                // The tenant is checked once the signature is: below.
                 let cred = match state
                     .sigv4_state
-                    .lookup_credential(parsed.access_key_id())
+                    .fetch_credential(parsed.access_key_id())
                     .await
                 {
                     Ok(cred) => Some(cred),
@@ -123,6 +135,16 @@ pub async fn iceberg_unified_auth_layer(
                     );
                     *request.uri_mut() = routed;
                     if let Ok(mut auth_result) = verify_result {
+                        if let Err(e) = state
+                            .sigv4_state
+                            .admit_tenant(
+                                &cred.tenant,
+                                &format!("key {} of user {}", cred.access_key_id, cred.user_id),
+                            )
+                            .await
+                        {
+                            return refuse_auth(&e);
+                        }
                         // A key confined to a bucket or prefix is for that
                         // data, as on the admin API: catalog operations
                         // don't fall inside it.
@@ -257,6 +279,17 @@ pub async fn iceberg_unified_auth_layer(
             "Iceberg session auth: user={} access_key={}",
             session.user, session.access_key
         );
+        // A session of a disabled tenant goes no further, as on the console.
+        if let Err(e) = state
+            .sigv4_state
+            .admit_tenant(
+                &session.tenant,
+                &format!("console session of user {}", session.user),
+            )
+            .await
+        {
+            return refuse_auth(&e);
+        }
         // SSO sessions carry the literal sentinel "oidc" in place of an
         // access_key (OIDC users have no AK/SK pair). For those, look up
         // the user by id; for AK/SK sessions, the existing credential

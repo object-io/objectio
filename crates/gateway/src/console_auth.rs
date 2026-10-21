@@ -802,6 +802,42 @@ pub fn validate_session_from_headers(headers: &HeaderMap) -> Option<SessionInfo>
     open_session(token_b64)
 }
 
+/// Refuse a request made with a console session of a tenant that is
+/// disabled or no longer exists, within the same bound as a key of it
+/// ([`crate::auth_middleware::AuthState::admit_tenant`]). A session is
+/// signed and carries its tenant, so without this it outlived the tenant's
+/// disabling by up to its 24 hours.
+///
+/// Runs inside the optional SigV4 layer: a request it authenticated was
+/// admitted or refused there, and its session cookie, if any, is not what
+/// it acts with. Signing in and out are let through: sign-in decides for
+/// itself and refuses a disabled tenant.
+pub async fn session_tenant_gate(
+    State(auth): State<Arc<crate::auth_middleware::AuthState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let signs_in_or_out = path == "/_console/api/login" || path == "/_console/api/logout";
+    let signed = request
+        .extensions()
+        .get::<objectio_auth::AuthResult>()
+        .is_some_and(|a| a.auth_mode != objectio_auth::AuthMode::Anonymous);
+    if !signs_in_or_out
+        && !signed
+        && let Some(session) = validate_session_from_headers(request.headers())
+        && let Err(e) = auth
+            .admit_tenant(
+                &session.tenant,
+                &format!("console session of user {}", session.user),
+            )
+            .await
+    {
+        return e.into_response();
+    }
+    next.run(request).await
+}
+
 /// Equal, compared in time that doesn't depend on where they differ.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -1381,7 +1417,7 @@ async fn provision_federated_user(
 /// # Errors
 ///
 /// Meta could not say.
-async fn tenant_open(
+pub(crate) async fn tenant_open(
     meta: &mut objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
         tonic::transport::Channel,
     >,
@@ -1393,7 +1429,7 @@ async fn tenant_open(
         })
         .await?
         .into_inner();
-    Ok(r.found && r.tenant.is_some_and(|t| t.enabled))
+    Ok(crate::auth_middleware::tenant_is_open(&r))
 }
 
 /// Back to the console the flow started on, with `msg` to show.
@@ -2089,5 +2125,109 @@ mod identity_tests {
         assert!(!id.is(&user("https://other", "sub-1", "acme"), "acme"));
         assert!(!id.is(&user("https://idp", "sub-2", "acme"), "acme"));
         assert!(!id.is(&user("https://idp", "sub-1", "other"), "acme"));
+    }
+}
+
+#[cfg(test)]
+mod session_gate_tests {
+    use super::*;
+    use crate::auth_middleware::{AuthState, CachedTenant};
+    use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
+    use tower::ServiceExt as _;
+
+    /// A router answering 200 behind the gate, whose meta is never reached:
+    /// a check that has to ask is refused as unavailable (503).
+    fn gated(auth: &Arc<AuthState>, signed_as: Option<&'static str>) -> axum::Router {
+        let router = axum::Router::new()
+            .route("/_admin/buckets", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/_console/api/login",
+                axum::routing::post(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(auth),
+                session_tenant_gate,
+            ));
+        // What the SigV4 layer outside the gate leaves on a request it
+        // authenticated.
+        match signed_as {
+            Some(tenant) => router.layer(axum::middleware::from_fn(
+                move |mut r: axum::extract::Request, next: axum::middleware::Next| async move {
+                    r.extensions_mut().insert(objectio_auth::AuthResult {
+                        user_id: "u".into(),
+                        tenant: tenant.into(),
+                        auth_mode: objectio_auth::AuthMode::Permanent,
+                        ..Default::default()
+                    });
+                    next.run(r).await
+                },
+            )),
+            None => router,
+        }
+    }
+
+    fn auth_state() -> Arc<AuthState> {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Arc::new(AuthState::new(
+            MetadataServiceClient::new(channel),
+            "us-east-1",
+        ))
+    }
+
+    fn tenant(auth: &AuthState, name: &str, open: bool) {
+        auth.tenant_cache.write().insert(
+            name.to_string(),
+            CachedTenant {
+                open,
+                cached_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    async fn status(router: axum::Router, method: &str, path: &str, tenant: &str) -> StatusCode {
+        let (session, _) = mint_session("u1", "AKID", tenant, "arn", tenant.is_empty());
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::COOKIE, format!("objectio-session={session}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn a_session_of_a_disabled_tenant_is_refused_and_restored_with_it() {
+        let auth = auth_state();
+        tenant(&auth, "acme", false);
+        let s = status(gated(&auth, None), "GET", "/_admin/buckets", "acme").await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        tenant(&auth, "acme", true);
+        let s = status(gated(&auth, None), "GET", "/_admin/buckets", "acme").await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_system_session_asks_nothing() {
+        let auth = auth_state();
+        let s = status(gated(&auth, None), "GET", "/_admin/buckets", "").await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn signing_in_is_left_to_sign_in() {
+        let auth = auth_state();
+        tenant(&auth, "acme", false);
+        let s = status(gated(&auth, None), "POST", "/_console/api/login", "acme").await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    /// A signed request was admitted by the SigV4 layer: a stale cookie of
+    /// a disabled tenant riding along is not what it acts with.
+    #[tokio::test]
+    async fn a_signed_request_is_the_sigv4_layers_to_decide() {
+        let auth = auth_state();
+        tenant(&auth, "acme", false);
+        let s = status(gated(&auth, Some("")), "GET", "/_admin/buckets", "acme").await;
+        assert_eq!(s, StatusCode::OK);
     }
 }

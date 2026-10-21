@@ -14,8 +14,8 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use objectio_auth::{AuthResult, CredentialScope, Operation};
 use objectio_proto::metadata::{
-    GetAccessKeyForAuthRequest, GetUserGroupsRequest, KeyOperation,
-    metadata_service_client::MetadataServiceClient,
+    GetAccessKeyForAuthRequest, GetTenantRequest, GetTenantResponse, GetUserGroupsRequest,
+    KeyOperation, metadata_service_client::MetadataServiceClient,
 };
 use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
@@ -55,12 +55,29 @@ fn credential_scope(scope: &str, operation: i32) -> Option<CredentialScope> {
     (!scope.is_unrestricted()).then_some(scope)
 }
 
+/// Whether a tenant was open (it exists and is enabled) when this gateway
+/// last asked meta, and when that was.
+#[derive(Clone, Copy)]
+pub struct CachedTenant {
+    pub open: bool,
+    pub cached_at: std::time::Instant,
+}
+
+/// Whether meta's answer names a tenant that exists and is enabled.
+pub(crate) fn tenant_is_open(r: &GetTenantResponse) -> bool {
+    r.found && r.tenant.as_ref().is_some_and(|t| t.enabled)
+}
+
 /// Authentication state shared across requests
 pub struct AuthState {
     /// Metadata service client for credential lookup
     pub meta_client: MetadataServiceClient<Channel>,
     /// Credential cache (access_key_id -> credential)
     pub credential_cache: RwLock<HashMap<String, CachedCredential>>,
+    /// Tenant cache (name -> whether it is open), held as long as a
+    /// credential is: a tenant disabled elsewhere is refused here within
+    /// `cache_ttl_secs`.
+    pub tenant_cache: RwLock<HashMap<String, CachedTenant>>,
     /// Cache TTL in seconds
     pub cache_ttl_secs: u64,
     /// AWS region for SigV4 verification
@@ -75,8 +92,9 @@ impl AuthState {
         Self {
             meta_client,
             credential_cache: RwLock::new(HashMap::new()),
-            // How long a suspended user or a deactivated or deleted key
-            // still works on a gateway. It was 5 minutes.
+            tenant_cache: RwLock::new(HashMap::new()),
+            // How long a suspended user, a deactivated or deleted key or a
+            // disabled tenant still works on a gateway. It was 5 minutes.
             cache_ttl_secs: 15,
             region: region.into(),
             sts_provider: None,
@@ -132,8 +150,84 @@ impl AuthState {
             .retain(|_, c| c.user_id != user_id);
     }
 
-    /// Look up credentials from cache or metadata service
+    /// Drop what this gateway knows of one tenant, so a change to it (it
+    /// is disabled, enabled or deleted) holds here at once; other gateways
+    /// pick it up within the cache TTL.
+    pub fn forget_tenant(&self, tenant: &str) {
+        self.tenant_cache.write().remove(tenant);
+    }
+
+    /// Refuse an identity of `tenant` while the tenant is disabled or no
+    /// longer exists. A system identity (no tenant) is never refused here.
+    /// `who` names the identity in the log.
+    ///
+    /// # Errors
+    ///
+    /// `AccessDenied` for a closed tenant; `Unavailable` when meta could not
+    /// say.
+    pub async fn admit_tenant(&self, tenant: &str, who: &str) -> Result<(), AuthError> {
+        if tenant.is_empty() {
+            return Ok(());
+        }
+        let cached = self
+            .tenant_cache
+            .read()
+            .get(tenant)
+            .filter(|t| t.cached_at.elapsed().as_secs() < self.cache_ttl_secs)
+            .map(|t| t.open);
+        let open = if let Some(open) = cached {
+            open
+        } else {
+            let r = self
+                .meta_client
+                .clone()
+                .get_tenant(GetTenantRequest {
+                    name: tenant.to_string(),
+                })
+                .await
+                .map_err(|e| {
+                    warn!("tenant lookup for '{tenant}' failed: {e}");
+                    AuthError::Unavailable(format!("tenant lookup failed: {e}; retry"))
+                })?
+                .into_inner();
+            let open = tenant_is_open(&r);
+            self.tenant_cache.write().insert(
+                tenant.to_string(),
+                CachedTenant {
+                    open,
+                    cached_at: std::time::Instant::now(),
+                },
+            );
+            open
+        };
+        if open {
+            Ok(())
+        } else {
+            warn!("refused {who}: tenant '{tenant}' is disabled or does not exist");
+            Err(AuthError::AccessDenied(format!(
+                "tenant '{tenant}' is disabled"
+            )))
+        }
+    }
+
+    /// Look up credentials from cache or metadata service, refused while
+    /// the key's tenant is disabled.
     pub async fn lookup_credential(
+        &self,
+        access_key_id: &str,
+    ) -> Result<CachedCredential, AuthError> {
+        let cred = self.fetch_credential(access_key_id).await?;
+        self.admit_tenant(
+            &cred.tenant,
+            &format!("key {access_key_id} of user {}", cred.user_id),
+        )
+        .await?;
+        Ok(cred)
+    }
+
+    /// As [`Self::lookup_credential`], without the tenant check: for a
+    /// caller that makes it itself, once the signature checks out.
+    pub(crate) async fn fetch_credential(
         &self,
         access_key_id: &str,
     ) -> Result<CachedCredential, AuthError> {
@@ -431,7 +525,24 @@ pub(crate) const USER_SESSION_SCOPE: &str = "user-session";
 /// A temporary key's signing secret and the identity it carries, as
 /// [`sts_session`], and a user's own session resolved to the user: its
 /// ARN, tenant and groups, refused once the user is suspended or deleted.
+/// Any session is refused while the tenant it acts in (a role's, or the
+/// user's) is disabled.
 pub(crate) async fn resolve_session(
+    auth_state: &AuthState,
+    access_key_id: &str,
+    token: Option<&str>,
+) -> Result<(CachedCredential, AuthResult), AuthError> {
+    let (cred, auth_result) = session_identity(auth_state, access_key_id, token).await?;
+    auth_state
+        .admit_tenant(
+            &auth_result.tenant,
+            &format!("session {access_key_id} of {}", auth_result.user_arn),
+        )
+        .await?;
+    Ok((cred, auth_result))
+}
+
+async fn session_identity(
     auth_state: &AuthState,
     access_key_id: &str,
     token: Option<&str>,
@@ -1967,5 +2078,170 @@ mod redaction_tests {
         assert!(debug.contains("x-amz-date"), "{debug}");
         assert!(!debug.contains(TOKEN), "{debug}");
         assert!(!debug.contains(SSE_KEY), "{debug}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Auth state whose meta is never reached: a check that gets as far as
+    /// asking is refused as unavailable, which is how these tests tell an
+    /// answer from the cache from one that had to ask.
+    fn state() -> AuthState {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        AuthState::new(MetadataServiceClient::new(channel), "us-east-1")
+    }
+
+    fn remember(s: &AuthState, tenant: &str, open: bool, age: Duration) {
+        s.tenant_cache.write().insert(
+            tenant.to_string(),
+            CachedTenant {
+                open,
+                cached_at: Instant::now().checked_sub(age).unwrap(),
+            },
+        );
+    }
+
+    fn key_of(s: &AuthState, access_key_id: &str, tenant: &str) {
+        s.credential_cache.write().insert(
+            access_key_id.to_string(),
+            CachedCredential {
+                access_key_id: access_key_id.to_string(),
+                secret_access_key: "secret".into(),
+                user_id: "u1".into(),
+                user_arn: "arn:obio:iam::acme:user/u1".into(),
+                tenant: tenant.to_string(),
+                scope: None,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
+    #[test]
+    fn only_a_tenant_that_exists_and_is_enabled_is_open() {
+        let tenant = |enabled| objectio_proto::metadata::TenantConfig {
+            name: "acme".into(),
+            enabled,
+            ..Default::default()
+        };
+        let answer = |found, t| GetTenantResponse { tenant: t, found };
+        assert!(tenant_is_open(&answer(true, Some(tenant(true)))));
+        assert!(!tenant_is_open(&answer(true, Some(tenant(false)))));
+        assert!(!tenant_is_open(&answer(false, None)));
+        assert!(!tenant_is_open(&answer(false, Some(tenant(true)))));
+    }
+
+    #[tokio::test]
+    async fn a_system_identity_is_never_checked() {
+        assert!(state().admit_tenant("", "system").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_tenant_is_refused_as_a_suspended_user_is() {
+        let s = state();
+        remember(&s, "acme", false, Duration::ZERO);
+        let Err(e) = s.admit_tenant("acme", "test").await else {
+            panic!("a disabled tenant was admitted");
+        };
+        assert!(matches!(&e, AuthError::AccessDenied(m) if m.contains("acme")));
+        assert_eq!(e.into_response().status(), StatusCode::FORBIDDEN);
+
+        remember(&s, "acme", true, Duration::ZERO);
+        assert!(s.admit_tenant("acme", "test").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_tenants_state_is_held_no_longer_than_a_credential() {
+        let s = state();
+        remember(&s, "acme", true, Duration::from_secs(s.cache_ttl_secs));
+        assert!(matches!(
+            s.admit_tenant("acme", "test").await,
+            Err(AuthError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_tenant_is_asked_about_again() {
+        let s = state();
+        remember(&s, "acme", true, Duration::ZERO);
+        s.forget_tenant("acme");
+        assert!(matches!(
+            s.admit_tenant("acme", "test").await,
+            Err(AuthError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_cached_key_of_a_disabled_tenant_is_refused() {
+        let s = state();
+        key_of(&s, "AKIDACME", "acme");
+        remember(&s, "acme", false, Duration::ZERO);
+        assert!(matches!(
+            s.lookup_credential("AKIDACME").await,
+            Err(AuthError::AccessDenied(_))
+        ));
+        // Without the check, for a caller that makes it once the signature
+        // checks out.
+        assert!(s.fetch_credential("AKIDACME").await.is_ok());
+        remember(&s, "acme", true, Duration::ZERO);
+        assert_eq!(
+            s.lookup_credential("AKIDACME").await.unwrap().tenant,
+            "acme"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_role_session_is_refused_while_its_tenant_is_disabled() {
+        let sts = objectio_auth::sts::StsProvider::new(b"test-signing-key");
+        let s = state().with_sts(sts.clone());
+        let creds = sts.issue_for(
+            "arn:obio:sts::acme:assumed-role/writer/s1",
+            "acme",
+            "",
+            Operation::ReadWrite,
+            Duration::from_secs(900),
+        );
+        let resolve = || resolve_session(&s, &creds.access_key_id, Some(&creds.session_token));
+
+        remember(&s, "acme", false, Duration::ZERO);
+        assert!(matches!(resolve().await, Err(AuthError::AccessDenied(_))));
+        remember(&s, "acme", true, Duration::ZERO);
+        let (_, auth) = resolve().await.unwrap();
+        assert_eq!(auth.tenant, "acme");
+
+        // A system role's session asks nothing about tenants.
+        let system = sts.issue_for(
+            "arn:obio:sts::objectio:assumed-role/ops/s1",
+            "",
+            "",
+            Operation::ReadWrite,
+            Duration::from_secs(900),
+        );
+        let (_, auth) = resolve_session(&s, &system.access_key_id, Some(&system.session_token))
+            .await
+            .unwrap();
+        assert_eq!(auth.tenant, "");
+    }
+
+    #[tokio::test]
+    async fn a_users_own_session_is_refused_while_its_tenant_is_disabled() {
+        let sts = objectio_auth::sts::StsProvider::new(b"test-signing-key");
+        let s = state().with_sts(sts.clone());
+        let creds = sts.issue_for(
+            &format!("{USER_SESSION_PREFIX}u1"),
+            "acme",
+            USER_SESSION_SCOPE,
+            Operation::ReadWrite,
+            Duration::from_secs(900),
+        );
+        // The user as resolved before: the session's key is cached.
+        key_of(&s, &creds.access_key_id, "acme");
+        remember(&s, "acme", false, Duration::ZERO);
+        assert!(matches!(
+            resolve_session(&s, &creds.access_key_id, Some(&creds.session_token)).await,
+            Err(AuthError::AccessDenied(_))
+        ));
     }
 }
