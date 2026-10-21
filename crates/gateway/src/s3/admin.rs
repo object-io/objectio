@@ -190,7 +190,8 @@ pub async fn admin_create_user(
             display_name: params.display_name,
             email: params.email,
             tenant,
-            path: String::new(),
+            // Never a single sign-on's user: only the sign-on creates those.
+            ..Default::default()
         })
         .await
     {

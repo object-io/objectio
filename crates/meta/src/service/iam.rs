@@ -12,6 +12,8 @@ fn user_meta(u: &StoredUser) -> UserMeta {
         email: u.email.clone(),
         tenant: u.tenant.clone(),
         path: shown_path(&u.path).to_string(),
+        federated_issuer: u.federated_issuer.clone(),
+        federated_subject: u.federated_subject.clone(),
     }
 }
 
@@ -252,6 +254,8 @@ impl MetaService {
             email: String::new(),
             tenant: String::new(), // system admin has no tenant
             path: String::new(),
+            federated_issuer: String::new(),
+            federated_subject: String::new(),
         };
 
         self.users.write().insert(user_id.clone(), user.clone());
@@ -337,6 +341,42 @@ impl MetaService {
             self.require_level(LEVEL_IAM_API, "a user path")?;
         }
 
+        let federated = !req.federated_issuer.is_empty() || !req.federated_subject.is_empty();
+        if federated {
+            if req.federated_issuer.is_empty() || req.federated_subject.is_empty() {
+                return Err(Status::invalid_argument(
+                    "a single sign-on user needs both an issuer and a subject",
+                ));
+            }
+            self.require_level(
+                objectio_common::version::FEDERATED_USERS_LEVEL,
+                "a single sign-on user",
+            )?;
+            // The binding, not the name, identifies a federated user: an
+            // issuer and subject sign in as the user first created for them,
+            // whatever name their token carries now.
+            let bound = self
+                .users
+                .read()
+                .values()
+                .find(|u| {
+                    u.status != UserStatus::UserDeleted as i32
+                        && u.federated_issuer == req.federated_issuer
+                        && u.federated_subject == req.federated_subject
+                })
+                .cloned();
+            if let Some(bound) = bound {
+                if bound.tenant != req.tenant {
+                    return Err(Status::failed_precondition(
+                        "this sign-on belongs to a user of another tenant",
+                    ));
+                }
+                return Ok(Response::new(CreateUserResponse {
+                    user: Some(user_meta(&bound)),
+                }));
+            }
+        }
+
         // Check if a *live* user with this name exists. DeleteUser is a soft
         // delete — it flips status to Deleted and leaves the record in place —
         // so scanning every value meant a deleted name was taken forever.
@@ -368,6 +408,8 @@ impl MetaService {
             email: req.email.clone(),
             tenant: tenant.clone(),
             path: stored_path(&path),
+            federated_issuer: req.federated_issuer.clone(),
+            federated_subject: req.federated_subject.clone(),
         };
 
         // Replicate through Raft. expected=None ensures the user_id
@@ -2408,6 +2450,79 @@ mod iam_api_tests {
         // A bad path is refused.
         let bad = user(&svc, "carol", "no-slashes").await.unwrap_err();
         assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+    }
+
+    async fn sign_on(
+        svc: &MetaService,
+        name: &str,
+        tenant: &str,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<UserMeta, Status> {
+        svc.create_user(Request::new(CreateUserRequest {
+            display_name: name.to_string(),
+            tenant: tenant.to_string(),
+            federated_issuer: issuer.to_string(),
+            federated_subject: subject.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .map(|r| r.into_inner().user.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_sign_on_is_only_ever_the_user_bound_to_its_issuer_and_subject() {
+        let (_d, svc) = service(objectio_common::version::FEDERATED_USERS_LEVEL);
+        // A user no sign-on created: its name is taken, never adopted.
+        let admin = user(&svc, "admin", "/").await.unwrap();
+        let taken = sign_on(&svc, "admin", "", "https://idp", "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(taken.code(), tonic::Code::AlreadyExists);
+
+        let alice = sign_on(&svc, "alice", "", "https://idp", "s1")
+            .await
+            .unwrap();
+        assert_ne!(alice.user_id, admin.user_id);
+        assert_eq!(
+            (
+                alice.federated_issuer.as_str(),
+                alice.federated_subject.as_str()
+            ),
+            ("https://idp", "s1")
+        );
+        // The same issuer and subject, under whatever name the token now
+        // carries: the same user, as it was created.
+        let again = sign_on(&svc, "admin", "", "https://idp", "s1")
+            .await
+            .unwrap();
+        assert_eq!(again.user_id, alice.user_id);
+        assert_eq!(again.display_name, "alice");
+        // The same subject from another issuer is someone else, and gets no
+        // one's name.
+        let other = sign_on(&svc, "alice", "", "https://other", "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(other.code(), tonic::Code::AlreadyExists);
+        // The binding is to a tenant too.
+        let elsewhere = sign_on(&svc, "alice", "acme", "https://idp", "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(elsewhere.code(), tonic::Code::FailedPrecondition);
+        // Half a binding is no binding.
+        let half = sign_on(&svc, "bob", "", "https://idp", "")
+            .await
+            .unwrap_err();
+        assert_eq!(half.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn sign_on_users_wait_for_the_cluster_to_reach_their_level() {
+        let (_d, svc) = service(objectio_common::version::FEDERATED_USERS_LEVEL - 1);
+        let early = sign_on(&svc, "alice", "", "https://idp", "s1")
+            .await
+            .unwrap_err();
+        assert_eq!(early.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]

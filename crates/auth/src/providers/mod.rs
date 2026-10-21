@@ -12,4 +12,4 @@ pub mod oidc;
 pub use builtin::BuiltinSigV4Provider;
 
 #[cfg(feature = "oidc")]
-pub use oidc::{OidcConfig, OidcProvider, TokenResponse};
+pub use oidc::{Claims, OidcConfig, OidcProvider, TokenResponse};

@@ -564,7 +564,7 @@ async fn check_kms_policy(
             // 2. Console session bypass — only for system-admin sessions.
             // Tenant users must fall through to SigV4 + IAM policy eval.
             if let Some(s) = crate::console_auth::validate_session_from_headers(headers) {
-                if s.tenant.is_empty() {
+                if s.system_admin {
                     return None;
                 }
                 return Some((StatusCode::FORBIDDEN, "Not authorized").into_response());

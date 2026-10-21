@@ -56,6 +56,7 @@ pub(super) async fn create_user(call: &Call<'_>, actor: &Actor) -> IamResult<Res
             email: String::new(),
             tenant: actor.tenant.clone(),
             path,
+            ..Default::default()
         })
         .await
         .map_err(|e| IamError::from_status(&e))?
