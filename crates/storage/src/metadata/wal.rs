@@ -1185,34 +1185,43 @@ mod group_commit_tests {
     /// Concurrent writers must actually share syncs rather than queue for them.
     ///
     /// Eight threads each appending 25 records is 200 records. Serialized,
-    /// that is 200 fsyncs; shared, fewer. Counted rather than timed: a
-    /// wall-clock bound failed on loaded CI runners, where a disk shared
-    /// with other tests made the concurrent run slow for reasons that have
-    /// nothing to do with whether syncs are shared.
+    /// that is 200 fsyncs; shared, one a round. Counted rather than timed:
+    /// a wall-clock bound failed on loaded CI runners. Nor left to chance:
+    /// with a fast enough fsync, writers that merely happen to run at once
+    /// take turns and share none. So each round holds the sync lock until
+    /// all eight records are written; the round's first sync covers them.
     #[test]
     fn concurrent_writers_share_syncs() {
+        const THREADS: u64 = 8;
+        const ROUNDS: u64 = 25;
         let dir = tempfile::tempdir().unwrap();
-        let w = Arc::new(wal(&dir));
-        let mut hs = Vec::new();
-        for tid in 0..8 {
-            let w = Arc::clone(&w);
-            hs.push(std::thread::spawn(move || {
-                for i in 0..25 {
-                    w.append(&op(tid * 100 + i)).unwrap();
+        let w = wal(&dir);
+        for round in 0..ROUNDS {
+            let written = w.written_lsn.load(Ordering::SeqCst);
+            std::thread::scope(|scope| {
+                let gate = w.sync_handle.lock();
+                for tid in 0..THREADS {
+                    let w = &w;
+                    scope.spawn(move || w.append(&op(round * 100 + tid)).unwrap());
                 }
-            }));
-        }
-        for h in hs {
-            h.join().unwrap();
+                while w.written_lsn.load(Ordering::SeqCst) < written + THREADS {
+                    std::thread::yield_now();
+                }
+                drop(gate);
+            });
         }
 
         let stats = w.sync_stats();
         let syncs = stats.syncs.load(Ordering::Relaxed);
         let records = stats.records.load(Ordering::Relaxed);
-        assert_eq!(records, 200, "every append must be made durable");
+        assert_eq!(
+            records,
+            THREADS * ROUNDS,
+            "every append must be made durable"
+        );
         assert!(
-            syncs < records,
-            "{syncs} fsyncs for {records} concurrent appends: writers are not sharing syncs"
+            syncs <= ROUNDS,
+            "{syncs} fsyncs for {records} appends in {ROUNDS} rounds: writers are not sharing syncs"
         );
     }
 

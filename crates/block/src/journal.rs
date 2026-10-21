@@ -989,14 +989,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal =
             std::sync::Arc::new(WriteJournal::open(dir.path().join("j"), 1 << 30).unwrap());
+        // Each round, every writer's entry is in before any of them syncs,
+        // so the round's first fsync covers them all. Without that, a fast
+        // enough fsync lets the writers take turns and share none.
+        let round = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
         let handles: Vec<_> = (0..THREADS)
             .map(|t| {
                 let j = std::sync::Arc::clone(&journal);
+                let round = std::sync::Arc::clone(&round);
                 std::thread::spawn(move || {
                     for i in 0..EACH {
                         let seq = j
                             .log_write("v", t, i * 4096, Bytes::from(vec![t as u8; 4096]))
                             .unwrap();
+                        round.wait();
                         j.sync_to(seq + 1).unwrap();
                     }
                 })
@@ -1008,8 +1014,8 @@ mod tests {
         let writes = THREADS * EACH;
         assert_eq!(journal.recover().unwrap().len() as u64, writes);
         assert!(
-            journal.fsyncs() < writes,
-            "{} fsyncs for {writes} writes: none were shared",
+            journal.fsyncs() <= EACH,
+            "{} fsyncs for {writes} writes in {EACH} rounds: the writers didn't share them",
             journal.fsyncs()
         );
         // Everything is durable: another sync has nothing to do.
