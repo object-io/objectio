@@ -763,17 +763,30 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut config = test_config(dir.path());
         config.wal.sync_on_write = true;
+        // Each writer's budget is PER_ROUND records a checkpoint: unbounded,
+        // a fast fsync let the writers outrun the checkpoints, each slower
+        // than the last, until the runner's disk quota ran out.
+        const PER_ROUND: u64 = 200;
         let written = Arc::new(AtomicU64::new(0));
         {
             let store = Arc::new(MetadataStore::create(config.clone()).unwrap());
             let stop = Arc::new(AtomicBool::new(false));
+            let round = Arc::new(AtomicU64::new(1));
             let writers: Vec<_> = (0..4u64)
                 .map(|w| {
-                    let (store, stop, written) =
-                        (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&written));
+                    let (store, stop, written, round) = (
+                        Arc::clone(&store),
+                        Arc::clone(&stop),
+                        Arc::clone(&written),
+                        Arc::clone(&round),
+                    );
                     thread::spawn(move || {
                         let mut i = 0u64;
                         while !stop.load(Ordering::Relaxed) {
+                            if i >= round.load(Ordering::Relaxed) * PER_ROUND {
+                                thread::yield_now();
+                                continue;
+                            }
                             store
                                 .put(MetadataKey::block(w << 32 | i), vec![1; 64])
                                 .unwrap();
@@ -785,6 +798,7 @@ mod tests {
                 .collect();
             for _ in 0..30 {
                 store.checkpoint().unwrap();
+                round.fetch_add(1, Ordering::Relaxed);
             }
             stop.store(true, Ordering::Relaxed);
             for w in writers {

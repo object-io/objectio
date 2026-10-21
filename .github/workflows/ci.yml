@@ -16,6 +16,13 @@
 
 name: CI
 
+# Runners pinned to ubuntu-24.04, as release.yml is. ubuntu-latest moved to
+# 26.04 on 2026-10-21, whose /tmp is a tmpfs with a quota: the tests' temp
+# dirs landed in memory, where an fsync costs nothing (the group-commit tests
+# saw no writers overlap) and a few GiB fill the quota (full_disk's disks,
+# the metadata compaction test). Tests of what reaches stable storage need a
+# disk under them; moving to 26.04 means pointing TMPDIR at one first.
+
 on:
   # A pull request runs the fast checks only (format, lints, unit tests,
   # console, chart: ~9 minutes); the heavy jobs (end-to-end, docker image,
@@ -50,7 +57,7 @@ env:
 jobs:
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +67,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,7 +84,7 @@ jobs:
 
   test:
     name: unit tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # mold: linking the test binaries is a large part of this job.
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -104,7 +111,7 @@ jobs:
   e2e-build:
     name: end-to-end (build)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -141,7 +148,7 @@ jobs:
   e2e-shard:
     name: end-to-end (${{ matrix.shard }}/8)
     needs: e2e-build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -179,7 +186,7 @@ jobs:
   e2e-release:
     name: end-to-end (release features)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -228,7 +235,7 @@ jobs:
     name: end-to-end
     needs: [e2e-shard, e2e-release]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - run: |
           ok() { test "$1" = success || { test "$1" = skipped && test "${{ github.event_name }}" = pull_request; }; }
@@ -237,7 +244,7 @@ jobs:
   upgrade:
     name: rolling upgrade
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A cluster on the previous release, rolled node by node to this one
     # under traffic (objectio-docs core/upgrade-path.md). The test is
     # #[ignore]d, so the e2e shards leave it out: it needs the previous
@@ -291,7 +298,7 @@ jobs:
   crash:
     name: crash consistency
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Every write the OSD acknowledged survives a power cut at any point
     # (crates/osd/tests/crash_consistency.rs): its devices on dm-log-writes,
     # the logs replayed to cut points. The test is #[ignore]d: it needs root
@@ -332,7 +339,7 @@ jobs:
   image:
     name: docker image
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The image build broke the moment tests/e2e became a workspace member —
     # cargo would not read the workspace without its manifest, so `cargo fetch`
     # failed before compiling anything — and stayed broken for five commits
@@ -359,7 +366,7 @@ jobs:
   rdma:
     name: rdma (transfer engine, tcp)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The Transfer Engine code paths (objectio-transport-te, and the OSD's,
     # gateway's and aio's `rdma` features) only build against a Mooncake build,
     # so the jobs above never compile them. This builds Mooncake at the pinned
@@ -391,7 +398,7 @@ jobs:
 
   chart:
     name: helm chart
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Nothing validated the chart. A broken template, a values key that no
     # longer exists, or an image the registry does not carry were all
     # discovered by `publish-chart` at the end of a release — after the
@@ -472,7 +479,7 @@ jobs:
   aio-release-build:
     name: aio (release features)
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The release compiles objectio-aio with feature flags nothing else turns
     # on — io_uring, the PCRE2 and Hyperscan grep engines. A cfg-gated path that no longer compiles under those is
     # invisible until a release is half-done: the version bump and tag land in
@@ -517,7 +524,7 @@ jobs:
     if: >-
       github.event_name == 'merge_group' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -570,7 +577,7 @@ jobs:
 
   console:
     name: console
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
