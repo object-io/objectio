@@ -310,16 +310,12 @@ impl NbdServer {
             .collect()
     }
 
-    /// Start the NBD TCP listener.
-    pub async fn serve(self: Arc<Self>, addr: SocketAddr) {
-        let listener = match TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("NBD: failed to bind {addr}: {e}");
-                return;
-            }
-        };
-        info!("NBD: listening on {addr}");
+    /// Serve NBD on `listener`, bound by the caller so that a port that
+    /// can't be bound fails the start.
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        if let Ok(addr) = listener.local_addr() {
+            info!("NBD: listening on {addr}");
+        }
 
         loop {
             match listener.accept().await {

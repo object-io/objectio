@@ -276,7 +276,10 @@ pub async fn run(
         .nbd_listen
         .parse()
         .context("parse NBD listen address")?;
-    tokio::spawn(nbd::NbdServer::serve(Arc::clone(&nbd_server), nbd_addr));
+    let nbd_listener = tokio::net::TcpListener::bind(nbd_addr)
+        .await
+        .with_context(|| format!("bind NBD on {nbd_addr}"))?;
+    tokio::spawn(nbd::NbdServer::serve(Arc::clone(&nbd_server), nbd_listener));
 
     // ── gRPC server ───────────────────────────────────────────────────────────
     let grpc_addr: SocketAddr = args.listen.parse().context("parse gRPC listen address")?;

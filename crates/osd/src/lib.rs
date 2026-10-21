@@ -646,11 +646,17 @@ pub async fn run(
     // Start metrics server
     // Port 0 turns it off: the same text is served over gRPC GetMetrics,
     // which the gateway re-exports (aio runs it this way).
+    // Bound here, not in the task that serves it: a port that can't be bound
+    // is a failed start, not an OSD running on without its health endpoint.
     let metrics_port = args.metrics_port;
     if metrics_port != 0 {
+        let addr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("bind the metrics port {addr}: {e}"))?;
         let metrics_state_clone = metrics_state.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_metrics_server(metrics_port, metrics_state_clone).await {
+            if let Err(e) = serve_metrics(listener, metrics_state_clone).await {
                 error!("Metrics server error: {}", e);
             }
         });
@@ -1050,19 +1056,14 @@ async fn health_handler(
     }
 }
 
-/// Start the metrics HTTP server
-async fn start_metrics_server(port: u16, state: Arc<OsdMetricsState>) -> Result<()> {
+/// Serve the metrics HTTP server on `listener`.
+async fn serve_metrics(listener: TcpListener, state: Arc<OsdMetricsState>) -> Result<()> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .with_state(state);
-
-    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
-    info!("Starting metrics server on {}", addr);
-
-    let listener = TcpListener::bind(addr).await?;
+    info!("Starting metrics server on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 

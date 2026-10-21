@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{Cluster, binary, free_port};
@@ -18,7 +19,9 @@ struct Meta {
     id: u64,
     grpc: u16,
     admin: u16,
-    metrics: u16,
+    /// Known to no peer, so moved to another port when another process
+    /// holds it (see [`HaCluster::spawn_meta`]).
+    metrics: AtomicU16,
     dir: PathBuf,
     /// Where its binary comes from: `None` for this build, or a directory
     /// holding another release's (rolling-upgrade tests).
@@ -281,7 +284,7 @@ impl HaCluster {
                     id: i as u64,
                     grpc: free_port(),
                     admin: free_port(),
-                    metrics: free_port(),
+                    metrics: AtomicU16::new(free_port()),
                     dir: dir.path().join(format!("meta{i}")),
                     bins: Mutex::new(bins.map(Path::to_path_buf)),
                     child: Mutex::new(None),
@@ -444,7 +447,10 @@ impl HaCluster {
             .filter(|m| m.running())
             .filter_map(|m| {
                 let text = http()
-                    .get(format!("http://127.0.0.1:{}/metrics", m.metrics))
+                    .get(format!(
+                        "http://127.0.0.1:{}/metrics",
+                        m.metrics.load(Ordering::Relaxed)
+                    ))
                     .send()
                     .ok()?
                     .text()
@@ -633,9 +639,17 @@ impl HaCluster {
 
     /// Start meta node `i` and wait until it listens; false if it exited
     /// instead (see [`await_child_listening`]).
+    ///
+    /// A metrics port another process took meanwhile (a meta node fails to
+    /// start on one it can't bind) is changed first: no peer knows it.
     fn spawn_meta(&self, i: usize) -> bool {
         let m = &self.metas[i];
         std::fs::create_dir_all(&m.dir).expect("meta dir");
+        let mut metrics = m.metrics.load(Ordering::Relaxed);
+        if std::net::TcpListener::bind(("0.0.0.0", metrics)).is_err() {
+            metrics = free_port();
+            m.metrics.store(metrics, Ordering::Relaxed);
+        }
         let bins = m.bins.lock().unwrap().clone();
         let (out, err) = log_target(self.dir.path(), &format!("meta-{i}"));
         let mut cmd = Command::new(bin(bins.as_deref(), "objectio-meta"));
@@ -653,7 +667,7 @@ impl HaCluster {
                 "--data-dir",
                 &m.dir.display().to_string(),
                 "--metrics-port",
-                &m.metrics.to_string(),
+                &metrics.to_string(),
                 "--admin-port",
                 &m.admin.to_string(),
                 "--ec-k",
@@ -747,7 +761,10 @@ impl HaCluster {
     #[must_use]
     pub fn meta_health(&self, i: usize) -> Option<u16> {
         http()
-            .get(format!("http://127.0.0.1:{}/health", self.metas[i].metrics))
+            .get(format!(
+                "http://127.0.0.1:{}/health",
+                self.metas[i].metrics.load(Ordering::Relaxed)
+            ))
             .send()
             .ok()
             .map(|r| r.status().as_u16())
@@ -908,7 +925,7 @@ impl HaCluster {
             id: new_id,
             grpc: free_port(),
             admin: free_port(),
-            metrics: free_port(),
+            metrics: AtomicU16::new(free_port()),
             dir: self.dir.path().join(format!("meta{new_id}")),
             bins: Mutex::new(None),
             child: Mutex::new(None),

@@ -2,13 +2,8 @@
 //! on (`aws:SourceVpce`) and the client's address (`aws:SourceIp`). A grant
 //! confined to either isn't public, so it stands with public access blocked.
 
-use objectio_e2e::{Cluster, Response};
+use objectio_e2e::{Cluster, Response, free_port};
 use serde_json::json;
-
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 /// The cluster's `--port` is the endpoint "internal"; `external` another.
 fn two_endpoints() -> (Cluster, String) {
