@@ -100,6 +100,12 @@ ec:
   k: 4
   m: 2
 
+# meta-ha-test.sh reads each meta's /status on its admin port from a pod
+# of its own.
+networkPolicy:
+  adminFrom:
+    - podSelector: {matchLabels: {objectio-test: meta-ha-load}}
+
 monitoring:
   enabled: true
 

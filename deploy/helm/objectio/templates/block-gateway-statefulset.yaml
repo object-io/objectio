@@ -87,7 +87,7 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "objectio.blockGateway.fullname" . }}
-        {{- with (include "objectio.tls.volume" .) }}
+        {{- with (include "objectio.tls.volume" (dict "ctx" . "role" "block-gateway")) }}
         {{- . | nindent 8 }}
         {{- end }}
 {{- end }}

@@ -84,10 +84,19 @@ pub struct Args {
     #[arg(long, default_value = "9101")]
     pub metrics_port: u16,
 
-    /// HTTP admin port for Raft bootstrap + membership endpoints
-    /// (/_admin/raft/{init,add-learner,change-membership,status}).
+    /// Admin port for Raft bootstrap and membership (/init, /add-learner,
+    /// /change-membership) and this node's state (/status, /health,
+    /// /ready). HTTPS under mTLS, where every call but reading the state
+    /// takes a client certificate of role admin; plain and unauthenticated
+    /// otherwise.
     #[arg(long, default_value = "9102")]
     pub admin_port: u16,
+
+    /// Address the admin port binds. Default: the host of `--listen`
+    /// (0.0.0.0 there: every interface, so `objectio-install cluster init`
+    /// and probes reach it from elsewhere; loopback: this host only).
+    #[arg(long)]
+    pub admin_host: Option<String>,
 
     /// Seconds between repair passes. Each pass checks every object's
     /// shards and rebuilds any that are missing or corrupt from the rest
@@ -147,6 +156,24 @@ pub struct Args {
     /// mTLS between services (A8a).
     #[command(flatten)]
     pub tls: objectio_proto::transport::TlsArgs,
+}
+
+/// Where the admin port binds: `host` when given, else the host meta's
+/// gRPC `listen` address binds (so a node listening on loopback doesn't
+/// open its admin port to the network).
+fn admin_address(host: Option<&str>, listen: &str, port: u16) -> Result<SocketAddr> {
+    let ip: std::net::IpAddr = match host {
+        Some(h) => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--admin-host {h}: {e}"))?,
+        None => listen
+            .parse::<SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("Invalid listen address {listen}: {e}"))?
+            .ip(),
+    };
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Largest Raft RPC message meta accepts.
@@ -416,13 +443,14 @@ pub async fn run(
         self_id: node_id,
         self_addr: self_addr.clone(),
     });
-    let admin_port = args.admin_port;
-    let admin_listener = bind_http(admin_port, "admin").await?;
-    info!("Raft admin API on http://0.0.0.0:{}/", admin_port);
+    // Bound here, so a port that can't be had fails startup.
+    let admin_addr = admin_address(args.admin_host.as_deref(), &args.listen, args.admin_port)?;
+    let admin_listener = TcpListener::bind(admin_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind the admin port {admin_addr}: {e}"))?;
     tokio::spawn(async move {
-        let router = admin_state.router();
-        if let Err(e) = axum::serve(admin_listener, router).await {
-            error!("Raft admin server error: {e}");
+        if let Err(e) = raft_admin::serve(admin_state, admin_listener).await {
+            error!("Raft admin server: {e:#}");
         }
     });
 
@@ -447,6 +475,13 @@ pub async fn run(
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(
             &op_metrics::RPC_METRICS,
         ))
+        // Who may call what (mTLS): checked here, on the node the caller
+        // reached, before a follower forwards the call under its own
+        // certificate.
+        .layer(objectio_proto::peer_auth::PeerAuthLayer::new(&[
+            objectio_proto::peer_auth::METADATA_SERVICE,
+            objectio_proto::peer_auth::RAFT_SERVICE,
+        ]))
         // A follower forwards every client call to the leader, so any meta
         // node serves any client (see `forward`).
         .layer(forward::ForwardToLeaderLayer::new(raft.clone(), node_id))

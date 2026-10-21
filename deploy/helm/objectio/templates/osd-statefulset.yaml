@@ -200,7 +200,7 @@ spec:
                     - key: ca.crt
                       path: ca.crt
         {{- end }}
-        {{- with (include "objectio.tls.volume" .) }}
+        {{- with (include "objectio.tls.volume" (dict "ctx" . "role" "osd")) }}
         {{- . | nindent 8 }}
         {{- end }}
   volumeClaimTemplates:

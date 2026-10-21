@@ -3,6 +3,8 @@
 //! Usage:
 //!   objectio-install init --role all --disks /dev/sdb,/dev/sdc --systemd
 //!   objectio-install cluster init meta1:9102 meta2:9102 meta3:9102
+//!   objectio-install cluster init --tls-cert admin.pem --tls-key admin.key \
+//!     --tls-ca ca.pem meta1 meta2 meta3                  # under mTLS
 //!   objectio-install disk list
 //!   objectio-install disk prepare /dev/sdb
 
@@ -162,6 +164,19 @@ enum ClusterCommands {
         /// How long to wait for every node to answer, in seconds
         #[arg(long, default_value_t = 120)]
         wait_secs: u64,
+
+        /// Under mTLS: a certificate of role admin (PEM). The admin ports
+        /// are then HTTPS, and change membership only for that role
+        #[arg(long, requires_all = ["tls_key", "tls_ca"])]
+        tls_cert: Option<PathBuf>,
+
+        /// The key of --tls-cert (PEM)
+        #[arg(long, requires_all = ["tls_cert", "tls_ca"])]
+        tls_key: Option<PathBuf>,
+
+        /// The CA that signed the meta nodes' certificates (PEM)
+        #[arg(long, requires_all = ["tls_cert", "tls_key"])]
+        tls_ca: Option<PathBuf>,
     },
 }
 
@@ -216,8 +231,23 @@ async fn main() -> Result<()> {
                     nodes,
                     admin_port,
                     wait_secs,
+                    tls_cert,
+                    tls_key,
+                    tls_ca,
                 },
-        } => cluster::init(&nodes, admin_port, Duration::from_secs(wait_secs)).await?,
+        } => {
+            let tls = match (tls_cert, tls_key, tls_ca) {
+                (Some(cert), Some(key), Some(ca)) => Some(cluster::Tls { cert, key, ca }),
+                _ => None,
+            };
+            cluster::init(
+                &nodes,
+                admin_port,
+                tls.as_ref(),
+                Duration::from_secs(wait_secs),
+            )
+            .await?;
+        }
         Commands::Disk { command } => handle_disk_command(command)?,
         Commands::Status { root } => show_status(&Layout::new(&root)?)?,
     }

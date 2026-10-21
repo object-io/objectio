@@ -246,6 +246,11 @@ pub fn plan(spec: &HostSpec, layout: &Layout) -> Result<Plan> {
             &p.meta_metrics.to_string(),
             "--admin-port",
             &p.meta_admin.to_string(),
+            // Every interface: `cluster init` may run on another host.
+            // Under mTLS it changes membership only with a certificate of
+            // role admin.
+            "--admin-host",
+            "0.0.0.0",
             "--data-dir",
             &data.display().to_string(),
         ]));
@@ -427,6 +432,7 @@ mod tests {
         assert_eq!(flag(meta, "--raft-advertise"), "node2.internal:9100");
         assert_eq!(flag(meta, "--metrics-port"), "9101");
         assert_eq!(flag(meta, "--admin-port"), "9102");
+        assert_eq!(flag(meta, "--admin-host"), "0.0.0.0");
         assert_eq!(flag(meta, "--data-dir"), "/var/lib/objectio/meta");
         assert_eq!(flag(meta, "--ec-k"), "4");
         assert_eq!(flag(meta, "--ec-m"), "2");

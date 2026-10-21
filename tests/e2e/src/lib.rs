@@ -290,9 +290,16 @@ impl Cluster {
     }
 
     /// One copy of each object (no erasure coding), with further aio
-    /// flags, as [`Self::start_with_ec_and_args`] takes them.
+    /// flags, as [`Self::start_with_ec_and_args`] takes them. A
+    /// `--listen-addr` among them replaces the harness's loopback one.
     pub fn start_with_args(osds: usize, args: &[&str]) -> Self {
         Self::boot(osds, None, args.iter().map(ToString::to_string).collect())
+    }
+
+    /// The aio process's id, while it runs.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
     }
 
     /// How many times a cluster is started before giving up, when aio
@@ -307,13 +314,17 @@ impl Cluster {
         extra_args: &[String],
     ) -> Child {
         let mut cmd = Command::new(aio_binary());
-        tls::apply(&mut cmd);
+        tls::apply(&mut cmd, tls::AIO);
         cmd.arg("--data")
             .arg(data_dir)
             .arg("--port")
             .arg(port.to_string())
-            .arg("--listen-addr")
-            .arg("127.0.0.1")
+            .args(
+                (!extra_args.iter().any(|a| a == "--listen-addr"))
+                    .then_some(["--listen-addr", "127.0.0.1"])
+                    .into_iter()
+                    .flatten(),
+            )
             .arg("--strict-port")
             .arg("--osds")
             .arg(osds.to_string())

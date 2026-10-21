@@ -13,7 +13,7 @@ use objectio_e2e::{await_exit, binary, free_port, tls};
 fn meta_exit(metrics: u16, admin: u16) -> Option<std::process::ExitStatus> {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(binary("objectio-meta"));
-    tls::apply(&mut cmd);
+    tls::apply(&mut cmd, tls::META);
     let grpc = free_port();
     let mut meta = cmd
         .args([

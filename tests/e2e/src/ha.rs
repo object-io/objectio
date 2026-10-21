@@ -82,6 +82,9 @@ pub struct HaCluster {
     /// rolling upgrade) runs plain, also once its nodes run this build: a
     /// cluster can't run half on TLS.
     tls: bool,
+    /// A client of meta's admin ports, as an operator (role admin under
+    /// mTLS), and the scheme they speak.
+    admin: (reqwest::blocking::Client, &'static str),
     /// Each OSD on a host of its own (`h0`, `h1`, …) rather than all on
     /// one: what a pool with placement groups needs to spread over them.
     osd_hosts: bool,
@@ -157,8 +160,8 @@ fn log_target(dir: &Path, name: &str) -> (Stdio, Stdio) {
     (file.into(), err.into())
 }
 
-/// A client for the meta nodes' admin ports, built once (see
-/// [`crate::http_client`]).
+/// A client for the meta nodes' metrics ports, built once (see
+/// [`crate::http_client`]); their admin ports take `HaCluster::admin`.
 fn http() -> &'static reqwest::blocking::Client {
     static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -298,6 +301,7 @@ impl HaCluster {
             secret_key: String::new(),
             meta_args: meta_args.iter().map(ToString::to_string).collect(),
             tls: bins.is_none(),
+            admin: crate::tls::admin_http(bins.is_none(), Some(crate::tls::ADMIN)),
             osd_hosts,
             osd_racks,
         };
@@ -371,7 +375,7 @@ impl HaCluster {
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
         if self.tls {
-            crate::tls::apply(&mut cmd);
+            crate::tls::apply(&mut cmd, crate::tls::OSD);
         }
         if osd_hosts {
             let config = o.state.join("osd.toml");
@@ -412,7 +416,7 @@ impl HaCluster {
         let (out, err) = log_target(self.dir.path(), &format!("gateway-{i}"));
         let mut cmd = Command::new(bin(bins, "objectio-gateway"));
         if self.tls {
-            crate::tls::apply(&mut cmd);
+            crate::tls::apply(&mut cmd, crate::tls::GATEWAY);
         }
         let child = cmd
             // Every gateway the same SSE master key, as in production.
@@ -654,7 +658,7 @@ impl HaCluster {
         let (out, err) = log_target(self.dir.path(), &format!("meta-{i}"));
         let mut cmd = Command::new(bin(bins.as_deref(), "objectio-meta"));
         if self.tls {
-            crate::tls::apply(&mut cmd);
+            crate::tls::apply(&mut cmd, crate::tls::META);
         }
         let child = cmd
             .args([
@@ -787,11 +791,25 @@ impl HaCluster {
         self.metas.len()
     }
 
+    /// The URL of `path` on meta node `i`'s admin port: HTTPS under mTLS.
+    #[must_use]
+    pub fn admin_url(&self, i: usize, path: &str) -> String {
+        format!("{}://127.0.0.1:{}{path}", self.admin.1, self.metas[i].admin)
+    }
+
+    /// Whether the cluster's nodes run mTLS between them.
+    #[must_use]
+    pub const fn tls(&self) -> bool {
+        self.tls
+    }
+
     /// Meta node `i`'s Raft view; `None` if it doesn't answer.
     #[must_use]
     pub fn status(&self, i: usize) -> Option<RaftStatus> {
-        let v: serde_json::Value = http()
-            .get(format!("http://127.0.0.1:{}/status", self.metas[i].admin))
+        let v: serde_json::Value = self
+            .admin
+            .0
+            .get(self.admin_url(i, "/status"))
             .send()
             .ok()?
             .json()
@@ -859,8 +877,10 @@ impl HaCluster {
         let admin = |path: &str, body: serde_json::Value| {
             let deadline = Instant::now() + Duration::from_secs(30);
             let r = loop {
-                match http()
-                    .post(format!("http://127.0.0.1:{}{path}", self.metas[0].admin))
+                match self
+                    .admin
+                    .0
+                    .post(self.admin_url(0, path))
                     .json(&body)
                     .send()
                 {
@@ -907,10 +927,11 @@ impl HaCluster {
     /// When the group refuses a step.
     pub fn replace_meta(&mut self, i: usize) -> usize {
         let leader = self.await_leader(Duration::from_secs(20));
-        let leader_admin = self.metas[leader].admin;
+        let leader_admin = self.admin_url(leader, "");
+        let client = self.admin.0.clone();
         let post = |path: &str, body: serde_json::Value| {
-            let r = http()
-                .post(format!("http://127.0.0.1:{leader_admin}{path}"))
+            let r = client
+                .post(format!("{leader_admin}{path}"))
                 .json(&body)
                 .send()
                 .unwrap_or_else(|e| panic!("{path}: {e}"));

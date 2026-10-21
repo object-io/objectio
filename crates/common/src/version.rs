@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// | 7 | every key placed through a placement group whose acting set and epoch are committed before use (objectio-docs `core/pg-recovery.md`, B31): a meta node of the previous release would place the default pool's keys elsewhere |
 /// | 8 | meta's group commit: several writes in one Raft entry (`MetaCommand::Batch`, objectio-docs `core/meta-log.md`); a gateway's metadata reads of an OSD several to a call (`GetObjectMetas`); an OSD's index values split to fit the index file's pages (`core/small-object-path.md`): a meta node of the previous release can't decode the first, an OSD of it doesn't answer the second and would read the first part of a split value alone |
 /// | 9 | users bound to the OIDC issuer and subject of the single sign-on that created them: a meta node of the previous release would drop the binding, and the user could no longer sign on |
-pub const FORMAT_LEVEL: u32 = 9;
+/// | 10 | roles on the services' certificates (objectio-docs `operations-guide/administration/mtls.md`): under mTLS each call between the services is checked against its peer's role, and a certificate of the previous release names none |
+pub const FORMAT_LEVEL: u32 = 10;
 
 /// The level from which small shards are kept in the OSDs' metadata
 /// records and sent with their object's metadata (B21).
@@ -60,6 +61,12 @@ pub const SPLIT_INDEX_VALUES_LEVEL: u32 = 8;
 /// token's issuer and subject, and is mapped only to that user. Before it,
 /// console single sign-on is refused.
 pub const FEDERATED_USERS_LEVEL: u32 = 9;
+
+/// The level from which a peer's certificate must name its role (a SAN
+/// URI `spiffe://objectio/<role>`): below it, while the cluster still runs
+/// a release whose certificates name none, one without a role is taken
+/// for any.
+pub const PEER_ROLES_LEVEL: u32 = 10;
 
 /// The largest shard kept in an OSD's metadata record rather than a disk
 /// block (B21): a 64 KiB object's shards with 4+2.

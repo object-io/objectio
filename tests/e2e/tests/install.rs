@@ -48,10 +48,20 @@ impl Services {
 
     /// Run the command line of `host`'s unit `unit`, as systemd would.
     fn start(&mut self, host: &Path, unit: &str) {
+        self.start_as(host, unit, None);
+    }
+
+    /// As [`Self::start`], under mTLS with the test certificate of
+    /// `identity` (`OBJECTIO_TLS_*`, as a drop-in's `Environment=` sets).
+    fn start_as(&mut self, host: &Path, unit: &str, identity: Option<&str>) {
         let argv = exec_start(host, unit);
         let log = host.join(format!("{unit}.log"));
         let out = std::fs::File::create(&log).expect("log file");
-        let child = Command::new(&argv[0])
+        let mut cmd = Command::new(&argv[0]);
+        if let Some(identity) = identity {
+            objectio_e2e::tls::apply(&mut cmd, identity);
+        }
+        let child = cmd
             .args(&argv[1..])
             .current_dir(host)
             .stdout(Stdio::from(out.try_clone().expect("log file")))
@@ -103,17 +113,28 @@ fn exec_start(host: &Path, unit: &str) -> Vec<String> {
 
 /// `objectio-install` with `args`; panics with its output if it fails.
 fn installer(args: &[&str]) -> String {
+    match try_installer(args) {
+        Ok(out) => out,
+        Err(e) => panic!("objectio-install {args:?}: {e}"),
+    }
+}
+
+/// `objectio-install` with `args`: its standard output, or both outputs
+/// if it fails.
+fn try_installer(args: &[&str]) -> Result<String, String> {
     let out = Command::new(binary("objectio-install"))
         .args(args)
         .output()
         .expect("run objectio-install");
-    assert!(
-        out.status.success(),
-        "objectio-install {args:?}: {}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).to_string()
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!(
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
 }
 
 /// `objectio-install init` for a host under `root`, the binaries this
@@ -354,4 +375,67 @@ fn three_hosts_set_up_by_the_installer_serve_s3() {
     let (ak, sk) = admin_keys(&hosts[2].path().join("var/lib/objectio/meta"));
     let c = Cluster::client(&format!("http://127.0.0.1:{gateway}"), &ak, &sk);
     serves_s3(&c, 3);
+}
+
+/// Under mTLS meta's admin port is HTTPS and changes membership only for
+/// a certificate of role admin: `cluster init` without one, or with
+/// another role's, forms nothing and says what it needs; with one it
+/// forms the group.
+#[test]
+fn cluster_init_under_mtls_takes_an_admin_certificate() {
+    let certs = objectio_e2e::tls::files().expect(
+        "OBJECTIO_E2E_PLAIN is set: the cluster runs plain gRPC, and this test is about mTLS",
+    );
+    let host = tempfile::tempdir().expect("tempdir");
+    let root = host.path();
+    let (meta, admin, metrics) = (free_port(), free_port(), free_port());
+    install(
+        root,
+        &[
+            "--role",
+            "meta",
+            "--ec-profile",
+            "2+1",
+            "--advertise",
+            "127.0.0.1",
+            "--meta-port",
+            &meta.to_string(),
+            "--meta-admin-port",
+            &admin.to_string(),
+            "--meta-metrics-port",
+            &metrics.to_string(),
+        ],
+    );
+    let mut services = Services::new();
+    services.start_as(root, "objectio-meta", Some(objectio_e2e::tls::META));
+    await_listening(admin, "meta's admin port");
+    let node = format!("127.0.0.1:{admin}");
+
+    // No certificate: the port speaks HTTPS only.
+    let e = try_installer(&["cluster", "init", "--wait-secs", "3", &node])
+        .expect_err("cluster init over plain HTTP formed a group");
+    assert!(e.contains("--tls-cert"), "{e}");
+
+    let ca = certs.ca.display().to_string();
+    let with = |identity: &str| {
+        let (cert, key) = certs.pair(identity);
+        let (cert, key) = (cert.display().to_string(), key.display().to_string());
+        try_installer(&[
+            "cluster",
+            "init",
+            "--tls-cert",
+            &cert,
+            "--tls-key",
+            &key,
+            "--tls-ca",
+            &ca,
+            &node,
+        ])
+    };
+    // Another role's certificate reads /status, but /init is refused.
+    let e = with(objectio_e2e::tls::GATEWAY).expect_err("a gateway's certificate formed a group");
+    assert!(e.contains("403") && e.contains("role admin"), "{e}");
+
+    let out = with(objectio_e2e::tls::ADMIN).unwrap_or_else(|e| panic!("as admin: {e}"));
+    assert!(out.contains("voters [1]"), "{out}");
 }

@@ -27,6 +27,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 which = "6"

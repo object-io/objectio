@@ -288,6 +288,9 @@ pub async fn run(
 
     let svc = service::BlockGatewayService::new(Arc::clone(&state));
     objectio_proto::transport::server()
+        .layer(objectio_proto::peer_auth::PeerAuthLayer::new(&[
+            objectio_proto::peer_auth::BLOCK_SERVICE,
+        ]))
         // tonic's default 4 MiB limit refused any Write or Read of a
         // chunk or more.
         .add_service(

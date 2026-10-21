@@ -74,7 +74,7 @@ fn every_service_stops_cleanly_on_sigterm() {
     let dir = tempfile::tempdir().unwrap();
     let grpc = free_port();
     let mut cmd = Command::new(binary("objectio-block-gateway"));
-    tls::apply(&mut cmd);
+    tls::apply(&mut cmd, tls::BLOCK_GATEWAY);
     let mut block = cmd
         .args([
             "--listen",
