@@ -108,15 +108,50 @@ impl Drop for HaCluster {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // A failing test keeps its processes' logs, copied next to the
+        // target dir (as a single-process cluster keeps its own).
+        if std::thread::panicking() {
+            let from = self.dir.path().join("logs");
+            let to = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/e2e-logs")
+                .join(format!(
+                    "{}-{}",
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("test")
+                        .replace("::", "-"),
+                    self.metas.first().map_or(0, |m| m.grpc)
+                ));
+            let copied = std::fs::read_dir(&from).is_ok_and(|entries| {
+                std::fs::create_dir_all(&to).is_ok()
+                    && entries
+                        .flatten()
+                        .all(|e| std::fs::copy(e.path(), to.join(e.file_name())).is_ok())
+            });
+            if copied {
+                eprintln!("cluster logs: {}", to.display());
+            }
+        }
     }
 }
 
-fn log_target() -> Stdio {
+/// Where a process's output goes: the test's own stdout and stderr with
+/// `OBJECTIO_E2E_LOGS` set, else `<name>.log` in the cluster's `logs/`
+/// (appended to across restarts), which a failing test keeps (see
+/// [`HaCluster`]'s `Drop`).
+fn log_target(dir: &Path, name: &str) -> (Stdio, Stdio) {
     if std::env::var_os("OBJECTIO_E2E_LOGS").is_some() {
-        Stdio::inherit()
-    } else {
-        Stdio::null()
+        return (Stdio::inherit(), Stdio::inherit());
     }
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).expect("logs dir");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join(format!("{name}.log")))
+        .expect("log file");
+    let err = file.try_clone().expect("log file");
+    (file.into(), err.into())
 }
 
 /// A client for the meta nodes' admin ports, built once (see
@@ -329,6 +364,7 @@ impl HaCluster {
             .get(i)
             .map(|r| format!("rack = \"{r}\"\n"))
             .unwrap_or_default();
+        let (out, err) = log_target(self.dir.path(), &format!("osd-{i}"));
         let o = &mut self.osds[i];
         let mut cmd = Command::new(bin(bins, "objectio-osd"));
         if self.tls {
@@ -358,8 +394,8 @@ impl HaCluster {
                 "--metrics-port",
                 "0",
             ])
-            .stdout(log_target())
-            .stderr(log_target())
+            .stdout(out)
+            .stderr(err)
             .spawn()
             .expect("spawn objectio-osd");
         o.child = Some(child);
@@ -370,6 +406,7 @@ impl HaCluster {
     fn spawn_gateway(&mut self, i: usize, bins: Option<&Path>) -> bool {
         let endpoints = self.meta_endpoints();
         let port = self.gateways[i].port;
+        let (out, err) = log_target(self.dir.path(), &format!("gateway-{i}"));
         let mut cmd = Command::new(bin(bins, "objectio-gateway"));
         if self.tls {
             crate::tls::apply(&mut cmd);
@@ -390,8 +427,8 @@ impl HaCluster {
                 "--test-hooks",
             ])
             .args(&self.gateways[i].args)
-            .stdout(log_target())
-            .stderr(log_target())
+            .stdout(out)
+            .stderr(err)
             .spawn()
             .expect("spawn objectio-gateway");
         let gateway = &mut self.gateways[i];
@@ -600,6 +637,7 @@ impl HaCluster {
         let m = &self.metas[i];
         std::fs::create_dir_all(&m.dir).expect("meta dir");
         let bins = m.bins.lock().unwrap().clone();
+        let (out, err) = log_target(self.dir.path(), &format!("meta-{i}"));
         let mut cmd = Command::new(bin(bins.as_deref(), "objectio-meta"));
         if self.tls {
             crate::tls::apply(&mut cmd);
@@ -632,8 +670,8 @@ impl HaCluster {
                     .flatten(),
             )
             .args(&self.meta_args)
-            .stdout(log_target())
-            .stderr(log_target())
+            .stdout(out)
+            .stderr(err)
             .spawn()
             .expect("spawn objectio-meta");
         let mut slot = m.child.lock().unwrap();
