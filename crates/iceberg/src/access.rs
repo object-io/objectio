@@ -57,19 +57,24 @@ pub struct IcebergPolicyCheck<'a> {
     pub resource_tags: &'a HashMap<String, String>,
 }
 
-/// Check an Iceberg policy (namespace or table level).
+/// Evaluate one Iceberg policy (catalog, namespace or table level).
 ///
-/// Returns `Ok(())` if access is allowed (explicit Allow, implicit deny with no
-/// policy, or no policy at all — owner has implicit access, same as S3).
-/// Returns `Err(IcebergError)` with 403 on explicit Deny.
+/// No policy, an empty one, or one with no statement matching the request
+/// is `ImplicitDeny`: it grants nothing. Whether the request goes ahead
+/// then rests on the rest of the chain and on who the caller is (see
+/// [`grant`]), as with an S3 bucket policy.
 ///
 /// Populates `RequestContext.variables` with Iceberg-specific condition keys
 /// so policies can use `Condition` blocks referencing `iceberg:namespace`,
 /// `iceberg:tableName`, and `iceberg:operation`.
 ///
 /// # Errors
-/// Returns `IcebergError` with `FORBIDDEN` status on explicit policy deny.
-pub fn check_iceberg_policy(check: &IcebergPolicyCheck<'_>) -> Result<(), IcebergError> {
+/// `FORBIDDEN` on an explicit Deny, and on a stored policy that doesn't
+/// parse: it could hold a Deny, so it can't be read as granting or denying
+/// nothing.
+pub fn check_iceberg_policy(
+    check: &IcebergPolicyCheck<'_>,
+) -> Result<PolicyDecision, IcebergError> {
     let IcebergPolicyCheck {
         evaluator,
         policy_json,
@@ -81,37 +86,17 @@ pub fn check_iceberg_policy(check: &IcebergPolicyCheck<'_>) -> Result<(), Iceber
         policy_source,
         resource_tags,
     } = check;
-    let Some(json) = policy_json else {
-        tracing::debug!(
-            namespace = %ns_levels.join("."),
-            table = table_name.unwrap_or(""),
-            user = %user_arn,
-            action = %action,
-            decision = "allow",
-            policy_source = %policy_source,
-            "iceberg.policy.decision: no policy set"
-        );
-        return Ok(());
+    let Some(json) = policy_json.filter(|j| !j.is_empty()) else {
+        return Ok(PolicyDecision::ImplicitDeny);
     };
-    if json.is_empty() {
-        tracing::debug!(
-            namespace = %ns_levels.join("."),
-            table = table_name.unwrap_or(""),
-            user = %user_arn,
-            action = %action,
-            decision = "allow",
-            policy_source = %policy_source,
-            "iceberg.policy.decision: empty policy"
-        );
-        return Ok(());
-    }
 
     let policy = match BucketPolicy::from_json(json) {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!("Failed to parse iceberg policy: {e}");
-            // Invalid policy — don't block (same as S3)
-            return Ok(());
+            tracing::error!("iceberg policy at {policy_source} does not parse: {e}");
+            return Err(IcebergError::forbidden(format!(
+                "Access denied: the {policy_source} policy could not be read"
+            )));
         }
     };
 
@@ -137,45 +122,73 @@ pub fn check_iceberg_policy(check: &IcebergPolicyCheck<'_>) -> Result<(), Iceber
     }
 
     let decision = evaluator.evaluate(&policy, &context);
-
-    match decision {
-        PolicyDecision::Deny => {
-            tracing::warn!(
-                namespace = %ns_levels.join("."),
-                table = table_name.unwrap_or(""),
-                user = %user_arn,
-                action = %action,
-                decision = "deny",
-                policy_source = %policy_source,
-                "iceberg.policy.decision"
-            );
-            Err(IcebergError::forbidden("Access denied by iceberg policy"))
-        }
-        PolicyDecision::Allow => {
-            tracing::info!(
-                namespace = %ns_levels.join("."),
-                table = table_name.unwrap_or(""),
-                user = %user_arn,
-                action = %action,
-                decision = "allow",
-                policy_source = %policy_source,
-                "iceberg.policy.decision"
-            );
-            Ok(())
-        }
-        PolicyDecision::ImplicitDeny => {
-            tracing::debug!(
-                namespace = %ns_levels.join("."),
-                table = table_name.unwrap_or(""),
-                user = %user_arn,
-                action = %action,
-                decision = "implicit_deny",
-                policy_source = %policy_source,
-                "iceberg.policy.decision"
-            );
-            Ok(())
-        }
+    tracing::debug!(
+        namespace = %ns_levels.join("."),
+        table = table_name.unwrap_or(""),
+        user = %user_arn,
+        action = %action,
+        decision = ?decision,
+        policy_source = %policy_source,
+        "iceberg.policy.decision"
+    );
+    if decision == PolicyDecision::Deny {
+        tracing::warn!(
+            namespace = %ns_levels.join("."),
+            table = table_name.unwrap_or(""),
+            user = %user_arn,
+            action = %action,
+            policy_source = %policy_source,
+            "iceberg.policy.decision: deny"
+        );
+        return Err(IcebergError::forbidden("Access denied by iceberg policy"));
     }
+    Ok(decision)
+}
+
+/// Whether a request the policy chain has decided on goes ahead.
+///
+/// Mirrors S3 authorization: an explicit Deny anywhere has already refused
+/// it; an Allow anywhere grants it; with neither, only the warehouse's
+/// administrators may go ahead (`administers`: the catalog admins and the
+/// warehouse tenant's admins), as only a bucket's owner may with no policy.
+///
+/// # Errors
+/// `FORBIDDEN` when nothing grants the request.
+pub fn grant(
+    decision: PolicyDecision,
+    administers: bool,
+    action: &str,
+    resource_arn: &str,
+) -> Result<(), IcebergError> {
+    match decision {
+        PolicyDecision::Allow => Ok(()),
+        PolicyDecision::ImplicitDeny if administers => Ok(()),
+        PolicyDecision::ImplicitDeny => Err(IcebergError::forbidden(format!(
+            "No policy allows {action} on {resource_arn}"
+        ))),
+        PolicyDecision::Deny => Err(IcebergError::forbidden("Access denied by iceberg policy")),
+    }
+}
+
+/// Fold one level's decision into the chain's: Deny wins (handled by the
+/// caller as an error), then Allow.
+const fn fold(chain: PolicyDecision, level: PolicyDecision) -> PolicyDecision {
+    match (chain, level) {
+        (PolicyDecision::Deny, _) | (_, PolicyDecision::Deny) => PolicyDecision::Deny,
+        (PolicyDecision::Allow, _) | (_, PolicyDecision::Allow) => PolicyDecision::Allow,
+        _ => PolicyDecision::ImplicitDeny,
+    }
+}
+
+/// Fold a further level into a chain's decision, refusing on a Deny.
+///
+/// # Errors
+/// `FORBIDDEN` if `level` is an error (a Deny or an unreadable policy).
+pub fn and_then(
+    chain: PolicyDecision,
+    level: Result<PolicyDecision, IcebergError>,
+) -> Result<PolicyDecision, IcebergError> {
+    Ok(fold(chain, level?))
 }
 
 /// Reserved namespace name for storing the catalog-level default policy.
@@ -202,14 +215,13 @@ pub struct HierarchicalPolicyCheck<'a> {
 /// 2. Each ancestor namespace policy (for multi-level namespaces)
 /// 3. The target namespace policy
 ///
-/// Any explicit Deny at any level immediately blocks the request.
-/// This function returns `Err` on the first Deny encountered.
+/// Returns `Allow` if any level allows the request, else `ImplicitDeny`.
 ///
 /// # Errors
-/// Returns `IcebergError` with `FORBIDDEN` status on explicit policy deny.
+/// `FORBIDDEN` on the first explicit Deny, or a policy that doesn't parse.
 pub fn check_hierarchical_policies(
     check: &HierarchicalPolicyCheck<'_>,
-) -> Result<(), IcebergError> {
+) -> Result<PolicyDecision, IcebergError> {
     let HierarchicalPolicyCheck {
         evaluator,
         catalog_policy_json,
@@ -222,7 +234,7 @@ pub fn check_hierarchical_policies(
         resource_tags,
     } = check;
     // 1. Check catalog-level policy
-    check_iceberg_policy(&IcebergPolicyCheck {
+    let mut decision = check_iceberg_policy(&IcebergPolicyCheck {
         evaluator,
         policy_json: *catalog_policy_json,
         user_arn,
@@ -236,20 +248,23 @@ pub fn check_hierarchical_policies(
 
     // 2. Check each ancestor/target namespace policy
     for (ns_label, policy_json) in *ancestor_policies {
-        check_iceberg_policy(&IcebergPolicyCheck {
-            evaluator,
-            policy_json: policy_json.as_deref(),
-            user_arn,
-            action,
-            resource_arn,
-            ns_levels,
-            table_name: *table_name,
-            policy_source: ns_label,
-            resource_tags,
-        })?;
+        decision = and_then(
+            decision,
+            check_iceberg_policy(&IcebergPolicyCheck {
+                evaluator,
+                policy_json: policy_json.as_deref(),
+                user_arn,
+                action,
+                resource_arn,
+                ns_levels,
+                table_name: *table_name,
+                policy_source: ns_label,
+                resource_tags,
+            }),
+        )?;
     }
 
-    Ok(())
+    Ok(decision)
 }
 
 /// Validate that a policy JSON string is a valid Iceberg policy.
@@ -300,7 +315,7 @@ mod tests {
         ns_levels: &[String],
         table_name: Option<&str>,
         policy_source: &str,
-    ) -> Result<(), IcebergError> {
+    ) -> Result<PolicyDecision, IcebergError> {
         check_with_tags(
             policy_json,
             user_arn,
@@ -323,7 +338,7 @@ mod tests {
         table_name: Option<&str>,
         policy_source: &str,
         resource_tags: &HashMap<String, String>,
-    ) -> Result<(), IcebergError> {
+    ) -> Result<PolicyDecision, IcebergError> {
         let evaluator = PolicyEvaluator::new();
         check_iceberg_policy(&IcebergPolicyCheck {
             evaluator: &evaluator,
@@ -350,32 +365,34 @@ mod tests {
         assert_eq!(arn, "arn:obio:iceberg:::db1/events");
     }
 
+    /// No policy grants nothing: only an administrator goes ahead.
     #[test]
-    fn test_no_policy_allows() {
-        let result = check(
-            None,
-            "arn:objectio:iam::user/alice",
-            "iceberg:LoadTable",
-            "arn:obio:iceberg:::db1/events",
-            &["db1".into()],
-            Some("events"),
-            "table",
+    fn no_policy_grants_nothing() {
+        for policy in [None, Some("")] {
+            let result = check(
+                policy,
+                "arn:objectio:iam::user/alice",
+                "iceberg:LoadTable",
+                "arn:obio:iceberg:::db1/events",
+                &["db1".into()],
+                Some("events"),
+                "table",
+            );
+            assert_eq!(result.unwrap(), PolicyDecision::ImplicitDeny);
+        }
+        let arn = "arn:obio:iceberg:::db1/events";
+        assert!(
+            grant(
+                PolicyDecision::ImplicitDeny,
+                false,
+                "iceberg:LoadTable",
+                arn
+            )
+            .is_err()
         );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_empty_policy_allows() {
-        let result = check(
-            Some(""),
-            "arn:objectio:iam::user/alice",
-            "iceberg:LoadTable",
-            "arn:obio:iceberg:::db1/events",
-            &["db1".into()],
-            Some("events"),
-            "table",
-        );
-        assert!(result.is_ok());
+        assert!(grant(PolicyDecision::ImplicitDeny, true, "iceberg:LoadTable", arn).is_ok());
+        assert!(grant(PolicyDecision::Allow, false, "iceberg:LoadTable", arn).is_ok());
+        assert!(grant(PolicyDecision::Deny, true, "iceberg:LoadTable", arn).is_err());
     }
 
     #[test]
@@ -423,11 +440,11 @@ mod tests {
             Some("events"),
             "namespace",
         );
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PolicyDecision::Allow);
     }
 
     #[test]
-    fn test_implicit_deny_allows() {
+    fn a_policy_that_names_someone_else_grants_nothing() {
         // Policy only allows bob, but alice is requesting — implicit deny
         let policy = r#"{
             "Version": "2012-10-17",
@@ -448,12 +465,12 @@ mod tests {
             Some("events"),
             "namespace",
         );
-        // Implicit deny = allow (owner has implicit access)
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PolicyDecision::ImplicitDeny);
     }
 
+    /// A stored policy that doesn't parse could hold a Deny: it refuses.
     #[test]
-    fn test_invalid_policy_json_allows() {
+    fn an_unreadable_policy_refuses() {
         let result = check(
             Some("not-valid-json"),
             "arn:objectio:iam::user/alice",
@@ -463,8 +480,7 @@ mod tests {
             Some("events"),
             "table",
         );
-        // Invalid policy — don't block
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap_err().code, axum::http::StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -715,7 +731,41 @@ mod tests {
             table_name: Some("events"),
             resource_tags: &HashMap::new(),
         });
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PolicyDecision::Allow);
+
+        // With nothing allowing it, the chain grants nothing.
+        let result = check_hierarchical_policies(&HierarchicalPolicyCheck {
+            evaluator: &PolicyEvaluator::new(),
+            catalog_policy_json: None,
+            ancestor_policies: &ancestor_policies,
+            user_arn: "arn:objectio:iam::user/alice",
+            action: "iceberg:LoadTable",
+            resource_arn: "arn:obio:iceberg:::analytics/events",
+            ns_levels: &ns_levels,
+            table_name: Some("events"),
+            resource_tags: &HashMap::new(),
+        });
+        assert_eq!(result.unwrap(), PolicyDecision::ImplicitDeny);
+    }
+
+    #[test]
+    fn a_deny_below_an_allow_still_refuses() {
+        let allow = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["iceberg:*"],"Resource":["arn:obio:iceberg:::*"]}]}"#;
+        let deny = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["iceberg:LoadTable"],"Resource":["arn:obio:iceberg:::*"]}]}"#;
+        let ns_levels = vec!["analytics".to_string()];
+        let levels = vec![("namespace:analytics".to_string(), Some(deny.to_string()))];
+        let result = check_hierarchical_policies(&HierarchicalPolicyCheck {
+            evaluator: &PolicyEvaluator::new(),
+            catalog_policy_json: Some(allow),
+            ancestor_policies: &levels,
+            user_arn: "arn:objectio:iam::user/alice",
+            action: "iceberg:LoadTable",
+            resource_arn: "arn:obio:iceberg:::analytics/events",
+            ns_levels: &ns_levels,
+            table_name: Some("events"),
+            resource_tags: &HashMap::new(),
+        });
+        assert!(result.is_err());
     }
 
     #[test]

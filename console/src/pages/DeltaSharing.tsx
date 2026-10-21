@@ -94,7 +94,7 @@ export default function DeltaSharing() {
     setSelectedShare(name);
     setView("detail");
     const r = await fetch(
-      `/_admin/delta-sharing/shares/${name}/tables`
+      `/_admin/shares/${name}/tables`
     )
       .then((r) => r.json())
       .catch(() => ({ tables: [] }));
@@ -119,7 +119,7 @@ export default function DeltaSharing() {
 
   const deleteShare = async (name: string) => {
     if (!confirm(`Delete share "${name}"?`)) return;
-    await fetch(`/_admin/delta-sharing/shares/${name}`, {
+    await fetch(`/_admin/shares/${name}`, {
       method: "DELETE",
     });
     if (selectedShare === name) setView("list");
@@ -150,7 +150,7 @@ export default function DeltaSharing() {
   const addTable = async () => {
     if (!addSchema || !addTableName) return;
     await fetch(
-      `/_admin/delta-sharing/shares/${selectedShare}/tables`,
+      `/_admin/shares/${selectedShare}/tables`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -174,7 +174,7 @@ export default function DeltaSharing() {
 
   const removeTable = async (schema: string, table: string) => {
     await fetch(
-      `/_admin/delta-sharing/shares/${selectedShare}/schemas/${schema}/tables/${table}`,
+      `/_admin/shares/${selectedShare}/schemas/${schema}/tables/${table}`,
       { method: "DELETE" }
     );
     openShare(selectedShare);
@@ -191,7 +191,7 @@ export default function DeltaSharing() {
 
   const createRecipient = async () => {
     if (!newRecipientName.trim()) return;
-    const r = await fetch("/_admin/delta-sharing/recipients", {
+    const r = await fetch("/_admin/recipients", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -209,7 +209,7 @@ export default function DeltaSharing() {
 
   const deleteRecipient = async (name: string) => {
     if (!confirm(`Delete recipient "${name}"?`)) return;
-    await fetch(`/_admin/delta-sharing/recipients/${name}`, {
+    await fetch(`/_admin/recipients/${name}`, {
       method: "DELETE",
     });
     load();

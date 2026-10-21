@@ -15,7 +15,7 @@ pub mod presigned_reader;
 pub mod types;
 
 use axum::Router;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use catalog::DeltaCatalog;
 use handlers::DeltaState;
 use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
@@ -54,8 +54,8 @@ pub struct DeltaSharingConfig {
 /// It must be mounted **outside** the `SigV4` middleware layer; bearer token
 /// validation is handled internally by the `access::authenticate_request` helper.
 ///
-/// Admin management endpoints are nested under `/_admin/delta-sharing/` in the
-/// main gateway router (not this router).
+/// Shares and recipients are managed on the gateway's admin API
+/// (`/_admin/shares`, `/_admin/recipients`), behind its authentication.
 pub fn router(meta_client: MetadataServiceClient<Channel>, config: DeltaSharingConfig) -> Router {
     let catalog = DeltaCatalog::new(meta_client.clone());
     let http = reqwest::Client::new();
@@ -104,52 +104,5 @@ pub fn router(meta_client: MetadataServiceClient<Channel>, config: DeltaSharingC
             "/v1/shares/{share}/schemas/{schema}/tables/{table}/query",
             post(handlers::query_table),
         )
-        .with_state(state)
-}
-
-/// Build the admin router for Delta Sharing management.
-///
-/// Should be nested at `/_admin/delta-sharing` in the gateway, behind
-/// the admin authentication middleware.
-pub fn admin_router(
-    meta_client: MetadataServiceClient<Channel>,
-    config: DeltaSharingConfig,
-) -> Router {
-    let catalog = DeltaCatalog::new(meta_client.clone());
-    let http = reqwest::Client::new();
-    let default_url_ttl = Duration::from_secs(
-        config
-            .default_url_ttl_seconds
-            .unwrap_or(DEFAULT_URL_TTL_SECS),
-    );
-    let state = Arc::new(DeltaState {
-        catalog,
-        meta_client,
-        endpoint: config.endpoint,
-        region: config.region,
-        access_key_id: config.access_key_id,
-        secret_access_key: config.secret_access_key,
-        http,
-        default_url_ttl,
-    });
-
-    Router::new()
-        // Share management
-        .route("/shares", get(handlers::admin_list_shares))
-        .route("/shares", post(handlers::admin_create_share))
-        .route("/shares/{share}", delete(handlers::admin_drop_share))
-        .route(
-            "/shares/{share}/tables",
-            get(handlers::admin_list_share_tables),
-        )
-        .route("/shares/{share}/tables", post(handlers::admin_add_table))
-        .route(
-            "/shares/{share}/schemas/{schema}/tables/{table}",
-            delete(handlers::admin_remove_table),
-        )
-        // Recipient management
-        .route("/recipients", get(handlers::admin_list_recipients))
-        .route("/recipients", post(handlers::admin_create_recipient))
-        .route("/recipients/{name}", delete(handlers::admin_drop_recipient))
         .with_state(state)
 }

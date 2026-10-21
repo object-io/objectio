@@ -86,6 +86,17 @@ impl UnityError {
             message: msg.into(),
         }
     }
+
+    /// Meta couldn't answer a read a decision rests on: retry, rather than
+    /// a decision made on part of the facts.
+    #[must_use]
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_code: "TEMPORARILY_UNAVAILABLE",
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for UnityError {

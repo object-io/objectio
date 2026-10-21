@@ -2182,7 +2182,7 @@ pub async fn admin_delete_warehouse(
     // Find the warehouse via a system-wide list to discover its tenant so we
     // can gate the delete properly. There is no dedicated Get RPC yet.
     let mut client = state.meta_client.clone();
-    let tenant = match client
+    let (tenant, bucket) = match client
         .iceberg_list_warehouses(objectio_proto::metadata::IcebergListWarehousesRequest {
             tenant: String::new(),
         })
@@ -2193,9 +2193,9 @@ pub async fn admin_delete_warehouse(
             .warehouses
             .into_iter()
             .find(|w| w.name == name)
-            .map(|w| w.tenant)
+            .map(|w| (w.tenant, w.bucket))
             .unwrap_or_default(),
-        Err(_) => return (StatusCode::NOT_FOUND, "Warehouse not found").into_response(),
+        Err(e) => return meta_failure(&e),
     };
     if tenant.is_empty() {
         if let Some(deny) = require_system_admin(&auth, &headers) {
@@ -2204,12 +2204,34 @@ pub async fn admin_delete_warehouse(
     } else if let Some(deny) = require_tenant_admin_access(&state, &auth, &headers, &tenant).await {
         return deny;
     }
+    if bucket.is_empty() {
+        return (StatusCode::NOT_FOUND, "Warehouse not found").into_response();
+    }
+    // Its bucket goes with it, so it must be empty, noncurrent versions
+    // included: those live only on the OSDs (meta checks current objects).
+    match crate::s3::holds_versions(&state, &bucket).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return (
+                StatusCode::CONFLICT,
+                "The warehouse's bucket holds object versions; empty it first",
+            )
+                .into_response();
+        }
+        Err(resp) => return resp,
+    }
     match client
         .iceberg_delete_warehouse(objectio_proto::metadata::IcebergDeleteWarehouseRequest { name })
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e.message().to_string()).into_response(),
+        Err(e) if e.code() == tonic::Code::FailedPrecondition => {
+            (StatusCode::CONFLICT, e.message().to_string()).into_response()
+        }
+        Err(e) if e.code() == tonic::Code::NotFound => {
+            (StatusCode::NOT_FOUND, e.message().to_string()).into_response()
+        }
+        Err(e) => meta_failure(&e),
     }
 }
 

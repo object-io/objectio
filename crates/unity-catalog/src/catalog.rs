@@ -95,6 +95,42 @@ impl UnityCatalogClient {
         Ok(resp.catalogs.into_iter().map(catalog_to_info).collect())
     }
 
+    /// Every catalog, with the tenant it belongs to (empty = the system
+    /// tenant).
+    pub async fn list_catalogs_with_tenant(&self) -> Result<Vec<(String, CatalogInfo)>> {
+        let resp = self
+            .meta_client
+            .clone()
+            .unity_list_catalogs(UnityListCatalogsRequest {
+                max_results: 0,
+                page_token: String::new(),
+                tenant: String::new(),
+            })
+            .await?
+            .into_inner();
+        Ok(resp
+            .catalogs
+            .into_iter()
+            .map(|c| (c.tenant.clone(), catalog_to_info(c)))
+            .collect())
+    }
+
+    /// The tenant a catalog belongs to (empty = the system tenant) and its
+    /// storage root.
+    pub async fn catalog_tenant_and_root(&self, name: &str) -> Result<(String, String)> {
+        let resp = self
+            .meta_client
+            .clone()
+            .unity_get_catalog(UnityGetCatalogRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        resp.catalog
+            .map(|c| (c.tenant, c.location))
+            .ok_or_else(|| UnityError::not_found(format!("catalog '{name}' not found")))
+    }
+
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
         let resp = self
             .meta_client

@@ -673,6 +673,22 @@ impl MetaService {
         Ok(Response::new(UnityDeleteSchemaResponse { success: true }))
     }
 
+    /// Refuse an external table's or volume's location outside its
+    /// catalog's storage root. Credentials vended for it are scoped to the
+    /// location, and the catalog's backing bucket is the storage it owns:
+    /// there are no registered external locations granting more.
+    #[allow(clippy::result_large_err)] // the Status the RPC returns, as is
+    fn unity_confine(location: &str, catalog: &UnityCatalog) -> Result<(), Status> {
+        if objectio_common::location::within(location, &catalog.location) {
+            Ok(())
+        } else {
+            Err(Status::invalid_argument(format!(
+                "storage_location \"{location}\" is outside catalog '{}' ({})",
+                catalog.name, catalog.location
+            )))
+        }
+    }
+
     pub(crate) async fn unity_create_table(
         &self,
         request: Request<UnityCreateTableRequest>,
@@ -733,6 +749,7 @@ impl MetaService {
                         "EXTERNAL tables require a storage_location",
                     ));
                 }
+                Self::unity_confine(&req.storage_location, &catalog)?;
                 req.storage_location
             }
             other => {
@@ -1090,6 +1107,7 @@ impl MetaService {
                         "EXTERNAL volumes require a storage_location",
                     ));
                 }
+                Self::unity_confine(&req.storage_location, &catalog)?;
                 req.storage_location
             }
             other => {
@@ -1886,5 +1904,88 @@ impl MetaService {
         Ok(Response::new(UnityGetTablePolicyResponse {
             policy_json: policy,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn catalog_with_schema() -> (tempfile::TempDir, MetaService) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MetaStore::open(dir.path().join("meta.redb")).unwrap());
+        let svc = MetaService::with_store(EcConfig::default(), store);
+        svc.unity_create_catalog(Request::new(UnityCreateCatalogRequest {
+            name: "cat".to_string(),
+            tenant: "acme".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        svc.unity_create_schema(Request::new(UnityCreateSchemaRequest {
+            catalog_name: "cat".to_string(),
+            name: "s".to_string(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        (dir, svc)
+    }
+
+    async fn external_table(svc: &MetaService, name: &str, location: &str) -> Result<(), Status> {
+        svc.unity_create_table(Request::new(UnityCreateTableRequest {
+            catalog_name: "cat".to_string(),
+            schema_name: "s".to_string(),
+            name: name.to_string(),
+            table_type: "EXTERNAL".to_string(),
+            storage_location: location.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .map(drop)
+    }
+
+    async fn external_volume(svc: &MetaService, name: &str, location: &str) -> Result<(), Status> {
+        svc.unity_create_volume(Request::new(UnityCreateVolumeRequest {
+            catalog_name: "cat".to_string(),
+            schema_name: "s".to_string(),
+            name: name.to_string(),
+            volume_type: "EXTERNAL".to_string(),
+            storage_location: location.to_string(),
+            ..Default::default()
+        }))
+        .await
+        .map(drop)
+    }
+
+    /// Credentials are vended for an external table's or volume's location:
+    /// one outside the catalog's bucket would get credentials there.
+    #[tokio::test]
+    async fn external_locations_stay_in_their_catalog() {
+        let (_dir, svc) = catalog_with_schema().await;
+        for location in [
+            "s3://other-bucket/t",
+            "s3://unity-cat2/t",
+            "s3://unity-cat/../other/t",
+        ] {
+            let e = external_table(&svc, "t", location).await.unwrap_err();
+            assert_eq!(
+                e.code(),
+                tonic::Code::InvalidArgument,
+                "table at {location}"
+            );
+            let e = external_volume(&svc, "v", location).await.unwrap_err();
+            assert_eq!(
+                e.code(),
+                tonic::Code::InvalidArgument,
+                "volume at {location}"
+            );
+        }
+        external_table(&svc, "t", "s3://unity-cat/ext/t/")
+            .await
+            .unwrap();
+        external_volume(&svc, "v", "s3://unity-cat/ext/v/")
+            .await
+            .unwrap();
     }
 }

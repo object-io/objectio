@@ -26,6 +26,10 @@ use tonic::transport::Channel;
 ///
 /// The returned router should be nested at `/iceberg` by the gateway.
 /// Routes follow the Iceberg REST Catalog `OpenAPI` spec (v1 prefix).
+///
+/// `auth_required` is false only under `--no-auth`: otherwise a request
+/// that reaches a handler with no identity is refused. Warehouses are
+/// managed on the admin API (`/_admin/warehouses`), not here.
 #[allow(clippy::too_many_lines)]
 pub fn router(
     meta_client: MetadataServiceClient<Channel>,
@@ -33,6 +37,7 @@ pub fn router(
     admin_principals: Vec<String>,
     sts_provider: Option<objectio_auth::sts::StsProvider>,
     s3_endpoint: String,
+    auth_required: bool,
 ) -> Router {
     let catalog = IcebergCatalog::new(meta_client);
     let state = Arc::new(IcebergState {
@@ -41,6 +46,7 @@ pub fn router(
         admin_principals,
         sts_provider,
         s3_endpoint,
+        auth_required,
     });
 
     Router::new()
@@ -166,12 +172,5 @@ pub fn router(
         .route("/v1/simulate-policy", post(handlers::simulate_policy))
         // Rename table
         .route("/v1/tables/rename", post(handlers::rename_table))
-        // Warehouse management
-        .route("/v1/warehouses", post(handlers::create_warehouse))
-        .route("/v1/warehouses", get(handlers::list_warehouses))
-        .route(
-            "/v1/warehouses/{warehouse}",
-            delete(handlers::delete_warehouse),
-        )
         .with_state(state)
 }

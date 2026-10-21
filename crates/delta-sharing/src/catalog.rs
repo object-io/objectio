@@ -2,11 +2,9 @@
 
 use crate::error::DeltaError;
 use objectio_proto::metadata::{
-    DeltaAddTableRequest, DeltaCreateRecipientRequest, DeltaCreateShareRequest,
-    DeltaDropRecipientRequest, DeltaDropShareRequest, DeltaGetRecipientByTokenRequest,
-    DeltaGetShareRequest, DeltaListRecipientsRequest, DeltaListSharesRequest,
-    DeltaListTablesRequest, DeltaRecipientEntry, DeltaRemoveTableRequest, DeltaShareEntry,
-    DeltaShareTableEntry, metadata_service_client::MetadataServiceClient,
+    DeltaGetRecipientByTokenRequest, DeltaGetShareRequest, DeltaListSharesRequest,
+    DeltaListTablesRequest, DeltaRecipientEntry, DeltaShareEntry, DeltaShareTableEntry,
+    metadata_service_client::MetadataServiceClient,
 };
 use tonic::transport::Channel;
 
@@ -19,28 +17,6 @@ impl DeltaCatalog {
     #[must_use]
     pub const fn new(client: MetadataServiceClient<Channel>) -> Self {
         Self { client }
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails or the response contains no share.
-    pub async fn create_share(
-        &self,
-        name: &str,
-        comment: &str,
-        tenant: &str,
-    ) -> Result<DeltaShareEntry, DeltaError> {
-        let resp = self
-            .client
-            .clone()
-            .delta_create_share(DeltaCreateShareRequest {
-                name: name.to_string(),
-                comment: comment.to_string(),
-                tenant: tenant.to_string(),
-            })
-            .await?;
-        resp.into_inner()
-            .share
-            .ok_or_else(|| DeltaError::internal("no share in response"))
     }
 
     /// # Errors
@@ -78,49 +54,6 @@ impl DeltaCatalog {
 
     /// # Errors
     /// Returns `DeltaError` if the gRPC call fails.
-    pub async fn drop_share(&self, name: &str) -> Result<(), DeltaError> {
-        self.client
-            .clone()
-            .delta_drop_share(DeltaDropShareRequest {
-                name: name.to_string(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails or the response contains no table.
-    pub async fn add_table(
-        &self,
-        req: DeltaAddTableRequest,
-    ) -> Result<DeltaShareTableEntry, DeltaError> {
-        let resp = self.client.clone().delta_add_table(req).await?;
-        resp.into_inner()
-            .table
-            .ok_or_else(|| DeltaError::internal("no table in response"))
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails.
-    pub async fn remove_table(
-        &self,
-        share: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<(), DeltaError> {
-        self.client
-            .clone()
-            .delta_remove_table(DeltaRemoveTableRequest {
-                share: share.to_string(),
-                schema: schema.to_string(),
-                table_name: name.to_string(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails.
     pub async fn list_tables(
         &self,
         share: &str,
@@ -151,28 +84,6 @@ impl DeltaCatalog {
     }
 
     /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails or the response contains no recipient.
-    pub async fn create_recipient(
-        &self,
-        name: &str,
-        shares: Vec<String>,
-    ) -> Result<(DeltaRecipientEntry, String), DeltaError> {
-        let resp = self
-            .client
-            .clone()
-            .delta_create_recipient(DeltaCreateRecipientRequest {
-                name: name.to_string(),
-                shares,
-            })
-            .await?;
-        let inner = resp.into_inner();
-        let recipient = inner
-            .recipient
-            .ok_or_else(|| DeltaError::internal("no recipient in response"))?;
-        Ok((recipient, inner.raw_token))
-    }
-
-    /// # Errors
     /// Returns `DeltaError` if the gRPC call fails.
     pub async fn get_recipient_by_token(
         &self,
@@ -191,31 +102,5 @@ impl DeltaCatalog {
         } else {
             Ok(None)
         }
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails.
-    pub async fn list_recipients(&self) -> Result<Vec<DeltaRecipientEntry>, DeltaError> {
-        let resp = self
-            .client
-            .clone()
-            .delta_list_recipients(DeltaListRecipientsRequest {
-                max_results: 0,
-                page_token: String::new(),
-            })
-            .await?;
-        Ok(resp.into_inner().recipients)
-    }
-
-    /// # Errors
-    /// Returns `DeltaError` if the gRPC call fails.
-    pub async fn drop_recipient(&self, name: &str) -> Result<(), DeltaError> {
-        self.client
-            .clone()
-            .delta_drop_recipient(DeltaDropRecipientRequest {
-                name: name.to_string(),
-            })
-            .await?;
-        Ok(())
     }
 }

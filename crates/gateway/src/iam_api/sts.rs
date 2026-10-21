@@ -139,6 +139,7 @@ async fn get_session_token(call: &Call<'_>) -> IamResult<Response> {
     let secs = duration(call, 900, 129_600, 43_200)?;
     let creds = call.sts.sts.issue_for(
         &format!("{USER_SESSION_PREFIX}{}", call.auth.user_id),
+        &call.auth.tenant,
         USER_SESSION_SCOPE,
         Operation::ReadWrite,
         Duration::from_secs(secs),
@@ -275,6 +276,7 @@ async fn assume_role(call: &Call<'_>) -> IamResult<Response> {
     );
     let creds = call.sts.sts.issue_for(
         &session_arn,
+        &role.tenant,
         "",
         Operation::ReadWrite,
         Duration::from_secs(secs),

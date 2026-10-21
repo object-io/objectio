@@ -457,6 +457,7 @@ impl IcebergCatalog {
             .iceberg_get_table_policy(IcebergGetTablePolicyRequest {
                 namespace_levels: ns_levels,
                 table_name: table_name.to_string(),
+                warehouse: self.warehouse.clone(),
             })
             .await?
             .into_inner();
@@ -483,6 +484,7 @@ impl IcebergCatalog {
                 namespace_levels: ns_levels,
                 table_name: table_name.to_string(),
                 policy_json,
+                warehouse: self.warehouse.clone(),
             })
             .await?;
         Ok(())

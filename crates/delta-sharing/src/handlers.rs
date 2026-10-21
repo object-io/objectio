@@ -12,7 +12,6 @@ use crate::delta_log::{self, DeltaSnapshot};
 use crate::error::DeltaError;
 use crate::presigned_reader::{DEFAULT_LOG_URL_TTL, PresignedHttpReader};
 use crate::types::{
-    AddTableRequest, CreateRecipientRequest, CreateRecipientResponse, CreateShareRequest,
     FileEntry, FileLine, Format, ListSchemasResponse, ListSharesResponse, ListTablesResponse,
     MetadataLine, Protocol, ProtocolLine, Schema, Share, Table, TableMetadata,
     TableVersionResponse,
@@ -29,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Channel;
-use tracing::{error, info};
+use tracing::error;
 
 type Result<T> = std::result::Result<T, DeltaError>;
 
@@ -332,194 +331,6 @@ pub async fn query_table(
         [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
         body,
     ))
-}
-
-// ---- Admin endpoints ----
-
-/// GET /_admin/delta-sharing/shares
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_list_shares(
-    State(state): State<Arc<DeltaState>>,
-) -> Result<Json<serde_json::Value>> {
-    let shares = state.catalog.list_shares_filtered("").await?;
-    let list: Vec<serde_json::Value> = shares
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "comment": s.comment,
-            })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "shares": list })))
-}
-
-/// GET /_admin/delta-sharing/shares/{share}/tables
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_list_share_tables(
-    State(state): State<Arc<DeltaState>>,
-    Path(share): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let tables = state.catalog.list_all_tables_in_share(&share).await?;
-    let list: Vec<serde_json::Value> = tables
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "share": t.share,
-                "schema": t.schema,
-                "name": t.table_name,
-                "table_type": t.table_type,
-            })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "tables": list })))
-}
-
-/// GET /_admin/delta-sharing/recipients
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_list_recipients(
-    State(state): State<Arc<DeltaState>>,
-) -> Result<Json<serde_json::Value>> {
-    let recipients = state.catalog.list_recipients().await?;
-    let list: Vec<serde_json::Value> = recipients
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "name": r.name,
-                "shares": r.shares,
-            })
-        })
-        .collect();
-    Ok(Json(serde_json::json!({ "recipients": list })))
-}
-
-/// POST /_admin/delta-sharing/shares
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_create_share(
-    State(state): State<Arc<DeltaState>>,
-    Json(body): Json<CreateShareRequest>,
-) -> Result<impl IntoResponse> {
-    let share = state
-        .catalog
-        .create_share(&body.name, &body.comment, &body.tenant)
-        .await?;
-    info!("Created delta share '{}'", share.name);
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "name": share.name, "comment": share.comment })),
-    ))
-}
-
-/// POST /_admin/delta-sharing/shares/{share}/tables
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_add_table(
-    State(state): State<Arc<DeltaState>>,
-    Path(share): Path<String>,
-    Json(body): Json<AddTableRequest>,
-) -> Result<impl IntoResponse> {
-    use objectio_proto::metadata::DeltaAddTableRequest;
-    let table = state
-        .catalog
-        .add_table(DeltaAddTableRequest {
-            share: share.clone(),
-            schema: body.schema.clone(),
-            table_name: body.name.clone(),
-            table_type: body.table_type.clone(),
-            bucket: body.bucket.clone(),
-            path: body.path.clone(),
-            warehouse: body.warehouse.clone(),
-            namespace: body.namespace.clone(),
-        })
-        .await?;
-    info!(
-        "Added table '{}.{}' (type={}) to share '{}'",
-        table.schema,
-        table.table_name,
-        if table.table_type.is_empty() {
-            "iceberg"
-        } else {
-            &table.table_type
-        },
-        share
-    );
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "share": table.share,
-            "schema": table.schema,
-            "name": table.table_name,
-            "table_type": table.table_type,
-        })),
-    ))
-}
-
-/// DELETE /_admin/delta-sharing/shares/{share}/schemas/{schema}/tables/{table}
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_remove_table(
-    State(state): State<Arc<DeltaState>>,
-    Path((share, schema, table)): Path<(String, String, String)>,
-) -> Result<impl IntoResponse> {
-    state.catalog.remove_table(&share, &schema, &table).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// DELETE /_admin/delta-sharing/shares/{share}
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_drop_share(
-    State(state): State<Arc<DeltaState>>,
-    Path(share): Path<String>,
-) -> Result<impl IntoResponse> {
-    state.catalog.drop_share(&share).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// POST /_admin/delta-sharing/recipients
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_create_recipient(
-    State(state): State<Arc<DeltaState>>,
-    Json(body): Json<CreateRecipientRequest>,
-) -> Result<impl IntoResponse> {
-    let (recipient, raw_token) = state
-        .catalog
-        .create_recipient(&body.name, body.shares.clone())
-        .await?;
-    info!("Created delta recipient '{}'", recipient.name);
-    Ok((
-        StatusCode::CREATED,
-        Json(CreateRecipientResponse {
-            name: recipient.name,
-            shares: recipient.shares,
-            bearer_token: raw_token,
-        }),
-    ))
-}
-
-/// DELETE /_admin/delta-sharing/recipients/{name}
-///
-/// # Errors
-/// Returns `DeltaError` if the catalog call fails.
-pub async fn admin_drop_recipient(
-    State(state): State<Arc<DeltaState>>,
-    Path(name): Path<String>,
-) -> Result<impl IntoResponse> {
-    state.catalog.drop_recipient(&name).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- Helpers ----
