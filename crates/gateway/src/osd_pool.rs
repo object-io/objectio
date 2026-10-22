@@ -171,7 +171,8 @@ impl OsdPool {
     }
 
     /// A write or delete of `bucket/key` reached the quorum but not every
-    /// copy: queue the key for healing (core/object-metadata-quorum.md).
+    /// copy: meta marks the key's placement group, whose peering and
+    /// recovery bring its copies to agree (core/object-metadata-quorum.md).
     /// Before the caller acknowledges; if meta can't take it, the data is
     /// still durable at quorum and only waits longer to converge.
     pub async fn queue_heal(&self, bucket: &str, key: &str, version_id: &str) {
@@ -1845,15 +1846,9 @@ async fn report_missing_small_shards(
 }
 
 /// How many copies of a key's ObjectMeta a write (or delete) needs
-/// (core/object-metadata-quorum.md): a majority. Every copy until the
-/// cluster is finalized at the level that allows it: a reader from the
-/// release before takes the first copy that answers.
+/// (core/object-metadata-quorum.md): a majority.
 fn meta_write_quorum(copies: usize) -> usize {
-    if objectio_common::version::allows(2) {
-        copies / 2 + 1
-    } else {
-        copies
-    }
+    copies / 2 + 1
 }
 
 /// How many copies a read must hear from: enough to include one that took
@@ -3362,7 +3357,6 @@ mod quorum_tests {
     /// A majority writes, and reads hear from enough copies to overlap it.
     #[test]
     fn the_metadata_quorums() {
-        objectio_common::version::set_active_level(2);
         for (copies, write, read) in [(6, 4, 3), (12, 7, 6), (3, 2, 2), (1, 1, 1)] {
             assert_eq!(meta_write_quorum(copies), write, "{copies} copies");
             assert_eq!(meta_read_quorum(copies), read, "{copies} copies");
@@ -3797,9 +3791,6 @@ mod tests {
     /// alone goes by itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_meta_reads_of_an_osd_share_calls() {
-        objectio_common::version::set_active_level(
-            objectio_common::version::BATCHED_META_READS_LEVEL,
-        );
         let finished = Arc::new(AtomicUsize::new(0));
         let batch_calls = Arc::new(AtomicUsize::new(0));
         let addr = serve(MetaOsd {

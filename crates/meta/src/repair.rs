@@ -1,55 +1,29 @@
-//! Repairer: finds objects that have lost redundancy and restores it.
+//! Repairer: finds stripes that have lost redundancy and restores it.
 //!
-//! An object can be left with fewer than k+m good shards in three ways: a
-//! PUT acknowledged with only some of them written (the write quorum is
-//! k+1), a shard that rotted on disk (found by an OSD's scrubber or a
-//! read), and a disk that was replaced, taking its shards with it. Left
-//! alone, each one is a failure closer to loss.
+//! A key is placed through a placement group (B31): scrubbed there
+//! (`service/scrub.rs`), rebuilt by its recovery (`service/recovery.rs`),
+//! its listing entry kept by its listing peering, and a degraded record of
+//! it marks its PG. What no placement group holds is walked here: block
+//! chunks and packs, recorded in meta's own tables (the only record of
+//! where their shards are).
 //!
-//! Every `--repair-interval-secs` the Raft leader walks every object, a page
-//! of ObjectMetas per OSD at a time, each object once (from the OSD that
-//! counts it in usage). For each erasure-coded stripe it asks the shard
-//! holders, in one `CheckShards` call per OSD per page, whether each shard
-//! is there and intact. A shard that is missing or corrupt, or a position
-//! the ObjectMeta has no location for, is rebuilt from k good shards:
+//! Every `--repair-interval-secs` the Raft leader walks them, a page at a
+//! time. For each erasure-coded stripe it asks the shard holders, in one
+//! `CheckShards` call per OSD per page, whether each shard is there and
+//! intact. A shard that is missing or corrupt, or a position the record
+//! has no location for, is rebuilt from k good shards:
 //!
 //! - in place, on the OSD that should hold it, for a shard it lost or that
-//!   rotted — the ObjectMeta already points there;
-//! - on the position's placement OSD for one that was never written; the
-//!   new location is then added to the ObjectMeta with a compare-and-set,
-//!   so a PUT that replaced the object meanwhile is never rolled back.
+//!   rotted — the record already points there;
+//! - on the position's placement OSD for one that was never written (unless
+//!   that OSD holds another shard of the stripe); the new location is then
+//!   added to the record (every chunk record holding the stripe, or the
+//!   pack's).
 //!
-//! The same walk restores entries missing from Meta's listing index (a
-//! PUT's listing commit that failed while its ObjectMeta landed), so such
-//! objects show up in ListObjects again.
-//!
-//! Block storage chunks are walked too, from meta's own block tables (the
-//! only record of where a chunk's shards are): a lost shard is rebuilt in
-//! place, and one never written is rebuilt on its placement OSD and its
-//! location added to every chunk record holding the stripe.
-//!
-//! A shard is never rebuilt onto an OSD holding another shard of its
-//! stripe: such a position stays missing (degraded) until its placement
-//! names an OSD of its own. A stripe whose shards are all good but two of
-//! them on one OSD (stored so by an earlier release) is spread (B20,
-//! backfill): the extra shard is copied to an active OSD holding none of
-//! the stripe, every ObjectMeta copy and the key's home are moved to it,
-//! and the old copy is deleted once reads that may still use it are done.
-//! A few moves per pass, so a returning OSD is filled without a storm.
-//!
-//! Out of scope here: replicated and LRC stripes, shards on OSDs that do
-//! not answer (they may be rebooting; drain handles OSDs that are gone),
-//! and version entries other than the current one.
-//!
-//! From format level 7 a key placed through a placement group is its
-//! PG's (B31): scrubbed there (`service/scrub.rs`), rebuilt by its
-//! recovery (`service/recovery.rs`), its listing entry kept by its listing
-//! peering, and a degraded record of it marks its PG. What the walk still
-//! checks and rebuilds: block chunks and packs (recorded in meta's own
-//! tables, in no PG), and keys written before placement groups (the
-//! rolling upgrade's: gone in the release after).
+//! Out of scope here: replicated and LRC stripes, and shards on OSDs that
+//! do not answer (they may be rebooting; drain handles OSDs that are gone).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,12 +31,10 @@ use std::time::Duration;
 
 use objectio_proto::metadata::metadata_service_server::MetadataService;
 use objectio_proto::metadata::{
-    CreateObjectRequest, ErasureType, GetPlacementRequest, NodePlacement, ObjectMeta,
-    ShardLocation, StripeMeta,
+    ErasureType, GetPlacementRequest, NodePlacement, ObjectMeta, ShardLocation, StripeMeta,
 };
 use objectio_proto::storage::{
-    CheckShardsRequest, DeleteShardRequest, GetObjectMetaRequest, ListObjectsMetaRequest,
-    PutObjectMetaRequest, ReadShardRequest, ShardId, ShardState, WriteShardRequest,
+    CheckShardsRequest, ReadShardRequest, ShardId, ShardState, WriteShardRequest,
     storage_service_client::StorageServiceClient,
 };
 use tracing::{debug, info, warn};
@@ -70,22 +42,11 @@ use tracing::{debug, info, warn};
 use crate::drain_observer::{checksum_of, open_channel, verified_shard};
 use crate::service::MetaService;
 
-/// ObjectMetas fetched from an OSD per page.
-const PAGE: u32 = 200;
+/// Stripes audited per page.
+const PAGE: usize = 200;
 
 /// Per-RPC timeout. Shard reads and writes move up to 4 MiB.
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Shards moved per pass at most (backfill).
-const MOVES_PER_PASS: usize = 64;
-
-/// How long a moved shard's old copy is kept: a read that fetched the
-/// ObjectMeta before the move may still be reading it.
-const MOVED_GRACE: Duration = Duration::from_secs(2 * 30);
-
-/// Old copies of moved shards, deleted once due: (due, OSD address, shard).
-static MOVED: std::sync::Mutex<Vec<(std::time::Instant, String, ShardId)>> =
-    std::sync::Mutex::new(Vec::new());
 
 /// What the repairer has done since this node started.
 #[derive(Default)]
@@ -95,8 +56,6 @@ struct Stats {
     rebuilt_missing: AtomicU64,
     rebuilt_corrupt: AtomicU64,
     unrecoverable: AtomicU64,
-    listings_restored: AtomicU64,
-    moved: AtomicU64,
     errors: AtomicU64,
     block_stripes: AtomicU64,
     last_pass_ms: AtomicU64,
@@ -110,8 +69,6 @@ static STATS: Stats = Stats {
     rebuilt_missing: AtomicU64::new(0),
     rebuilt_corrupt: AtomicU64::new(0),
     unrecoverable: AtomicU64::new(0),
-    listings_restored: AtomicU64::new(0),
-    moved: AtomicU64::new(0),
     errors: AtomicU64::new(0),
     block_stripes: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
@@ -202,16 +159,6 @@ pub fn render_metrics(out: &mut String) {
             &s.unrecoverable,
         ),
         (
-            "objectio_meta_repair_listings_restored_total",
-            "Listing entries restored for objects missing from ListObjects",
-            &s.listings_restored,
-        ),
-        (
-            "objectio_meta_repair_shards_moved_total",
-            "Shards moved off an OSD holding two of their stripe (backfill)",
-            &s.moved,
-        ),
-        (
             "objectio_meta_repair_errors_total",
             "Repairs that failed and will be retried next pass",
             &s.errors,
@@ -249,52 +196,10 @@ pub fn render_metrics(out: &mut String) {
     );
 }
 
-/// One full pass over every object on every OSD that is not Out.
+/// One full pass over every block chunk stripe and every sealed pack.
 pub async fn pass(meta: &Arc<MetaService>) {
     let started = std::time::Instant::now();
-    release_moved().await;
-    let mut moves = MOVES_PER_PASS;
-    let osds: Vec<([u8; 16], String)> = meta
-        .osd_nodes_snapshot()
-        .into_iter()
-        .filter(|n| n.admin_state != objectio_common::OsdAdminState::Out)
-        .map(|n| (n.node_id, n.address))
-        .collect();
-    for (node_id, address) in osds {
-        let mut cursor = String::new();
-        loop {
-            if !meta.is_raft_leader() {
-                return;
-            }
-            let (page, next) = match list_page(&address, &cursor).await {
-                Ok(p) => p,
-                Err(e) => {
-                    debug!("repair: cannot list {address}: {e}");
-                    break;
-                }
-            };
-            let owned: Vec<ObjectMeta> = page
-                .into_iter()
-                .filter(|o| owner(o) == Some(node_id.as_slice()))
-                .collect();
-            // A key placed through a placement group is its PG's: scrubbed
-            // there (`service/scrub.rs`), rebuilt by its recovery, and its
-            // listing entry kept by its listing peering (B31 phase 4). The
-            // walk audits keys written before placement groups only, the
-            // rolling upgrade's (`core/upgrade-path.md`): delete this and
-            // what serves it in the release after.
-            let others: Vec<ObjectMeta> = owned
-                .into_iter()
-                .filter(|o| meta.key_pg(&o.bucket, &o.key).is_none())
-                .collect();
-            audit(meta, Source::Osd(&address), &others, &mut moves).await;
-            if next.is_empty() {
-                break;
-            }
-            cursor = next;
-        }
-    }
-    for page in meta.block_stripes().chunks(PAGE as usize) {
+    for page in meta.block_stripes().chunks(PAGE) {
         if !meta.is_raft_leader() {
             return;
         }
@@ -302,7 +207,7 @@ pub async fn pass(meta: &Arc<MetaService>) {
         STATS
             .block_stripes
             .fetch_add(objects.len() as u64, Ordering::Relaxed);
-        audit(meta, Source::Block, &objects, &mut 0).await;
+        audit(meta, Source::Block, &objects).await;
     }
     // Packs: their shards are recorded once, in meta's pack table; the
     // objects in them name the pack and hold no shards of their own.
@@ -312,11 +217,11 @@ pub async fn pass(meta: &Arc<MetaService>) {
         .filter(|p| p.sealed)
         .filter_map(pack_object)
         .collect();
-    for page in packs.chunks(PAGE as usize) {
+    for page in packs.chunks(PAGE) {
         if !meta.is_raft_leader() {
             return;
         }
-        audit(meta, Source::Pack, page, &mut 0).await;
+        audit(meta, Source::Pack, page).await;
     }
     STATS.passes.fetch_add(1, Ordering::Relaxed);
     STATS.last_pass_ms.store(
@@ -331,12 +236,10 @@ pub async fn pass(meta: &Arc<MetaService>) {
     );
 }
 
-/// Where the objects being audited are recorded, and so where a rebuilt
+/// Where the stripes being audited are recorded, and so where a rebuilt
 /// shard's new location goes.
 #[derive(Clone, Copy)]
-enum Source<'a> {
-    /// ObjectMetas listed from the OSD at this address, which owns them.
-    Osd(&'a str),
+enum Source {
     /// Block chunk stripes, recorded in meta's block tables.
     Block,
     /// Pack stripes, recorded in meta's pack table.
@@ -374,46 +277,6 @@ fn block_object(stripe: StripeMeta) -> ObjectMeta {
 
 /// Bucket name block chunks are placed under.
 const BLOCK_BUCKET: &str = "__block__";
-
-/// The node that answers for this object: the one that counts it in usage,
-/// or for objects written before that existed, the holder of its first
-/// shard. Walking only the objects a node owns visits each object once.
-fn owner(o: &ObjectMeta) -> Option<&[u8]> {
-    if !o.usage_owner.is_empty() {
-        return Some(&o.usage_owner);
-    }
-    o.stripes
-        .first()
-        .and_then(|s| s.shards.first())
-        .map(|s| s.node_id.as_slice())
-}
-
-/// A page of the ObjectMetas an OSD holds, and the cursor for the next one
-/// (empty after the last page).
-pub(crate) async fn list_page(
-    address: &str,
-    cursor: &str,
-) -> anyhow::Result<(Vec<ObjectMeta>, String)> {
-    let mut client = StorageServiceClient::new(open_channel(address).await?)
-        .max_decoding_message_size(100 * 1024 * 1024);
-    let resp = tokio::time::timeout(
-        RPC_TIMEOUT,
-        client.list_objects_meta(ListObjectsMetaRequest {
-            bucket: String::new(),
-            start_after: cursor.to_string(),
-            max_keys: PAGE,
-            ..Default::default()
-        }),
-    )
-    .await??
-    .into_inner();
-    let next = if resp.is_truncated {
-        resp.next_continuation_token
-    } else {
-        String::new()
-    };
-    Ok((resp.objects, next))
-}
 
 /// Where a shard stands, as far as this pass could tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,14 +329,8 @@ fn repairable(stripe: &StripeMeta) -> bool {
     ec == ErasureType::ErasureMds && stripe.ec_k > 0 && stripe.ec_m > 0 && stripe.pack_id.is_empty()
 }
 
-/// Check `objects`' stripes and repair them; spread doubled-up ones (an
-/// object's own, from an OSD listing) while `moves` lasts.
-async fn audit(
-    meta: &Arc<MetaService>,
-    source: Source<'_>,
-    objects: &[ObjectMeta],
-    moves: &mut usize,
-) -> Vec<bool> {
+/// Check `objects`' stripes and repair them.
+async fn audit(meta: &Arc<MetaService>, source: Source, objects: &[ObjectMeta]) {
     // Every listed shard of every repairable stripe, grouped by node, so
     // each node is asked once for the whole page.
     let mut asks: HashMap<Vec<u8>, Vec<(usize, usize, u32)>> = HashMap::new();
@@ -540,13 +397,12 @@ async fn audit(
     };
     let mut order: Vec<usize> = (0..objects.len()).collect();
     order.sort_by_key(|&oi| spare(oi));
-    let rebuilds: Vec<futures::future::BoxFuture<'_, (usize, bool)>> = order
+    let rebuilds: Vec<futures::future::BoxFuture<'_, ()>> = order
         .into_iter()
         .map(|oi| (oi, &objects[oi]))
         .map(|(oi, object)| {
             async move {
                 STATS.objects.fetch_add(1, Ordering::Relaxed);
-                let mut healthy = true;
                 for (si, stripe) in object.stripes.iter().enumerate() {
                     if !repairable(stripe) {
                         continue;
@@ -561,9 +417,7 @@ async fn audit(
                                 .unwrap_or(Seen::Unknown);
                         }
                     }
-                    let v = verdict(&seen, stripe.ec_k as usize);
-                    healthy &= v == Verdict::Healthy && !seen.contains(&Seen::Unknown);
-                    match v {
+                    match verdict(&seen, stripe.ec_k as usize) {
                         Verdict::Healthy => {}
                         Verdict::Unrecoverable { good } => {
                             STATS.unrecoverable.fetch_add(1, Ordering::Relaxed);
@@ -593,44 +447,15 @@ async fn audit(
                         }
                     }
                 }
-                (oi, healthy)
             }
             .boxed()
         })
         .collect();
     use futures::StreamExt;
-    let done: Vec<(usize, bool)> = futures::stream::iter(rebuilds)
+    futures::stream::iter(rebuilds)
         .buffered(REBUILDS_AT_ONCE)
-        .collect()
+        .collect::<Vec<()>>()
         .await;
-    // Back in the objects' order.
-    let mut healthy = vec![false; objects.len()];
-    for (oi, h) in done {
-        healthy[oi] = h;
-    }
-
-    // Then, in order: backfill (bounded by `moves`) and listings.
-    for (object, &healthy) in objects.iter().zip(&healthy) {
-        let Source::Osd(owner_addr) = source else {
-            continue;
-        };
-        if healthy && *moves > 0 && doubled_up(object) {
-            match spread(meta, owner_addr, object, moves).await {
-                Ok(n) => {
-                    STATS.moved.fetch_add(n as u64, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    STATS.errors.fetch_add(1, Ordering::Relaxed);
-                    warn!("backfill: {}/{}: {e}", object.bucket, object.key);
-                }
-            }
-        }
-        if let Err(e) = restore_listing(meta, owner_addr, object).await {
-            STATS.errors.fetch_add(1, Ordering::Relaxed);
-            warn!("repair: listing for {}/{}: {e}", object.bucket, object.key);
-        }
-    }
-    healthy
 }
 
 /// Wakes the walk before it is due: an OSD came back without the shards
@@ -646,21 +471,12 @@ pub(crate) fn walk_now() {
 /// How often the objects recorded short of shards are worked (B29).
 const DEGRADED_EVERY: Duration = Duration::from_secs(5);
 
-/// Repair the objects recorded as written short of shards (B29), those with
-/// the fewest to spare first. A record goes once its object has every
-/// shard back, or once the key holds another object or none; one that
-/// can't be done yet (an OSD down, too few shards to read) stays for a
-/// later round.
-///
-/// A round works [`DEGRADED_AT_ONCE`] records at a time and stops after
-/// [`DEGRADED_ROUND`]; the next one reads and sorts the list again. A round
-/// used to take the whole list, one record at a time: after a partition
-/// left thousands, an object written meanwhile with nothing to spare waited
-/// 23 minutes behind them, and a drive lost then took it below k (B2 soak
-/// run 11).
+/// Count the objects recorded as written short of shards (B29) and as
+/// lost, and hand each degraded one to its placement group (B31 phase 3a):
+/// its record marks the PG for peering, which recovery acts on, and goes
+/// once the object is whole (recovery forgets it) or the PG has been found
+/// clean since it was made. A record whose PG isn't made yet waits.
 pub async fn work_degraded(meta: &Arc<MetaService>) {
-    use futures::StreamExt;
-
     LOST.store(meta.lost_objects().len() as u64, Ordering::Relaxed);
     let records = meta.degraded_objects();
     DEGRADED.store(records.len() as u64, Ordering::Relaxed);
@@ -676,18 +492,13 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
         Ordering::Relaxed,
     );
 
-    // A key placed through a placement group is its PG's recovery's (B31
-    // phase 3a): its record marks the PG for peering, which recovery acts
-    // on, and goes once the object is whole (recovery forgets it) or the PG
-    // has been found clean since it was made.
-    let (in_pgs, records): (Vec<_>, Vec<_>) = records.into_iter().partition(|(key, _, _)| {
-        key.split_once('/')
-            .is_some_and(|(b, k)| meta.key_pg(b, k).is_some())
-    });
-    for (key, record, bytes) in in_pgs {
+    for (key, record, bytes) in records {
         let Some((bucket, k)) = key.split_once('/') else {
             continue;
         };
+        if meta.key_pg(bucket, k).is_none() {
+            continue;
+        }
         let (pg_id, pool) = meta.listing_pg(bucket, k);
         let clean_since = meta
             .pg_state(&pool, pg_id)
@@ -700,120 +511,6 @@ pub async fn work_degraded(meta: &Arc<MetaService>) {
             meta.mark_key_dirty(bucket, k);
         }
     }
-
-    let started = std::time::Instant::now();
-    let todo = due(&mut DEFERRED.lock(), records, started);
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let mut work = futures::stream::iter(todo)
-        .map(|(key, record, bytes)| {
-            let stop = &stop;
-            async move {
-                // Past the round's time, or no longer leader: what is left
-                // waits for the next round. Nothing started is cut short.
-                if stop.load(Ordering::Relaxed) {
-                    return None;
-                }
-                let done = work_one(meta, &key, &record, bytes).await;
-                Some((key, done))
-            }
-        })
-        .buffer_unordered(DEGRADED_AT_ONCE);
-    while let Some(outcome) = work.next().await {
-        if let Some((key, false)) = outcome {
-            DEFERRED
-                .lock()
-                .insert(key, std::time::Instant::now() + DEGRADED_RETRY_AFTER);
-        }
-        if started.elapsed() >= DEGRADED_ROUND || !meta.is_raft_leader() {
-            stop.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-/// How long a round of degraded objects runs before the list is read and
-/// sorted again: how long a record made meanwhile, however much at risk,
-/// can wait for the round under way.
-const DEGRADED_ROUND: Duration = Duration::from_secs(10);
-
-/// Degraded objects worked at once.
-const DEGRADED_AT_ONCE: usize = 16;
-
-/// A record that wasn't done (an OSD down, a shard still being rebuilt) is
-/// left this long, so a run of them can't hold the front of the list.
-const DEGRADED_RETRY_AFTER: Duration = Duration::from_secs(10);
-
-/// Records left until a later round, and until when.
-static DEFERRED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, std::time::Instant>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// The records due this round, in the order given (most at risk first):
-/// every one not left for later. Deferrals that ran out, or whose record is
-/// gone, are dropped.
-fn due<R, B>(
-    deferred: &mut HashMap<String, std::time::Instant>,
-    records: Vec<(String, R, B)>,
-    now: std::time::Instant,
-) -> Vec<(String, R, B)> {
-    let present: std::collections::HashSet<&str> =
-        records.iter().map(|(k, _, _)| k.as_str()).collect();
-    deferred.retain(|k, until| *until > now && present.contains(k.as_str()));
-    records
-        .into_iter()
-        .filter(|(k, _, _)| !deferred.contains_key(k))
-        .collect()
-}
-
-/// Work one degraded record: true once it is settled (repaired, or its
-/// object gone), false to try it again later.
-async fn work_one(
-    meta: &Arc<MetaService>,
-    key: &str,
-    record: &objectio_proto::metadata::DegradedObject,
-    bytes: Vec<u8>,
-) -> bool {
-    let Some((bucket, k)) = key.split_once('/') else {
-        return true;
-    };
-    let probe = ObjectMeta {
-        bucket: bucket.to_string(),
-        key: k.to_string(),
-        ..Default::default()
-    };
-    let current = match quorum_current(meta, &probe).await {
-        Ok(c) => c,
-        Err(e) => {
-            debug!("repair: degraded {key}: {e}; later");
-            return false;
-        }
-    };
-    let Some(object) = current.filter(|o| o.object_id == record.object_id) else {
-        // Replaced or deleted since: nothing of it to repair.
-        if let Err(e) = meta.forget_degraded(key, bytes).await {
-            debug!("repair: degraded {key}: {e}");
-        }
-        return true;
-    };
-    let Some(owner_addr) = owner(&object).and_then(|n| node_address(meta, n)) else {
-        debug!("repair: degraded {key}: its owner is not registered; later");
-        return false;
-    };
-    let healthy = audit(
-        meta,
-        Source::Osd(&owner_addr),
-        std::slice::from_ref(&object),
-        &mut 0,
-    )
-    .await;
-    if !healthy.first().copied().unwrap_or(false) {
-        // Rebuilt just now (checked again next time), or not yet possible.
-        return false;
-    }
-    info!("repair: {key} has every shard again; no longer degraded");
-    STATS.degraded_repaired.fetch_add(1, Ordering::Relaxed);
-    if let Err(e) = meta.forget_degraded(key, bytes).await {
-        debug!("repair: degraded {key}: {e}");
-    }
-    true
 }
 
 /// Degraded-object records, and the age of the oldest, as last counted.
@@ -876,7 +573,7 @@ async fn check_shards(
 /// where they belong.
 async fn rebuild(
     meta: &Arc<MetaService>,
-    source: Source<'_>,
+    source: Source,
     object: &ObjectMeta,
     stripe: &StripeMeta,
     seen: &[Seen],
@@ -1020,9 +717,6 @@ async fn rebuild(
 
     if !added.is_empty() {
         match source {
-            Source::Osd(owner_addr) => {
-                record_locations(meta, owner_addr, object, stripe.stripe_id, added).await?;
-            }
             Source::Block => {
                 meta.block_add_shard_locations(&object.object_id, &added)
                     .await
@@ -1036,149 +730,6 @@ async fn rebuild(
         }
     }
     Ok(())
-}
-
-/// Whether any of the object's stripes has two shards on one OSD.
-fn doubled_up(object: &ObjectMeta) -> bool {
-    object.stripes.iter().filter(|s| repairable(s)).any(|s| {
-        let mut nodes = std::collections::HashSet::new();
-        s.shards.iter().any(|l| !nodes.insert(l.node_id.as_slice()))
-    })
-}
-
-/// Move the extra shards off OSDs holding two of a stripe to active OSDs
-/// holding none (B20). The object's stripes are all good (checked by the
-/// caller). Each shard is copied first; then every ObjectMeta copy and the
-/// key's home follow; the old copies are deleted after [`MOVED_GRACE`].
-/// Returns the shards moved.
-async fn spread(
-    meta: &Arc<MetaService>,
-    owner_addr: &str,
-    object: &ObjectMeta,
-    budget: &mut usize,
-) -> anyhow::Result<usize> {
-    // (stripe id, the shard's old location, its new one, old OSD's address)
-    let mut moved: Vec<(u64, ShardLocation, ShardLocation, String)> = Vec::new();
-    for stripe in object.stripes.iter().filter(|s| repairable(s)) {
-        let mut holders: std::collections::HashSet<Vec<u8>> =
-            stripe.shards.iter().map(|l| l.node_id.clone()).collect();
-        let mut kept = std::collections::HashSet::new();
-        let mut shards = stripe.shards.clone();
-        shards.sort_by_key(|l| l.position);
-        for old in shards {
-            if kept.insert(old.node_id.clone()) || *budget == 0 {
-                continue;
-            }
-            let Some((to, to_addr)) = meta.spread_target(&object.object_id, &holders) else {
-                break; // every active OSD holds a shard of it already
-            };
-            let from_addr = node_address(meta, &old.node_id).ok_or_else(|| {
-                anyhow::anyhow!("holder of position {} not registered", old.position)
-            })?;
-            let bytes = read_shard(
-                &from_addr,
-                &stripe.object_id,
-                stripe.stripe_id,
-                old.position,
-                old.crc32c,
-            )
-            .await?;
-            let at = write_shard(&to_addr, &stripe.object_id, stripe, old.position, bytes).await?;
-            holders.insert(to.to_vec());
-            *budget -= 1;
-            info!(
-                "backfill: {}/{} stripe {} position {} from {from_addr} to {to_addr}",
-                object.bucket, object.key, stripe.stripe_id, old.position
-            );
-            let new = ShardLocation {
-                node_id: to.to_vec(),
-                disk_id: at.disk_id,
-                offset: at.offset,
-                ..old.clone()
-            };
-            moved.push((stripe.stripe_id, old, new, from_addr));
-        }
-    }
-    if moved.is_empty() {
-        return Ok(0);
-    }
-
-    let changes: Vec<(u64, ShardLocation, ShardLocation)> = moved
-        .iter()
-        .map(|(id, old, new, _)| (*id, old.clone(), new.clone()))
-        .collect();
-    // On failure the new copies are left: some ObjectMeta copies may name
-    // them already. A leak, never a loss.
-    update_locations(meta, owner_addr, object, |fresh| {
-        for (stripe_id, old, new) in changes {
-            let loc = fresh
-                .stripes
-                .iter_mut()
-                .find(|s| s.stripe_id == stripe_id)
-                .and_then(|s| s.shards.iter_mut().find(|l| l.position == old.position))
-                .filter(|l| l.node_id == old.node_id)
-                .ok_or_else(|| anyhow::anyhow!("position {} moved meanwhile", old.position))?;
-            *loc = new;
-        }
-        Ok(())
-    })
-    .await?;
-
-    let due = std::time::Instant::now() + MOVED_GRACE;
-    let mut queue = MOVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let stripes: HashMap<u64, &StripeMeta> =
-        object.stripes.iter().map(|s| (s.stripe_id, s)).collect();
-    for (stripe_id, old, _, from_addr) in &moved {
-        if let Some(stripe) = stripes.get(stripe_id) {
-            queue.push((
-                due,
-                from_addr.clone(),
-                ShardId {
-                    object_id: stripe.object_id.clone(),
-                    stripe_id: *stripe_id,
-                    position: old.position,
-                },
-            ));
-        }
-    }
-    Ok(moved.len())
-}
-
-/// Delete moved shards' old copies that are due. One that can't be deleted
-/// now is tried again next pass.
-async fn release_moved() {
-    let now = std::time::Instant::now();
-    let due: Vec<(std::time::Instant, String, ShardId)> = {
-        let mut queue = MOVED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (due, later) = queue.drain(..).partition(|(at, ..)| *at <= now);
-        *queue = later;
-        due
-    };
-    for (at, addr, shard) in due {
-        let deleted = async {
-            let mut client = StorageServiceClient::new(open_channel(&addr).await?);
-            tokio::time::timeout(
-                RPC_TIMEOUT,
-                client.delete_shard(DeleteShardRequest {
-                    shard_id: Some(shard.clone()),
-                }),
-            )
-            .await??;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        if let Err(e) = deleted {
-            debug!("backfill: old copy on {addr} not deleted yet: {e}");
-            MOVED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((at, addr, shard));
-        }
-    }
 }
 
 /// `expected_crc32c`: what the shard's object records (B23); the OSD
@@ -1269,269 +820,9 @@ async fn placement_of(
     Ok(resp.into_inner().nodes)
 }
 
-/// Add rebuilt shards' locations to the object's ObjectMeta on every node
-/// that holds a copy — only if the key still holds this object.
-async fn record_locations(
-    meta: &Arc<MetaService>,
-    owner_addr: &str,
-    object: &ObjectMeta,
-    stripe_id: u64,
-    added: Vec<ShardLocation>,
-) -> anyhow::Result<()> {
-    update_locations(meta, owner_addr, object, |fresh| {
-        let stripe = fresh
-            .stripes
-            .iter_mut()
-            .find(|s| s.stripe_id == stripe_id)
-            .ok_or_else(|| anyhow::anyhow!("stripe {stripe_id} is gone"))?;
-        for loc in added {
-            if stripe.shards.iter().all(|l| l.position != loc.position) {
-                stripe.shards.push(loc);
-            }
-        }
-        stripe.shards.sort_by_key(|l| l.position);
-        Ok(())
-    })
-    .await
-}
-
-/// Change where the object's shards are, with `edit`, in its ObjectMeta on
-/// every node that holds a copy (and every node that holds a shard after
-/// the change) — only if the key still holds this object.
-async fn update_locations(
-    meta: &Arc<MetaService>,
-    owner_addr: &str,
-    object: &ObjectMeta,
-    edit: impl FnOnce(&mut ObjectMeta) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    // The object as a read takes it, from a quorum of its copies. Read
-    // from the owner's copy alone, an object whose owner missed its write
-    // (down while it was written, its heal not yet done) was "gone" to
-    // every repair of it, and its record waited forever (soak run 16).
-    let Some(mut fresh) = quorum_current(meta, object).await? else {
-        return Err(anyhow::anyhow!("object is gone"));
-    };
-    if fresh.object_id != object.object_id {
-        return Err(anyhow::anyhow!("object was replaced meanwhile"));
-    }
-    edit(&mut fresh)?;
-
-    // Every copy: the key's placement, plus anyone holding a shard.
-    let mut targets: BTreeSet<String> = placement_of(meta, object)
-        .await?
-        .into_iter()
-        .map(|n| n.node_address)
-        .collect();
-    for s in &fresh.stripes {
-        for l in &s.shards {
-            if let Some(a) = node_address(meta, &l.node_id) {
-                targets.insert(a);
-            }
-        }
-    }
-    // An update of what was read: ordered after its other updates, the same
-    // on every copy; its stamp stays, so a newer object still wins.
-    fresh.update_stamp = objectio_common::stamp::CLOCK.next_after(fresh.update_stamp);
-    let mut stored_on_owner = false;
-    for addr in targets {
-        let req = PutObjectMetaRequest {
-            bucket: fresh.bucket.clone(),
-            key: fresh.key.clone(),
-            object: Some(fresh.clone()),
-            versioning_enabled: false,
-            expected_object_id: fresh.object_id.clone(),
-            // A copy that missed the write gets it: a quorum holds it. A
-            // copy that took a delete since keeps it: its tombstone refuses
-            // an object stamped before it, so nothing deleted comes back.
-            require_existing: false,
-            version_only: false,
-            keep_newer_current: false,
-            replication_update: false,
-            replication_set: std::collections::HashMap::new(),
-            shard: None,
-            pg: None,
-        };
-        let result = async {
-            let mut client = StorageServiceClient::new(open_channel(&addr).await?);
-            tokio::time::timeout(RPC_TIMEOUT, client.put_object_meta(req)).await??;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        match result {
-            Ok(()) => stored_on_owner |= addr == owner_addr,
-            // A copy that no longer holds this object, or a node that is
-            // down: the next pass looks again.
-            Err(e) => debug!("repair: ObjectMeta update on {addr}: {e}"),
-        }
-    }
-    if stored_on_owner {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("could not update the owner's ObjectMeta"))
-    }
-}
-
-/// Meta's listing entry for `object`.
-async fn list(meta: &Arc<MetaService>, object: &ObjectMeta) -> anyhow::Result<()> {
-    // Restored only when a read quorum of its placement found it current
-    // (`restore_listing`): from level 7 that is its placement group.
-    let (pg_id, pool) = meta.listing_pg(&object.bucket, &object.key);
-    MetadataService::create_object(
-        meta.as_ref(),
-        tonic::Request::new(CreateObjectRequest {
-            bucket: object.bucket.clone(),
-            key: object.key.clone(),
-            size: object.size,
-            content_type: object.content_type.clone(),
-            etag: object.etag.clone(),
-            user_metadata: object.user_metadata.clone(),
-            stripes: object.stripes.clone(),
-            object_id: object.object_id.clone(),
-            pg_id,
-            pool,
-            ..Default::default()
-        }),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("create_object: {e}"))?;
-    Ok(())
-}
-
-/// The key's current object as a read quorum of its copies has it, as a
-/// GET reads it (objectio-docs core/object-metadata-quorum.md): the newest
-/// object, unless a tombstone is newer. `None`: deleted, or absent. An
-/// error when fewer than a read quorum answer.
-async fn quorum_current(
-    meta: &Arc<MetaService>,
-    object: &ObjectMeta,
-) -> anyhow::Result<Option<ObjectMeta>> {
-    let mut addrs: Vec<String> = Vec::new();
-    let mut seen_nodes: Vec<Vec<u8>> = Vec::new();
-    for n in placement_of(meta, object).await? {
-        if !seen_nodes.contains(&n.node_id) {
-            seen_nodes.push(n.node_id.clone());
-            addrs.push(n.node_address);
-        }
-    }
-    let copies = addrs.len();
-    let read_quorum = copies - (copies / 2 + 1) + 1;
-    let asks = addrs.iter().map(|addr| async move {
-        let mut client = StorageServiceClient::new(open_channel(addr).await?)
-            .max_decoding_message_size(100 * 1024 * 1024);
-        let resp = tokio::time::timeout(
-            RPC_TIMEOUT,
-            client.get_object_meta(GetObjectMetaRequest {
-                bucket: object.bucket.clone(),
-                key: object.key.clone(),
-                version_id: String::new(),
-                with_small_shard: false,
-            }),
-        )
-        .await??
-        .into_inner();
-        Ok::<_, anyhow::Error>((resp.object.filter(|_| resp.found), resp.tombstone_stamp))
-    });
-    let mut answered = 0;
-    let mut newest: Option<ObjectMeta> = None;
-    let mut deleted_at = 0u64;
-    for answer in futures::future::join_all(asks).await.into_iter().flatten() {
-        answered += 1;
-        deleted_at = deleted_at.max(answer.1);
-        if let Some(o) = answer.0
-            && newest
-                .as_ref()
-                .is_none_or(|n| o.write_order() > n.write_order())
-        {
-            newest = Some(o);
-        }
-    }
-    if answered < read_quorum {
-        return Err(anyhow::anyhow!(
-            "{answered} of {copies} copies answered, need {read_quorum}"
-        ));
-    }
-    Ok(newest.filter(|o| deleted_at == 0 || deleted_at < o.stamp))
-}
-
-/// Put an object missing from Meta's listing index back, so ListObjects
-/// shows it: only if a read quorum of its copies has it as the current
-/// object, as a GET would. Checked against the owner alone it listed
-/// objects deleted moments before (a copy that missed or hadn't yet taken
-/// the delete; the B2 soak). And checked again after, in case a delete
-/// landed in between: then the entry goes again.
-async fn restore_listing(
-    meta: &Arc<MetaService>,
-    _owner_addr: &str,
-    object: &ObjectMeta,
-) -> anyhow::Result<()> {
-    if object.is_delete_marker || meta.object_listed(&object.bucket, &object.key) {
-        return Ok(());
-    }
-    let is_current = |c: &Option<ObjectMeta>| {
-        c.as_ref()
-            .is_some_and(|c| c.object_id == object.object_id && !c.is_delete_marker)
-    };
-    if !is_current(&quorum_current(meta, object).await?) {
-        return Ok(());
-    }
-    list(meta, object).await?;
-    // A delete or a replacement may have landed since the check: the entry
-    // follows what is current now.
-    match quorum_current(meta, object).await? {
-        Some(c) if c.object_id == object.object_id && !c.is_delete_marker => {}
-        Some(c) if !c.is_delete_marker => {
-            list(meta, &c).await?;
-            return Ok(());
-        }
-        _ => {
-            MetadataService::delete_object(
-                meta.as_ref(),
-                tonic::Request::new(objectio_proto::metadata::DeleteObjectRequest {
-                    bucket: object.bucket.clone(),
-                    key: object.key.clone(),
-                    version_id: String::new(),
-                }),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("delete_object: {e}"))?;
-            return Ok(());
-        }
-    }
-    STATS.listings_restored.fetch_add(1, Ordering::Relaxed);
-    info!(
-        "repair: restored the listing entry of {}/{}",
-        object.bucket, object.key
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Seen, Verdict, due, verdict};
-    use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_deferred_record_waits_and_the_rest_keep_their_order() {
-        let now = Instant::now();
-        let records = |keys: &[&str]| -> Vec<(String, (), ())> {
-            keys.iter().map(|k| ((*k).to_string(), (), ())).collect()
-        };
-        let mut deferred = HashMap::from([
-            ("b/stuck".to_string(), now + Duration::from_secs(30)),
-            ("b/ran-out".to_string(), now - Duration::from_secs(1)),
-            ("b/gone".to_string(), now + Duration::from_secs(30)),
-        ]);
-        let picked = due(
-            &mut deferred,
-            records(&["b/zero-spare", "b/stuck", "b/ran-out", "b/one-spare"]),
-            now,
-        );
-        let keys: Vec<&str> = picked.iter().map(|(k, _, _)| k.as_str()).collect();
-        assert_eq!(keys, ["b/zero-spare", "b/ran-out", "b/one-spare"]);
-        // Kept: only a deferral still running for a record still there.
-        assert_eq!(deferred.keys().collect::<Vec<_>>(), ["b/stuck"]);
-    }
+    use super::{Seen, Verdict, verdict};
 
     const LOST: Seen = Seen::Lost { corrupt: false };
     const ROT: Seen = Seen::Lost { corrupt: true };

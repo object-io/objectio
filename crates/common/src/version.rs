@@ -12,50 +12,26 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// This binary's format level. Releases before levels existed (v0.4.0 and
-/// earlier) are not supported at all: a cluster on one is reinstalled, not
-/// upgraded, and a client that declares no level is refused.
+/// This binary's format level.
 ///
-/// | Level | Adds |
-/// |---|---|
-/// | 1 | format levels (v0.5.0) |
-/// | 2 | object metadata at quorum: an ObjectMeta write succeeds at the write quorum, so a copy may lag (objectio-docs `core/object-metadata-quorum.md`); readers must take the newest copy |
-/// | 3 | the IAM API: paths on users, groups, roles and policies; role and policy ids; group renames; inline policies (meta table `iam_inline_policies`) |
-/// | 4 | meta's Raft log in files of its own, not in its database (objectio-docs `core/meta-log.md`): a meta node of the previous release would find its log empty |
-/// | 5 | small shards kept in the OSD's metadata records, not disk blocks (objectio-docs `core/small-object-path.md`): an OSD of the previous release can't read them |
-/// | 6 | multipart uploads kept, marked as being completed, until their object is stored: a meta node of the previous release would take one for open and let an abort free the parts of a stored object |
-/// | 7 | every key placed through a placement group whose acting set and epoch are committed before use (objectio-docs `core/pg-recovery.md`, B31): a meta node of the previous release would place the default pool's keys elsewhere |
-/// | 8 | meta's group commit: several writes in one Raft entry (`MetaCommand::Batch`, objectio-docs `core/meta-log.md`); a gateway's metadata reads of an OSD several to a call (`GetObjectMetas`); an OSD's index values split to fit the index file's pages (`core/small-object-path.md`): a meta node of the previous release can't decode the first, an OSD of it doesn't answer the second and would read the first part of a split value alone |
-/// | 9 | users bound to the OIDC issuer and subject of the single sign-on that created them: a meta node of the previous release would drop the binding, and the user could no longer sign on |
-/// | 10 | roles on the services' certificates (objectio-docs `operations-guide/administration/mtls.md`): under mTLS each call between the services is checked against its peer's role, and a certificate of the previous release names none |
+/// Level 8 is the **baseline**: 0.1.0-rc.1, the first release, ran at it,
+/// and no binary runs below it ([`MIN_LEVEL`]). What levels 1 to 8 added
+/// (development builds before 0.1.0 ran at those) is how every supported
+/// release works: format levels and version reports; object metadata at
+/// quorum; the IAM API's paths and ids; meta's Raft log in files of its
+/// own; small shards in the OSDs' metadata records; multipart completions
+/// kept until their object is stored; every key placed through a placement
+/// group; meta's group commit, metadata reads of an OSD several to a call,
+/// and index values split to fit the index file's pages. A cluster on a
+/// development build is reinstalled, not upgraded, and a client that
+/// declares no level is refused.
+///
+/// | Level | Release | Adds |
+/// |---|---|---|
+/// | 8 | 0.1.0-rc.1 | the baseline |
+/// | 9 | 0.1.0-rc.2 | users bound to the OIDC issuer and subject of the single sign-on that created them: a meta node of the previous release would drop the binding, and the user could no longer sign on |
+/// | 10 | 0.1.0-rc.2 | roles on the services' certificates (objectio-docs `operations-guide/administration/mtls.md`): under mTLS each call between the services is checked against its peer's role, and a certificate of the previous release names none |
 pub const FORMAT_LEVEL: u32 = 10;
-
-/// The level from which small shards are kept in the OSDs' metadata
-/// records and sent with their object's metadata (B21).
-pub const SMALL_SHARDS_LEVEL: u32 = 5;
-
-/// The level from which a multipart completion is two-phase: meta keeps the
-/// upload, marked as being completed, until the gateway settles it.
-pub const COMPLETED_UPLOADS_LEVEL: u32 = 6;
-
-/// The level from which every key is placed through a placement group
-/// (B31): the default pool has PGs, acting sets are committed with an
-/// epoch before use, and OSDs refuse requests placed under an older epoch.
-/// Keys written before it keep the placement they were written with.
-pub const PG_PLACEMENT_LEVEL: u32 = 7;
-
-/// The level from which meta commits the writes that arrive while one is
-/// being committed together, in one Raft entry (`MetaCommand::Batch`).
-pub const BATCHED_WRITES_LEVEL: u32 = 8;
-
-/// The level from which a gateway sends its concurrent metadata reads of
-/// an OSD in one call (`GetObjectMetas`).
-pub const BATCHED_META_READS_LEVEL: u32 = 8;
-
-/// The level from which an OSD splits a value of its index that is just
-/// past a power of two, to fit the index file's pages (a small shard of a
-/// 64 KiB object took twice its size).
-pub const SPLIT_INDEX_VALUES_LEVEL: u32 = 8;
 
 /// The level from which a single sign-on creates a user bound to the
 /// token's issuer and subject, and is mapped only to that user. Before it,
@@ -72,9 +48,10 @@ pub const PEER_ROLES_LEVEL: u32 = 10;
 /// block (B21): a 64 KiB object's shards with 4+2.
 pub const SMALL_SHARD_MAX: usize = 16 * 1024;
 
-/// The lowest active level this binary can run in: it reads every format
-/// from this level up.
-pub const MIN_LEVEL: u32 = 1;
+/// The lowest active level this binary can run in, the baseline: it reads
+/// every format from this level up, and refuses to start in, or join, a
+/// cluster below it.
+pub const MIN_LEVEL: u32 = 8;
 
 /// The release, as tagged (`v` + the workspace version).
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
@@ -121,8 +98,10 @@ pub fn incompatibility(active: u32) -> Option<String> {
         ))
     } else if MIN_LEVEL > active {
         Some(format!(
-            "this binary (release {RELEASE}) needs the cluster at format level {MIN_LEVEL} or \
-             above, and it is at {active}: upgrade through the releases in between first"
+            "this binary (release {RELEASE}) runs in a cluster at format level {MIN_LEVEL} \
+             (0.1.0-rc.1) or above, and this one is at {active}: a development build from \
+             before 0.1.0, which can't be upgraded. Install this release fresh and copy the \
+             data across"
         ))
     } else {
         None
@@ -169,5 +148,16 @@ mod tests {
         assert!(incompatibility(FORMAT_LEVEL).is_none());
         assert!(incompatibility(MIN_LEVEL).is_none());
         assert!(incompatibility(FORMAT_LEVEL + 1).is_some());
+    }
+
+    #[test]
+    fn a_cluster_below_the_baseline_is_refused_saying_why() {
+        assert_eq!(MIN_LEVEL, 8, "the baseline: 0.1.0-rc.1's level");
+        assert!(incompatibility(8).is_none(), "0.1.0-rc.1's level");
+        for below in 1..MIN_LEVEL {
+            let why = incompatibility(below).expect("a level below the baseline");
+            assert!(why.contains("development build"), "{why}");
+            assert!(why.contains(&format!("at {below}")), "{why}");
+        }
     }
 }

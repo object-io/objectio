@@ -337,9 +337,6 @@ impl MetaService {
             return Err(Status::invalid_argument("display_name is required"));
         }
         let path = iam_path(&req.path)?;
-        if path != "/" {
-            self.require_level(LEVEL_IAM_API, "a user path")?;
-        }
 
         let federated = !req.federated_issuer.is_empty() || !req.federated_subject.is_empty();
         if federated {
@@ -929,9 +926,6 @@ impl MetaService {
             return Err(Status::invalid_argument("group_name is required"));
         }
         let path = iam_path(&req.path)?;
-        if path != "/" {
-            self.require_level(LEVEL_IAM_API, "a group path")?;
-        }
 
         // Unique within its tenant, ignoring case.
         let arn = group_arn(&req.tenant, &path, &req.group_name);
@@ -998,7 +992,6 @@ impl MetaService {
         request: Request<UpdateGroupRequest>,
     ) -> Result<Response<UpdateGroupResponse>, Status> {
         let req = request.into_inner();
-        self.require_level(LEVEL_IAM_API, "renaming a group")?;
         let old = self
             .groups
             .read()
@@ -1489,9 +1482,6 @@ impl MetaService {
             ));
         }
         let path = iam_path(&req.path)?;
-        if path != "/" || !req.description.is_empty() {
-            self.require_level(LEVEL_IAM_API, "a policy path or description")?;
-        }
         if req.shared && !req.tenant.is_empty() {
             return Err(Status::invalid_argument(
                 "only system policies can be shared",
@@ -1521,11 +1511,7 @@ impl MetaService {
             tenant: req.tenant,
             shared: req.shared,
             path: stored_path(&path),
-            policy_id: if self.active_level() >= LEVEL_IAM_API {
-                iam_id("ANPA")
-            } else {
-                String::new()
-            },
+            policy_id: iam_id("ANPA"),
             description: req.description,
         };
         let bytes = policy.encode_to_vec();
@@ -1915,9 +1901,6 @@ impl MetaService {
         }
         if let Some(path) = req.path {
             let path = iam_path(&path)?;
-            if path != shown_path(&old.path) {
-                self.require_level(LEVEL_IAM_API, "a user path")?;
-            }
             new.path = stored_path(&path);
         }
         // The ARN names the user by path and name, and follows them. The
@@ -2074,9 +2057,6 @@ impl MetaService {
             ));
         }
         let path = iam_path(&role.path)?;
-        if path != "/" {
-            self.require_level(LEVEL_IAM_API, "a role path")?;
-        }
         // Names are unique per tenant, ignoring case (the key keeps the
         // case it was created with).
         let taken = self
@@ -2096,11 +2076,7 @@ impl MetaService {
         let now = Self::current_timestamp();
         role.arn = role_arn(&role.tenant, &path, &role.name);
         role.path = stored_path(&path);
-        role.role_id = if self.active_level() >= LEVEL_IAM_API {
-            iam_id("AROA")
-        } else {
-            String::new()
-        };
+        role.role_id = iam_id("AROA");
         role.created_at = now;
         role.updated_at = now;
         self.cas_one(
@@ -2233,7 +2209,6 @@ impl MetaService {
         request: Request<PutInlinePolicyRequest>,
     ) -> Result<Response<PutInlinePolicyResponse>, Status> {
         let req = request.into_inner();
-        self.require_level(LEVEL_IAM_API, "inline policies")?;
         if !iam_name_ok(&req.name, 128) {
             return Err(Status::invalid_argument(
                 "Policy name: 1 to 128 letters, digits and +=,.@_-",
@@ -2425,7 +2400,7 @@ mod iam_api_tests {
 
     #[tokio::test]
     async fn names_are_case_insensitive_and_the_arn_follows_a_rename() {
-        let (_d, svc) = service(LEVEL_IAM_API);
+        let (_d, svc) = service(objectio_common::version::MIN_LEVEL);
         let alice = user(&svc, "Alice", "/team/").await.unwrap();
         assert_eq!(alice.arn, "arn:objectio:iam::user/team/Alice");
         assert_eq!(alice.path, "/team/");
@@ -2526,22 +2501,8 @@ mod iam_api_tests {
     }
 
     #[tokio::test]
-    async fn what_level_3_adds_waits_for_the_cluster_to_reach_it() {
-        let (_d, svc) = service(2);
-        // The root path is what was always written.
-        user(&svc, "alice", "/").await.unwrap();
-        let pathed = user(&svc, "bob", "/team/").await.unwrap_err();
-        assert_eq!(pathed.code(), tonic::Code::FailedPrecondition);
-        let alice = svc.users.read().values().next().unwrap().user_id.clone();
-        let inline = put_inline(&svc, &format!("user:{alice}"), "p")
-            .await
-            .unwrap_err();
-        assert_eq!(inline.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
     async fn a_deleted_role_takes_its_policies_and_a_new_one_starts_empty() {
-        let (_d, svc) = service(LEVEL_IAM_API);
+        let (_d, svc) = service(objectio_common::version::MIN_LEVEL);
         let role = || RoleObject {
             name: "ci".into(),
             tenant: String::new(),
@@ -2604,7 +2565,7 @@ mod iam_api_tests {
 
     #[tokio::test]
     async fn a_deleted_user_leaves_its_groups_and_policies() {
-        let (_d, svc) = service(LEVEL_IAM_API);
+        let (_d, svc) = service(objectio_common::version::MIN_LEVEL);
         let alice = user(&svc, "alice", "/").await.unwrap();
         let group = svc
             .create_group(Request::new(CreateGroupRequest {
@@ -2643,7 +2604,7 @@ mod iam_api_tests {
 
     #[tokio::test]
     async fn a_group_renamed_keeps_its_id_and_its_arn_follows() {
-        let (_d, svc) = service(LEVEL_IAM_API);
+        let (_d, svc) = service(objectio_common::version::MIN_LEVEL);
         let create = |name: &str| {
             svc.create_group(Request::new(CreateGroupRequest {
                 group_name: name.into(),
@@ -2681,7 +2642,7 @@ mod iam_api_tests {
 
     #[tokio::test]
     async fn only_known_aws_managed_policies_attach() {
-        let (_d, svc) = service(LEVEL_IAM_API);
+        let (_d, svc) = service(objectio_common::version::MIN_LEVEL);
         let alice = user(&svc, "alice", "/").await.unwrap();
         let attach = |name: &str| {
             svc.attach_policy(Request::new(AttachPolicyRequest {

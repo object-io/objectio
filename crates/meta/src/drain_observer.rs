@@ -1,11 +1,12 @@
 //! Drain observer **and** migrator (Phase 3a + 3b).
 //!
-//! From format level 7 (B31) a key placed through a placement group is not
-//! moved here: its PG stands in for an OSD being drained or lost, and
-//! recovery (`service/recovery.rs`) backfills the stand-in. What this moves
+//! A key is placed through a placement group (B31), whose PG stands in for
+//! an OSD being drained or lost, and recovery (`service/recovery.rs`)
+//! backfills the stand-in: such shards are not moved here. What this moves
 //! is what no PG holds: block chunk stripes and packs (recorded in meta's
-//! own tables) and keys written before placement groups. An OSD is
-//! finalised once nothing of those refers to it and no PG holds it.
+//! own tables), and a stripe of a key placed where its PG no longer has the
+//! OSD (a multipart part placed elsewhere). An OSD is finalised once
+//! nothing of those refers to it and no PG holds it.
 //!
 //! Per sweep on the Raft leader, this task:
 //!
@@ -963,18 +964,9 @@ async fn settle_lost(
         if !copy.stripes.iter().any(|s| is_shard_of(s, &mv.shard)) {
             continue;
         }
-        let (addrs, copies) = match meta.key_copy_addrs(&o.bucket, &o.key, draining) {
-            Some(copies) => copies,
-            None => (
-                stripe
-                    .shards
-                    .iter()
-                    .filter(|l| l.node_id.as_slice() != draining.as_slice())
-                    .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
-                    .filter_map(|id| meta.osd_address_by_id(&id))
-                    .collect(),
-                stripe.shards.len(),
-            ),
+        // A key whose placement group isn't known can't be shown lost.
+        let Some((addrs, copies)) = meta.key_copy_addrs(&o.bucket, &o.key, draining) else {
+            return Ok(false);
         };
         let Some(mut object) = newest_copy(&addrs, copies, &o.bucket, &o.key)
             .await?
@@ -1058,27 +1050,10 @@ async fn settle_stale(
         return Ok(false);
     }
     for o in &mv.objects {
-        // Where the key's copies are: its placement group's acting set, or,
-        // for a key placed otherwise (before level 7), the OSDs the stale
-        // copy itself names, which hold any delete's tombstones.
-        let (others, copies) = match meta.key_copy_addrs(&o.bucket, &o.key, draining) {
-            Some(copies) => copies,
-            None => {
-                let Some(stale) = get_object_meta(&o.owner_addr, &o.bucket, &o.key).await? else {
-                    continue; // gone from that copy since: nothing to settle
-                };
-                let Some(stripe) = stale.stripes.iter().find(|s| is_shard_of(s, &mv.shard)) else {
-                    continue; // that copy no longer names this shard
-                };
-                let addrs: Vec<String> = stripe
-                    .shards
-                    .iter()
-                    .filter(|l| l.node_id.as_slice() != draining.as_slice())
-                    .filter_map(|l| <[u8; 16]>::try_from(l.node_id.as_slice()).ok())
-                    .filter_map(|id| meta.osd_address_by_id(&id))
-                    .collect();
-                (addrs, stripe.shards.len())
-            }
+        // Where the key's copies are: its placement group's acting set. A
+        // key whose PG isn't known can't be shown stale: its shard moves.
+        let Some((others, copies)) = meta.key_copy_addrs(&o.bucket, &o.key, draining) else {
+            return Ok(false);
         };
         let (newest, deleted_at) = read_copies(&others, copies, &o.bucket, &o.key).await?;
         if newest

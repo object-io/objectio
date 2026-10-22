@@ -70,10 +70,6 @@ type Entry = openraft::Entry<MetaTypeConfig>;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RaftPersistentState {
     last_applied: Option<LogId<NodeId>>,
-    /// Where the previous release kept the purged log id, with the log in
-    /// redb. Read only to move it to `raft-log/` on the upgrade from that
-    /// release; always `None` after. Remove in the release after this one.
-    last_purged: Option<LogId<NodeId>>,
     membership: StoredMembership<NodeId, Node>,
     /// The previous release's config version counter (the current one is
     /// `config_version` in [`tables::COUNTERS`], which snapshots carry).
@@ -95,21 +91,6 @@ fn decode_counter(b: &[u8]) -> Result<u64, StorageError<NodeId>> {
     })
 }
 
-/// The format level from which a node keeps its Raft log in files of its
-/// own (B25). Before the cluster is finalized at it, the log stays in redb,
-/// where the previous release reads it, so a node can still go back.
-pub const LOG_FILES_LEVEL: u32 = 4;
-
-/// Where the log is.
-enum LogStore {
-    /// In redb's `raft_logs`, the purged log id in `raft_state`: the
-    /// previous release's layout, kept until the cluster is finalized at
-    /// [`LOG_FILES_LEVEL`].
-    Redb,
-    /// In files ([`RaftLog`]).
-    Files(RaftLog),
-}
-
 /// Redb-backed Raft storage for meta.
 ///
 /// Cheap to clone — internally it's an `Arc<Database>`. The openraft
@@ -126,13 +107,8 @@ pub struct MetaRaftStorage {
     listener: Option<tokio::sync::mpsc::UnboundedSender<ApplyEvent>>,
     /// Where snapshots are written while they are built or received.
     snapshot_dir: PathBuf,
-    /// The Raft log: in redb until the cluster is finalized at
-    /// [`LOG_FILES_LEVEL`], in `log_dir`'s files after.
-    log: Arc<parking_lot::Mutex<LogStore>>,
-    log_dir: PathBuf,
-    /// Whether the log may be in files yet: the cluster finalized at
-    /// [`LOG_FILES_LEVEL`] (tests choose).
-    files_allowed: fn() -> bool,
+    /// The Raft log, in its own files (B25).
+    log: Arc<parking_lot::Mutex<RaftLog>>,
     /// Entries applied since the last checkpoint: set after each apply's
     /// commit, cleared as a checkpoint starts.
     dirty: Arc<AtomicBool>,
@@ -143,59 +119,33 @@ pub struct MetaRaftStorage {
 impl MetaRaftStorage {
     /// The storage over a shared redb database, with the log in `log_dir`
     /// and snapshots through files in `snapshot_dir` (both created if
-    /// missing). A log the previous release kept in redb is moved to
-    /// `log_dir` first.
+    /// missing).
     ///
     /// # Errors
-    /// The log can't be opened (I/O, or damage it won't skip), or moved.
+    /// The log can't be opened (I/O, or damage it won't skip), or the
+    /// database still holds a log of its own ([`log_in_database`]).
     pub fn open(
         db: Arc<Database>,
         snapshot_dir: PathBuf,
         log_dir: &Path,
     ) -> Result<Self, StorageError<NodeId>> {
-        // A node that has moved its log keeps it in files from then on (a
-        // crash part way through the move moves it again).
-        let log = if RaftLog::exists(log_dir) {
-            let started = std::time::Instant::now();
-            let mut files = RaftLog::open(log_dir).map_err(read_err)?;
-            crate::commit_metrics::log_opened(started.elapsed());
-            tracing::info!(
-                "Raft log opened in {:.2} s: entries {:?}",
-                started.elapsed().as_secs_f64(),
-                files.range()
-            );
-            move_log_from_redb(&db, &mut files)?;
-            LogStore::Files(files)
-        } else {
-            LogStore::Redb
-        };
+        log_in_database(&db, log_dir)?;
+        let started = std::time::Instant::now();
+        let log = RaftLog::open(log_dir).map_err(read_err)?;
+        crate::commit_metrics::log_opened(started.elapsed());
+        tracing::info!(
+            "Raft log opened in {:.2} s: entries {:?}",
+            started.elapsed().as_secs_f64(),
+            log.range()
+        );
         Ok(Self {
             db,
             listener: None,
             snapshot_dir,
             log: Arc::new(parking_lot::Mutex::new(log)),
-            log_dir: log_dir.to_path_buf(),
-            files_allowed: if cfg!(test) {
-                || true
-            } else {
-                || objectio_common::version::allows(LOG_FILES_LEVEL)
-            },
             dirty: Arc::default(),
             committed: Arc::default(),
         })
-    }
-
-    /// The log, moved to its files first if the cluster has been finalized
-    /// at [`LOG_FILES_LEVEL`] since it was opened: until then a node may go
-    /// back to the previous release, which reads its log from redb.
-    fn log(&self) -> Result<parking_lot::MutexGuard<'_, LogStore>, StorageError<NodeId>> {
-        let mut log = self.log.lock();
-        if matches!(*log, LogStore::Redb) && (self.files_allowed)() {
-            let mut files = RaftLog::open(&self.log_dir).map_err(read_err)?;
-            move_log_from_redb(&self.db, &mut files)?;
-            *log = LogStore::Files(files);
-        }
-        Ok(log)
     }
 
     /// Attach an apply-event listener. The state machine will send one
@@ -229,12 +179,10 @@ impl MetaRaftStorage {
             return Err(write_err(e));
         }
         let committed = *self.committed.lock();
-        if committed.is_some()
-            && let LogStore::Files(log) = &*self.log.lock()
-        {
+        if committed.is_some() {
             let bytes = serde_json::to_vec(&committed).map_err(|e| encode_err("committed", e))?;
             // Not synced: a lost one costs only a later re-apply.
-            log.save_committed(&bytes).map_err(write_err)?;
+            self.log.lock().save_committed(&bytes).map_err(write_err)?;
         }
         Ok(true)
     }
@@ -425,69 +373,26 @@ fn config_event(key: &str, new_value: Option<Vec<u8>>) -> ApplyEvent {
     }
 }
 
-/// The upgrade from the previous release, which kept the log in redb
-/// (`raft_logs`, and `last_purged` in `raft_state`): move it to the log
-/// files, then empty the table in one durable commit. A crash in between
-/// moves it again: the files are rewritten while the table holds entries.
-/// Remove in the release after this one.
-fn move_log_from_redb(db: &Database, log: &mut RaftLog) -> Result<(), StorageError<NodeId>> {
-    let mut state = {
-        let txn = db.begin_read().map_err(read_err)?;
-        match txn.open_table(tables::RAFT_STATE) {
-            Ok(t) => match t.get("state").map_err(read_err)? {
-                Some(v) => serde_json::from_slice::<RaftPersistentState>(v.value())
-                    .map_err(|e| decode_err("raft_state", e))?,
-                None => RaftPersistentState::default(),
-            },
-            Err(redb::TableError::TableDoesNotExist(_)) => RaftPersistentState::default(),
-            Err(e) => return Err(read_err(e)),
-        }
-    };
-    let has_table = {
-        let txn = db.begin_read().map_err(read_err)?;
-        match txn.open_table(tables::RAFT_LOGS) {
-            Ok(_) => true,
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(read_err(e)),
-        }
-    };
-    if !has_table && state.last_purged.is_none() {
-        return Ok(());
+/// Refuse a database that still holds a Raft log of its own (`raft_logs`):
+/// one from a development build before format level 8, which kept its log
+/// there, or from a 0.1.0-rc.2 meta node of a cluster that never finished
+/// setting up (no OSD ever registered), which keeps it there until then.
+/// Opened with an empty log beside it, the node would lose entries it
+/// acknowledged.
+fn log_in_database(db: &Database, log_dir: &Path) -> Result<(), StorageError<NodeId>> {
+    use redb::TableHandle;
+    let txn = db.begin_read().map_err(read_err)?;
+    let tables = txn.list_tables().map_err(read_err)?;
+    if tables.into_iter().any(|t| t.name() == "raft_logs") {
+        return Err(read_err(std::io::Error::other(format!(
+            "this meta node's Raft log is in its database, not in {}: it was written by a \
+             development build from before 0.1.0, or by 0.1.0-rc.2 in a cluster no OSD has \
+             joined yet. Upgrade from 0.1.0-rc.2 once an OSD has registered (that moves the \
+             log); a development build's cluster is reinstalled, not upgraded",
+            log_dir.display()
+        ))));
     }
-    tracing::info!("moving the Raft log from the database to its own files (B25)");
-    log.clear().map_err(write_err)?;
-    if let Some(purged) = state.last_purged {
-        let caller = serde_json::to_vec(&Some(purged)).map_err(|e| encode_err("purged", e))?;
-        log.record_purge(purged.index, &caller).map_err(write_err)?;
-        log.purge_upto(purged.index).map_err(write_err)?;
-    }
-    if has_table {
-        let txn = db.begin_read().map_err(read_err)?;
-        let table = txn.open_table(tables::RAFT_LOGS).map_err(read_err)?;
-        let mut batch = Vec::new();
-        let mut moved = 0u64;
-        for row in table.iter().map_err(read_err)? {
-            let (k, v) = row.map_err(read_err)?;
-            let entry: Entry =
-                serde_json::from_slice(v.value()).map_err(|e| decode_err("raft_logs entry", e))?;
-            batch.push((k.value(), entry.log_id.leader_id.term, v.value().to_vec()));
-            if batch.len() == 10_000 {
-                log.append(&batch).map_err(write_err)?;
-                moved += batch.len() as u64;
-                batch.clear();
-            }
-        }
-        log.append(&batch).map_err(write_err)?;
-        moved += batch.len() as u64;
-        tracing::info!("moved {moved} Raft log entries");
-    }
-    let txn = db.begin_write().map_err(write_err)?;
-    if has_table {
-        txn.delete_table(tables::RAFT_LOGS).map_err(write_err)?;
-    }
-    state.last_purged = None;
-    write_state(&txn, &state)?;
-    crate::commit_metrics::commit(txn, Commit::Durable).map_err(write_err)
+    Ok(())
 }
 
 /// Write `state` (`last_applied`, the config version, membership) into
@@ -688,22 +593,7 @@ impl RaftLogReader<MetaTypeConfig> for MetaRaftStorage {
             std::ops::Bound::Unbounded => u64::MAX,
         };
 
-        let records = match &*self.log()? {
-            LogStore::Files(log) => log.read(start, end).map_err(read_err)?,
-            LogStore::Redb => {
-                let txn = self.db.begin_read().map_err(read_err)?;
-                let table = match txn.open_table(tables::RAFT_LOGS) {
-                    Ok(t) => t,
-                    Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-                    Err(e) => return Err(read_err(e)),
-                };
-                table
-                    .range(start..end)
-                    .map_err(read_err)?
-                    .map(|row| row.map(|(_, v)| v.value().to_vec()).map_err(read_err))
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-        };
+        let records = self.log.lock().read(start, end).map_err(read_err)?;
         records
             .iter()
             .map(|b| serde_json::from_slice(b).map_err(|e| decode_err("raft log entry", e)))
@@ -1095,39 +985,16 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<MetaTypeConfig>, StorageError<NodeId>> {
-        let log = self.log()?;
-        let (last_purged_log_id, last) = match &*log {
-            LogStore::Files(log) => {
-                let purged: Option<LogId<NodeId>> = log
-                    .purged()
-                    .map_err(read_err)?
-                    .map(|b| {
-                        serde_json::from_slice(&b).map_err(|e| decode_err("raft log purged", e))
-                    })
-                    .transpose()?
-                    .flatten();
-                let last = match log.range() {
-                    Some((_, last)) => log.read(last, last + 1).map_err(read_err)?.pop(),
-                    None => None,
-                };
-                (purged, last)
-            }
-            LogStore::Redb => {
-                let purged = self.load_state()?.last_purged;
-                let txn = self.db.begin_read().map_err(read_err)?;
-                let last = match txn.open_table(tables::RAFT_LOGS) {
-                    Ok(t) => t
-                        .iter()
-                        .map_err(read_err)?
-                        .next_back()
-                        .transpose()
-                        .map_err(read_err)?
-                        .map(|(_, v)| v.value().to_vec()),
-                    Err(redb::TableError::TableDoesNotExist(_)) => None,
-                    Err(e) => return Err(read_err(e)),
-                };
-                (purged, last)
-            }
+        let log = self.log.lock();
+        let last_purged_log_id: Option<LogId<NodeId>> = log
+            .purged()
+            .map_err(read_err)?
+            .map(|b| serde_json::from_slice(&b).map_err(|e| decode_err("raft log purged", e)))
+            .transpose()?
+            .flatten();
+        let last = match log.range() {
+            Some((_, last)) => log.read(last, last + 1).map_err(read_err)?.pop(),
+            None => None,
         };
         let last_log_id = match last {
             Some(bytes) => Some(
@@ -1152,10 +1019,7 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        let guard = self.log()?;
-        let LogStore::Files(log) = &*guard else {
-            return Ok(None); // saved only beside the log's files
-        };
+        let log = self.log.lock();
         let Some(bytes) = log.committed().map_err(read_err)? else {
             return Ok(None);
         };
@@ -1184,79 +1048,28 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                     .map_err(|err| encode_err("raft log entry", err))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        match &mut *self.log()? {
-            // Synced before it returns.
-            LogStore::Files(log) => log.append(&records).map_err(write_err),
-            LogStore::Redb => {
-                let txn = self.db.begin_write().map_err(write_err)?;
-                {
-                    let mut t = txn.open_table(tables::RAFT_LOGS).map_err(write_err)?;
-                    for (index, _, bytes) in &records {
-                        t.insert(*index, bytes.as_slice()).map_err(write_err)?;
-                    }
-                }
-                crate::commit_metrics::commit(txn, Commit::Durable).map_err(write_err)
-            }
-        }
+        // Synced before it returns.
+        self.log.lock().append(&records).map_err(write_err)
     }
 
     async fn delete_conflict_logs_since(
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
-        match &mut *self.log()? {
-            LogStore::Files(log) => log.truncate_from(log_id.index).map_err(write_err),
-            LogStore::Redb => {
-                let txn = self.db.begin_write().map_err(write_err)?;
-                {
-                    let mut t = txn.open_table(tables::RAFT_LOGS).map_err(write_err)?;
-                    let indices: Vec<u64> = t
-                        .range(log_id.index..)
-                        .map_err(write_err)?
-                        .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                        .collect();
-                    for idx in indices {
-                        t.remove(idx).map_err(write_err)?;
-                    }
-                }
-                crate::commit_metrics::commit(txn, Commit::Durable).map_err(write_err)
-            }
-        }
+        self.log
+            .lock()
+            .truncate_from(log_id.index)
+            .map_err(write_err)
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Never purge past the durable state machine: a crash would roll
         // `last_applied` back below entries no longer in the log.
         self.checkpoint()?;
-        match &mut *self.log()? {
-            LogStore::Files(log) => {
-                let caller =
-                    serde_json::to_vec(&Some(log_id)).map_err(|e| encode_err("purged", e))?;
-                log.record_purge(log_id.index, &caller).map_err(write_err)?;
-                log.purge_upto(log_id.index).map_err(write_err)
-            }
-            LogStore::Redb => {
-                let txn = self.db.begin_write().map_err(write_err)?;
-                {
-                    let mut t = txn.open_table(tables::RAFT_LOGS).map_err(write_err)?;
-                    let indices: Vec<u64> = t
-                        .range(..=log_id.index)
-                        .map_err(write_err)?
-                        .filter_map(|r| r.ok().map(|(k, _)| k.value()))
-                        .collect();
-                    for idx in indices {
-                        t.remove(idx).map_err(write_err)?;
-                    }
-                }
-                // With the entries, in the same transaction: purged entries
-                // that a crash left recorded as still there would be asked
-                // for, and missed.
-                let mut state = self.load_state()?;
-                state.last_purged = Some(log_id);
-                write_state(&txn, &state)?;
-                crate::commit_metrics::commit(txn, Commit::Durable).map_err(write_err)
-            }
-        }
+        let caller = serde_json::to_vec(&Some(log_id)).map_err(|e| encode_err("purged", e))?;
+        let mut log = self.log.lock();
+        log.record_purge(log_id.index, &caller).map_err(write_err)?;
+        log.purge_upto(log_id.index).map_err(write_err)
     }
 
     async fn last_applied_state(
@@ -2160,69 +1973,29 @@ mod tests {
         );
     }
 
-    static FINALIZED: AtomicBool = AtomicBool::new(false);
-
     #[tokio::test]
-    async fn the_log_stays_in_redb_until_finalize_then_moves_to_its_files_once() {
+    async fn a_database_holding_its_own_raft_log_is_refused() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("meta.db");
-        let log_dir = dir.path().join("raft-log");
         {
-            // The previous release: entries 5..=7 in `raft_logs`, 1..=4
-            // purged, recorded in `raft_state`.
             let db = Database::create(&path).unwrap();
             let txn = db.begin_write().unwrap();
             {
-                let mut t = txn.open_table(tables::RAFT_LOGS).unwrap();
-                for i in 5..=7 {
-                    let bytes = serde_json::to_vec(&set_config(i, "x")).unwrap();
-                    t.insert(i, bytes.as_slice()).unwrap();
-                }
+                let def: redb::TableDefinition<u64, &[u8]> =
+                    redb::TableDefinition::new("raft_logs");
+                let mut t = txn.open_table(def).unwrap();
+                let bytes = serde_json::to_vec(&set_config(1, "x")).unwrap();
+                t.insert(1, bytes.as_slice()).unwrap();
             }
-            let state = RaftPersistentState {
-                last_purged: Some(log_id(1, 4)),
-                ..Default::default()
-            };
-            write_state(&txn, &state).unwrap();
             txn.commit().unwrap();
         }
-        let open = || {
-            let db = Database::create(&path).unwrap();
-            let mut s = MetaRaftStorage::open(Arc::new(db), test_snapshot_dir(), &log_dir).unwrap();
-            s.files_allowed = || FINALIZED.load(Ordering::Relaxed);
-            s
+        let db = Database::create(&path).unwrap();
+        let log_dir = dir.path().join("raft-log");
+        let Err(e) = MetaRaftStorage::open(Arc::new(db), test_snapshot_dir(), &log_dir) else {
+            panic!("opened a database whose log is in it");
         };
-        let in_redb = |s: &MetaRaftStorage| {
-            let txn = s.db.begin_read().unwrap();
-            txn.open_table(tables::RAFT_LOGS).is_ok()
-        };
-        async fn check(s: &mut MetaRaftStorage, last: u64) {
-            let state = s.get_log_state().await.unwrap();
-            assert_eq!(state.last_purged_log_id, Some(log_id(1, 4)));
-            assert_eq!(state.last_log_id, Some(log_id(1, last)));
-            let entries = s.try_get_log_entries(5..=last).await.unwrap();
-            assert_eq!(entries.len() as u64, last - 4);
-        }
-
-        // Before finalize: the log stays where the previous release reads
-        // it, appends included, so a node can go back.
-        {
-            let mut s = open();
-            check(&mut s, 7).await;
-            s.append_to_log([set_config(8, "y")]).await.unwrap();
-            check(&mut s, 8).await;
-            assert!(in_redb(&s));
-            assert!(!RaftLog::exists(&log_dir));
-        }
-        // Finalized: the next log call moves it, once.
-        FINALIZED.store(true, Ordering::Relaxed);
-        for _ in 0..2 {
-            let mut s = open();
-            check(&mut s, 8).await;
-            assert!(!in_redb(&s));
-            assert!(RaftLog::exists(&log_dir));
-            assert!(s.load_state().unwrap().last_purged.is_none());
-        }
+        assert!(e.to_string().contains("Raft log is in its database"), "{e}");
+        assert!(!RaftLog::exists(&log_dir), "a log was started beside it");
     }
 
     #[tokio::test]

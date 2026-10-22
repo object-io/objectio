@@ -15,7 +15,7 @@
 //! might be. So the balancer writes only `up`, and recovery
 //! (`service/recovery.rs`) moves the PG: at each position where `up`
 //! differs, acting takes the up member, filled from the member it
-//! replaces. Below format level 7 it does not run at all.
+//! replaces.
 //!
 //! # Tuning knobs (config keys, all optional)
 //!
@@ -164,10 +164,6 @@ async fn sweep_once(meta: &Arc<MetaService>, tuning: &Tuning) -> anyhow::Result<
         debug!("balancer: paused via balancer/paused config");
         return Ok(());
     }
-    if !crate::service::pgs::pg_placement() {
-        return Ok(()); // see "What a move moves"
-    }
-
     let topology = meta.topology_snapshot();
     let active_osds: usize = topology.active_nodes().count();
     if active_osds == 0 {
@@ -262,7 +258,7 @@ fn pg_osd_counts(pg: &PlacementGroup, osd_counts: &HashMap<[u8; 16], usize>) -> 
 }
 
 /// Where the balancer wants the PG: its `up` set, which starts as its
-/// acting set (and is empty in a PG made before level 7).
+/// acting set.
 fn members(pg: &PlacementGroup) -> &[Vec<u8>] {
     if pg.up.is_empty() { &pg.acting } else { &pg.up }
 }

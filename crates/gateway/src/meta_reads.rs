@@ -14,14 +14,9 @@
 //! itself, so nothing waits that wouldn't have. The batcher owns the call:
 //! a reader that stops waiting (its quorum came) cancels nothing (see
 //! [`crate::osd_pool`]'s `closed_by_us`).
-//!
-//! An OSD of the previous release has no `GetObjectMetas`: reads are
-//! batched only once the cluster is finalized at
-//! [`version::BATCHED_META_READS_LEVEL`].
 
 #![allow(clippy::result_large_err)] // tonic::Status, as every gRPC call answers
 
-use objectio_common::version;
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 use objectio_proto::storage::{GetObjectMetaRequest, GetObjectMetaResponse, GetObjectMetasRequest};
 use std::collections::HashMap;
@@ -53,9 +48,9 @@ pub struct MetaReads {
     batchers: Mutex<HashMap<String, mpsc::UnboundedSender<Pending>>>,
 }
 
-/// Where reads of one OSD go: its batcher, once the cluster allows.
+/// Where reads of one OSD go: its batcher.
 #[derive(Clone)]
-pub struct MetaReadsTo(Option<mpsc::UnboundedSender<Pending>>);
+pub struct MetaReadsTo(mpsc::UnboundedSender<Pending>);
 
 impl MetaReadsTo {
     /// `req`, through `client` (the OSD's channel).
@@ -67,18 +62,12 @@ impl MetaReadsTo {
         client: StorageServiceClient<Channel>,
         req: GetObjectMetaRequest,
     ) -> Answer {
-        let Some(batcher) = self.0 else {
-            // In a task of its own, so a copy that answers after the quorum
-            // did is let finish, not cancelled: an answer to a cancelled
-            // call counts towards h2 closing the connection
-            // (`osd_pool::closed_by_us`), and these were thousands a second.
-            return tokio::spawn(single(client, req))
-                .await
-                .unwrap_or_else(|e| Err(Status::internal(format!("metadata read: {e}"))));
-        };
-        // The batcher owns the call: dropping this wait cancels nothing.
+        // The batcher owns the call: dropping this wait cancels nothing (a
+        // copy that answers after the quorum did is let finish: an answer to
+        // a cancelled call counts towards h2 closing the connection,
+        // `osd_pool::closed_by_us`, and these were thousands a second).
         let (tx, rx) = oneshot::channel();
-        batcher
+        self.0
             .send((client, req, tx))
             .map_err(|_| Status::internal("metadata reads stopped"))?;
         rx.await
@@ -108,9 +97,7 @@ async fn single(mut client: StorageServiceClient<Channel>, req: GetObjectMetaReq
 impl MetaReads {
     /// Where reads of the OSD at `address` go.
     pub fn to(&self, address: &str) -> MetaReadsTo {
-        MetaReadsTo(
-            version::allows(version::BATCHED_META_READS_LEVEL).then(|| self.batcher(address)),
-        )
+        MetaReadsTo(self.batcher(address))
     }
 
     fn batcher(&self, address: &str) -> mpsc::UnboundedSender<Pending> {

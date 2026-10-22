@@ -27,7 +27,7 @@ use objectio_meta_store::{
     StoredDataFilter, StoredGroup, StoredUser,
 };
 use objectio_placement::{
-    Crush2, PlacementTemplate, ShardRole,
+    Crush2,
     topology::{ClusterTopology, DiskInfo, FailureDomainInfo, NodeInfo},
 };
 use sha2::{Digest, Sha256};
@@ -2136,10 +2136,6 @@ const ROLES_TABLE: &str = "iam_roles";
 /// [`inline_policy_key`]. Written through `CasTable::Named`.
 const INLINE_POLICIES_TABLE: &str = "iam_inline_policies";
 
-/// Format level that adds IAM paths, role and policy ids, group renames
-/// and inline policies (the IAM API).
-const LEVEL_IAM_API: u32 = 3;
-
 /// Where an inline policy is stored: its principal ("user:<id>",
 /// "group:<id>", "role:<key>"), NUL, its name.
 fn inline_policy_key(principal: &str, name: &str) -> String {
@@ -2240,21 +2236,6 @@ fn iam_id(prefix: &str) -> String {
         .map(|_| char::from(CHARS[rng.gen_range(0..CHARS.len())]))
         .collect();
     format!("{prefix}{tail}")
-}
-
-/// Keys whose ObjectMeta copies may disagree, for gateways to heal
-/// (objectio-docs core/object-metadata-quorum.md): `CasTable::Named`,
-/// keyed by [`heal_key`], each a `HealEntry`.
-const HEAL_TABLE: &str = "heal_queue";
-
-fn heal_key(bucket: &str, key: &str, version_id: &str) -> String {
-    format!("{bucket}\u{0}{key}\u{0}{version_id}")
-}
-
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Small-object packs, by pack id (hex): prost `PackRecord`.
@@ -3062,10 +3043,6 @@ mod multipart_reclaim_tests {
     }
 
     fn two_phase(id: &str, parts: &[u32]) -> CompleteMultipartUploadRequest {
-        // Recorded only at the level every node reads it.
-        objectio_common::version::set_active_level(
-            objectio_common::version::COMPLETED_UPLOADS_LEVEL,
-        );
         CompleteMultipartUploadRequest {
             bucket: "b".into(),
             key: "k".into(),

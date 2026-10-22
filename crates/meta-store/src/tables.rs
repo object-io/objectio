@@ -47,17 +47,17 @@ pub const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
 pub const COUNTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("counters");
 
 // ---- Raft consensus tables ----
-// One row per log index → JSON-encoded openraft::Entry<MetaTypeConfig>.
-// Indexes are contiguous; the low watermark moves forward via purge.
-pub const RAFT_LOGS: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_logs");
+// (The log itself is in files of its own: crate::raft_log.)
 // Single-row table; the row holds the serialized current vote (JSON).
 pub const RAFT_VOTE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_vote");
-// Single-row table: last applied log id + stored membership + last purged
-// log id, JSON-encoded. Written in the same transaction as apply() so
-// recovery after crash never re-applies committed commands.
+// Single-row table: last applied log id + stored membership, JSON-encoded.
+// Written in the same transaction as apply() so recovery after crash never
+// re-applies committed commands.
 pub const RAFT_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_state");
 
-/// Raft's own tables: never written by a command.
+/// Raft's own tables: never written by a command. `raft_logs` is where the
+/// log was before it had files of its own: a database holding it is refused
+/// at open (`raft_storage::log_in_database`), and no command may make it.
 pub const RAFT_TABLES: [&str; 3] = ["raft_logs", "raft_vote", "raft_state"];
 
 // Server pools

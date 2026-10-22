@@ -186,3 +186,73 @@ fn the_active_level_is_not_ordinary_config() {
     let v = ha.clients[0].request("GET", "/_admin/upgrade", &[]).json();
     assert_eq!(v["active_level"], FORMAT_LEVEL, "{v}");
 }
+
+/// Level 8, 0.1.0-rc.1's, is the baseline: no binary runs in a cluster
+/// below it (one only development builds made). A meta node whose store
+/// says the cluster is at 7 stops at start-up, saying why, rather than
+/// serve formats it no longer reads.
+#[test]
+fn a_meta_node_of_a_cluster_below_the_baseline_stops_saying_why() {
+    use objectio_common::version::{ACTIVE_LEVEL_KEY, MIN_LEVEL};
+    use prost::Message;
+
+    let below = MIN_LEVEL - 1;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = redb::Database::create(dir.path().join("meta.redb")).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let config: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("config");
+            let mut t = txn.open_table(config).unwrap();
+            let entry = objectio_proto::metadata::ConfigEntry {
+                key: ACTIVE_LEVEL_KEY.to_string(),
+                value: below.to_string().into_bytes(),
+                updated_at: 1,
+                updated_by: "a development build".into(),
+                version: 1,
+            };
+            t.insert(ACTIVE_LEVEL_KEY, entry.encode_to_vec().as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    let grpc = objectio_e2e::free_port();
+    let log = dir.path().join("meta.log");
+    let mut cmd = std::process::Command::new(objectio_e2e::binary("objectio-meta"));
+    objectio_e2e::tls::apply(&mut cmd, objectio_e2e::tls::META);
+    let mut child = cmd
+        .args([
+            "--node-id",
+            "1",
+            "--listen",
+            &format!("127.0.0.1:{grpc}"),
+            "--raft-advertise",
+            &format!("127.0.0.1:{grpc}"),
+            "--data-dir",
+            &dir.path().display().to_string(),
+            "--metrics-port",
+            &objectio_e2e::free_port().to_string(),
+            "--admin-port",
+            &objectio_e2e::free_port().to_string(),
+            "--ec-k",
+            "4",
+            "--ec-m",
+            "2",
+        ])
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(dir.path().join("meta.err")).unwrap())
+        .spawn()
+        .unwrap();
+    let status = objectio_e2e::await_exit(&mut child, Duration::from_secs(30));
+    let output = std::fs::read_to_string(&log).unwrap_or_default()
+        + &std::fs::read_to_string(dir.path().join("meta.err")).unwrap_or_default();
+    let status = status.unwrap_or_else(|| panic!("meta kept running at level {below}: {output}"));
+    assert_eq!(status.code(), Some(78), "{status}: {output}");
+    assert!(
+        output.contains(&format!("format level {MIN_LEVEL}"))
+            && output.contains(&format!("at {below}"))
+            && output.contains("development build"),
+        "the reason isn't in meta's log: {output}"
+    );
+}

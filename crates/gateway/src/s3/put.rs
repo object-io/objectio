@@ -714,17 +714,19 @@ async fn plan_put(
         return Err(refused);
     }
     let mut meta_client = state.meta_client.clone();
-    // What meta must answer before the data moves, in one call (B21). An
-    // older meta, without it, is asked call by call, as before.
+    // What meta must answer before the data moves, in one call (B21).
     let (pre_encryption, pre_versioning, pre_lock, pre_placement) =
         match write_context(&mut meta_client, bucket, key, size).await {
-            Some(c) => (
+            Ok(c) => (
                 Some(c.encryption),
                 Some(c.versioning),
                 Some(c.object_lock),
-                Some(c.placement),
+                c.placement,
             ),
-            None => (None, None, None, None),
+            Err(e) => {
+                error!("Failed to get the write context: {e}");
+                return Err(meta_failure(&e, "Failed to get the write context"));
+            }
         };
     // SSE: if the request header or bucket default asks for encryption,
     // the body is encrypted before it enters the erasure-coding path.
@@ -753,19 +755,7 @@ async fn plan_put(
         .map_or(version_id, |r| r.version_id.clone());
 
     // Get placement from metadata service
-    let answer = match pre_placement {
-        Some(answer) => answer,
-        None => meta_client
-            .get_placement(GetPlacementRequest {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                size,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-            .map(tonic::Response::into_inner),
-    };
-    let placement = match answer {
+    let placement = match pre_placement {
         Ok(p) => {
             // Where a read of the key, soon after, finds it (B21).
             crate::placement_cache::put(bucket, key, &p);
@@ -1179,15 +1169,13 @@ async fn put_object_placed(
     let mut all_stripes = Vec::with_capacity(num_stripes);
     let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
     // A small object (B21): one stripe whose shards each fit in an OSD's
-    // metadata record, each on an OSD of its own, once the cluster allows
-    // it. Its shards go with its metadata, in the commit: one call and one
-    // flush per OSD.
+    // metadata record, each on an OSD of its own. Its shards go with its
+    // metadata, in the commit: one call and one flush per OSD.
     let mut small: Option<SmallShards> = None;
     let small_object = num_stripes == 1
         && matches!(scheme, crate::stripe::Scheme::Mds { .. })
         && state.rdma.is_none()
         && body.len().div_ceil(scheme.data_shards()) <= state.small_shard_max
-        && objectio_common::version::allows(objectio_common::version::SMALL_SHARDS_LEVEL)
         && placement.nodes.len() == total_shards
         && objectio_proto::stripe::targets(&placement.nodes, total_shards)
             .iter()
@@ -1597,14 +1585,13 @@ struct WriteContext {
 }
 
 /// The bucket's encryption, versioning and object lock and the key's
-/// placement, in one meta call (`GetWriteContext`, B21). `None` if meta
-/// can't answer it (an older release): then each is asked on its own.
+/// placement, in one meta call (`GetWriteContext`, B21).
 async fn write_context(
     meta_client: &mut MetadataServiceClient<Channel>,
     bucket: &str,
     key: &str,
     size: u64,
-) -> Option<WriteContext> {
+) -> Result<WriteContext, tonic::Status> {
     #[allow(clippy::result_large_err)] // tonic::Status, as every call returns
     fn unpack<T: prost::Message + Default>(
         c: Option<objectio_proto::metadata::CallResult>,
@@ -1625,10 +1612,9 @@ async fn write_context(
                 storage_class: "STANDARD".to_string(),
             }),
         })
-        .await
-        .ok()?
+        .await?
         .into_inner();
-    Some(WriteContext {
+    Ok(WriteContext {
         encryption: unpack(r.encryption),
         versioning: unpack(r.versioning),
         object_lock: unpack(r.object_lock),

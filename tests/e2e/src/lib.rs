@@ -722,8 +722,8 @@ impl Cluster {
     /// being bound) fails the start, so it is retried on fresh ports.
     /// Wait until the default pool's placement groups are made (B31): a
     /// key is placed through them, and until they are a PUT is answered
-    /// 503. Meta makes them once enough OSDs are up. A cluster on a
-    /// release before placement groups has none: given up on after a while.
+    /// 503. Meta makes them once enough OSDs are up. Given up on after
+    /// 20 s: what needs the pool then fails on its own, saying so.
     fn wait_default_pool(&self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {

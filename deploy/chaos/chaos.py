@@ -479,7 +479,7 @@ def drive_lost(vm="chaos-5", new=None):
 
 def repair_counters():
     """Meta's repair counters, as a gateway exports them: passes, and
-    shards rebuilt or moved."""
+    shards rebuilt."""
     status, body = http("GET", f"{GW[0]}/metrics", timeout=10)
     if status != 200:
         return None
@@ -488,14 +488,13 @@ def repair_counters():
         name = line.split("{")[0].split(" ")[0]
         if name == "objectio_meta_repair_passes_total":
             passes += int(float(line.rsplit(" ", 1)[1]))
-        elif name in ("objectio_meta_repair_shards_rebuilt_total",
-                      "objectio_meta_repair_shards_moved_total"):
+        elif name == "objectio_meta_repair_shards_rebuilt_total":
             work += int(float(line.rsplit(" ", 1)[1]))
     return passes, work
 
 
 def await_repair_quiet(deadline):
-    """Wait for a whole repair pass that rebuilt and moved nothing. Stopping
+    """Wait for a whole repair pass that rebuilt nothing. Stopping
     OSDs while repair still works would only slow it: a shard can't be
     rebuilt from stopped OSDs."""
     start = None

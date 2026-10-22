@@ -464,11 +464,6 @@ impl DiskIndex {
         // a soak VM, and growing with it). It costs each commit an extra
         // flush, and commits here are one a checkpoint.
         tx.set_quick_repair(true);
-        // Values split to fit a page only once every OSD reads them
-        // (format level 8): an OSD of the previous release would read the
-        // first part alone.
-        let split =
-            objectio_common::version::allows(objectio_common::version::SPLIT_INDEX_VALUES_LEVEL);
         {
             let mut entries = tx.open_table(ENTRIES).map_err(storage_err("checkpoint"))?;
             let mut tails = tx.open_table(TAILS).map_err(storage_err("checkpoint"))?;
@@ -477,7 +472,7 @@ impl DiskIndex {
                 // A rest of the value this replaces goes with it.
                 tails.remove(k).map_err(storage_err("checkpoint"))?;
                 match v {
-                    Some(v) => match split_at(k, v.len()).filter(|_| split) {
+                    Some(v) => match split_at(k, v.len()) {
                         Some(at) => {
                             entries
                                 .insert(k, &v[..at])
@@ -824,9 +819,6 @@ mod tests {
     /// the length of a first part.
     #[test]
     fn split_values_read_whole_and_go_whole() {
-        objectio_common::version::set_active_level(
-            objectio_common::version::SPLIT_INDEX_VALUES_LEVEL,
-        );
         let dir = tempdir().unwrap();
         let idx = open(dir.path());
         let value = |len: usize, seed: u8| -> Vec<u8> {
@@ -881,9 +873,6 @@ mod tests {
     /// their size in the file, not twice it.
     #[test]
     fn small_shards_take_about_their_size_in_the_file() {
-        objectio_common::version::set_active_level(
-            objectio_common::version::SPLIT_INDEX_VALUES_LEVEL,
-        );
         let dir = tempdir().unwrap();
         let idx = open(dir.path());
         let n = 2000u32;

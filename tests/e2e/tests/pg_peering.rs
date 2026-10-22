@@ -254,9 +254,7 @@ fn assert_matches(all: &HashMap<u32, Value>, truth: &BTreeMap<u32, (u64, u64, u6
 }
 
 fn cluster() -> HaCluster {
-    let mut ha = HaCluster::start(1, OSDS, 1);
-    // Nothing heals metadata copies behind peering's back.
-    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let ha = HaCluster::start(1, OSDS, 1);
     let _ = ha.await_leader(Duration::from_secs(30));
     peer_often(&ha);
     // Nor recovers what peering counts (B31 phase 3a acts on it).

@@ -6,8 +6,7 @@
 //! refuses stamped writes (503) while the two differ by more than
 //! [`MAX_SKEW_MS`].
 //!
-//! Until the first comparison, and against a meta that can't tell its time
-//! (an older release, during a rolling upgrade), writes go ahead.
+//! Until the first comparison, writes go ahead.
 
 use objectio_proto::metadata::GetTimeRequest;
 use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
@@ -71,18 +70,11 @@ pub fn spawn(meta: MetadataServiceClient<Channel>) {
         loop {
             let mut client = meta.clone();
             let sent = now_ms();
-            match client.get_time(GetTimeRequest {}).await {
-                Ok(resp) => {
-                    let meta_ms = i64::try_from(resp.into_inner().unix_millis).unwrap_or(0);
-                    record(sent, now_ms(), meta_ms);
-                }
-                // An older meta: no comparison, no refusal.
-                Err(s) if s.code() == tonic::Code::Unimplemented => {
-                    SKEWED.store(false, Ordering::Relaxed);
-                }
-                // Meta unreachable: writes fail on their own; keep the last
-                // comparison.
-                Err(_) => {}
+            // Meta unreachable: writes fail on their own; keep the last
+            // comparison.
+            if let Ok(resp) = client.get_time(GetTimeRequest {}).await {
+                let meta_ms = i64::try_from(resp.into_inner().unix_millis).unwrap_or(0);
+                record(sent, now_ms(), meta_ms);
             }
             tokio::time::sleep(EVERY).await;
         }

@@ -6,7 +6,7 @@
 //!
 //! With small shards kept in metadata (B21) no object up to `PACK_MAX` takes
 //! a block of its own, so there is nothing to pack: these clusters run with
-//! `--small-shard-max 0`, as objects written before level 5 are.
+//! `--small-shard-max 0`, which keeps every shard in a block.
 
 use std::time::{Duration, Instant};
 

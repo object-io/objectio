@@ -54,17 +54,11 @@ impl MetaService {
             .and_then(|s| s.read_object_listing(&listing_key));
         // The placement group the key is placed through (B31): as the
         // gateway placed it, or, for a listing re-synced without one, the
-        // key's own; a key written before level 7 keeps none.
-        let (pg_id, pool) = if !req.pool.is_empty() || !super::pgs::pg_placement() {
-            (req.pg_id, req.pool.clone())
-        } else if expected_bytes
-            .as_deref()
-            .and_then(|b| ObjectListingEntry::decode(b).ok())
-            .is_some_and(|e| e.pool.is_empty())
-        {
-            (0, String::new())
-        } else {
+        // key's own.
+        let (pg_id, pool) = if req.pool.is_empty() {
             self.listing_pg(&req.bucket, &req.key)
+        } else {
+            (req.pg_id, req.pool.clone())
         };
         let entry = ObjectListingEntry {
             bucket: req.bucket.clone(),
@@ -79,10 +73,8 @@ impl MetaService {
             storage_class: "STANDARD".into(),
             user_metadata: req.user_metadata.clone(),
             primary_osd_id,
-            // Gateway carried these from its GetPlacement call. With
-            // pg_id set, ListObjects + GET can resolve osd_ids via a
-            // single PG lookup; without, we fall back to the legacy
-            // per-object CRUSH path.
+            // Gateway carried these from its GetPlacement call:
+            // ListObjects + GET resolve osd_ids via a single PG lookup.
             pg_id,
             pool,
             object_id: req.object_id.clone(),

@@ -2552,6 +2552,7 @@ dependencies = [
  "objectio-common",
  "objectio-proto",
  "parquet",
+ "prost",
  "rcgen",
  "redb",
  "reqwest",
