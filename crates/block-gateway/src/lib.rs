@@ -290,7 +290,7 @@ pub async fn run(
     info!("NBD server on {nbd_addr}");
 
     let svc = service::BlockGatewayService::new(Arc::clone(&state));
-    objectio_proto::transport::server()
+    let grpc = objectio_proto::transport::server()
         .layer(objectio_proto::peer_auth::PeerAuthLayer::new(&[
             objectio_proto::peer_auth::BLOCK_SERVICE,
         ]))
@@ -300,13 +300,16 @@ pub async fn run(
             BlockServiceServer::new(svc)
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
-        )
-        .serve_with_shutdown(grpc_addr, async move {
-            shutdown.await;
-            info!("Shutting down...");
-        })
+        );
+    let listener = tokio::net::TcpListener::bind(grpc_addr)
         .await
-        .context("gRPC server error")?;
+        .with_context(|| format!("bind gRPC on {grpc_addr}"))?;
+    objectio_proto::transport::serve(grpc, listener, async move {
+        shutdown.await;
+        info!("Shutting down...");
+    })
+    .await
+    .context("gRPC server error")?;
 
     // Every acknowledged write is already in the journal, synced. A flush
     // under way is let finish rather than cut off halfway (one cut off is

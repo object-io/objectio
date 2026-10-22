@@ -2457,8 +2457,7 @@ pub(crate) fn meta_failure(e: &tonic::Status) -> Response {
 async fn connect_osd(
     addr: &str,
 ) -> Result<StorageServiceClient<tonic::transport::Channel>, String> {
-    let channel = objectio_proto::transport::endpoint(addr)?
-        .connect()
+    let channel = objectio_proto::transport::connect(&objectio_proto::transport::endpoint(addr)?)
         .await
         .map_err(|e| e.to_string())?;
     Ok(StorageServiceClient::new(channel))

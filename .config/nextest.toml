@@ -1,0 +1,5 @@
+# A test that hangs is ended, and reported as a failure, after 15 minutes
+# (the slowest end-to-end test takes about 6), rather than holding its CI
+# shard until the job's timeout cancels it with nothing to show.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 15 }

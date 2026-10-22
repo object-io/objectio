@@ -2855,6 +2855,7 @@ version = "0.1.0-dev"
 dependencies = [
  "clap",
  "futures",
+ "hyper-util",
  "objectio-common",
  "parking_lot",
  "prost",

@@ -284,7 +284,11 @@ impl OsdPool {
             };
             while marked() {
                 let answers = match objectio_proto::transport::endpoint(&address) {
-                    Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                    Ok(ep) => {
+                        objectio_proto::transport::connect(&ep.connect_timeout(PROBE_TIMEOUT))
+                            .await
+                            .is_ok()
+                    }
                     Err(_) => false,
                 };
                 {
@@ -373,7 +377,9 @@ impl OsdPool {
         let address = address.to_string();
         runtime.spawn(async move {
             let answers = match objectio_proto::transport::endpoint(&address) {
-                Ok(ep) => ep.connect_timeout(PROBE_TIMEOUT).connect().await.is_ok(),
+                Ok(ep) => objectio_proto::transport::connect(&ep.connect_timeout(PROBE_TIMEOUT))
+                    .await
+                    .is_ok(),
                 Err(_) => false,
             };
             if !answers {
@@ -447,14 +453,15 @@ impl OsdPool {
         // and an open connection that stops answering keepalives is closed
         // after about 5 s, failing what is in flight on it (writes wait for
         // every shard, so this bounds how long a vanished host holds them).
-        let channel = objectio_proto::transport::endpoint(address)
+        // The 3 s cover the TLS handshake too (`transport::connect`).
+        let endpoint = objectio_proto::transport::endpoint(address)
             .map_err(OsdPoolError::ConnectionFailed)?
             .connect_timeout(std::time::Duration::from_secs(3))
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(2))
             .keep_alive_timeout(std::time::Duration::from_secs(3))
-            .keep_alive_while_idle(true)
-            .connect()
+            .keep_alive_while_idle(true);
+        let channel = objectio_proto::transport::connect(&endpoint)
             .await
             .map_err(|e| {
                 self.mark_unreachable(address);
@@ -3322,7 +3329,9 @@ mod reclaim_tests {
     #[tokio::test]
     async fn what_cannot_be_freed_is_retried_then_counted() {
         let pool = Arc::new(OsdPool::new());
-        let meta = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let meta = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         let mut meta =
             objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(meta);
         let target = ShardTarget {

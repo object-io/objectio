@@ -175,8 +175,7 @@ pub fn client() {
 /// The address doesn't parse, or nothing answers.
 pub async fn channel(addr: &str) -> Result<tonic::transport::Channel, String> {
     client();
-    objectio_proto::transport::endpoint(addr)?
-        .connect()
+    objectio_proto::transport::connect(&objectio_proto::transport::endpoint(addr)?)
         .await
         .map_err(|e| e.to_string())
 }

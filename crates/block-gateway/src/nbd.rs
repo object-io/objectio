@@ -765,7 +765,9 @@ mod tests {
         cache.init_volume("vol");
         cache.init_volume("ro");
         // Never connected: the handshake does no I/O.
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         let meta = Arc::new(crate::meta_blocks::MetaBlocks::new(Arc::new(
             tokio::sync::Mutex::new(
                 objectio_proto::metadata::metadata_service_client::MetadataServiceClient::new(

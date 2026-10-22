@@ -159,8 +159,8 @@ pub async fn serve(state: Arc<RaftAdminState>, listener: TcpListener) -> anyhow:
     Ok(())
 }
 
-/// How long a client has to finish its TLS handshake.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client has to finish its TLS handshake: as on the gRPC port.
+const HANDSHAKE_TIMEOUT: Duration = objectio_proto::transport::HANDSHAKE_TIMEOUT;
 
 /// Connections that completed their TLS handshake, each with its peer.
 /// Handshakes run on tasks of their own, so a slow one holds up no other.

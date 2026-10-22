@@ -365,9 +365,9 @@ async fn purge_one(meta: &Arc<MetaService>, node_id: [u8; 16], address: &str) {
     let result = async {
         let channel = tokio::time::timeout(
             PER_OSD_TIMEOUT,
-            objectio_proto::transport::endpoint(address)
-                .map_err(anyhow::Error::msg)?
-                .connect(),
+            objectio_proto::transport::connect(
+                &objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?,
+            ),
         )
         .await
         .map_err(|_| anyhow::anyhow!("connect timeout"))??;
@@ -406,9 +406,9 @@ async fn purge_one(meta: &Arc<MetaService>, node_id: [u8; 16], address: &str) {
 async fn query_shard_count(address: &str) -> anyhow::Result<u64> {
     let channel = tokio::time::timeout(
         PER_OSD_TIMEOUT,
-        objectio_proto::transport::endpoint(address)
-            .map_err(anyhow::Error::msg)?
-            .connect(),
+        objectio_proto::transport::connect(
+            &objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout"))??;
@@ -1355,9 +1355,12 @@ pub(crate) async fn open_channel(address: &str) -> anyhow::Result<Channel> {
         return Ok(ch.clone());
     }
     let endpoint = objectio_proto::transport::endpoint(address).map_err(anyhow::Error::msg)?;
-    let channel = tokio::time::timeout(PER_OSD_TIMEOUT, endpoint.connect())
-        .await
-        .map_err(|_| anyhow::anyhow!("connect timeout"))??;
+    let channel = tokio::time::timeout(
+        PER_OSD_TIMEOUT,
+        objectio_proto::transport::connect(&endpoint),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connect timeout"))??;
     CHANNELS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

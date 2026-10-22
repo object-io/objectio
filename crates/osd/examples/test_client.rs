@@ -14,7 +14,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to OSD at {}...", endpoint);
 
-    let mut client = StorageServiceClient::connect(endpoint).await?;
+    let endpoint = objectio_proto::transport::endpoint(&endpoint)?;
+    let mut client =
+        StorageServiceClient::new(objectio_proto::transport::connect(&endpoint).await?);
 
     // Test 1: Health check
     println!("\n--- Health Check ---");

@@ -435,8 +435,7 @@ async fn serves_block(grpc_port: u16, nbd_port: u16, max: u64) -> Result<()> {
     let mut last = String::new();
     for _ in 0..(max * 10) {
         let connected = match objectio_proto::transport::endpoint(&url) {
-            Ok(ep) => ep
-                .connect()
+            Ok(ep) => objectio_proto::transport::connect(&ep)
                 .await
                 .map(BlockServiceClient::new)
                 .map_err(|e| e.to_string()),
@@ -539,37 +538,47 @@ async fn http_oneshot(
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .context("connect")?;
-    let mut s: Box<dyn Stream> = match tls {
-        None => Box::new(s),
-        Some(config) => {
-            let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(
-                std::net::Ipv4Addr::LOCALHOST.into(),
-            );
-            Box::new(
-                tokio_rustls::TlsConnector::from(config)
-                    .connect(name, s)
-                    .await
-                    .context("TLS")?,
-            )
+    // Meta's admin port answers in milliseconds: one that takes the
+    // connection and answers nothing (a TLS handshake never answered, say)
+    // fails the attempt, which the caller retries, rather than holding
+    // aio's start for good.
+    let exchange = async {
+        let s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .context("connect")?;
+        let mut s: Box<dyn Stream> = match tls {
+            None => Box::new(s),
+            Some(config) => {
+                let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(
+                    std::net::Ipv4Addr::LOCALHOST.into(),
+                );
+                Box::new(
+                    tokio_rustls::TlsConnector::from(config)
+                        .connect(name, s)
+                        .await
+                        .context("TLS")?,
+                )
+            }
+        };
+        s.write_all(req.as_bytes()).await?;
+        if !body.is_empty() {
+            s.write_all(body).await?;
         }
+        s.flush().await?;
+        let mut resp = Vec::with_capacity(1024);
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => resp.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        Ok::<_, anyhow::Error>(resp)
     };
-    s.write_all(req.as_bytes()).await?;
-    if !body.is_empty() {
-        s.write_all(body).await?;
-    }
-    s.flush().await?;
-    let mut resp = Vec::with_capacity(1024);
-    let mut buf = [0u8; 1024];
-    loop {
-        match s.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => resp.extend_from_slice(&buf[..n]),
-            Err(_) => break,
-        }
-    }
+    let resp = tokio::time::timeout(Duration::from_secs(30), exchange)
+        .await
+        .map_err(|_| anyhow!("{method} {path}: no answer from the admin port in 30 s"))??;
     let raw = String::from_utf8_lossy(&resp).into_owned();
     let status = raw.lines().next().unwrap_or("").to_string();
     let body_start = raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(raw.len());

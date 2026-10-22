@@ -2261,7 +2261,9 @@ mod tenant_gate_tests {
     /// asking is refused as unavailable, which is how these tests tell an
     /// answer from the cache from one that had to ask.
     fn state() -> AuthState {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         AuthState::new(MetadataServiceClient::new(channel), "us-east-1")
     }
 

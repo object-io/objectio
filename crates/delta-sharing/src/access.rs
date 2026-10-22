@@ -128,7 +128,9 @@ mod tests {
     /// A request without a bearer token is 401, as the protocol has it.
     #[tokio::test]
     async fn no_bearer_token_is_unauthenticated() {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         let catalog = DeltaCatalog::new(MetadataServiceClient::new(channel));
         let Err(err) = authenticate_request(&HeaderMap::new(), &catalog, None).await else {
             panic!("a request without a token was let in");
@@ -140,7 +142,9 @@ mod tests {
     /// once meta says its tenant is (here meta can't be reached).
     #[tokio::test]
     async fn only_a_tenants_shares_wait_on_its_tenant() {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         let catalog = DeltaCatalog::new(MetadataServiceClient::new(channel));
         let share = |name: &str, tenant: &str| DeltaShareEntry {
             name: name.into(),

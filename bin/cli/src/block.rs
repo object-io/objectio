@@ -91,11 +91,11 @@ const SNAPSHOT_COLUMNS: &[(&str, &str)] = &[
 ];
 
 async fn connect(endpoint: &str) -> Result<BlockServiceClient<tonic::transport::Channel>> {
-    let channel = objectio_proto::transport::endpoint(endpoint)
-        .map_err(anyhow::Error::msg)?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to the block gateway at {endpoint}"))?;
+    let channel = objectio_proto::transport::connect(
+        &objectio_proto::transport::endpoint(endpoint).map_err(anyhow::Error::msg)?,
+    )
+    .await
+    .with_context(|| format!("connecting to the block gateway at {endpoint}"))?;
     Ok(BlockServiceClient::new(channel))
 }
 

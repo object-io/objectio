@@ -164,11 +164,11 @@ impl ForwardToLeaderLayer {
         // the call forever: the client retries elsewhere. Its answer is
         // passed on as it arrives, so one that stopped after its headers
         // is noticed by the pings (`meta_endpoint`), not the call timeout.
-        let channel = objectio_proto::transport::meta_endpoint(addr)
+        let endpoint = objectio_proto::transport::meta_endpoint(addr)
             .map_err(|e| tonic::Status::internal(format!("leader address {addr}: {e}")))?
             .initial_stream_window_size(objectio_proto::transport::STREAM_WINDOW)
-            .initial_connection_window_size(objectio_proto::transport::CONNECTION_WINDOW)
-            .connect_lazy();
+            .initial_connection_window_size(objectio_proto::transport::CONNECTION_WINDOW);
+        let channel = objectio_proto::transport::connect_lazy(&endpoint);
         channels.insert(addr.to_string(), channel.clone());
         Ok(channel)
     }

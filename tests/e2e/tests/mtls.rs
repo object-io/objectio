@@ -3,7 +3,12 @@
 //! only from a peer whose certificate names a role allowed to make it.
 //! Meta's admin port takes membership changes only from role admin, and
 //! answers its probes without a client certificate; the all-in-one keeps
-//! its internal ports on loopback.
+//! its internal ports on loopback. A peer that never completes its TLS
+//! handshake is disconnected within the handshake timeout, and nothing a
+//! peer does keeps a node from serving the next.
+
+use std::io::Read;
+use std::time::{Duration, Instant};
 
 use objectio_e2e::Cluster;
 use objectio_e2e::ha::HaCluster;
@@ -14,31 +19,75 @@ use objectio_proto::metadata::{
 };
 use objectio_proto::storage::storage_service_client::StorageServiceClient;
 use objectio_proto::storage::{ListPgRequest, PurgeRequest};
+use objectio_proto::transport::HANDSHAKE_TIMEOUT;
 use tonic::Code;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+
+/// The longest a node may take to answer a call or refuse a peer: it
+/// refuses within its handshake timeout, and answers in milliseconds.
+const WITHIN: Duration = HANDSHAKE_TIMEOUT.saturating_add(Duration::from_secs(10));
 
 /// A call refused at the connection, not answered by meta.
 fn refused(r: Result<(), String>) -> bool {
     r.is_err_and(|e| !e.contains("FailedPrecondition") && !e.contains("PermissionDenied"))
 }
 
-/// What a call to meta, connected as `ep` describes, gets.
-fn call(rt: &tokio::runtime::Runtime, ep: Result<Endpoint, String>) -> Result<(), String> {
+/// What a call to meta, connected as `ep` describes (a `client`), gets.
+///
+/// # Panics
+/// When meta neither answers nor refuses within [`WITHIN`]: a node that
+/// holds a peer it won't serve, rather than refuse it, is a bug, and this
+/// test's to find (it hung CI for 18 minutes once).
+fn call(
+    rt: &tokio::runtime::Runtime,
+    client: &str,
+    ep: Result<Endpoint, String>,
+) -> Result<(), String> {
+    let started = Instant::now();
     rt.block_on(async {
         // As the current release: meta refuses a client too old for the
         // cluster, which would look like a refusal for another reason.
-        let channel = ep?
+        let ep = ep?
             .user_agent(objectio_common::version::user_agent())
-            .map_err(|e| e.to_string())?
-            .connect()
-            .await
             .map_err(|e| e.to_string())?;
-        MetadataServiceClient::new(channel)
-            .get_metrics(GetMetricsRequest::default())
+        let attempt = async {
+            let channel = objectio_proto::transport::connect(&ep)
+                .await
+                .map_err(|e| e.to_string())?;
+            MetadataServiceClient::new(channel)
+                .get_metrics(GetMetricsRequest::default())
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+        };
+        tokio::time::timeout(WITHIN, attempt)
             .await
-            .map(drop)
-            .map_err(|e| e.to_string())
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{client}: meta neither answered nor refused it in {:?}",
+                    started.elapsed()
+                )
+            })
     })
+}
+
+/// Connect to `addr` and say nothing: the node must close the connection
+/// once the handshake timeout is out, and not much before. Returns how
+/// long it held it.
+fn held_silent(addr: &str) -> Duration {
+    let started = Instant::now();
+    let mut s = std::net::TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(WITHIN)).unwrap();
+    let r = s.read(&mut [0u8; 64]);
+    let held = started.elapsed();
+    assert!(
+        matches!(r, Ok(0))
+            || r.as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{addr} held a client that sent nothing for {held:?} ({r:?}): a peer with no \
+         certificate holds a connection and a task until it goes away"
+    );
+    held
 }
 
 #[test]
@@ -51,12 +100,30 @@ fn a_node_refuses_a_client_without_the_clusters_certificate() {
         .meta_endpoints()
         .trim_start_matches("http://")
         .to_string();
+    let osd = ha.osd_endpoint(0).trim_start_matches("http://").to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let pem = |p: &std::path::Path| std::fs::read(p).unwrap();
 
+    // A client that connects and never starts a TLS handshake: meta and an
+    // OSD each disconnect it once the handshake timeout is out.
+    let silent: Vec<_> = [addr.clone(), osd]
+        .into_iter()
+        .map(|a| std::thread::spawn(move || (held_silent(&a), a)))
+        .collect();
+    for t in silent {
+        let (held, a) = t.join().expect("silent client");
+        assert!(
+            held >= HANDSHAKE_TIMEOUT.saturating_sub(Duration::from_secs(1)),
+            "{a} closed a silent client after {held:?}, before the handshake timeout"
+        );
+    }
+
     // Plain gRPC.
     let plain = Endpoint::from_shared(format!("http://{addr}")).map_err(|e| e.to_string());
-    assert!(refused(call(&rt, plain)), "a plaintext client was served");
+    assert!(
+        refused(call(&rt, "a plaintext client", plain)),
+        "a plaintext client was served"
+    );
 
     // TLS, trusting the CA, but no certificate of its own.
     let anonymous = Endpoint::from_shared(format!("https://{addr}"))
@@ -67,7 +134,7 @@ fn a_node_refuses_a_client_without_the_clusters_certificate() {
         })
         .map_err(|e| e.to_string());
     assert!(
-        refused(call(&rt, anonymous)),
+        refused(call(&rt, "a client with no certificate", anonymous)),
         "a client with no certificate was served"
     );
 
@@ -91,36 +158,45 @@ fn a_node_refuses_a_client_without_the_clusters_certificate() {
         })
         .map_err(|e| e.to_string());
     assert!(
-        refused(call(&rt, stranger)),
+        refused(call(
+            &rt,
+            "a client with another CA's certificate",
+            stranger
+        )),
         "a client with another CA's certificate was served"
     );
 
-    // The cluster's certificate: served.
+    // The cluster's certificate: served, all of the above notwithstanding.
     objectio_e2e::tls::client();
-    call(&rt, objectio_proto::transport::endpoint(&addr)).expect("the cluster's own certificate");
+    call(
+        &rt,
+        "a client with the cluster's certificate",
+        objectio_proto::transport::endpoint(&addr),
+    )
+    .expect("the cluster's own certificate");
 }
 
 /// A channel to the gRPC server at `addr` presenting the test certificate
-/// of `identity` (a role, or `tls::NO_ROLE`).
+/// of `identity` (a role, or `tls::NO_ROLE`). Connecting, and each call,
+/// fail rather than wait past [`WITHIN`].
 fn channel_as(rt: &tokio::runtime::Runtime, addr: &str, identity: &str) -> Channel {
     let files = tls::files().expect("mTLS");
     let (cert, key) = files.pair(identity);
     let pem = |p: &std::path::Path| std::fs::read(p).unwrap();
-    rt.block_on(async {
-        Endpoint::from_shared(format!("https://{addr}"))
-            .unwrap()
-            .tls_config(
-                ClientTlsConfig::new()
-                    .ca_certificate(Certificate::from_pem(pem(&files.ca)))
-                    .identity(Identity::from_pem(pem(cert), pem(key))),
-            )
-            .unwrap()
-            .user_agent(objectio_common::version::user_agent())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap()
-    })
+    let endpoint = Endpoint::from_shared(format!("https://{addr}"))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(pem(&files.ca)))
+                .identity(Identity::from_pem(pem(cert), pem(key))),
+        )
+        .unwrap()
+        .user_agent(objectio_common::version::user_agent())
+        .unwrap()
+        .connect_timeout(WITHIN)
+        .timeout(WITHIN);
+    rt.block_on(objectio_proto::transport::connect(&endpoint))
+        .unwrap_or_else(|e| panic!("{addr} as {identity}: {e}"))
 }
 
 #[test]
