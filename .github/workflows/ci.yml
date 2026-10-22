@@ -58,6 +58,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +69,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,6 +78,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # ISA-L, which every build erasure-codes with, is built from source.
       - name: protoc and ISA-L's build tools
+        # A stalled mirror once held a job for its full 6 hours.
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev
       # The workspace sets clippy::all + pedantic + nursery in Cargo.toml and
       # the Makefile passes -D warnings; match it rather than letting CI be
@@ -85,6 +89,7 @@ jobs:
   test:
     name: unit tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       # mold: linking the test binaries is a large part of this job.
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -93,6 +98,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold and ISA-L's build tools
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # Excluding the e2e package: it boots a cluster and belongs in its own
       # job so its runtime and its failures stay legible.
@@ -119,6 +125,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: protoc, mold and ISA-L's build tools
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist. build.rs creates it empty when absent so a
       # clone still builds, but the e2e job should exercise the real thing.
@@ -201,6 +208,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: protoc, mold, ISA-L's build tools, PCRE2
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool \
@@ -261,6 +269,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold and ISA-L's build tools
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       - name: find the previous release
         id: previous
@@ -315,6 +324,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold, device mapper, ISA-L's build tools
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler mold dmsetup e2fsprogs \
@@ -489,6 +499,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build deps
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler \
@@ -544,6 +555,7 @@ jobs:
           key: perf
       # The dedicated runner's image has these already.
       - name: build deps
+        timeout-minutes: 10
         if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
