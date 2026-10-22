@@ -83,7 +83,7 @@ struct HashingBody {
 }
 
 #[derive(Debug)]
-struct Mismatch;
+pub(crate) struct Mismatch;
 
 impl std::fmt::Display for Mismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -18,6 +18,13 @@ pub(crate) fn is_object_metadata_header(name: &str) -> bool {
         )
 }
 
+/// Whether the bucket's dedup policy asks for bodies written to it to be
+/// noted.
+pub(crate) fn dedup_wanted(placement: &objectio_proto::metadata::GetPlacementResponse) -> bool {
+    use objectio_proto::metadata::DedupMode;
+    matches!(placement.dedup_mode(), DedupMode::DryRun | DedupMode::On)
+}
+
 /// Hand a body just written to `bucket` to the dedup dry-run, when the
 /// bucket's policy asks for one. Encrypted bodies never deduplicate (their
 /// ciphertext differs per object by design), and inline-sized ones are not
@@ -29,8 +36,7 @@ pub(crate) fn dedup_dry_run(
     body: &Bytes,
     encrypted: bool,
 ) {
-    use objectio_proto::metadata::DedupMode;
-    if !matches!(placement.dedup_mode(), DedupMode::DryRun | DedupMode::On) || body.is_empty() {
+    if !dedup_wanted(placement) || body.is_empty() {
         return;
     }
     if encrypted {
@@ -678,6 +684,285 @@ pub async fn put_object(
     .await
 }
 
+/// What a PUT decided before any of its body is stored: how it is
+/// encrypted, versioned, locked and placed, and on what condition.
+pub(crate) struct PutPlan {
+    tags: HashMap<String, String>,
+    sse: PutSse,
+    versioning_enabled: bool,
+    retention: Option<ObjectRetention>,
+    legal_hold: Option<LegalHold>,
+    version_id: String,
+    replica: Option<crate::replication::Replica>,
+    placement: objectio_proto::metadata::GetPlacementResponse,
+    condition: PutCondition,
+}
+
+/// Everything a PUT of `size` bytes (its declared length) asks meta, and
+/// decides, before its body moves; refused here, nothing is stored.
+async fn plan_put(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    auth: &Option<Extension<AuthResult>>,
+    headers: &HeaderMap,
+    tags: HashMap<String, String>,
+    size: u64,
+) -> Result<PutPlan, Response> {
+    // Quotas (A8b): admitted before any of it is stored.
+    if let Some(refused) = crate::quota::check(bucket, size, 1) {
+        return Err(refused);
+    }
+    let mut meta_client = state.meta_client.clone();
+    // What meta must answer before the data moves, in one call (B21). An
+    // older meta, without it, is asked call by call, as before.
+    let (pre_encryption, pre_versioning, pre_lock, pre_placement) =
+        match write_context(&mut meta_client, bucket, key, size).await {
+            Some(c) => (
+                Some(c.encryption),
+                Some(c.versioning),
+                Some(c.object_lock),
+                Some(c.placement),
+            ),
+            None => (None, None, None, None),
+        };
+    // SSE: if the request header or bucket default asks for encryption,
+    // the body is encrypted before it enters the erasure-coding path.
+    // Shards on OSDs see ciphertext; the storage layer is oblivious.
+    let sse = put_sse(state, &mut meta_client, bucket, headers, pre_encryption).await?;
+
+    // Check bucket versioning state: a missing bucket refuses the PUT.
+    let versioning_enabled = bucket_versioning_with(&mut meta_client, bucket, pre_versioning)
+        .await?
+        == VersioningState::VersioningEnabled;
+    let (retention, legal_hold) =
+        object_lock_for_write(&mut meta_client, bucket, headers, pre_lock).await?;
+    let version_id = if versioning_enabled {
+        new_version_id()
+    } else {
+        String::new()
+    };
+    // A replica another cluster sends keeps its version id (and ETag); one
+    // this bucket holds already is a repeat, answered without storing it
+    // again.
+    let replica =
+        crate::replication::replica_request(state, auth, bucket, key, headers, versioning_enabled)
+            .await?;
+    let version_id = replica
+        .as_ref()
+        .map_or(version_id, |r| r.version_id.clone());
+
+    // Get placement from metadata service
+    let answer = match pre_placement {
+        Some(answer) => answer,
+        None => meta_client
+            .get_placement(GetPlacementRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                size,
+                storage_class: "STANDARD".to_string(),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    };
+    let placement = match answer {
+        Ok(p) => {
+            // Where a read of the key, soon after, finds it (B21).
+            crate::placement_cache::put(bucket, key, &p);
+            p
+        }
+        Err(e) => {
+            error!("Failed to get placement: {}", e);
+            return Err(meta_failure(&e, "Failed to get placement"));
+        }
+    };
+    crate::test_hooks::held_after_placement(bucket, key).await;
+
+    // If-Match / If-None-Match: refused now if the current object already
+    // says no, before any data is written. The commit decides for good.
+    let condition = PutCondition::from_headers(headers);
+    if condition.is_set() {
+        let current = get_object_meta_from_any(&state.osd_pool, &placement.nodes, bucket, key)
+            .await
+            .ok()
+            .flatten()
+            .filter(|o| !o.is_delete_marker);
+        if let Some(refused) = condition.refuse(current.as_ref()) {
+            return Err(refused);
+        }
+    }
+    Ok(PutPlan {
+        tags,
+        sse,
+        versioning_enabled,
+        retention,
+        legal_hold,
+        version_id,
+        replica,
+        placement,
+        condition,
+    })
+}
+
+/// A PUT's body, stored and not yet committed.
+pub(crate) struct Written {
+    object_id: [u8; 16],
+    size: u64,
+    stripes: Vec<StripeMeta>,
+    /// The quoted MD5 of the plaintext.
+    etag: String,
+    /// The flexible checksum the client sent, kept with the object.
+    checksum: Option<(crate::checksum::ChecksumAlgorithm, String)>,
+    /// The object itself, when it is small enough to live in its metadata.
+    inline_data: Vec<u8>,
+    sent: Vec<ShardTarget>,
+    small: Option<SmallShards>,
+    /// The body as stored, for the dedup dry-run (a body read whole; a
+    /// streamed one is noted stripe by stripe).
+    dedup: Option<Bytes>,
+}
+
+/// Commit a PUT whose body is stored, and answer it.
+async fn finish_put(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    plan: PutPlan,
+    written: Written,
+    phases: &mut crate::gateway_metrics::PhaseTimer,
+) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let inline = !written.inline_data.is_empty();
+    let stripes = written.stripes.len();
+    let etag = plan
+        .replica
+        .as_ref()
+        .map_or(written.etag, |r| r.etag.clone());
+    let sse = &plan.sse;
+    let object_meta = ObjectMeta {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        object_id: written.object_id.to_vec(),
+        size: written.size,
+        content_type,
+        etag: etag.clone(),
+        created_at: timestamp,
+        modified_at: timestamp,
+        stripes: written.stripes,
+        user_metadata: extract_user_metadata(headers),
+        version_id: plan.version_id.clone(),
+        storage_class: "STANDARD".to_string(),
+        is_delete_marker: false,
+        retention: plan.retention,
+        legal_hold: plan.legal_hold,
+        encryption_algorithm: sse.algorithm as i32,
+        kms_key_id: sse.kms_key_id.clone(),
+        encrypted_dek: sse.encrypted_dek.clone(),
+        encryption_iv: sse.iv.clone(),
+        encryption_context: sse.encryption_context.clone(),
+        usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+        inline_data: written.inline_data,
+        checksum: written.checksum.as_ref().map(|(a, v)| ObjectChecksum {
+            algorithm: a.aws_name().to_string(),
+            value: v.clone(),
+        }),
+        tags: plan.tags,
+        part_checksums: Vec::new(),
+        replication: HashMap::new(),
+        replica_of: plan
+            .replica
+            .as_ref()
+            .map(|r| r.of.clone())
+            .unwrap_or_default(),
+        required_level: 0,
+        stamp: 0, // stamped when stored
+        update_stamp: 0,
+        pg_pool: plan.placement.pool.clone(),
+        pg_id: plan.placement.pg_id,
+    };
+
+    // What lifecycle filters on, for x-amz-expiration once it's stored.
+    let expiration_of = ObjectMeta {
+        key: object_meta.key.clone(),
+        size: object_meta.size,
+        tags: object_meta.tags.clone(),
+        ..ObjectMeta::default()
+    };
+    if let Err(resp) = commit_put(
+        state,
+        &plan.placement,
+        object_meta,
+        plan.versioning_enabled,
+        written.sent,
+        &plan.condition,
+        written.small.as_ref(),
+    )
+    .await
+    {
+        return resp;
+    }
+    phases.mark("commit");
+
+    if let Some(body) = &written.dedup {
+        dedup_dry_run(state, bucket, &plan.placement, body, sse.encrypts());
+    }
+    debug!(
+        "Created object: {bucket}/{key}, size={}, stripes={stripes}, replicas={}",
+        written.size,
+        plan.placement.nodes.len(),
+    );
+    if inline {
+        crate::gateway_metrics::record_inline(written.size);
+    }
+
+    let expiration = crate::lifecycle::expiration_header(
+        state,
+        bucket,
+        &expiration_of,
+        crate::lifecycle::now_ms(),
+    )
+    .await;
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("ETag", etag);
+    if let Some((algorithm, value)) = &written.checksum {
+        resp = resp.header(algorithm.header_name(), value);
+    }
+    if !plan.version_id.is_empty() {
+        resp = resp.header("x-amz-version-id", &plan.version_id);
+    }
+    if let Some(v) = expiration {
+        resp = resp.header("x-amz-expiration", v);
+    }
+    if let Some(v) = sse.response_header {
+        resp = resp.header("x-amz-server-side-encryption", v);
+        if v == "aws:kms" && !sse.kms_key_id.is_empty() {
+            resp = resp.header(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                &sse.kms_key_id,
+            );
+        }
+    }
+    if sse.algorithm == SseAlgorithm::SseC {
+        resp = resp
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header(
+                "x-amz-server-side-encryption-customer-key-md5",
+                &sse.sse_c_key_md5,
+            );
+    }
+    resp.body(Body::empty()).unwrap()
+}
+
 async fn put_object_placed(
     state: Arc<AppState>,
     bucket: String,
@@ -804,8 +1089,6 @@ async fn put_object_placed(
         state.ec_m,
     );
 
-    let mut meta_client = state.meta_client.clone();
-
     // Generate object ID and ETag (MD5 of the *plaintext* body — matches AWS
     // SSE-S3/SSE-KMS ETag semantics; taken before we possibly encrypt).
     //
@@ -837,136 +1120,25 @@ async fn put_object_placed(
             tokio::task::spawn_blocking(move || format!("\"{}\"", crate::digest::md5_hex(&body)))
         }
     };
-    let stored_checksum = checksums.flexible.as_ref().map(|f| ObjectChecksum {
-        algorithm: f.algorithm.aws_name().to_string(),
-        value: f.value_b64(),
-    });
     let original_size = body.len() as u64;
-    // Quotas (A8b): admitted before any of it is stored.
-    if let Some(refused) = crate::quota::check(&bucket, original_size, 1) {
-        return refused;
-    }
-
-    // SSE: if the request header or bucket default asks for encryption,
-    // encrypt the body before it enters the erasure-coding path. Shards
-    // on OSDs see ciphertext; the storage layer is oblivious.
-    // What meta must answer before the data moves, in one call (B21). An
-    // older meta, without it, is asked call by call, as before.
-    let (pre_encryption, pre_versioning, pre_lock, pre_placement) =
-        match write_context(&mut meta_client, &bucket, &key, original_size).await {
-            Some(c) => (
-                Some(c.encryption),
-                Some(c.versioning),
-                Some(c.object_lock),
-                Some(c.placement),
-            ),
-            None => (None, None, None, None),
-        };
-    let (
-        body,
-        sse_algorithm,
-        sse_kms_key_id,
-        sse_encrypted_dek,
-        sse_iv,
-        sse_encryption_context,
-        sse_response_header,
-        sse_c_key_md5,
-    ) = match apply_put_sse(
-        &state,
-        &mut meta_client,
-        &bucket,
-        &headers,
-        body,
-        pre_encryption,
-    )
-    .await
-    {
-        Ok(v) => v,
+    let plan = match plan_put(&state, &bucket, &key, &auth, &headers, tags, original_size).await {
+        Ok(plan) => plan,
         Err(resp) => return resp,
     };
-    phases.mark("sse");
-
-    // Check bucket versioning state: a missing bucket refuses the PUT.
-    let versioning_enabled =
-        match bucket_versioning_with(&mut meta_client, &bucket, pre_versioning).await {
-            Ok(v) => v == VersioningState::VersioningEnabled,
-            Err(resp) => return resp,
-        };
-    let (lock_retention, lock_hold) =
-        match object_lock_for_write(&mut meta_client, &bucket, &headers, pre_lock).await {
-            Ok(lock) => lock,
-            Err(resp) => return resp,
-        };
-    let version_id = if versioning_enabled {
-        new_version_id()
+    let body = if plan.sse.encrypts() {
+        let mut buf = body.to_vec();
+        plan.sse.cipher().apply(0, &mut buf);
+        Bytes::from(buf)
     } else {
-        String::new()
+        body
     };
-    // A replica another cluster sends keeps its version id (and ETag); one
-    // this bucket holds already is a repeat, answered without storing it
-    // again.
-    let replica = match crate::replication::replica_request(
-        &state,
-        &auth,
-        &bucket,
-        &key,
-        &headers,
-        versioning_enabled,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-    let version_id = replica
-        .as_ref()
-        .map_or(version_id, |r| r.version_id.clone());
-
-    // Get placement from metadata service
-    let answer = match pre_placement {
-        Some(answer) => answer,
-        None => meta_client
-            .get_placement(GetPlacementRequest {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                size: original_size,
-                storage_class: "STANDARD".to_string(),
-            })
-            .await
-            .map(tonic::Response::into_inner),
-    };
-    let placement = match answer {
-        Ok(p) => {
-            // Where a read of the key, soon after, finds it (B21).
-            crate::placement_cache::put(&bucket, &key, &p);
-            p
-        }
-        Err(e) => {
-            error!("Failed to get placement: {}", e);
-            return meta_failure(&e, "Failed to get placement");
-        }
-    };
-    crate::test_hooks::held_after_placement(&bucket, &key).await;
     phases.mark("meta_lookup");
-
-    // If-Match / If-None-Match: refused now if the current object already
-    // says no, before any data is written. The commit decides for good.
-    let condition = PutCondition::from_headers(&headers);
-    if condition.is_set() {
-        let current = get_object_meta_from_any(&state.osd_pool, &placement.nodes, &bucket, &key)
-            .await
-            .ok()
-            .flatten()
-            .filter(|o| !o.is_delete_marker);
-        if let Some(refused) = condition.refuse(current.as_ref()) {
-            return refused;
-        }
-    }
 
     // Where and how the stripes go, and the placement group epoch every
     // shard is written under (B31): an OSD that knows a newer one refuses
     // it, and the PUT is placed again.
-    let placed = crate::stripe::Placed::new(&placement);
+    let placement = &plan.placement;
+    let placed = crate::stripe::Placed::new(placement);
     let scheme = placed.scheme;
     let total_shards = scheme.width();
 
@@ -1005,7 +1177,6 @@ async fn put_object_placed(
         }
     };
     let mut all_stripes = Vec::with_capacity(num_stripes);
-    let mut total_shards_written = 0;
     let mut pending = pending_shards(&state, format!("{bucket}/{key}"));
     // A small object (B21): one stripe whose shards each fit in an OSD's
     // metadata record, each on an OSD of its own, once the cluster allows
@@ -1035,27 +1206,7 @@ async fn put_object_placed(
             .rdma
             .as_deref()
             .filter(|_| matches!(scheme, crate::stripe::Scheme::Mds { .. }));
-        let mut rdma_base: Option<u64> = None;
-        let slot = rdma.zip(coder.codec()).and_then(|(r, codec)| {
-            r.stripe_slot(codec.stripe_len(stripe_data.len()))
-                .map(|slot| (slot, codec))
-        });
-        let encoded = match slot {
-            Some((mut slot, codec)) => {
-                let base = slot.addr();
-                codec
-                    .encode_into(&stripe_data, slot.as_mut_slice())
-                    .map(|shard_size| {
-                        rdma_base = Some(base);
-                        let stripe = slot.into_bytes(shard_size * total_shards);
-                        (0..total_shards)
-                            .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
-                            .collect()
-                    })
-            }
-            None => coder.shards(stripe_data),
-        };
-        let shards: Vec<Bytes> = match encoded {
+        let (shards, rdma_base) = match crate::stripe::encode(&coder, rdma, stripe_data) {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to encode stripe {}: {}", stripe_idx, e);
@@ -1104,7 +1255,6 @@ async fn put_object_placed(
                     },
                 );
             }
-            total_shards_written += total_shards;
             small = Some(SmallShards {
                 shards: shards_by_node,
                 quorum: scheme.quorum(),
@@ -1141,7 +1291,6 @@ async fn put_object_placed(
                 return crate::stripe::refused(&short, stripe_idx as u64);
             }
         };
-        total_shards_written += shard_locs.len();
         all_stripes.push(scheme.stripe(
             stripe_idx as u64,
             stripe_data_size,
@@ -1149,13 +1298,6 @@ async fn put_object_placed(
             shard_locs,
         ));
     }
-
-    // Store object metadata on primary OSD (position 0)
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
     phases.mark("shards");
 
     // The ETag has been computing alongside the stripes; collect it.
@@ -1172,128 +1314,185 @@ async fn put_object_placed(
     };
     phases.mark("etag");
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Build ObjectMeta for OSD storage
-    let etag = replica.as_ref().map_or(etag, |r| r.etag.clone());
-    let object_meta = ObjectMeta {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        object_id: object_id.to_vec(),
+    let written = Written {
+        object_id,
         size: original_size,
-        content_type: content_type.clone(),
-        etag: etag.clone(),
-        created_at: timestamp,
-        modified_at: timestamp,
         stripes: all_stripes,
-        user_metadata: extract_user_metadata(&headers),
-        version_id: version_id.clone(),
-        storage_class: "STANDARD".to_string(),
-        is_delete_marker: false,
-        retention: lock_retention,
-        legal_hold: lock_hold,
-        encryption_algorithm: sse_algorithm as i32,
-        kms_key_id: sse_kms_key_id.clone(),
-        encrypted_dek: sse_encrypted_dek,
-        encryption_iv: sse_iv,
-        encryption_context: sse_encryption_context,
-        usage_owner: Vec::new(), // filled in by put_object_meta_to_all
+        etag,
+        checksum: checksums
+            .flexible
+            .as_ref()
+            .map(|f| (f.algorithm, f.value_b64())),
         inline_data: if inline { body.to_vec() } else { Vec::new() },
-        checksum: stored_checksum,
-        tags,
-        part_checksums: Vec::new(),
-        replication: HashMap::new(),
-        replica_of: replica.as_ref().map(|r| r.of.clone()).unwrap_or_default(),
-        required_level: 0,
-        stamp: 0, // stamped when stored
-        update_stamp: 0,
-        pg_pool: placement.pool.clone(),
-        pg_id: placement.pg_id,
+        sent: pending.disarm(),
+        small,
+        dedup: Some(body),
     };
+    finish_put(&state, &bucket, &key, &headers, plan, written, &mut phases).await
+}
 
-    // What lifecycle filters on, for x-amz-expiration once it's stored.
-    let expiration_of = ObjectMeta {
-        key: object_meta.key.clone(),
-        size: object_meta.size,
-        tags: object_meta.tags.clone(),
-        ..ObjectMeta::default()
+/// The length a streamed upload's request declares for its payload
+/// (`Content-Length`, which the chunked decoder sets to the decoded
+/// length), if it does.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// A body read up to its first stripe that ended there: the bytes, with
+/// its checksum trailers as headers, for the path a body read whole takes.
+pub(crate) enum FirstStripe {
+    /// The whole body; the request's headers with its trailers.
+    Whole(Bytes, HeaderMap),
+    /// More follows: the reader has it all, the first stripe put back.
+    More,
+}
+
+/// Read a streamed body's first stripe, and whether that was all of it: a
+/// body that small is stored as any of its size is (inline, small shards,
+/// one stripe), on the path that reads bodies whole.
+pub(crate) async fn first_stripe(
+    reader: &mut super::stream::BodyReader,
+    size: usize,
+    headers: &HeaderMap,
+) -> Result<FirstStripe, Response> {
+    let refused = |e: axum::Error| crate::admission::body_refused(&e);
+    let first = reader.next(size).await.map_err(refused)?;
+    if reader.at_end().await.map_err(refused)? {
+        let mut headers = headers.clone();
+        if let Some(t) = reader.trailers.take() {
+            headers.extend(t);
+        }
+        return Ok(FirstStripe::Whole(
+            first.map(bytes::BytesMut::freeze).unwrap_or_default(),
+            headers,
+        ));
+    }
+    if let Some(first) = first {
+        reader.unread(first.freeze());
+    }
+    Ok(FirstStripe::More)
+}
+
+/// A PUT whose body is streamed ([`crate::admission::Streamed`]): written
+/// to the shards stripe by stripe as it arrives, never held whole, and
+/// committed once all of it has arrived and passed its checks.
+pub(crate) async fn put_object_streamed(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    auth: Option<Extension<AuthResult>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let tags = match tagging_header(&headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
-    let sent = pending.disarm();
-    if let Err(resp) = commit_put(
+    let checksums = match crate::checksum::RequestChecksums::from_headers(&headers) {
+        Ok(c) => c,
+        Err(e) => return S3Error::xml_response(e.code(), &e.message(), StatusCode::BAD_REQUEST),
+    };
+    let declared = declared_length(&headers);
+    let mut phases = crate::gateway_metrics::PhaseTimer::start("PutObject");
+    let plan = match plan_put(
         &state,
-        &placement,
-        object_meta,
-        versioning_enabled,
-        sent,
-        &condition,
-        small.as_ref(),
+        &bucket,
+        &key,
+        &auth,
+        &headers,
+        tags,
+        declared.unwrap_or(0),
     )
     .await
     {
-        return resp;
-    }
-    phases.mark("commit");
-
-    dedup_dry_run(
-        &state,
-        &bucket,
-        &placement,
-        &body,
-        sse_algorithm != SseAlgorithm::SseNone,
-    );
-    debug!(
-        "Created object: {}/{}, size={}, stripes={}, shards_written={}, replicas={}",
-        bucket,
-        key,
-        original_size,
-        num_stripes,
-        total_shards_written,
-        placement.nodes.len(),
-    );
-    if inline {
-        crate::gateway_metrics::record_inline(original_size);
-    }
-
-    let expiration = crate::lifecycle::expiration_header(
-        &state,
-        &bucket,
-        &expiration_of,
-        crate::lifecycle::now_ms(),
-    )
-    .await;
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header("ETag", etag);
-    if let Some(c) = &checksums.flexible {
-        resp = resp.header(c.algorithm.header_name(), c.value_b64());
-    }
-    if !version_id.is_empty() {
-        resp = resp.header("x-amz-version-id", &version_id);
-    }
-    if let Some(v) = expiration {
-        resp = resp.header("x-amz-expiration", v);
-    }
-    if let Some(v) = sse_response_header {
-        resp = resp.header("x-amz-server-side-encryption", v);
-        if v == "aws:kms" && !sse_kms_key_id.is_empty() {
-            resp = resp.header(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                &sse_kms_key_id,
-            );
+        Ok(plan) => plan,
+        Err(resp) => return resp,
+    };
+    phases.mark("meta_lookup");
+    let scheme = crate::stripe::Scheme::of(&plan.placement);
+    // What it holds of its body, reserved before a byte of it is read.
+    let Some(window) = state
+        .admission
+        .budget
+        .try_reserve(super::stream::window(scheme, declared))
+    else {
+        return crate::admission::slow_down("memory");
+    };
+    let mut reader = super::stream::BodyReader::new(body);
+    match first_stripe(&mut reader, super::stream::stripe_size(scheme), &headers).await {
+        Err(resp) => return resp,
+        Ok(FirstStripe::Whole(body, headers)) => {
+            drop(plan);
+            return put_object(State(state), Path((bucket, key)), auth, headers, body).await;
         }
+        Ok(FirstStripe::More) => {}
     }
-    if sse_algorithm == SseAlgorithm::SseC {
-        resp = resp
-            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-            .header(
-                "x-amz-server-side-encryption-customer-key-md5",
-                &sse_c_key_md5,
-            );
+
+    let object_id = *Uuid::now_v7().as_bytes();
+    let dedup_on = dedup_wanted(&plan.placement);
+    let to = super::stream::StreamTo {
+        state: &state,
+        placement: &plan.placement,
+        object_id,
+        cipher: plan.sse.cipher(),
+        rdma: true,
+        dedup: (dedup_on && !plan.sse.encrypts())
+            .then_some((bucket.as_str(), plan.placement.dedup_domain.as_str())),
+        what: format!("{bucket}/{key}"),
+    };
+    let streamed = match super::stream::stream_stripes(
+        to,
+        &mut reader,
+        crate::checksum::StreamingChecksums::new(checksums, None),
+        window,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(resp) => {
+            crate::stripe::stale_streamed(&bucket, &key, &resp);
+            return resp;
+        }
+    };
+    phases.mark("shards");
+    // A length not known up front is held to the quota now, before it is
+    // committed.
+    if declared.is_none()
+        && let Some(refused) = crate::quota::check(&bucket, streamed.size, 1)
+    {
+        return refused;
     }
-    resp.body(Body::empty()).unwrap()
+    if dedup_on && plan.sse.encrypts() {
+        crate::gateway_metrics::record_dedup_skipped("encrypted");
+    }
+    debug!(
+        "PUT object: {bucket}/{key}, {} bytes streamed in {} stripes",
+        streamed.size,
+        streamed.stripes.len()
+    );
+    let written = Written {
+        object_id,
+        size: streamed.size,
+        stripes: streamed.stripes,
+        etag: format!("\"{}\"", hex::encode(streamed.checksums.md5)),
+        checksum: streamed.checksums.sent(),
+        inline_data: Vec::new(),
+        sent: streamed.sent.disarm(),
+        small: None,
+        dedup: None,
+    };
+    finish_put(&state, &bucket, &key, &headers, plan, written, &mut phases).await
+}
+
+/// A request body that the admission layer has already read whole, as
+/// one buffer.
+async fn whole(body: Body) -> Result<Bytes, Response> {
+    axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| crate::admission::body_refused(&e))
 }
 
 /// PUT /{bucket}/{key}?uploadId=X&partNumber=N - Upload part
@@ -1302,8 +1501,9 @@ pub async fn put_object_with_params(
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<PutObjectParams>,
     auth: Option<Extension<AuthResult>>,
+    streamed: Option<Extension<crate::admission::Streamed>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // If uploadId and partNumber are present, this is a multipart part upload
     if let (Some(upload_id), Some(part_number)) = (params.upload_id, params.part_number) {
@@ -1319,10 +1519,22 @@ pub async fn put_object_with_params(
             )
             .await;
         }
+        if streamed.is_some() {
+            return upload_part_streamed(state, bucket, key, upload_id, part_number, headers, body)
+                .await;
+        }
+        let body = match whole(body).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
         return upload_part_internal(state, bucket, key, upload_id, part_number, headers, body)
             .await;
     }
     if params.acl.is_some() {
+        let body = match whole(body).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
         return put_acl(&state, &bucket, Some(&key), &headers, &body).await;
     }
     if let Some(refused) = acl_header_refusal(&headers) {
@@ -1334,6 +1546,10 @@ pub async fn put_object_with_params(
         {
             return refused;
         }
+        let body = match whole(body).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
         return put_object_retention_internal(state, bucket, key, body, &headers).await;
     }
     if params.legal_hold.is_some() {
@@ -1342,6 +1558,10 @@ pub async fn put_object_with_params(
         {
             return refused;
         }
+        let body = match whole(body).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
         return put_object_legal_hold_internal(state, bucket, key, body).await;
     }
     if params.tagging.is_some() {
@@ -1350,10 +1570,21 @@ pub async fn put_object_with_params(
         {
             return refused;
         }
+        let body = match whole(body).await {
+            Ok(b) => b,
+            Err(resp) => return resp,
+        };
         return put_object_tagging_internal(state, bucket, key, body).await;
     }
 
     // Otherwise, it's a regular PUT object
+    if streamed.is_some() {
+        return put_object_streamed(state, bucket, key, auth, headers, body).await;
+    }
+    let body = match whole(body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     put_object(State(state), Path((bucket, key)), auth, headers, body).await
 }
 

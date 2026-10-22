@@ -1555,6 +1555,31 @@ impl SignedRequest {
         }
         Response::from(req.body(body).send().expect("request"))
     }
+
+    /// Send it with a body read as it is sent (a large one, never held
+    /// whole), the unsigned headers `extra`, waiting at most `timeout`.
+    ///
+    /// # Errors
+    /// The connection failed, or was closed before an answer.
+    pub fn send_streamed(
+        &self,
+        body: reqwest::blocking::Body,
+        extra: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Result<Response, reqwest::Error> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap();
+        let mut req = client.request(self.method.parse().expect("method"), &self.url);
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        req.body(body).send().map(Response::from)
+    }
 }
 
 fn hmac(key: &[u8], data: &str) -> Vec<u8> {

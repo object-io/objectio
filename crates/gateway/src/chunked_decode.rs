@@ -18,8 +18,20 @@
 //! no body at all: each chunk carries its own signature, chained from the
 //! request's, and that chain is what proves the body. It is checked here,
 //! chunk by chunk, with the signing key the auth layer derived; `-TRAILER`
-//! adds a signature over the trailing headers. A body whose chain breaks is
-//! refused before the handler sees any of it.
+//! adds a signature over the trailing headers.
+//!
+//! A body read whole (most) is decoded here before the handler runs: one
+//! whose chain breaks is refused before the handler sees any of it, and a
+//! checksum trailer becomes a request header. A large upload's body, which
+//! is never held whole ([`crate::admission::Streamed`]), is decoded as the
+//! handler reads it: each chunk's data passes on as it arrives and its
+//! signature is checked at its end, and the body ends in an error rather
+//! than its end if anything is wrong, so the handler commits nothing built
+//! from it. Its checksum trailers come as the body's HTTP trailers.
+
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use axum::{
     body::Body,
@@ -27,7 +39,9 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use http_body::{Body as HttpBody, Frame, SizeHint};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::auth_middleware::{
@@ -46,13 +60,19 @@ const TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
 /// signed one hashes every byte.
 const DECODE_INLINE_BYTES: usize = 256 * 1024;
 
+/// The longest chunk-size line taken (its size and a signature are about
+/// 90 bytes): a line that never ends is not buffered without end.
+const MAX_LINE: usize = 4096;
+
+/// The most trailer bytes taken after the terminal chunk.
+const MAX_TRAILERS: usize = 64 * 1024;
+
 /// Whether the request says its body is in AWS-chunked framing: a
 /// streaming payload hash (`STREAMING-*`), or `aws-chunked` together with
 /// the decoded length an SDK sends with it. `aws-chunked` in
 /// Content-Encoding alone is weaker: clients name it over plain bodies too,
 /// so such a body is decoded only if it parses as complete framing.
-fn is_s3_chunked(request: &Request<Body>) -> bool {
-    let headers = request.headers();
+fn is_s3_chunked(headers: &http::HeaderMap) -> bool {
     let streaming = headers
         .get("x-amz-content-sha256")
         .and_then(|v| v.to_str().ok())
@@ -87,29 +107,58 @@ fn strip_aws_chunked(headers: &mut http::HeaderMap) {
     }
 }
 
-/// An AWS-chunked body, decoded.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Decoded {
-    payload: Vec<u8>,
-    /// Trailing headers after the terminal chunk, `(name, value)` with the
-    /// name lowercased. This is where an SDK puts `x-amz-checksum-*` when it
-    /// streams the body.
-    trailers: Vec<(String, String)>,
-}
-
 /// Why a framed body was refused.
 #[derive(Debug, PartialEq, Eq)]
-enum DecodeError {
+pub(crate) enum DecodeError {
     /// The framing is broken: cut short, a wrong size, no CRLF.
     Malformed(String),
     /// A chunk or the trailers are not signed as the chain says.
     BadSignature(String),
+    /// Trailers the request names in `x-amz-trailer` and the body left off.
+    MissingTrailers(Vec<String>),
+    /// The payload is not `x-amz-decoded-content-length` long.
+    Length { expected: u64, got: u64 },
+    /// The payload is over this many bytes, the request's limit.
+    TooLarge(u64),
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Malformed(m) | Self::BadSignature(m) => f.write_str(m),
+            Self::MissingTrailers(names) => {
+                write!(f, "announced trailers missing: {}", names.join(", "))
+            }
+            Self::Length { expected, got } => write!(
+                f,
+                "x-amz-decoded-content-length is {expected}, the body decoded to {got} bytes"
+            ),
+            Self::TooLarge(max) => write!(f, "the payload is over {max} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl DecodeError {
+    /// How S3 answers it.
+    pub(crate) fn response(&self) -> Response {
+        match self {
+            Self::Malformed(m) => incomplete_body(&format!("Malformed aws-chunked body: {m}")),
+            Self::BadSignature(m) => {
+                debug!("s3-chunked body refused: {m}");
+                AuthError::SignatureDoesNotMatch.into_response()
+            }
+            Self::MissingTrailers(names) => crate::s3::S3Error::xml_response(
+                "MalformedTrailerError",
+                &format!(
+                    "The request names trailing headers it does not carry: {}",
+                    names.join(", ")
+                ),
+                http::StatusCode::BAD_REQUEST,
+            ),
+            Self::Length { .. } => incomplete_body(&self.to_string()),
+            Self::TooLarge(max) => crate::admission::entity_too_large(*max),
         }
     }
 }
@@ -137,14 +186,12 @@ impl ChunkVerifier {
         }
     }
 
-    /// Check one chunk's signature and move the chain on to it.
-    fn chunk(&mut self, data: &[u8], provided: Option<&str>) -> Result<(), DecodeError> {
+    /// Check the signature of one chunk, whose data's SHA-256 is
+    /// `data_sha256` (hex), and move the chain on to it.
+    fn chunk(&mut self, data_sha256: &str, provided: Option<&str>) -> Result<(), DecodeError> {
         let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{}",
-            self.seed.date,
-            self.seed.scope,
-            self.previous,
-            hex_sha256(data)
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{data_sha256}",
+            self.seed.date, self.seed.scope, self.previous,
         );
         self.advance(&string_to_sign, provided, "chunk")
     }
@@ -221,105 +268,204 @@ fn chunk_signature(extensions: &str) -> Option<&str> {
     })
 }
 
-/// Decode an AWS-chunked body into raw payload bytes and its trailers.
-#[cfg(test)]
-fn decode_s3_chunked(
-    raw: &[u8],
-    verifier: Option<&mut ChunkVerifier>,
-) -> Result<Decoded, DecodeError> {
-    decode_in_place(raw.to_vec(), verifier)
+/// Where a [`Decoder`] is in the framing.
+#[derive(Debug, Clone, Copy)]
+enum State {
+    /// In a chunk-size line.
+    Size,
+    /// In a chunk's data, this many bytes of it to come.
+    Data(u64),
+    /// After a chunk's data: its CR, then its LF.
+    DataCr,
+    DataLf,
+    /// After the terminal chunk: the trailers, to the end of the body.
+    Trailers,
 }
 
-/// Decode the AWS-chunked body in `raw` where it is: each chunk's data is
-/// moved down over the framing before it, and the buffer cut to the
-/// payload, so a body of any size is decoded without a second copy of it.
-///
-/// Parses the `<hex-size>[;extensions]\r\n<data>\r\n` framing. With a
-/// verifier, every chunk's signature is checked (before its data is
-/// moved), and the trailers' when the verifier says they are signed;
-/// without one, chunk signatures are not read.
-fn decode_in_place(
-    mut raw: Vec<u8>,
-    mut verifier: Option<&mut ChunkVerifier>,
-) -> Result<Decoded, DecodeError> {
-    // Where the payload decoded so far ends; never past `pos`, since every
-    // chunk's data follows a size line of at least three bytes.
-    let mut written = 0;
-    let mut pos = 0;
+/// An AWS-chunked body decoded as it arrives, whatever pieces it comes
+/// in: `<hex-size>[;extensions]\r\n<data>\r\n`, up to the terminal chunk
+/// and its trailers. With a verifier, every chunk's signature is checked
+/// at its end (its data is hashed as it passes), and the trailers' when the
+/// verifier says they are signed; without one, chunk signatures are not
+/// read. Data passes on as it arrives, before its chunk is checked: what a
+/// body decodes to counts only once [`Self::finish`] has accepted it.
+pub(crate) struct Decoder {
+    state: State,
+    line: Vec<u8>,
+    trailer: Vec<u8>,
+    verifier: Option<ChunkVerifier>,
+    /// The chunk being read: its data's hash so far, and its signature.
+    chunk: Option<(Sha256, Option<String>)>,
+    decoded: u64,
+}
 
-    loop {
-        // A body that stops before the terminal chunk is a cut-off upload,
-        // not a short object.
-        if pos >= raw.len() {
-            return Err(malformed("body ended before the terminal chunk"));
+impl Decoder {
+    fn new(verifier: Option<ChunkVerifier>) -> Self {
+        Self {
+            state: State::Size,
+            line: Vec::new(),
+            trailer: Vec::new(),
+            verifier,
+            chunk: None,
+            decoded: 0,
         }
+    }
 
-        // Find the end of the chunk-size line (\r\n)
-        let line_end = find_crlf(&raw, pos)
-            .ok_or_else(|| malformed(format!("missing CRLF after chunk size at offset {pos}")))?;
-
-        let line = &raw[pos..line_end];
-        // The chunk size line may contain extensions after a semicolon
-        // e.g. "ab;chunk-signature=..."
-        let size_str = std::str::from_utf8(line)
-            .map_err(|e| malformed(format!("invalid UTF-8 in chunk header: {e}")))?;
-        let (hex_part, extensions) = size_str.split_once(';').unwrap_or((size_str, ""));
-        let hex_part = hex_part.trim();
-
-        let chunk_size = usize::from_str_radix(hex_part, 16)
-            .map_err(|e| malformed(format!("invalid hex chunk size '{hex_part}': {e}")))?;
-        let signature = chunk_signature(extensions);
-
-        // Move past the size line + \r\n
-        pos = line_end + 2;
-
-        if chunk_size == 0 {
-            // Terminal chunk — remaining bytes are trailing headers, one
-            // `name:value` per line, ended by an empty line.
-            let trailer_bytes = &raw[pos.min(raw.len())..];
-            let trailers = parse_trailers(trailer_bytes);
-            if let Some(v) = verifier.as_deref_mut() {
-                v.chunk(&[], signature)?;
-                if v.trailer {
-                    let provided = trailers
-                        .iter()
-                        .find(|(name, _)| name == TRAILER_SIGNATURE)
-                        .map(|(_, value)| value.as_str());
-                    v.trailers(trailer_bytes, provided)?;
+    /// Decode `input`, the next bytes of the body, handing each piece of
+    /// payload in it to `out` (slices of `input`, not copies).
+    fn push(&mut self, mut input: Bytes, out: &mut impl FnMut(Bytes)) -> Result<(), DecodeError> {
+        while !input.is_empty() {
+            match self.state {
+                State::Size => {
+                    let end = memchr::memchr(b'\n', &input);
+                    let take = end.map_or(input.len(), |i| i + 1);
+                    if self.line.len() + take > MAX_LINE {
+                        return Err(malformed(format!(
+                            "a chunk-size line over {MAX_LINE} bytes"
+                        )));
+                    }
+                    self.line.extend_from_slice(&input[..take]);
+                    input.advance(take);
+                    if end.is_some() {
+                        self.chunk_header()?;
+                    }
+                }
+                State::Data(left) => {
+                    let n = usize::try_from(left).map_or(input.len(), |l| l.min(input.len()));
+                    let piece = input.split_to(n);
+                    if let Some((hasher, _)) = self.chunk.as_mut() {
+                        hasher.update(&piece);
+                    }
+                    self.decoded += n as u64;
+                    out(piece);
+                    let left = left - n as u64;
+                    if left == 0 {
+                        self.end_chunk()?;
+                        self.state = State::DataCr;
+                    } else {
+                        self.state = State::Data(left);
+                    }
+                }
+                State::DataCr | State::DataLf => {
+                    let cr = matches!(self.state, State::DataCr);
+                    // The chunk's data is followed by CRLF; anything else
+                    // means the declared size was wrong.
+                    if input[0] != if cr { b'\r' } else { b'\n' } {
+                        return Err(malformed(format!(
+                            "missing CRLF after chunk data at payload offset {}",
+                            self.decoded
+                        )));
+                    }
+                    input.advance(1);
+                    self.state = if cr { State::DataLf } else { State::Size };
+                }
+                State::Trailers => {
+                    if self.trailer.len() + input.len() > MAX_TRAILERS {
+                        return Err(malformed(format!("trailers over {MAX_TRAILERS} bytes")));
+                    }
+                    self.trailer.extend_from_slice(&input);
+                    input.clear();
                 }
             }
-            raw.truncate(written);
-            return Ok(Decoded {
-                payload: raw,
-                trailers,
-            });
         }
-
-        // Read chunk_size bytes of data
-        let Some(chunk_end) = pos.checked_add(chunk_size).filter(|&e| e <= raw.len()) else {
-            return Err(malformed(format!(
-                "chunk data truncated: need {} bytes at offset {}, have {}",
-                chunk_size,
-                pos,
-                raw.len() - pos
-            )));
-        };
-        if let Some(v) = verifier.as_deref_mut() {
-            v.chunk(&raw[pos..chunk_end], signature)?;
-        }
-        raw.copy_within(pos..chunk_end, written);
-        written += chunk_size;
-        pos = chunk_end;
-
-        // The chunk's data is followed by CRLF; anything else means the
-        // declared size was wrong.
-        if raw.get(pos..pos + 2) != Some(b"\r\n".as_slice()) {
-            return Err(malformed(format!(
-                "missing CRLF after chunk data at offset {pos}"
-            )));
-        }
-        pos += 2;
+        Ok(())
     }
+
+    /// A chunk-size line has ended: start its chunk, or the trailers.
+    fn chunk_header(&mut self) -> Result<(), DecodeError> {
+        let line = std::mem::take(&mut self.line);
+        let line = line
+            .strip_suffix(b"\r\n")
+            .ok_or_else(|| malformed("missing CRLF after chunk size"))?;
+        let text = std::str::from_utf8(line)
+            .map_err(|e| malformed(format!("invalid UTF-8 in chunk header: {e}")))?;
+        // The chunk size line may contain extensions after a semicolon
+        // e.g. "ab;chunk-signature=..."
+        let (hex_part, extensions) = text.split_once(';').unwrap_or((text, ""));
+        let hex_part = hex_part.trim();
+        let size = u64::from_str_radix(hex_part, 16)
+            .map_err(|e| malformed(format!("invalid hex chunk size '{hex_part}': {e}")))?;
+        let signature = chunk_signature(extensions).map(str::to_string);
+        if size == 0 {
+            if let Some(v) = self.verifier.as_mut() {
+                v.chunk(EMPTY_SHA256, signature.as_deref())?;
+            }
+            self.state = State::Trailers;
+        } else {
+            self.chunk = self.verifier.is_some().then(|| (Sha256::new(), signature));
+            self.state = State::Data(size);
+        }
+        Ok(())
+    }
+
+    /// A chunk's data has all passed: check its signature.
+    fn end_chunk(&mut self) -> Result<(), DecodeError> {
+        if let (Some(v), Some((hasher, signature))) = (self.verifier.as_mut(), self.chunk.take()) {
+            v.chunk(&hex::encode(hasher.finalize()), signature.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// The body has ended: it must have ended in its terminal chunk and
+    /// trailers (signed, when they are to be). Returns the trailers,
+    /// `(name, value)`, the name lowercased: where an SDK puts
+    /// `x-amz-checksum-*` when it streams the body.
+    fn finish(mut self) -> Result<Vec<(String, String)>, DecodeError> {
+        // A body that stops before the terminal chunk is a cut-off upload,
+        // not a short object.
+        if !matches!(self.state, State::Trailers) {
+            return Err(malformed("body ended before the terminal chunk"));
+        }
+        let trailers = parse_trailers(&self.trailer);
+        if let Some(v) = self.verifier.as_mut()
+            && v.trailer
+        {
+            let provided = trailers
+                .iter()
+                .find(|(name, _)| name == TRAILER_SIGNATURE)
+                .map(|(_, value)| value.as_str());
+            v.trailers(&self.trailer, provided)?;
+        }
+        Ok(trailers)
+    }
+}
+
+/// An AWS-chunked body, decoded.
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Decoded {
+    payload: Vec<u8>,
+    trailers: Vec<(String, String)>,
+}
+
+/// Decode a whole AWS-chunked body, fed to the decoder in pieces of every
+/// size from one byte up, and once whole: each must decode the same.
+#[cfg(test)]
+fn decode_s3_chunked(raw: &[u8], verifier: Option<ChunkVerifier>) -> Result<Decoded, DecodeError> {
+    let decode = |piece: usize, verifier: Option<ChunkVerifier>| {
+        let mut d = Decoder::new(verifier);
+        let mut payload = Vec::new();
+        for p in raw.chunks(piece.max(1)) {
+            d.push(Bytes::copy_from_slice(p), &mut |b| {
+                payload.extend_from_slice(&b);
+            })?;
+        }
+        Ok(Decoded {
+            payload,
+            trailers: d.finish()?,
+        })
+    };
+    let whole = decode(raw.len(), verifier.as_ref().map(clone_verifier));
+    for piece in [1, 2, 3, 7, 64, 1000] {
+        let pieces = decode(piece, verifier.as_ref().map(clone_verifier));
+        assert_eq!(pieces, whole, "fed in pieces of {piece} bytes");
+    }
+    whole
+}
+
+#[cfg(test)]
+fn clone_verifier(v: &ChunkVerifier) -> ChunkVerifier {
+    ChunkVerifier::new(v.seed.clone(), v.trailer)
 }
 
 /// Trailing headers after the terminal chunk. Lines that are not
@@ -333,15 +479,6 @@ fn parse_trailers(raw: &[u8]) -> Vec<(String, String)> {
             Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
         })
         .collect()
-}
-
-/// Find the position of the next \r\n starting from `start`.
-fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
-    data.windows(2)
-        .enumerate()
-        .skip(start)
-        .find(|(_, w)| w == b"\r\n")
-        .map(|(i, _)| i)
 }
 
 /// `Content-Encoding` with the `aws-chunked` coding taken out.
@@ -358,60 +495,174 @@ fn incomplete_body(message: &str) -> Response {
     crate::s3::S3Error::xml_response("IncompleteBody", message, http::StatusCode::BAD_REQUEST)
 }
 
-/// The trailers the request names in `x-amz-trailer` that the body does not
-/// carry. A checksum sent as a trailer is checked only if it arrives, so
-/// one that was announced and left off is refused, not skipped.
-fn missing_trailers(headers: &http::HeaderMap, trailers: &[(String, String)]) -> Vec<String> {
+/// The trailers the request names in `x-amz-trailer`, lowercased.
+fn announced_trailers(headers: &http::HeaderMap) -> Vec<String> {
     headers
         .get_all("x-amz-trailer")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(|name| name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty() && !trailers.iter().any(|(n, _)| n == name))
+        .filter(|name| !name.is_empty())
         .collect()
+}
+
+/// The decoded body checked against what its request says of it: its
+/// `x-amz-decoded-content-length`, and the trailers it named in
+/// `x-amz-trailer` (a checksum sent as a trailer is checked only if it
+/// arrives, so one that was announced and left off is refused, not
+/// skipped). Returns the trailers that become the request's checksum:
+/// only checksums, and only when they are the client's (with signed
+/// chunks, only signed trailers are).
+fn accepted_trailers(
+    trailers: Vec<(String, String)>,
+    decoded: u64,
+    expected: Option<u64>,
+    announced: &[String],
+    trusted: bool,
+) -> Result<http::HeaderMap, DecodeError> {
+    let missing: Vec<String> = announced
+        .iter()
+        .filter(|name| !trailers.iter().any(|(n, _)| n == *name))
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(DecodeError::MissingTrailers(missing));
+    }
+    if let Some(expected) = expected
+        && expected != decoded
+    {
+        return Err(DecodeError::Length {
+            expected,
+            got: decoded,
+        });
+    }
+    let mut out = http::HeaderMap::new();
+    for (name, value) in trailers {
+        if !trusted || !name.starts_with("x-amz-checksum-") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            out.insert(name, value);
+        }
+    }
+    Ok(out)
+}
+
+/// What a request's framing says of its body.
+struct Framing {
+    /// `x-amz-decoded-content-length`.
+    decoded: Option<u64>,
+    announced: Vec<String>,
+    /// Whether its trailers are the client's (see [`accepted_trailers`]).
+    trusted: bool,
+    /// The payload limit.
+    max: u64,
+}
+
+/// A streamed AWS-chunked body, decoded as it is read: payload frames, then
+/// the accepted checksum trailers as an HTTP trailers frame. Anything wrong
+/// with it ends it in an error ([`DecodeError`]), never its end.
+struct DecodingBody {
+    inner: Body,
+    decoder: Option<Decoder>,
+    framing: Framing,
+    out: VecDeque<Bytes>,
+    trailers: Option<http::HeaderMap>,
+}
+
+impl DecodingBody {
+    fn fail(&mut self, e: DecodeError) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        self.decoder = None;
+        self.out.clear();
+        Poll::Ready(Some(Err(axum::Error::new(e))))
+    }
+}
+
+impl HttpBody for DecodingBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        loop {
+            if let Some(piece) = this.out.pop_front() {
+                return Poll::Ready(Some(Ok(Frame::data(piece))));
+            }
+            let Some(decoder) = this.decoder.as_mut() else {
+                return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
+            };
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => {
+                    this.decoder = None;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    let out = &mut this.out;
+                    if let Err(e) = decoder.push(data, &mut |piece| out.push_back(piece)) {
+                        return this.fail(e);
+                    }
+                    if decoder.decoded > this.framing.max {
+                        return this.fail(DecodeError::TooLarge(this.framing.max));
+                    }
+                }
+                Poll::Ready(None) => {
+                    let Some(decoder) = this.decoder.take() else {
+                        continue;
+                    };
+                    let decoded = decoder.decoded;
+                    let f = &this.framing;
+                    match decoder.finish().and_then(|t| {
+                        accepted_trailers(t, decoded, f.decoded, &f.announced, f.trusted)
+                    }) {
+                        Ok(t) => this.trailers = (!t.is_empty()).then_some(t),
+                        Err(e) => return this.fail(e),
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.decoder.is_none() && self.out.is_empty() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
 }
 
 /// Middleware that decodes S3 chunked transfer encoding before handlers see the body.
 pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Response {
-    let signalled = is_s3_chunked(&request);
+    let signalled = is_s3_chunked(request.headers());
     if !signalled && !names_aws_chunked(request.headers()) {
         return next.run(request).await;
     }
+    let max = crate::admission::payload_limit(crate::admission::is_upload(
+        request.method(),
+        request.uri(),
+        request.headers(),
+    ));
 
     let (mut parts, body) = request.into_parts();
-
-    if parts
+    let decoded_len = parts
         .headers
         .get("x-amz-decoded-content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .is_some_and(|n| n > crate::admission::MAX_BODY as u64)
-    {
-        return crate::admission::entity_too_large();
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if decoded_len.is_some_and(|n| n > max) {
+        return crate::admission::entity_too_large(max);
     }
-
-    // Read the full body, no more of it than a handler could take with its
-    // framing (the admission layer has already read it, into one buffer
-    // this takes without a copy). A body that can't be read, or decoded,
-    // fails the request: handing the handler an empty or still-framed body
-    // would store the wrong bytes under the key.
-    let raw =
-        match crate::admission::body_into_vec(body, 0, crate::admission::wire_limit(true), None)
-            .await
-        {
-            Ok(raw) => raw,
-            Err(crate::admission::BodyError::TooLarge) => {
-                return crate::admission::entity_too_large();
-            }
-            Err(e) => {
-                warn!("Failed to read s3-chunked body: {e:?}");
-                return incomplete_body("The request body could not be read in full");
-            }
-        };
-    let raw_len = raw.len();
-
-    debug!("Decoding s3-chunked body ({raw_len} raw bytes)");
 
     // Signed chunks are checked against the chain the auth layer seeded. A
     // request it did not seed was not signed (anonymous, `--no-auth`), and
@@ -429,23 +680,93 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
         .remove::<ChunkSigningSeed>()
         .filter(|_| signed_chunks)
         .map(|seed| ChunkVerifier::new(seed, signed_trailer));
-
-    // Decoded where it lies when the request says it is framed (a failure
-    // refuses it); otherwise a copy, since a body that doesn't parse is
-    // stored as sent.
-    let (raw, as_sent) = if signalled {
-        (raw, None)
-    } else {
-        (raw.clone(), Some(raw))
+    let framing = Framing {
+        decoded: decoded_len,
+        announced: announced_trailers(&parts.headers),
+        // When the chunks are signed and the trailers are not, the
+        // trailers are not the client's and are left out.
+        trusted: !signed_chunks || signed_trailer,
+        max,
     };
-    let decode = move |raw: Vec<u8>| {
-        let mut verifier = verifier;
-        decode_in_place(raw, verifier.as_mut())
+
+    if parts
+        .extensions
+        .get::<crate::admission::Streamed>()
+        .is_some()
+    {
+        strip_aws_chunked(&mut parts.headers);
+        // Only named in Content-Encoding: a streamed body can't be tried as
+        // framing and then stored as sent if it isn't, so it is taken as
+        // sent. SDKs that frame a body say so (a streaming hash, a decoded
+        // length).
+        if !signalled {
+            return next.run(Request::from_parts(parts, body)).await;
+        }
+        match decoded_len {
+            Some(n) => parts.headers.insert("content-length", n.into()),
+            None => parts.headers.remove("content-length"),
+        };
+        mark_unsigned(&mut parts.headers, &payload_hash);
+        let body = Body::new(DecodingBody {
+            inner: body,
+            decoder: Some(Decoder::new(verifier)),
+            framing,
+            out: VecDeque::new(),
+            trailers: None,
+        });
+        return next.run(Request::from_parts(parts, body)).await;
+    }
+
+    // Read the full body, no more of it than a handler could take with its
+    // framing (the admission layer has already read it, into one buffer
+    // this takes without a copy). A body that can't be read, or decoded,
+    // fails the request: handing the handler an empty or still-framed body
+    // would store the wrong bytes under the key.
+    let raw = match crate::admission::body_into_vec(
+        body,
+        0,
+        crate::admission::wire_limit(true, max),
+        None,
+    )
+    .await
+    {
+        Ok(raw) => Bytes::from(raw),
+        Err(crate::admission::BodyError::TooLarge(_)) => {
+            return crate::admission::entity_too_large(max);
+        }
+        Err(e) => {
+            warn!("Failed to read s3-chunked body: {e:?}");
+            return incomplete_body("The request body could not be read in full");
+        }
+    };
+    let raw_len = raw.len();
+    debug!("Decoding s3-chunked body ({raw_len} raw bytes)");
+
+    let decode = {
+        let raw = raw.clone();
+        move || {
+            let mut decoder = Decoder::new(verifier);
+            let mut payload = Vec::with_capacity(raw.len());
+            decoder.push(raw, &mut |piece| payload.extend_from_slice(&piece))?;
+            let decoded = decoder.decoded;
+            let trailers = decoder.finish()?;
+            if decoded > framing.max {
+                return Err(DecodeError::TooLarge(framing.max));
+            }
+            let trailers = accepted_trailers(
+                trailers,
+                decoded,
+                framing.decoded,
+                &framing.announced,
+                framing.trusted,
+            )?;
+            Ok((payload, trailers))
+        }
     };
     let result = if raw_len <= DECODE_INLINE_BYTES {
-        decode(raw)
+        decode()
     } else {
-        match tokio::task::spawn_blocking(move || decode(raw)).await {
+        match tokio::task::spawn_blocking(decode).await {
             Ok(r) => r,
             Err(e) => {
                 warn!("s3-chunked decode task failed: {e}");
@@ -459,95 +780,54 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
     };
 
     let decoded = match result {
-        Ok(Decoded { payload, trailers }) => {
+        Ok((payload, trailers)) => {
             debug!("Decoded s3-chunked: {raw_len} -> {} bytes", payload.len());
-            let missing = missing_trailers(&parts.headers, &trailers);
-            if !missing.is_empty() {
-                return crate::s3::S3Error::xml_response(
-                    "MalformedTrailerError",
-                    &format!(
-                        "The request names trailing headers it does not carry: {}",
-                        missing.join(", ")
-                    ),
-                    http::StatusCode::BAD_REQUEST,
-                );
-            }
             // A checksum sent as a trailer becomes a header, so the handler
-            // checks it the same way as one sent up front. Only checksums:
-            // other trailers (the trailer signature) are not request headers.
-            // When the chunks are signed and the trailers are not, the
-            // trailers are not the client's and are left out.
-            let trailers_trusted = !signed_chunks || signed_trailer;
-            for (name, value) in trailers {
-                if !trailers_trusted || !name.starts_with("x-amz-checksum-") {
-                    continue;
-                }
-                if let (Ok(name), Ok(value)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(&value),
-                ) {
-                    parts.headers.insert(name, value);
-                }
-            }
+            // checks it the same way as one sent up front.
+            parts.headers.extend(trailers);
             payload
-        }
-        Err(DecodeError::BadSignature(e)) => {
-            debug!("s3-chunked body refused: {e}");
-            return AuthError::SignatureDoesNotMatch.into_response();
-        }
-        // Framing the request says it has (a streaming hash, a decoded
-        // length), broken: refused.
-        Err(e) if signalled => {
-            warn!("Failed to decode s3-chunked body: {}", e);
-            return incomplete_body(&format!("Malformed aws-chunked body: {e}"));
         }
         // Only named in Content-Encoding, and not complete framing: a
         // plain body, stored as sent. (A body that does parse as complete
         // framing, terminal chunk and all, is framed.)
-        Err(_) => {
+        Err(DecodeError::Malformed(_)) if !signalled => {
             strip_aws_chunked(&mut parts.headers);
-            let raw = as_sent.unwrap_or_default();
             return next.run(Request::from_parts(parts, Body::from(raw))).await;
         }
+        Err(e) => {
+            if matches!(e, DecodeError::Malformed(_)) {
+                warn!("Failed to decode s3-chunked body: {e}");
+            }
+            return e.response();
+        }
     };
-
-    if decoded.len() > crate::admission::MAX_BODY {
-        return crate::admission::entity_too_large();
-    }
-    if let Some(expected) = parts
-        .headers
-        .get("x-amz-decoded-content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        && expected != decoded.len()
-    {
-        return incomplete_body(&format!(
-            "x-amz-decoded-content-length is {expected}, the body decoded to {} bytes",
-            decoded.len()
-        ));
-    }
 
     // Update Content-Length to the decoded size. `aws-chunked` is only the
     // transfer framing: any other coding (`gzip, aws-chunked`) belongs to
     // the object and is kept.
     parts.headers.insert("content-length", decoded.len().into());
     strip_aws_chunked(&mut parts.headers);
-    // The body is decoded (and its chunks checked): downstream sees a plain
-    // body, whose hash was not signed.
-    if payload_hash.starts_with("STREAMING-") {
-        parts.headers.insert(
-            "x-amz-content-sha256",
-            http::HeaderValue::from_static("UNSIGNED-PAYLOAD"),
-        );
-    }
+    mark_unsigned(&mut parts.headers, &payload_hash);
 
     let rebuilt = Request::from_parts(parts, Body::from(Bytes::from(decoded)));
     next.run(rebuilt).await
 }
 
+/// The body is decoded (and its chunks checked, or being checked):
+/// downstream sees a plain body, whose hash was not signed.
+fn mark_unsigned(headers: &mut http::HeaderMap, payload_hash: &str) {
+    if payload_hash.starts_with("STREAMING-") {
+        headers.insert(
+            "x-amz-content-sha256",
+            http::HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use http_body_util::BodyExt;
 
     #[test]
@@ -742,8 +1022,8 @@ mod tests {
         let (data, body) = aws_body();
         // The example's Content-Length, so the framing is the example's.
         assert_eq!(body.len(), 66_824);
-        let mut v = ChunkVerifier::new(aws_seed(), false);
-        let decoded = decode_s3_chunked(&body, Some(&mut v)).unwrap();
+        let v = ChunkVerifier::new(aws_seed(), false);
+        let decoded = decode_s3_chunked(&body, Some(v)).unwrap();
         assert_eq!(decoded.payload, data);
         // And an independent client computes the same chain.
         assert_eq!(client_chain(&aws_seed(), &data, 65_536), AWS_CHUNK_SIGS);
@@ -757,18 +1037,18 @@ mod tests {
         let at = tampered.len() - 120;
         assert_eq!(tampered[at], b'a');
         tampered[at] = b'b';
-        let mut v = ChunkVerifier::new(aws_seed(), false);
+        let v = ChunkVerifier::new(aws_seed(), false);
         assert!(matches!(
-            decode_s3_chunked(&tampered, Some(&mut v)),
+            decode_s3_chunked(&tampered, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
 
         // A different seed: the chain is another request's.
         let mut seed = aws_seed();
         seed.signature = "0".repeat(64);
-        let mut v = ChunkVerifier::new(seed, false);
+        let v = ChunkVerifier::new(seed, false);
         assert!(matches!(
-            decode_s3_chunked(&body, Some(&mut v)),
+            decode_s3_chunked(&body, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
 
@@ -779,17 +1059,17 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
         let short = framed(&data[65_536..], 65_536, &sigs, "");
-        let mut v = ChunkVerifier::new(aws_seed(), false);
+        let v = ChunkVerifier::new(aws_seed(), false);
         assert!(matches!(
-            decode_s3_chunked(&short, Some(&mut v)),
+            decode_s3_chunked(&short, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
 
         // A chunk without a signature.
         let unsigned = b"5\r\nhello\r\n0\r\n\r\n";
-        let mut v = ChunkVerifier::new(aws_seed(), false);
+        let v = ChunkVerifier::new(aws_seed(), false);
         assert!(matches!(
-            decode_s3_chunked(unsigned, Some(&mut v)),
+            decode_s3_chunked(unsigned, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
     }
@@ -821,8 +1101,8 @@ mod tests {
             &sigs,
             &format!("{trailer}\r\nx-amz-trailer-signature:{tsig}\r\n"),
         );
-        let mut v = ChunkVerifier::new(seed.clone(), true);
-        let decoded = decode_s3_chunked(&good, Some(&mut v)).unwrap();
+        let v = ChunkVerifier::new(seed.clone(), true);
+        let decoded = decode_s3_chunked(&good, Some(v)).unwrap();
         assert_eq!(decoded.payload, data);
         assert_eq!(decoded.trailers[0].1, "sOO8/Q==");
 
@@ -834,8 +1114,8 @@ mod tests {
             &sigs,
             &format!("{trailer}\n\r\nx-amz-trailer-signature:{tsig}\r\n"),
         );
-        let mut v = ChunkVerifier::new(seed.clone(), true);
-        let decoded = decode_s3_chunked(&minio_go, Some(&mut v)).unwrap();
+        let v = ChunkVerifier::new(seed.clone(), true);
+        let decoded = decode_s3_chunked(&minio_go, Some(v)).unwrap();
         assert_eq!(decoded.trailers[0].1, "sOO8/Q==");
 
         // Two trailers, signed in the order sent.
@@ -849,8 +1129,8 @@ mod tests {
                 "x-amz-checksum-crc32c:sOO8/Q==\r\nx-amz-meta-x:1\r\nx-amz-trailer-signature:{tsig2}\r\n"
             ),
         );
-        let mut v = ChunkVerifier::new(seed.clone(), true);
-        assert!(decode_s3_chunked(&both, Some(&mut v)).is_ok());
+        let v = ChunkVerifier::new(seed.clone(), true);
+        assert!(decode_s3_chunked(&both, Some(v)).is_ok());
 
         // The checksum changed after signing.
         let bad = framed(
@@ -859,17 +1139,17 @@ mod tests {
             &sigs,
             &format!("x-amz-checksum-crc32c:AAAAAA==\r\nx-amz-trailer-signature:{tsig}\r\n"),
         );
-        let mut v = ChunkVerifier::new(seed.clone(), true);
+        let v = ChunkVerifier::new(seed.clone(), true);
         assert!(matches!(
-            decode_s3_chunked(&bad, Some(&mut v)),
+            decode_s3_chunked(&bad, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
 
         // The trailer signature left off.
         let unsigned = framed(&data, 8192, &sigs, &format!("{trailer}\r\n"));
-        let mut v = ChunkVerifier::new(seed, true);
+        let v = ChunkVerifier::new(seed, true);
         assert!(matches!(
-            decode_s3_chunked(&unsigned, Some(&mut v)),
+            decode_s3_chunked(&unsigned, Some(v)),
             Err(DecodeError::BadSignature(_))
         ));
     }
@@ -1016,5 +1296,161 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 400);
         let text = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&text).contains("EntityTooLarge"));
+    }
+
+    /// What a handler of a streamed body sees: its payload, its trailers,
+    /// or the error it ended in, as S3 answers it.
+    async fn stream_through(
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+        seed: Option<ChunkSigningSeed>,
+    ) -> Result<(Vec<u8>, Option<http::HeaderMap>), String> {
+        use axum::{Router, middleware, routing::put};
+        type Seen = std::sync::Arc<
+            std::sync::Mutex<Option<Result<(Vec<u8>, Option<http::HeaderMap>), String>>>,
+        >;
+        let seen: Seen = std::sync::Arc::default();
+        let app = {
+            let seen = std::sync::Arc::clone(&seen);
+            Router::new()
+                .route(
+                    "/b/k",
+                    put(move |body: Body| {
+                        let seen = std::sync::Arc::clone(&seen);
+                        async move {
+                            let got = match body.collect().await {
+                                Ok(c) => {
+                                    let trailers = c.trailers().cloned();
+                                    Ok((c.to_bytes().to_vec(), trailers))
+                                }
+                                Err(e) => {
+                                    let resp = crate::admission::body_refused(&e);
+                                    let text = resp.into_body().collect().await.unwrap().to_bytes();
+                                    Err(String::from_utf8_lossy(&text).into_owned())
+                                }
+                            };
+                            *seen.lock().unwrap() = Some(got);
+                            "done"
+                        }
+                    }),
+                )
+                .layer(middleware::from_fn(s3_chunked_decode_layer))
+        };
+        // In small frames, as a connection delivers a large body.
+        let frames: Vec<Result<Bytes, std::io::Error>> = body
+            .chunks(1000)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let mut req = Request::builder().method("PUT").uri("/b/k");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let mut req = req
+            .body(Body::from_stream(futures::stream::iter(frames)))
+            .unwrap();
+        req.extensions_mut().insert(crate::admission::Streamed);
+        if let Some(seed) = seed {
+            req.extensions_mut().insert(seed);
+        }
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "the handler ran");
+        let got = seen.lock().unwrap().take();
+        got.expect("the handler saw the body")
+    }
+
+    /// A streamed upload's chunks are checked as they pass, and its
+    /// checksum trailer comes as the body's trailers.
+    #[tokio::test]
+    async fn a_streamed_body_is_decoded_and_checked_as_it_is_read() {
+        let seed = aws_seed();
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let sigs = client_chain(&seed, &data, 65_536);
+        let trailer = format!(
+            "x-amz-checksum-crc32c:{}",
+            base64::engine::general_purpose::STANDARD.encode(crc32c::crc32c(&data).to_be_bytes())
+        );
+        let tsig = client_trailer_sig(&seed, sigs.last().unwrap(), &format!("{trailer}\n"));
+        let body = framed(
+            &data,
+            65_536,
+            &sigs,
+            &format!("{trailer}\r\nx-amz-trailer-signature:{tsig}\r\n"),
+        );
+        let len = data.len().to_string();
+        let headers = [
+            (
+                "x-amz-content-sha256",
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            ),
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", len.as_str()),
+            ("x-amz-trailer", "x-amz-checksum-crc32c"),
+        ];
+        let (payload, trailers) = stream_through(body.clone(), &headers, Some(seed.clone()))
+            .await
+            .expect("decodes");
+        assert!(payload == data);
+        let trailers = trailers.expect("the checksum trailer");
+        assert_eq!(
+            trailers.get("x-amz-checksum-crc32c").unwrap(),
+            trailer.split_once(':').unwrap().1
+        );
+        assert!(!trailers.contains_key(TRAILER_SIGNATURE));
+
+        // One byte of the middle chunk changed: the body ends in an error.
+        let mut tampered = body.clone();
+        let at = tampered.len() / 2;
+        tampered[at] ^= 1;
+        let err = stream_through(tampered, &headers, Some(seed.clone()))
+            .await
+            .expect_err("a broken chain");
+        assert!(err.contains("SignatureDoesNotMatch"), "{err}");
+
+        // Cut off before its terminal chunk.
+        let err = stream_through(
+            body[..body.len() / 2].to_vec(),
+            &headers,
+            Some(seed.clone()),
+        )
+        .await
+        .expect_err("cut short");
+        assert!(err.contains("IncompleteBody"), "{err}");
+
+        // Longer than it said.
+        let short = (data.len() - 1).to_string();
+        let mut lying = headers;
+        lying[2] = ("x-amz-decoded-content-length", short.as_str());
+        let err = stream_through(body, &lying, Some(seed))
+            .await
+            .expect_err("the wrong length");
+        assert!(err.contains("IncompleteBody"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_without_its_announced_trailer_is_refused() {
+        let body = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        let err = stream_through(
+            body,
+            &[
+                ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", "5"),
+                ("x-amz-trailer", "x-amz-checksum-crc32c"),
+            ],
+            None,
+        )
+        .await
+        .expect_err("refused");
+        assert!(err.contains("MalformedTrailerError"), "{err}");
+    }
+
+    #[test]
+    fn a_line_that_never_ends_is_not_buffered() {
+        let mut d = Decoder::new(None);
+        let long = Bytes::from(vec![b'a'; MAX_LINE + 1]);
+        assert!(matches!(
+            d.push(long, &mut |_| {}),
+            Err(DecodeError::Malformed(_))
+        ));
     }
 }

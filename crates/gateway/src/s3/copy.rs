@@ -4,9 +4,9 @@ use super::*;
 
 /// The most a copy that rewrites the bytes takes from its source (an
 /// UploadPartCopy's range, or a CopyObject that can't share the source's
-/// stripes): they are held in memory and written as a PUT is, so a copy is
-/// held to the single-PUT limit.
-pub(crate) const MAX_COPY_SOURCE: usize = crate::admission::MAX_BODY;
+/// stripes): they are written as a PUT's body is, so a copy is held to the
+/// single PUT's limit, S3's 5 GiB.
+pub(crate) const MAX_COPY_SOURCE: u64 = crate::admission::MAX_UPLOAD;
 
 /// A copy source over [`MAX_COPY_SOURCE`], refused as S3 refuses one over
 /// its own 5 GiB.
@@ -20,14 +20,26 @@ fn copy_source_too_large() -> Response {
     )
 }
 
-/// The source of a copy that rewrites its bytes, read in full: refused
-/// over [`MAX_COPY_SOURCE`] before its body is read, and only with room
-/// for it in the memory budget (503 SlowDown otherwise), which it holds
-/// until the copy is written.
+/// A copy source's bytes, taken as a PUT's body is.
+enum SourceBody {
+    /// Read whole, held under its reservation of the memory budget until
+    /// the copy is written.
+    Whole(Bytes, crate::admission::Reservation),
+    /// Over [`crate::admission::STREAM_ABOVE`]: streamed from the source's
+    /// stripes to the copy's, never held whole. Its length.
+    Streamed(Body, u64),
+}
+
+/// The source of a copy that rewrites its bytes: refused over
+/// [`MAX_COPY_SOURCE`] before its body is read. A small one is read in
+/// full, only with room for it in the memory budget (503 SlowDown
+/// otherwise); a larger one is handed on as a stream, as a large upload's
+/// body is. A source that fails as it is read fails the copy, which then
+/// stores nothing.
 async fn read_copy_source(
     state: &AppState,
     got: Response,
-) -> Result<(http::response::Parts, Bytes, crate::admission::Reservation), Response> {
+) -> Result<(http::response::Parts, SourceBody), Response> {
     let (parts, body) = got.into_parts();
     let size = parts
         .headers
@@ -35,14 +47,20 @@ async fn read_copy_source(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    if size > MAX_COPY_SOURCE as u64 {
+    if size > MAX_COPY_SOURCE {
         return Err(copy_source_too_large());
+    }
+    if size > crate::admission::STREAM_ABOVE {
+        use http_body_util::BodyExt;
+        let body =
+            body.map_err(|e| axum::Error::new(crate::admission::BodyError::Source(e.to_string())));
+        return Ok((parts, SourceBody::Streamed(Body::new(body), size)));
     }
     let Some(reservation) = state.admission.budget.try_reserve(size) else {
         return Err(crate::admission::slow_down("memory"));
     };
-    match axum::body::to_bytes(body, MAX_COPY_SOURCE).await {
-        Ok(b) => Ok((parts, b, reservation)),
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => Ok((parts, SourceBody::Whole(b, reservation))),
         Err(e) => {
             error!("copy: failed to read the source: {e}");
             Err(S3Error::xml_response(
@@ -164,7 +182,7 @@ pub(crate) async fn upload_part_copy_internal(
             StatusCode::RANGE_NOT_SATISFIABLE,
         );
     }
-    let (_, data, _reservation) = match read_copy_source(&state, got).await {
+    let (_, source) = match read_copy_source(&state, got).await {
         Ok(read) => read,
         Err(resp) => return resp,
     };
@@ -179,16 +197,33 @@ pub(crate) async fn upload_part_copy_internal(
             part_headers.insert(name.clone(), value.clone());
         }
     }
-    let put = upload_part_internal(
-        state,
-        bucket,
-        key,
-        upload_id,
-        part_number,
-        part_headers,
-        data,
-    )
-    .await;
+    let put = match source {
+        SourceBody::Whole(data, _reservation) => {
+            upload_part_internal(
+                state,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                part_headers,
+                data,
+            )
+            .await
+        }
+        SourceBody::Streamed(body, size) => {
+            part_headers.insert(header::CONTENT_LENGTH, size.into());
+            upload_part_streamed(
+                state,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                part_headers,
+                body,
+            )
+            .await
+        }
+    };
     if !put.status().is_success() {
         return put;
     }
@@ -574,9 +609,9 @@ pub(crate) async fn copy_by_reference(
 /// Sharing is safe because meta now counts who references a shared stripe
 /// (`ShareStripes`/`ReleaseStripes`): a copy that shared the source's shards
 /// used to lose its data when the source was deleted -- and a rename through
-/// an S3 FUSE mount is a copy then a delete. The bytes are held in memory,
-/// as a PUT's body is, so a copy that rewrites them is held to the PUT's
-/// limit ([`MAX_COPY_SOURCE`]).
+/// an S3 FUSE mount is a copy then a delete. The bytes are taken as a PUT's
+/// body is (a large source streamed, never held whole), so a copy that
+/// rewrites them is held to the PUT's limit ([`MAX_COPY_SOURCE`]).
 ///
 /// Metadata follows S3's `x-amz-metadata-directive`: COPY (the default) keeps
 /// the source's content type, standard headers and user metadata; REPLACE
@@ -636,7 +671,7 @@ pub(crate) async fn copy_object_data(
     if !get_resp.status().is_success() {
         return copy_condition_failed(get_resp);
     }
-    let (source_parts, plaintext, _reservation) = match read_copy_source(&state, get_resp).await {
+    let (source_parts, source) = match read_copy_source(&state, get_resp).await {
         Ok(read) => read,
         Err(resp) => return resp,
     };
@@ -715,19 +750,36 @@ pub(crate) async fn copy_object_data(
     // 3. Re-PUT through the regular handler. Encryption/erasure-coding/
     //    metadata writing all happen through the same code path single-part
     //    PUTs use, so SSE transitions "just work".
-    let copied_bytes = plaintext.len();
-    let put_resp = put_object(
-        State(Arc::clone(&state)),
-        Path((dest_bucket.clone(), dest_key.clone())),
-        auth,
-        put_headers,
-        plaintext,
-    )
-    .await;
+    let (copied_bytes, put_resp) = match source {
+        SourceBody::Whole(plaintext, _reservation) => (
+            plaintext.len() as u64,
+            put_object(
+                State(Arc::clone(&state)),
+                Path((dest_bucket.clone(), dest_key.clone())),
+                auth,
+                put_headers,
+                plaintext,
+            )
+            .await,
+        ),
+        SourceBody::Streamed(body, size) => {
+            put_headers.insert(header::CONTENT_LENGTH, size.into());
+            let put = put_object_streamed(
+                Arc::clone(&state),
+                dest_bucket.clone(),
+                dest_key.clone(),
+                auth,
+                put_headers,
+                body,
+            )
+            .await;
+            (size, put)
+        }
+    };
     if !put_resp.status().is_success() {
         return put_resp;
     }
-    crate::gateway_metrics::record_copy("bytes", copied_bytes as u64);
+    crate::gateway_metrics::record_copy("bytes", copied_bytes);
 
     // 4. CopyObject wants a CopyObjectResult XML body, not the PUT's empty
     //    response. ETag comes from the PUT we just issued.

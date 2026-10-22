@@ -8,8 +8,9 @@
 //! not an edge case.
 //!
 //! An `aws-chunked` body carries its checksum as a trailer instead of a
-//! header; `chunked_decode` lifts that trailer into the request headers, so
-//! both arrive here the same way.
+//! header. A body read whole has it lifted into the request headers by
+//! `chunked_decode`, so both arrive the same way; a streamed body brings it
+//! with its end, and [`StreamingChecksums`] checks it then.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -27,7 +28,7 @@ pub enum ChecksumAlgorithm {
 }
 
 /// CRC-64/NVME, the checksum S3 computes for every object by default.
-const CRC64_NVME: crc::Crc<u64, crc::Table<16>> =
+static CRC64_NVME: crc::Crc<u64, crc::Table<16>> =
     crc::Crc::<u64, crc::Table<16>>::new(&crc::CRC_64_NVME);
 
 impl ChecksumAlgorithm {
@@ -184,13 +185,56 @@ impl ChecksumAlgorithm {
     /// base64 the header carries.
     #[must_use]
     pub fn compute(self, data: &[u8]) -> Vec<u8> {
+        let mut h = self.hasher();
+        h.update(data);
+        h.finish()
+    }
+
+    /// A checksum of this algorithm over data given a piece at a time.
+    #[must_use]
+    pub fn hasher(self) -> ChecksumHasher {
         use sha2::Digest as _;
         match self {
-            Self::Crc32 => crc32fast::hash(data).to_be_bytes().to_vec(),
-            Self::Crc32c => crc32c::crc32c(data).to_be_bytes().to_vec(),
-            Self::Crc64Nvme => CRC64_NVME.checksum(data).to_be_bytes().to_vec(),
-            Self::Sha1 => sha1::Sha1::digest(data).to_vec(),
-            Self::Sha256 => sha2::Sha256::digest(data).to_vec(),
+            Self::Crc32 => ChecksumHasher::Crc32(crc32fast::Hasher::new()),
+            Self::Crc32c => ChecksumHasher::Crc32c(0),
+            Self::Crc64Nvme => ChecksumHasher::Crc64Nvme(CRC64_NVME.digest()),
+            Self::Sha1 => ChecksumHasher::Sha1(sha1::Sha1::new()),
+            Self::Sha256 => ChecksumHasher::Sha256(sha2::Sha256::new()),
+        }
+    }
+}
+
+/// A checksum being computed over data as it arrives.
+pub enum ChecksumHasher {
+    Crc32(crc32fast::Hasher),
+    Crc32c(u32),
+    Crc64Nvme(crc::Digest<'static, u64, crc::Table<16>>),
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl ChecksumHasher {
+    pub fn update(&mut self, data: &[u8]) {
+        use sha2::Digest as _;
+        match self {
+            Self::Crc32(h) => h.update(data),
+            Self::Crc32c(crc) => *crc = crc32c::crc32c_append(*crc, data),
+            Self::Crc64Nvme(d) => d.update(data),
+            Self::Sha1(h) => h.update(data),
+            Self::Sha256(h) => h.update(data),
+        }
+    }
+
+    /// The checksum, as [`ChecksumAlgorithm::compute`] gives it.
+    #[must_use]
+    pub fn finish(self) -> Vec<u8> {
+        use sha2::Digest as _;
+        match self {
+            Self::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
+            Self::Crc32c(crc) => crc.to_be_bytes().to_vec(),
+            Self::Crc64Nvme(d) => d.finalize().to_be_bytes().to_vec(),
+            Self::Sha1(h) => h.finalize().to_vec(),
+            Self::Sha256(h) => h.finalize().to_vec(),
         }
     }
 }
@@ -258,6 +302,24 @@ impl ChecksumError {
 pub struct RequestChecksums {
     content_md5: Option<[u8; 16]>,
     pub flexible: Option<FlexibleChecksum>,
+    /// A flexible checksum `x-amz-trailer` names, when no header carries
+    /// one: its value comes after the body, as a trailer.
+    pub trailer: Option<ChecksumAlgorithm>,
+}
+
+/// A flexible checksum's value as a header or trailer carries it: base64
+/// of the algorithm's length.
+fn decode_value(algorithm: ChecksumAlgorithm, value: &str) -> Result<Vec<u8>, ChecksumError> {
+    B64.decode(value.trim())
+        .ok()
+        .filter(|d| d.len() == algorithm.len())
+        // AWS's answer (Ceph RGW says BadDigest instead).
+        .ok_or_else(|| {
+            ChecksumError::InvalidRequest(format!(
+                "Value for {} header is invalid.",
+                algorithm.header_name()
+            ))
+        })
 }
 
 impl RequestChecksums {
@@ -293,22 +355,36 @@ impl RequestChecksums {
                         .to_string(),
                 ));
             }
-            let expected = value
-                .to_str()
-                .ok()
-                .and_then(|s| B64.decode(s.trim()).ok())
-                .filter(|d| d.len() == algorithm.len())
-                // AWS's answer (Ceph RGW says BadDigest instead).
-                .ok_or_else(|| {
-                    ChecksumError::InvalidRequest(format!(
-                        "Value for {} header is invalid.",
-                        algorithm.header_name()
-                    ))
-                })?;
+            let expected = decode_value(algorithm, value.to_str().unwrap_or_default())?;
             flexible = Some(FlexibleChecksum {
                 algorithm,
                 expected,
             });
+        }
+
+        // A checksum sent after the body: named up front in x-amz-trailer.
+        let mut trailer: Option<ChecksumAlgorithm> = None;
+        for name in headers
+            .get_all("x-amz-trailer")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+        {
+            let Some(algorithm) = ChecksumAlgorithm::from_header_name(name.trim()) else {
+                continue;
+            };
+            if trailer.is_some_and(|t| t != algorithm) {
+                return Err(ChecksumError::InvalidRequest(
+                    "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed."
+                        .to_string(),
+                ));
+            }
+            trailer = Some(algorithm);
+        }
+        // A header that carries it already (a trailer lifted into one, for
+        // a body read whole) is the checksum.
+        if flexible.is_some() {
+            trailer = None;
         }
 
         // The SDK names the algorithm it used; it must be one we know and
@@ -323,7 +399,7 @@ impl RequestChecksums {
                         "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
                     )
                 })?;
-            match &flexible {
+            match flexible.as_ref().map(|f| f.algorithm).or(trailer) {
                 None => {
                     return Err(ChecksumError::InvalidRequest(
                         "x-amz-sdk-checksum-algorithm specified, but no corresponding \
@@ -331,7 +407,7 @@ impl RequestChecksums {
                             .to_string(),
                     ));
                 }
-                Some(f) if f.algorithm != named => {
+                Some(a) if a != named => {
                     return Err(ChecksumError::InvalidRequest(
                         "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
                     ));
@@ -343,6 +419,7 @@ impl RequestChecksums {
         Ok(Self {
             content_md5,
             flexible,
+            trailer,
         })
     }
 
@@ -376,6 +453,104 @@ impl RequestChecksums {
             return Err(ChecksumError::BadChecksum(f.algorithm));
         }
         Ok(md5)
+    }
+}
+
+/// An upload's body checked as it streams: its MD5 (the ETag, and what
+/// `Content-MD5` is held to) and the flexible checksum it carries, in a
+/// header or a trailer, or that its upload declared.
+pub struct StreamingChecksums {
+    request: RequestChecksums,
+    md5: Md5,
+    flexible: Option<(ChecksumAlgorithm, ChecksumHasher)>,
+}
+
+/// What a streamed body turned out to be, once every checksum it carried
+/// matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedChecksums {
+    pub md5: [u8; 16],
+    /// The flexible checksum computed, and whether the client sent it (or
+    /// only its upload declared the algorithm).
+    pub flexible: Option<(ChecksumAlgorithm, Vec<u8>, bool)>,
+}
+
+impl StreamedChecksums {
+    /// The flexible checksum the client sent, as stored and answered.
+    #[must_use]
+    pub fn sent(&self) -> Option<(ChecksumAlgorithm, String)> {
+        self.flexible
+            .as_ref()
+            .filter(|(_, _, sent)| *sent)
+            .map(|(a, v, _)| (*a, B64.encode(v)))
+    }
+
+    /// The flexible checksum computed, sent or not.
+    #[must_use]
+    pub fn computed(&self) -> Option<(ChecksumAlgorithm, String)> {
+        self.flexible.as_ref().map(|(a, v, _)| (*a, B64.encode(v)))
+    }
+}
+
+impl StreamingChecksums {
+    /// Check against what `request` carries; `declared` is the algorithm
+    /// computed when the request sends none (a part of an upload that
+    /// declared one).
+    #[must_use]
+    pub fn new(request: RequestChecksums, declared: Option<ChecksumAlgorithm>) -> Self {
+        let algorithm = request
+            .flexible
+            .as_ref()
+            .map(|f| f.algorithm)
+            .or(request.trailer)
+            .or(declared);
+        Self {
+            request,
+            md5: Md5::new(),
+            flexible: algorithm.map(|a| (a, a.hasher())),
+        }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.md5.update(data);
+        if let Some((_, h)) = self.flexible.as_mut() {
+            h.update(data);
+        }
+    }
+
+    /// The body has ended, with `trailers` (an `aws-chunked` body's
+    /// checksum): check every checksum the request carried.
+    ///
+    /// # Errors
+    /// The first checksum that does not match, or a trailer whose value is
+    /// malformed.
+    pub fn finish(self, trailers: Option<&HeaderMap>) -> Result<StreamedChecksums, ChecksumError> {
+        let md5: [u8; 16] = self.md5.finalize().into();
+        if self.request.content_md5.is_some_and(|want| want != md5) {
+            return Err(ChecksumError::BadDigest);
+        }
+        let Some((algorithm, hasher)) = self.flexible else {
+            return Ok(StreamedChecksums {
+                md5,
+                flexible: None,
+            });
+        };
+        let computed = hasher.finish();
+        let expected = match (&self.request.flexible, self.request.trailer) {
+            (Some(f), _) => Some(f.expected.clone()),
+            (None, Some(a)) => trailers
+                .and_then(|t| t.get(a.header_name()))
+                .map(|v| decode_value(a, v.to_str().unwrap_or_default()))
+                .transpose()?,
+            (None, None) => None,
+        };
+        if expected.as_ref().is_some_and(|e| *e != computed) {
+            return Err(ChecksumError::BadChecksum(algorithm));
+        }
+        Ok(StreamedChecksums {
+            md5,
+            flexible: Some((algorithm, computed, expected.is_some())),
+        })
     }
 }
 
@@ -536,5 +711,86 @@ mod tests {
             assert_eq!(algo.combine(&parts), Some(algo.compute(&data)), "{algo:?}");
         }
         assert_eq!(ChecksumAlgorithm::Sha256.combine(&[(vec![0; 32], 1)]), None);
+    }
+
+    /// Fed in pieces, a hasher gives what one pass over the whole gives.
+    #[test]
+    fn a_checksum_in_pieces_is_the_checksum_of_the_whole() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        for algo in ChecksumAlgorithm::all() {
+            let mut h = algo.hasher();
+            for piece in data.chunks(7_777) {
+                h.update(piece);
+            }
+            assert_eq!(h.finish(), algo.compute(&data), "{algo:?}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_body_is_held_to_its_headers() {
+        let c = RequestChecksums::from_headers(&headers(&[
+            ("content-md5", "XrY7u+Ae7tCTyyK7j1rNww=="),
+            ("x-amz-checksum-crc32c", "yZRlqg=="),
+        ]))
+        .unwrap();
+        let mut s = StreamingChecksums::new(c.clone(), None);
+        s.update(b"hello ");
+        s.update(b"world");
+        let done = s.finish(None).unwrap();
+        assert_eq!(hex::encode(done.md5), "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        assert_eq!(
+            done.sent(),
+            Some((ChecksumAlgorithm::Crc32c, "yZRlqg==".to_string()))
+        );
+
+        let mut s = StreamingChecksums::new(c, None);
+        s.update(b"hello world!");
+        assert_eq!(s.finish(None), Err(ChecksumError::BadDigest));
+    }
+
+    /// A checksum named in x-amz-trailer is computed as the body streams and
+    /// checked against the trailer at its end.
+    #[test]
+    fn a_trailer_checksum_is_checked_at_the_end() {
+        let c = RequestChecksums::from_headers(&headers(&[
+            ("x-amz-trailer", "x-amz-checksum-crc32c"),
+            ("x-amz-sdk-checksum-algorithm", "CRC32C"),
+        ]))
+        .unwrap();
+        assert_eq!(c.trailer, Some(ChecksumAlgorithm::Crc32c));
+        let trailers = headers(&[("x-amz-checksum-crc32c", "yZRlqg==")]);
+        let mut s = StreamingChecksums::new(c.clone(), None);
+        s.update(b"hello world");
+        assert_eq!(
+            s.finish(Some(&trailers)).unwrap().sent(),
+            Some((ChecksumAlgorithm::Crc32c, "yZRlqg==".to_string()))
+        );
+
+        let mut s = StreamingChecksums::new(c.clone(), None);
+        s.update(b"hello there");
+        assert_eq!(
+            s.finish(Some(&trailers)),
+            Err(ChecksumError::BadChecksum(ChecksumAlgorithm::Crc32c))
+        );
+
+        let bad = headers(&[("x-amz-checksum-crc32c", "AAAAAAAA")]);
+        let mut s = StreamingChecksums::new(c, None);
+        s.update(b"hello world");
+        assert_eq!(s.finish(Some(&bad)).unwrap_err().code(), "InvalidRequest");
+    }
+
+    /// An upload part sent without a checksum gets the one its upload
+    /// declared, computed, and not reported as sent.
+    #[test]
+    fn a_declared_algorithm_is_computed_when_none_is_sent() {
+        let mut s =
+            StreamingChecksums::new(RequestChecksums::default(), Some(ChecksumAlgorithm::Crc32));
+        s.update(b"hello world");
+        let done = s.finish(None).unwrap();
+        assert_eq!(done.sent(), None);
+        assert_eq!(
+            done.computed(),
+            Some((ChecksumAlgorithm::Crc32, "DUoRhQ==".to_string()))
+        );
     }
 }

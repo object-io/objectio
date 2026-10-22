@@ -191,6 +191,10 @@ pub struct RaftStatus {
     pub fatal: Option<String>,
 }
 
+/// The size of each OSD's disk, a sparse file, unless a test asks for
+/// another.
+const DISK_BYTES: u64 = 2 << 30;
+
 impl HaCluster {
     /// `metas` meta nodes in one Raft group, `osds` OSDs (4+2), and
     /// `gateways` gateways with auth on, all separate processes.
@@ -249,6 +253,28 @@ impl HaCluster {
             meta_args,
             true,
             racks.iter().map(ToString::to_string).collect(),
+            DISK_BYTES,
+        )
+    }
+
+    /// As [`Self::start`], each OSD's disk `disk_bytes` large (a sparse
+    /// file): for tests that store more than the usual disks hold.
+    #[must_use]
+    pub fn start_with_disk_bytes(
+        metas: usize,
+        osds: usize,
+        gateways: usize,
+        disk_bytes: u64,
+    ) -> Self {
+        Self::start_inner(
+            None,
+            metas,
+            osds,
+            gateways,
+            &[],
+            false,
+            Vec::new(),
+            disk_bytes,
         )
     }
 
@@ -268,9 +294,11 @@ impl HaCluster {
             meta_args,
             osd_hosts,
             Vec::new(),
+            DISK_BYTES,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         bins: Option<&Path>,
         metas: usize,
@@ -279,6 +307,7 @@ impl HaCluster {
         meta_args: &[&str],
         osd_hosts: bool,
         osd_racks: Vec<String>,
+        disk_bytes: u64,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut cluster = Self {
@@ -320,7 +349,7 @@ impl HaCluster {
             std::fs::create_dir_all(state.join("state")).expect("osd dir");
             let disk = state.join("disk.raw");
             std::fs::File::create(&disk)
-                .and_then(|f| f.set_len(2 << 30))
+                .and_then(|f| f.set_len(disk_bytes))
                 .expect("osd disk");
             cluster.osds.push(Osd {
                 port: free_port(),
