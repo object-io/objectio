@@ -46,11 +46,9 @@ jobs:
       # autotools on both, NASM on x86_64 only (installed on both, unused
       # on arm64).
       - name: build dependencies
-        # A stalled mirror once held a job for its full 6 hours.
-        timeout-minutes: 10
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev mold
+          scripts/ci/apt-install.sh protobuf-compiler nasm autoconf automake libtool libclang-dev mold
       # aio embeds the console.
       - uses: actions/setup-node@v4
         with:
