@@ -531,22 +531,20 @@ pub(crate) async fn gather_versions(
                 continue;
             }
         };
-        match client
-            .list_object_versions_meta(ListObjectVersionsMetaRequest {
-                bucket: bucket.clone(),
-                prefix: req.prefix.clone(),
-                key_marker: from,
-                // The marker key's own versions, on the first page only:
-                // its later versions come after the version marker.
-                version_id_marker: if first && !req.version_id_marker.is_empty() {
-                    req.version_id_marker.clone()
-                } else {
-                    String::new()
-                },
-                max_keys: page,
-            })
-            .await
-        {
+        let call = client.list_object_versions_meta(ListObjectVersionsMetaRequest {
+            bucket: bucket.clone(),
+            prefix: req.prefix.clone(),
+            key_marker: from,
+            // The marker key's own versions, on the first page only: its
+            // later versions come after the version marker.
+            version_id_marker: if first && !req.version_id_marker.is_empty() {
+                req.version_id_marker.clone()
+            } else {
+                String::new()
+            },
+            max_keys: page,
+        });
+        match state.osd_pool.watched(&behind.node.address, call).await {
             Ok(resp) => {
                 let page = resp.into_inner();
                 for v in page.versions {
@@ -560,6 +558,7 @@ pub(crate) async fn gather_versions(
             }
             Err(e) => {
                 warn!("version listing: OSD {} failed: {e}", behind.node.address);
+                state.osd_pool.call_failed(&behind.node.address, &e);
             }
         }
     }

@@ -642,7 +642,26 @@ impl HaCluster {
         self.start_osd(i, bins);
     }
 
-    /// Stop gateway `i` and start it again from `bins`.
+    /// Freeze OSD `i` (SIGSTOP): its connections stay open and its kernel
+    /// still accepts new ones, but nothing on them is answered, as a host
+    /// hung or cut off without a reset.
+    pub fn freeze_osd(&self, i: usize) {
+        self.signal_osd(i, "-STOP");
+    }
+
+    /// Let a frozen OSD run again (SIGCONT).
+    pub fn thaw_osd(&self, i: usize) {
+        self.signal_osd(i, "-CONT");
+    }
+
+    fn signal_osd(&self, i: usize, sig: &str) {
+        let pid = self.osd_pid(i).expect("OSD running");
+        Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .status()
+            .expect("kill");
+    }
+
     /// Gateway `i`'s process id, while it runs: to read its memory from
     /// `/proc`.
     #[must_use]

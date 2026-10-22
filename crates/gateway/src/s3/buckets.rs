@@ -461,14 +461,19 @@ pub(crate) async fn holds_versions(state: &AppState, bucket: &str) -> Result<boo
             .get_or_connect(&node.node_id, &node.address)
             .await
             .map_err(|e| unavailable(format!("OSD {}: {e}", node.address)))?;
-        let page = client
-            .list_object_versions_meta(ListObjectVersionsMetaRequest {
-                bucket: bucket.to_string(),
-                max_keys: 1,
-                ..Default::default()
-            })
+        let call = client.list_object_versions_meta(ListObjectVersionsMetaRequest {
+            bucket: bucket.to_string(),
+            max_keys: 1,
+            ..Default::default()
+        });
+        let page = state
+            .osd_pool
+            .watched(&node.address, call)
             .await
-            .map_err(|e| unavailable(format!("OSD {}: {e}", node.address)))?
+            .map_err(|e| {
+                state.osd_pool.call_failed(&node.address, &e);
+                unavailable(format!("OSD {}: {e}", node.address))
+            })?
             .into_inner();
         if !page.versions.is_empty() {
             return Ok(true);
