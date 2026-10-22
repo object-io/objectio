@@ -2,7 +2,7 @@
 //! of the voters.
 //!
 //! A node cut off from the others times out waiting for the leader and
-//! starts an election every election timeout (2-4 s by default,
+//! starts an election every election timeout (1-2 s by default,
 //! `--raft-election-ms`), raising its term each time, though it can never
 //! win. When it is reachable again its term is far ahead, the leader that
 //! served all along sees it and steps down, and the cluster goes without a

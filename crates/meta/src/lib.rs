@@ -127,16 +127,36 @@ pub struct Args {
     pub raft_keep_logs: u64,
 
     /// Raft heartbeat interval, in ms. It also bounds how long a leader
-    /// waits for a follower to take entries before counting it lost.
+    /// waits for a follower to take entries before counting it lost, so
+    /// it isn't lowered to elect sooner: a follower fsyncing a batch under
+    /// load would time out. openraft's timer ticks every 1.5 × this: an
+    /// idle leader heartbeats, and a follower checks its election timer,
+    /// once a tick.
     #[arg(long, default_value_t = 500)]
     pub raft_heartbeat_ms: u64,
 
-    /// A follower that hears nothing from its leader for a random time in
-    /// [this, 2 × this] ms stands for election. Under write load a follower
-    /// fsyncing its log, or a busy VM, delays heartbeats: at 500 ms meta
-    /// elected under the soak's load with no fault at all, and every
-    /// election is seconds of 503s.
-    #[arg(long, default_value_t = 2000)]
+    /// Election timeout, in ms (`E`); all meta nodes should use the same.
+    ///
+    /// Each node draws its timeout once, at start, from [E, 2E]. A follower
+    /// stands for election after hearing nothing from its leader for the
+    /// leader lease (2E) plus that timeout, checked on the next tick, and
+    /// until the lease has passed it refuses to vote for anyone else. The
+    /// default, 1000, makes that 3-4 s of silence (up to 4.75 s with the
+    /// tick); a candidate that loses a vote to a peer in the same term
+    /// tries again after its timeout, 1-2 s more.
+    ///
+    /// Lower costs spurious elections: under write load a follower
+    /// fsyncing its log, or a busy VM, delays heartbeats, and at 500 ms
+    /// (1.5-2 s of silence) meta elected under the soak's load with no
+    /// fault at all; every election is seconds of 503s. Higher costs
+    /// failover: at 2000 a lost leader was replaced 6-9 s after its last
+    /// heartbeat, 12 s when the first candidate's log was behind.
+    ///
+    /// A leader's quorum confirmation serves reads for E/2 (`read_gate`),
+    /// which is safe while that is shorter than every voter's lease (2E):
+    /// values less than 4× apart across the nodes, as in a rolling upgrade
+    /// that changes this default, are still safe.
+    #[arg(long, default_value_t = 1000)]
     pub raft_election_ms: u64,
 
     /// Shards a drain sweep moves off each draining OSD, at most.
@@ -773,5 +793,40 @@ mod raft_config_tests {
             openraft::SnapshotPolicy::LogsSinceLast(1000)
         ));
         assert_eq!(c.max_in_snapshot_log_to_keep, 100);
+    }
+
+    /// The default timing, as openraft 0.9 applies it: a follower whose
+    /// leader is gone stands for election after the leader lease
+    /// (`election_timeout_max`) plus its own timeout (drawn once from
+    /// [min, max]), on the first tick (every 1.5 heartbeats) after that.
+    /// It is replaced within ~5 s of its last heartbeat, ~8 s if the first
+    /// candidate loses a vote in the same term; a follower tolerates 3 s
+    /// of silence (2× what elected spuriously under load at 500 ms); and
+    /// a read confirmation is reused for less than any voter's lease.
+    #[test]
+    fn the_default_timing_replaces_a_lost_leader_within_seconds() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from(["objectio-meta"]).unwrap();
+        let c = super::raft_config(1, 1, args.raft_heartbeat_ms, args.raft_election_ms)
+            .validate()
+            .unwrap();
+        let (min, max) = (c.election_timeout_min, c.election_timeout_max);
+        let lease = max;
+        let tick = c.heartbeat_interval * 3 / 2;
+
+        let tolerated = lease + min;
+        let first = lease + max + tick;
+        let after_a_lost_vote = first + max + tick;
+        assert!(tolerated >= 3000, "elects after {tolerated} ms of silence");
+        assert!(first <= 5000, "first election {first} ms after the leader");
+        assert!(after_a_lost_vote <= 8000, "{after_a_lost_vote} ms");
+
+        // Read confirmations (read_gate) are reused for min / 2 from when
+        // the round started; no voter that acked it votes for another
+        // leader within its lease, so the reuse must end well before.
+        assert!(min / 2 * 4 <= lease, "window {} vs lease {lease}", min / 2);
+        // A node still on the previous default (2000) during a rolling
+        // upgrade, as leader, reuses for 1 s; voters here lease for 2 s.
+        assert!(2000 / 2 < lease);
     }
 }
