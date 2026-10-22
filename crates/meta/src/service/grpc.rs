@@ -1215,6 +1215,15 @@ impl MetadataService for MetaService {
         Self::finalize_upgrade(self, request).await
     }
 
+    type ExportMetaStream = super::restored::ExportStream;
+
+    async fn export_meta(
+        &self,
+        request: Request<objectio_proto::metadata::ExportMetaRequest>,
+    ) -> Result<Response<Self::ExportMetaStream>, Status> {
+        Self::export_meta(self, request).await
+    }
+
     async fn acquire_lease(
         &self,
         request: Request<objectio_proto::metadata::AcquireLeaseRequest>,

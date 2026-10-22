@@ -977,6 +977,111 @@ impl HaCluster {
         n
     }
 
+    /// Meta node `i`'s Raft id.
+    #[must_use]
+    pub fn meta_id(&self, i: usize) -> u64 {
+        self.metas[i].id
+    }
+
+    /// Stop meta node `i` and delete its data directory: lost for good.
+    /// [`Self::start_meta`] then starts it empty, at its old id and ports.
+    pub fn lose_meta(&self, i: usize) {
+        self.kill_meta(i);
+        let _ = std::fs::remove_dir_all(&self.metas[i].dir);
+    }
+
+    /// Restore `backup` into meta node `i`'s data directory (stopped, and
+    /// empty), as the one voter at its id and address. Returns what the
+    /// tool printed.
+    #[must_use]
+    pub fn restore_meta(&self, i: usize, backup: &Path) -> String {
+        let m = &self.metas[i];
+        assert!(!m.running(), "stop meta node {i} first");
+        meta_tool(&[
+            "restore",
+            "--from",
+            &backup.display().to_string(),
+            "--data-dir",
+            &m.dir.display().to_string(),
+            "--node-id",
+            &m.id.to_string(),
+            "--raft-advertise",
+            &format!("127.0.0.1:{}", m.grpc),
+        ])
+    }
+
+    /// Make meta node `i` (stopped) the only voter of its group, on its own
+    /// data. Returns what the tool printed.
+    #[must_use]
+    pub fn force_single_voter(&self, i: usize) -> String {
+        let m = &self.metas[i];
+        assert!(!m.running(), "stop meta node {i} first");
+        meta_tool(&[
+            "force-single-voter",
+            "--data-dir",
+            &m.dir.display().to_string(),
+            "--node-id",
+            &m.id.to_string(),
+            "--others-lost-for-good",
+        ])
+    }
+
+    /// Add meta nodes `others` (running, empty) to the group meta node
+    /// `leader` leads, as the bootstrap does: each as a learner, then all
+    /// of them voters beside the leader.
+    ///
+    /// # Panics
+    /// When the group refuses a step.
+    pub fn join_metas(&self, leader: usize, others: &[usize]) {
+        let post = |path: &str, body: serde_json::Value| {
+            let r = self
+                .admin
+                .0
+                .post(self.admin_url(leader, path))
+                .json(&body)
+                .send()
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert!(
+                r.status().is_success(),
+                "{path}: {}",
+                r.text().unwrap_or_default()
+            );
+        };
+        for &i in others {
+            let m = &self.metas[i];
+            post(
+                "/add-learner",
+                serde_json::json!({ "node_id": m.id, "addr": format!("127.0.0.1:{}", m.grpc) }),
+            );
+        }
+        let voters: Vec<u64> = std::iter::once(leader)
+            .chain(others.iter().copied())
+            .map(|i| self.metas[i].id)
+            .collect();
+        post(
+            "/change-membership",
+            serde_json::json!({ "voters": voters }),
+        );
+    }
+
+    /// Run `obioctl` as the admin against gateway `g`.
+    #[must_use]
+    pub fn obioctl(&self, g: usize, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new(bin(None, "obioctl"));
+        cmd.env_clear();
+        if self.tls {
+            crate::tls::apply(&mut cmd, crate::tls::ADMIN);
+        }
+        cmd.env("HOME", self.dir.path())
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("OBJECTIO_ENDPOINT", &self.clients[g].endpoint)
+            .env("OBJECTIO_ACCESS_KEY", &self.access_key)
+            .env("OBJECTIO_SECRET_KEY", &self.secret_key)
+            .args(args)
+            .output()
+            .expect("run obioctl")
+    }
+
     /// Wait until every OSD is known to the cluster (placement works). A
     /// cluster of meta nodes alone has nothing to wait for.
     fn await_osds(&self, osds: usize) {
@@ -1017,6 +1122,26 @@ impl HaCluster {
             std::thread::sleep(Duration::from_millis(200));
         }
     }
+}
+
+/// Run `objectio-meta` with `args` (an offline tool), and return what it
+/// printed.
+///
+/// # Panics
+/// When it fails.
+fn meta_tool(args: &[&str]) -> String {
+    let out = Command::new(bin(None, "objectio-meta"))
+        .args(args)
+        .output()
+        .expect("run objectio-meta");
+    assert!(
+        out.status.success(),
+        "objectio-meta {args:?} failed ({}):\nstdout: {}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// Wait until every one of `ports` accepts connections, or `child` exits.

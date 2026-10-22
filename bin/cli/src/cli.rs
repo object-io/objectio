@@ -143,6 +143,11 @@ pub enum Command {
         #[command(subcommand)]
         action: UpgradeCmd,
     },
+    /// Meta's state machine: backups (system admin)
+    Meta {
+        #[command(subcommand)]
+        action: MetaCmd,
+    },
     /// Storage nodes (OSDs)
     Node {
         #[command(subcommand)]
@@ -898,6 +903,20 @@ pub enum ClusterCmd {
     Rebalance {
         #[command(subcommand)]
         action: RebalanceCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MetaCmd {
+    /// GET /_admin/meta/export: a backup of meta's whole state machine
+    /// (buckets, users, keys, policies, placement, listings, config), taken
+    /// from the leader while the cluster serves. Checked as it downloads; a
+    /// transfer cut short fails. Restore it with `objectio-meta restore`.
+    Export {
+        /// Write the backup here (through PATH.part, renamed once whole);
+        /// without it, to standard output.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 

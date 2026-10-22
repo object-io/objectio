@@ -288,7 +288,7 @@ its replica count), then lower `partition` by one per checked pod.
 | Lost | What goes with it | Keep instead |
 |---|---|---|
 | The SSE master key | Every SSE-S3 and locally wrapped SSE-KMS object, for good | `kubectl -n objectio get secret objectio-gateway-sse -o jsonpath='{.data.master-key}' \| base64 -d` (aio: `<data>/master_key`), stored off the cluster |
-| A meta majority, disks and all | The cluster: buckets, users, keys, the object index. No tool rebuilds it from the OSDs' disks | A meta backup before every upgrade: stop a follower, copy its `--data-dir` (`meta.redb`), start it; or snapshot the meta PVCs |
+| A meta majority, disks and all | Everything since the last meta backup: buckets, users and keys made since, block volumes' writes, objects packed since (objects written since read, and are listed again) | `obioctl meta export --file F` on a schedule and before every upgrade, stored off the cluster; restore with `objectio-meta restore` ([failure recovery](https://object-io.github.io/latest/operations-guide/operations/failure-recovery/)). Two of three metas lost for good with one intact: the last resort, `objectio-meta force-single-voter --others-lost-for-good` on the survivor once the others' data is wiped, no backup needed |
 | More than m shards of a stripe | Those objects | Enough hosts; a dead host set `out` within hours |
 | A whole site | Whatever had not replicated | Bucket replication to a second ObjectIO cluster (`objectio-admin`) |
 | The block gateway's journal disk | Block writes not yet flushed (a known gap) | -- |

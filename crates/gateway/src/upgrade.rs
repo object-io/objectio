@@ -20,7 +20,7 @@ use serde_json::json;
 use crate::s3::AppState;
 
 #[allow(clippy::result_large_err)]
-fn system_admin(
+pub(crate) fn system_admin(
     auth: &Option<Extension<AuthResult>>,
     headers: &HeaderMap,
 ) -> Result<String, Response> {
@@ -36,7 +36,7 @@ fn system_admin(
     }
 }
 
-fn meta_error(e: &tonic::Status) -> Response {
+pub(crate) fn meta_error(e: &tonic::Status) -> Response {
     let status = match e.code() {
         tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
         tonic::Code::Aborted => StatusCode::CONFLICT,

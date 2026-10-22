@@ -11,7 +11,7 @@ pub mod types;
 
 pub use raft::{ApplyEvent, CasOp, CasTable, MAX_OPS, MetaCommand, MetaResponse, MetaTypeConfig};
 pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
-pub use raft_storage::{MetaRaftStorage, cas_table_name};
+pub use raft_storage::{BackupHeader, Edit, Forced, MetaRaftStorage, Voter, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
 pub use types::record;
 pub use types::{

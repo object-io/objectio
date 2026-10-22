@@ -310,6 +310,10 @@ pub const RULES: &[(&str, &[(&str, Roles)])] = &[
             ("ReportVersion", NODES),
             ("GetUpgradeStatus", GW),
             ("FinalizeUpgrade", GW),
+            // A backup of the whole state machine, secrets included: the
+            // gateway's admin API serves it to a system admin, and the
+            // gateway already holds every secret it carries.
+            ("ExportMeta", GW),
             ("PutBucketSetting", GW),
             ("CreateKmsKey", GW),
             ("GetKmsKey", GW),

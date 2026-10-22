@@ -395,6 +395,9 @@ impl MetaService {
                 ok
             };
             if ok {
+                // After a restore, a stripe that predates it may have a use
+                // the registry lost: its reference goes, its bytes stay.
+                let (freeable, freed_packs) = self.hold_restored_frees(freeable, freed_packs);
                 return Ok((freeable, freed_packs));
             }
         }

@@ -44,9 +44,10 @@ md5 = "0.7"
 prost = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+# The offline restore tools edit the state machine they install.
+redb = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-redb = { workspace = true }
 # The read gate's tests run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }

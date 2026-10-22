@@ -2475,6 +2475,7 @@ dependencies = [
  "hmac",
  "http",
  "objectio-auth",
+ "objectio-common",
  "objectio-proto",
  "reqwest",
  "serde",

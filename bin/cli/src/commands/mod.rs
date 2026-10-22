@@ -4,6 +4,7 @@ pub mod access;
 pub mod bucket;
 pub mod cluster;
 pub mod iam;
+pub mod meta;
 pub mod replication;
 
 use crate::cli::{Command, TenantOpt};
@@ -42,6 +43,7 @@ pub async fn run(cmd: Command, ctx: &mut Ctx<'_, '_>) -> Result<()> {
         Command::Provision { action } => bucket::provision(action, ctx).await,
         Command::Cluster { action } => cluster::cluster(action, ctx).await,
         Command::Upgrade { action } => cluster::upgrade(action, ctx).await,
+        Command::Meta { action } => meta::meta(action, ctx).await,
         Command::Node { action } => cluster::node(action, ctx).await,
         Command::Osd { action } => cluster::osd(action, ctx).await,
         Command::Pool { action } => cluster::pool(action, ctx).await,

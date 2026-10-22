@@ -208,6 +208,9 @@ async fn sweep_once(meta: &Arc<MetaService>, batch: usize) -> anyhow::Result<boo
                     || (n.admin_state == objectio_common::OsdAdminState::Out
                         && meta.purge_state(n.node_id).is_none())
             })
+            // Restored as draining or out: it may be back in, with data
+            // the restored state doesn't know. Until an operator says.
+            .filter(|n| !meta.osd_to_confirm(&n.node_id))
             .map(|n| {
                 let out = n.admin_state == objectio_common::OsdAdminState::Out;
                 (n.node_id, n.address, out)
@@ -345,9 +348,11 @@ async fn purge_pending(meta: &Arc<MetaService>) {
             let _ = meta.set_purge_state(node_id, None).await;
             continue;
         };
-        if node.admin_state != objectio_common::OsdAdminState::Out {
+        if node.admin_state != objectio_common::OsdAdminState::Out || meta.osd_to_confirm(&node_id)
+        {
             // Only ever a drained, Out OSD. (It can't be put back In while
-            // pending; anything else is left alone.)
+            // pending; anything else is left alone.) Nor one a restore left
+            // pending: it may have been purged and put back in since.
             continue;
         }
         purge_one(meta, node_id, &node.address).await;

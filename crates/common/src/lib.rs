@@ -9,6 +9,7 @@ pub mod exposition;
 pub mod histogram;
 pub mod location;
 pub mod log_tail;
+pub mod meta_backup;
 pub mod metrics_registry;
 pub mod process_metrics;
 pub mod shutdown;

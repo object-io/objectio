@@ -15,6 +15,7 @@ path = "src/main.rs"
 objectio-proto = { workspace = true }
 # validate_scope, to refuse a malformed key scope before sending it.
 objectio-auth = { workspace = true }
+objectio-common = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

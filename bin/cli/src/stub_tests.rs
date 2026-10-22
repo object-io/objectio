@@ -964,3 +964,101 @@ async fn metrics_query_passes_promql_through() {
         ])
     );
 }
+
+// ── meta backups ────────────────────────────────────────────────────────
+
+/// A gateway that answers one request with `body`, as bytes; and the
+/// request line it got.
+async fn bytes_stub(body: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let served = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&chunk[..n]);
+        }
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(reply.as_bytes()).await.unwrap();
+        sock.write_all(&body).await.unwrap();
+        let _ = sock.shutdown().await;
+        String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    });
+    (url, served)
+}
+
+fn a_backup() -> Vec<u8> {
+    use std::io::Write as _;
+    let mut w = objectio_common::meta_backup::Writer::new(
+        Vec::new(),
+        br#"{"cluster_id":"ab","last_applied":{"index":7},"active_level":8}"#,
+    )
+    .unwrap();
+    w.write_all(&vec![7u8; 100_000]).unwrap();
+    w.finish().unwrap()
+}
+
+async fn export_to(file: &std::path::Path, body: Vec<u8>) -> (anyhow::Result<()>, String) {
+    let (url, served) = bytes_stub(body).await;
+    let parsed = Args::try_parse_from([
+        "obioctl",
+        "--endpoint",
+        &url,
+        "--access-key",
+        "AKTEST",
+        "--secret-key",
+        "sktest",
+        "meta",
+        "export",
+        "--file",
+        file.to_str().unwrap(),
+    ])
+    .expect("arguments parse");
+    let mut out = Vec::new();
+    let result = crate::execute(parsed, &|_| None, &mut out).await;
+    (result, served.await.unwrap())
+}
+
+#[tokio::test]
+async fn meta_export_keeps_a_whole_backup_under_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("meta.backup");
+    let backup = a_backup();
+    let (result, request) = export_to(&file, backup.clone()).await;
+    result.unwrap();
+    assert!(request.starts_with("GET /_admin/meta/export "), "{request}");
+    assert_eq!(std::fs::read(&file).unwrap(), backup);
+    assert!(!dir.path().join("meta.backup.part").exists());
+    // It carries every secret meta keeps: its owner's only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+}
+
+#[tokio::test]
+async fn a_meta_export_that_is_not_whole_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("meta.backup");
+    let mut backup = a_backup();
+    backup.truncate(backup.len() - 10);
+    let (result, _) = export_to(&file, backup).await;
+    let e = result.unwrap_err();
+    assert!(format!("{e:#}").contains("not whole"), "{e:#}");
+    assert!(!file.exists());
+    assert!(!dir.path().join("meta.backup.part").exists());
+}
