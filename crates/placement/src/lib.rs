@@ -35,7 +35,7 @@ pub use topology::{
 pub use crush2::templates;
 pub use crush2::{
     Crush2, HrwPlacement, PlacementFeasibility, PlacementFeasibilityReport, PlacementTemplate,
-    ShardRole, StripeGroup,
+    ShardRole, StripeGroup, TooFewOsds,
 };
 
 // Placement-group engine (Phase 2+). The jump-consistent-hash step

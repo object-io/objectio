@@ -514,11 +514,17 @@ fn remap_positions(meta: &MetaService, pg: &PlacementGroup) -> Vec<usize> {
     if pg.up.len() != pg.acting.len() {
         return Vec::new();
     }
+    let mut chosen: HashSet<&[u8]> = HashSet::new();
     (0..pg.up.len())
         .filter(|&p| pg.up[p] != pg.acting[p])
         .filter(|&p| meta.usable_address(&pg.up[p]).is_some())
-        // Not onto a member already holding another position of the PG.
+        // Not onto a member already holding another position of the PG,
+        // nor onto one this move gives another position: up can name an
+        // OSD twice (stood in for at one position, then down again while
+        // up still names it at another), and moving both onto it would
+        // put two of the PG's shards on one OSD.
         .filter(|&p| !pg.acting.contains(&pg.up[p]))
+        .filter(|&p| chosen.insert(pg.up[p].as_slice()))
         .collect()
 }
 
@@ -2675,6 +2681,47 @@ mod tests {
 
     fn ids(n: &[u8]) -> BTreeSet<Vec<u8>> {
         n.iter().map(|&i| vec![i; 16]).collect()
+    }
+
+    /// Up names OSD 2 at positions 1 and 3, neither on it: the move goes
+    /// to it at one position only, never both, so the PG never has two
+    /// positions on one OSD. The other waits (and is moved next time only
+    /// if up still wants it and 2 is free).
+    #[tokio::test]
+    async fn a_remap_never_moves_two_positions_onto_one_osd() {
+        use objectio_proto::metadata::RegisterOsdRequest;
+        use objectio_proto::metadata::metadata_service_server::MetadataService;
+        let svc = MetaService::new();
+        for n in 1..=8u8 {
+            MetadataService::register_osd(
+                &svc,
+                Request::new(RegisterOsdRequest {
+                    node_id: vec![n; 16],
+                    address: format!("http://10.0.0.{n}:9200"),
+                    disk_ids: vec![vec![n; 16]],
+                    disk_capacity_bytes: vec![1 << 30],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let members = |m: [u8; 6]| m.iter().map(|&n| vec![n; 16]).collect::<Vec<_>>();
+        let pg = PlacementGroup {
+            pool: "p".into(),
+            pg_id: 1,
+            acting: members([1, 7, 3, 8, 5, 6]),
+            up: members([1, 2, 3, 2, 5, 6]),
+            epoch: 3,
+            ..Default::default()
+        };
+        assert_eq!(remap_positions(&svc, &pg), vec![1]);
+        // Up naming acting members elsewhere: no move onto them.
+        let pg = PlacementGroup {
+            up: members([7, 1, 3, 8, 5, 6]),
+            ..pg
+        };
+        assert!(remap_positions(&svc, &pg).is_empty());
     }
 
     #[test]

@@ -486,7 +486,9 @@ impl MetaService {
 
         let crush = self.crush.read();
         let obj_id = objectio_common::ObjectId::from_uuid(uuid::Uuid::from_bytes(*object_id));
-        let placements = crush.select_placement(&obj_id, &template);
+        // Too few OSDs for the stripe: no CRUSH choice, the caller looks
+        // for one itself.
+        let placements = crush.select_placement(&obj_id, &template).ok()?;
         drop(crush);
 
         let registered: std::collections::HashSet<[u8; 16]> =
@@ -974,7 +976,12 @@ impl MetaService {
 
         // Use CRUSH 2.0 for placement
         let crush = self.crush.read();
-        let hrw_placements = crush.select_placement(&object_id, &template);
+        // Never two shards of a stripe on one OSD: with too few OSDs the
+        // write is refused (503, retryable: OSDs may come back) rather than
+        // stored one failure short of its protection.
+        let hrw_placements = crush
+            .select_placement(&object_id, &template)
+            .map_err(|e| Status::unavailable(format!("{}/{}: {e}", req.bucket, req.key)))?;
         drop(crush);
 
         // Convert HRW placements to NodePlacement responses

@@ -28,8 +28,10 @@
 //! place, and one never written is rebuilt on its placement OSD and its
 //! location added to every chunk record holding the stripe.
 //!
-//! A stripe whose shards are all good but two of them on one OSD (written
-//! while an OSD was out, so placement doubled up) is spread (B20,
+//! A shard is never rebuilt onto an OSD holding another shard of its
+//! stripe: such a position stays missing (degraded) until its placement
+//! names an OSD of its own. A stripe whose shards are all good but two of
+//! them on one OSD (stored so by an earlier release) is spread (B20,
 //! backfill): the extra shard is copied to an active OSD holding none of
 //! the stripe, every ObjectMeta copy and the key's home are moved to it,
 //! and the old copy is deleted once reads that may still use it are done.
@@ -945,6 +947,12 @@ async fn rebuild(
         None
     };
 
+    // OSDs holding a shard of the stripe: one of them gets no other. A
+    // position whose placement OSD is one (the placement changed since the
+    // stripe was written) is left missing, degraded, rather than put where
+    // losing one disk loses two shards.
+    let mut holders: std::collections::HashSet<Vec<u8>> =
+        stripe.shards.iter().map(|l| l.node_id.clone()).collect();
     let mut added = Vec::new();
     for (&p, bytes) in bad.iter().zip(rebuilt) {
         let position = p as u32;
@@ -970,6 +978,17 @@ async fn rebuild(
                     .as_ref()
                     .and_then(|nodes| nodes.iter().find(|n| n.position == position))
                     .ok_or_else(|| anyhow::anyhow!("no placement for position {p}"))?;
+                if !holders.insert(target.node_id.clone()) {
+                    warn!(
+                        "repair: {}/{} stripe {} position {p}: its placement OSD {} holds \
+                         another shard of the stripe; left missing",
+                        object.bucket,
+                        object.key,
+                        stripe.stripe_id,
+                        hex::encode(&target.node_id)
+                    );
+                    continue;
+                }
                 (
                     target.node_id.clone(),
                     target.node_address.clone(),
