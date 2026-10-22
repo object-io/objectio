@@ -205,6 +205,20 @@ pub struct PlacementFeasibilityReport {
     pub available_domains: Vec<String>,
 }
 
+/// A stripe that can't be placed with every shard on an OSD of its own.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a stripe of {needed} shards needs {needed} distinct OSDs and {usable} can take one; \
+     add OSDs or bring the down ones back"
+)]
+pub struct TooFewOsds {
+    /// Positions in the stripe.
+    pub needed: usize,
+    /// OSDs that can hold one: the active ones, and the down ones a write
+    /// may do without.
+    pub usable: usize,
+}
+
 /// Result of HRW node selection
 #[derive(Clone, Debug)]
 pub struct HrwPlacement {
@@ -280,11 +294,20 @@ impl Crush2 {
     /// 1. Map object to stripe group
     /// 2. Apply EC placement template
     /// 3. Use HRW hashing within each domain
+    ///
+    /// Every position is on an OSD of its own: two shards on one OSD are
+    /// lost together, and the stripe survives one failure fewer than it
+    /// was written to. The failure domain is a preference (an unused OSD
+    /// elsewhere beats none); a distinct OSD is not.
+    ///
+    /// # Errors
+    /// [`TooFewOsds`] when fewer OSDs than positions can take one: the
+    /// active ones, and the down ones a write may do without.
     pub fn select_placement(
         &self,
         object_id: &ObjectId,
         template: &PlacementTemplate,
-    ) -> Vec<HrwPlacement> {
+    ) -> Result<Vec<HrwPlacement>, TooFewOsds> {
         // Step 1: Object → stripe group
         let object_hash = self.hash_object(object_id);
         let group_idx = (object_hash as u32) % self.num_groups;
@@ -314,6 +337,13 @@ impl Crush2 {
         } else {
             0
         };
+        let too_few = TooFewOsds {
+            needed: template.shards.len(),
+            usable: all_nodes.len() + down_nodes.len().min(down_allowed),
+        };
+        if too_few.usable < too_few.needed {
+            return Err(too_few);
+        }
 
         // Step 2 & 3: Apply template with HRW hashing per domain
         let mut placements = Vec::with_capacity(template.total_shards() as usize);
@@ -341,11 +371,9 @@ impl Crush2 {
             // unused node anywhere (relaxing the domain beats doubling up on
             // a disk). Then an unused node that is down: the write goes on
             // without its shard (within `down_allowed`), and the repairer
-            // writes it there once it is back. Doubling up instead is for
-            // good — the object's home keeps the layout — and leaves the
-            // object one failure short of its protection. Only when every
-            // node already holds a shard — fewer OSDs than shards — reuse
-            // the least-loaded one.
+            // writes it there once it is back. Never a node already holding
+            // a shard of the stripe: that leaves the object one failure
+            // short of its protection.
             let (node_id, score) = self
                 .hrw_pick(object_id, &nodes, &used)
                 .or_else(|| self.hrw_pick(object_id, &all_nodes, &used))
@@ -356,8 +384,7 @@ impl Crush2 {
                     down_allowed -= usize::from(pick.is_some());
                     pick
                 })
-                .or_else(|| self.least_used(object_id, &all_nodes, &used))
-                .unwrap_or_else(|| self.placeholder(object_id));
+                .ok_or_else(|| too_few.clone())?;
 
             used.push(node_id);
 
@@ -370,7 +397,7 @@ impl Crush2 {
             });
         }
 
-        placements
+        Ok(placements)
     }
 
     /// HRW score: `hash(object_id || node_id) * weight`.
@@ -397,33 +424,6 @@ impl Crush2 {
             .filter(|n| !exclude.contains(&n.id))
             .map(|n| (n.id, self.hrw_score(object_id, n)))
             .max_by_key(|(_, score)| *score)
-    }
-
-    /// When every node already holds a shard: the node holding the fewest,
-    /// ties broken by HRW score so the choice stays deterministic.
-    fn least_used(
-        &self,
-        object_id: &ObjectId,
-        nodes: &[&NodeInfo],
-        used: &[NodeId],
-    ) -> Option<(NodeId, u64)> {
-        nodes
-            .iter()
-            .map(|n| {
-                let count = used.iter().filter(|u| **u == n.id).count();
-                let score = self.hrw_score(object_id, n);
-                (n.id, score, count)
-            })
-            .min_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)))
-            .map(|(id, score, _)| (id, score))
-    }
-
-    /// No nodes at all: a deterministic placeholder, as before.
-    fn placeholder(&self, object_id: &ObjectId) -> (NodeId, u64) {
-        let hash = self.hash_object(object_id);
-        let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&hash.to_le_bytes());
-        (NodeId::from_bytes(bytes), 0)
     }
 
     /// Select multiple nodes using HRW (for simple replication/MDS)
@@ -632,40 +632,113 @@ mod tests {
         let crush = Crush2::new(single_rack_topology(6), 16);
         let template = PlacementTemplate::mds(4, 2);
         for _ in 0..200 {
-            let p = crush.select_placement(&ObjectId::new(), &template);
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
             assert_eq!(p.len(), 6);
             assert_eq!(distinct_nodes(&p), 6, "{p:?}");
         }
     }
 
-    /// Fewer OSDs than shards: reuse is unavoidable, but it must be even —
-    /// three OSDs take two shards each, not six on one.
+    fn set_status(topology: &mut ClusterTopology, id: NodeId, status: NodeStatus) {
+        let mut n = topology.get_node(id).unwrap().clone();
+        n.status = status;
+        topology.upsert_node(n);
+    }
+
+    fn mark_down(topology: &mut ClusterTopology, id: NodeId) {
+        set_status(topology, id, NodeStatus::Down);
+    }
+
+    /// Fewer OSDs than shards: refused, not two shards on one OSD. Three
+    /// OSDs used to take two shards of a 4+2 stripe each, so losing any one
+    /// lost two, and a second loss the object.
     #[test]
-    fn fewer_osds_than_shards_spreads_evenly() {
-        let crush = Crush2::new(single_rack_topology(3), 16);
+    fn fewer_osds_than_shards_is_refused() {
         let template = PlacementTemplate::mds(4, 2);
-        for _ in 0..200 {
-            let p = crush.select_placement(&ObjectId::new(), &template);
-            let mut counts: HashMap<NodeId, usize> = HashMap::new();
-            for x in &p {
-                *counts.entry(x.node_id).or_default() += 1;
+        for osds in 1..6 {
+            let crush = Crush2::new(single_rack_topology(osds), 16);
+            for _ in 0..50 {
+                let err = crush
+                    .select_placement(&ObjectId::new(), &template)
+                    .unwrap_err();
+                assert_eq!(
+                    err,
+                    TooFewOsds {
+                        needed: 6,
+                        usable: osds
+                    }
+                );
             }
-            assert_eq!(counts.len(), 3, "{p:?}");
-            assert!(counts.values().all(|c| *c == 2), "{counts:?}");
         }
+        // No OSD at all: refused too, not a made-up node.
+        let crush = Crush2::new(ClusterTopology::new(), 16);
+        assert!(crush.select_placement(&ObjectId::new(), &template).is_err());
+    }
+
+    /// Three hosts of two OSDs each, 4+2, one host a rack (the failure
+    /// domain): three domains for six shards, so the domain is relaxed and
+    /// each OSD takes one shard. With one OSD down it keeps its position
+    /// (the write does without it); with one drained there are five OSDs
+    /// for six shards, and the stripe is refused.
+    #[test]
+    fn three_hosts_of_two_osds_hold_a_four_two_stripe_one_shard_each() {
+        let mut topology = ClusterTopology::new();
+        for host in 0..3 {
+            for osd in 0..2 {
+                topology.upsert_node(NodeInfo {
+                    id: NodeId::new(),
+                    name: format!("h{host}-osd{osd}"),
+                    address: format!("10.0.{host}.{osd}:9200").parse().unwrap(),
+                    failure_domain: FailureDomainInfo::new_full(
+                        "r",
+                        "z",
+                        "dc",
+                        &format!("rack{host}"),
+                        &format!("host{host}"),
+                    ),
+                    status: NodeStatus::Active,
+                    disks: vec![],
+                    weight: 1.0,
+                    last_heartbeat: 0,
+                });
+            }
+        }
+        let ids: Vec<NodeId> = topology.all_nodes().map(|n| n.id).collect();
+        let template = PlacementTemplate::mds(4, 2);
+        let crush = Crush2::new(topology.clone(), 16);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
+        }
+
+        mark_down(&mut topology, ids[0]);
+        let crush = Crush2::new(topology.clone(), 16);
+        for _ in 0..200 {
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
+        }
+
+        set_status(&mut topology, ids[0], NodeStatus::Active);
+        set_status(&mut topology, ids[1], NodeStatus::Draining);
+        let crush = Crush2::new(topology, 16);
+        let err = crush
+            .select_placement(&ObjectId::new(), &template)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TooFewOsds {
+                needed: 6,
+                usable: 5
+            }
+        );
     }
 
     /// One OSD of six down: its position stays on it rather than doubling
     /// up on a live one, so the repairer can fill it when it is back. Two
     /// down: only one position may wait (a write needs k + 1 = 5 shards),
-    /// so the other doubles up.
+    /// and the other has no OSD of its own: refused. It doubled up on a
+    /// live OSD before.
     #[test]
     fn a_down_osd_keeps_its_position_within_the_write_quorum() {
-        fn mark_down(topology: &mut ClusterTopology, id: NodeId) {
-            let mut n = topology.get_node(id).unwrap().clone();
-            n.status = NodeStatus::Down;
-            topology.upsert_node(n);
-        }
         let mut topology = single_rack_topology(6);
         let ids: Vec<NodeId> = topology.all_nodes().map(|n| n.id).collect();
         let template = PlacementTemplate::mds(4, 2);
@@ -673,21 +746,154 @@ mod tests {
         mark_down(&mut topology, ids[0]);
         let crush = Crush2::new(topology.clone(), 16);
         for _ in 0..200 {
-            let p = crush.select_placement(&ObjectId::new(), &template);
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
             assert_eq!(distinct_nodes(&p), 6, "{p:?}");
         }
 
         mark_down(&mut topology, ids[1]);
+        let crush = Crush2::new(topology.clone(), 16);
+        for _ in 0..200 {
+            let err = crush
+                .select_placement(&ObjectId::new(), &template)
+                .unwrap_err();
+            assert_eq!(
+                err,
+                TooFewOsds {
+                    needed: 6,
+                    usable: 5
+                }
+            );
+        }
+
+        // A seventh OSD: the stripe has six of its own again, one of them
+        // down.
+        topology.upsert_node(NodeInfo {
+            id: NodeId::new(),
+            name: "node-6".into(),
+            address: "10.0.0.6:9002".parse().unwrap(),
+            failure_domain: FailureDomainInfo::new("us-east", "dc1", "rack0"),
+            status: NodeStatus::Active,
+            disks: vec![],
+            weight: 1.0,
+            last_heartbeat: 0,
+        });
         let crush = Crush2::new(topology, 16);
         for _ in 0..200 {
-            let p = crush.select_placement(&ObjectId::new(), &template);
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
             let on_down = p
                 .iter()
                 .filter(|x| x.node_id == ids[0] || x.node_id == ids[1])
                 .count();
             assert_eq!(on_down, 1, "{p:?}");
-            assert_eq!(distinct_nodes(&p), 5, "{p:?}");
+            assert_eq!(distinct_nodes(&p), 6, "{p:?}");
         }
+    }
+
+    /// Random topologies, statuses and schemes: a stripe is placed with
+    /// every shard on an OSD of its own, none on an OSD that can't take it,
+    /// no more on down OSDs than a write can do without, the same every
+    /// time; or it is refused, exactly when there aren't OSDs enough.
+    #[test]
+    fn any_topology_places_on_distinct_osds_or_refuses() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let templates = [
+            PlacementTemplate::mds(4, 2),
+            PlacementTemplate::mds(2, 1),
+            PlacementTemplate::mds(8, 4),
+            PlacementTemplate::mds(3, 0), // three copies
+            PlacementTemplate::lrc(6, 2, 2),
+        ];
+        let statuses = [
+            NodeStatus::Active,
+            NodeStatus::Active,
+            NodeStatus::Active,
+            NodeStatus::Down,
+            NodeStatus::Draining,
+            NodeStatus::Decommissioning,
+        ];
+        let mut rng = StdRng::seed_from_u64(0x0b10);
+        let (mut placed, mut refused) = (0, 0);
+        for _ in 0..300 {
+            let mut topology = ClusterTopology::new();
+            let racks = rng.gen_range(1..=5);
+            for rack in 0..racks {
+                for host in 0..rng.gen_range(1..=3) {
+                    for osd in 0..rng.gen_range(1..=3) {
+                        topology.upsert_node(NodeInfo {
+                            id: NodeId::new(),
+                            name: format!("r{rack}-h{host}-o{osd}"),
+                            address: "10.0.0.1:9200".parse().unwrap(),
+                            failure_domain: FailureDomainInfo::new_full(
+                                "r",
+                                "z",
+                                "dc",
+                                &format!("rack{rack}"),
+                                &format!("r{rack}-host{host}"),
+                            ),
+                            status: statuses[rng.gen_range(0..statuses.len())],
+                            disks: vec![],
+                            weight: 1.0,
+                            last_heartbeat: 0,
+                        });
+                    }
+                }
+            }
+            let status: HashMap<NodeId, NodeStatus> =
+                topology.all_nodes().map(|n| (n.id, n.status)).collect();
+            let active = status
+                .values()
+                .filter(|s| **s == NodeStatus::Active)
+                .count();
+            let down = status.values().filter(|s| **s == NodeStatus::Down).count();
+            let crush = Crush2::new(topology, 16);
+            for template in &templates {
+                let width = template.shards.len();
+                let may_wait = if template.local_parity == 0 {
+                    usize::from(template.global_parity.saturating_sub(1))
+                } else {
+                    0
+                };
+                let enough = active + down.min(may_wait) >= width;
+                for _ in 0..5 {
+                    let object = ObjectId::new();
+                    match crush.select_placement(&object, template) {
+                        Ok(p) => {
+                            assert!(enough, "placed with too few OSDs: {p:?}");
+                            assert_eq!(p.len(), width);
+                            assert_eq!(distinct_nodes(&p), width, "{p:?}");
+                            let on_down = p
+                                .iter()
+                                .filter(|x| status[&x.node_id] == NodeStatus::Down)
+                                .count();
+                            assert!(on_down <= may_wait, "{on_down} on down OSDs: {p:?}");
+                            assert!(
+                                p.iter().all(|x| matches!(
+                                    status[&x.node_id],
+                                    NodeStatus::Active | NodeStatus::Down
+                                )),
+                                "{p:?}"
+                            );
+                            let again = crush.select_placement(&object, template).unwrap();
+                            assert!(
+                                p.iter().zip(&again).all(|(a, b)| a.node_id == b.node_id),
+                                "not deterministic"
+                            );
+                            placed += 1;
+                        }
+                        Err(e) => {
+                            assert!(!enough, "refused with OSDs enough: {e}");
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            placed > 100 && refused > 100,
+            "{placed} placed, {refused} refused"
+        );
     }
 
     /// The multi-rack layout the existing tests use keeps working: still
@@ -697,7 +903,7 @@ mod tests {
         let crush = Crush2::new(create_test_topology(), 16);
         let template = PlacementTemplate::mds(4, 2);
         for _ in 0..200 {
-            let p = crush.select_placement(&ObjectId::new(), &template);
+            let p = crush.select_placement(&ObjectId::new(), &template).unwrap();
             assert_eq!(distinct_nodes(&p), 6, "{p:?}");
         }
     }
@@ -711,8 +917,8 @@ mod tests {
         let object_id = ObjectId::new();
 
         // Same object should always get same placement
-        let p1 = crush.select_placement(&object_id, &template);
-        let p2 = crush.select_placement(&object_id, &template);
+        let p1 = crush.select_placement(&object_id, &template).unwrap();
+        let p2 = crush.select_placement(&object_id, &template).unwrap();
 
         assert_eq!(p1.len(), p2.len());
         for (a, b) in p1.iter().zip(p2.iter()) {
@@ -815,7 +1021,7 @@ mod tests {
         let template = templates::lrc_6_2_2();
 
         let object_id = ObjectId::new();
-        let placements = crush.select_placement(&object_id, &template);
+        let placements = crush.select_placement(&object_id, &template).unwrap();
 
         assert_eq!(placements.len(), 10);
 

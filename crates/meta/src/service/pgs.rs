@@ -740,9 +740,20 @@ impl MetaService {
                     Some((p, domain_name(&n, rule.level), unit_name(&n, rule)))
                 })
                 .collect();
+            // Not a member of acting, nor of up at another position: up is
+            // where recovery moves the PG (a member back from down, the
+            // balancer's plan), and a stand-in there would put two of the
+            // PG's positions on one OSD when it does.
+            let taken = |id: &[u8]| {
+                acting.iter().any(|a| a.as_slice() == id)
+                    || up
+                        .iter()
+                        .enumerate()
+                        .any(|(p, u)| p != position && u.as_slice() == id)
+            };
             let spare = topology
                 .active_nodes()
-                .filter(|n| !acting.contains(&n.id.as_bytes().to_vec()))
+                .filter(|n| !taken(n.id.as_bytes()))
                 .filter(|n| self.acting_usable(n.id.as_bytes(), down_since, grace))
                 .filter(|n| {
                     rule.admits(
@@ -807,6 +818,19 @@ impl MetaService {
         why: &str,
     ) -> anyhow::Result<()> {
         use objectio_meta_store::{CasOp, CasTable, MetaCommand, MetaResponse};
+        // The last word on it: whatever chose the members, no change puts
+        // two of a PG's positions on one OSD.
+        if let Some((old, new)) = changes
+            .iter()
+            .find(|(old, new)| adds_shared_member(&old.acting, &new.acting))
+        {
+            return Err(anyhow::anyhow!(
+                "pg {}/{}: {} would put an OSD at two positions; not committed",
+                new.pool,
+                new.pg_id,
+                describe_change(&old.acting, &new.acting)
+            ));
+        }
         let ops: Vec<CasOp> = changes
             .iter()
             .map(|(old, new)| CasOp {
@@ -942,6 +966,17 @@ pub(crate) fn set_filling(filling: &mut Vec<PgFill>, position: u32, from: Vec<u8
         from,
         epoch,
     });
+}
+
+/// Whether `new` has an OSD at more positions than `old` had it: a change
+/// that puts two of a PG's shards on one OSD. (One that only keeps what
+/// `old` had is let through, so such a PG can still be changed.)
+fn adds_shared_member(old: &[Vec<u8>], new: &[Vec<u8>]) -> bool {
+    let count = |set: &[Vec<u8>], id: &[u8]| set.iter().filter(|m| m.as_slice() == id).count();
+    new.iter().any(|id| {
+        let n = count(new, id);
+        n > 1 && n > count(old, id)
+    })
 }
 
 /// "position 2: 1a2b… → 3c4d…" for each position that changed.
@@ -1197,6 +1232,48 @@ mod tests {
         both.extend(down(3));
         let new = svc.stand_in(&p, &rule, &both, GRACE).unwrap();
         assert_eq!(new.acting, [7, 2, 3, 4, 5, 6].map(id));
+    }
+
+    #[test]
+    fn a_change_putting_an_osd_at_two_positions_is_caught() {
+        let set = |m: &[u8]| m.iter().map(|&n| id(n)).collect::<Vec<_>>();
+        assert!(adds_shared_member(
+            &set(&[1, 2, 3, 4, 5, 6]),
+            &set(&[1, 2, 3, 4, 5, 2])
+        ));
+        assert!(!adds_shared_member(
+            &set(&[1, 2, 3, 4, 5, 6]),
+            &set(&[1, 7, 3, 4, 5, 6])
+        ));
+        // One that had it already, changed elsewhere: let through.
+        assert!(!adds_shared_member(
+            &set(&[1, 2, 3, 4, 5, 2]),
+            &set(&[1, 2, 3, 7, 5, 2])
+        ));
+        // Taking a third: caught.
+        assert!(adds_shared_member(
+            &set(&[1, 2, 3, 4, 5, 2]),
+            &set(&[1, 2, 2, 4, 5, 2])
+        ));
+    }
+
+    /// A member back from down (2, stood in for by 7 at position 1, still
+    /// in up there: recovery moves the PG back to it) is no stand-in for
+    /// another position: recovery would then put both positions on it.
+    /// With 8 to spare, 8 stands in; with nothing else, the PG is left
+    /// undersized.
+    #[tokio::test]
+    async fn a_member_up_names_elsewhere_does_not_stand_in() {
+        let mut p = pg(&[1, 2, 3, 4, 5, 6]);
+        p.acting = [1, 7, 3, 4, 5, 6].map(id).to_vec();
+        let svc = cluster(8, |n| format!("h{n}")).await;
+        for pg_id in 0..32 {
+            p.pg_id = pg_id;
+            let new = svc.stand_in(&p, &host_rule(), &down(6), GRACE).unwrap();
+            assert_eq!(new.acting, [1, 7, 3, 4, 5, 8].map(id), "pg {pg_id}");
+        }
+        let svc = cluster(7, |n| format!("h{n}")).await;
+        assert!(svc.stand_in(&p, &host_rule(), &down(6), GRACE).is_none());
     }
 
     /// LRC 4+2+1 with each local group in a rack of its own: positions 0,

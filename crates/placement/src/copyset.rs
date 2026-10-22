@@ -910,6 +910,67 @@ mod tests {
         assert!(rule.admits(6, "D", "d1", &rest));
     }
 
+    /// Random topologies (some OSDs without a host name, some not active)
+    /// and rules: every copyset a pool is built from has each position on
+    /// an active OSD of its own, or the pool is refused. A placement group
+    /// takes its members from one, so two of its shards never share an OSD.
+    #[test]
+    fn every_copyset_is_on_distinct_active_osds() {
+        let rules = [
+            PlacementRule::spread(FailureDomain::Host, 6),
+            PlacementRule::spread(FailureDomain::Node, 6),
+            PlacementRule::spread(FailureDomain::Rack, 3),
+            four_two_over_three_racks(),
+            lrc_groups_per_rack(),
+        ];
+        let mut rng = StdRng::seed_from_u64(0x0b10);
+        let (mut built, mut refused) = (0, 0);
+        for _ in 0..200 {
+            let mut t = ClusterTopology::new();
+            let mut seed = 0u8;
+            for rack in 0..rng.gen_range(1..=5) {
+                for host in 0..rng.gen_range(1..=3) {
+                    for _ in 0..rng.gen_range(1..=3) {
+                        seed = seed.wrapping_add(1);
+                        let name = if rng.gen_bool(0.2) {
+                            String::new()
+                        } else {
+                            format!("r{rack}-h{host}")
+                        };
+                        let mut n = mk_node(seed, &name, &format!("rack{rack}"));
+                        if rng.gen_bool(0.2) {
+                            n.status = NodeStatus::Down;
+                        }
+                        t.upsert_node(n);
+                    }
+                }
+            }
+            for rule in &rules {
+                match CopysetPool::build_with_rule(&t, rule, 5, rng.r#gen()) {
+                    Ok(pool) => {
+                        for cs in &pool.sets {
+                            assert_eq!(cs.size(), rule.copy_count, "{cs:?}");
+                            let distinct: HashSet<&NodeId> = cs.osds.iter().collect();
+                            assert_eq!(distinct.len(), cs.size(), "an OSD twice: {cs:?}");
+                            assert!(
+                                cs.osds.iter().all(|id| t
+                                    .get_node(*id)
+                                    .is_some_and(|n| n.status == NodeStatus::Active)),
+                                "{cs:?}"
+                            );
+                        }
+                        built += 1;
+                    }
+                    Err(_) => refused += 1,
+                }
+            }
+        }
+        assert!(
+            built > 50 && refused > 50,
+            "{built} built, {refused} refused"
+        );
+    }
+
     // Silence unused import warnings in builds that don't run tests.
     #[allow(dead_code)]
     fn _unused(_: SocketAddr) {}
