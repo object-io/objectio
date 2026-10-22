@@ -261,7 +261,7 @@ mod pread_backend {
             let path = self.path.clone();
             let buf = tokio::task::spawn_blocking(move || {
                 file.write_all_at(buf.as_slice(), offset)
-                    .map_err(|e| Error::Storage(format!("write {path} @ {offset}: {e}")))
+                    .map_err(|e| Error::io(format_args!("write {path} @ {offset}"), &e))
                     .map(|()| buf)
             })
             .await
@@ -274,7 +274,7 @@ mod pread_backend {
             let path = self.path.clone();
             tokio::task::spawn_blocking(move || {
                 file.sync_all()
-                    .map_err(|e| Error::Storage(format!("sync {path}: {e}")))
+                    .map_err(|e| Error::io(format_args!("sync {path}"), &e))
             })
             .await
             .map_err(|e| Error::Storage(format!("join blocking sync: {e}")))?
@@ -285,7 +285,7 @@ mod pread_backend {
             let path = self.path.clone();
             tokio::task::spawn_blocking(move || {
                 file.sync_data()
-                    .map_err(|e| Error::Storage(format!("sync_data {path}: {e}")))
+                    .map_err(|e| Error::io(format_args!("sync_data {path}"), &e))
             })
             .await
             .map_err(|e| Error::Storage(format!("join blocking sync_data: {e}")))?
@@ -472,9 +472,9 @@ mod uring_backend {
                             Ok(n) => Err(Error::Storage(format!(
                                 "uring write {path} @ {offset}: {n} of {want} bytes"
                             ))),
-                            Err(e) => Err(Error::Storage(format!(
-                                "uring write {path} @ {offset}: {e}"
-                            ))),
+                            Err(e) => {
+                                Err(Error::io(format_args!("uring write {path} @ {offset}"), &e))
+                            }
                         };
                         let _ = reply.send(r);
                     }
@@ -482,14 +482,14 @@ mod uring_backend {
                         let r = file
                             .sync_all()
                             .await
-                            .map_err(|e| Error::Storage(format!("uring sync {path}: {e}")));
+                            .map_err(|e| Error::io(format_args!("uring sync {path}"), &e));
                         let _ = reply.send(r);
                     }
                     Op::SyncData { reply } => {
                         let r = file
                             .sync_data()
                             .await
-                            .map_err(|e| Error::Storage(format!("uring sync_data {path}: {e}")));
+                            .map_err(|e| Error::io(format_args!("uring sync_data {path}"), &e));
                         let _ = reply.send(r);
                     }
                     Op::Shutdown => break,

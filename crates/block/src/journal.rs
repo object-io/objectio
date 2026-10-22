@@ -396,8 +396,9 @@ pub struct WriteJournal {
 #[cfg(test)]
 #[derive(Default)]
 struct Faults {
-    /// The next write fails after writing this many bytes.
-    write: Mutex<Option<usize>>,
+    /// The next write fails after writing this many bytes, as this kind of
+    /// error.
+    write: Mutex<Option<(usize, std::io::ErrorKind)>>,
     /// The next sync fails.
     sync: std::sync::atomic::AtomicBool,
 }
@@ -667,6 +668,48 @@ impl WriteJournal {
         BlockError::Journal(format!("journal {}: {cause}", self.path.display()))
     }
 
+    /// The error for an append whose write failed. One the filesystem had
+    /// no room for (ENOSPC, EDQUOT) is cut off where it began, at `start`:
+    /// the entry is then not in the journal and nothing before it was
+    /// touched, so that write fails alone and the journal takes writes
+    /// again once there is room. Nothing is synced for the cut: the next
+    /// entry is written over it and synced with the file's new end; a crash
+    /// before then leaves at most a torn tail, which the open cuts off. Any
+    /// other failure, or a cut that fails, fails the journal.
+    fn write_failed(&self, file: &mut File, start: u64, e: &std::io::Error) -> BlockError {
+        if !objectio_common::error::is_out_of_space(e) {
+            return self.fail("write", e);
+        }
+        let cut = file.metadata().and_then(|m| {
+            if m.len() < start {
+                return Err(std::io::Error::other(format!(
+                    "the file is {} bytes, shorter than the {start} the journal wrote",
+                    m.len()
+                )));
+            }
+            file.set_len(start)?;
+            // A rotated journal is not opened to append: its next write
+            // would go where this one stopped, past a hole.
+            file.seek(SeekFrom::Start(start)).map(drop)
+        });
+        match cut {
+            Ok(()) => {
+                warn!(
+                    "Journal {}: no room for an entry ({e}); it is not in the journal",
+                    self.path.display()
+                );
+                BlockError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("journal {}: write failed: {e}", self.path.display()),
+                ))
+            }
+            Err(cut) => self.fail(
+                "write",
+                format_args!("{e}, and what it left could not be cut off ({cut})"),
+            ),
+        }
+    }
+
     /// Refuse if a write or sync has failed.
     fn check(&self) -> BlockResult<()> {
         match self.failed.get() {
@@ -705,12 +748,16 @@ impl WriteJournal {
             .as_mut()
             .ok_or_else(|| BlockError::Journal("journal closed".to_string()))?;
 
+        let start = self.current_size.load(Ordering::SeqCst);
         #[cfg(test)]
-        if let Some(after) = self.faults.write.lock().take() {
+        if let Some((after, kind)) = self.faults.write.lock().take() {
             let _ = writer.write_all(&data[..after.min(data.len())]);
-            return Err(self.fail("write", "injected write failure"));
+            let e = std::io::Error::new(kind, "injected write failure");
+            return Err(self.write_failed(writer, start, &e));
         }
-        writer.write_all(&data).map_err(|e| self.fail("write", e))?;
+        if let Err(e) = writer.write_all(&data) {
+            return Err(self.write_failed(writer, start, &e));
+        }
 
         self.current_size.fetch_add(data_len, Ordering::SeqCst);
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
@@ -892,7 +939,14 @@ impl WriteJournal {
     /// Make the next write fail after writing `after` bytes of it.
     #[cfg(test)]
     fn fail_next_write(&self, after: usize) {
-        *self.faults.write.lock() = Some(after);
+        self.fail_next_write_as(after, std::io::ErrorKind::Other);
+    }
+
+    /// Make the next write fail after writing `after` bytes of it, as
+    /// `kind`.
+    #[cfg(test)]
+    fn fail_next_write_as(&self, after: usize, kind: std::io::ErrorKind) {
+        *self.faults.write.lock() = Some((after, kind));
     }
 
     /// Make the next sync fail.
@@ -1250,6 +1304,43 @@ mod fail_stop_tests {
         assert_eq!(
             chunks(&WriteJournal::open(&path, 1 << 30).unwrap()),
             vec![2]
+        );
+    }
+
+    /// A write the filesystem had no room for, part of it written, fails
+    /// alone, as out of space: what it left is cut off, and writes after
+    /// it go on, in the journal as opened and in a rotated one alike.
+    /// Reopened, it holds what was acknowledged and nothing of the failed
+    /// writes.
+    #[test]
+    fn a_write_with_no_room_fails_alone_and_the_journal_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j");
+        write_synced(&WriteJournal::open(&path, 1 << 30).unwrap(), 1);
+        {
+            let journal = WriteJournal::open(&path, 1 << 30).unwrap();
+            let no_room = |journal: &WriteJournal| {
+                journal.fail_next_write_as(40, std::io::ErrorKind::StorageFull);
+                let err = journal
+                    .log_write("v", 99, 0, Bytes::from(vec![9u8; 512]))
+                    .unwrap_err();
+                assert!(
+                    matches!(&err, BlockError::Io(e)
+                        if objectio_common::error::is_out_of_space(e)),
+                    "{err}"
+                );
+            };
+            no_room(&journal);
+            write_synced(&journal, 2);
+            assert_eq!(chunks(&journal), vec![1, 2]);
+            journal.rotate().unwrap();
+            no_room(&journal);
+            write_synced(&journal, 3);
+            assert_eq!(chunks(&journal), vec![3]);
+        }
+        assert_eq!(
+            chunks(&WriteJournal::open(&path, 1 << 30).unwrap()),
+            vec![3]
         );
     }
 }

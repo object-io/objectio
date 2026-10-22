@@ -27,7 +27,9 @@ pub enum OsdPoolError {
     #[error("shard checksum mismatch: {0}")]
     ChecksumMismatch(String),
 
-    /// The OSD has no room for a client write (B3): past its full ratio.
+    /// The OSD has no room for a client write: past its full ratio (B3),
+    /// or the filesystem under its disks or metadata store refused the
+    /// write (ENOSPC, EDQUOT).
     #[error("OSD full: {0}")]
     Full(String),
 
@@ -662,6 +664,29 @@ impl OsdPoolError {
     #[must_use]
     pub const fn is_stale_epoch(&self) -> bool {
         matches!(self, Self::StaleEpoch(_))
+    }
+
+    /// Of the `failed` copies or shards of a write that `stored` reached
+    /// and that needed `quorum`: the refusal for lack of room, if those are
+    /// what kept it short, i.e. had every other failure succeeded it would
+    /// still have been. It then waits for space to be freed, and S3 hears
+    /// 507. Otherwise (some OSDs full, others unreachable that could still
+    /// make the quorum) a retry may succeed once they are back: none.
+    pub fn full_kept_it_short<'a>(
+        stored: usize,
+        quorum: usize,
+        failed: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<&'a Self> {
+        let mut full = None;
+        let mut others = 0;
+        for e in failed {
+            if e.is_full() {
+                full.get_or_insert(e);
+            } else {
+                others += 1;
+            }
+        }
+        full.filter(|_| stored + others < quorum)
     }
 }
 
@@ -1341,6 +1366,13 @@ pub async fn put_object_meta_with(
                         if is_stale_epoch(&e) {
                             return (OsdPoolError::StaleEpoch(e.message().to_string()), true);
                         }
+                        // No room in the OSD's metadata store: full, as a
+                        // shard refused for room is, not unreachable. It
+                        // may still hold the write (a failed sync), so it
+                        // isn't taken as refused.
+                        if e.code() == tonic::Code::ResourceExhausted && !connection_broke(&e) {
+                            return (OsdPoolError::Full(e.message().to_string()), refused);
+                        }
                         (OsdPoolError::ConnectionFailed(e.to_string()), refused)
                     })?
                     .into_inner();
@@ -1386,7 +1418,7 @@ pub async fn put_object_meta_with(
 
     let quorum = meta_write_quorum(targets.len()).max(min_copies);
     let mut displaced = Vec::with_capacity(results.len());
-    let mut failure: Option<OsdPoolError> = None;
+    let mut failures: Vec<OsdPoolError> = Vec::new();
     let mut unapplied = true;
     let mut applied = 0;
     // Per copy: it holds this write; it may (an answer that never came).
@@ -1403,7 +1435,7 @@ pub async fn put_object_meta_with(
             }
             Err((e, refused)) => {
                 unapplied &= refused;
-                failure.get_or_insert(e);
+                failures.push(e);
                 // A copy that may hold what this write replaced: nothing
                 // it could still name is freed (repair heals it).
                 displaced.push(Displaced {
@@ -1415,6 +1447,14 @@ pub async fn put_object_meta_with(
             }
         }
     }
+    // What S3 hears of a write short of its quorum: lack of room only when
+    // the full copies kept it short, else the first other failure.
+    let full = OsdPoolError::full_kept_it_short(applied, quorum, &failures).is_some();
+    let at = failures
+        .iter()
+        .position(|e| e.is_full() == full)
+        .unwrap_or(0);
+    let failure = (!failures.is_empty()).then(|| failures.swap_remove(at));
     match failure {
         Some(error) if applied < quorum => {
             let mut withdrawing = None;
@@ -3328,6 +3368,24 @@ mod quorum_tests {
             assert_eq!(meta_read_quorum(copies), read, "{copies} copies");
             assert!(write + read > copies);
         }
+    }
+
+    /// A write short of its quorum is full (507) only when the copies with
+    /// no room kept it short; with unreachable ones that could still make
+    /// it, it is a retry (503).
+    #[test]
+    fn full_copies_answer_for_a_short_write_only_when_they_kept_it_short() {
+        let full = || OsdPoolError::Full("no room".into());
+        let down = || OsdPoolError::ConnectionFailed("down".into());
+        let short = |stored, failed: &[OsdPoolError]| {
+            OsdPoolError::full_kept_it_short(stored, 4, failed).is_some()
+        };
+        // Six copies, a quorum of four.
+        assert!(short(2, &[full(), full(), full(), full()]));
+        assert!(short(2, &[full(), full(), full(), down()]));
+        assert!(!short(2, &[full(), full(), down(), down()]));
+        assert!(!short(1, &[down(), down(), down(), down(), down()]));
+        assert!(!short(4, &[full(), full()]), "it made its quorum");
     }
 }
 
