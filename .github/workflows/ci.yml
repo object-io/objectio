@@ -58,6 +58,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,6 +69,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,7 +78,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # ISA-L, which every build erasure-codes with, is built from source.
       - name: protoc and ISA-L's build tools
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev
+        timeout-minutes: 25
+        run: scripts/ci/apt-install.sh protobuf-compiler nasm autoconf automake libtool libclang-dev
       # The workspace sets clippy::all + pedantic + nursery in Cargo.toml and
       # the Makefile passes -D warnings; match it rather than letting CI be
       # laxer than the local command.
@@ -85,6 +88,7 @@ jobs:
   test:
     name: unit tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       # mold: linking the test binaries is a large part of this job.
       RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -93,7 +97,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold and ISA-L's build tools
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
+        timeout-minutes: 25
+        run: scripts/ci/apt-install.sh protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # Excluding the e2e package: it boots a cluster and belongs in its own
       # job so its runtime and its failures stay legible.
       - run: cargo test --workspace --exclude objectio-e2e
@@ -119,7 +124,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: protoc, mold and ISA-L's build tools
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
+        timeout-minutes: 25
+        run: scripts/ci/apt-install.sh protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist. build.rs creates it empty when absent so a
       # clone still builds, but the e2e job should exercise the real thing.
       - uses: actions/setup-node@v4
@@ -201,9 +207,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - name: protoc, mold, ISA-L's build tools, PCRE2
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool \
+          scripts/ci/apt-install.sh protobuf-compiler mold nasm autoconf automake libtool \
             libclang-dev libpcre2-dev pkg-config
       # Fails if this runner denies io_uring: the OSDs would otherwise fall
       # back to pread, and the run below test nothing new.
@@ -261,7 +267,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold and ISA-L's build tools
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler mold nasm autoconf automake libtool libclang-dev
+        timeout-minutes: 25
+        run: scripts/ci/apt-install.sh protobuf-compiler mold nasm autoconf automake libtool libclang-dev
       - name: find the previous release
         id: previous
         run: |
@@ -315,16 +322,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: protoc, mold, device mapper, ISA-L's build tools
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler mold dmsetup e2fsprogs \
+          scripts/ci/apt-install.sh protobuf-compiler mold dmsetup e2fsprogs \
             nasm autoconf automake libtool libclang-dev
       - name: dm-log-writes
         run: |
           # In linux-modules on Ubuntu's generic kernels; a cloud kernel may
           # keep it in linux-modules-extra.
           if ! sudo modprobe dm-log-writes; then
-            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            scripts/ci/apt-install.sh "linux-modules-extra-$(uname -r)"
             sudo modprobe dm-log-writes
           fi
           sudo dmsetup targets | grep -w log-writes
@@ -489,9 +496,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: build deps
+        timeout-minutes: 25
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler \
+          scripts/ci/apt-install.sh protobuf-compiler \
             nasm autoconf automake libtool libclang-dev
       # aio embeds console/dist; build.rs creates it empty when absent, which
       # is enough to compile. Debug profile: this links, which is the point,
@@ -544,10 +551,10 @@ jobs:
           key: perf
       # The dedicated runner's image has these already.
       - name: build deps
+        timeout-minutes: 25
         if: runner.environment == 'github-hosted'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler nasm autoconf automake libtool libclang-dev mold
+          scripts/ci/apt-install.sh protobuf-compiler nasm autoconf automake libtool libclang-dev mold
       # Head, then the base in the same checkout: the checkout leaves
       # unchanged files' times alone, so only the crates the change touches
       # are built twice.
