@@ -678,9 +678,6 @@ impl ErasureCodec {
         }
     }
 
-    /// Verify that shards are consistent
-    ///
-    /// Re-encodes the data shards and compares parity to verify integrity.
     /// Reconstruct specific missing shards without decoding the full
     /// original data.
     ///
@@ -774,62 +771,6 @@ impl ErasureCodec {
                     })
                     .collect()
             }
-        }
-    }
-
-    pub fn verify(&self, shards: &[Vec<u8>]) -> Result<bool> {
-        let total = self.total_shards();
-
-        if shards.len() != total {
-            return Ok(false);
-        }
-
-        // Check all shards have same size
-        if let Some(first_len) = shards.first().map(Vec::len)
-            && !shards.iter().all(|s| s.len() == first_len)
-        {
-            return Ok(false);
-        }
-
-        // Convert to slice references
-        let shard_refs: Vec<&[u8]> = shards.iter().map(|s| s.as_slice()).collect();
-
-        // Verify using backend
-        match &self.backend {
-            CodecBackend::Mds(backend) => backend
-                .verify(&shard_refs)
-                .map_err(|e| ErasureError::EncodingFailed(e.to_string()).into()),
-            CodecBackend::Lrc(backend) => backend
-                .verify(&shard_refs)
-                .map_err(|e| ErasureError::EncodingFailed(e.to_string()).into()),
-        }
-    }
-
-    /// Try to recover a single missing shard using local parity (LRC only)
-    ///
-    /// Returns `None` if local recovery is not possible (e.g., MDS mode or
-    /// multiple failures in the local group).
-    pub fn try_local_recovery(
-        &self,
-        shards: &[Option<&[u8]>],
-        shard_size: usize,
-        missing_index: usize,
-    ) -> Result<Option<Vec<u8>>> {
-        match &self.backend {
-            CodecBackend::Mds(_) => Ok(None),
-            CodecBackend::Lrc(backend) => backend
-                .decode_local(shards, shard_size, missing_index)
-                .map_err(|e| ErasureError::DecodingFailed(e.to_string()).into()),
-        }
-    }
-
-    /// Check if a missing shard can be recovered using local parity only
-    ///
-    /// This is useful for repair scheduling to prioritize local repairs.
-    pub fn can_recover_locally(&self, available: &[bool], missing_index: usize) -> bool {
-        match &self.backend {
-            CodecBackend::Mds(_) => false,
-            CodecBackend::Lrc(backend) => backend.can_recover_locally(available, missing_index),
         }
     }
 }
@@ -1251,20 +1192,6 @@ mod tests {
         // Should be able to recover using local parity
         let decoded = codec.decode(&mut shard_opts, data.len()).unwrap();
         assert_eq!(decoded, data);
-    }
-
-    #[test]
-    fn test_verify_mds() {
-        let codec = ErasureCodec::new(ErasureConfig::new(4, 2)).unwrap();
-        let data = b"Data to verify with erasure coding.";
-
-        let shards = codec.encode(data).unwrap();
-        assert!(codec.verify(&shards).unwrap());
-
-        // Corrupt a shard and verify should fail
-        let mut corrupted = shards.clone();
-        corrupted[0][0] ^= 0xFF;
-        assert!(!codec.verify(&corrupted).unwrap());
     }
 
     #[test]

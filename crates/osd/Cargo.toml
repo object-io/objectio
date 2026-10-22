@@ -14,7 +14,6 @@ objectio-common = { workspace = true }
 objectio-storage = { workspace = true }
 objectio-erasure = { workspace = true }
 objectio-proto = { workspace = true }
-objectio-block = { workspace = true }
 objectio-transport-te = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }

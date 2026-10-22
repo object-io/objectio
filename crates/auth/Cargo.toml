@@ -6,23 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["builtin"]
-# Builtin SigV4 authentication (always available)
-builtin = []
 # OIDC/JWT authentication support
 oidc = ["dep:jsonwebtoken", "dep:reqwest"]
-# OpenFGA policy engine support
-openfga = ["dep:reqwest"]
-# Full feature set
-full = ["builtin", "oidc", "openfga"]
 
 [dependencies]
 # Async support
 async-trait = "0.1"
 
-# Crypto for SigV4/SigV2
+# Crypto for SigV4
 hmac = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
@@ -43,15 +35,13 @@ chrono = "0.4"
 # HTTP types
 http = "1.2"
 
-# Regex for pattern matching
-
 # Random generation
 rand = { workspace = true }
 
 # OIDC support (optional)
 jsonwebtoken = { version = "9", optional = true }
 
-# HTTP client for external services (optional)
+# HTTP client for OIDC discovery and JWKS (optional)
 reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]

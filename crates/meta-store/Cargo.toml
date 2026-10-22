@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 objectio-common = { workspace = true }
-objectio-placement = { workspace = true }
 objectio-proto = { workspace = true }
 tokio = { workspace = true }
 openraft = { workspace = true }

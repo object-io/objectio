@@ -556,18 +556,6 @@ impl OsdPool {
         }
     }
 
-    /// Get all connected node IDs
-    #[allow(dead_code)]
-    pub async fn connected_nodes(&self) -> Vec<NodeId> {
-        self.nodes.read().await.keys().cloned().collect()
-    }
-
-    /// Get the number of connected nodes
-    #[allow(dead_code)]
-    pub async fn node_count(&self) -> usize {
-        self.nodes.read().await.len()
-    }
-
     /// Get a client for a node placement
     pub async fn get_client_for_placement(
         &self,

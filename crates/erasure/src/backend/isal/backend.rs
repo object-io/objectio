@@ -206,31 +206,6 @@ impl ErasureBackend for IsalBackend {
 
         Ok(result)
     }
-
-    fn verify(&self, shards: &[&[u8]]) -> BackendResult<bool> {
-        if shards.len() != self.k + self.m {
-            return Ok(false);
-        }
-
-        // Check all shards have same size
-        if let Some(first_len) = shards.first().map(|s| s.len()) {
-            if !shards.iter().all(|s| s.len() == first_len) {
-                return Ok(false);
-            }
-
-            // Re-encode and compare parity
-            let data_shards: Vec<&[u8]> = shards[..self.k].to_vec();
-            let encoded = self.encode(&data_shards, first_len)?;
-
-            for i in 0..self.m {
-                if encoded[self.k + i] != shards[self.k + i] {
-                    return Ok(false);
-                }
-            }
-        }
-
-        Ok(true)
-    }
 }
 
 // Safety: IsalBackend contains owned data and ErasureCode which is Send+Sync

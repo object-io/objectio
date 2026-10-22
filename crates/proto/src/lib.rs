@@ -46,11 +46,6 @@ impl metadata::ObjectMeta {
 /// it knows. The gateway takes it as "place again".
 pub const STALE_EPOCH_HEADER: &str = "x-objectio-pg-epoch";
 
-/// Cluster service (node and disk management)
-pub mod cluster {
-    tonic::include_proto!("objectio.cluster");
-}
-
 /// Block service (volume and snapshot management)
 pub mod block {
     tonic::include_proto!("objectio.block");

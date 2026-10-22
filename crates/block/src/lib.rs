@@ -10,13 +10,13 @@
 //! - **Thin provisioning**: Only allocate storage on write
 //! - **Snapshots**: Copy-on-write snapshots
 //! - **Clones**: Writable copies from snapshots
-//! - **Multiple protocols**: iSCSI, NVMe-oF, NBD support
+//! - **Protocols**: NBD, and volume management over gRPC
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌─────────────────┐
-//! │  Block Client   │  (iSCSI/NVMe-oF/NBD)
+//! │  Block Client   │  (NBD)
 //! └────────┬────────┘
 //!          │
 //! ┌────────▼────────┐
@@ -35,21 +35,12 @@ pub mod cache;
 pub mod chunk;
 pub mod error;
 pub mod journal;
-pub mod metrics;
-pub mod qos;
 pub mod volume;
 
 pub use cache::{CacheConfig, WriteCache};
 pub use chunk::{ChunkId, ChunkMapper, ChunkRange};
 pub use error::{BlockError, BlockResult};
 pub use journal::{JournalEntry, WriteJournal};
-pub use metrics::{
-    ClusterMetrics, HealthStatus, MetricsCollector, OsdMetrics, PrometheusExporter, VolumeMetrics,
-};
-pub use qos::{
-    IoStats, LatencyHistogram, LatencyPercentiles, Priority, TokenBucket, VolumeQosConfig,
-    VolumeRateLimiter,
-};
 pub use volume::{Volume, VolumeManager, VolumeState};
 
 /// Default chunk size: 4MB (matches EC stripe size)

@@ -1,6 +1,6 @@
 //! AWS `SigV4` request signing for the S3 service: the client half, for
 //! requests ObjectIO itself sends (the CLI's, and the replicator's to a
-//! target cluster). [`crate::sigv4`] verifies them. It
+//! target cluster). The gateway's `auth_middleware` verifies them. It
 //! follows the SDKs (`sdk/go/sigv4.go`, `sdk/python/objectio/_sigv4.py`)
 //! exactly and is pinned to the same test vectors, so the three cannot drift.
 //!
@@ -299,95 +299,5 @@ mod tests {
             canonical_query(&[("lifecycle".to_string(), String::new())]),
             "lifecycle="
         );
-    }
-
-    /// What the gateway's own verifier accepts — not just what the SDK
-    /// vectors say — for the shapes the CLI sends: a query string, a
-    /// subresource, an escaped segment, a JSON body.
-    #[test]
-    fn the_gateway_verifier_accepts_what_this_signs() {
-        type Case<'a> = (
-            &'a str,
-            String,
-            Vec<(String, String)>,
-            Option<&'a str>,
-            &'a [u8],
-        );
-        use std::sync::Arc;
-        let store = crate::UserStore::new();
-        let user = store.create_user("cli-test").unwrap();
-        let key = store.create_access_key(&user.user_id).unwrap();
-        let verifier = crate::SigV4Verifier::new(Arc::new(store), "us-east-1");
-        let s = Signer {
-            access_key: &key.access_key_id,
-            secret_key: &key.secret_access_key,
-            region: "us-east-1",
-        };
-
-        let cases: Vec<Case> = vec![
-            (
-                "GET",
-                "/_admin/policies".into(),
-                vec![("tenant".into(), "acme corp".into())],
-                None,
-                b"",
-            ),
-            (
-                "PUT",
-                "/bkt".into(),
-                vec![("lifecycle".into(), String::new())],
-                Some("application/xml"),
-                b"<LifecycleConfiguration/>",
-            ),
-            (
-                "DELETE",
-                format!(
-                    "/_admin/tenants/acme/admins/{}",
-                    escape_segment("arn:obio:iam::acme:user/u1")
-                ),
-                vec![],
-                None,
-                b"",
-            ),
-            (
-                "POST",
-                "/_admin/users".into(),
-                vec![],
-                Some("application/json"),
-                br#"{"display_name":"x"}"#,
-            ),
-        ];
-        for (method, path, query, ct, body) in cases {
-            let headers = s.sign(
-                &Request {
-                    method,
-                    host: "127.0.0.1:9000",
-                    path: &path,
-                    query: &query,
-                    content_type: ct,
-                    body,
-                },
-                Utc::now(),
-            );
-            let qs = if query.is_empty() {
-                String::new()
-            } else {
-                format!("?{}", canonical_query(&query))
-            };
-            let mut b = http::Request::builder()
-                .method(method)
-                .uri(format!("http://127.0.0.1:9000{path}{qs}"))
-                .header("host", "127.0.0.1:9000");
-            if let Some(ct) = ct {
-                b = b.header("content-type", ct);
-            }
-            for (k, v) in &headers {
-                b = b.header(*k, v);
-            }
-            let req = b.body(()).unwrap();
-            verifier
-                .verify(&req)
-                .unwrap_or_else(|e| panic!("{method} {path}{qs} rejected: {e}"));
-        }
     }
 }

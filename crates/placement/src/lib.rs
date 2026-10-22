@@ -7,11 +7,8 @@
 //!
 //! # Algorithms
 //!
-//! ## CRUSH (Original)
-//! Traditional CRUSH algorithm with straw bucket selection.
-//!
-//! ## CRUSH 2.0 (Recommended)
-//! Enhanced placement using:
+//! ## CRUSH 2.0
+//! Placement using:
 //! - **HRW (Rendezvous) hashing**: Better balance, minimal remapping
 //! - **EC placement templates**: Pre-defined shard layouts
 //! - **Stripe groups**: Deterministic domain assignment
@@ -26,15 +23,10 @@
 //! ```
 
 pub mod copyset;
-pub mod crush;
 pub mod crush2;
 pub mod jump_hash;
-pub mod policy;
 pub mod topology;
 
-// Original CRUSH exports
-pub use crush::{CrushMap, LrcPlacementConfig, LrcShardPlacement, ShardType};
-pub use policy::{PlacementPolicy, PlacementResult, ShardPlacement};
 pub use topology::{
     ClusterTopology, FailureDomainInfo, NodeInfo, RackInfo, TopologyDistance, distance,
 };
