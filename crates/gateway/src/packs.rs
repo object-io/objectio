@@ -377,7 +377,7 @@ pub async fn pack_objects(
         }
         // The bytes as a GET returns them, checked against the ETag of the
         // object read: a body from an object written meanwhile won't match.
-        let resp = crate::s3::get_object_version(
+        let resp = crate::s3::read_object_version(
             state.clone(),
             bucket.to_string(),
             key.clone(),

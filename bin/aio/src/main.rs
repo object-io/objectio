@@ -173,6 +173,23 @@ struct Args {
     #[arg(long)]
     pack_interval_secs: Option<u64>,
 
+    /// The gateway's memory budget for request bodies and GET read-ahead
+    /// (`512MiB`, `2GiB`); forwarded. Unset: the gateway's default.
+    #[arg(long)]
+    memory_budget: Option<String>,
+
+    /// Requests the gateway serves at once; forwarded.
+    #[arg(long)]
+    max_requests: Option<usize>,
+
+    /// The gateway's header timeout (seconds); forwarded.
+    #[arg(long)]
+    header_timeout_secs: Option<u64>,
+
+    /// The gateway's body timeout (seconds); forwarded.
+    #[arg(long)]
+    body_timeout_secs: Option<u64>,
+
     /// Objects written more recently than this aren't packed (seconds).
     #[arg(long)]
     pack_min_age_secs: Option<u64>,
@@ -1003,6 +1020,18 @@ async fn serve() -> Result<()> {
     }
     if let Some(secs) = args.pack_interval_secs {
         gw_argv.extend(["--pack-interval-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(size) = &args.memory_budget {
+        gw_argv.extend(["--memory-budget".to_string(), size.clone()]);
+    }
+    if let Some(n) = args.max_requests {
+        gw_argv.extend(["--max-requests".to_string(), n.to_string()]);
+    }
+    if let Some(secs) = args.header_timeout_secs {
+        gw_argv.extend(["--header-timeout-secs".to_string(), secs.to_string()]);
+    }
+    if let Some(secs) = args.body_timeout_secs {
+        gw_argv.extend(["--body-timeout-secs".to_string(), secs.to_string()]);
     }
     if let Some(secs) = args.pack_min_age_secs {
         gw_argv.extend(["--pack-min-age-secs".to_string(), secs.to_string()]);

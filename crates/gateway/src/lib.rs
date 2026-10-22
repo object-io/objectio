@@ -4,6 +4,7 @@
 //! Credentials are managed by the metadata service for persistence.
 
 pub mod admin;
+pub mod admission;
 pub mod audit;
 pub mod audit_spool;
 pub mod auth_middleware;
@@ -46,6 +47,7 @@ pub mod replication;
 pub mod s3;
 pub mod s3_metrics;
 pub mod scatter_gather;
+pub mod serve;
 pub mod share_admin;
 pub mod stripe;
 pub mod sts_api;
@@ -55,7 +57,6 @@ pub mod upgrade;
 use crate::s3_metrics::{ProtectionConfig, s3_metrics};
 use anyhow::Result;
 use auth_middleware::{AuthState, auth_layer, optional_auth_layer};
-use axum::serve::ListenerExt as _;
 use axum::{
     Extension, Router,
     extract::DefaultBodyLimit,
@@ -77,11 +78,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn};
-
-/// The largest request body a handler takes (larger objects need
-/// multipart).
-pub(crate) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+use tracing::{info, warn};
 
 /// Prometheus metrics endpoint handler
 /// Join the per-OSD usage with meta's buckets and tenants. `None` when meta
@@ -568,6 +565,31 @@ pub struct Args {
         default_value = "objectio-osd"
     )]
     pub host_provider_osd_sts: String,
+
+    /// The memory budget for request bodies and GET read-ahead, e.g.
+    /// `512MiB` or `2GiB`: a request that does not fit is answered 503
+    /// SlowDown. Unset: half the process's memory limit (its cgroup's, a
+    /// container's limit) when it has one, otherwise 512 MiB.
+    #[arg(long, env = "OBJECTIO_MEMORY_BUDGET", value_parser = admission::parse_size)]
+    pub memory_budget: Option<u64>,
+
+    /// Requests served at once, a response's body included until it is
+    /// sent; more are answered 503 SlowDown. Health, readiness and metrics
+    /// are not counted.
+    #[arg(long, env = "OBJECTIO_MAX_REQUESTS", default_value_t = 1024)]
+    pub max_requests: usize,
+
+    /// Seconds a request's headers may take to arrive, and an idle
+    /// keep-alive connection waits for its next request, before the
+    /// connection is closed.
+    #[arg(long, env = "OBJECTIO_HEADER_TIMEOUT_SECS", default_value_t = 30)]
+    pub header_timeout_secs: u64,
+
+    /// Seconds a request body may go without sending a byte (400
+    /// RequestTimeout), and a client may go without reading a byte of a
+    /// response (the connection is closed).
+    #[arg(long, env = "OBJECTIO_BODY_TIMEOUT_SECS", default_value_t = 30)]
+    pub body_timeout_secs: u64,
 
     /// Log level
     #[arg(long, default_value = "info")]
@@ -1067,6 +1089,19 @@ pub async fn run(
         args.region.clone(),
     );
     auditor.set_bucket_logging(Arc::clone(&bucket_logger));
+    let body_timeout = std::time::Duration::from_secs(args.body_timeout_secs.max(1));
+    let admission = admission::Admission::new(
+        admission::budget_bytes(args.memory_budget),
+        args.max_requests,
+        body_timeout,
+    );
+    admission.register();
+    info!(
+        "Admission: {} requests at once; header timeout {} s, body timeout {} s",
+        args.max_requests,
+        args.header_timeout_secs,
+        body_timeout.as_secs()
+    );
     let state = Arc::new(AppState {
         meta_client,
         osd_pool,
@@ -1092,6 +1127,7 @@ pub async fn run(
         auditor: Arc::clone(&auditor),
         pack_cache: crate::packs::PackCache::default(),
         replication: crate::replication::Replication::default(),
+        admission: Arc::clone(&admission),
     });
 
     bucket_logging::spawn_delivery(Arc::clone(&state), Arc::clone(&bucket_logger));
@@ -1145,7 +1181,7 @@ pub async fn run(
 
     // Build router
     // Allow up to 100MB for single-part uploads (larger objects need multipart)
-    let body_limit = DefaultBodyLimit::max(MAX_BODY_BYTES);
+    let body_limit = DefaultBodyLimit::max(admission::MAX_BODY);
     info!("Max single-part upload size: 100 MB");
 
     // Bucket operations (including ?policy and ?uploads query params;
@@ -1579,7 +1615,13 @@ pub async fn run(
             // Innermost: after authentication and authorization.
             .layer(middleware::from_fn(s3::unsupported_subresource_layer))
             .layer(middleware::from_fn(chunked_decode::s3_chunked_decode_layer))
-            .layer(body_limit);
+            .layer(body_limit)
+            // Bodies are reserved from the memory budget and read here,
+            // once the caller is authenticated.
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&admission),
+                admission::body_layer,
+            ));
         let r = if args.no_auth {
             // Nothing signed, but a body is still held to the hash it
             // declares; with auth on, the auth layer does it.
@@ -1667,6 +1709,10 @@ pub async fn run(
             .nest("/iceberg", iceberg_router.clone())
             .merge(unity_router.clone())
             .nest("/delta-sharing", delta_sharing_router.clone())
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&admission),
+                admission::request_layer,
+            ))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Data))
             .layer(TraceLayer::new_for_http())
@@ -1713,6 +1759,10 @@ pub async fn run(
                 get(|| async { Redirect::temporary("/_console/admin/") }),
             )
             .route("/metrics", get(metrics_handler))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&admission),
+                admission::request_layer,
+            ))
             .layer(middleware::from_fn(metrics_middleware::metrics_layer))
             .layer(Extension(ListenerKind::Combined))
             .layer(TraceLayer::new_for_http());
@@ -1823,7 +1873,7 @@ pub async fn run(
     }
 
     // Bind all listeners and serve concurrently. A shared broadcast channel
-    // fans the user's shutdown future out to every axum::serve.
+    // fans the user's shutdown future out to every listener.
     // Keep capacity, usage, data-safety and the OSD / meta metrics fed.
     // Polled rather than gathered on scrape: /metrics has to stay fast and
     // must not fail because one node is slow to answer.
@@ -1832,6 +1882,10 @@ pub async fn run(
     clock_skew::spawn(state.meta_client.clone());
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(listeners.len().max(1));
+    let timeouts = admission::Timeouts {
+        header: std::time::Duration::from_secs(args.header_timeout_secs.max(1)),
+        send: body_timeout,
+    };
     let mut tasks = Vec::with_capacity(listeners.len());
     for (addr, router, label, endpoint) in listeners {
         // Audited outermost (inside only the endpoint's name), so every
@@ -1842,14 +1896,7 @@ pub async fn run(
                 audit::audit_layer,
             ))
             .layer(Extension(origin::Endpoint(endpoint)));
-        // axum serves accepted sockets with Nagle on unless told otherwise;
-        // Nagle holding back the tail of a response while the client delays
-        // its ACK stalls a lone request by ~40 ms on Linux.
-        let listener = TcpListener::bind(addr).await?.tap_io(|tcp| {
-            if let Err(e) = tcp.set_nodelay(true) {
-                debug!("TCP_NODELAY on accepted connection: {e}");
-            }
-        });
+        let listener = TcpListener::bind(addr).await?;
         info!("Listener: {label} on {addr}");
         // Iceberg path rewrite (`/iceberg/v1/ws/{wh}/...` →
         // `/iceberg/v1/...?warehouse={wh}`) is harmless on listeners
@@ -1859,21 +1906,11 @@ pub async fn run(
             .service(router);
         let mut rx = shutdown_tx.subscribe();
         tasks.push(tokio::spawn(async move {
-            // Each connection's peer address rides on its requests.
-            axum::serve(
-                listener,
-                tower::service_fn(move |stream: axum::serve::IncomingStream<'_, _>| {
-                    let svc = origin::WithClientAddr {
-                        inner: app.clone(),
-                        addr: *stream.remote_addr(),
-                    };
-                    async move { Ok::<_, std::convert::Infallible>(svc) }
-                }),
-            )
-            .with_graceful_shutdown(async move {
+            serve::serve(listener, app, timeouts, async move {
                 let _ = rx.recv().await;
             })
-            .await
+            .await;
+            Ok::<(), std::io::Error>(())
         }));
     }
 

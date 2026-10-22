@@ -69,6 +69,11 @@ const EXPECTED: &[(&str, &str)] = &[
     ("objectio_meta_grpc_latency_seconds", "histogram"),
     ("objectio_meta_commit_seconds", "histogram"),
     ("objectio_build_info", "gauge"),
+    // Admission: the memory budget and the request limit.
+    ("objectio_gateway_memory_budget_bytes", "gauge"),
+    ("objectio_gateway_memory_budget_in_use_bytes", "gauge"),
+    ("objectio_gateway_requests_limit", "gauge"),
+    ("objectio_gateway_requests_admitted", "gauge"),
     // Block gateway, in this process under aio.
     ("objectio_block_io_seconds", "histogram"),
     ("objectio_block_io_bytes_total", "counter"),

@@ -199,7 +199,7 @@ impl Source {
     async fn open(mut self, range: &str) -> Result<(Self, Bytes), Response> {
         let mut h = self.headers.clone();
         h.insert(header::RANGE, header::HeaderValue::from_str(range).unwrap());
-        let resp = super::get::get_object_version(
+        let resp = super::get::read_object_version(
             self.state.clone(),
             self.bucket.clone(),
             self.key.clone(),
@@ -256,7 +256,7 @@ impl Source {
             h.insert(header::IF_MATCH, v);
         }
         self.handle.block_on(async {
-            let resp = super::get::get_object_version(
+            let resp = super::get::read_object_version(
                 self.state.clone(),
                 self.bucket.clone(),
                 self.key.clone(),

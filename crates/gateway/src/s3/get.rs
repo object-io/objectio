@@ -533,13 +533,42 @@ pub(crate) fn part_bounds(object: &ObjectMeta, n: u32) -> Result<(u64, u64, u32)
     Ok((start, start + len.saturating_sub(1), count))
 }
 
-/// GET one version of an object (`?versionId=`), or the current one.
+/// GET one version of an object (`?versionId=`), or the current one, for a
+/// client: the body streams stripe by stripe, each charged to the memory
+/// budget until it is sent.
 pub(crate) async fn get_object_version(
     state: Arc<AppState>,
     bucket: String,
     key: String,
     version_id: Option<String>,
     headers: HeaderMap,
+) -> Response {
+    read_version(state, bucket, key, version_id, headers, true).await
+}
+
+/// [`get_object_version`] for the gateway's own reads, whose caller takes
+/// the whole body (a copy's source, Select, replication, packing): its
+/// stripes are not charged to the memory budget, which a body held whole
+/// would never give back before its end (an object larger than the budget
+/// would wait for room for ever). A caller that can bound what it holds
+/// reserves that itself.
+pub(crate) async fn read_object_version(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    headers: HeaderMap,
+) -> Response {
+    read_version(state, bucket, key, version_id, headers, false).await
+}
+
+async fn read_version(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    headers: HeaderMap,
+    metered: bool,
 ) -> Response {
     let mut notes = ReadNotes::default();
     let mut resp = get_object_version_once(
@@ -549,6 +578,7 @@ pub(crate) async fn get_object_version(
         version_id.clone(),
         headers.clone(),
         false,
+        metered,
         &mut notes,
     )
     .await;
@@ -556,16 +586,24 @@ pub(crate) async fn get_object_version(
     // through a cached placement, found nothing): the pack, or the key's
     // home, may have moved (repair, drain, an evacuation). Once more,
     // asking meta.
-    let stale_packs = resp.status().is_server_error() && !notes.cached_packs.is_empty();
-    let stale_placement = notes.cached_placement
-        && (resp.status().is_server_error() || resp.status() == StatusCode::NOT_FOUND);
+    // Not when refused for want of memory: nothing was read.
+    let failed = resp.status().is_server_error()
+        && resp
+            .extensions()
+            .get::<crate::gateway_metrics::S3ErrorCode>()
+            .is_none_or(|c| c.0 != "SlowDown");
+    let stale_packs = failed && !notes.cached_packs.is_empty();
+    let stale_placement =
+        notes.cached_placement && (failed || resp.status() == StatusCode::NOT_FOUND);
     if stale_packs || stale_placement {
         state
             .pack_cache
             .forget(notes.cached_packs.iter().map(Vec::as_slice));
         crate::placement_cache::forget(&bucket, &key);
-        resp = get_object_version_once(state, bucket, key, version_id, headers, true, &mut notes)
-            .await;
+        resp = get_object_version_once(
+            state, bucket, key, version_id, headers, true, metered, &mut notes,
+        )
+        .await;
     }
     if resp.status().is_success()
         && let Some(v) = notes.expiration
@@ -597,7 +635,10 @@ pub(crate) struct ReadNotes {
 }
 
 /// One attempt at [`get_object_version`]. `fresh_packs` resolves packs
-/// and the placement from meta, not the caches; `notes` gets what the caller needs to know.
+/// and the placement from meta, not the caches; `metered` charges the
+/// stripes read to the memory budget; `notes` gets what the caller needs
+/// to know.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_object_version_once(
     state: Arc<AppState>,
     bucket: String,
@@ -605,6 +646,7 @@ pub(crate) async fn get_object_version_once(
     version_id: Option<String>,
     headers: HeaderMap,
     fresh_packs: bool,
+    metered: bool,
     notes: &mut ReadNotes,
 ) -> Response {
     debug!("GET object: {}/{}", bucket, key);
@@ -921,50 +963,348 @@ pub(crate) async fn get_object_version_once(
         }
     }
 
-    // Determine which stripes to fetch (skip non-overlapping stripes for range requests)
-    let stripe_plan: Vec<(usize, u64)> = if let Some(ref range) = resolved_range {
-        let plan = overlapping_stripes(&object.stripes, range);
-        debug!(
-            "Range request bytes={}-{} for {}/{}: fetching {} of {} stripes",
-            range.start,
-            range.end,
-            bucket,
-            key,
-            plan.len(),
-            object.stripes.len()
-        );
-        plan
-    } else {
-        // Full object: all stripes, each at its place in the object. Not
-        // sliced, but a single-part encrypted object is one stream across
-        // its stripes, decrypted from there: from 0, every stripe after the
-        // first decrypted to garbage, served with 200.
-        overlapping_stripes(
-            &object.stripes,
-            &ByteRange {
-                start: 0,
-                end: u64::MAX - 1,
-            },
-        )
-    };
-
-    // Pre-allocate with appropriate capacity
-    let capacity = if let Some(ref range) = resolved_range {
-        (range.end - range.start + 1) as usize
-    } else {
-        object.size as usize
-    };
-    let mut all_data = Vec::with_capacity(capacity);
+    // The stripes the response is made of: each one's place in the object
+    // and how many of its bytes the response carries.
+    let plan = plan_stripes(&object.stripes, resolved_range.as_ref());
+    let body_len = resolved_range.map_or(total_size, |r| r.end - r.start + 1);
+    debug!(
+        "GET {}/{}: {} of {} stripes{}",
+        bucket,
+        key,
+        plan.len(),
+        object.stripes.len(),
+        resolved_range.map_or_else(String::new, |r| format!(
+            ", range=bytes {}-{}",
+            r.start, r.end
+        ))
+    );
 
     // An inline object is all here already; its stripe plan is empty.
-    if !object.inline_data.is_empty() {
+    let body = if object.inline_data.is_empty() {
+        // Never sent: bytes that don't add up to the object are not the
+        // object. Known from the metadata, before any header goes out.
+        let planned: u64 = plan.iter().map(|p| p.len).sum();
+        if planned != body_len {
+            error!(
+                "Data size mismatch for {}/{}: its stripes hold {} of the {} bytes asked for (object.size={})",
+                bucket, key, planned, body_len, total_size
+            );
+            return S3Error::xml_response(
+                "InternalError",
+                "The object's data did not reassemble to its size",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+        let budget = metered.then(|| state.admission.budget.clone());
+        let wait = state.admission.body_timeout;
+        let mut reader = StripeReader {
+            state: Arc::clone(&state),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            object: object.clone(),
+            range: resolved_range,
+            dek: get_sse_dek,
+            node_address_map,
+            node_topo_map,
+            node_te_map,
+            meta_client,
+            small_shards,
+        };
+        let mut stripes = plan.into_iter();
+        let Some(first) = stripes.next() else {
+            return S3Error::xml_response(
+                "InternalError",
+                "Object has no stripe metadata",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        };
+        // The first stripe is read before the answer is given: a read that
+        // fails here is an error status (and a retry, above), not a cut-off
+        // body.
+        let mut reservation = match &budget {
+            Some(b) => match b.try_reserve(first.read_bytes) {
+                Some(r) => r,
+                None => return crate::admission::slow_down("memory"),
+            },
+            None => crate::admission::Reservation::default(),
+        };
+        let data = match reader.read(&first).await {
+            Ok(d) => d,
+            Err(resp) => return resp,
+        };
+        if data.len() as u64 != first.len {
+            error!(
+                "GET {bucket}/{key}: stripe {} read back {} bytes, {} expected",
+                first.index,
+                data.len(),
+                first.len
+            );
+            return S3Error::xml_response(
+                "InternalError",
+                "The object's data did not reassemble to its size",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+        reservation.shrink_to(data.len() as u64);
+        let first = crate::admission::reserved_bytes(data, reservation);
+        stream_stripes(reader, first, stripes.collect(), budget, wait)
+    } else {
         match inline_slice(&object, resolved_range.as_ref(), get_sse_dek.as_ref()) {
-            Ok(data) => all_data = data,
+            Ok(data) => Body::from(data),
             Err(resp) => return resp,
         }
-    }
+    };
+    phases.mark("shards");
 
-    for &(stripe_idx, stripe_byte_offset) in &stripe_plan {
+    // Decryption (when the object is SSE-encrypted) is applied per stripe
+    // as it is read.
+    let mut builder = with_version_id(Response::builder(), &object)
+        .header(header::CONTENT_TYPE, &object.content_type)
+        .header(header::CONTENT_LENGTH, body_len.to_string())
+        .header("ETag", &object.etag)
+        .header("Accept-Ranges", "bytes")
+        .header(
+            header::LAST_MODIFIED,
+            timestamp_to_http_date(object.modified_at),
+        );
+    builder = match resolved_range {
+        Some(range) => builder.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{total_size}", range.start, range.end),
+        ),
+        None => builder.status(StatusCode::OK),
+    };
+    if let Some(v) = sse_response_header {
+        builder = builder.header("x-amz-server-side-encryption", v);
+        if v == "aws:kms" && !object.kms_key_id.is_empty() {
+            builder = builder.header(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                &object.kms_key_id,
+            );
+        }
+    }
+    if !sse_c_key_md5.is_empty() {
+        builder = builder
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header(
+                "x-amz-server-side-encryption-customer-key-md5",
+                &sse_c_key_md5,
+            );
+    }
+    let builder = add_metadata_headers(builder, &object.user_metadata);
+    let mut builder = add_tagging_count(builder, &object.tags);
+    // The stored checksum is the whole object's: not for a range.
+    if resolved_range.is_none() {
+        builder = add_checksum_header(builder, &headers, &object);
+    }
+    builder.body(body).unwrap()
+}
+
+/// One stripe of a GET's answer.
+pub(crate) struct PlannedStripe {
+    /// Its index in the object's stripes.
+    index: usize,
+    /// Where its bytes start in the object.
+    offset: u64,
+    /// How many of its bytes the answer carries.
+    len: u64,
+    /// What reading it holds in memory at most: the decoded stripe (a pack
+    /// member's slice is read on its own).
+    read_bytes: u64,
+}
+
+/// The stripes a GET of `range` (or of the whole object) reads, in order.
+fn plan_stripes(stripes: &[StripeMeta], range: Option<&ByteRange>) -> Vec<PlannedStripe> {
+    let whole = ByteRange {
+        start: 0,
+        end: u64::MAX - 1,
+    };
+    let range = range.unwrap_or(&whole);
+    overlapping_stripes(stripes, range)
+        .into_iter()
+        .map(|(index, offset)| {
+            let stripe = &stripes[index];
+            let size = if stripe.slice_length > 0 {
+                stripe.slice_length
+            } else {
+                stripe.data_size
+            };
+            let from = range.start.max(offset);
+            let to = (range.end + 1).min(offset + size);
+            let len = to.saturating_sub(from);
+            PlannedStripe {
+                index,
+                offset,
+                len,
+                read_bytes: if stripe.slice_length > 0 {
+                    len
+                } else {
+                    stripe.data_size
+                },
+            }
+        })
+        .collect()
+}
+
+/// The body of a GET: `first`, then the stripes of `rest` as a task reads
+/// them, one stripe ahead of the client: the next is read only once the
+/// connection has taken the one before. Each stripe's bytes hold their
+/// reservation of `budget` until they are sent.
+///
+/// A stripe that can't be read once the headers are out ends the body with
+/// an error, so the connection is closed short of its Content-Length: the
+/// client sees a failed download, never wrong bytes.
+fn stream_stripes(
+    mut reader: StripeReader,
+    first: Bytes,
+    rest: Vec<PlannedStripe>,
+    budget: Option<crate::admission::MemoryBudget>,
+    wait: std::time::Duration,
+) -> Body {
+    if rest.is_empty() {
+        return Body::from(first);
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    tokio::spawn(async move {
+        let abort = |slot: tokio::sync::mpsc::Permit<'_, Result<Bytes, std::io::Error>>,
+                     reason: &str,
+                     what: String| {
+            error!("GET cut off after its headers: {what}");
+            crate::admission::record_get_abort(reason);
+            slot.send(Err(std::io::Error::other(what)));
+        };
+        for p in rest {
+            // Gone: the client closed the connection.
+            let Ok(slot) = tx.reserve().await else {
+                return;
+            };
+            let what = format!(
+                "{}/{} stripe {} of {}",
+                reader.bucket,
+                reader.key,
+                p.index,
+                reader.object.stripes.len()
+            );
+            let mut reservation = match &budget {
+                Some(b) => match b.reserve(p.read_bytes, wait).await {
+                    Some(r) => r,
+                    None => {
+                        abort(
+                            slot,
+                            "memory",
+                            format!("{what}: no room in the memory budget in {wait:?}"),
+                        );
+                        return;
+                    }
+                },
+                None => crate::admission::Reservation::default(),
+            };
+            match reader.read(&p).await {
+                Ok(data) if data.len() as u64 == p.len => {
+                    reservation.shrink_to(data.len() as u64);
+                    slot.send(Ok(crate::admission::reserved_bytes(data, reservation)));
+                }
+                Ok(data) => {
+                    let got = data.len();
+                    abort(
+                        slot,
+                        "length",
+                        format!("{what}: read {got} bytes, {} expected", p.len),
+                    );
+                    return;
+                }
+                Err(resp) => {
+                    abort(
+                        slot,
+                        "read",
+                        format!("{what}: unreadable ({})", resp.status()),
+                    );
+                    return;
+                }
+            }
+        }
+    });
+    let first = futures::stream::once(async move { Ok::<_, std::io::Error>(first) });
+    Body::from_stream(futures::StreamExt::chain(
+        first,
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ))
+}
+
+/// The bytes of an inline object a GET asked for: all of them, or `range`,
+/// decrypted when the object is encrypted.
+#[allow(clippy::result_large_err)]
+pub(crate) fn inline_slice(
+    object: &ObjectMeta,
+    range: Option<&ByteRange>,
+    dek: Option<&[u8; objectio_kms::DEK_LEN]>,
+) -> Result<Vec<u8>, Response> {
+    if object.inline_data.len() as u64 != object.size {
+        error!(
+            "Inline object {}/{} holds {} bytes but its size is {}",
+            object.bucket,
+            object.key,
+            object.inline_data.len(),
+            object.size
+        );
+        return Err(S3Error::xml_response(
+            "InternalError",
+            "Object metadata is inconsistent (inline size)",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+    }
+    let (start, end) = range.map_or((0, object.size), |r| (r.start, r.end + 1));
+    let mut data = object.inline_data[start as usize..end as usize].to_vec();
+    if let Some(dek) = dek {
+        // Stored like a single stripe starting at byte 0 of the object.
+        decrypt_stripe_slice(dek, &StripeMeta::default(), object, 0, start, &mut data)?;
+    }
+    Ok(data)
+}
+
+/// A GET's reader of its object's stripes: where their shards are, and what
+/// a stripe's bytes are cut and decrypted to. Owned, so that the stripes
+/// after the first can be read by the task that streams them.
+pub(crate) struct StripeReader {
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    object: ObjectMeta,
+    range: Option<ByteRange>,
+    dek: Option<[u8; objectio_kms::DEK_LEN]>,
+    node_address_map: HashMap<Vec<u8>, String>,
+    node_topo_map: HashMap<Vec<u8>, objectio_placement::FailureDomainInfo>,
+    node_te_map: HashMap<Vec<u8>, String>,
+    meta_client: MetadataServiceClient<Channel>,
+    small_shards: crate::osd_pool::SmallShards,
+}
+
+impl StripeReader {
+    /// The bytes of stripe `p` the response carries, decoded from its
+    /// shards (verified), cut to the range and decrypted. `Err` is the
+    /// answer a GET gives when it can't be read.
+    #[allow(clippy::result_large_err)] // Err is a fully-formed Response built once per request.
+    async fn read(&mut self, p: &PlannedStripe) -> Result<Vec<u8>, Response> {
+        let stripe_idx = p.index;
+        let stripe_byte_offset = p.offset;
+        let resolved_range = self.range;
+        let get_sse_dek = self.dek;
+        let Self {
+            state,
+            bucket,
+            key,
+            object,
+            node_address_map,
+            node_topo_map,
+            node_te_map,
+            meta_client,
+            small_shards,
+            ..
+        } = self;
+        let state: &Arc<AppState> = state;
+        let object: &ObjectMeta = object;
+        let bucket: &str = bucket;
+        let key: &str = key;
         let stripe = &object.stripes[stripe_idx];
         let ec_k = stripe.ec_k as usize;
         let ec_m = stripe.ec_m as usize;
@@ -974,11 +1314,11 @@ pub(crate) async fn get_object_version_once(
         let stripe_data_size = stripe.data_size as usize;
         if stripe_data_size == 0 && object.size > 0 {
             error!("Object stripe {stripe_idx} has no data_size");
-            return S3Error::xml_response(
+            return Err(S3Error::xml_response(
                 "InternalError",
                 "Object metadata is incomplete (missing stripe data_size)",
                 StatusCode::INTERNAL_SERVER_ERROR,
-            );
+            ));
         }
 
         // Replication mode: just read raw data from any replica
@@ -989,14 +1329,9 @@ pub(crate) async fn get_object_version_once(
             );
 
             // Try each replica until we get the data
-            let mut data_read = false;
             for shard_loc in &stripe.shards {
-                let node_addr = resolve_node_address(
-                    &mut node_address_map,
-                    &mut meta_client,
-                    &shard_loc.node_id,
-                )
-                .await;
+                let node_addr =
+                    resolve_node_address(node_address_map, meta_client, &shard_loc.node_id).await;
                 let node_placement = objectio_proto::metadata::NodePlacement {
                     te_segment: String::new(),
                     position: shard_loc.position,
@@ -1036,11 +1371,14 @@ pub(crate) async fn get_object_version_once(
                         let (mut slice, slice_start_in_stripe): (Vec<u8>, u64) =
                             if let Some(ref range) = resolved_range {
                                 let stripe_end = stripe_byte_offset + actual_data.len() as u64;
-                                let slice_start =
-                                    range.start.saturating_sub(stripe_byte_offset) as usize;
                                 let slice_end = std::cmp::min(range.end + 1, stripe_end)
                                     .saturating_sub(stripe_byte_offset)
                                     as usize;
+                                // A replica shorter than its stripe: the
+                                // length check after the read refuses it.
+                                let slice_start = (range.start.saturating_sub(stripe_byte_offset)
+                                    as usize)
+                                    .min(slice_end);
                                 (
                                     actual_data[slice_start..slice_end].to_vec(),
                                     slice_start as u64,
@@ -1052,17 +1390,15 @@ pub(crate) async fn get_object_version_once(
                             && let Err(resp) = decrypt_stripe_slice(
                                 dek,
                                 stripe,
-                                &object,
+                                object,
                                 stripe_byte_offset,
                                 slice_start_in_stripe,
                                 &mut slice,
                             )
                         {
-                            return resp;
+                            return Err(resp);
                         }
-                        all_data.extend(slice);
-                        data_read = true;
-                        break;
+                        return Ok(slice);
                     }
                     Err(e) => {
                         warn!(
@@ -1073,19 +1409,15 @@ pub(crate) async fn get_object_version_once(
                 }
             }
 
-            if !data_read {
-                error!(
-                    "Failed to read any replica for stripe {} of {}/{}",
-                    stripe_idx, bucket, key
-                );
-                return S3Error::xml_response(
-                    "InternalError",
-                    "Failed to read object: no replicas available",
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                );
-            }
-
-            continue; // Move to next stripe
+            error!(
+                "Failed to read any replica for stripe {} of {}/{}",
+                stripe_idx, bucket, key
+            );
+            return Err(S3Error::xml_response(
+                "InternalError",
+                "Failed to read object: no replicas available",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ));
         }
 
         // EC mode: need to read k shards and decode
@@ -1110,9 +1442,9 @@ pub(crate) async fn get_object_version_once(
                 None => (0, part_len),
             };
             if let Some(mut slice) = read_packed_slice(
-                &state,
-                &mut node_address_map,
-                &mut meta_client,
+                state,
+                node_address_map,
+                meta_client,
                 stripe,
                 stripe_data_size,
                 stripe.slice_offset + from,
@@ -1124,16 +1456,15 @@ pub(crate) async fn get_object_version_once(
                     && let Err(resp) = decrypt_stripe_slice(
                         dek,
                         stripe,
-                        &object,
+                        object,
                         stripe_byte_offset,
                         from,
                         &mut slice,
                     )
                 {
-                    return resp;
+                    return Err(resp);
                 }
-                all_data.extend(slice);
-                continue;
+                return Ok(slice);
             }
         }
 
@@ -1216,11 +1547,11 @@ pub(crate) async fn get_object_version_once(
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to create erasure codec: {}", e);
-                return S3Error::xml_response(
+                return Err(S3Error::xml_response(
                     "InternalError",
                     &format!("Erasure coding error: {}", e),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                ));
             }
         };
 
@@ -1246,12 +1577,9 @@ pub(crate) async fn get_object_version_once(
                     let Some(shard_loc) = shard_map.get(&pos) else {
                         continue;
                     };
-                    let node_addr = resolve_node_address(
-                        &mut node_address_map,
-                        &mut meta_client,
-                        &shard_loc.node_id,
-                    )
-                    .await;
+                    let node_addr =
+                        resolve_node_address(node_address_map, meta_client, &shard_loc.node_id)
+                            .await;
                     let node_placement = objectio_proto::metadata::NodePlacement {
                         te_segment: node_te_map
                             .get(&shard_loc.node_id)
@@ -1313,21 +1641,21 @@ pub(crate) async fn get_object_version_once(
                     "Insufficient shards to reconstruct stripe {}: have {}, need {}",
                     stripe_idx, read_count, ec_k
                 );
-                return S3Error::xml_response(
+                return Err(S3Error::xml_response(
                     "InternalError",
                     &format!(
                         "Cannot read object: only {} shards available for stripe {}, need {}",
                         read_count, stripe_idx, ec_k
                     ),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                );
+                ));
             }
 
             if !unreadable.is_empty() && stripe_ec_type == ErasureType::ErasureMds {
                 crate::heal::report_degraded(
-                    &state,
-                    &bucket,
-                    &key,
+                    state,
+                    bucket,
+                    key,
                     &object.object_id,
                     stripe.stripe_id,
                     &unreadable,
@@ -1360,9 +1688,9 @@ pub(crate) async fn get_object_version_once(
                     error!("Failed to decode stripe {}: {}", stripe_idx, e);
                     if matches!(e, objectio_erasure::ErasureError::Unverified(_)) {
                         crate::heal::report_degraded(
-                            &state,
-                            &bucket,
-                            &key,
+                            state,
+                            bucket,
+                            key,
                             &object.object_id,
                             stripe.stripe_id,
                             &unreadable,
@@ -1370,11 +1698,11 @@ pub(crate) async fn get_object_version_once(
                             stripe.ec_k,
                         );
                     }
-                    return S3Error::xml_response(
+                    return Err(S3Error::xml_response(
                         "InternalError",
                         &format!("Erasure decoding failed for stripe {}: {}", stripe_idx, e),
                         StatusCode::INTERNAL_SERVER_ERROR,
-                    );
+                    ));
                 }
             }
         };
@@ -1397,154 +1725,16 @@ pub(crate) async fn get_object_version_once(
             && let Err(resp) = decrypt_stripe_slice(
                 dek,
                 stripe,
-                &object,
+                object,
                 stripe_byte_offset,
                 slice_start_in_stripe,
                 &mut slice,
             )
         {
-            return resp;
+            return Err(resp);
         }
-        all_data.extend(slice);
+        Ok(slice)
     }
-    phases.mark("shards");
-
-    debug!(
-        "Read object: {}/{}, size={}, stripes_fetched={}/{}{}",
-        bucket,
-        key,
-        all_data.len(),
-        stripe_plan.len(),
-        object.stripes.len(),
-        if let Some(ref r) = resolved_range {
-            format!(", range=bytes {}-{}", r.start, r.end)
-        } else {
-            String::new()
-        }
-    );
-
-    // Verify data integrity for full (non-range) reads
-    // Never sent: bytes that don't add up to the object are not the object.
-    if resolved_range.is_none() && all_data.len() as u64 != total_size {
-        error!(
-            "Data size mismatch for {}/{}: reassembled {} bytes but object.size={}",
-            bucket,
-            key,
-            all_data.len(),
-            total_size
-        );
-        return S3Error::xml_response(
-            "InternalError",
-            "The object's data did not reassemble to its size",
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-
-    // Build response — range requests already have sliced data.
-    // Decryption (when the object is SSE-encrypted) has already been
-    // applied per-stripe inside the fetch loop above.
-    if let Some(ref range) = resolved_range {
-        let content_range = format!("bytes {}-{}/{total_size}", range.start, range.end);
-
-        let mut builder = with_version_id(Response::builder(), &object)
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_TYPE, &object.content_type)
-            .header(header::CONTENT_LENGTH, all_data.len().to_string())
-            .header(header::CONTENT_RANGE, content_range)
-            .header("ETag", &object.etag)
-            .header("Accept-Ranges", "bytes")
-            .header(
-                header::LAST_MODIFIED,
-                timestamp_to_http_date(object.modified_at),
-            );
-        if let Some(v) = sse_response_header {
-            builder = builder.header("x-amz-server-side-encryption", v);
-            if v == "aws:kms" && !object.kms_key_id.is_empty() {
-                builder = builder.header(
-                    "x-amz-server-side-encryption-aws-kms-key-id",
-                    &object.kms_key_id,
-                );
-            }
-        }
-        if !sse_c_key_md5.is_empty() {
-            builder = builder
-                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                .header(
-                    "x-amz-server-side-encryption-customer-key-md5",
-                    &sse_c_key_md5,
-                );
-        }
-
-        let builder = add_metadata_headers(builder, &object.user_metadata);
-        let builder = add_tagging_count(builder, &object.tags);
-
-        builder.body(Body::from(all_data)).unwrap()
-    } else {
-        let mut builder = with_version_id(Response::builder(), &object)
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, &object.content_type)
-            .header(header::CONTENT_LENGTH, all_data.len().to_string())
-            .header("ETag", &object.etag)
-            .header("Accept-Ranges", "bytes")
-            .header(
-                header::LAST_MODIFIED,
-                timestamp_to_http_date(object.modified_at),
-            );
-        if let Some(v) = sse_response_header {
-            builder = builder.header("x-amz-server-side-encryption", v);
-            if v == "aws:kms" && !object.kms_key_id.is_empty() {
-                builder = builder.header(
-                    "x-amz-server-side-encryption-aws-kms-key-id",
-                    &object.kms_key_id,
-                );
-            }
-        }
-        if !sse_c_key_md5.is_empty() {
-            builder = builder
-                .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                .header(
-                    "x-amz-server-side-encryption-customer-key-md5",
-                    &sse_c_key_md5,
-                );
-        }
-
-        let builder = add_metadata_headers(builder, &object.user_metadata);
-        let builder = add_tagging_count(builder, &object.tags);
-        let builder = add_checksum_header(builder, &headers, &object);
-
-        builder.body(Body::from(all_data)).unwrap()
-    }
-}
-
-/// The bytes of an inline object a GET asked for: all of them, or `range`,
-/// decrypted when the object is encrypted.
-#[allow(clippy::result_large_err)]
-pub(crate) fn inline_slice(
-    object: &ObjectMeta,
-    range: Option<&ByteRange>,
-    dek: Option<&[u8; objectio_kms::DEK_LEN]>,
-) -> Result<Vec<u8>, Response> {
-    if object.inline_data.len() as u64 != object.size {
-        error!(
-            "Inline object {}/{} holds {} bytes but its size is {}",
-            object.bucket,
-            object.key,
-            object.inline_data.len(),
-            object.size
-        );
-        return Err(S3Error::xml_response(
-            "InternalError",
-            "Object metadata is inconsistent (inline size)",
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ));
-    }
-    let (start, end) = range.map_or((0, object.size), |r| (r.start, r.end + 1));
-    let mut data = object.inline_data[start as usize..end as usize].to_vec();
-    if let Some(dek) = dek {
-        // Stored like a single stripe starting at byte 0 of the object.
-        decrypt_stripe_slice(dek, &StripeMeta::default(), object, 0, start, &mut data)?;
-    }
-    Ok(data)
 }
 
 /// Resolve the gRPC address for a node.
@@ -1866,4 +2056,65 @@ pub async fn get_object_with_params(
         return get_object_part(state, bucket, key, params.version_id, n, headers).await;
     }
     get_object_version(state, bucket, key, params.version_id, headers).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stripes(sizes: &[u64]) -> Vec<StripeMeta> {
+        sizes
+            .iter()
+            .map(|&data_size| StripeMeta {
+                data_size,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn plan(p: &[PlannedStripe]) -> Vec<(usize, u64, u64)> {
+        p.iter().map(|s| (s.index, s.offset, s.len)).collect()
+    }
+
+    /// Each stripe of a whole-object read is at its own place in the
+    /// object: what a single-part object's decryption counts from. They
+    /// used to be all at 0, which decrypted every stripe after the first
+    /// to garbage.
+    #[test]
+    fn a_whole_read_places_each_stripe_where_it_starts() {
+        let s = stripes(&[100, 100, 40]);
+        assert_eq!(
+            plan(&plan_stripes(&s, None)),
+            vec![(0, 0, 100), (1, 100, 100), (2, 200, 40)]
+        );
+    }
+
+    #[test]
+    fn a_range_takes_only_its_bytes_of_each_stripe() {
+        let s = stripes(&[100, 100, 100]);
+        let r = ByteRange {
+            start: 150,
+            end: 249,
+        };
+        assert_eq!(
+            plan(&plan_stripes(&s, Some(&r))),
+            vec![(1, 100, 50), (2, 200, 50)]
+        );
+        let r = ByteRange { start: 0, end: 0 };
+        assert_eq!(plan(&plan_stripes(&s, Some(&r))), vec![(0, 0, 1)]);
+    }
+
+    /// Reading a stripe holds it decoded; a pack member's slice is read
+    /// alone, so it holds only its own bytes.
+    #[test]
+    fn what_a_stripe_read_holds_is_the_stripe_or_a_pack_member_slice() {
+        let mut s = stripes(&[1 << 20, 1 << 20]);
+        assert_eq!(plan_stripes(&s, None)[0].read_bytes, 1 << 20);
+        s[1].slice_offset = 4096;
+        s[1].slice_length = 300;
+        let p = plan_stripes(&s, None);
+        assert_eq!(p[1].read_bytes, 300);
+        assert_eq!(p[1].len, 300);
+        assert_eq!(p[1].offset, 1 << 20);
+    }
 }

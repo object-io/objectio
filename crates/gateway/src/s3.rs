@@ -183,6 +183,8 @@ pub struct AppState {
     pub pack_cache: crate::packs::PackCache,
     /// Bucket replication: caches, the fast-path queue, the backlog.
     pub replication: crate::replication::Replication,
+    /// The memory budget and the request limit (`crate::admission`).
+    pub admission: Arc<crate::admission::Admission>,
 }
 
 impl AppState {

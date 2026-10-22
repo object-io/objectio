@@ -28,7 +28,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use tracing::{debug, warn};
 
 use crate::auth_middleware::{
@@ -42,11 +41,6 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 
 /// The trailer that signs the other trailers.
 const TRAILER_SIGNATURE: &str = "x-amz-trailer-signature";
-
-/// The most framed body read: the largest body a handler takes, plus room
-/// for the framing (SDKs send 64 KiB chunks, about 90 bytes of framing
-/// each; AWS's smallest chunk is 8 KiB).
-const MAX_RAW_BYTES: usize = crate::MAX_BODY_BYTES + crate::MAX_BODY_BYTES / 8 + 64 * 1024;
 
 /// A framed body this large is decoded off the async workers: decoding a
 /// signed one hashes every byte.
@@ -228,16 +222,29 @@ fn chunk_signature(extensions: &str) -> Option<&str> {
 }
 
 /// Decode an AWS-chunked body into raw payload bytes and its trailers.
-///
-/// Parses the `<hex-size>[;extensions]\r\n<data>\r\n` framing. With a
-/// verifier, every chunk's signature is checked, and the trailers' when
-/// the verifier says they are signed; without one, chunk signatures are
-/// not read.
+#[cfg(test)]
 fn decode_s3_chunked(
     raw: &[u8],
+    verifier: Option<&mut ChunkVerifier>,
+) -> Result<Decoded, DecodeError> {
+    decode_in_place(raw.to_vec(), verifier)
+}
+
+/// Decode the AWS-chunked body in `raw` where it is: each chunk's data is
+/// moved down over the framing before it, and the buffer cut to the
+/// payload, so a body of any size is decoded without a second copy of it.
+///
+/// Parses the `<hex-size>[;extensions]\r\n<data>\r\n` framing. With a
+/// verifier, every chunk's signature is checked (before its data is
+/// moved), and the trailers' when the verifier says they are signed;
+/// without one, chunk signatures are not read.
+fn decode_in_place(
+    mut raw: Vec<u8>,
     mut verifier: Option<&mut ChunkVerifier>,
 ) -> Result<Decoded, DecodeError> {
-    let mut output = Vec::with_capacity(raw.len());
+    // Where the payload decoded so far ends; never past `pos`, since every
+    // chunk's data follows a size line of at least three bytes.
+    let mut written = 0;
     let mut pos = 0;
 
     loop {
@@ -248,7 +255,7 @@ fn decode_s3_chunked(
         }
 
         // Find the end of the chunk-size line (\r\n)
-        let line_end = find_crlf(raw, pos)
+        let line_end = find_crlf(&raw, pos)
             .ok_or_else(|| malformed(format!("missing CRLF after chunk size at offset {pos}")))?;
 
         let line = &raw[pos..line_end];
@@ -261,6 +268,7 @@ fn decode_s3_chunked(
 
         let chunk_size = usize::from_str_radix(hex_part, 16)
             .map_err(|e| malformed(format!("invalid hex chunk size '{hex_part}': {e}")))?;
+        let signature = chunk_signature(extensions);
 
         // Move past the size line + \r\n
         pos = line_end + 2;
@@ -271,7 +279,7 @@ fn decode_s3_chunked(
             let trailer_bytes = &raw[pos.min(raw.len())..];
             let trailers = parse_trailers(trailer_bytes);
             if let Some(v) = verifier.as_deref_mut() {
-                v.chunk(&[], chunk_signature(extensions))?;
+                v.chunk(&[], signature)?;
                 if v.trailer {
                     let provided = trailers
                         .iter()
@@ -280,17 +288,15 @@ fn decode_s3_chunked(
                     v.trailers(trailer_bytes, provided)?;
                 }
             }
+            raw.truncate(written);
             return Ok(Decoded {
-                payload: output,
+                payload: raw,
                 trailers,
             });
         }
 
         // Read chunk_size bytes of data
-        let Some(data) = pos
-            .checked_add(chunk_size)
-            .and_then(|end| raw.get(pos..end))
-        else {
+        let Some(chunk_end) = pos.checked_add(chunk_size).filter(|&e| e <= raw.len()) else {
             return Err(malformed(format!(
                 "chunk data truncated: need {} bytes at offset {}, have {}",
                 chunk_size,
@@ -299,10 +305,11 @@ fn decode_s3_chunked(
             )));
         };
         if let Some(v) = verifier.as_deref_mut() {
-            v.chunk(data, chunk_signature(extensions))?;
+            v.chunk(&raw[pos..chunk_end], signature)?;
         }
-        output.extend_from_slice(data);
-        pos += chunk_size;
+        raw.copy_within(pos..chunk_end, written);
+        written += chunk_size;
+        pos = chunk_end;
 
         // The chunk's data is followed by CRLF; anything else means the
         // declared size was wrong.
@@ -351,14 +358,6 @@ fn incomplete_body(message: &str) -> Response {
     crate::s3::S3Error::xml_response("IncompleteBody", message, http::StatusCode::BAD_REQUEST)
 }
 
-fn too_large() -> Response {
-    crate::s3::S3Error::xml_response(
-        "EntityTooLarge",
-        "Your proposed upload exceeds the maximum allowed size",
-        http::StatusCode::BAD_REQUEST,
-    )
-}
-
 /// The trailers the request names in `x-amz-trailer` that the body does not
 /// carry. A checksum sent as a trailer is checked only if it arrives, so
 /// one that was announced and left off is refused, not skipped.
@@ -387,28 +386,32 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
         .get("x-amz-decoded-content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .is_some_and(|n| n > crate::MAX_BODY_BYTES as u64)
+        .is_some_and(|n| n > crate::admission::MAX_BODY as u64)
     {
-        return too_large();
+        return crate::admission::entity_too_large();
     }
 
-    // Read the full body, no more of it than a handler could take. A body
-    // that can't be read, or decoded, fails the request: handing the
-    // handler an empty or still-framed body would store the wrong bytes
-    // under the key.
-    let raw = match http_body_util::Limited::new(body, MAX_RAW_BYTES)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) if e.is::<http_body_util::LengthLimitError>() => return too_large(),
-        Err(e) => {
-            warn!("Failed to read s3-chunked body: {}", e);
-            return incomplete_body("The request body could not be read in full");
-        }
-    };
+    // Read the full body, no more of it than a handler could take with its
+    // framing (the admission layer has already read it, into one buffer
+    // this takes without a copy). A body that can't be read, or decoded,
+    // fails the request: handing the handler an empty or still-framed body
+    // would store the wrong bytes under the key.
+    let raw =
+        match crate::admission::body_into_vec(body, 0, crate::admission::wire_limit(true), None)
+            .await
+        {
+            Ok(raw) => raw,
+            Err(crate::admission::BodyError::TooLarge) => {
+                return crate::admission::entity_too_large();
+            }
+            Err(e) => {
+                warn!("Failed to read s3-chunked body: {e:?}");
+                return incomplete_body("The request body could not be read in full");
+            }
+        };
+    let raw_len = raw.len();
 
-    debug!("Decoding s3-chunked body ({} raw bytes)", raw.len());
+    debug!("Decoding s3-chunked body ({raw_len} raw bytes)");
 
     // Signed chunks are checked against the chain the auth layer seeded. A
     // request it did not seed was not signed (anonymous, `--no-auth`), and
@@ -427,11 +430,19 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
         .filter(|_| signed_chunks)
         .map(|seed| ChunkVerifier::new(seed, signed_trailer));
 
-    let decode = move |raw: Bytes| {
-        let mut verifier = verifier;
-        decode_s3_chunked(&raw, verifier.as_mut()).map_err(|e| (e, raw))
+    // Decoded where it lies when the request says it is framed (a failure
+    // refuses it); otherwise a copy, since a body that doesn't parse is
+    // stored as sent.
+    let (raw, as_sent) = if signalled {
+        (raw, None)
+    } else {
+        (raw.clone(), Some(raw))
     };
-    let result = if raw.len() <= DECODE_INLINE_BYTES {
+    let decode = move |raw: Vec<u8>| {
+        let mut verifier = verifier;
+        decode_in_place(raw, verifier.as_mut())
+    };
+    let result = if raw_len <= DECODE_INLINE_BYTES {
         decode(raw)
     } else {
         match tokio::task::spawn_blocking(move || decode(raw)).await {
@@ -449,7 +460,7 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
 
     let decoded = match result {
         Ok(Decoded { payload, trailers }) => {
-            debug!("Decoded s3-chunked: {} bytes", payload.len());
+            debug!("Decoded s3-chunked: {raw_len} -> {} bytes", payload.len());
             let missing = missing_trailers(&parts.headers, &trailers);
             if !missing.is_empty() {
                 return crate::s3::S3Error::xml_response(
@@ -480,25 +491,29 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
             }
             payload
         }
-        Err((DecodeError::BadSignature(e), _)) => {
+        Err(DecodeError::BadSignature(e)) => {
             debug!("s3-chunked body refused: {e}");
             return AuthError::SignatureDoesNotMatch.into_response();
         }
         // Framing the request says it has (a streaming hash, a decoded
         // length), broken: refused.
-        Err((e, _)) if signalled => {
+        Err(e) if signalled => {
             warn!("Failed to decode s3-chunked body: {}", e);
             return incomplete_body(&format!("Malformed aws-chunked body: {e}"));
         }
         // Only named in Content-Encoding, and not complete framing: a
         // plain body, stored as sent. (A body that does parse as complete
         // framing, terminal chunk and all, is framed.)
-        Err((_, raw)) => {
+        Err(_) => {
             strip_aws_chunked(&mut parts.headers);
+            let raw = as_sent.unwrap_or_default();
             return next.run(Request::from_parts(parts, Body::from(raw))).await;
         }
     };
 
+    if decoded.len() > crate::admission::MAX_BODY {
+        return crate::admission::entity_too_large();
+    }
     if let Some(expected) = parts
         .headers
         .get("x-amz-decoded-content-length")
@@ -533,6 +548,7 @@ pub async fn s3_chunked_decode_layer(request: Request<Body>, next: Next) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     #[test]
     fn a_body_without_its_terminal_chunk_is_refused() {
@@ -992,7 +1008,7 @@ mod tests {
             .header("content-encoding", "aws-chunked")
             .header(
                 "x-amz-decoded-content-length",
-                (crate::MAX_BODY_BYTES + 1).to_string(),
+                (crate::admission::MAX_BODY + 1).to_string(),
             )
             .body(Body::from(&b"5\r\nhello\r\n0\r\n\r\n"[..]))
             .unwrap();

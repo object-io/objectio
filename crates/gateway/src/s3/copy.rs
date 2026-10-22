@@ -2,9 +2,57 @@
 
 use super::*;
 
-/// Largest part UploadPartCopy takes: it is read into memory, so it is
+/// The most a copy that rewrites the bytes takes from its source (an
+/// UploadPartCopy's range, or a CopyObject that can't share the source's
+/// stripes): they are held in memory and written as a PUT is, so a copy is
 /// held to the single-PUT limit.
-pub(crate) const MAX_COPY_PART: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_COPY_SOURCE: usize = crate::admission::MAX_BODY;
+
+/// A copy source over [`MAX_COPY_SOURCE`], refused as S3 refuses one over
+/// its own 5 GiB.
+fn copy_source_too_large() -> Response {
+    S3Error::xml_response(
+        "InvalidRequest",
+        &format!(
+            "The specified copy source is larger than the maximum allowable size for a copy source: {MAX_COPY_SOURCE}"
+        ),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// The source of a copy that rewrites its bytes, read in full: refused
+/// over [`MAX_COPY_SOURCE`] before its body is read, and only with room
+/// for it in the memory budget (503 SlowDown otherwise), which it holds
+/// until the copy is written.
+async fn read_copy_source(
+    state: &AppState,
+    got: Response,
+) -> Result<(http::response::Parts, Bytes, crate::admission::Reservation), Response> {
+    let (parts, body) = got.into_parts();
+    let size = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if size > MAX_COPY_SOURCE as u64 {
+        return Err(copy_source_too_large());
+    }
+    let Some(reservation) = state.admission.budget.try_reserve(size) else {
+        return Err(crate::admission::slow_down("memory"));
+    };
+    match axum::body::to_bytes(body, MAX_COPY_SOURCE).await {
+        Ok(b) => Ok((parts, b, reservation)),
+        Err(e) => {
+            error!("copy: failed to read the source: {e}");
+            Err(S3Error::xml_response(
+                "InternalError",
+                "Failed to read the source object",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))
+        }
+    }
+}
 
 /// UploadPartCopy: a part of a multipart upload taken from (a range of) an
 /// existing object.
@@ -90,7 +138,7 @@ pub(crate) async fn upload_part_copy_internal(
         get_headers.insert(header::RANGE, range.clone());
     }
     let _ = auth;
-    let got = get_object_version(
+    let got = read_object_version(
         Arc::clone(&state),
         source_bucket.to_string(),
         source_key.to_string(),
@@ -116,15 +164,9 @@ pub(crate) async fn upload_part_copy_internal(
             StatusCode::RANGE_NOT_SATISFIABLE,
         );
     }
-    let data = match axum::body::to_bytes(got.into_body(), MAX_COPY_PART).await {
-        Ok(b) => b,
-        Err(_) => {
-            return S3Error::xml_response(
-                "EntityTooLarge",
-                &format!("A copied part may be at most {MAX_COPY_PART} bytes"),
-                StatusCode::BAD_REQUEST,
-            );
-        }
+    let (_, data, _reservation) = match read_copy_source(&state, got).await {
+        Ok(read) => read,
+        Err(resp) => return resp,
     };
 
     // The upload's own SSE-C key, as an UploadPart to it carries.
@@ -532,8 +574,9 @@ pub(crate) async fn copy_by_reference(
 /// Sharing is safe because meta now counts who references a shared stripe
 /// (`ShareStripes`/`ReleaseStripes`): a copy that shared the source's shards
 /// used to lose its data when the source was deleted -- and a rename through
-/// an S3 FUSE mount is a copy then a delete. Buffers the object in memory, as the rest of the PUT
-/// path does; streaming copies are a separate improvement.
+/// an S3 FUSE mount is a copy then a delete. The bytes are held in memory,
+/// as a PUT's body is, so a copy that rewrites them is held to the PUT's
+/// limit ([`MAX_COPY_SOURCE`]).
 ///
 /// Metadata follows S3's `x-amz-metadata-directive`: COPY (the default) keeps
 /// the source's content type, standard headers and user metadata; REPLACE
@@ -582,7 +625,7 @@ pub(crate) async fn copy_object_data(
     //    care of reconstruction + decryption.
     let mut source_read = source_conditions;
     source_read.extend(copy_source_customer_headers(&copy_headers));
-    let get_resp = get_object_version(
+    let get_resp = read_object_version(
         Arc::clone(&state),
         source_bucket.clone(),
         source_key.clone(),
@@ -593,17 +636,9 @@ pub(crate) async fn copy_object_data(
     if !get_resp.status().is_success() {
         return copy_condition_failed(get_resp);
     }
-    let (source_parts, body) = get_resp.into_parts();
-    let plaintext = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("CopyObject: failed to buffer source: {e}");
-            return S3Error::xml_response(
-                "InternalError",
-                "Failed to buffer the source object",
-                StatusCode::INTERNAL_SERVER_ERROR,
-            );
-        }
+    let (source_parts, plaintext, _reservation) = match read_copy_source(&state, get_resp).await {
+        Ok(read) => read,
+        Err(resp) => return resp,
     };
 
     // 2. Build headers for the destination PUT. SSE settings come from the

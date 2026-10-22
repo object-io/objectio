@@ -36,6 +36,10 @@ quick-xml = { workspace = true }
 bytes = { workspace = true }
 http-body = "1"
 http-body-util = "0.1"
+# The connection builder axum::serve wraps, for what it does not expose:
+# the header read timeout (crate::serve).
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
 md-5 = { workspace = true }
 crc32c = { workspace = true }
 # Upload checksums (x-amz-checksum-crc32 / -crc64nvme); see src/checksum.rs.
