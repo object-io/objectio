@@ -284,6 +284,55 @@ fn a_write_placed_under_an_old_epoch_is_refused_and_placed_again() {
     assert!(placed_again >= 1, "the PUT was not placed again");
 }
 
+/// A DELETE placed under an epoch that changes before it reaches the copies
+/// is refused by every one of them, which did nothing, and placed again,
+/// as a PUT is: the client gets a 204 and the object is gone. It was
+/// answered 503 ("reached 0 of 6 metadata copies"); a lost OSD's
+/// replacement registering just before a delete did that in CI.
+#[test]
+fn a_delete_placed_under_an_old_epoch_is_refused_and_placed_again() {
+    let ha = HaCluster::start(1, OSDS, 1);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let c = &ha.clients[0];
+    c.request("PUT", "/pgs", &[]).expect(200);
+    c.request("PUT", "/pgs/k", &payload(300_000, 1)).expect(200);
+
+    let before = placement(&rt, &ha, "pgs", "k");
+    let member = hex::encode(&before.nodes[0].node_id);
+    let held = c.json(
+        "POST",
+        "/_admin/test/hold-placed",
+        json!({ "bucket": "pgs", "key": "k", "millis": 8000 }),
+    );
+    assert!(held.status < 300, "hold: {}", held.text());
+
+    let deleted = std::thread::scope(|s| {
+        let deleter = s.spawn(|| c.request("DELETE", "/pgs/k", &[]));
+        // Placed, then held: the acting set changes under it.
+        std::thread::sleep(Duration::from_secs(1));
+        set_out(c, &member);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while placement(&rt, &ha, "pgs", "k").pg_epoch <= before.pg_epoch {
+            assert!(
+                Instant::now() < deadline,
+                "no stand-in committed for {member}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        deleter.join().unwrap()
+    });
+    assert_eq!(deleted.status, 204, "{}", deleted.text());
+    assert_eq!(c.request("GET", "/pgs/k", &[]).status, 404);
+    let placed_again: u64 = c
+        .request("GET", "/metrics", &[])
+        .text()
+        .lines()
+        .filter(|l| l.starts_with("objectio_gateway_stale_placement_total"))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert!(placed_again >= 1, "the DELETE was not placed again");
+}
+
 /// A part (`UploadPart`) placed under an epoch that changes before it writes
 /// is refused by the OSDs and placed again, as a PUT is: the client gets a
 /// 200, and the completed object is on the new acting set. A part was

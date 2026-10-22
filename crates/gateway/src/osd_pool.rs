@@ -2118,6 +2118,9 @@ pub struct MetaDeleted {
     pub ok: usize,
     pub of: usize,
     pub quorum: usize,
+    /// Replicas that refused it as placed under an older epoch of its
+    /// placement group than they know (B31): they did nothing.
+    pub stale: usize,
     /// What those replicas removed, as each had it. Replicas can disagree
     /// (a write racing the delete): each is what that copy named.
     pub removed: Vec<objectio_proto::metadata::ObjectMeta>,
@@ -2189,7 +2192,11 @@ pub async fn delete_meta_from_all(
             .map_err(|_| OsdPoolError::ConnectionFailed("delete_object_meta timeout".into()))?
             .map_err(|e| {
                 pool.call_failed(&p.node_address, &e);
-                OsdPoolError::ConnectionFailed(e.to_string())
+                if is_stale_epoch(&e) {
+                    OsdPoolError::StaleEpoch(e.message().to_string())
+                } else {
+                    OsdPoolError::ConnectionFailed(e.to_string())
+                }
             })?
             .into_inner();
             Ok::<_, OsdPoolError>(resp)
@@ -2226,7 +2233,10 @@ pub async fn delete_meta_from_all(
     for r in answers {
         match r {
             Ok(_) => out.ok += 1,
-            Err(e) => warn!("delete {bucket}/{key} (version {version_id:?}): {e}"),
+            Err(e) => {
+                out.stale += usize::from(e.is_stale_epoch());
+                warn!("delete {bucket}/{key} (version {version_id:?}): {e}");
+            }
         }
     }
     // Left on some copies, the copies are brought to agree: a delete that
@@ -3137,6 +3147,7 @@ mod reclaim_tests {
             ok,
             of: 3,
             quorum: 2,
+            stale: 0,
             removed,
         };
         assert!(deleted(3, vec![x.clone(), x.clone(), x.clone()]).agreed());

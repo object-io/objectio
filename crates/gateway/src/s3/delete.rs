@@ -384,12 +384,30 @@ pub(crate) async fn unless_current(
     }
 }
 
+/// A delete marker's write refused short of its quorum. Placed again
+/// (`delete_object`) only when no copy took it: one that did may keep it,
+/// and a second marker would follow it.
+fn marker_refused(e: &crate::osd_pool::MetaWriteError) -> Response {
+    let mut resp = S3Error::for_osd_error(&e.error, "Failed to store object metadata");
+    if !e.unapplied {
+        resp.extensions_mut()
+            .remove::<crate::osd_pool::StalePlacement>();
+    }
+    resp
+}
+
 /// Delete object (DELETE /{bucket}/{key})
 ///
 /// Runs to the end even if the client hangs up. A delete is several steps —
 /// the OSDs' metadata, the listing in meta, the shards — and a request
 /// future dropped between them (a client timeout) left a key listed that
 /// no longer existed, and a bucket that then couldn't be deleted.
+///
+/// Placed again once when every copy it reached refused it as placed under
+/// an older epoch of the key's placement group than it knows, as a PUT is
+/// ([`crate::stripe::placed_again`]): a delete placed just before the acting
+/// set changed (a lost OSD's replacement registering) did nothing, and was
+/// answered 503.
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path((bucket, key)): Path<(String, String)>,
@@ -398,9 +416,19 @@ pub async fn delete_object(
     version_id: Option<String>,
     headers: HeaderMap,
 ) -> Response {
-    let task = tokio::spawn(delete_object_to_the_end(
-        state, bucket, key, auth, version_id, headers,
-    ));
+    let task = tokio::spawn(async move {
+        crate::stripe::placed_again(&bucket, &key, || {
+            delete_object_to_the_end(
+                Arc::clone(&state),
+                bucket.clone(),
+                key.clone(),
+                auth.clone(),
+                version_id.clone(),
+                headers.clone(),
+            )
+        })
+        .await
+    });
     task.await.unwrap_or_else(|e| {
         error!("delete task failed: {e}");
         S3Error::xml_response(
@@ -443,6 +471,7 @@ pub(crate) async fn delete_object_to_the_end(
             "No OSDs to delete from",
         );
     }
+    crate::test_hooks::held_after_placement(&bucket, &key).await;
 
     // Check versioning state
     let versioning = match bucket_versioning(&mut meta_client, &bucket).await {
@@ -560,7 +589,7 @@ pub(crate) async fn delete_object_to_the_end(
         .await
         {
             error!("Failed to create delete marker: {}", e);
-            return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
+            return marker_refused(&e);
         }
 
         // The key no longer has a current version, so drop it from Meta's
@@ -630,7 +659,7 @@ pub(crate) async fn delete_object_to_the_end(
             Ok(d) => d,
             Err(e) => {
                 error!("Failed to put the null delete marker: {}", e.error);
-                return S3Error::for_osd_error(&e.error, "Failed to store object metadata");
+                return marker_refused(&e);
             }
         };
         // A null version it replaced: its shards, as an overwrite's.
@@ -693,6 +722,16 @@ pub(crate) async fn delete_object_to_the_end(
         pg.as_ref(),
     )
     .await;
+    if deleted.ok == 0 && deleted.stale > 0 {
+        // Nothing done: placed again (`delete_object`).
+        return S3Error::for_osd_error(
+            &crate::osd_pool::OsdPoolError::StaleEpoch(format!(
+                "{} of {} copies know a newer epoch of its placement group",
+                deleted.stale, deleted.of
+            )),
+            "The delete was placed under an old epoch",
+        );
+    }
     if deleted.ok < deleted.quorum {
         sync_listing(&state, &placement.nodes, &bucket, &key).await;
         return S3Error::xml_response(
