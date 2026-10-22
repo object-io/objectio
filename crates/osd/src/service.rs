@@ -1593,38 +1593,70 @@ impl StorageService for OsdService {
         &self,
         request: Request<ListShardsRequest>,
     ) -> Result<Response<ListShardsResponse>, Status> {
+        use prost::Message;
         let req = request.into_inner();
         let limit = if req.limit == 0 {
             100
         } else {
             req.limit as usize
         };
+        // The token is the last shard a page returned; the next page
+        // starts after it. Empty: from the first shard.
+        let mut after = if req.continuation_token.is_empty() {
+            None
+        } else {
+            Some(
+                objectio_proto::storage::ShardId::decode(req.continuation_token.as_slice())
+                    .map_err(|e| Status::invalid_argument(format!("continuation token: {e}")))?,
+            )
+        };
 
         let mut shards: Vec<GetShardMetaResponse> = Vec::new();
-
-        for (shard_id, location) in self.shards.page(None, limit) {
-            // Filter by object_id if specified
-            if !req.object_id.is_empty() && shard_id.object_id != req.object_id {
-                continue;
+        let mut next_token = Vec::new();
+        // Pages of the store until `limit` shards match: filtering a single
+        // page returned fewer than asked, and no way on. Shards are in
+        // object order, so an object's are together and the walk ends past
+        // them.
+        let mut seen_object = false;
+        'walk: loop {
+            let page = self.shards.page(after.as_ref(), limit);
+            let last_page = page.len() < limit;
+            for (shard_id, location) in page {
+                after = Some(shard_id.clone());
+                if !req.object_id.is_empty() {
+                    if shard_id.object_id != req.object_id {
+                        if seen_object {
+                            break 'walk;
+                        }
+                        continue;
+                    }
+                    seen_object = true;
+                }
+                shards.push(GetShardMetaResponse {
+                    location: Some(self.block_location(&location)),
+                    size: location.size,
+                    checksum: Some(Checksum {
+                        crc32c: location.crc32c,
+                        xxhash64: 0,
+                        sha256: vec![],
+                    }),
+                    created_at: location.created_at,
+                    shard_id: Some(shard_id),
+                });
+                if shards.len() == limit {
+                    next_token = after
+                        .as_ref()
+                        .map(Message::encode_to_vec)
+                        .unwrap_or_default();
+                    break 'walk;
+                }
             }
-
-            shards.push(GetShardMetaResponse {
-                shard_id: Some(shard_id),
-                location: Some(self.block_location(&location)),
-                size: location.size,
-                checksum: Some(Checksum {
-                    crc32c: location.crc32c,
-                    xxhash64: 0,
-                    sha256: vec![],
-                }),
-                created_at: location.created_at,
-            });
+            if last_page {
+                break;
+            }
         }
 
-        Ok(Response::new(ListShardsResponse {
-            shards,
-            next_token: vec![],
-        }))
+        Ok(Response::new(ListShardsResponse { shards, next_token }))
     }
 
     async fn health_check(
@@ -3021,6 +3053,83 @@ mod integrity_tests {
         }))
         .await
         .unwrap();
+    }
+
+    /// ListShards walks every shard once, a page at a time, by the token
+    /// each page returns; filtered to an object, each page holds as many
+    /// of its shards as asked for, not those of one unfiltered page.
+    #[tokio::test]
+    async fn list_shards_pages_by_its_token() {
+        use objectio_proto::storage::ListShardsRequest;
+        let (_dir, osd) = osd();
+        let data = payload(1);
+        let mut all = Vec::new();
+        for (object, positions) in [(3u8, 2u32), (7, 5), (9, 2)] {
+            for position in 0..positions {
+                let shard_id = ShardId {
+                    object_id: vec![object; 16],
+                    stripe_id: 0,
+                    position,
+                };
+                osd.write_shard(Request::new(WriteShardRequest {
+                    shard_id: Some(shard_id.clone()),
+                    data: data.clone().into(),
+                    ec_k: 4,
+                    ec_m: 2,
+                    checksum: Some(Checksum {
+                        crc32c: crc32c::crc32c(&data),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+                all.push(shard_id);
+            }
+        }
+        let walk = |object_id: Vec<u8>, limit: u32| {
+            let osd = &osd;
+            async move {
+                let (mut pages, mut token) = (Vec::new(), Vec::new());
+                loop {
+                    let r = osd
+                        .list_shards(Request::new(ListShardsRequest {
+                            object_id: object_id.clone(),
+                            limit,
+                            continuation_token: token,
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    pages.push(
+                        r.shards
+                            .into_iter()
+                            .map(|s| s.shard_id.unwrap())
+                            .collect::<Vec<_>>(),
+                    );
+                    if r.next_token.is_empty() {
+                        return pages;
+                    }
+                    token = r.next_token;
+                }
+            }
+        };
+
+        let pages = walk(Vec::new(), 4).await;
+        assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 1]);
+        assert_eq!(pages.concat(), all);
+
+        let pages = walk(vec![7; 16], 2).await;
+        assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+        assert_eq!(pages.concat(), all[2..7]);
+
+        let bad = osd
+            .list_shards(Request::new(ListShardsRequest {
+                continuation_token: vec![0xff; 3],
+                ..Default::default()
+            }))
+            .await;
+        assert_eq!(bad.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     /// B21: a small shard sent with its metadata is kept in its record: no

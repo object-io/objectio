@@ -269,8 +269,21 @@ fn delta_sharing_management_needs_an_administrator() {
                "bucket": "lake-data", "path": "events/"}),
     )
     .expect_ok();
+    // A share serves Delta tables only: an Iceberg one, which it would
+    // serve as files no client can read, is refused.
+    for table_type in ["iceberg", "uniform", ""] {
+        let r = c.json(
+            "POST",
+            "/_admin/shares/s/tables",
+            json!({"schema": "sales", "name": "ice", "table_type": table_type,
+                   "warehouse": "w", "namespace": "db"}),
+        );
+        assert_eq!(r.status, 400, "{table_type:?}: {}", r.text());
+        assert!(r.text().contains("Iceberg table"), "{}", r.text());
+    }
     let tables = c.request("GET", "/_admin/shares/s/tables", &[]);
     tables.expect(200);
+    assert_eq!(tables.json()["tables"].as_array().map(Vec::len), Some(1));
     assert_eq!(tables.json()["tables"][0]["name"], "events");
     let recipient = c.json(
         "POST",

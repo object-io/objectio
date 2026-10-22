@@ -11,7 +11,6 @@ import {
   ChevronRight,
 } from "lucide-react";
 import PageHeader from "../components/PageHeader";
-import { iceberg } from "../api/client";
 
 interface Share {
   name: string;
@@ -45,18 +44,13 @@ export default function DeltaSharing() {
   const [newShareName, setNewShareName] = useState("");
   const [newShareComment, setNewShareComment] = useState("");
 
-  // Add table
+  // Add table: a share serves Delta tables (their _delta_log) only.
   const [showAddTable, setShowAddTable] = useState(false);
-  const [tableType, setTableType] = useState("uniform");
   const [addSchema, setAddSchema] = useState("");
   const [addTableName, setAddTableName] = useState("");
-  // For uniform: pick from existing iceberg tables
-  const [icebergNamespaces, setIcebergNamespaces] = useState<string[]>([]);
-  const [icebergTables, setIcebergTables] = useState<string[]>([]);
-  const [selectedNs, setSelectedNs] = useState("");
-  // For delta
   const [deltaBucket, setDeltaBucket] = useState("");
   const [deltaPath, setDeltaPath] = useState("");
+  const [addError, setAddError] = useState("");
 
   // Create recipient
   const [showCreateRecipient, setShowCreateRecipient] = useState(false);
@@ -126,30 +120,14 @@ export default function DeltaSharing() {
     load();
   };
 
-  // Load iceberg namespaces for dropdown
-  const loadIcebergNamespaces = async () => {
-    const r = await iceberg.listNamespaces().catch(() => ({ namespaces: [] }));
-    setIcebergNamespaces(
-      (r.namespaces || []).map((ns: string[]) => ns.join("."))
-    );
-  };
-
-  const loadIcebergTables = async (ns: string) => {
-    setSelectedNs(ns);
-    const r = await iceberg.listTables(ns).catch(() => ({ identifiers: [] }));
-    setIcebergTables(
-      (r.identifiers || []).map((t: { name: string }) => t.name)
-    );
-  };
-
   const startAddTable = () => {
+    setAddError("");
     setShowAddTable(true);
-    loadIcebergNamespaces();
   };
 
   const addTable = async () => {
     if (!addSchema || !addTableName) return;
-    await fetch(
+    const r = await fetch(
       `/_admin/shares/${selectedShare}/tables`,
       {
         method: "POST",
@@ -157,18 +135,21 @@ export default function DeltaSharing() {
         body: JSON.stringify({
           schema: addSchema,
           name: addTableName,
-          table_type: tableType,
-          warehouse: "",
-          namespace: selectedNs,
+          table_type: "delta",
           bucket: deltaBucket,
           path: deltaPath,
         }),
       }
     );
+    if (!r.ok) {
+      // The admin API answers an error as plain text.
+      const text = await r.text().catch(() => "");
+      setAddError(text || `Adding the table failed (${r.status})`);
+      return;
+    }
     setShowAddTable(false);
     setAddSchema("");
     setAddTableName("");
-    setSelectedNs("");
     openShare(selectedShare);
   };
 
@@ -539,20 +520,11 @@ export default function DeltaSharing() {
 
           {showAddTable && (
             <div className="p-4 border-b border-border space-y-3">
-              <div className="grid grid-cols-3 gap-2">
-                <div>
-                  <label className="block text-[11px] text-muted mb-1">
-                    Type
-                  </label>
-                  <select
-                    value={tableType}
-                    onChange={(e) => setTableType(e.target.value)}
-                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                  >
-                    <option value="uniform">Iceberg (UniForm)</option>
-                    <option value="delta">Delta Lake</option>
-                  </select>
-                </div>
+              <p className="text-[11px] text-faint">
+                A Delta Lake table, by the bucket and path of its _delta_log.
+                Iceberg tables are read through the Iceberg REST catalog.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-[11px] text-muted mb-1">
                     Schema
@@ -568,84 +540,42 @@ export default function DeltaSharing() {
                   <label className="block text-[11px] text-muted mb-1">
                     Table Name
                   </label>
-                  {tableType === "uniform" ? (
-                    <select
-                      value={addTableName}
-                      onChange={(e) => setAddTableName(e.target.value)}
-                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                    >
-                      <option value="">Select table...</option>
-                      {icebergTables.map((t) => (
-                        <option key={t} value={t}>
-                          {t}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      value={addTableName}
-                      onChange={(e) => setAddTableName(e.target.value)}
-                      placeholder="Table name"
-                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                    />
-                  )}
+                  <input
+                    value={addTableName}
+                    onChange={(e) => setAddTableName(e.target.value)}
+                    placeholder="Table name"
+                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
                 </div>
               </div>
 
-              {tableType === "uniform" && (
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-[11px] text-muted mb-1">
-                      Iceberg Namespace
-                    </label>
-                    <select
-                      value={selectedNs}
-                      onChange={(e) => {
-                        loadIcebergTables(e.target.value);
-                      }}
-                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                    >
-                      <option value="">Select namespace...</option>
-                      {icebergNamespaces.map((ns) => (
-                        <option key={ns} value={ns}>
-                          {ns}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="flex items-end">
-                    <p className="text-[11px] text-faint pb-1.5">
-                      Select namespace to browse existing Iceberg tables
-                    </p>
-                  </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[11px] text-muted mb-1">
+                    S3 Bucket
+                  </label>
+                  <input
+                    value={deltaBucket}
+                    onChange={(e) => setDeltaBucket(e.target.value)}
+                    placeholder="analytics"
+                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
                 </div>
-              )}
+                <div>
+                  <label className="block text-[11px] text-muted mb-1">
+                    Path
+                  </label>
+                  <input
+                    value={deltaPath}
+                    onChange={(e) => setDeltaPath(e.target.value)}
+                    placeholder="employees/"
+                    className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
+                  />
+                </div>
+              </div>
 
-              {tableType === "delta" && (
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-[11px] text-muted mb-1">
-                      S3 Bucket
-                    </label>
-                    <input
-                      value={deltaBucket}
-                      onChange={(e) => setDeltaBucket(e.target.value)}
-                      placeholder="analytics"
-                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-muted mb-1">
-                      Path
-                    </label>
-                    <input
-                      value={deltaPath}
-                      onChange={(e) => setDeltaPath(e.target.value)}
-                      placeholder="employees/"
-                      className="w-full px-2 py-1.5 border border-border-strong rounded text-[12px] focus:outline-none focus:ring-1 focus:ring-accent"
-                    />
-                  </div>
-                </div>
+              {addError && (
+                <p className="text-[11px] text-err">{addError}</p>
               )}
 
               <div className="flex gap-1.5">

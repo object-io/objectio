@@ -1242,3 +1242,85 @@ async fn serve() -> Result<()> {
     // process alive even after every run() returned.
     std::process::exit(0);
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    /// A Dockerfile exec-form array: `["a", "b"]`. Its strings hold no
+    /// commas or quotes.
+    fn exec_form(s: &str) -> Vec<String> {
+        s.trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|a| a.trim().trim_matches('"').to_string())
+            .collect()
+    }
+
+    fn port_of(addr: &str) -> u16 {
+        addr.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    /// Every service image's default command (ENTRYPOINT and CMD) is
+    /// arguments its binary takes, and its HEALTHCHECK asks the port that
+    /// command serves /health on. The images once passed flags no binary
+    /// had (`--bind`, `--raft-bind`) and checked health with `exit 0`.
+    #[test]
+    fn the_images_run_their_binaries_and_check_their_health() {
+        let dockerfile = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Dockerfile"));
+        let mut checked = Vec::new();
+        let (mut entrypoint, mut health) = (None::<String>, None::<u16>);
+        for line in dockerfile.lines() {
+            if line.starts_with("FROM ") {
+                entrypoint = None;
+                health = None;
+            } else if let Some(rest) = line.strip_prefix("    CMD [") {
+                let argv = exec_form(rest);
+                assert_eq!(argv[0], "/usr/local/bin/healthcheck.sh", "{line}");
+                health = Some(argv[1].parse().unwrap());
+            } else if let Some(rest) = line.strip_prefix("ENTRYPOINT ") {
+                entrypoint = exec_form(rest).into_iter().next();
+            } else if let (Some(rest), Some(bin)) = (line.strip_prefix("CMD "), &entrypoint) {
+                let argv: Vec<String> = std::iter::once(bin.clone())
+                    .chain(exec_form(rest))
+                    .collect();
+                let serves = match bin.as_str() {
+                    "objectio-gateway" => port_of(
+                        &objectio_gateway::Args::try_parse_from(&argv)
+                            .unwrap()
+                            .listen,
+                    ),
+                    "objectio-meta" => {
+                        objectio_meta::Args::try_parse_from(&argv)
+                            .unwrap()
+                            .metrics_port
+                    }
+                    "objectio-osd" => {
+                        objectio_osd::Args::try_parse_from(&argv)
+                            .unwrap()
+                            .metrics_port
+                    }
+                    "objectio-block-gateway" => port_of(
+                        &objectio_block_gateway::Args::try_parse_from(&argv)
+                            .unwrap()
+                            .metrics_listen,
+                    ),
+                    _ => continue,
+                };
+                assert_eq!(health, Some(serves), "{bin}: HEALTHCHECK port");
+                checked.push(bin.clone());
+            }
+        }
+        checked.sort();
+        assert_eq!(
+            checked,
+            [
+                "objectio-block-gateway",
+                "objectio-gateway",
+                "objectio-meta",
+                "objectio-osd"
+            ]
+        );
+    }
+}

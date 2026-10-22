@@ -153,8 +153,11 @@ pub struct Args {
     pub tls: objectio_proto::transport::TlsArgs,
 }
 
-/// Configuration file structure
+/// Configuration file structure. A key it doesn't know is an error, as a
+/// file that doesn't parse is: a misspelt `[osd.failure_domain]` would
+/// otherwise run on the default failure domain, unnoticed.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default)]
     osd: OsdConfig,
@@ -164,13 +167,21 @@ struct Config {
     logging: LoggingConfig,
 }
 
+/// Whether `text` is a config file the OSD starts with (`--config`): what
+/// writes one (the installer) checks it with this.
+///
+/// # Errors
+/// What the OSD would refuse it for: TOML that doesn't parse, or a key it
+/// doesn't know.
+pub fn check_config(text: &str) -> Result<()> {
+    toml::from_str::<Config>(text).map(drop).map_err(Into::into)
+}
+
 /// `[osd]`. A field left out, or the whole table, takes its value from
 /// `Default`, so a file without the table and no file at all mean the same.
 #[derive(Debug, Deserialize)]
-#[serde(default)]
-#[allow(dead_code)]
+#[serde(default, deny_unknown_fields)]
 struct OsdConfig {
-    node_id: Option<String>,
     node_name: Option<String>,
     listen: String,
     /// Address to advertise to metadata service (how other services reach this OSD)
@@ -183,7 +194,6 @@ struct OsdConfig {
 impl Default for OsdConfig {
     fn default() -> Self {
         Self {
-            node_id: None,
             node_name: None,
             listen: default_listen(),
             advertise_addr: None,
@@ -198,6 +208,7 @@ impl Default for OsdConfig {
 /// topology. `zone` and `host` are additive; empty string on either means
 /// "inherit from the enclosing level" (still safe for the 3-level world).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct FailureDomainConfig {
     #[serde(default = "default_region")]
     region: String,
@@ -240,6 +251,7 @@ fn default_weight() -> f64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StorageConfig {
     #[serde(default)]
     disks: Vec<String>,
@@ -264,7 +276,7 @@ impl Default for StorageConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct LoggingConfig {
     level: String,
 }
@@ -314,7 +326,8 @@ fn load_config(path: &str) -> Result<Config> {
     if !std::path::Path::new(path).exists() {
         return Ok(Config::default());
     }
-    let text = std::fs::read_to_string(path)?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("config file {path}: {e}"))?;
     toml::from_str(&text).map_err(|e| anyhow::anyhow!("config file {path}: {e}"))
 }
 
@@ -675,19 +688,6 @@ pub async fn run(
         advertise_addr.clone(),
     );
 
-    // Start heartbeat task
-    let heartbeat_meta_endpoint = meta_endpoint.clone();
-    let heartbeat_node_id = node_id_bytes;
-    let heartbeat_disk_ids = disk_ids.clone();
-    let heartbeat_handle = tokio::spawn(async move {
-        heartbeat_loop(
-            &heartbeat_meta_endpoint,
-            &heartbeat_node_id,
-            &heartbeat_disk_ids,
-        )
-        .await
-    });
-
     // Start gRPC server with increased message size limit (100MB for large objects)
     let max_message_size = 100 * 1024 * 1024; // 100 MB
     let storage_service = StorageServiceServer::from_arc(osd_service)
@@ -725,11 +725,7 @@ pub async fn run(
         }
     }
 
-    // Run server (heartbeat continues in background)
     server_future.await?;
-
-    // Cancel heartbeat on shutdown
-    heartbeat_handle.abort();
 
     info!("OSD shut down gracefully");
 
@@ -993,7 +989,7 @@ fn render_metrics(state: &OsdMetricsState) -> String {
     }
     writeln!(
         output,
-        "# HELP objectio_disk_errors_total IO errors and checksum mismatches"
+        "# HELP objectio_disk_errors_total Failed reads, failed writes and flushes, and checksum mismatches"
     )
     .unwrap();
     writeln!(output, "# TYPE objectio_disk_errors_total counter").unwrap();
@@ -1070,27 +1066,6 @@ async fn serve_metrics(listener: TcpListener, state: Arc<OsdMetricsState>) -> Re
     Ok(())
 }
 
-/// Send periodic heartbeats to the metadata service
-async fn heartbeat_loop(meta_endpoint: &str, node_id: &[u8; 16], _disk_ids: &[Vec<u8>]) {
-    let heartbeat_interval = Duration::from_secs(10);
-
-    loop {
-        tokio::time::sleep(heartbeat_interval).await;
-
-        // In a full implementation, we would:
-        // 1. Connect to metadata service
-        // 2. Send HeartbeatRequest with node status and disk health
-        // 3. Process HeartbeatResponse for cluster map updates
-        //
-        // For now, just log that we would send a heartbeat
-        tracing::trace!(
-            "Would send heartbeat for node {} to {}",
-            hex::encode(&node_id[..4]),
-            meta_endpoint
-        );
-    }
-}
-
 /// The host part of an `http://host:port` address.
 #[cfg(feature = "rdma")]
 fn host_of(addr: &str) -> &str {
@@ -1153,6 +1128,50 @@ mod tests {
                     objectio_storage::DEFAULT_BLOCK_SIZE as usize
                 );
             }
+        }
+    }
+
+    /// A file that doesn't parse, or names a key the OSD doesn't know, stops
+    /// it: it used to run on defaults, failure domain included.
+    #[test]
+    fn a_bad_file_is_an_error_not_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("osd.toml");
+        for (bad, why) in [
+            ("[osd\nlisten = 1", "not TOML"),
+            ("[osd.failure_domian]\nrack = \"r2\"\n", "a misspelt table"),
+            ("[osd.failure_domain]\nrak = \"r2\"\n", "a misspelt key"),
+            ("[osd]\nnode_id = \"n1\"\n", "a key the OSD never read"),
+            ("[osd]\nweight = \"heavy\"\n", "a wrong type"),
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let err = super::load_config(path.to_str().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("{why} was accepted"))
+                .to_string();
+            assert!(err.contains("osd.toml"), "{why}: {err}");
+        }
+    }
+
+    /// The shapes the chart and the e2e harness write start an OSD.
+    #[test]
+    fn the_written_configs_parse() {
+        for (name, text) in [
+            (
+                "chart",
+                "[osd]\nnode_name = \"n\"\nlisten = \"0.0.0.0:9200\"\n\
+                 advertise_addr = \"http://a:9200\"\nmeta_endpoint = \"http://m:9100\"\n\
+                 weight = 1.0\n[osd.failure_domain]\nregion = \"r\"\nzone = \"z\"\n\
+                 datacenter = \"d\"\nrack = \"k\"\nhost = \"h\"\n[storage]\n\
+                 disks = [\"/data/disk0/disk.raw\"]\nblock_size = 4096\n\
+                 data_dir = \"/var/lib/objectio/osd\"\n[logging]\nlevel = \"info\"\n",
+            ),
+            (
+                "e2e",
+                "[osd.failure_domain]\nhost = \"h0\"\nrack = \"r0\"\n",
+            ),
+        ] {
+            super::check_config(text).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 }

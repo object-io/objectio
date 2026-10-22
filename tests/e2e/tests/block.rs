@@ -258,6 +258,95 @@ fn io_past_the_end_of_a_volume_is_refused() {
     assert_eq!(read.unwrap_err().code(), tonic::Code::OutOfRange);
 }
 
+/// What the gateway doesn't do it refuses, rather than answering OK with
+/// nothing done (quality of service) or with zeros (stats, metrics,
+/// traces); and a volume asked for with a quality of service isn't created
+/// without it.
+#[test]
+fn unimplemented_calls_fail_as_unimplemented() {
+    use objectio_proto::block::{
+        GetClusterMetricsRequest, GetIoTraceRequest, GetOsdMetricsRequest, GetVolumeStatsRequest,
+        ListOsdMetricsRequest, UpdateVolumeQosRequest, VolumeQos,
+    };
+    let b = Block::start();
+    let vol = b.create("plain", 8 * MIB);
+    let qos = VolumeQos {
+        max_iops: 1000,
+        ..Default::default()
+    };
+    let mut c = b.client();
+    let codes = b.rt.block_on(async {
+        vec![
+            (
+                "UpdateVolumeQos",
+                c.update_volume_qos(UpdateVolumeQosRequest {
+                    volume_id: vol.clone(),
+                    qos: Some(qos),
+                })
+                .await
+                .map(drop),
+            ),
+            (
+                "GetVolumeStats",
+                c.get_volume_stats(GetVolumeStatsRequest {
+                    volume_id: vol.clone(),
+                })
+                .await
+                .map(drop),
+            ),
+            (
+                "GetOsdMetrics",
+                c.get_osd_metrics(GetOsdMetricsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "ListOsdMetrics",
+                c.list_osd_metrics(ListOsdMetricsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetClusterMetrics",
+                c.get_cluster_metrics(GetClusterMetricsRequest::default())
+                    .await
+                    .map(drop),
+            ),
+            (
+                "GetIoTrace",
+                c.get_io_trace(GetIoTraceRequest::default()).await.map(drop),
+            ),
+            (
+                "CreateVolume with QoS",
+                c.create_volume(CreateVolumeRequest {
+                    name: "with-qos".into(),
+                    size_bytes: 8 * MIB,
+                    qos: Some(qos),
+                    ..Default::default()
+                })
+                .await
+                .map(drop),
+            ),
+        ]
+    });
+    for (call, result) in codes {
+        assert_eq!(
+            result.map_err(|s| s.code()),
+            Err(tonic::Code::Unimplemented),
+            "{call}"
+        );
+    }
+    let names: Vec<String> =
+        b.rt.block_on(b.client().list_volumes(ListVolumesRequest::default()))
+            .unwrap()
+            .into_inner()
+            .volumes
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+    assert_eq!(names, ["plain"]);
+}
+
 /// What snapshots are for: the volume moves on, the snapshot does not, and
 /// a clone starts from the snapshot and then goes its own way — all of it
 /// still so after a restart.

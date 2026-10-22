@@ -4,8 +4,9 @@
 //!
 //! A share belongs to a tenant, and that tenant's admins manage it, as the
 //! system admin does every share. It exposes data of its own tenant: only
-//! the system admin may add a table held in another tenant's bucket or
-//! warehouse, which is how cross-tenant sharing is meant to work. A
+//! the system admin may add a table held in another tenant's bucket, which
+//! is how cross-tenant sharing is meant to work. A share holds Delta tables
+//! only. A
 //! recipient is managed by whoever administers every share it reads.
 
 use axum::{
@@ -15,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use objectio_auth::AuthResult;
+use objectio_delta_sharing::handlers::delta_only;
 use objectio_delta_sharing::types::{
     AddTableRequest, CreateRecipientRequest, CreateRecipientResponse,
 };
@@ -22,7 +24,6 @@ use objectio_proto::metadata::{
     DeltaAddTableRequest, DeltaCreateRecipientRequest, DeltaDropRecipientRequest,
     DeltaDropShareRequest, DeltaGetShareRequest, DeltaListRecipientsRequest,
     DeltaListTablesRequest, DeltaRemoveTableRequest, GetBucketRequest,
-    IcebergListWarehousesRequest,
 };
 use std::sync::Arc;
 use tracing::info;
@@ -100,63 +101,36 @@ async fn administered_share(
     }
 }
 
-/// The tenant holding the data a share table points at: its bucket's for a
-/// Delta table, its warehouse's for an Iceberg one.
+/// The tenant holding the data a share table points at: its bucket's. A
+/// share serves Delta tables only; an Iceberg one is refused here, before
+/// it is recorded.
 async fn data_tenant(state: &AppState, body: &AddTableRequest) -> Result<String, Response> {
-    let mut client = state.meta_client.clone();
-    match body.table_type.as_str() {
-        "delta" => {
-            if body.bucket.is_empty() {
-                return Err(
-                    (StatusCode::BAD_REQUEST, "a delta table needs a bucket").into_response()
-                );
-            }
-            match client
-                .get_bucket(GetBucketRequest {
-                    name: body.bucket.clone(),
-                })
-                .await
-            {
-                Ok(r) => r.into_inner().bucket.map(|b| b.tenant).ok_or_else(|| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("no bucket '{}'", body.bucket),
-                    )
-                        .into_response()
-                }),
-                Err(e) if e.code() == tonic::Code::NotFound => Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("no bucket '{}'", body.bucket),
-                )
-                    .into_response()),
-                Err(e) => Err(meta_failure(&e)),
-            }
-        }
-        // An Iceberg table outside any warehouse is the system tenant's.
-        "" | "iceberg" | "uniform" if body.warehouse.is_empty() => Ok(String::new()),
-        "" | "iceberg" | "uniform" => client
-            .iceberg_list_warehouses(IcebergListWarehousesRequest {
-                tenant: String::new(),
-            })
-            .await
-            .map_err(|e| meta_failure(&e))?
-            .into_inner()
-            .warehouses
-            .into_iter()
-            .find(|w| w.name == body.warehouse)
-            .map(|w| w.tenant)
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("no warehouse '{}'", body.warehouse),
-                )
-                    .into_response()
-            }),
-        other => Err((
+    delta_only(&body.table_type, &body.schema, &body.name)
+        .map_err(|e| (e.status, e.message).into_response())?;
+    if body.bucket.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "a delta table needs a bucket").into_response());
+    }
+    match state
+        .meta_client
+        .clone()
+        .get_bucket(GetBucketRequest {
+            name: body.bucket.clone(),
+        })
+        .await
+    {
+        Ok(r) => r.into_inner().bucket.map(|b| b.tenant).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("no bucket '{}'", body.bucket),
+            )
+                .into_response()
+        }),
+        Err(e) if e.code() == tonic::Code::NotFound => Err((
             StatusCode::BAD_REQUEST,
-            format!("unknown table_type '{other}'"),
+            format!("no bucket '{}'", body.bucket),
         )
             .into_response()),
+        Err(e) => Err(meta_failure(&e)),
     }
 }
 

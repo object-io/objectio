@@ -7,9 +7,8 @@
 //! renamed, or moved ports stayed `Active` and kept receiving writes until an
 //! operator noticed and marked it out by hand.
 //!
-//! The OSD-side heartbeat is a stub that logs "Would send heartbeat" and there
-//! is no heartbeat RPC to receive, so rather than invent a protocol this
-//! probes from the side that needs the answer. Meta already holds every OSD's
+//! OSDs send no heartbeat and there is no heartbeat RPC to receive, so rather
+//! than invent a protocol this probes from the side that needs the answer. Meta already holds every OSD's
 //! address and already opens `StorageServiceClient` elsewhere
 //! (see `drain_observer`).
 //!
