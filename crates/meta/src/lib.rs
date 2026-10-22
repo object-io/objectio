@@ -48,10 +48,6 @@ pub struct Args {
     #[arg(short, long, default_value = "0.0.0.0:9100")]
     pub listen: String,
 
-    /// Peer addresses for Raft cluster
-    #[arg(long)]
-    pub peers: Vec<String>,
-
     /// Erasure coding data shards (k)
     #[arg(long, default_value = "4")]
     pub ec_k: u8,

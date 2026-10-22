@@ -212,10 +212,6 @@ pub struct Args {
     #[arg(long, default_value = "http://localhost:9100")]
     pub meta_endpoint: String,
 
-    /// OSD endpoint (initial OSD, more discovered via metadata service)
-    #[arg(long, default_value = "http://localhost:9200")]
-    pub osd_endpoint: String,
-
     /// Erasure coding data shards (k)
     #[arg(long, default_value = "4")]
     pub ec_k: u32,
@@ -614,7 +610,6 @@ pub async fn run(
     }
     info!("Starting ObjectIO Gateway");
     info!("Metadata endpoint: {}", args.meta_endpoint);
-    info!("OSD endpoint: {}", args.osd_endpoint);
 
     // Register protection config for Prometheus metrics
     let protection_config = match args.protection.as_str() {
@@ -705,24 +700,6 @@ pub async fn run(
     // Create OSD connection pool
     let osd_pool = Arc::new(OsdPool::new());
     osd_pool.set_heal_queue(meta_client.clone());
-
-    // Connect to initial OSD (more will be discovered via placement)
-    // Generate a temporary node ID for the initial OSD
-    let initial_node_id = uuid::Uuid::new_v4();
-    if let Err(e) = osd_pool
-        .connect(
-            osd_pool::NodeId::from(*initial_node_id.as_bytes()),
-            &args.osd_endpoint,
-        )
-        .await
-    {
-        tracing::warn!(
-            "Failed to connect to initial OSD: {}. Will connect on demand.",
-            e
-        );
-    } else {
-        info!("Connected to initial OSD at {}", args.osd_endpoint);
-    }
 
     // STS provider for vended Iceberg credentials + S3 temporary auth.
     // Keyed by the cluster's secret from meta, shared by every gateway.

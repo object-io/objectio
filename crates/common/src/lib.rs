@@ -4,7 +4,6 @@
 //! used across all ObjectIO components.
 
 pub mod checksum;
-pub mod config;
 pub mod error;
 pub mod exposition;
 pub mod histogram;
@@ -18,7 +17,6 @@ pub mod types;
 pub mod version;
 
 pub use checksum::{Checksum, ChecksumCalculator};
-pub use config::Config;
 pub use error::{Error, Result};
 pub use shutdown::shutdown_signal;
 pub use types::*;

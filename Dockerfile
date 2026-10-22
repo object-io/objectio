@@ -200,7 +200,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:9000/health || exit 1
 
 ENTRYPOINT ["objectio-gateway"]
-CMD ["--bind", "0.0.0.0:9000"]
+CMD ["--listen", "0.0.0.0:9000"]
 
 # =============================================================================
 # Stage 6: Metadata service (Raft consensus)
@@ -217,9 +217,10 @@ COPY --from=builder /build/target/release/objectio-meta /usr/local/bin/
 
 USER objectio
 
-# 9100: Client gRPC API
-# 9101: Raft peer communication
-EXPOSE 9100 9101
+# 9100: gRPC API and Raft
+# 9101: Prometheus metrics
+# 9102: admin (Raft bootstrap and membership, status)
+EXPOSE 9100 9101 9102
 
 VOLUME ["/var/lib/objectio"]
 
@@ -227,7 +228,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD /usr/local/bin/healthcheck.sh
 
 ENTRYPOINT ["objectio-meta"]
-CMD ["--bind", "0.0.0.0:9100", "--raft-bind", "0.0.0.0:9101", "--data-dir", "/var/lib/objectio/meta"]
+CMD ["--listen", "0.0.0.0:9100", "--data-dir", "/var/lib/objectio/meta"]
 
 # =============================================================================
 # Stage 7: OSD (Object Storage Daemon)
@@ -244,8 +245,8 @@ COPY --from=builder /build/target/release/objectio-osd /usr/local/bin/
 
 USER objectio
 
-# 9200: Client gRPC API
-# 9201: Data transfer / replication
+# 9200: gRPC API
+# 9201: Prometheus metrics
 EXPOSE 9200 9201
 
 VOLUME ["/var/lib/objectio"]
@@ -254,7 +255,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD /usr/local/bin/healthcheck.sh
 
 ENTRYPOINT ["objectio-osd"]
-CMD ["--bind", "0.0.0.0:9200", "--data-dir", "/var/lib/objectio/osd"]
+CMD ["--listen", "0.0.0.0:9200", "--data-dir", "/var/lib/objectio/osd"]
 
 # =============================================================================
 # Stage 8: CLI tool

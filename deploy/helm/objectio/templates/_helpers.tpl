@@ -110,21 +110,6 @@ Grafana fullname.
 {{- end }}
 
 {{/*
-Generate comma-separated meta peer list for Raft.
-Format: meta-0.HEADLESS:9100,meta-1.HEADLESS:9100,...
-*/}}
-{{- define "objectio.metaPeers" -}}
-{{- $headless := include "objectio.meta.headless" . }}
-{{- $fullname := include "objectio.meta.fullname" . }}
-{{- $port := .Values.meta.service.port | int }}
-{{- $peers := list }}
-{{- range $i := until (.Values.meta.replicas | int) }}
-{{- $peers = append $peers (printf "%s-%d.%s:%d" $fullname $i $headless $port) }}
-{{- end }}
-{{- join "," $peers }}
-{{- end }}
-
-{{/*
 mTLS between the services (A8a): the Secret holding a role's certificate
 (tls.crt, tls.key, ca.crt, as cert-manager writes them), and what each
 component mounts and sets from it. Each certificate names its role in a

@@ -48,7 +48,6 @@ spec:
                 --raft-advertise "$ADVERTISE" \
                 --admin-port {{ .Values.meta.service.adminPort }} \
                 --metrics-port {{ .Values.meta.service.metricsPort }} \
-                --peers "{{ include "objectio.metaPeers" . }}" \
                 --data-dir /var/lib/objectio/meta \
               {{- if .Values.replication }}
                 --replication "{{ .Values.replication }}" \

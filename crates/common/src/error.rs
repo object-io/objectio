@@ -2,7 +2,7 @@
 //!
 //! This module defines the common error types used throughout the system.
 
-use crate::types::{BucketNameError, ObjectKeyError};
+use crate::types::BucketNameError;
 use thiserror::Error;
 
 /// Common result type for ObjectIO operations
@@ -55,9 +55,6 @@ pub enum Error {
 
     #[error("invalid bucket name: {0}")]
     InvalidBucketName(#[from] BucketNameError),
-
-    #[error("invalid object key: {0}")]
-    InvalidObjectKey(#[from] ObjectKeyError),
 
     // Placement errors
     #[error("insufficient nodes for placement: have {available}, need {required}")]
@@ -184,7 +181,6 @@ impl Error {
             Self::InvalidRequest(_)
             | Self::InvalidArgument(_)
             | Self::InvalidBucketName(_)
-            | Self::InvalidObjectKey(_)
             | Self::InvalidPart { .. }
             | Self::InvalidPartOrder => 400,
 
