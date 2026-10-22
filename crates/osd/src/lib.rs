@@ -694,22 +694,18 @@ pub async fn run(
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
 
-    // tonic sets TCP_NODELAY only on listeners it binds itself; a listener
-    // handed in is served as-is, with Nagle on. Nagle holding back the tail
-    // of a response while the peer delays its ACK stalled idle requests by
-    // ~40 ms on Linux.
-    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
-        .map_err(|e| anyhow::anyhow!("OSD listener: {e}"))?;
-    let server_future = objectio_proto::transport::server()
+    // `serve` turns Nagle off on each connection, as tonic does only on
+    // listeners it binds itself.
+    let grpc = objectio_proto::transport::server()
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(&RPC_METRICS))
         .layer(objectio_proto::peer_auth::PeerAuthLayer::new(&[
             objectio_proto::peer_auth::STORAGE_SERVICE,
         ]))
-        .add_service(storage_service)
-        .serve_with_incoming_shutdown(incoming, async move {
-            shutdown.await;
-            info!("Shutting down...");
-        });
+        .add_service(storage_service);
+    let server_future = objectio_proto::transport::serve(grpc, listener, async move {
+        shutdown.await;
+        info!("Shutting down...");
+    });
 
     // Wait for registration to complete (with timeout)
     tokio::select! {

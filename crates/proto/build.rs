@@ -9,6 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .build_server(true)
         .build_client(true)
+        // No `XClient::connect`: it would connect plain, with the TLS
+        // handshake unbounded. Clients connect through `transport::connect`.
+        .build_transport(false)
         .compile_protos(
             &[
                 "proto/storage.proto",

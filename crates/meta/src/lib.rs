@@ -288,7 +288,7 @@ pub async fn run(
     let meta_service = MetaService::with_store(ec_config, store.clone());
 
     // Parse listen address
-    let addr = args
+    let addr: std::net::SocketAddr = args
         .listen
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid listen address {}: {}", args.listen, e))?;
@@ -493,7 +493,7 @@ pub async fn run(
             "without a walk"
         }
     );
-    objectio_proto::transport::server()
+    let grpc = objectio_proto::transport::server()
         .layer(objectio_proto::rpc_metrics::RpcMetricsLayer(
             &op_metrics::RPC_METRICS,
         ))
@@ -515,12 +515,15 @@ pub async fn run(
             objectio_proto::raft::raft_rpc_server::RaftRpcServer::new(raft_rpc_svc)
                 .max_decoding_message_size(RAFT_MESSAGE_LIMIT)
                 .max_encoding_message_size(RAFT_MESSAGE_LIMIT),
-        )
-        .serve_with_shutdown(addr, async move {
-            shutdown.await;
-            info!("Shutting down...");
-        })
-        .await?;
+        );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind gRPC on {addr}: {e}"))?;
+    objectio_proto::transport::serve(grpc, listener, async move {
+        shutdown.await;
+        info!("Shutting down...");
+    })
+    .await?;
 
     // The calls in flight have been answered. Raft stops before the last
     // checkpoint, so that checkpoint holds everything it applied.

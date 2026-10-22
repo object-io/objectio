@@ -102,9 +102,9 @@ impl OsdPool {
         drop(nodes);
 
         let max_message_size = 100 * 1024 * 1024;
-        let channel = objectio_proto::transport::endpoint(address)
-            .map_err(OsdPoolError::ConnectionFailed)?
-            .connect()
+        let endpoint =
+            objectio_proto::transport::endpoint(address).map_err(OsdPoolError::ConnectionFailed)?;
+        let channel = objectio_proto::transport::connect(&endpoint)
             .await
             .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
 

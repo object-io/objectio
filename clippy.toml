@@ -1,0 +1,10 @@
+# tonic 0.12 bounds neither side of a TLS handshake: its `connect` and
+# `connect_lazy` time out the TCP connection only, and its servers give a
+# handshake forever. objectio_proto::transport makes both bounded.
+disallowed-methods = [
+    { path = "tonic::transport::Endpoint::connect", reason = "the TLS handshake is unbounded: use objectio_proto::transport::connect" },
+    { path = "tonic::transport::Endpoint::connect_lazy", reason = "the TLS handshake is unbounded: use objectio_proto::transport::connect_lazy" },
+    { path = "tonic::transport::server::Router::serve", reason = "no mTLS, and handshakes unbounded: use objectio_proto::transport::serve" },
+    { path = "tonic::transport::server::Router::serve_with_shutdown", reason = "no mTLS, and handshakes unbounded: use objectio_proto::transport::serve" },
+    { path = "tonic::transport::Server::tls_config", reason = "tonic's TLS handshakes are unbounded: use objectio_proto::transport::serve" },
+]

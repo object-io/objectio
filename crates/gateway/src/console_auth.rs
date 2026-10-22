@@ -2167,7 +2167,9 @@ mod session_gate_tests {
     }
 
     fn auth_state() -> Arc<AuthState> {
-        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let channel = objectio_proto::transport::connect_lazy(
+            &tonic::transport::Endpoint::from_static("http://127.0.0.1:1"),
+        );
         Arc::new(AuthState::new(
             MetadataServiceClient::new(channel),
             "us-east-1",

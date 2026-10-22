@@ -187,7 +187,7 @@ async fn probe(address: &str) -> bool {
         Ok(e) => e.connect_timeout(PROBE_TIMEOUT).timeout(PROBE_TIMEOUT),
         Err(_) => return false,
     };
-    let Ok(channel) = endpoint.connect().await else {
+    let Ok(channel) = objectio_proto::transport::connect(&endpoint).await else {
         return false;
     };
     let mut client = StorageServiceClient::new(channel);

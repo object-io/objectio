@@ -24,6 +24,9 @@ parking_lot = { workspace = true }
 # rustls checks the chain but doesn't expose URIs. The parser rcgen uses.
 x509-parser = { version = "0.16", default-features = false }
 tokio-rustls = { workspace = true }
+# The TCP connector handed to tonic's `connect_with_connector`, so that the
+# connect timeout covers the TLS handshake too (transport::connect).
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 
 [dev-dependencies]
 rcgen = "0.13"

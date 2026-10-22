@@ -55,13 +55,13 @@ impl ChannelCache {
         // two seconds, not after the kernel's retransmission timeout: on
         // Raft's timescale (elections in under a second) a hung connection
         // otherwise blocks votes and replication for minutes.
-        let channel = objectio_proto::transport::endpoint(addr)?
+        let endpoint = objectio_proto::transport::endpoint(addr)?
             .connect_timeout(std::time::Duration::from_secs(1))
             .tcp_keepalive(Some(std::time::Duration::from_secs(5)))
             .http2_keep_alive_interval(std::time::Duration::from_secs(1))
             .keep_alive_timeout(std::time::Duration::from_secs(2))
-            .keep_alive_while_idle(true)
-            .connect_lazy();
+            .keep_alive_while_idle(true);
+        let channel = objectio_proto::transport::connect_lazy(&endpoint);
         self.inner.lock().insert(addr.to_string(), channel.clone());
         Ok(channel)
     }
