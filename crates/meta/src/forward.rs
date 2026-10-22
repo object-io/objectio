@@ -89,11 +89,15 @@ pub struct ForwardToLeaderLayer {
 }
 
 impl ForwardToLeaderLayer {
-    pub fn new(raft: Arc<openraft::Raft<MetaTypeConfig>>, self_id: u64) -> Self {
-        let election_timeout_min =
-            std::time::Duration::from_millis(raft.config().election_timeout_min);
+    /// `gate` is also the Raft service's (`raft_rpc`), which closes it
+    /// when another node may lead.
+    pub fn new(
+        raft: Arc<openraft::Raft<MetaTypeConfig>>,
+        self_id: u64,
+        gate: Arc<ReadGate>,
+    ) -> Self {
         Self {
-            gate: ReadGate::for_raft(raft.clone(), election_timeout_min),
+            gate,
             raft,
             self_id,
             channels: Arc::default(),

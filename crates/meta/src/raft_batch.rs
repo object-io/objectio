@@ -216,14 +216,14 @@ async fn commit(raft: &Raft, mut batch: Vec<Pending>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use objectio_meta_store::raft_storage::MetaRaftStorage;
     use objectio_meta_store::{CasOp, CasTable};
     use std::collections::BTreeMap;
 
     /// A single-voter meta Raft in `dir`, leading.
-    async fn single_node(dir: &std::path::Path) -> Arc<Raft> {
+    pub(crate) async fn single_node(dir: &std::path::Path) -> Arc<Raft> {
         single_node_with(dir, |_| {}).await
     }
 

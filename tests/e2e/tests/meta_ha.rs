@@ -92,6 +92,25 @@ fn while_writing(ha: &HaCluster, bucket: &str, acked: &Acked, secs: u64, during:
     });
 }
 
+/// The longest time without an acknowledged write from `since` on: how
+/// long writes stopped across a loss (one acknowledged just after it may
+/// have been under way before).
+fn longest_pause(acked: &Acked, since: Instant) -> Duration {
+    let mut at: Vec<Instant> = acked
+        .lock()
+        .unwrap()
+        .values()
+        .map(|(_, at)| *at)
+        .filter(|at| *at > since)
+        .collect();
+    at.push(since);
+    at.sort();
+    at.windows(2)
+        .map(|w| w[1].duration_since(w[0]))
+        .max()
+        .unwrap_or_default()
+}
+
 /// How long after `since` writes were acknowledged again.
 fn resumed_after(acked: &Acked, since: Instant) -> Duration {
     acked
@@ -121,6 +140,10 @@ fn losing_the_leader_loses_no_acknowledged_write() {
     let new_leader = ha.await_leader(Duration::from_secs(20));
     assert_ne!(new_leader, leader, "the killed node still leads");
     let resumed = resumed_after(&acked, killed_at);
+    eprintln!(
+        "writes stopped for {:?} at most after the leader was killed",
+        longest_pause(&acked, killed_at)
+    );
     assert!(
         resumed < Duration::from_secs(10),
         "writes took {resumed:?} to resume after the leader was lost"
@@ -227,6 +250,10 @@ fn a_frozen_leader_steps_down_when_it_returns() {
     let new_leader = ha.await_leader_among_others(Duration::from_secs(20), &[leader]);
     assert_ne!(new_leader, leader);
     let resumed = resumed_after(&acked, frozen_at);
+    eprintln!(
+        "writes stopped for {:?} at most after the leader froze",
+        longest_pause(&acked, frozen_at)
+    );
     assert!(
         resumed < Duration::from_secs(10),
         "writes took {resumed:?} to resume after the leader froze"
@@ -326,6 +353,127 @@ fn a_leader_cut_off_from_its_followers_stops_serving_reads() {
                     "meta {i} (leader {leader}) never served again: {status}"
                 ),
             }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+type MetaClient = objectio_proto::metadata::metadata_service_client::MetadataServiceClient<
+    tonic::transport::Channel,
+>;
+
+/// Two clients of meta node `i` alone, sharing one connection made now,
+/// with neither the balanced channel's probes nor its pings: a call sent
+/// on it while the node is frozen waits in the node's socket, and is among
+/// the first things the node reads when it thaws.
+fn direct_clients(
+    rt: &tokio::runtime::Runtime,
+    ha: &HaCluster,
+    i: usize,
+) -> (MetaClient, MetaClient) {
+    objectio_e2e::tls::client();
+    let endpoint = objectio_proto::transport::endpoint(&ha.meta_endpoint(i))
+        .unwrap()
+        .user_agent(objectio_common::version::user_agent())
+        .unwrap();
+    let channel = rt
+        .block_on(objectio_proto::transport::connect(&endpoint))
+        .expect("connect to meta");
+    (MetaClient::new(channel.clone()), MetaClient::new(channel))
+}
+
+async fn bucket_names(mut client: MetaClient) -> Result<Vec<String>, tonic::Status> {
+    use objectio_proto::metadata::ListBucketsRequest;
+    let r = client.list_buckets(ListBucketsRequest::default()).await?;
+    Ok(r.into_inner().buckets.into_iter().map(|b| b.name).collect())
+}
+
+/// Create bucket `name` through meta node `i`, retrying while it answers
+/// UNAVAILABLE (a leader just elected).
+fn create_bucket_at(rt: &tokio::runtime::Runtime, ha: &HaCluster, i: usize, name: &str) {
+    use objectio_proto::metadata::CreateBucketRequest;
+    use objectio_proto::metadata::metadata_service_client::MetadataServiceClient;
+    objectio_e2e::tls::client();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let r = rt.block_on(async {
+            let channel = objectio_proto::transport::meta_channel(&ha.meta_endpoint(i))
+                .await
+                .map_err(tonic::Status::unavailable)?;
+            MetadataServiceClient::new(channel)
+                .create_bucket(CreateBucketRequest {
+                    name: name.into(),
+                    owner: "admin".into(),
+                    ..Default::default()
+                })
+                .await
+        });
+        match r {
+            Ok(_) => return,
+            Err(s) if s.code() == tonic::Code::Unavailable && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(s) => panic!("create bucket {name} through meta {i}: {s}"),
+        }
+    }
+}
+
+/// A leader frozen (a paused process, as across a partition) just after
+/// it answered a read, so with its leadership freshly confirmed: the
+/// others elect a new leader and create a bucket on it. A listing sent to
+/// the old leader while it is frozen, which it reads as soon as it thaws,
+/// before it has heard of the new leader, names that bucket or fails
+/// UNAVAILABLE: never the list from before the write (`read_gate`).
+#[test]
+fn a_leader_frozen_while_another_commits_never_answers_from_before() {
+    let ha = HaCluster::start(3, 0, 0);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for round in 0..3 {
+        let leader = ha.await_leader(Duration::from_secs(30));
+        // A read now, and one sent to it once frozen, on one connection.
+        let (now, later) = direct_clients(&rt, &ha, leader);
+        rt.block_on(bucket_names(now))
+            .expect("a read from the leader");
+        ha.freeze_meta(leader);
+        let frozen_at = Instant::now();
+        let new_leader = ha.await_leader_among_others(Duration::from_secs(20), &[leader]);
+        let elected = frozen_at.elapsed();
+        let name = format!("after-freeze-{round}");
+        create_bucket_at(&rt, &ha, new_leader, &name);
+        eprintln!(
+            "round {round}: a new leader {elected:?} after the freeze, the bucket \
+             created {:?} after it",
+            frozen_at.elapsed()
+        );
+
+        let read = rt.spawn(bucket_names(later));
+        std::thread::sleep(Duration::from_millis(300));
+        ha.thaw_meta(leader);
+        match rt.block_on(read).unwrap() {
+            Ok(names) => assert!(
+                names.contains(&name),
+                "round {round}: the old leader answered from before the write: {names:?}"
+            ),
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::Unavailable, "{status}");
+                eprintln!("round {round}: the thawed leader refused the read: {status}");
+            }
+        }
+
+        // It steps down and follows before the next round freezes another.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (s, l) = (ha.status(leader), ha.status(new_leader));
+            if let (Some(s), Some(l)) = (&s, &l)
+                && s.state == "Follower"
+                && s.last_applied >= l.last_applied
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the thawed node never caught up: {s:?} vs {l:?}"
+            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
