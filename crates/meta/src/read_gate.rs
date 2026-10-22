@@ -11,16 +11,24 @@
 //! `ensure_linearizable`: a heartbeat round, then waiting until this
 //! node has applied everything committed when it started).
 //!
-//! One confirmation serves every call for a while: a follower that acked
-//! it doesn't stand for election until it has heard nothing for an
-//! election timeout, and doesn't vote for another candidate within the
-//! leader lease (`election_timeout_max`), so no other leader can be
-//! elected, and so nothing can change elsewhere, sooner than
-//! `election_timeout_min` after the round started. A success is reused
-//! while younger than half that, counted from when its round *started*;
-//! calls arriving while a round is under way wait for it rather than
-//! start another, so the cost is at most one heartbeat round per window,
-//! however many calls there are.
+//! One confirmation serves every call for a while. Why that is safe, in
+//! openraft 0.9's terms: a follower that acked the round's heartbeat
+//! (sent after the round started, at `T`) noted the time it did, `u ≥ T`.
+//! It refuses to vote for anyone else until its leader lease has passed
+//! (`now ≤ u + lease`, the lease being its `election_timeout_max`), and
+//! doesn't stand itself before `u + lease + election timeout`. A new
+//! leader needs votes from a quorum, which shares a node with the quorum
+//! that acked (a follower, or this node, which by voting leaves the term
+//! the confirmation is for), so none is elected, and nothing can change
+//! elsewhere, before `T + lease`, the smallest lease among the voters.
+//! A success is reused while younger than half of this node's
+//! `election_timeout_min`, counted from `T`: a quarter of the lease when
+//! every node runs the same `--raft-election-ms` (lease = 2 × min), and
+//! still inside it while the nodes' values are less than 4× apart (a
+//! rolling upgrade that changes the default). Calls arriving while a
+//! round is under way wait for it rather than start another, so the
+//! cost is at most one heartbeat round per window, however many calls
+//! there are.
 //!
 //! A round that can't reach a quorum is tried again until the gate's
 //! timeout (one `election_timeout_min`); then the calls waiting on it are
