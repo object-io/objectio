@@ -152,10 +152,11 @@ pub struct Args {
     /// failover: at 2000 a lost leader was replaced 6-9 s after its last
     /// heartbeat, 12 s when the first candidate's log was behind.
     ///
-    /// A leader's quorum confirmation serves reads for E/2 (`read_gate`),
-    /// which is safe while that is shorter than every voter's lease (2E):
-    /// values less than 4× apart across the nodes, as in a rolling upgrade
-    /// that changes this default, are still safe.
+    /// A leader's quorum confirmation serves reads for a quarter of its
+    /// lease, E/2 (`read_gate`), which is safe while that is shorter than
+    /// every voter's lease (2E): values less than 4× apart across the
+    /// nodes, as in a rolling upgrade that changes this default, are still
+    /// safe.
     #[arg(long, default_value_t = 1000)]
     pub raft_election_ms: u64,
 
@@ -482,7 +483,8 @@ pub async fn run(
     }
 
     // Start gRPC server with metadata, block, and Raft RPC services.
-    let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id);
+    let read_gate = read_gate::ReadGate::for_raft(raft.clone());
+    let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id, read_gate.clone());
     objectio_meta_store::commit_metrics::ready(process_started.elapsed());
     info!(
         "Serving {:.2} s after start (the database opened {})",
@@ -506,7 +508,11 @@ pub async fn run(
         ]))
         // A follower forwards every client call to the leader, so any meta
         // node serves any client (see `forward`).
-        .layer(forward::ForwardToLeaderLayer::new(raft.clone(), node_id))
+        .layer(forward::ForwardToLeaderLayer::new(
+            raft.clone(),
+            node_id,
+            read_gate,
+        ))
         .add_service(MetadataServiceServer::from_arc(meta_service))
         // Raft messages are JSON, which bloats binary values 3-4x; at
         // tonic's default 4 MiB limit a batch of large entries, or a
@@ -824,12 +830,14 @@ mod raft_config_tests {
         assert!(first <= 5000, "first election {first} ms after the leader");
         assert!(after_a_lost_vote <= 8000, "{after_a_lost_vote} ms");
 
-        // Read confirmations (read_gate) are reused for min / 2 from when
-        // the round started; no voter that acked it votes for another
-        // leader within its lease, so the reuse must end well before.
-        assert!(min / 2 * 4 <= lease, "window {} vs lease {lease}", min / 2);
+        // Read confirmations (read_gate) are reused for a quarter of the
+        // lease from when the round started; no voter that acked it votes
+        // for another leader within its lease, so the reuse must end well
+        // before.
+        let window = lease / 4;
+        assert_eq!(window, 500, "the window is E/2");
         // A node still on the previous default (2000) during a rolling
         // upgrade, as leader, reuses for 1 s; voters here lease for 2 s.
-        assert!(2000 / 2 < lease);
+        assert!(4000 / 4 < lease);
     }
 }
