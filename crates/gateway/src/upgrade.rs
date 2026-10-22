@@ -38,6 +38,7 @@ pub(crate) fn system_admin(
 
 pub(crate) fn meta_error(e: &tonic::Status) -> Response {
     let status = match e.code() {
+        _ if objectio_proto::is_no_room(e) => StatusCode::INSUFFICIENT_STORAGE,
         tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
         tonic::Code::Aborted => StatusCode::CONFLICT,
         _ if crate::s3::S3Error::is_unavailable(e) => StatusCode::SERVICE_UNAVAILABLE,

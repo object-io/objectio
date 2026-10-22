@@ -105,6 +105,20 @@ groups:
         labels: {severity: warning}
         annotations:
           summary: A meta follower is more than 1000 log entries behind
+      - alert: ObjectIOMetaDiskLow
+        # Room to act before writes stop: under twice the reserve
+        # (--min-free-mib). -1 is a free space meta can't tell.
+        expr: objectio_meta_disk_free_bytes >= 0 and objectio_meta_disk_free_bytes < 2 * objectio_meta_disk_reserve_bytes
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: A meta node's data filesystem has less than twice its reserve free; under the reserve it takes no writes
+      - alert: ObjectIOMetaDiskFull
+        expr: max(objectio_meta_disk_full) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: A meta node has less than its reserve free; leading, it refuses writes (507), following, it falls behind
       - alert: ObjectIOHealQueueFailing
         expr: increase(objectio_gateway_heal_queued_total{result="failed"}[15m]) > 0
         labels: {severity: warning}

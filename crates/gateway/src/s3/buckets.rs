@@ -323,6 +323,8 @@ pub async fn create_bucket(
             ) {
                 // A pool that doesn't exist or is disabled.
                 S3Error::xml_response("InvalidArgument", e.message(), StatusCode::BAD_REQUEST)
+            } else if objectio_proto::is_no_room(&e) {
+                S3Error::meta_full(&e)
             } else if e.code() == tonic::Code::ResourceExhausted {
                 S3Error::xml_response("TooManyBuckets", e.message(), StatusCode::BAD_REQUEST)
             } else {
@@ -1088,5 +1090,31 @@ mod location_tests {
             "{west}"
         );
         assert!(location_xml("a<b").contains(">a&lt;b<"));
+    }
+}
+
+#[cfg(test)]
+mod meta_full_tests {
+    use crate::s3::S3Error;
+    use axum::http::StatusCode;
+
+    /// A write meta refused for want of room is 507 StorageFull; a
+    /// tenant's bucket quota (ResourceExhausted, unmarked) is not, nor is
+    /// meta being unavailable.
+    #[test]
+    fn a_write_meta_has_no_room_for_is_507() {
+        let full = objectio_proto::no_room("meta can't take writes");
+        assert_eq!(
+            S3Error::from_status(&full).status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert_eq!(
+            S3Error::from_status(&tonic::Status::unavailable("election")).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_ne!(
+            S3Error::from_status(&tonic::Status::resource_exhausted("quota")).status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
     }
 }

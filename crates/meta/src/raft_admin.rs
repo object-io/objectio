@@ -70,6 +70,8 @@ pub struct RaftAdminState {
     pub raft: Arc<Raft<MetaTypeConfig>>,
     pub self_id: u64,
     pub self_addr: String,
+    /// Room on the filesystem under this node's data.
+    pub space: Arc<objectio_meta_store::DiskSpace>,
 }
 
 impl RaftAdminState {
@@ -392,6 +394,17 @@ struct StatusResponse {
     /// Whether opening the database at start had to walk all of it (B25:
     /// never expected).
     open_repair: bool,
+    /// Bytes free on the filesystem of the data directory; absent when it
+    /// can't be told.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_free: Option<u64>,
+    /// Bytes meta keeps free there (`--min-free-mib`).
+    disk_reserve: u64,
+    /// Why this node, leading, would refuse a write for want of room, if
+    /// it would: under its reserve, or a write found the filesystem full
+    /// lately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_full: Option<String>,
 }
 
 /// GET /status — current leader / term / log / membership.
@@ -414,6 +427,9 @@ async fn status(State(s): State<Arc<RaftAdminState>>) -> impl IntoResponse {
         voters,
         learners,
         open_repair: objectio_meta_store::commit_metrics::open_repaired(),
+        disk_free: s.space.free(),
+        disk_reserve: s.space.reserve(),
+        disk_full: s.space.has_room_for_writes().err().map(|e| e.to_string()),
     };
     Json(resp).into_response()
 }

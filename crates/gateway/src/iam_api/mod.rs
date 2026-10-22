@@ -105,6 +105,9 @@ impl IamError {
     pub(crate) fn from_status(e: &tonic::Status) -> Self {
         let message = e.message().to_string();
         match e.code() {
+            _ if objectio_proto::is_no_room(e) => {
+                Self::new(StatusCode::INSUFFICIENT_STORAGE, "ServiceFailure", message)
+            }
             tonic::Code::NotFound => Self::no_such_entity(message),
             tonic::Code::AlreadyExists => Self::already_exists(message),
             tonic::Code::InvalidArgument => Self::validation(message),

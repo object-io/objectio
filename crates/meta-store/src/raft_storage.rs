@@ -37,6 +37,19 @@
 //! - Snapshots: the whole state machine, streamed through a file in the
 //!   snapshot directory (never held in memory: meta has a listing entry
 //!   per object), so the log can be compacted (B18).
+//!
+//! ## A full filesystem (objectio-docs `core/meta.md`)
+//!
+//! openraft stops a node for good on any error from these calls, and redb
+//! refuses everything after an I/O error until it is opened again. What
+//! the filesystem can refuse for want of room without anything being lost
+//! waits for room instead of failing: a log append or a purge record
+//! (cut off and tried again, [`crate::raft_log`]), a snapshot build (waits
+//! until there is room for it above the reserve, and stops before eating
+//! into it). A redb commit that fails (apply, checkpoint, vote, install)
+//! still fails: the database must be reopened, so the node stops and is
+//! restarted, applying again from its log. The reserve
+//! ([`crate::disk_space`]) keeps those from meeting a full filesystem.
 
 use std::fmt::Debug;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
@@ -54,9 +67,20 @@ use redb::{Database, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use crate::commit_metrics::Commit;
+use crate::disk_space::DiskSpace;
 use crate::raft::{ApplyEvent, CasOp, CasTable, MetaCommand, MetaResponse, MetaTypeConfig};
-use crate::raft_log::RaftLog;
+use crate::raft_log::{LogError, RaftLog};
 use crate::tables;
+
+/// How long a log write the filesystem had no room for waits before it is
+/// tried again.
+const LOG_ROOM_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a snapshot that found no room waits before it is tried again.
+const SNAPSHOT_ROOM_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a write still waiting for room says so.
+const WAITING_TOLD_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 mod backup;
 pub use backup::{BackupHeader, Edit, Forced, Voter, rows};
@@ -114,6 +138,8 @@ pub struct MetaRaftStorage {
     dirty: Arc<AtomicBool>,
     /// The commit index openraft last gave, written at each checkpoint.
     committed: Arc<parking_lot::Mutex<Option<LogId<NodeId>>>>,
+    /// Room on the filesystem, and meta's reserve on it.
+    space: Arc<DiskSpace>,
 }
 
 impl MetaRaftStorage {
@@ -130,6 +156,7 @@ impl MetaRaftStorage {
         log_dir: &Path,
     ) -> Result<Self, StorageError<NodeId>> {
         log_in_database(&db, log_dir)?;
+        clear_partial_snapshots(&snapshot_dir);
         let started = std::time::Instant::now();
         let log = RaftLog::open(log_dir).map_err(read_err)?;
         crate::commit_metrics::log_opened(started.elapsed());
@@ -141,11 +168,72 @@ impl MetaRaftStorage {
         Ok(Self {
             db,
             listener: None,
+            space: Arc::new(DiskSpace::new(log_dir, 0)),
             snapshot_dir,
             log: Arc::new(parking_lot::Mutex::new(log)),
             dirty: Arc::default(),
             committed: Arc::default(),
         })
+    }
+
+    /// Check room on the filesystem against `space` (its reserve): a
+    /// snapshot is built only with room for it above the reserve. Without
+    /// this, no reserve is kept.
+    #[must_use]
+    pub fn with_disk_space(mut self, space: Arc<DiskSpace>) -> Self {
+        self.space = space;
+        self
+    }
+
+    /// Run `op` on the log until the filesystem has room for it: an append
+    /// or a purge record it had none for was cut off, and is tried again
+    /// every [`LOG_ROOM_RETRY`]. openraft waits meanwhile (this node falls
+    /// behind, or, leading, stops answering and is replaced) rather than
+    /// stop for good, as it would on an error. Any other failure is
+    /// returned.
+    async fn until_room<T>(
+        &self,
+        what: &str,
+        mut op: impl FnMut(&mut RaftLog) -> Result<T, LogError>,
+    ) -> Result<T, StorageError<NodeId>> {
+        let mut waiting: Option<(std::time::Instant, std::time::Instant)> = None;
+        loop {
+            let result = op(&mut self.log.lock());
+            match result {
+                Ok(v) => {
+                    if let Some((since, _)) = waiting {
+                        tracing::info!(
+                            "raft log: {what} written after waiting {:.1} s for room",
+                            since.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(v);
+                }
+                Err(e) if e.is_out_of_space() => {
+                    self.space.out_of_space();
+                    let now = std::time::Instant::now();
+                    match &mut waiting {
+                        None => {
+                            tracing::error!(
+                                "raft log: no room for {what} ({e}); waiting for room, \
+                                 retried every {LOG_ROOM_RETRY:?}"
+                            );
+                            waiting = Some((now, now));
+                        }
+                        Some((since, told)) if told.elapsed() >= WAITING_TOLD_EVERY => {
+                            tracing::error!(
+                                "raft log: still no room for {what} after {:.0} s ({e})",
+                                since.elapsed().as_secs_f64()
+                            );
+                            *told = now;
+                        }
+                        Some(_) => {}
+                    }
+                    tokio::time::sleep(LOG_ROOM_RETRY).await;
+                }
+                Err(e) => return Err(write_err(e)),
+            }
+        }
     }
 
     /// Attach an apply-event listener. The state machine will send one
@@ -181,8 +269,11 @@ impl MetaRaftStorage {
         let committed = *self.committed.lock();
         if committed.is_some() {
             let bytes = serde_json::to_vec(&committed).map_err(|e| encode_err("committed", e))?;
-            // Not synced: a lost one costs only a later re-apply.
-            self.log.lock().save_committed(&bytes).map_err(write_err)?;
+            // Not synced, and not needed: a lost one (no room for it, say)
+            // costs only a later re-apply.
+            if let Err(e) = self.log.lock().save_committed(&bytes) {
+                tracing::warn!("raft log: commit index not saved: {e}");
+            }
         }
         Ok(true)
     }
@@ -760,13 +851,32 @@ impl MetaRaftStorage {
     /// Build a snapshot of the state machine as it is now, and make it the
     /// current one (see [`Self::current_snapshot`]).
     async fn snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
+        self.try_snapshot_of().await.map_err(|e| match e {
+            Unbuilt::NoRoom(why) => encode_err("snapshot", std::io::Error::other(why)),
+            Unbuilt::Failed(e) => e,
+        })
+    }
+
+    /// [`Self::snapshot_of`], telling a filesystem without room for it
+    /// (which a later try may have) from a failure. Whatever it wrote is
+    /// removed when it fails.
+    async fn try_snapshot_of(&self) -> Result<Snapshot<MetaTypeConfig>, Unbuilt> {
         let (db, dir) = (Arc::clone(&self.db), self.snapshot_dir.clone());
+        let space = Arc::clone(&self.space);
         tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
-            let (file, path) = snapshot_file(&dir, "build")?;
-            let mut out = BufWriter::with_capacity(1 << 20, &file);
-            let state = Self::write_state_machine(&db, &mut out)?;
+            let (file, path) = snapshot_file(&dir, "build").map_err(Unbuilt::Failed)?;
+            let mut guarded = RoomFor::new(&file, &space);
+            let mut out = BufWriter::with_capacity(1 << 20, &mut guarded);
+            let written = Self::write_state_machine(&db, &mut out);
             drop(out);
+            let state = match written {
+                Ok(state) => state,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(guarded.no_room.map_or(Unbuilt::Failed(e), Unbuilt::NoRoom));
+                }
+            };
             let len = file.metadata().map_or(0, |m| m.len());
             crate::commit_metrics::snapshot_built(
                 usize::try_from(len).unwrap_or(usize::MAX),
@@ -782,14 +892,69 @@ impl MetaRaftStorage {
                 last_membership: state.membership,
                 snapshot_id,
             };
-            keep_snapshot(&dir, &file, &path, &meta)?;
-            Ok::<_, StorageError<NodeId>>(())
+            if let Err(e) = keep_snapshot(&dir, &file, &path, &meta) {
+                discard_unkept(&dir, &path, &meta.snapshot_id);
+                return Err(if objectio_common::error::is_out_of_space(&e) {
+                    space.out_of_space();
+                    Unbuilt::NoRoom(format!("keeping the snapshot: {e}"))
+                } else {
+                    Unbuilt::Failed(encode_err("snapshot", e))
+                });
+            }
+            Ok(())
         })
         .await
-        .map_err(|e| encode_err("snapshot", std::io::Error::other(e)))??;
+        .map_err(|e| Unbuilt::Failed(encode_err("snapshot", std::io::Error::other(e))))??;
         self.current_snapshot()
-            .await?
-            .ok_or_else(|| encode_err("snapshot", std::io::Error::other("just built, now gone")))
+            .await
+            .map_err(Unbuilt::Failed)?
+            .ok_or_else(|| {
+                Unbuilt::Failed(encode_err(
+                    "snapshot",
+                    std::io::Error::other("just built, now gone"),
+                ))
+            })
+    }
+
+    /// One try at a snapshot for openraft: `Ok(None)`, with why, when it
+    /// must wait for room, or (`after_waiting`) for entries past a
+    /// snapshot installed meanwhile.
+    async fn try_build_snapshot(
+        &self,
+        after_waiting: bool,
+    ) -> Result<Result<Snapshot<MetaTypeConfig>, String>, StorageError<NodeId>> {
+        let dir = self.snapshot_dir.clone();
+        let kept = tokio::task::spawn_blocking(move || current_snapshot_files(&dir))
+            .await
+            .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))??;
+        // The last one's size: what this one needs, give or take.
+        let estimate = kept
+            .as_ref()
+            .and_then(|(data, _)| std::fs::metadata(data).ok())
+            .map_or(0, |m| m.len());
+        if let Err(no_room) = self.space.admit_snapshot(estimate) {
+            return Ok(Err(no_room.to_string()));
+        }
+        // openraft takes only a snapshot past the one it knows of; one
+        // received from the leader while this one waited may be as far
+        // as the state machine is.
+        if after_waiting
+            && let Some((_, meta)) = &kept
+            && meta.last_log_id >= self.load_state()?.last_applied
+        {
+            return Ok(Err(format!(
+                "snapshot {} is as far as the state machine; waiting for entries past it",
+                meta.snapshot_id
+            )));
+        }
+        // The state captured is made durable first: the log is purged up to
+        // it next, and a crash must not roll `last_applied` back below that.
+        self.checkpoint()?;
+        match self.try_snapshot_of().await {
+            Ok(snapshot) => Ok(Ok(snapshot)),
+            Err(Unbuilt::NoRoom(why)) => Ok(Err(why)),
+            Err(Unbuilt::Failed(e)) => Err(e),
+        }
     }
 
     /// The current snapshot: the last one built or installed, exactly as it
@@ -825,24 +990,20 @@ fn keep_snapshot(
     file: &std::fs::File,
     tmp: &Path,
     meta: &SnapshotMeta<NodeId, Node>,
-) -> Result<(), StorageError<NodeId>> {
-    let io = |e: std::io::Error| encode_err("snapshot", e);
-    file.sync_all().map_err(io)?;
+) -> std::io::Result<()> {
+    file.sync_all()?;
     let data = dir.join(format!("{}.data", meta.snapshot_id));
-    std::fs::rename(tmp, &data).map_err(io)?;
+    std::fs::rename(tmp, &data)?;
     let meta_tmp = dir.join(format!("{}.meta.tmp", meta.snapshot_id));
     {
-        let mut f = std::fs::File::create(&meta_tmp).map_err(io)?;
-        f.write_all(&serde_json::to_vec(meta).map_err(|e| encode_err("snapshot meta", e))?)
-            .map_err(io)?;
-        f.sync_all().map_err(io)?;
+        let mut f = std::fs::File::create(&meta_tmp)?;
+        f.write_all(&serde_json::to_vec(meta).map_err(std::io::Error::other)?)?;
+        f.sync_all()?;
     }
-    std::fs::rename(&meta_tmp, dir.join(format!("{}.meta", meta.snapshot_id))).map_err(io)?;
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io)?;
+    std::fs::rename(&meta_tmp, dir.join(format!("{}.meta", meta.snapshot_id)))?;
+    std::fs::File::open(dir).and_then(|d| d.sync_all())?;
     // Everything else: older snapshots, and what a crash left half-written.
-    for e in std::fs::read_dir(dir).map_err(io)?.filter_map(Result::ok) {
+    for e in std::fs::read_dir(dir)?.filter_map(Result::ok) {
         let name = e.file_name();
         let name = name.to_string_lossy();
         let ours = name == format!("{}.data", meta.snapshot_id)
@@ -852,6 +1013,108 @@ fn keep_snapshot(
         }
     }
     Ok(())
+}
+
+/// Remove what a snapshot that failed to be kept as `id` left: its file at
+/// `tmp`, and its data and half-written description unless its
+/// description was written (it is then whole, and current).
+fn discard_unkept(dir: &Path, tmp: &Path, id: &str) {
+    let _ = std::fs::remove_file(tmp);
+    if !dir.join(format!("{id}.meta")).exists() {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.data")));
+        let _ = std::fs::remove_file(dir.join(format!("{id}.meta.tmp")));
+    }
+}
+
+/// Remove what snapshots a crash interrupted left in `dir` (a file being
+/// built or copied, a description half-written, data without its
+/// description): on a full filesystem it holds room the next snapshot
+/// needs. Nothing is being written at open.
+fn clear_partial_snapshots(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.filter_map(Result::ok) {
+        let path = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let partial = name.ends_with(".snap")
+            || name.ends_with(".tmp")
+            || (name.ends_with(".data") && !path.with_extension("meta").exists());
+        if partial {
+            tracing::info!(
+                "removing {}, left by an unfinished snapshot",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Why a snapshot wasn't built.
+enum Unbuilt {
+    /// The filesystem had no room for it, or not above the reserve: a
+    /// later try may.
+    NoRoom(String),
+    Failed(StorageError<NodeId>),
+}
+
+/// How much a snapshot writes between two looks at the free space.
+const SNAPSHOT_ROOM_EVERY: u64 = 16 << 20;
+
+/// A snapshot's file as it is written: the write stops, out of space,
+/// before it eats into meta's reserve, and says when the filesystem had no
+/// room for it.
+struct RoomFor<'a> {
+    file: &'a std::fs::File,
+    space: &'a DiskSpace,
+    /// Written since the free space was last looked at.
+    unchecked: u64,
+    /// Why the write was stopped for want of room, if it was.
+    no_room: Option<String>,
+}
+
+impl<'a> RoomFor<'a> {
+    fn new(file: &'a std::fs::File, space: &'a DiskSpace) -> Self {
+        Self {
+            file,
+            space,
+            unchecked: 0,
+            no_room: None,
+        }
+    }
+}
+
+impl Write for RoomFor<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.unchecked >= SNAPSHOT_ROOM_EVERY {
+            self.unchecked = 0;
+            if let Err(e) = self.space.admit_snapshot(SNAPSHOT_ROOM_EVERY) {
+                self.no_room = Some(e.to_string());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    e.to_string(),
+                ));
+            }
+        }
+        match (&mut &*self.file).write(buf) {
+            Ok(n) => {
+                self.unchecked += n as u64;
+                Ok(n)
+            }
+            Err(e) => {
+                if objectio_common::error::is_out_of_space(&e) {
+                    self.space.out_of_space();
+                    self.no_room = Some(e.to_string());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&mut &*self.file).flush()
+    }
 }
 
 /// A kept snapshot: its data file and its description.
@@ -941,11 +1204,46 @@ fn get_string(src: &mut impl Read) -> Result<String, String> {
 }
 
 impl RaftSnapshotBuilder<MetaTypeConfig> for MetaRaftStorage {
+    /// A snapshot of the state machine as it is. openraft stops for good on
+    /// an error here, so one the filesystem has no room for (above the
+    /// reserve) waits, and is tried again every [`SNAPSHOT_ROOM_RETRY`]
+    /// until it fits. openraft builds in a task of its own: Raft goes on
+    /// meanwhile, without compacting its log.
     async fn build_snapshot(&mut self) -> Result<Snapshot<MetaTypeConfig>, StorageError<NodeId>> {
-        // The state captured is made durable first: the log is purged up to
-        // it next, and a crash must not roll `last_applied` back below that.
-        self.checkpoint()?;
-        self.snapshot_of().await
+        let mut waiting: Option<(std::time::Instant, std::time::Instant)> = None;
+        loop {
+            match self.try_build_snapshot(waiting.is_some()).await? {
+                Ok(snapshot) => {
+                    if let Some((since, _)) = waiting {
+                        tracing::info!(
+                            "raft snapshot built after waiting {:.0} s",
+                            since.elapsed().as_secs_f64()
+                        );
+                    }
+                    return Ok(snapshot);
+                }
+                Err(why) => {
+                    let now = std::time::Instant::now();
+                    match &mut waiting {
+                        None => {
+                            tracing::warn!(
+                                "raft snapshot waits ({why}); the log isn't compacted meanwhile"
+                            );
+                            waiting = Some((now, now));
+                        }
+                        Some((since, told)) if told.elapsed() >= WAITING_TOLD_EVERY => {
+                            tracing::warn!(
+                                "raft snapshot still waiting after {:.0} s ({why})",
+                                since.elapsed().as_secs_f64()
+                            );
+                            *told = now;
+                        }
+                        Some(_) => {}
+                    }
+                    tokio::time::sleep(SNAPSHOT_ROOM_RETRY).await;
+                }
+            }
+        }
     }
 }
 
@@ -1048,8 +1346,10 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                     .map_err(|err| encode_err("raft log entry", err))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Synced before it returns.
-        self.log.lock().append(&records).map_err(write_err)
+        // Synced before it returns; with no room, cut off and tried again
+        // until there is.
+        self.until_room("an append", |log| log.append(&records))
+            .await
     }
 
     async fn delete_conflict_logs_since(
@@ -1067,9 +1367,13 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
         // `last_applied` back below entries no longer in the log.
         self.checkpoint()?;
         let caller = serde_json::to_vec(&Some(log_id)).map_err(|e| encode_err("purged", e))?;
-        let mut log = self.log.lock();
-        log.record_purge(log_id.index, &caller).map_err(write_err)?;
-        log.purge_upto(log_id.index).map_err(write_err)
+        // The record is a small file replaced whole; with no room, nothing
+        // is purged until there is.
+        self.until_room("a purge record", |log| {
+            log.record_purge(log_id.index, &caller)
+        })
+        .await?;
+        self.log.lock().purge_upto(log_id.index).map_err(write_err)
     }
 
     async fn last_applied_state(
@@ -1165,8 +1469,13 @@ impl RaftStorage<MetaTypeConfig> for MetaRaftStorage {
                 .seek(std::io::SeekFrom::Start(0))
                 .map_err(|e| decode_err("snapshot", e))?;
             let (copy, tmp) = snapshot_file(&dir, "recv")?;
-            std::io::copy(&mut received, &mut &copy).map_err(|e| encode_err("snapshot", e))?;
-            keep_snapshot(&dir, &copy, &tmp, &meta_owned)
+            std::io::copy(&mut received, &mut &copy)
+                .map(drop)
+                .and_then(|()| keep_snapshot(&dir, &copy, &tmp, &meta_owned))
+                .map_err(|e| {
+                    discard_unkept(&dir, &tmp, &meta_owned.snapshot_id);
+                    encode_err("snapshot", e)
+                })
         })
         .await
         .map_err(|e| decode_err("snapshot", std::io::Error::other(e)))??;
@@ -2275,5 +2584,183 @@ mod snapshot_tests {
             .await
             .unwrap();
         assert!(matches!(rx.try_recv(), Ok(ApplyEvent::SnapshotInstalled)));
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    //! A filesystem without room: openraft stops for good on an error, so
+    //! what can wait for room waits, and nothing a full filesystem cut
+    //! short is left behind or taken for data.
+
+    use super::tests::normal_entry;
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A storage whose free space is read from `<dir>/free`.
+    fn storage(free: u64, reserve: u64) -> (TempDir, MetaRaftStorage) {
+        let dir = TempDir::new().unwrap();
+        set_free(&dir, free);
+        let db = Database::create(dir.path().join("meta.db")).unwrap();
+        let space = DiskSpace::with_free_bytes_file(dir.path(), reserve, &dir.path().join("free"));
+        let s = MetaRaftStorage::open(
+            Arc::new(db),
+            dir.path().join("snapshots"),
+            &dir.path().join("raft-log"),
+        )
+        .unwrap()
+        .with_disk_space(Arc::new(space));
+        (dir, s)
+    }
+
+    fn set_free(dir: &TempDir, free: u64) {
+        std::fs::write(dir.path().join("free"), free.to_string()).unwrap();
+    }
+
+    fn put(s: &MetaRaftStorage, key: &str, len: usize) {
+        let txn = s.db.begin_write().unwrap();
+        {
+            let mut t = txn
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new("buckets"))
+                .unwrap();
+            t.insert(key, vec![7u8; len].as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn config(index: u64) -> Entry {
+        normal_entry(
+            index,
+            MetaCommand::SetConfig {
+                key: format!("k{index}"),
+                value: b"v".to_vec(),
+                updated_by: "t".into(),
+                updated_at: 1,
+            },
+        )
+    }
+
+    fn snapshot_files(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("snapshots"))
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A log append that finds the filesystem full waits for room and then
+    /// lands, once: openraft never sees the error, which would stop the
+    /// node for good. Until then the node counts as having no room.
+    #[tokio::test]
+    async fn a_log_append_with_no_room_waits_and_lands_once() {
+        let (_d, mut s) = storage(u64::MAX / 4, 0);
+        s.append_to_log(vec![config(1)]).await.unwrap();
+        s.log
+            .lock()
+            .fail_next_write(10, std::io::ErrorKind::StorageFull);
+        let started = std::time::Instant::now();
+        s.append_to_log(vec![config(2), config(3)]).await.unwrap();
+        assert!(started.elapsed() >= LOG_ROOM_RETRY, "it waited for room");
+        assert!(s.space.starved(), "no room, for now");
+        assert!(s.space.admit_write().is_err());
+        let held: Vec<u64> = s
+            .try_get_log_entries(1..10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.log_id.index)
+            .collect();
+        assert_eq!(held, [1, 2, 3]);
+    }
+
+    /// A snapshot with no room above the reserve writes nothing and says
+    /// why; once there is room it is built.
+    #[tokio::test]
+    async fn a_snapshot_without_room_above_the_reserve_waits_and_writes_nothing() {
+        let (dir, s) = storage(999, 1000);
+        put(&s, "b", 100);
+        let why = s.try_build_snapshot(false).await.unwrap().unwrap_err();
+        assert!(why.contains("999 bytes free"), "{why}");
+        assert!(
+            snapshot_files(&dir).is_empty(),
+            "{:?}",
+            snapshot_files(&dir)
+        );
+
+        set_free(&dir, 1 << 40);
+        let built = s.try_build_snapshot(true).await.unwrap().unwrap();
+        let current = s.current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, built.meta);
+    }
+
+    /// A snapshot that would eat into the reserve stops part way: what it
+    /// wrote is removed and the one kept before stays current. That is no
+    /// full filesystem: new writes are still taken.
+    #[tokio::test]
+    async fn a_snapshot_that_would_eat_into_the_reserve_stops_and_leaves_nothing() {
+        let (dir, s) = storage(1 << 40, 1000);
+        put(&s, "small", 10);
+        let kept = s.try_build_snapshot(false).await.unwrap().unwrap();
+        let before = snapshot_files(&dir);
+        assert_eq!(before.len(), 2, "{before:?}");
+        for i in 0..20 {
+            put(&s, &format!("big{i}"), 1 << 20);
+        }
+        // Room for one as large as the last, not for 16 MiB more.
+        set_free(&dir, 1000 + (1 << 20));
+        let why = s.try_build_snapshot(false).await.unwrap().unwrap_err();
+        assert!(
+            why.contains(&format!("{} needed above 1000", 16 << 20)),
+            "stopped part way: {why}"
+        );
+        assert_eq!(snapshot_files(&dir), before);
+        let current = s.current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, kept.meta);
+        s.space.admit_write().unwrap();
+    }
+
+    /// A snapshot's write the filesystem refuses (ENOSPC, from /dev/full)
+    /// is no room, not a failure, and counts as no room for a while.
+    #[test]
+    fn a_full_device_stops_a_snapshot_as_no_room() {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let dir = TempDir::new().unwrap();
+        let space = DiskSpace::new(dir.path(), 0);
+        let mut out = RoomFor::new(&full, &space);
+        let e = out.write_all(&[0u8; 4096]).unwrap_err();
+        assert!(objectio_common::error::is_out_of_space(&e), "{e}");
+        assert!(out.no_room.is_some());
+        assert!(space.starved());
+    }
+
+    /// What a snapshot interrupted by a crash left (a file being built, a
+    /// description half-written, data without one) is removed at open, so
+    /// it doesn't hold room the next one needs; the kept one stays.
+    #[tokio::test]
+    async fn what_an_interrupted_snapshot_left_is_removed_at_open() {
+        let (dir, s) = storage(1 << 40, 0);
+        put(&s, "b", 10);
+        s.try_build_snapshot(false).await.unwrap().unwrap();
+        let kept = snapshot_files(&dir);
+        drop(s);
+        let snaps = dir.path().join("snapshots");
+        for junk in [
+            "build-1-2.snap",
+            "meta-snap-9-9.meta.tmp",
+            "meta-snap-9-9.data",
+        ] {
+            std::fs::write(snaps.join(junk), b"junk").unwrap();
+        }
+        let db = Database::open(dir.path().join("meta.db")).unwrap();
+        let s = MetaRaftStorage::open(Arc::new(db), snaps, &dir.path().join("raft-log")).unwrap();
+        assert_eq!(snapshot_files(&dir), kept);
+        assert!(s.current_snapshot().await.unwrap().is_some());
     }
 }

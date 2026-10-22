@@ -19,6 +19,8 @@ tonic = { workspace = true }
 prost = { workspace = true }
 parking_lot = { workspace = true }
 crc32c = { workspace = true }
+# statvfs: the free space under the data directory (`disk_space`).
+nix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

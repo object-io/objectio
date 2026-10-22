@@ -10,7 +10,9 @@
 //!
 //! little-endian, the checksum over everything after it. An append is
 //! written to the last segment and synced (`fdatasync`) before it returns;
-//! a new segment is followed by a sync of the directory. Two small files
+//! a new segment is followed by a sync of the directory. An append the
+//! filesystem had no room for (ENOSPC, EDQUOT) is cut off where it began,
+//! so it can be tried again; a failed sync is never retried. Two small files
 //! sit beside the segments: `purged` (the purged log id) and `committed`
 //! (the commit index openraft last gave), each replaced whole through a
 //! temporary file and a rename.
@@ -83,6 +85,15 @@ pub enum LogError {
     Misuse(String),
 }
 
+impl LogError {
+    /// Whether this is the filesystem out of room (ENOSPC, EDQUOT): an
+    /// append that failed so was cut off, and can be tried again.
+    #[must_use]
+    pub fn is_out_of_space(&self) -> bool {
+        matches!(self, Self::Io { source, .. } if objectio_common::error::is_out_of_space(source))
+    }
+}
+
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> LogError + '_ {
     move |source| LogError::Io {
         path: path.to_path_buf(),
@@ -114,6 +125,10 @@ pub struct RaftLog {
     positions: VecDeque<Pos>,
     /// The index of `positions[0]` (when there are records).
     first: u64,
+    /// Tests: the next append's write stops after this many bytes and
+    /// fails as this kind of error.
+    #[cfg(test)]
+    fail_next_write: Option<(usize, io::ErrorKind)>,
 }
 
 fn sync_dir(dir: &Path) -> Result<(), LogError> {
@@ -284,6 +299,8 @@ impl RaftLog {
             segments: Vec::new(),
             positions: VecDeque::new(),
             first: 0,
+            #[cfg(test)]
+            fail_next_write: None,
         };
         let count = firsts.len();
         for (n, first) in firsts.into_iter().enumerate() {
@@ -608,11 +625,14 @@ impl RaftLog {
             buf.extend_from_slice(entry);
             expect += 1;
         }
+        if let Err(e) = self.write_at(segment, &buf, base) {
+            return Err(self.append_failed(segment, base, new_segment, e));
+        }
         let seg = &mut self.segments[segment];
-        seg.file
-            .write_all_at(&buf, base)
-            .and_then(|()| seg.file.sync_data())
-            .map_err(io_err(&seg.path))?;
+        // A failed sync is never tried again: the kernel may have dropped
+        // the pages it couldn't write, so nothing in the file can be taken
+        // as durable. openraft stops the node, which reopens the log.
+        seg.file.sync_data().map_err(io_err(&seg.path))?;
         seg.len += buf.len() as u64;
         if new_segment {
             sync_dir(&self.dir)?;
@@ -622,6 +642,67 @@ impl RaftLog {
         }
         self.positions.extend(positions);
         Ok(())
+    }
+
+    /// Tests: make the next append's write stop after `after` bytes and
+    /// fail as `kind`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&mut self, after: usize, kind: io::ErrorKind) {
+        self.fail_next_write = Some((after, kind));
+    }
+
+    fn write_at(&mut self, segment: usize, buf: &[u8], at: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some((after, kind)) = self.fail_next_write.take() {
+            self.segments[segment]
+                .file
+                .write_all_at(&buf[..after.min(buf.len())], at)?;
+            return Err(io::Error::new(kind, "injected write failure"));
+        }
+        self.segments[segment].file.write_all_at(buf, at)
+    }
+
+    /// The error for an append whose write to `segment` at `base` failed.
+    /// One the filesystem had no room for is cut off where it began (and a
+    /// segment it started is removed), so the log is as it was and the
+    /// append can be tried again once there is room. Nothing is synced for
+    /// the cut: the next append writes over it and its sync covers the
+    /// file's new end; a crash before that leaves at most a torn tail,
+    /// which the open cuts off. Any other failure, or a cut that fails, is
+    /// returned as it is.
+    fn append_failed(
+        &mut self,
+        segment: usize,
+        base: u64,
+        new_segment: bool,
+        e: io::Error,
+    ) -> LogError {
+        let path = self.segments[segment].path.clone();
+        if !objectio_common::error::is_out_of_space(&e) {
+            return io_err(&path)(e);
+        }
+        let cut = if new_segment {
+            let seg = self.segments.pop().expect("the segment just started");
+            fs::remove_file(&seg.path)
+        } else {
+            self.segments[segment].file.set_len(base)
+        };
+        match cut {
+            // The caller says so, once, while it waits for room.
+            Ok(()) => {
+                tracing::debug!(
+                    "raft log {}: no room for an append ({e}); it is not in the log",
+                    path.display()
+                );
+                io_err(&path)(e)
+            }
+            Err(cut) => LogError::Io {
+                path,
+                source: io::Error::other(format!(
+                    "{e}, and what it left could not be cut off: {cut}"
+                )),
+            },
+        }
     }
 
     fn start_segment(&mut self, first: u64) -> Result<(), LogError> {
@@ -737,10 +818,17 @@ impl RaftLog {
     pub fn write_marker(&self, name: &str, bytes: &[u8], sync: bool) -> Result<(), LogError> {
         let tmp = self.dir.join(format!("{name}.tmp"));
         let path = self.dir.join(name);
-        let mut f = File::create(&tmp).map_err(io_err(&tmp))?;
-        f.write_all(bytes).map_err(io_err(&tmp))?;
-        if sync {
-            f.sync_all().map_err(io_err(&tmp))?;
+        let written = File::create(&tmp).and_then(|mut f| {
+            f.write_all(bytes)?;
+            if sync {
+                f.sync_all()?;
+            }
+            Ok(())
+        });
+        if let Err(e) = written {
+            // Not left to hold what little room there may be.
+            let _ = fs::remove_file(&tmp);
+            return Err(io_err(&tmp)(e));
         }
         fs::rename(&tmp, &path).map_err(io_err(&path))?;
         if sync {
@@ -974,6 +1062,67 @@ mod tests {
     fn big(index: u64, term: u64) -> (u64, u64, Vec<u8>) {
         let fill = u8::try_from(index % 251).unwrap();
         (index, term, vec![fill; (SEGMENT_BYTES / 3) as usize])
+    }
+
+    /// An append the filesystem had no room for, part of it written: it
+    /// fails as out of space, the log holds what it held (in memory and in
+    /// the file), and the same append succeeds once tried again.
+    #[test]
+    fn an_append_with_no_room_is_cut_off_and_can_be_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1), rec(2, 1)]).unwrap();
+        let len = fs::metadata(&log.segments[0].path).unwrap().len();
+        for kind in [io::ErrorKind::StorageFull, io::ErrorKind::QuotaExceeded] {
+            log.fail_next_write = Some((30, kind));
+            let err = log.append(&[rec(3, 2), rec(4, 2)]).expect_err("no room");
+            assert!(err.is_out_of_space(), "{err}");
+            assert_eq!(log.range(), Some((1, 2)));
+            assert_eq!(fs::metadata(&log.segments[0].path).unwrap().len(), len);
+        }
+        log.append(&[rec(3, 2), rec(4, 2)]).unwrap();
+        drop(log);
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(
+            texts(&log, 1, 5),
+            ["entry 1", "entry 2", "entry 3", "entry 4"]
+        );
+    }
+
+    /// An append with no room that started a segment: the segment goes
+    /// with it, and the next try starts it again.
+    #[test]
+    fn an_append_with_no_room_in_a_new_segment_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        for i in 1..=3 {
+            log.append(&[big(i, 1)]).unwrap();
+        }
+        assert_eq!(log.segments.len(), 1);
+        log.fail_next_write = Some((100, io::ErrorKind::StorageFull));
+        let err = log.append(&[big(4, 1)]).expect_err("no room");
+        assert!(err.is_out_of_space(), "{err}");
+        assert_eq!(log.segments.len(), 1);
+        assert!(!dir.path().join(segment_name(4)).exists());
+        log.append(&[big(4, 1)]).unwrap();
+        assert_eq!(log.segments.len(), 2);
+        drop(log);
+        let log = RaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.range(), Some((1, 4)));
+        assert_eq!(log.read(1, 5).unwrap().len(), 4);
+    }
+
+    /// A write that failed for another reason is no room problem, and is
+    /// not taken back.
+    #[test]
+    fn another_write_failure_is_not_out_of_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RaftLog::open(dir.path()).unwrap();
+        log.append(&[rec(1, 1)]).unwrap();
+        log.fail_next_write = Some((5, io::ErrorKind::Other));
+        let err = log.append(&[rec(2, 1)]).expect_err("failed");
+        assert!(!err.is_out_of_space(), "{err}");
+        assert_eq!(log.range(), Some((1, 1)));
     }
 
     #[test]

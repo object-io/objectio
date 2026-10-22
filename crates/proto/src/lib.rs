@@ -46,6 +46,29 @@ impl metadata::ObjectMeta {
 /// it knows. The gateway takes it as "place again".
 pub const STALE_EPOCH_HEADER: &str = "x-objectio-pg-epoch";
 
+/// The gRPC metadata on a call meta refused because it has no room for
+/// it: the filesystem under the leader's data (or a majority's) is below
+/// meta's reserve. ResourceExhausted alone also means a quota (a tenant's
+/// buckets) or a connection told to calm down; this says which.
+pub const NO_ROOM_HEADER: &str = "x-objectio-no-room";
+
+/// A refusal for want of room ([`NO_ROOM_HEADER`]).
+#[must_use]
+pub fn no_room(message: impl Into<String>) -> tonic::Status {
+    let mut s = tonic::Status::resource_exhausted(message);
+    s.metadata_mut().insert(
+        NO_ROOM_HEADER,
+        tonic::metadata::MetadataValue::from_static("1"),
+    );
+    s
+}
+
+/// Whether `s` is a refusal for want of room ([`no_room`]).
+#[must_use]
+pub fn is_no_room(s: &tonic::Status) -> bool {
+    s.code() == tonic::Code::ResourceExhausted && s.metadata().contains_key(NO_ROOM_HEADER)
+}
+
 /// Block service (volume and snapshot management)
 pub mod block {
     tonic::include_proto!("objectio.block");
@@ -76,3 +99,20 @@ pub mod dedup;
 // How a stripe is written, shared by the gateway and the block gateway.
 #[warn(clippy::pedantic, clippy::nursery)]
 pub mod stripe;
+
+#[cfg(test)]
+mod no_room_tests {
+    use super::{is_no_room, no_room};
+
+    /// The mark survives the wire (a status sent as HTTP headers and read
+    /// back), and only a refusal for room carries it: another
+    /// ResourceExhausted (a quota) doesn't.
+    #[test]
+    fn a_refusal_for_room_is_told_from_other_resource_exhaustion() {
+        let sent = no_room("no room").into_http();
+        let back = tonic::Status::from_header_map(sent.headers()).expect("a status");
+        assert!(is_no_room(&back), "{back:?}");
+        assert!(!is_no_room(&tonic::Status::resource_exhausted("quota")));
+        assert!(!is_no_room(&tonic::Status::unavailable("no room")));
+    }
+}

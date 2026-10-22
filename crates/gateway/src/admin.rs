@@ -1685,6 +1685,7 @@ pub async fn admin_create_bucket(
         .into_response(),
         Err(e) => {
             let status = match e.code() {
+                _ if objectio_proto::is_no_room(&e) => StatusCode::INSUFFICIENT_STORAGE,
                 tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
                 tonic::Code::AlreadyExists => StatusCode::CONFLICT,
                 _ => StatusCode::BAD_REQUEST,
@@ -2443,9 +2444,12 @@ pub async fn admin_list_recipients_tenant(
 
 /// A failed meta call, as the admin API answers it: 503 (retry) when meta
 /// was unavailable, ran out of time or the connection dropped, as the S3
-/// API answers it; 500 otherwise. The body is meta's message.
+/// API answers it; 507 when meta has no room for a write; 500 otherwise.
+/// The body is meta's message.
 pub(crate) fn meta_failure(e: &tonic::Status) -> Response {
-    let status = if crate::s3::S3Error::is_unavailable(e) {
+    let status = if objectio_proto::is_no_room(e) {
+        StatusCode::INSUFFICIENT_STORAGE
+    } else if crate::s3::S3Error::is_unavailable(e) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -3386,6 +3390,7 @@ pub async fn admin_usage(auth: Option<Extension<AuthResult>>, headers: HeaderMap
 
 fn status_response(e: &tonic::Status) -> Response {
     let code = match e.code() {
+        _ if objectio_proto::is_no_room(e) => StatusCode::INSUFFICIENT_STORAGE,
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
         tonic::Code::Aborted => StatusCode::CONFLICT,
@@ -3593,6 +3598,7 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 
 fn grpc_error(e: &tonic::Status) -> Response {
     let status = match e.code() {
+        _ if objectio_proto::is_no_room(e) => StatusCode::INSUFFICIENT_STORAGE,
         tonic::Code::NotFound => StatusCode::NOT_FOUND,
         tonic::Code::AlreadyExists | tonic::Code::Aborted => StatusCode::CONFLICT,
         tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => StatusCode::BAD_REQUEST,

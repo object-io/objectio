@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openraft::BasicNode;
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
+use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -73,12 +73,42 @@ impl ChannelCache {
     }
 }
 
+/// The followers that last refused this leader's entries for want of room
+/// (below half their reserve, `crate::disk_space`), until one takes them
+/// again. A leader that can't count a majority without them refuses new
+/// writes rather than accept what it can't commit.
+#[derive(Clone, Default)]
+pub struct PeersWithoutRoom {
+    inner: Arc<Mutex<std::collections::BTreeSet<NodeId>>>,
+}
+
+impl PeersWithoutRoom {
+    fn refused(&self, peer: NodeId) {
+        if self.inner.lock().insert(peer) {
+            tracing::warn!("meta node {peer} has no room for log entries");
+        }
+    }
+
+    fn took(&self, peer: NodeId) {
+        if self.inner.lock().remove(&peer) {
+            tracing::info!("meta node {peer} takes log entries again");
+        }
+    }
+
+    /// The peers without room.
+    #[must_use]
+    pub fn get(&self) -> std::collections::BTreeSet<NodeId> {
+        self.inner.lock().clone()
+    }
+}
+
 /// Factory openraft calls on startup / membership change to get a network
 /// handle per peer. Owns the shared connection cache.
 #[derive(Clone, Default)]
 pub struct MetaRaftNetworkFactory {
     self_id: u64,
     channels: ChannelCache,
+    without_room: PeersWithoutRoom,
 }
 
 impl MetaRaftNetworkFactory {
@@ -87,7 +117,15 @@ impl MetaRaftNetworkFactory {
         Self {
             self_id,
             channels: ChannelCache::default(),
+            without_room: PeersWithoutRoom::default(),
         }
+    }
+
+    /// The followers that refuse entries for want of room, as this node's
+    /// replication finds them.
+    #[must_use]
+    pub fn peers_without_room(&self) -> PeersWithoutRoom {
+        self.without_room.clone()
     }
 }
 
@@ -100,6 +138,7 @@ impl RaftNetworkFactory<MetaTypeConfig> for MetaRaftNetworkFactory {
             target,
             target_addr: node.addr.clone(),
             channels: self.channels.clone(),
+            without_room: self.without_room.clone(),
         }
     }
 }
@@ -108,12 +147,10 @@ impl RaftNetworkFactory<MetaTypeConfig> for MetaRaftNetworkFactory {
 /// target; every RPC opens a fresh tonic client using the cached channel.
 pub struct MetaRaftNetwork {
     self_id: u64,
-    /// Target peer node id — preserved for telemetry / future retry
-    /// logic that differentiates per-peer error budgets.
-    #[allow(dead_code)]
     target: u64,
     target_addr: String,
     channels: ChannelCache,
+    without_room: PeersWithoutRoom,
 }
 
 impl MetaRaftNetwork {
@@ -142,7 +179,7 @@ impl MetaRaftNetwork {
                 Output = Result<tonic::Response<objectio_proto::raft::RaftEnvelope>, tonic::Status>,
             >,
     {
-        let client = self.client().map_err(|e| RpcErr(e.0))?;
+        let client = self.client().map_err(|e| RpcErr::from(e.0))?;
         match tokio::time::timeout(option.hard_ttl(), rpc(client)).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(s)) => {
@@ -153,7 +190,7 @@ impl MetaRaftNetwork {
             }
             Err(_) => {
                 self.channels.forget(&self.target_addr);
-                Err(RpcErr(format!(
+                Err(RpcErr::from(format!(
                     "no answer from {} within {:?}",
                     self.target_addr,
                     option.hard_ttl()
@@ -178,18 +215,34 @@ impl MetaRaftNetwork {
 struct TransportErr(String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct RpcErr(String);
+#[error("{message}")]
+struct RpcErr {
+    message: String,
+    /// The peer refused for want of room (`objectio_proto::no_room`).
+    no_room: bool,
+}
+
+impl From<String> for RpcErr {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            no_room: false,
+        }
+    }
+}
 
 impl From<tonic::Status> for RpcErr {
     fn from(s: tonic::Status) -> Self {
-        RpcErr(format!("{}: {}", s.code(), s.message()))
+        Self {
+            message: format!("{}: {}", s.code(), s.message()),
+            no_room: objectio_proto::is_no_room(&s),
+        }
     }
 }
 
 impl From<serde_json::Error> for RpcErr {
     fn from(e: serde_json::Error) -> Self {
-        RpcErr(format!("decode: {e}"))
+        Self::from(format!("decode: {e}"))
     }
 }
 
@@ -199,14 +252,27 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
         rpc: AppendEntriesRequest<MetaTypeConfig>,
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let carries_entries = !rpc.entries.is_empty();
         let payload = serde_json::to_vec(&rpc).expect("openraft payload must serialize");
         let envelope = self.envelope(payload);
-        let resp = self
+        let resp = match self
             .call(&option, |mut c| async move {
                 c.append_entries(tonic::Request::new(envelope)).await
             })
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        {
+            Ok(resp) => resp,
+            // Unreachable, not a network error: openraft backs off before
+            // it sends the entries again, rather than at once.
+            Err(e) if e.no_room => {
+                self.without_room.refused(self.target);
+                return Err(RPCError::Unreachable(Unreachable::new(&e)));
+            }
+            Err(e) => return Err(RPCError::Network(NetworkError::new(&e))),
+        };
+        if carries_entries {
+            self.without_room.took(self.target);
+        }
         serde_json::from_slice::<AppendEntriesResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
     }
@@ -221,12 +287,24 @@ impl RaftNetwork<MetaTypeConfig> for MetaRaftNetwork {
     > {
         let payload = serde_json::to_vec(&rpc).expect("openraft payload must serialize");
         let envelope = self.envelope(payload);
-        let resp = self
+        let resp = match self
             .call(&option, |mut c| async move {
                 c.install_snapshot(tonic::Request::new(envelope)).await
             })
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        {
+            Ok(resp) => resp,
+            Err(e) if e.no_room => {
+                self.without_room.refused(self.target);
+                // openraft sends the chunk again at once, whatever the
+                // error: wait out the call's time first, so a follower
+                // without room isn't sent it a thousand times a second.
+                tokio::time::sleep(option.hard_ttl()).await;
+                return Err(RPCError::Unreachable(Unreachable::new(&e)));
+            }
+            Err(e) => return Err(RPCError::Network(NetworkError::new(&e))),
+        };
+        self.without_room.took(self.target);
         serde_json::from_slice::<InstallSnapshotResponse<NodeId>>(&resp.into_inner().payload)
             .map_err(|e| RPCError::Network(NetworkError::new(&RpcErr::from(e))))
     }

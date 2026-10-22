@@ -22,11 +22,16 @@
 //! One the state machine refuses all the same (what the store holds) is
 //! answered `MetaResponse::Rejected`, which reaches its caller as
 //! [`WriteError::Refused`], and the other commands of its entry apply.
+//!
+//! A leader without room refuses a write before proposing it too
+//! ([`WriteError::NoRoom`]): when the filesystem under its data is below
+//! meta's reserve, or a majority of the voters can't take entries
+//! (objectio-docs `core/meta.md`, "A full disk").
 
 use std::ops::Deref;
 use std::sync::Arc;
 
-use objectio_meta_store::{MetaCommand, MetaResponse, MetaTypeConfig};
+use objectio_meta_store::{DiskSpace, MetaCommand, MetaResponse, MetaTypeConfig, PeersWithoutRoom};
 use openraft::BasicNode;
 use openraft::error::{ClientWriteError, Fatal, RaftError};
 use openraft::raft::ClientWriteResponse;
@@ -44,6 +49,9 @@ pub enum WriteError {
     /// answered `MetaResponse::Rejected` by the state machine. Nothing was
     /// written.
     Refused(String),
+    /// The leader has no room for it: refused before it was proposed, and
+    /// taken again once there is room. Nothing was written.
+    NoRoom(String),
 }
 
 impl std::fmt::Display for WriteError {
@@ -51,6 +59,7 @@ impl std::fmt::Display for WriteError {
         match self {
             Self::Raft(e) => e.fmt(f),
             Self::Refused(reason) => write!(f, "refused: {reason}"),
+            Self::NoRoom(why) => write!(f, "{why}"),
         }
     }
 }
@@ -78,6 +87,15 @@ type Pending = (MetaCommand, oneshot::Sender<WriteResult>);
 pub struct MetaRaft {
     raft: Arc<Raft>,
     tx: mpsc::UnboundedSender<Pending>,
+    /// What decides whether there is room for a write: none, always.
+    room: Option<Room>,
+}
+
+/// Where a leader's writes must find room: its own filesystem, and a
+/// majority of voters that take entries.
+pub struct Room {
+    pub space: Arc<DiskSpace>,
+    pub peers: PeersWithoutRoom,
 }
 
 impl Deref for MetaRaft {
@@ -94,7 +112,49 @@ impl MetaRaft {
     pub fn new(raft: Arc<Raft>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(batcher(Arc::clone(&raft), rx));
-        Self { raft, tx }
+        Self {
+            raft,
+            tx,
+            room: None,
+        }
+    }
+
+    /// [`Self::new`], refusing writes, as leader, while `room` has none.
+    #[must_use]
+    pub fn with_room(raft: Arc<Raft>, room: Room) -> Self {
+        Self {
+            room: Some(room),
+            ..Self::new(raft)
+        }
+    }
+
+    /// Why this node, leading, has no room for a write, if it hasn't:
+    /// less than the reserve free under its data, or too few voters that
+    /// take entries to commit it. A follower doesn't refuse: its write
+    /// goes to openraft, which says who leads.
+    fn no_room(&self) -> Option<String> {
+        let room = self.room.as_ref()?;
+        let (voters, leading) = {
+            let m = self.raft.metrics();
+            let m = m.borrow();
+            let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+            (voters, m.state == openraft::ServerState::Leader)
+        };
+        if !leading {
+            return None;
+        }
+        if let Err(e) = room.space.admit_write() {
+            return Some(format!("meta can't take writes: {e}"));
+        }
+        let without = room.peers.get();
+        let with_room = voters.iter().filter(|v| !without.contains(v)).count();
+        (with_room <= voters.len() / 2).then(|| {
+            format!(
+                "meta can't take writes: {} of its {} voters have no room for log entries",
+                voters.len() - with_room,
+                voters.len()
+            )
+        })
     }
 
     /// The Raft itself.
@@ -118,6 +178,9 @@ impl MetaRaft {
         }
         if let Some(reason) = cmd.refusal() {
             return Err(WriteError::Refused(reason));
+        }
+        if let Some(why) = self.no_room() {
+            return Err(WriteError::NoRoom(why));
         }
         let (tx, rx) = oneshot::channel();
         if self.tx.send((cmd, tx)).is_err() {
@@ -272,6 +335,39 @@ pub(crate) mod tests {
             }],
             requested_by: "test".into(),
         }
+    }
+
+    /// A leader with less than its reserve free refuses a write before
+    /// proposing it (nothing reaches the log), and takes writes again once
+    /// there is room, without a restart.
+    #[tokio::test]
+    async fn a_leader_without_room_refuses_writes_until_there_is_room() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let raft = single_node(dir.path()).await;
+        let free = dir.path().join("free");
+        std::fs::write(&free, "999").unwrap();
+        let space = DiskSpace::with_free_bytes_file(dir.path(), 1000, &free);
+        let meta = MetaRaft::with_room(
+            raft.clone(),
+            Room {
+                space: Arc::new(space),
+                peers: PeersWithoutRoom::default(),
+            },
+        );
+        let before = raft.metrics().borrow().last_log_index;
+        match meta.client_write(create("a")).await.err() {
+            Some(WriteError::NoRoom(why)) => assert!(why.contains("999 bytes free"), "{why}"),
+            other => panic!("expected no room, got {other:?}"),
+        }
+        assert_eq!(
+            raft.metrics().borrow().last_log_index,
+            before,
+            "nothing proposed"
+        );
+
+        std::fs::write(&free, "1000").unwrap();
+        let r = meta.client_write(create("a")).await.unwrap();
+        assert!(matches!(r.data, MetaResponse::MultiCasOk), "{:?}", r.data);
     }
 
     /// Writes made together are committed in fewer entries than writes

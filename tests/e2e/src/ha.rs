@@ -189,6 +189,8 @@ pub struct RaftStatus {
     pub open_repair: bool,
     /// Why the node's Raft has stopped for good, if it has.
     pub fatal: Option<String>,
+    /// Why the node has no room for writes, if it hasn't.
+    pub disk_full: Option<String>,
 }
 
 /// The size of each OSD's disk, a sparse file, unless a test asks for
@@ -863,6 +865,7 @@ impl HaCluster {
                 .unwrap_or_default(),
             open_repair: v["open_repair"].as_bool().unwrap_or(false),
             fatal: v["fatal"].as_str().map(str::to_string),
+            disk_full: v["disk_full"].as_str().map(str::to_string),
         })
     }
 

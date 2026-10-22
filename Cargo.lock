@@ -2775,6 +2775,7 @@ name = "objectio-meta-store"
 version = "0.1.0-dev"
 dependencies = [
  "crc32c",
+ "nix",
  "objectio-common",
  "objectio-proto",
  "openraft",

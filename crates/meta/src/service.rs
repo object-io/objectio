@@ -432,7 +432,9 @@ use uuid::Uuid;
 
 /// Map a meta write's error to a tonic status the gateway / CLI can
 /// interpret. A refused command (it can never apply) is
-/// `InvalidArgument`; ForwardToLeader becomes `FailedPrecondition` with a
+/// `InvalidArgument`; one the leader has no room for is
+/// `ResourceExhausted`, marked as such (`objectio_proto::no_room`), which
+/// the gateway answers 507; ForwardToLeader becomes `FailedPrecondition` with a
 /// message the caller can parse for the leader id; all other errors become
 /// `Internal`.
 fn raft_write_to_status(err: &crate::raft_batch::WriteError) -> tonic::Status {
@@ -440,6 +442,7 @@ fn raft_write_to_status(err: &crate::raft_batch::WriteError) -> tonic::Status {
     use openraft::error::{ClientWriteError, RaftError};
     match err {
         WriteError::Refused(reason) => tonic::Status::invalid_argument(reason.clone()),
+        WriteError::NoRoom(why) => objectio_proto::no_room(why.clone()),
         WriteError::Raft(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
             let leader = f
                 .leader_id
@@ -957,8 +960,8 @@ impl MetaService {
     /// Config mutations routed through Raft become linearizable; without
     /// a handle set, they fall back to the legacy direct-redb path
     /// (useful for in-memory tests).
-    pub fn set_raft(&self, raft: Arc<openraft::Raft<objectio_meta_store::MetaTypeConfig>>) {
-        *self.raft.write() = Some(Arc::new(crate::raft_batch::MetaRaft::new(raft)));
+    pub fn set_raft(&self, raft: crate::raft_batch::MetaRaft) {
+        *self.raft.write() = Some(Arc::new(raft));
     }
 
     /// Current Raft handle, if any: its writes go through meta's group
