@@ -21,10 +21,13 @@ pub struct RewriteShard {
     /// to this gateway, which every read check then passes.
     #[serde(default)]
     record: bool,
+    /// Which of the object's stripes (by index; the first by default).
+    #[serde(default)]
+    stripe: usize,
 }
 
 /// `POST /_admin/test/rewrite-shard`: store wrong bytes for one shard of
-/// an object's first stripe, on the OSD that holds it, as a bad rebuild
+/// one of an object's stripes, on the OSD that holds it, as a bad rebuild
 /// would: the OSD takes them with a checksum of their own, so its checks
 /// pass (B23). With `record`, the object's checksum of the shard is theirs
 /// too.
@@ -61,8 +64,8 @@ pub async fn rewrite_shard(
             Ok(None) => return (StatusCode::NOT_FOUND, "no such object").into_response(),
             Err(e) => return fail(e.to_string()),
         };
-    let Some(stripe) = object.stripes.first() else {
-        return fail("no stripes (inline?)".into());
+    let Some(stripe) = object.stripes.get(req.stripe) else {
+        return fail(format!("no stripe {} (inline?)", req.stripe));
     };
     let Some(loc) = stripe.shards.iter().find(|l| l.position == req.position) else {
         return fail(format!("no shard at position {}", req.position));
@@ -123,7 +126,7 @@ pub async fn rewrite_shard(
     let position = loc.position;
     let expected = object.object_id.clone();
     let mut object = object;
-    if let Some(l) = object.stripes[0]
+    if let Some(l) = object.stripes[req.stripe]
         .shards
         .iter_mut()
         .find(|l| l.position == position)

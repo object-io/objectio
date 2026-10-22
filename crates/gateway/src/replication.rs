@@ -1529,7 +1529,7 @@ async fn read(
                 .map_err(|e| e.to_string())?,
         );
     }
-    let resp = crate::s3::get_object_version(
+    let resp = crate::s3::read_object_version(
         Arc::clone(state),
         job.bucket.clone(),
         job.key.clone(),

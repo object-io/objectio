@@ -614,6 +614,13 @@ impl HaCluster {
     }
 
     /// Stop gateway `i` and start it again from `bins`.
+    /// Gateway `i`'s process id, while it runs: to read its memory from
+    /// `/proc`.
+    #[must_use]
+    pub fn gateway_pid(&self, i: usize) -> Option<u32> {
+        self.gateways[i].child.as_ref().map(Child::id)
+    }
+
     pub fn restart_gateway(&mut self, i: usize, bins: Option<&Path>) {
         if let Some(mut c) = self.gateways[i].child.take() {
             let _ = c.kill();
