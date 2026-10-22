@@ -163,7 +163,8 @@ pub fn refused(short: &Short<OsdPoolError>, stripe_id: u64) -> Response {
 /// A write of `bucket/key`, placed once more when it was refused as placed
 /// under an older epoch of its placement group than an OSD knew (B31): the
 /// acting set changed between placing and writing, and nothing was
-/// stored. The client never sees that. PUT and UploadPart alike.
+/// stored. The client never sees that. PUT and UploadPart alike, and a
+/// DELETE that no copy carried out.
 pub async fn placed_again<F, Fut>(bucket: &str, key: &str, attempt: F) -> Response
 where
     F: Fn() -> Fut,

@@ -197,7 +197,7 @@ pub fn maybe_lost<T>(call: &str, answer: Result<T, tonic::Status>) -> Result<T, 
     }
 }
 
-/// PUTs and UploadParts to hold, by "bucket/key", after they are placed:
+/// PUTs, UploadParts and DELETEs to hold, by "bucket/key", after they are placed:
 /// how long.
 static HOLD_PLACED: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
 
@@ -208,7 +208,7 @@ pub struct HoldPlaced {
     millis: u64,
 }
 
-/// `POST /_admin/test/hold-placed`: the next PUT or UploadPart of
+/// `POST /_admin/test/hold-placed`: the next PUT, UploadPart or DELETE of
 /// `bucket/key` waits `millis` between being placed and writing anything,
 /// so a test can change the placement group's acting set meanwhile (B31):
 /// the write is then placed under an epoch that is no longer current.
@@ -228,7 +228,7 @@ pub async fn hold_placed(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Wait, if a test asked the next PUT or UploadPart of `bucket/key` to
+/// Wait, if a test asked the next PUT, UploadPart or DELETE of `bucket/key` to
 /// (only ever with `--test-hooks`).
 pub async fn held_after_placement(bucket: &str, key: &str) {
     let millis = {
