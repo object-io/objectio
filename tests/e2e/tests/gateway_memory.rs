@@ -660,15 +660,16 @@ fn a_streamed_get_done_or_stalled_holds_up_no_other_call_to_the_osds() {
 }
 
 /// A copy that has to rewrite its source's bytes (here into an SSE-C
-/// copy) holds them in memory, as a PUT holds its body: a source over the
-/// PUT's limit is refused with `InvalidRequest`, as S3 refuses one over its
-/// own, rather than read into memory whatever its size.
+/// copy) takes them as a PUT takes a body: a source larger than a body read
+/// whole is streamed from its stripes to the copy's, never held whole, and
+/// the copy reads back as the source. (Over 100 MiB, it used to be
+/// refused.)
 #[test]
-fn a_rewriting_copy_of_a_source_over_the_put_limit_is_refused() {
+fn a_rewriting_copy_of_a_large_source_streams() {
     let c = Cluster::start_with_ec(6, 4, 2);
     c.json("POST", "/_admin/buckets", json!({"name": "cp"}))
         .expect_ok();
-    // 110 MiB, over the 100 MiB a PUT takes.
+    // 110 MiB, over the 100 MiB a copy used to take.
     multipart_put(&c, "/cp/big", 2, |n| pattern(55 * MIB, n));
     let key = [3u8; 32];
     let b64 = |b: &[u8]| {
@@ -676,8 +677,7 @@ fn a_rewriting_copy_of_a_source_over_the_put_limit_is_refused() {
         base64::engine::general_purpose::STANDARD.encode(b)
     };
     let (k, md5) = (b64(&key), b64(&md5::Md5::digest(key)));
-    let headers = [
-        ("x-amz-copy-source", "/cp/big"),
+    let sse_c = [
         ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
         ("x-amz-server-side-encryption-customer-key", k.as_str()),
         (
@@ -685,15 +685,16 @@ fn a_rewriting_copy_of_a_source_over_the_put_limit_is_refused() {
             md5.as_str(),
         ),
     ];
-    let r = c.request_with_headers("PUT", "/cp/enc", &[], &headers);
-    assert_eq!(r.status, 400, "{}", r.text());
-    assert!(
-        r.text().contains("<Code>InvalidRequest</Code>"),
-        "{}",
-        r.text()
-    );
-    assert!(r.text().contains("copy source is larger"), "{}", r.text());
-    assert_eq!(c.request("HEAD", "/cp/enc", &[]).status, 404);
+    let mut headers = vec![("x-amz-copy-source", "/cp/big")];
+    headers.extend(sse_c);
+    c.request_with_headers("PUT", "/cp/enc", &[], &headers)
+        .expect(200);
+    let got = c.request_with_headers("GET", "/cp/enc", &[], &sse_c);
+    assert_eq!(got.status, 200, "{}", got.text());
+    let mut want = pattern(55 * MIB, 1);
+    want.extend(pattern(55 * MIB, 2));
+    assert!(got.bytes == want, "the copy read back other bytes");
+    assert_eq!(c.request("GET", "/cp/enc", &[]).status, 400, "no key");
 
     // Unencrypted, the copy shares the source's stripes: any size.
     c.request_with_headers("PUT", "/cp/plain", &[], &[("x-amz-copy-source", "/cp/big")])

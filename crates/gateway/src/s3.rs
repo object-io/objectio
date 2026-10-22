@@ -98,6 +98,7 @@ mod multipart;
 mod put;
 mod select;
 mod sse;
+mod stream;
 mod tagging;
 mod types;
 mod versions;

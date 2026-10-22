@@ -1,5 +1,6 @@
 //! Multipart uploads.
 
+use super::sse::StripeCipher;
 use super::*;
 
 /// User-metadata key under which a multipart upload carries the tags its
@@ -408,6 +409,318 @@ pub(crate) async fn upload_part_internal(
     .await
 }
 
+/// What an UploadPart decided before any of its body is stored: the
+/// upload's encryption, its declared checksum, where the part goes.
+pub(crate) struct PartPlan {
+    /// The upload's key: each of the part's stripes is encrypted with it
+    /// and an IV of its own.
+    dek: Option<[u8; objectio_kms::DEK_LEN]>,
+    sse_response_header: Option<&'static str>,
+    sse_kms_key_id: String,
+    sse_c_key_md5: String,
+    /// The checksum algorithm the upload declared, computed for a part
+    /// that sends none.
+    declared_checksum: Option<crate::checksum::ChecksumAlgorithm>,
+    placement: objectio_proto::metadata::GetPlacementResponse,
+}
+
+/// Everything an UploadPart of `size` bytes asks meta before its body
+/// moves; refused here, nothing is stored.
+async fn plan_part(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    headers: &HeaderMap,
+    size: u64,
+) -> Result<PartPlan, Response> {
+    // Validate part number
+    if part_number == 0 || part_number > 10000 {
+        return Err(S3Error::xml_response(
+            "InvalidArgument",
+            "Part number must be between 1 and 10000",
+            StatusCode::BAD_REQUEST,
+        ));
+    }
+    // Quotas (A8b): a part's bytes count when it is uploaded; the object,
+    // when the upload completes.
+    if let Some(refused) = crate::quota::check(bucket, size, 0) {
+        return Err(refused);
+    }
+
+    let mut meta_client = state.meta_client.clone();
+
+    // Fetch the MPU's SSE state. The decision was made at CreateMultipartUpload
+    // time — per-UploadPart SSE headers are ignored for SSE-S3/SSE-KMS. For
+    // SSE-C the client must resupply their customer key on every part and we
+    // validate against the stored MD5. If encryption is on, we unwrap the DEK
+    // once and generate a fresh IV per stripe.
+    let mpu = match meta_client
+        .get_multipart_upload(GetMultipartUploadRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            error!("Failed to fetch MPU state for {upload_id}: {e}");
+            return Err(S3Error::from_status(&e));
+        }
+    };
+    if !mpu.found {
+        return Err(S3Error::xml_response(
+            "NoSuchUpload",
+            "The specified multipart upload does not exist",
+            StatusCode::NOT_FOUND,
+        ));
+    }
+    let declared_checksum = mpu
+        .user_metadata
+        .get(UPLOAD_CHECKSUM_KEY)
+        .and_then(|name| crate::checksum::ChecksumAlgorithm::from_aws_name(name));
+    let algo = SseAlgorithm::try_from(mpu.encryption_algorithm).unwrap_or(SseAlgorithm::SseNone);
+    let (dek, sse_response_header, sse_kms_key_id, sse_c_key_md5) = match algo {
+        SseAlgorithm::SseS3 => {
+            let Some(mk) = state.master_key.as_ref() else {
+                return Err(S3Error::xml_response(
+                    "ServiceUnavailable",
+                    "SSE master key not configured on the gateway",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            };
+            match mk.unwrap_dek(&mpu.encrypted_dek) {
+                Ok(dek) => (Some(dek), Some("AES256"), String::new(), String::new()),
+                Err(e) => {
+                    error!("Failed to unwrap DEK for MPU {upload_id}: {e}");
+                    return Err(S3Error::xml_response(
+                        "InternalError",
+                        "Failed to unwrap MPU DEK",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    ));
+                }
+            }
+        }
+        SseAlgorithm::SseKms => {
+            let Some(kms) = state.kms() else {
+                return Err(S3Error::xml_response(
+                    "ServiceUnavailable",
+                    "SSE-KMS is not configured on this gateway",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            };
+            // The encryption context was supplied at CreateMultipartUpload
+            // and stored on the MPU state so every UploadPart uses the
+            // same AEAD binding as the wrapped DEK.
+            match kms
+                .decrypt(&mpu.kms_key_id, &mpu.encrypted_dek, &mpu.encryption_context)
+                .await
+            {
+                Ok(dek) => (Some(dek), Some("aws:kms"), mpu.kms_key_id, String::new()),
+                Err(e) => {
+                    error!("Failed to unwrap KMS DEK for MPU {upload_id}: {e}");
+                    return Err(S3Error::xml_response(
+                        "InternalError",
+                        "Failed to unwrap MPU DEK via KMS",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    ));
+                }
+            }
+        }
+        SseAlgorithm::SseC => {
+            // UploadPart must resupply the customer key headers. Compare
+            // the provided MD5 against what was stored at CreateMPU; if
+            // they differ we reject without ever reading the key bytes.
+            let cust = match parse_sse_c_headers(headers)? {
+                Some(c) => c,
+                None => {
+                    return Err(S3Error::xml_response(
+                        "InvalidRequest",
+                        "UploadPart on an SSE-C multipart upload must include the customer-key headers",
+                        StatusCode::BAD_REQUEST,
+                    ));
+                }
+            };
+            if cust.md5_b64 != mpu.customer_key_md5 {
+                return Err(S3Error::xml_response(
+                    "InvalidArgument",
+                    "Customer key MD5 does not match the MD5 provided at CreateMultipartUpload",
+                    StatusCode::BAD_REQUEST,
+                ));
+            }
+            (Some(cust.key), None, String::new(), cust.md5_b64)
+        }
+        _ => (None, None, String::new(), String::new()),
+    };
+
+    // Placed where the object will be: its key's placement group, each
+    // shard on the acting member at its position. Placed by a key of its
+    // own (`__mpu/{upload}/part{n}`), as parts were, they landed in another
+    // PG, and recovery copied every completed object's parts into the
+    // object's PG (B31): one more copy of every multipart upload.
+    let placement = match meta_client
+        .get_placement(GetPlacementRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size,
+            storage_class: "STANDARD".to_string(),
+        })
+        .await
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            error!("Failed to get placement for part: {}", e);
+            return Err(meta_failure(&e, "Failed to get placement"));
+        }
+    };
+    crate::test_hooks::held_after_placement(bucket, key).await;
+    Ok(PartPlan {
+        dek,
+        sse_response_header,
+        sse_kms_key_id,
+        sse_c_key_md5,
+        declared_checksum,
+        placement,
+    })
+}
+
+impl PartPlan {
+    fn cipher(&self) -> StripeCipher {
+        self.dek
+            .map_or(StripeCipher::Plain, |key| StripeCipher::PerStripe { key })
+    }
+}
+
+/// A part's body, stored and not yet registered.
+struct PartWritten {
+    size: u64,
+    stripes: Vec<StripeMeta>,
+    /// The quoted MD5 of the plaintext.
+    etag: String,
+    /// The part's checksum, kept for the object's composite: the one the
+    /// request sent (verified), else computed with the algorithm the upload
+    /// declared. Over the plaintext, as the client sees the part.
+    checksum: Option<ObjectChecksum>,
+    sent: Vec<ShardTarget>,
+    /// The body, for the dedup dry-run (a body read whole).
+    dedup: Option<Bytes>,
+}
+
+/// The upload and part a part's write is of.
+struct PartOf<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+    part_number: u32,
+}
+
+/// Register a part whose body is stored with its upload, and answer it.
+/// Registered or not, the part's shards are settled: kept if meta recorded
+/// the part, freed if it refused it (the upload was aborted or completed
+/// meanwhile). An error that is not a refusal may have landed.
+async fn finish_part(
+    state: &Arc<AppState>,
+    of: PartOf<'_>,
+    plan: PartPlan,
+    written: PartWritten,
+) -> Response {
+    let PartOf {
+        bucket,
+        key,
+        upload_id,
+        part_number,
+    } = of;
+    debug!(
+        "Part {part_number} uploaded: {} stripes",
+        written.stripes.len()
+    );
+    let registered = state
+        .meta_client
+        .clone()
+        .register_part(RegisterPartRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_number,
+            etag: written.etag.clone(),
+            size: written.size,
+            stripes: written.stripes, // Multiple stripes for large parts
+            checksum: written.checksum.clone(),
+        })
+        .await;
+    let what = format!("{bucket}/{key} upload {upload_id} part {part_number}");
+    match registered {
+        Ok(resp) => {
+            info!(
+                "Uploaded part {}: bucket={}, key={}, uploadId={}, size={}",
+                part_number, bucket, key, upload_id, written.size
+            );
+            // The part this one replaced is referenced by nothing now.
+            spawn_reclaim(
+                state,
+                stripe_targets(&resp.into_inner().replaced_stripes),
+                Reclaim::ReplacedPart,
+                what,
+            );
+            if let Some(body) = &written.dedup {
+                dedup_dry_run(state, bucket, &plan.placement, body, plan.dek.is_some());
+            }
+
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", &written.etag);
+            if let Some(c) = &written.checksum
+                && let Some(a) = crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
+            {
+                builder = builder.header(a.header_name(), &c.value);
+            }
+            if let Some(v) = plan.sse_response_header {
+                builder = builder.header("x-amz-server-side-encryption", v);
+                if v == "aws:kms" && !plan.sse_kms_key_id.is_empty() {
+                    builder = builder.header(
+                        "x-amz-server-side-encryption-aws-kms-key-id",
+                        &plan.sse_kms_key_id,
+                    );
+                }
+            }
+            if !plan.sse_c_key_md5.is_empty() {
+                builder = builder
+                    .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+                    .header(
+                        "x-amz-server-side-encryption-customer-key-md5",
+                        &plan.sse_c_key_md5,
+                    );
+            }
+            builder.body(Body::empty()).unwrap()
+        }
+        Err(e) => {
+            error!("Failed to register part: {}", e);
+            if matches!(
+                e.code(),
+                tonic::Code::NotFound | tonic::Code::InvalidArgument
+            ) {
+                spawn_reclaim(state, written.sent, Reclaim::FailedWrite, what);
+            } else if !written.sent.is_empty() {
+                warn!(
+                    "{what}: {} shards stay allocated: meta may have recorded the part",
+                    written.sent.len()
+                );
+            }
+            if e.code() == tonic::Code::NotFound {
+                S3Error::xml_response(
+                    "NoSuchUpload",
+                    "The specified multipart upload does not exist",
+                    StatusCode::NOT_FOUND,
+                )
+            } else {
+                S3Error::from_status(&e)
+            }
+        }
+    }
+}
+
 async fn upload_part_placed(
     state: Arc<AppState>,
     bucket: String,
@@ -426,15 +739,6 @@ async fn upload_part_placed(
         body.len()
     );
 
-    // Validate part number
-    if part_number == 0 || part_number > 10000 {
-        return S3Error::xml_response(
-            "InvalidArgument",
-            "Part number must be between 1 and 10000",
-            StatusCode::BAD_REQUEST,
-        );
-    }
-
     // Refuse a part that does not match its checksum before any of it is
     // written, as PutObject does.
     let (checksums, verified_md5) = match verify_upload_checksums(&headers, &body).await {
@@ -450,165 +754,41 @@ async fn upload_part_placed(
         verified_md5.map_or_else(|| crate::digest::md5_hex(&body), hex::encode)
     );
     let part_size = body.len() as u64;
-    // Quotas (A8b): a part's bytes count when it is uploaded; the object,
-    // when the upload completes.
-    if let Some(refused) = crate::quota::check(&bucket, part_size, 0) {
-        return refused;
-    }
-
-    let mut meta_client = state.meta_client.clone();
-
-    // Fetch the MPU's SSE state. The decision was made at CreateMultipartUpload
-    // time — per-UploadPart SSE headers are ignored for SSE-S3/SSE-KMS. For
-    // SSE-C the client must resupply their customer key on every part and we
-    // validate against the stored MD5. If encryption is on, we unwrap the DEK
-    // once and generate a fresh IV per stripe below.
-    let declared_checksum: Option<String>;
-    let (mpu_dek, sse_response_header, sse_kms_key_id, sse_c_key_md5_for_resp) = match meta_client
-        .get_multipart_upload(GetMultipartUploadRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
-        })
-        .await
+    let plan = match plan_part(
+        &state,
+        &bucket,
+        &key,
+        &upload_id,
+        part_number,
+        &headers,
+        part_size,
+    )
+    .await
     {
-        Ok(resp) => {
-            let mpu = resp.into_inner();
-            if !mpu.found {
-                return S3Error::xml_response(
-                    "NoSuchUpload",
-                    "The specified multipart upload does not exist",
-                    StatusCode::NOT_FOUND,
-                );
-            }
-            declared_checksum = mpu.user_metadata.get(UPLOAD_CHECKSUM_KEY).cloned();
-            let algo =
-                SseAlgorithm::try_from(mpu.encryption_algorithm).unwrap_or(SseAlgorithm::SseNone);
-            match algo {
-                SseAlgorithm::SseS3 => {
-                    let Some(mk) = state.master_key.as_ref() else {
-                        return S3Error::xml_response(
-                            "ServiceUnavailable",
-                            "SSE master key not configured on the gateway",
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        );
-                    };
-                    match mk.unwrap_dek(&mpu.encrypted_dek) {
-                        Ok(dek) => (Some(dek), Some("AES256"), String::new(), String::new()),
-                        Err(e) => {
-                            error!("Failed to unwrap DEK for MPU {upload_id}: {e}");
-                            return S3Error::xml_response(
-                                "InternalError",
-                                "Failed to unwrap MPU DEK",
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            );
-                        }
-                    }
-                }
-                SseAlgorithm::SseKms => {
-                    let Some(kms) = state.kms() else {
-                        return S3Error::xml_response(
-                            "ServiceUnavailable",
-                            "SSE-KMS is not configured on this gateway",
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        );
-                    };
-                    // The encryption context was supplied at CreateMultipartUpload
-                    // and stored on the MPU state so every UploadPart uses the
-                    // same AEAD binding as the wrapped DEK.
-                    match kms
-                        .decrypt(&mpu.kms_key_id, &mpu.encrypted_dek, &mpu.encryption_context)
-                        .await
-                    {
-                        Ok(dek) => (Some(dek), Some("aws:kms"), mpu.kms_key_id, String::new()),
-                        Err(e) => {
-                            error!("Failed to unwrap KMS DEK for MPU {upload_id}: {e}");
-                            return S3Error::xml_response(
-                                "InternalError",
-                                "Failed to unwrap MPU DEK via KMS",
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                            );
-                        }
-                    }
-                }
-                SseAlgorithm::SseC => {
-                    // UploadPart must resupply the customer key headers. Compare
-                    // the provided MD5 against what was stored at CreateMPU; if
-                    // they differ we reject without ever reading the key bytes.
-                    let cust = match parse_sse_c_headers(&headers) {
-                        Ok(Some(c)) => c,
-                        Ok(None) => {
-                            return S3Error::xml_response(
-                                "InvalidRequest",
-                                "UploadPart on an SSE-C multipart upload must include the customer-key headers",
-                                StatusCode::BAD_REQUEST,
-                            );
-                        }
-                        Err(resp) => return resp,
-                    };
-                    if cust.md5_b64 != mpu.customer_key_md5 {
-                        return S3Error::xml_response(
-                            "InvalidArgument",
-                            "Customer key MD5 does not match the MD5 provided at CreateMultipartUpload",
-                            StatusCode::BAD_REQUEST,
-                        );
-                    }
-                    (Some(cust.key), None, String::new(), cust.md5_b64)
-                }
-                _ => (None, None, String::new(), String::new()),
-            }
-        }
-        Err(e) => {
-            error!("Failed to fetch MPU state for {upload_id}: {e}");
-            return S3Error::from_status(&e);
-        }
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
-    // The part's checksum, kept for the object's composite: the one the
-    // request sent (verified above), else computed with the algorithm the
-    // upload declared. Over the plaintext, as the client sees the part.
-    let part_checksum = match (&checksums.flexible, declared_checksum.as_deref()) {
+    let part_checksum = match (&checksums.flexible, plan.declared_checksum) {
         (Some(c), _) => Some(ObjectChecksum {
             algorithm: c.algorithm.aws_name().to_string(),
             value: c.value_b64(),
         }),
-        (None, Some(name)) => crate::checksum::ChecksumAlgorithm::from_aws_name(name).map(|a| {
+        (None, Some(a)) => {
             use base64::Engine;
-            ObjectChecksum {
+            Some(ObjectChecksum {
                 algorithm: a.aws_name().to_string(),
                 value: base64::engine::general_purpose::STANDARD.encode(a.compute(&body)),
-            }
-        }),
+            })
+        }
         (None, None) => None,
     };
-
-    // Placed where the object will be: its key's placement group, each
-    // shard on the acting member at its position. Placed by a key of its
-    // own (`__mpu/{upload}/part{n}`), as parts were, they landed in another
-    // PG, and recovery copied every completed object's parts into the
-    // object's PG (B31): one more copy of every multipart upload.
-    let placement = match meta_client
-        .get_placement(GetPlacementRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            size: part_size,
-            storage_class: "STANDARD".to_string(),
-        })
-        .await
-    {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            error!("Failed to get placement for part: {}", e);
-            return meta_failure(&e, "Failed to get placement");
-        }
-    };
-    crate::test_hooks::held_after_placement(&bucket, &key).await;
 
     // Written as a PUT to the pool is (crate::stripe): the same coding (an
     // LRC pool's parts are LRC stripes), the same quorum and answers short
     // of it, fenced by the placement group's epoch and placed again once
     // when an OSD knew a newer one.
-    let placed = crate::stripe::Placed::new(&placement);
+    let placed = crate::stripe::Placed::new(&plan.placement);
     let scheme = placed.scheme;
     let coder = match crate::stripe::Coder::new(scheme) {
         Ok(c) => c,
@@ -640,22 +820,16 @@ async fn upload_part_placed(
         body.len()
     );
 
+    let cipher = plan.cipher();
     let mut all_stripes = Vec::with_capacity(num_stripes);
-    let mut total_success = 0;
     for stripe_idx in 0..num_stripes {
         let stripe_start = stripe_idx * max_stripe_data_size;
         let stripe_end = std::cmp::min(stripe_start + max_stripe_data_size, body.len());
         // Copy this stripe's bytes out; encrypt in place if the MPU is
-        // SSE-S3. A fresh IV per stripe means on GET each stripe can
+        // encrypted. A fresh IV per stripe means on GET each stripe can
         // decrypt independently starting from its own offset zero.
         let mut stripe_bytes = body[stripe_start..stripe_end].to_vec();
-        let stripe_iv: Vec<u8> = if let Some(dek) = mpu_dek.as_ref() {
-            let iv = objectio_kms::generate_iv();
-            objectio_kms::encrypt_in_place(dek, &iv, &mut stripe_bytes);
-            iv.to_vec()
-        } else {
-            Vec::new()
-        };
+        let stripe_iv = cipher.apply(0, &mut stripe_bytes);
         let stripe_data_size = stripe_bytes.len() as u64;
 
         let shards = match coder.shards(Bytes::from(stripe_bytes)) {
@@ -690,7 +864,6 @@ async fn upload_part_placed(
                 return crate::stripe::refused(&short, stripe_idx as u64);
             }
         };
-        total_success += locs.len();
         all_stripes.push(StripeMeta {
             encryption_iv: stripe_iv,
             ..scheme.stripe(
@@ -702,97 +875,138 @@ async fn upload_part_placed(
         });
     }
 
-    debug!(
-        "Part {} uploaded: {} stripes, {} shards written",
-        part_number,
-        all_stripes.len(),
-        total_success,
-    );
-
-    // Register the part with metadata service (using all stripes)
-    // Registered or not, the part's shards are settled below: kept if meta
-    // recorded the part, freed if it refused it (the upload was aborted or
-    // completed meanwhile). An error that is not a refusal may have landed.
-    let sent = pending.disarm();
-    let registered = meta_client
-        .register_part(RegisterPartRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
+    let written = PartWritten {
+        size: part_size,
+        stripes: all_stripes,
+        etag,
+        checksum: part_checksum,
+        sent: pending.disarm(),
+        dedup: Some(body),
+    };
+    finish_part(
+        &state,
+        PartOf {
+            bucket: &bucket,
+            key: &key,
+            upload_id: &upload_id,
             part_number,
-            etag: etag.clone(),
-            size: part_size,
-            stripes: all_stripes, // Multiple stripes for large parts
-            checksum: part_checksum.clone(),
-        })
-        .await;
-    let what = format!("{bucket}/{key} upload {upload_id} part {part_number}");
-    match registered {
-        Ok(resp) => {
-            info!(
-                "Uploaded part {}: bucket={}, key={}, uploadId={}, size={}",
-                part_number, bucket, key, upload_id, part_size
-            );
-            // The part this one replaced is referenced by nothing now.
-            spawn_reclaim(
-                &state,
-                stripe_targets(&resp.into_inner().replaced_stripes),
-                Reclaim::ReplacedPart,
-                what,
-            );
-            dedup_dry_run(&state, &bucket, &placement, &body, mpu_dek.is_some());
+        },
+        plan,
+        written,
+    )
+    .await
+}
 
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("ETag", &etag);
-            if let Some(c) = &part_checksum
-                && let Some(a) = crate::checksum::ChecksumAlgorithm::from_aws_name(&c.algorithm)
-            {
-                builder = builder.header(a.header_name(), &c.value);
-            }
-            if let Some(v) = sse_response_header {
-                builder = builder.header("x-amz-server-side-encryption", v);
-                if v == "aws:kms" && !sse_kms_key_id.is_empty() {
-                    builder = builder.header(
-                        "x-amz-server-side-encryption-aws-kms-key-id",
-                        &sse_kms_key_id,
-                    );
-                }
-            }
-            if !sse_c_key_md5_for_resp.is_empty() {
-                builder = builder
-                    .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
-                    .header(
-                        "x-amz-server-side-encryption-customer-key-md5",
-                        &sse_c_key_md5_for_resp,
-                    );
-            }
-            builder.body(Body::empty()).unwrap()
+/// An UploadPart whose body is streamed ([`crate::admission::Streamed`]):
+/// written to the shards stripe by stripe as it arrives, never held whole,
+/// and registered once all of it has arrived and passed its checks.
+pub(crate) async fn upload_part_streamed(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let checksums = match crate::checksum::RequestChecksums::from_headers(&headers) {
+        Ok(c) => c,
+        Err(e) => return S3Error::xml_response(e.code(), &e.message(), StatusCode::BAD_REQUEST),
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let plan = match plan_part(
+        &state,
+        &bucket,
+        &key,
+        &upload_id,
+        part_number,
+        &headers,
+        declared.unwrap_or(0),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let scheme = crate::stripe::Scheme::of(&plan.placement);
+    let window = super::stream::window(scheme, declared);
+    let Some(window) = state.admission.budget.try_reserve(window) else {
+        return crate::admission::slow_down("memory");
+    };
+    let mut reader = super::stream::BodyReader::new(body);
+    match first_stripe(&mut reader, super::stream::stripe_size(scheme), &headers).await {
+        Err(resp) => return resp,
+        Ok(FirstStripe::Whole(body, headers)) => {
+            drop(plan);
+            return upload_part_internal(state, bucket, key, upload_id, part_number, headers, body)
+                .await;
         }
-        Err(e) => {
-            error!("Failed to register part: {}", e);
-            if matches!(
-                e.code(),
-                tonic::Code::NotFound | tonic::Code::InvalidArgument
-            ) {
-                spawn_reclaim(&state, sent, Reclaim::FailedWrite, what);
-            } else if !sent.is_empty() {
-                warn!(
-                    "{what}: {} shards stay allocated: meta may have recorded the part",
-                    sent.len()
-                );
-            }
-            if e.code() == tonic::Code::NotFound {
-                S3Error::xml_response(
-                    "NoSuchUpload",
-                    "The specified multipart upload does not exist",
-                    StatusCode::NOT_FOUND,
-                )
-            } else {
-                S3Error::from_status(&e)
-            }
-        }
+        Ok(FirstStripe::More) => {}
     }
+
+    let dedup_on = dedup_wanted(&plan.placement);
+    let to = super::stream::StreamTo {
+        state: &state,
+        placement: &plan.placement,
+        object_id: *Uuid::now_v7().as_bytes(),
+        cipher: plan.cipher(),
+        // Parts go over gRPC (for now).
+        rdma: false,
+        dedup: (dedup_on && plan.dek.is_none())
+            .then_some((bucket.as_str(), plan.placement.dedup_domain.as_str())),
+        what: format!("{bucket}/{key} upload {upload_id} part {part_number}"),
+    };
+    let streamed = match super::stream::stream_stripes(
+        to,
+        &mut reader,
+        crate::checksum::StreamingChecksums::new(checksums, plan.declared_checksum),
+        window,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(resp) => {
+            crate::stripe::stale_streamed(&bucket, &key, &resp);
+            return resp;
+        }
+    };
+    if declared.is_none()
+        && let Some(refused) = crate::quota::check(&bucket, streamed.size, 0)
+    {
+        return refused;
+    }
+    if dedup_on && plan.dek.is_some() {
+        crate::gateway_metrics::record_dedup_skipped("encrypted");
+    }
+    let written = PartWritten {
+        size: streamed.size,
+        stripes: streamed.stripes,
+        etag: format!("\"{}\"", hex::encode(streamed.checksums.md5)),
+        checksum: streamed
+            .checksums
+            .computed()
+            .map(|(a, value)| ObjectChecksum {
+                algorithm: a.aws_name().to_string(),
+                value,
+            }),
+        sent: streamed.sent.disarm(),
+        dedup: None,
+    };
+    finish_part(
+        &state,
+        PartOf {
+            bucket: &bucket,
+            key: &key,
+            upload_id: &upload_id,
+            part_number,
+        },
+        plan,
+        written,
+    )
+    .await
 }
 
 /// Complete multipart upload - internal implementation
@@ -1225,7 +1439,7 @@ pub(crate) async fn complete_multipart_upload_internal(
                     StatusCode::NOT_FOUND,
                 )
             } else if e.code() == tonic::Code::InvalidArgument
-                && let Some(code) = ["EntityTooSmall", "InvalidPartOrder"]
+                && let Some(code) = ["EntityTooSmall", "EntityTooLarge", "InvalidPartOrder"]
                     .into_iter()
                     .find(|c| e.message().starts_with(c))
             {

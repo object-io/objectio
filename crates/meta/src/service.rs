@@ -2328,9 +2328,14 @@ impl MetaService {
     }
 }
 
+/// The largest object a multipart upload makes: S3's 5 TiB, whatever its
+/// parts (each up to 5 GiB, 10,000 of them) add up to.
+const MAX_OBJECT_SIZE: u64 = 5 << 40;
+
 /// Check a completion against `upload` and build the object it makes:
-/// every part named exists with its ETag, all but the last at least 5 MiB.
-/// Returns the object and the stripes of parts left out of it.
+/// every part named exists with its ETag, all but the last at least 5 MiB,
+/// and they make at most 5 TiB. Returns the object and the stripes of
+/// parts left out of it.
 #[allow(clippy::result_large_err)]
 fn complete_upload(
     upload: &MultipartUploadState,
@@ -2386,6 +2391,12 @@ fn complete_upload(
 
         // Add all stripes for this part (large parts may have multiple stripes)
         stripes.extend(stored_part.stripes.clone());
+    }
+    if total_size > MAX_OBJECT_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "EntityTooLarge: the parts make {total_size} bytes; an object is at most \
+             {MAX_OBJECT_SIZE} bytes (5 TiB)"
+        )));
     }
 
     // Calculate multipart ETag: MD5 of concatenated part MD5s + "-" + part count
@@ -2874,6 +2885,66 @@ mod stripe_refs_tests {
         release(&svc, SOURCE).await;
         let err = share(&svc, SOURCE, COPY2).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+}
+
+#[cfg(test)]
+mod complete_upload_tests {
+    use super::{MAX_OBJECT_SIZE, complete_upload};
+    use objectio_meta_store::{MultipartUploadState, PartState};
+    use objectio_proto::metadata::{CompleteMultipartUploadRequest, PartInfo};
+
+    /// An upload of `parts` parts of `size` bytes each, and the completion
+    /// naming them all.
+    fn upload_of(parts: u32, size: u64) -> (MultipartUploadState, CompleteMultipartUploadRequest) {
+        let etag = |n: u32| format!("\"{n:032x}\"");
+        let upload = MultipartUploadState {
+            bucket: "b".into(),
+            key: "k".into(),
+            parts: (1..=parts)
+                .map(|n| {
+                    let part = PartState {
+                        part_number: n,
+                        etag: etag(n),
+                        size,
+                        ..Default::default()
+                    };
+                    (n, part)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let req = CompleteMultipartUploadRequest {
+            bucket: "b".into(),
+            key: "k".into(),
+            parts: (1..=parts)
+                .map(|n| PartInfo {
+                    part_number: n,
+                    etag: etag(n),
+                    size: 0,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        (upload, req)
+    }
+
+    /// Parts of 5 GiB make objects up to S3's 5 TiB, and no larger.
+    #[test]
+    fn an_object_is_at_most_five_tib() {
+        const PART: u64 = 5 << 30;
+        let (upload, req) = upload_of(1024, PART);
+        let (object, _) = complete_upload(&upload, &req).expect("5 TiB is allowed");
+        assert_eq!(object.size, MAX_OBJECT_SIZE);
+
+        let (upload, req) = upload_of(1025, PART);
+        let refused = complete_upload(&upload, &req).expect_err("over 5 TiB");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(
+            refused.message().starts_with("EntityTooLarge"),
+            "{}",
+            refused.message()
+        );
     }
 }
 

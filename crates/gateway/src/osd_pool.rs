@@ -2722,6 +2722,12 @@ impl PendingShards {
         });
     }
 
+    /// Take over what `other` recorded (a stripe written on its own), to
+    /// free with the rest.
+    pub fn absorb(&mut self, other: Self) {
+        self.targets.extend(other.disarm());
+    }
+
     /// Stop freeing on drop; returns what was sent.
     #[must_use]
     pub fn disarm(mut self) -> Vec<ShardTarget> {

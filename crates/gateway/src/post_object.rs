@@ -24,7 +24,7 @@
 //! [`MAX_FIELDS_BYTES`]) is read and checked first — signature, policy,
 //! authorization — so nothing is read of a file that won't be accepted; the
 //! file is then read up to the smaller of the policy's
-//! `content-length-range` maximum and the single-PUT limit, and no further.
+//! `content-length-range` maximum and [`MAX_FILE_SIZE`], and no further.
 
 // Every refusal here is a finished S3 error response, built once per request.
 #![allow(clippy::result_large_err)]
@@ -48,8 +48,9 @@ use tracing::debug;
 use crate::auth_middleware::AuthError;
 use crate::s3::{AppState, S3Error};
 
-/// The largest file a form may upload: the single-PUT limit (the body
-/// limit on the S3 routes in `lib.rs`). Larger objects need multipart.
+/// The largest file a form may upload. The file is read whole, as other
+/// bodies read whole are held to (`crate::admission::MAX_BODY`); a PUT,
+/// which streams, goes to 5 GiB.
 pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 /// Everything before the file: the fields, their part headers and the
 /// boundaries between them.

@@ -1179,10 +1179,14 @@ pub async fn run(
         );
     }
 
-    // Build router
-    // Allow up to 100MB for single-part uploads (larger objects need multipart)
+    // Build router. Bodies read whole are held to MAX_BODY; a PUT or an
+    // UploadPart up to MAX_UPLOAD is streamed (admission::body_layer).
     let body_limit = DefaultBodyLimit::max(admission::MAX_BODY);
-    info!("Max single-part upload size: 100 MB");
+    info!(
+        "Max single PUT / upload part: {} GiB, streamed above {} MiB",
+        admission::MAX_UPLOAD >> 30,
+        admission::STREAM_ABOVE >> 20
+    );
 
     // Bucket operations (including ?policy and ?uploads query params;
     // POST is ?delete, the batch delete)

@@ -75,6 +75,36 @@ impl Coder {
     }
 }
 
+/// A stripe's shards from its bytes. With Transfer Engine (`rdma`) an
+/// erasure-coded stripe is encoded straight into a registered stripe slot,
+/// when one is free, for OSDs to read their shards out of; the second value
+/// is then the slot's first byte. Otherwise, and for copies, the shards are
+/// in memory of their own (copies share the stripe's).
+///
+/// # Errors
+/// The codec refusing the data.
+pub fn encode(
+    coder: &Coder,
+    rdma: Option<&crate::rdma::GatewayRdma>,
+    data: Bytes,
+) -> objectio_common::Result<(Vec<Bytes>, Option<u64>)> {
+    let width = coder.scheme.width();
+    let slot = rdma.zip(coder.codec()).and_then(|(r, codec)| {
+        r.stripe_slot(codec.stripe_len(data.len()))
+            .map(|s| (s, codec))
+    });
+    let Some((mut slot, codec)) = slot else {
+        return coder.shards(data).map(|s| (s, None));
+    };
+    let base = slot.addr();
+    let shard_size = codec.encode_into(&data, slot.as_mut_slice())?;
+    let stripe = slot.into_bytes(shard_size * width);
+    let shards = (0..width)
+        .map(|i| stripe.slice(i * shard_size..(i + 1) * shard_size))
+        .collect();
+    Ok((shards, Some(base)))
+}
+
 /// A stripe encoded into the gateway's Transfer Engine memory, for OSDs to
 /// read their shards out of.
 pub struct RdmaStripe<'a> {
@@ -158,6 +188,17 @@ pub fn refused(short: &Short<OsdPoolError>, stripe_id: u64) -> Response {
         &format!("Write quorum not met for stripe {stripe_id}: {short}"),
         StatusCode::SERVICE_UNAVAILABLE,
     )
+}
+
+/// A streamed write of `bucket/key` refused as `placed_again` would place
+/// it again: its body is gone, so the client's retry places it again
+/// instead. The 503 says to retry.
+pub fn stale_streamed(bucket: &str, key: &str, resp: &Response) {
+    if resp.extensions().get::<StalePlacement>().is_some() {
+        crate::gateway_metrics::record_stale_placement();
+        crate::placement_cache::forget(bucket, key);
+        tracing::info!("{bucket}/{key}: a streamed write placed under an old epoch; refused");
+    }
 }
 
 /// A write of `bucket/key`, placed once more when it was refused as placed

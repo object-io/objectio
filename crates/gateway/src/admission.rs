@@ -8,10 +8,13 @@
 //! - **A memory budget** (`--memory-budget`), in bytes: what the gateway
 //!   holds of request bodies, and of GET data read ahead of the client. A
 //!   request body is reserved in full, from its declared length, before a
-//!   byte of it is read; a GET reserves each stripe before reading it, and
-//!   gives it back once the client has been sent it. A new request that
-//!   does not fit is refused; a GET already streaming waits for room for
-//!   its next stripe (released bytes go to waiters first).
+//!   byte of it is read — except a large upload's (a PUT or an UploadPart
+//!   over [`STREAM_ABOVE`]), which is never held whole: it is streamed to
+//!   the shards, and reserves only the stripes it has in hand at once. A
+//!   GET reserves each stripe before reading it, and gives it back once the
+//!   client has been sent it. A new request that does not fit is refused;
+//!   a GET already streaming waits for room for its next stripe (released
+//!   bytes go to waiters first).
 //!
 //! Health, readiness and metrics are never limited: a load balancer has to
 //! be able to see an overloaded gateway.
@@ -28,7 +31,7 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use http_body::{Body as HttpBody, Frame, SizeHint};
@@ -37,8 +40,20 @@ use std::sync::LazyLock;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
-/// The largest request body the S3 API takes (a PUT or an upload part).
+/// The largest request body the S3 API takes other than an upload's (an
+/// XML document, a form, a sub-resource's body), all read whole.
 pub const MAX_BODY: usize = 100 * 1024 * 1024;
+
+/// The largest body of a single PUT or an UploadPart: S3's 5 GiB. An
+/// object of more is uploaded in parts (up to 10,000 of them).
+pub const MAX_UPLOAD: u64 = 5 * 1024 * 1024 * 1024;
+
+/// An upload body larger than this, or of a length not known up front, is
+/// not read whole: its handler streams it to the shards stripe by stripe.
+/// One up to it is read here, as other bodies are: about a stripe of the
+/// usual 4+2 code, which an upload holds whole on its way to the shards
+/// either way.
+pub const STREAM_ABOVE: u64 = 16 * 1024 * 1024;
 
 /// The budget's default when no `--memory-budget` is given and the process
 /// has no memory limit of its own.
@@ -286,6 +301,34 @@ impl Reservation {
             .map_or(0, |p| p.num_permits() as u64 * UNIT)
     }
 
+    /// `bytes` of this reservation (rounded up to the budget's unit, and at
+    /// most what it holds) as a reservation of their own.
+    #[must_use]
+    pub fn split(&mut self, bytes: u64) -> Self {
+        let want = usize::try_from(bytes.div_ceil(UNIT)).unwrap_or(usize::MAX);
+        let Some(p) = self.permit.as_mut() else {
+            return Self::default();
+        };
+        let take = want.min(p.num_permits());
+        if take == p.num_permits() {
+            return Self {
+                permit: self.permit.take(),
+            };
+        }
+        Self {
+            permit: p.split(take),
+        }
+    }
+
+    /// Take `other`, split from this one, back into it.
+    pub fn merge(&mut self, other: Self) {
+        match (self.permit.as_mut(), other.permit) {
+            (Some(p), Some(o)) => p.merge(o),
+            (None, o) => self.permit = o,
+            (Some(_), None) => {}
+        }
+    }
+
     /// Give back all but `bytes` of it (rounded up to the budget's unit).
     pub fn shrink_to(&mut self, bytes: u64) {
         let keep = usize::try_from(bytes.div_ceil(UNIT)).unwrap_or(usize::MAX);
@@ -445,12 +488,48 @@ fn aws_chunked(headers: &HeaderMap) -> bool {
             .is_some_and(|v| v.to_ascii_lowercase().contains("aws-chunked"))
 }
 
-/// The most wire bytes a body may have: the payload limit, and for an
-/// AWS-chunked body room for its framing too (SDKs send 64 KiB chunks,
-/// about 90 bytes of framing each; AWS's smallest chunk is 8 KiB), and the
-/// trailers.
-pub(crate) fn wire_limit(chunked: bool) -> u64 {
-    let max = MAX_BODY as u64;
+/// Whether the path names an object (`/bucket/key`), not a bucket.
+fn on_object(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .split_once('/')
+        .is_some_and(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+}
+
+/// Whether the request is an upload, a PutObject or an UploadPart: a PUT
+/// to an object that copies nothing and names none of its sub-resources
+/// (an ACL, tags, a retention, a legal hold), whose bodies are small
+/// documents.
+pub(crate) fn is_upload(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    method == Method::PUT
+        && on_object(uri.path())
+        && !headers.contains_key("x-amz-copy-source")
+        && !uri.query().is_some_and(|q| {
+            q.split('&').any(|pair| {
+                matches!(
+                    pair.split('=').next().unwrap_or_default(),
+                    "acl" | "tagging" | "retention" | "legal-hold"
+                )
+            })
+        })
+}
+
+/// The largest payload the request may carry: [`MAX_UPLOAD`] for an
+/// upload, [`MAX_BODY`] for anything else.
+pub(crate) fn payload_limit(upload: bool) -> u64 {
+    if upload { MAX_UPLOAD } else { MAX_BODY as u64 }
+}
+
+/// A request body the handler streams rather than one read whole here: a
+/// large upload's (see [`STREAM_ABOVE`]). Its handler reserves from the
+/// budget what it holds of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Streamed;
+
+/// The most wire bytes a body of a payload of at most `max` may have: the
+/// payload, and for an AWS-chunked body room for its framing too (SDKs
+/// send 64 KiB chunks, about 90 bytes of framing each; AWS's smallest
+/// chunk is 8 KiB), and the trailers.
+pub(crate) fn wire_limit(chunked: bool, max: u64) -> u64 {
     if chunked {
         max + max / 8 + 64 * 1024
     } else {
@@ -458,10 +537,19 @@ pub(crate) fn wire_limit(chunked: bool) -> u64 {
     }
 }
 
-pub(crate) fn entity_too_large() -> Response {
+/// S3's answer to a payload over `max` bytes.
+pub(crate) fn entity_too_large(max: u64) -> Response {
     crate::s3::S3Error::xml_response(
         "EntityTooLarge",
-        &format!("Your proposed upload exceeds the maximum allowed size of {MAX_BODY} bytes"),
+        &format!("Your proposed upload exceeds the maximum allowed size of {max} bytes"),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+fn incomplete_body() -> Response {
+    crate::s3::S3Error::xml_response(
+        "IncompleteBody",
+        "You did not provide the number of bytes specified by the Content-Length HTTP header.",
         StatusCode::BAD_REQUEST,
     )
 }
@@ -477,12 +565,149 @@ fn request_timeout() -> Response {
 /// Why a body could not be read in full.
 #[derive(Debug)]
 pub enum BodyError {
-    /// More bytes than the limit.
-    TooLarge,
+    /// More bytes than the limit, which is this many bytes of payload.
+    TooLarge(u64),
     /// No bytes for longer than the body timeout.
     Timeout,
     /// The connection failed, or the client ended the body early.
     Read(String),
+    /// What the body is read from (an object being copied) failed.
+    Source(String),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge(max) => write!(f, "the body is over {max} bytes"),
+            Self::Timeout => f.write_str("no body bytes within the body timeout"),
+            Self::Read(e) => write!(f, "the body could not be read: {e}"),
+            Self::Source(e) => write!(f, "the body's source could not be read: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BodyError {}
+
+/// How S3 answers a request whose body failed as it was read: an error a
+/// streamed body ended in (this layer's limit or timeout, a broken
+/// `aws-chunked` framing or chunk signature, a payload that is not the one
+/// signed), whichever it is under `error`'s causes. Anything else is the
+/// client's connection failing, `IncompleteBody`.
+pub(crate) fn body_refused(error: &(dyn std::error::Error + 'static)) -> Response {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(b) = e.downcast_ref::<BodyError>() {
+            return match b {
+                BodyError::TooLarge(max) => entity_too_large(*max),
+                BodyError::Timeout => {
+                    record_timeout("body");
+                    warn!("an upload's body stopped arriving; cut off");
+                    request_timeout()
+                }
+                BodyError::Read(_) => incomplete_body(),
+                BodyError::Source(e) => {
+                    warn!("a copy's source failed as it was read: {e}");
+                    crate::s3::S3Error::xml_response(
+                        "InternalError",
+                        "Failed to read the source object",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    )
+                }
+            };
+        }
+        if let Some(d) = e.downcast_ref::<crate::chunked_decode::DecodeError>() {
+            return d.response();
+        }
+        if e.is::<crate::payload_hash::Mismatch>() {
+            return crate::payload_hash::mismatch_response();
+        }
+        cause = e.source();
+    }
+    debug!("an upload's body failed: {error}");
+    incomplete_body()
+}
+
+/// A streamed request body held to the limits a body read whole is: at
+/// most `limit` bytes on the wire, and never `idle` without a byte while
+/// it is being read. Errors of the body it wraps pass through as they are.
+struct LimitedBody {
+    inner: Body,
+    /// The payload limit, for the refusal.
+    max: u64,
+    limit: u64,
+    read: u64,
+    idle: Duration,
+    /// Runs only while the reader waits on the client: between reads (the
+    /// handler busy with what it has) the client is not late.
+    timer: Pin<Box<tokio::time::Sleep>>,
+    waiting: bool,
+    failed: bool,
+}
+
+impl LimitedBody {
+    fn new(inner: Body, max: u64, limit: u64, idle: Duration) -> Self {
+        Self {
+            inner,
+            max,
+            limit,
+            read: 0,
+            idle,
+            timer: Box::pin(tokio::time::sleep(idle)),
+            waiting: false,
+            failed: false,
+        }
+    }
+}
+
+impl HttpBody for LimitedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if this.failed {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => {
+                if !this.waiting {
+                    this.waiting = true;
+                    let deadline = tokio::time::Instant::now() + this.idle;
+                    this.timer.as_mut().reset(deadline);
+                }
+                if this.timer.as_mut().poll(cx).is_ready() {
+                    this.failed = true;
+                    return Poll::Ready(Some(Err(axum::Error::new(BodyError::Timeout))));
+                }
+                Poll::Pending
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                this.waiting = false;
+                if let Some(data) = frame.data_ref() {
+                    this.read += data.len() as u64;
+                    if this.read > this.limit {
+                        this.failed = true;
+                        return Poll::Ready(Some(Err(axum::Error::new(BodyError::TooLarge(
+                            this.max,
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.failed || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// Read `body` into one buffer, at most `limit` bytes, each frame within
@@ -519,7 +744,7 @@ pub async fn body_into_vec(
         };
         let held = out.as_ref().map_or(0, Vec::len) as u64;
         if held + data.len() as u64 > limit {
-            return Err(BodyError::TooLarge);
+            return Err(BodyError::TooLarge(limit));
         }
         match out.as_mut() {
             // The first frame: taken over without a copy when it is the
@@ -537,33 +762,49 @@ pub async fn body_into_vec(
     Ok(out.unwrap_or_default())
 }
 
-/// Request bodies on the S3 API, after authentication: the declared length
-/// is reserved from the memory budget (or `503 SlowDown`), refused over the
-/// limit (`400 EntityTooLarge`, as S3 answers), and read in full here into one buffer,
-/// each part within the body timeout of the last (`400 RequestTimeout`).
-/// Handlers then take it without another copy.
+/// Request bodies on the S3 API, after authentication: refused over the
+/// limit (`400 EntityTooLarge`, as S3 answers) before a byte is read, then
+/// either
+///
+/// - read in full here into one buffer, its declared length reserved from
+///   the memory budget first (or `503 SlowDown`), each part within the body
+///   timeout of the last (`400 RequestTimeout`); handlers then take it
+///   without another copy; or
+/// - for an upload over [`STREAM_ABOVE`] (or of unknown length), handed on
+///   unread, marked [`Streamed`], held to the same limit and timeout as it
+///   is read: its handler streams it to the shards.
 pub async fn body_layer(
     State(admission): State<Arc<Admission>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let hint = request.body().size_hint();
     if request.body().is_end_stream() || hint.exact() == Some(0) {
         return next.run(request).await;
     }
+    let upload = is_upload(request.method(), request.uri(), request.headers());
+    let max = payload_limit(upload);
     let chunked = aws_chunked(request.headers());
-    let limit = wire_limit(chunked);
-    let decoded_too_large = request
+    let limit = wire_limit(chunked, max);
+    let decoded = request
         .headers()
         .get("x-amz-decoded-content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|n| n > MAX_BODY as u64);
+        .and_then(|v| v.parse::<u64>().ok());
+    if hint.exact().is_some_and(|n| n > limit) || decoded.is_some_and(|n| n > max) {
+        return entity_too_large(max);
+    }
+    // The most the payload can be, when that is known: its decoded length,
+    // else what is on the wire.
+    let payload = decoded.or(hint.exact());
+    if upload && payload.is_none_or(|n| n > STREAM_ABOVE) {
+        request.extensions_mut().insert(Streamed);
+        let idle = admission.body_timeout;
+        let request = request.map(|body| Body::new(LimitedBody::new(body, max, limit, idle)));
+        return next.run(request).await;
+    }
     // Without a length (chunked transfer encoding), the most it may be.
     let declared = hint.exact().unwrap_or(limit);
-    if declared > limit || decoded_too_large {
-        return entity_too_large();
-    }
     let Some(reservation) = admission.budget.try_reserve(declared) else {
         debug!(
             "refused a {declared}-byte body: {} of {} budget bytes in use",
@@ -575,7 +816,7 @@ pub async fn body_layer(
     let (parts, body) = request.into_parts();
     let data = match body_into_vec(body, declared, limit, Some(admission.body_timeout)).await {
         Ok(d) => d,
-        Err(BodyError::TooLarge) => return entity_too_large(),
+        Err(BodyError::TooLarge(_)) => return entity_too_large(max),
         Err(BodyError::Timeout) => {
             record_timeout("body");
             warn!(
@@ -586,13 +827,9 @@ pub async fn body_layer(
             );
             return request_timeout();
         }
-        Err(BodyError::Read(e)) => {
+        Err(BodyError::Read(e) | BodyError::Source(e)) => {
             debug!("request body could not be read: {e}");
-            return crate::s3::S3Error::xml_response(
-                "IncompleteBody",
-                "You did not provide the number of bytes specified by the Content-Length HTTP header.",
-                StatusCode::BAD_REQUEST,
-            );
+            return incomplete_body();
         }
     };
     let request = Request::from_parts(parts, Body::from(data));
@@ -747,7 +984,7 @@ mod tests {
         let body = Body::from(vec![1u8; 1001]);
         assert!(matches!(
             body_into_vec(body, 1001, 1000, None).await,
-            Err(BodyError::TooLarge)
+            Err(BodyError::TooLarge(1000))
         ));
     }
 
@@ -778,13 +1015,105 @@ mod tests {
     fn an_aws_chunked_body_may_carry_its_framing_over_the_limit() {
         let mut h = HeaderMap::new();
         assert!(!aws_chunked(&h));
-        assert_eq!(wire_limit(false), MAX_BODY as u64);
+        assert_eq!(wire_limit(false, MAX_UPLOAD), MAX_UPLOAD);
         h.insert(
             "x-amz-content-sha256",
             HeaderValue::from_static("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
         );
         assert!(aws_chunked(&h));
-        assert!(wire_limit(true) > MAX_BODY as u64);
+        assert!(wire_limit(true, MAX_UPLOAD) > MAX_UPLOAD);
+    }
+
+    #[test]
+    fn only_an_object_put_without_a_sub_resource_is_an_upload() {
+        let put = Method::PUT;
+        let uri = |u: &str| u.parse::<Uri>().unwrap();
+        let none = HeaderMap::new();
+        assert!(is_upload(&put, &uri("/b/k"), &none));
+        assert!(is_upload(&put, &uri("/b/dir/k"), &none));
+        assert!(is_upload(&put, &uri("/b/k?partNumber=2&uploadId=x"), &none));
+        assert!(!is_upload(&Method::POST, &uri("/b/k"), &none));
+        assert!(!is_upload(&put, &uri("/b"), &none));
+        assert!(!is_upload(&put, &uri("/b/"), &none));
+        for sub in ["acl", "tagging", "retention", "legal-hold"] {
+            assert!(
+                !is_upload(&put, &uri(&format!("/b/k?{sub}")), &none),
+                "{sub}"
+            );
+        }
+        let mut copy = HeaderMap::new();
+        copy.insert("x-amz-copy-source", HeaderValue::from_static("/a/b"));
+        assert!(!is_upload(&put, &uri("/b/k"), &copy));
+        assert_eq!(payload_limit(true), MAX_UPLOAD);
+        assert_eq!(payload_limit(false), MAX_BODY as u64);
+    }
+
+    #[test]
+    fn a_reservation_splits_and_merges_back() {
+        let b = MemoryBudget::new(64 * MIB);
+        let mut r = b.try_reserve(48 * MIB).expect("fits");
+        let part = r.split(16 * MIB);
+        assert_eq!((r.bytes(), part.bytes()), (32 * MIB, 16 * MIB));
+        assert_eq!(b.in_use(), 48 * MIB);
+        drop(part);
+        assert_eq!(b.in_use(), 32 * MIB, "a part dropped is given back");
+        let part = r.split(16 * MIB);
+        r.merge(part);
+        assert_eq!(r.bytes(), 32 * MIB);
+        // Asked for more than it holds: all of it.
+        let all = r.split(100 * MIB);
+        assert_eq!((r.bytes(), all.bytes()), (0, 32 * MIB));
+        r.merge(all);
+        assert_eq!(r.bytes(), 32 * MIB);
+        drop(r);
+        assert_eq!(b.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_is_held_to_its_limit() {
+        use http_body_util::BodyExt;
+        let frames = futures::stream::iter(
+            (0..4u8).map(|i| Ok::<_, std::io::Error>(Bytes::from(vec![i; 100]))),
+        );
+        let body = LimitedBody::new(Body::from_stream(frames), 300, 300, Duration::from_secs(5));
+        let err = body.collect().await.expect_err("over the limit");
+        let resp = body_refused(&err);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&text).contains("EntityTooLarge"));
+
+        let frames = futures::stream::iter(
+            (0..3u8).map(|i| Ok::<_, std::io::Error>(Bytes::from(vec![i; 100]))),
+        );
+        let body = LimitedBody::new(Body::from_stream(frames), 300, 300, Duration::from_secs(5));
+        assert_eq!(body.collect().await.unwrap().to_bytes().len(), 300);
+    }
+
+    /// The idle timer runs only while the body is awaited: a reader that
+    /// takes long between reads does not make the client late.
+    #[tokio::test(start_paused = true)]
+    async fn a_streamed_body_times_out_only_while_waited_on() {
+        use http_body_util::BodyExt;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let mut body = LimitedBody::new(
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            1000,
+            1000,
+            Duration::from_secs(30),
+        );
+        tx.send(Ok(Bytes::from_static(b"abc"))).await.unwrap();
+        assert!(body.frame().await.unwrap().is_ok());
+        // The reader busy for longer than the timeout; the client has sent
+        // its next bytes meanwhile.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        tx.send(Ok(Bytes::from_static(b"def"))).await.unwrap();
+        assert!(body.frame().await.unwrap().is_ok());
+        // Now the client stops.
+        let err = body.frame().await.unwrap().expect_err("timed out");
+        let resp = body_refused(&err);
+        let text = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&text).contains("RequestTimeout"));
+        drop(tx);
     }
 
     #[test]

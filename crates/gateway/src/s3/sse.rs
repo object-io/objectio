@@ -354,35 +354,120 @@ pub(crate) fn parse_encryption_context_header(
     }
 }
 
-/// Apply SSE to an incoming PUT. Consults the effective SSE decision
-/// (request header, else bucket default) and encrypts the body with
-/// AES-256-CTR using a per-object DEK.
+/// How a PUT's body is encrypted: decided, and its key made, before any of
+/// the body is read, so that a body streamed stripe by stripe is encrypted
+/// as it goes.
+pub(crate) struct PutSse {
+    pub(crate) algorithm: SseAlgorithm,
+    pub(crate) kms_key_id: String,
+    /// The DEK as stored: wrapped by the master key or the KMS; empty for
+    /// SSE-C (the client holds the key).
+    pub(crate) encrypted_dek: Vec<u8>,
+    pub(crate) iv: Vec<u8>,
+    pub(crate) encryption_context: HashMap<String, String>,
+    /// `x-amz-server-side-encryption` for the response.
+    pub(crate) response_header: Option<&'static str>,
+    /// SSE-C only: the key's MD5, echoed back.
+    pub(crate) sse_c_key_md5: String,
+    /// The key and IV the body is encrypted with.
+    cipher: StripeCipher,
+}
+
+/// How the bytes of a stripe are encrypted on their way to the shards.
+#[derive(Clone, Copy)]
+pub(crate) enum StripeCipher {
+    Plain,
+    /// One object's, from its first byte (a PUT's): each stripe is
+    /// encrypted where it lies in the object, with the object's IV.
+    /// AES-256-CTR is seekable, so the object reads back as if encrypted
+    /// in one pass.
+    Object {
+        key: [u8; objectio_kms::DEK_LEN],
+        iv: [u8; objectio_kms::IV_LEN],
+    },
+    /// Each stripe with a fresh IV of its own, kept in its `StripeMeta`
+    /// (a multipart upload's parts, which share the upload's key).
+    PerStripe {
+        key: [u8; objectio_kms::DEK_LEN],
+    },
+}
+
+impl StripeCipher {
+    /// Encrypt `buf` in place: the body's bytes from `offset` on. Returns
+    /// the stripe's own IV, if it has one.
+    pub(crate) fn apply(&self, offset: u64, buf: &mut [u8]) -> Vec<u8> {
+        match self {
+            Self::Plain => Vec::new(),
+            Self::Object { key, iv } => {
+                // CTR's keystream is XORed either way: decrypting at an
+                // offset is encrypting there.
+                objectio_kms::decrypt_in_place(key, iv, offset, buf);
+                Vec::new()
+            }
+            Self::PerStripe { key } => {
+                let iv = objectio_kms::generate_iv();
+                objectio_kms::encrypt_in_place(key, &iv, buf);
+                iv.to_vec()
+            }
+        }
+    }
+
+    pub(crate) const fn encrypts(&self) -> bool {
+        !matches!(self, Self::Plain)
+    }
+}
+
+impl PutSse {
+    fn plaintext() -> Self {
+        Self {
+            algorithm: SseAlgorithm::SseNone,
+            kms_key_id: String::new(),
+            encrypted_dek: Vec::new(),
+            iv: Vec::new(),
+            encryption_context: HashMap::new(),
+            response_header: None,
+            sse_c_key_md5: String::new(),
+            cipher: StripeCipher::Plain,
+        }
+    }
+
+    fn keyed(algorithm: SseAlgorithm, key: [u8; objectio_kms::DEK_LEN]) -> Self {
+        let iv = objectio_kms::generate_iv();
+        Self {
+            algorithm,
+            iv: iv.to_vec(),
+            cipher: StripeCipher::Object { key, iv },
+            ..Self::plaintext()
+        }
+    }
+
+    /// Whether the body is encrypted.
+    pub(crate) const fn encrypts(&self) -> bool {
+        self.cipher.encrypts()
+    }
+
+    /// How the body's stripes are encrypted.
+    pub(crate) const fn cipher(&self) -> StripeCipher {
+        self.cipher
+    }
+}
+
+/// Decide SSE for an incoming PUT: the request's headers, else the bucket's
+/// default; and make its key: a per-object DEK for AES-256-CTR (the
+/// customer's own key for SSE-C).
 ///
 /// For SSE-S3 the DEK is wrapped by the gateway's service master key.
 /// For SSE-KMS it's wrapped via the `KmsProvider` (which in turn
 /// unwraps a KEK held only on the gateway and binds the wrap to the
 /// caller's encryption context).
 #[allow(clippy::result_large_err)]
-pub(crate) async fn apply_put_sse(
+pub(crate) async fn put_sse(
     state: &Arc<AppState>,
     meta_client: &mut MetadataServiceClient<Channel>,
     bucket: &str,
     headers: &HeaderMap,
-    body: Bytes,
     pre: Option<Result<objectio_proto::metadata::GetBucketEncryptionResponse, tonic::Status>>,
-) -> Result<
-    (
-        Bytes,
-        SseAlgorithm,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        HashMap<String, String>,
-        Option<&'static str>,
-        String, // sse_c_key_md5 — only populated for SSE-C; empty otherwise
-    ),
-    Response,
-> {
+) -> Result<PutSse, Response> {
     if let Some(refused) = sse_header_conflict(headers) {
         return Err(refused);
     }
@@ -401,33 +486,18 @@ pub(crate) async fn apply_put_sse(
                 StatusCode::BAD_REQUEST,
             ));
         }
-        let iv = objectio_kms::generate_iv();
-        let mut buf = body.to_vec();
-        objectio_kms::encrypt_in_place(&cust.key, &iv, &mut buf);
-        return Ok((
-            Bytes::from(buf),
-            SseAlgorithm::SseC,
-            String::new(), // no KMS key
-            Vec::new(),    // no wrapped DEK — the client holds the key
-            iv.to_vec(),
-            sse_c_verifier(&cust.key),
-            None, // SSE-C uses customer-algorithm headers, not x-amz-server-side-encryption
-            cust.md5_b64,
-        ));
+        // No wrapped DEK: the client holds the key. SSE-C uses
+        // customer-algorithm headers, not x-amz-server-side-encryption.
+        return Ok(PutSse {
+            encryption_context: sse_c_verifier(&cust.key),
+            sse_c_key_md5: cust.md5_b64,
+            ..PutSse::keyed(SseAlgorithm::SseC, cust.key)
+        });
     }
 
     let Some(decision) = resolve_sse_decision_with(meta_client, bucket, Some(headers), pre).await?
     else {
-        return Ok((
-            body,
-            SseAlgorithm::SseNone,
-            String::new(),
-            Vec::new(),
-            Vec::new(),
-            HashMap::new(),
-            None,
-            String::new(),
-        ));
+        return Ok(PutSse::plaintext());
     };
 
     match decision.algorithm {
@@ -441,19 +511,11 @@ pub(crate) async fn apply_put_sse(
                 ));
             };
             let dek = objectio_kms::generate_dek();
-            let iv = objectio_kms::generate_iv();
-            let mut buf = body.to_vec();
-            objectio_kms::encrypt_in_place(&dek, &iv, &mut buf);
-            Ok((
-                Bytes::from(buf),
-                SseAlgorithm::SseS3,
-                String::new(),
-                mk.wrap_dek(&dek),
-                iv.to_vec(),
-                HashMap::new(),
-                Some("AES256"),
-                String::new(),
-            ))
+            Ok(PutSse {
+                encrypted_dek: mk.wrap_dek(&dek),
+                response_header: Some("AES256"),
+                ..PutSse::keyed(SseAlgorithm::SseS3, dek)
+            })
         }
         SseAlgorithm::SseKms => {
             let Some(kms) = state.kms() else {
@@ -494,19 +556,13 @@ pub(crate) async fn apply_put_sse(
                     ));
                 }
             };
-            let iv = objectio_kms::generate_iv();
-            let mut buf = body.to_vec();
-            objectio_kms::encrypt_in_place(&data_key.plaintext_dek, &iv, &mut buf);
-            Ok((
-                Bytes::from(buf),
-                SseAlgorithm::SseKms,
-                decision.kms_key_id,
-                data_key.wrapped_dek,
-                iv.to_vec(),
-                decision.encryption_context,
-                Some("aws:kms"),
-                String::new(),
-            ))
+            Ok(PutSse {
+                kms_key_id: decision.kms_key_id,
+                encrypted_dek: data_key.wrapped_dek,
+                encryption_context: decision.encryption_context,
+                response_header: Some("aws:kms"),
+                ..PutSse::keyed(SseAlgorithm::SseKms, data_key.plaintext_dek)
+            })
         }
         _ => unreachable!("resolve_sse_decision returned unsupported algorithm"),
     }
@@ -934,5 +990,40 @@ pub(crate) async fn delete_bucket_encryption_internal(
             error!("Failed to delete encryption config for {}: {}", bucket, e);
             S3Error::from_status(&e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An object encrypted stripe by stripe, each where it lies, is the
+    /// object encrypted in one pass: what a GET decrypts.
+    #[test]
+    fn an_object_encrypted_by_stripes_is_the_object_encrypted_whole() {
+        let key = objectio_kms::generate_dek();
+        let iv = objectio_kms::generate_iv();
+        let plain: Vec<u8> = (0..100_003u32).map(|i| (i % 251) as u8).collect();
+        let mut whole = plain.clone();
+        objectio_kms::encrypt_in_place(&key, &iv, &mut whole);
+
+        let cipher = StripeCipher::Object { key, iv };
+        let mut offset = 0u64;
+        let mut by_stripes = Vec::new();
+        for stripe in plain.chunks(16_411) {
+            let mut buf = stripe.to_vec();
+            assert!(cipher.apply(offset, &mut buf).is_empty());
+            offset += buf.len() as u64;
+            by_stripes.extend_from_slice(&buf);
+        }
+        assert_eq!(by_stripes, whole);
+
+        // A part's stripes each get an IV of their own.
+        let per = StripeCipher::PerStripe { key };
+        let mut a = plain[..100].to_vec();
+        let iv_a = per.apply(0, &mut a);
+        objectio_kms::decrypt_in_place(&key, &iv_a.clone().try_into().unwrap(), 0, &mut a);
+        assert_eq!(a, plain[..100]);
+        assert!(!StripeCipher::Plain.encrypts());
     }
 }
