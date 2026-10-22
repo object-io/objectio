@@ -3,6 +3,7 @@
 //! This binary provides the S3-compatible HTTP API.
 //! Credentials are managed by the metadata service for persistence.
 
+pub mod addressing;
 pub mod admin;
 pub mod admission;
 pub mod audit;
@@ -477,6 +478,15 @@ pub struct Args {
     #[arg(long, default_value = "")]
     pub external_endpoint: String,
 
+    /// A domain clients address buckets under by host name
+    /// (virtual-hosted style), e.g. `s3.example.com`: a request to
+    /// `photos.s3.example.com/key` is for bucket `photos`. Repeat the flag
+    /// or separate domains with commas. Path-style addressing works with or
+    /// without it. Wildcard DNS and a wildcard TLS certificate for the
+    /// domain are the operator's to provide.
+    #[arg(long = "s3-domain", env = "OBJECTIO_S3_DOMAIN", value_delimiter = ',')]
+    pub s3_domains: Vec<String>,
+
     /// Admin access key ID for Delta Sharing presigned URL generation.
     /// Leave empty to disable Delta Sharing presigned URL support.
     #[arg(long, default_value = "")]
@@ -628,6 +638,13 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     objectio_proto::transport::configure_tls(&args.tls).map_err(anyhow::Error::msg)?;
+    let s3_domains = addressing::S3Domains::parse(&args.s3_domains).map_err(anyhow::Error::msg)?;
+    if !s3_domains.is_empty() {
+        info!(
+            "Virtual-hosted addressing under: {}",
+            s3_domains.names().join(", ")
+        );
+    }
     if args.test_clock_offset_ms != 0 {
         objectio_common::stamp::set_test_offset_ms(args.test_clock_offset_ms);
     }
@@ -887,7 +904,7 @@ pub async fn run(
                 && let Some(slash_pos) = rest.find('/')
             {
                 // The client signed the URI it sent, not this one.
-                let sent = iceberg_auth::ClientUri(req.uri().clone());
+                let sent = origin::ClientUri(req.uri().clone());
                 req.extensions_mut().insert(sent);
                 let warehouse = &rest[..slash_pos];
                 let remaining = &rest[slash_pos..];
@@ -1678,8 +1695,9 @@ pub async fn run(
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid --listen {}: {}", args.listen, e))?;
 
-    // Each entry: (bind addr, router, label-for-logs, endpoint name).
-    let mut listeners: Vec<(SocketAddr, Router, String, Option<String>)> = Vec::new();
+    // Each entry: (bind addr, router, label-for-logs, endpoint name,
+    // whether it serves S3).
+    let mut listeners: Vec<(SocketAddr, Router, String, Option<String>, bool)> = Vec::new();
     let main_endpoint = if args.endpoint_name.is_empty() {
         None
     } else if origin::valid_name(&args.endpoint_name) {
@@ -1709,6 +1727,10 @@ pub async fn run(
             .nest("/iceberg", iceberg_router.clone())
             .merge(unity_router.clone())
             .nest("/delta-sharing", delta_sharing_router.clone())
+            .layer(middleware::from_fn_with_state(
+                s3_domains.clone(),
+                addressing::refusal_layer,
+            ))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&admission),
                 admission::request_layer,
@@ -1760,6 +1782,10 @@ pub async fn run(
             )
             .route("/metrics", get(metrics_handler))
             .layer(middleware::from_fn_with_state(
+                s3_domains.clone(),
+                addressing::refusal_layer,
+            ))
+            .layer(middleware::from_fn_with_state(
                 Arc::clone(&admission),
                 admission::request_layer,
             ))
@@ -1771,6 +1797,7 @@ pub async fn run(
             combined,
             "data (+ admin + console)".into(),
             main_endpoint.clone(),
+            true,
         ));
     } else {
         // ---------- Split mode ----------
@@ -1780,6 +1807,7 @@ pub async fn run(
             data_only_router(),
             "data plane (S3 + Iceberg + Delta Sharing)".into(),
             main_endpoint.clone(),
+            true,
         ));
 
         if let Some(addr) = admin_addr {
@@ -1799,7 +1827,7 @@ pub async fn run(
                 .merge(console_oidc_routes.clone())
                 .layer(Extension(ListenerKind::AdminApi))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, admin_only, "admin API + metrics".into(), None));
+            listeners.push((addr, admin_only, "admin API + metrics".into(), None, false));
         }
 
         if let Some(addr) = ops_console_addr {
@@ -1830,7 +1858,7 @@ pub async fn run(
                 )
                 .layer(Extension(ListenerKind::OpsConsole))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, ops_router, "ops console".into(), None));
+            listeners.push((addr, ops_router, "ops console".into(), None, false));
         }
 
         if let Some(addr) = tenant_console_addr {
@@ -1859,7 +1887,7 @@ pub async fn run(
                 )
                 .layer(Extension(ListenerKind::TenantConsole))
                 .layer(TraceLayer::new_for_http());
-            listeners.push((addr, tenant_router, "tenant console".into(), None));
+            listeners.push((addr, tenant_router, "tenant console".into(), None, false));
         }
     }
 
@@ -1869,6 +1897,7 @@ pub async fn run(
             data_only_router(),
             format!("data plane, endpoint {name:?}"),
             Some(name),
+            true,
         ));
     }
 
@@ -1887,7 +1916,7 @@ pub async fn run(
         send: body_timeout,
     };
     let mut tasks = Vec::with_capacity(listeners.len());
-    for (addr, router, label, endpoint) in listeners {
+    for (addr, router, label, endpoint, serves_s3) in listeners {
         // Audited outermost (inside only the endpoint's name), so every
         // refusal on the way in is recorded too.
         let router = router
@@ -1901,7 +1930,19 @@ pub async fn run(
         // Iceberg path rewrite (`/iceberg/v1/ws/{wh}/...` →
         // `/iceberg/v1/...?warehouse={wh}`) is harmless on listeners
         // that don't serve Iceberg, but cheap to apply universally.
+        // A bucket named in the host moves into the path first, so the
+        // router, and the warehouse rewrite, see a path-style request.
+        let domains = if serves_s3 {
+            s3_domains.clone()
+        } else {
+            addressing::S3Domains::default()
+        };
         let app = tower::ServiceBuilder::new()
+            .layer(tower::util::MapRequestLayer::new(
+                move |req: axum::http::Request<axum::body::Body>| {
+                    addressing::rewrite(&domains, req)
+                },
+            ))
             .layer(warehouse_rewrite.clone())
             .service(router);
         let mut rx = shutdown_tx.subscribe();

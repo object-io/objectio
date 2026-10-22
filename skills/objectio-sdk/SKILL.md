@@ -17,9 +17,13 @@ One base URL (port 9000 by default) serves S3, STS, the IAM API, Iceberg,
 Delta Sharing and the admin API. If the operator gave the admin API its own
 port, only the management SDKs point there.
 
-- **Path-style only.** The gateway has no virtual-hosted routing. A request
-  to `bucket.s3.example.com` arrives as `GET /` and is answered as
-  ListBuckets, so a listing comes back empty instead of failing.
+- **Path-style always works; virtual-hosted only where configured.**
+  `bucket.s3.example.com` addresses the bucket when the operator set the
+  gateway's S3 domain (`--s3-domain s3.example.com`, helm
+  `gateway.s3Domains`) and wildcard DNS and TLS for it. Without that, a
+  bucket operation on `/` from such a client is refused with `400
+  InvalidRequest`, but a bare `GET /` still reads as ListBuckets: use
+  path-style unless the operator says the domain is set.
 - **Region** must match the gateway's `--region` (default `us-east-1`).
   Any other region gets `SignatureDoesNotMatch`.
 - **SigV4 only.** SigV2 gets `400 InvalidRequest`. boto3 and AWS CLI v1
@@ -288,8 +292,8 @@ to end before you depend on one.
 - **No admin or unscoped key in an app,** image or repo: it mints keys and
   reaches every bucket in the tenant. Use a scoped key or STS.
 - **No ACLs to share data:** they grant nothing. Use policies or presigned URLs.
-- **No RGW or MinIO extensions, no virtual-hosted addressing:** refused, or
-  worse, silently misread.
+- **No RGW or MinIO extensions, and no virtual-hosted addressing against a
+  gateway without an S3 domain:** refused, or worse, misread.
 - **No consistency workarounds:** an acknowledged write is durable and visible.
 - **No secrets in logs:** a secret is shown once, at creation. A lost one is
   replaced, not recovered.

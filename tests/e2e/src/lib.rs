@@ -58,6 +58,9 @@ pub struct Cluster {
     ec: Option<(u8, u8)>,
     /// Further aio flags, passed on every start and restart.
     extra_args: Vec<String>,
+    /// The `Host` requests are sent and signed with, when not the
+    /// endpoint's ([`Cluster::at_host`]).
+    host: Option<String>,
 }
 
 /// The HTTP client every request of the harness goes through, built once.
@@ -254,7 +257,39 @@ impl Cluster {
             osds: 0,
             ec: None,
             extra_args: Vec::new(),
+            host: None,
         }
+    }
+
+    /// A client of this cluster that sends, and signs, `host` as its `Host`
+    /// — `bucket.s3.test:PORT`, as a client addressing buckets by host name
+    /// sends it — while connecting to the same endpoint.
+    #[must_use]
+    pub fn at_host(&self, host: &str) -> Self {
+        let mut c = Self::client(&self.endpoint, &self.access_key, &self.secret_key);
+        c.host = Some(host.to_string());
+        c
+    }
+
+    /// The `Host` requests carry: [`Cluster::at_host`]'s, or the endpoint's.
+    #[must_use]
+    pub fn host(&self) -> String {
+        self.host.clone().unwrap_or_else(|| {
+            self.endpoint
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .to_string()
+        })
+    }
+
+    /// The gateway's port, from the endpoint.
+    #[must_use]
+    pub fn endpoint_port(&self) -> u16 {
+        self.endpoint
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.trim_end_matches('/').parse().ok())
+            .expect("endpoint has a port")
     }
 
     const fn child_mut(&mut self) -> &mut Child {
@@ -390,6 +425,7 @@ impl Cluster {
                 osds,
                 ec,
                 extra_args: extra_args.clone(),
+                host: None,
             };
             match cluster.wait_healthy() {
                 Ok(()) => return cluster,
@@ -807,7 +843,7 @@ impl Cluster {
         secret_key: &str,
         age_secs: i64,
     ) -> String {
-        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let host = self.host();
         let (path_only, extra_query) = match path.split_once('?') {
             Some((p, q)) => (p, q),
             None => (path, ""),
@@ -869,7 +905,7 @@ impl Cluster {
     /// Fetch a URL with no credentials of any kind — what a client handed a
     /// presigned link actually does.
     pub fn fetch(&self, method: &str, url: &str, body: &[u8]) -> Response {
-        Self::fetch_raw(method, url, body, &[])
+        self.fetch_raw(method, url, body, &[])
     }
 
     /// As [`Self::fetch`], with these headers and no body: for requests
@@ -880,12 +916,21 @@ impl Cluster {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Response {
-        Self::fetch_raw(method, url, &[], headers)
+        self.fetch_raw(method, url, &[], headers)
     }
 
-    fn fetch_raw(method: &str, url: &str, body: &[u8], headers: &[(&str, &str)]) -> Response {
+    fn fetch_raw(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Response {
         let client = http_client();
         let mut req = client.request(method.parse().expect("method"), url);
+        if let Some(host) = &self.host {
+            req = req.header("Host", host);
+        }
         for (name, value) in headers {
             req = req.header(*name, *value);
         }
@@ -1004,7 +1049,7 @@ impl Cluster {
         extra_headers: &[(&str, &str)],
     ) -> Result<Response, reqwest::Error> {
         let payload_hash = hex::encode(Sha256::digest(body));
-        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let host = self.host();
         let (path_only, query) = match path.split_once('?') {
             Some((p, q)) => (p, q),
             None => (path, ""),
@@ -1072,6 +1117,9 @@ impl Cluster {
                      SignedHeaders={signed_headers}, Signature={signature}"
                 ),
             );
+        if let Some(host) = &self.host {
+            req = req.header("Host", host);
+        }
         for (k, v) in extra_headers {
             req = req.header(*k, *v);
         }
@@ -1099,7 +1147,7 @@ impl Cluster {
         date_header: bool,
     ) -> Response {
         let payload_hash = hex::encode(Sha256::digest(body));
-        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let host = self.host();
         let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
         let escaped_path = escape_path(path_only);
         let (amz_date, date_stamp) = time_now();
@@ -1164,7 +1212,7 @@ impl Cluster {
             ),
         );
         for (k, v) in &headers {
-            if k != "host" {
+            if k != "host" || self.host.is_some() {
                 req = req.header(
                     k.as_str(),
                     reqwest::header::HeaderValue::from_bytes(v).expect("header value"),
@@ -1189,7 +1237,7 @@ impl Cluster {
         payload_hash: &str,
         signed: &[(&str, &str)],
     ) -> SignedRequest {
-        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let host = self.host();
         let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
         let escaped_path = escape_path(path_only);
         let (amz_date, date_stamp) = time_now();
@@ -1225,7 +1273,9 @@ impl Cluster {
         key = hmac(&key, "s3");
         key = hmac(&key, "aws4_request");
         let signature = hex::encode(hmac(&key, &string_to_sign));
-        headers.retain(|(k, _)| k != "host");
+        if self.host.is_none() {
+            headers.retain(|(k, _)| k != "host");
+        }
         headers.push((
             "authorization".into(),
             format!(
@@ -1267,7 +1317,7 @@ impl Cluster {
             .collect::<Vec<_>>()
             .join("&");
         let payload_hash = hex::encode(Sha256::digest(body.as_bytes()));
-        let host = self.endpoint.trim_start_matches("http://").to_string();
+        let host = self.host();
         let (amz_date, date_stamp) = time_now();
         let mut headers: Vec<(&str, String)> = vec![
             (
@@ -1314,7 +1364,7 @@ impl Cluster {
             )
             .body(body);
         for (k, v) in &headers {
-            if *k != "host" {
+            if *k != "host" || self.host.is_some() {
                 req = req.header(*k, v.as_str());
             }
         }

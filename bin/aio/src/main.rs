@@ -243,6 +243,13 @@ struct Args {
     #[arg(long, env = "OBJECTIO_EXTERNAL_ENDPOINT", default_value = "")]
     external_endpoint: String,
 
+    /// A domain clients address buckets under by host name
+    /// (virtual-hosted style), e.g. `s3.example.com`: `photos.s3.example.com`
+    /// is bucket `photos`. Repeat or separate with commas. Path-style works
+    /// with or without it.
+    #[arg(long = "s3-domain", env = "OBJECTIO_S3_DOMAIN", value_delimiter = ',')]
+    s3_domains: Vec<String>,
+
     /// Base URL of a Prometheus that scrapes this server, e.g.
     /// `http://127.0.0.1:9090`. Forwarded to the gateway, which proxies the
     /// console's range queries to it.
@@ -947,6 +954,9 @@ async fn serve() -> Result<()> {
     ];
     if !args.auth {
         gw_argv.push("--no-auth".into());
+    }
+    if !args.s3_domains.is_empty() {
+        gw_argv.extend(["--s3-domain".to_string(), args.s3_domains.join(",")]);
     }
     #[cfg(feature = "rdma")]
     if let Some(protocol) = &args.rdma {

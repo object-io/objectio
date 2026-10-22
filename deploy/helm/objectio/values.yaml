@@ -118,6 +118,12 @@ gateway:
   # credentials, Delta Sharing presigned URLs, and the console OIDC
   # callback. Leave empty to default to http://<listen>.
   externalUrl: ""
+  # Domains clients address buckets under by host name (virtual-hosted
+  # style), e.g. [s3.example.com]: photos.s3.example.com is bucket
+  # "photos". Path-style works with or without them. Each needs wildcard
+  # DNS (*.s3.example.com) to the gateway, an ingress host for the
+  # wildcard, and a TLS certificate that covers it. Empty: path-style only.
+  s3Domains: []
   # Delta Sharing presigned URL config. Credentials only — the URL base
   # is taken from gateway.externalUrl. The old deltaSharing.externalEndpoint
   # key is still read as a fallback for older deployments but should be

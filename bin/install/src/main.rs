@@ -109,6 +109,12 @@ struct InitArgs {
     #[arg(long)]
     external_endpoint: Option<String>,
 
+    /// A domain clients address buckets under by host name
+    /// (virtual-hosted style), e.g. `s3.example.com`; repeat or separate
+    /// with commas
+    #[arg(long = "s3-domain", value_delimiter = ',')]
+    s3_domains: Vec<String>,
+
     /// Meta's gRPC port (Raft and the metadata service)
     #[arg(long, default_value_t = 9100)]
     meta_port: u16,
@@ -276,6 +282,7 @@ fn init_host(a: InitArgs) -> Result<()> {
         no_auth: a.no_auth,
         region: a.region,
         external_endpoint: a.external_endpoint,
+        s3_domains: a.s3_domains,
         ports: Ports {
             meta: a.meta_port,
             meta_admin: a.meta_admin_port,

@@ -942,7 +942,9 @@ pub(crate) fn verify_presigned_v4<B>(
         return Err(AuthError::RequestTimeTooSkewed);
     }
 
-    let uri = request.uri();
+    // Signed as sent: before virtual-hosted addressing moved the bucket
+    // into the path.
+    let uri = crate::origin::sent_uri(request);
     let path = uri.path();
     let canonical_uri = if path.is_empty() { "/" } else { path };
     let canonical_query = build_canonical_query_string_presigned(uri.query().unwrap_or(""));
@@ -1368,7 +1370,9 @@ fn build_canonical_request<B>(
     payload_hash: &str,
 ) -> Result<String, AuthError> {
     let method = request.method().as_str();
-    let uri = request.uri();
+    // Signed as sent: before virtual-hosted addressing moved the bucket
+    // into the path.
+    let uri = crate::origin::sent_uri(request);
     let path = uri.path();
 
     let canonical_uri = if path.is_empty() { "/" } else { path };
@@ -2045,6 +2049,71 @@ mod sigv4_tests {
             )
             .unwrap_or_else(|e| panic!("{method} {path}{qs} rejected: {e:?}"));
         }
+    }
+
+    /// A client that puts the bucket in the host signs the path it sends
+    /// (`/key`), not the one the gateway routes (`/bucket/key`).
+    #[test]
+    fn a_virtual_hosted_request_is_verified_as_it_was_sent() {
+        use super::{CachedCredential, verify_request_v4};
+        use objectio_auth::signer::{Request, Signer};
+        let cred = CachedCredential {
+            access_key_id: "AKIAVHOST".into(),
+            secret_access_key: SECRET.into(),
+            user_id: "u1".into(),
+            user_arn: "arn:obio:iam::acme:user/u1".into(),
+            tenant: "acme".into(),
+            scope: None,
+            cached_at: std::time::Instant::now(),
+        };
+        let s = Signer {
+            access_key: &cred.access_key_id,
+            secret_key: &cred.secret_access_key,
+            region: "us-east-1",
+        };
+        let host = "photos.s3.example.com:9000";
+        let query = vec![("versionId".to_string(), "v1".to_string())];
+        let headers = s.sign(
+            &Request {
+                method: "GET",
+                host,
+                path: "/a/b.jpg",
+                query: &query,
+                content_type: None,
+                body: b"",
+            },
+            chrono::Utc::now(),
+        );
+        let build = || {
+            let mut b = http::Request::builder()
+                .uri("/a/b.jpg?versionId=v1")
+                .header("host", host);
+            for (k, v) in &headers {
+                b = b.header(*k, v);
+            }
+            b.body(()).unwrap()
+        };
+        let domains = crate::addressing::S3Domains::parse(&["s3.example.com".into()]).unwrap();
+        let req = crate::addressing::rewrite(&domains, build());
+        assert_eq!(req.uri(), "/photos/a/b.jpg?versionId=v1");
+        let parsed =
+            parse_authorization_header(req.headers()["authorization"].to_str().unwrap()).unwrap();
+        let verify = |req: &http::Request<()>| {
+            verify_request_v4(
+                req,
+                &parsed.signed_headers,
+                &parsed.signature,
+                &cred,
+                "us-east-1",
+            )
+        };
+        verify(&req).expect("the signature over the sent path verifies");
+
+        // The routed path is not what was signed: without the sent URI kept,
+        // the same request fails.
+        let mut routed = build();
+        *routed.uri_mut() = "/photos/a/b.jpg?versionId=v1".parse().unwrap();
+        assert!(verify(&routed).is_err());
     }
 }
 

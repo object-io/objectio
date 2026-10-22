@@ -94,6 +94,10 @@ spec:
             - "--trusted-proxies"
             - {{ .Values.gateway.trustedProxies | quote }}
             {{- end }}
+            {{- with .Values.gateway.s3Domains }}
+            - "--s3-domain"
+            - {{ join "," . | quote }}
+            {{- end }}
             {{- if .Values.gateway.hostProvider.enabled }}
             - "--host-provider"
             - {{ .Values.gateway.hostProvider.kind | quote }}

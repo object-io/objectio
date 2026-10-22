@@ -19,7 +19,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::task::{Context, Poll};
 
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, Request, Uri};
 
 /// The peer address of the connection a request arrived on.
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +28,21 @@ pub struct ClientAddr(pub SocketAddr);
 /// The name of the endpoint (listener) a request arrived on.
 #[derive(Clone, Debug, Default)]
 pub struct Endpoint(pub Option<String>);
+
+/// The URI a request arrived with, set when the gateway rewrote it for its
+/// router (virtual-hosted addressing, `crate::addressing`; the Iceberg
+/// warehouse prefix): the one its client signed.
+#[derive(Clone, Debug)]
+pub struct ClientUri(pub Uri);
+
+/// The URI as the client sent it, before any rewrite: what its signature
+/// covers.
+pub fn sent_uri<B>(request: &Request<B>) -> &Uri {
+    request
+        .extensions()
+        .get::<ClientUri>()
+        .map_or_else(|| request.uri(), |u| &u.0)
+}
 
 /// Proxies whose `X-Forwarded-For` is believed.
 #[derive(Clone, Debug, Default)]
