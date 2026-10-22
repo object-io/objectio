@@ -1041,6 +1041,13 @@ async fn meta_export_keeps_a_whole_backup_under_its_name() {
     assert!(request.starts_with("GET /_admin/meta/export "), "{request}");
     assert_eq!(std::fs::read(&file).unwrap(), backup);
     assert!(!dir.path().join("meta.backup.part").exists());
+    // It carries every secret meta keeps: its owner's only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
 }
 
 #[tokio::test]

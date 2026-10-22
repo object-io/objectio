@@ -760,6 +760,14 @@ impl MetaRaftStorage {
     ) -> Result<(), StorageError<NodeId>> {
         use redb::ReadableTableMetadata as _;
         let io = |e: std::io::Error| encode_err("snapshot", e);
+        // Only `&str -> &[u8]` tables are carried; a table of another kind
+        // fails the snapshot (and a backup) rather than be left out of it.
+        if let Some(t) = txn.list_multimap_tables().map_err(read_err)?.next() {
+            return Err(read_err(std::io::Error::other(format!(
+                "multimap table {} can't be carried in a snapshot",
+                redb::MultimapTableHandle::name(&t)
+            ))));
+        }
         let mut names: Vec<String> = txn
             .list_tables()
             .map_err(read_err)?

@@ -43,6 +43,24 @@ fn part_of(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// A backup carries every secret meta keeps (users' secret keys, the
+/// cluster's signing secret, wrapped KMS keys): readable by its owner only.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        opts.mode(0o600);
+        let f = opts.open(path)?;
+        // A file left from an earlier run keeps its mode: set it.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(f)
+    }
+    #[cfg(not(unix))]
+    opts.open(path)
+}
+
 /// Download the backup to `file` (through `file.part`) or standard output,
 /// checking it as it passes: a download that isn't a whole backup fails,
 /// and never gets `file`'s name.
@@ -59,7 +77,7 @@ async fn export(file: Option<&Path>, ctx: &mut Ctx<'_, '_>) -> Result<()> {
     let mut part = match file {
         Some(f) => Some((
             part_of(f),
-            std::fs::File::create(part_of(f))
+            create_private(&part_of(f))
                 .with_context(|| format!("creating {}", part_of(f).display()))?,
         )),
         None => None,

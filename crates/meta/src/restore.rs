@@ -45,9 +45,11 @@ pub enum Tool {
         #[arg(long)]
         raft_advertise: String,
     },
-    /// Make this node the only voter of its group, the other voters lost
-    /// for good. Every entry in its log is kept; entries the lost majority
-    /// committed that this node never received are gone.
+    /// The last resort: make this node the only voter of its group, the
+    /// other voters lost for good. Every entry in its log is kept; entries
+    /// the lost majority committed that this node never received are gone.
+    /// A lost node that comes back with its data would lead a group of its
+    /// own: wipe or destroy every other voter first.
     ForceSingleVoter {
         /// The surviving node's data directory.
         #[arg(long)]
@@ -59,6 +61,10 @@ pub enum Tool {
         /// membership gives it.
         #[arg(long)]
         raft_advertise: Option<String>,
+        /// Say that every other voter is gone for good (its data wiped or
+        /// its disks destroyed) and can never start again with it.
+        #[arg(long)]
+        others_lost_for_good: bool,
     },
 }
 
@@ -94,7 +100,19 @@ pub async fn run(tool: Tool) -> anyhow::Result<()> {
             data_dir,
             node_id,
             raft_advertise,
-        } => force_single_voter(&data_dir, node_id, raft_advertise).await,
+            others_lost_for_good,
+        } => {
+            if !others_lost_for_good {
+                bail!(
+                    "force-single-voter is the last resort, for a group whose majority is lost \
+                     for good: a voter that comes back with its data would lead a group of its \
+                     own beside this one, and the two would give the OSDs different answers. \
+                     Wipe or destroy every other voter's data first, then run it again with \
+                     --others-lost-for-good. While a majority can still start, start it instead."
+                );
+            }
+            force_single_voter(&data_dir, node_id, raft_advertise).await
+        }
     }
 }
 
@@ -395,6 +413,22 @@ mod tests {
             te_segment: String::new(),
         };
         (hex::encode([id; 16]), node.to_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_forced_membership_without_saying_the_others_are_lost_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(MetaStore::open(dir.path().join("meta.redb")).unwrap());
+        let e = run(Tool::ForceSingleVoter {
+            data_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            raft_advertise: None,
+            others_lost_for_good: false,
+        })
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("--others-lost-for-good"), "{e}");
+        assert!(!dir.path().join(INCOMPLETE).exists());
     }
 
     #[test]

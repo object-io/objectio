@@ -1022,6 +1022,7 @@ impl HaCluster {
             &m.dir.display().to_string(),
             "--node-id",
             &m.id.to_string(),
+            "--others-lost-for-good",
         ])
     }
 
@@ -1032,10 +1033,11 @@ impl HaCluster {
     /// # Panics
     /// When the group refuses a step.
     pub fn join_metas(&self, leader: usize, others: &[usize]) {
-        let admin = self.metas[leader].admin;
         let post = |path: &str, body: serde_json::Value| {
-            let r = http()
-                .post(format!("http://127.0.0.1:{admin}{path}"))
+            let r = self
+                .admin
+                .0
+                .post(self.admin_url(leader, path))
                 .json(&body)
                 .send()
                 .unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -1068,7 +1070,7 @@ impl HaCluster {
         let mut cmd = Command::new(bin(None, "obioctl"));
         cmd.env_clear();
         if self.tls {
-            crate::tls::apply(&mut cmd);
+            crate::tls::apply(&mut cmd, crate::tls::ADMIN);
         }
         cmd.env("HOME", self.dir.path())
             .env("PATH", std::env::var("PATH").unwrap_or_default())

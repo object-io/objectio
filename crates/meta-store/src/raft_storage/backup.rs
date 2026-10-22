@@ -334,24 +334,17 @@ impl MetaRaftStorage {
         let txn = self.db.begin_write().map_err(|e| storage("restore", e))?;
         let mut events = Vec::new();
         for cmd in &commands {
-            match Self::apply_command(&txn, &mut state, cmd, &mut events)
-                .map_err(|e| storage("restore", e))?
-            {
-                MetaResponse::MultiCasConflict { failed_indices } => {
-                    return Err(Error::Storage(format!(
-                        "a restore change met a value it didn't expect (ops {failed_indices:?})"
-                    )));
-                }
-                MetaResponse::Batch(replies)
-                    if replies
-                        .iter()
-                        .any(|r| matches!(r, MetaResponse::MultiCasConflict { .. })) =>
-                {
-                    return Err(Error::Storage(
-                        "a restore change met a value it didn't expect".into(),
-                    ));
-                }
-                _ => {}
+            // Every change must land: one refused or in conflict would leave
+            // the state machine short of what keeps it safe to serve.
+            if let Some(why) = cmd.refusal() {
+                return Err(Error::Storage(format!(
+                    "a restore change is refused: {why}"
+                )));
+            }
+            let answer = Self::apply_command(&txn, &mut state, cmd, &mut events)
+                .map_err(|e| storage("restore", e))?;
+            if let Some(why) = not_applied(&answer) {
+                return Err(Error::Storage(format!("a restore change {why}")));
             }
         }
         state.last_applied = Some(at);
@@ -375,6 +368,18 @@ impl MetaRaftStorage {
             .await
             .map_err(|e| storage("raft vote", e))?;
         Ok(())
+    }
+}
+
+/// Why `answer` says its command didn't apply whole, if it does.
+fn not_applied(answer: &MetaResponse) -> Option<String> {
+    match answer {
+        MetaResponse::MultiCasConflict { failed_indices } => Some(format!(
+            "met a value it didn't expect (ops {failed_indices:?})"
+        )),
+        MetaResponse::Rejected { reason } => Some(format!("was refused: {reason}")),
+        MetaResponse::Batch(answers) => answers.iter().find_map(not_applied),
+        _ => None,
     }
 }
 
@@ -592,6 +597,102 @@ mod tests {
             rows(&learner.db, "config").unwrap(),
             rows(&s.db, "config").unwrap()
         );
+    }
+
+    /// Every state-machine table in `db`, with its rows.
+    fn every_table(db: &Database) -> BTreeMap<String, Vec<(String, Vec<u8>)>> {
+        let txn = db.begin_read().unwrap();
+        txn.list_tables()
+            .unwrap()
+            .map(|h| redb::TableHandle::name(&h).to_string())
+            .filter(|n| !crate::tables::RAFT_TABLES.contains(&n.as_str()))
+            .map(|n| {
+                let r = rows(db, &n).unwrap();
+                (n, r)
+            })
+            .collect()
+    }
+
+    /// A backup that left a table out would lose it on a restore, silently:
+    /// whatever tables meta keeps, today's or ones added later, the
+    /// restored node holds each, row for row.
+    #[tokio::test]
+    async fn a_restore_holds_every_table_the_source_did_row_for_row() {
+        let (dir, src) = source().await;
+        let named = [
+            "access_keys",
+            "bucket_settings",
+            "counters",
+            "iam_roles",
+            "osd_nodes",
+            "packs",
+            "pg_relist",
+            "placement_groups",
+            "tenants",
+            "users",
+        ];
+        for (i, t) in named.iter().enumerate() {
+            put(&src, t, &format!("k{i}"), format!("v{i}").as_bytes());
+        }
+        // One no code names yet.
+        put(&src, "a_table_added_later", "k", b"v");
+        let before = every_table(&src.db);
+        assert!(before.contains_key("counters"), "{:?}", before.keys());
+        let path = backup_of(&src, dir.path());
+
+        let (_d, mut s) = storage();
+        s.restore(&path, &voter(), no_edit()).await.unwrap();
+        assert_eq!(every_table(&s.db), before);
+    }
+
+    /// A table the snapshot can't carry fails the export, never goes
+    /// missing from it.
+    #[tokio::test]
+    async fn a_table_a_backup_cant_carry_fails_the_export() {
+        let (dir, src) = source().await;
+        let txn = src.db.begin_write().unwrap();
+        txn.open_multimap_table(redb::MultimapTableDefinition::<&str, &str>::new("multi"))
+            .unwrap()
+            .insert("k", "v")
+            .unwrap();
+        txn.commit().unwrap();
+        let file = std::fs::File::create(dir.path().join("multi.backup")).unwrap();
+        assert!(MetaRaftStorage::export(&src.db, BufWriter::new(file)).is_err());
+
+        let (dir, src) = source().await;
+        let txn = src.db.begin_write().unwrap();
+        txn.open_table(redb::TableDefinition::<u64, u64>::new("numbers"))
+            .unwrap()
+            .insert(1, 2)
+            .unwrap();
+        txn.commit().unwrap();
+        let file = std::fs::File::create(dir.path().join("numbers.backup")).unwrap();
+        assert!(MetaRaftStorage::export(&src.db, BufWriter::new(file)).is_err());
+    }
+
+    /// A restore's change the state machine refuses (one that can never
+    /// apply) fails the restore rather than be skipped.
+    #[tokio::test]
+    async fn a_restore_whose_change_is_refused_fails() {
+        let (dir, src) = source().await;
+        let path = backup_of(&src, dir.path());
+        let (_d, mut s) = storage();
+        let edit: Edit<'_> = Box::new(|_, _| {
+            Ok(vec![MetaCommand::MultiCas {
+                ops: (0..=crate::raft::MAX_OPS)
+                    .map(|i| crate::CasOp {
+                        table: crate::CasTable::Named("t".into()),
+                        key: i.to_string(),
+                        expected: None,
+                        new_value: Some(b"v".to_vec()),
+                    })
+                    .collect(),
+                requested_by: "t".into(),
+            }])
+        });
+        let e = s.restore(&path, &voter(), edit).await.unwrap_err();
+        assert!(e.to_string().contains("refused"), "{e}");
+        assert!(rows(&s.db, "t").unwrap().is_empty());
     }
 
     #[tokio::test]

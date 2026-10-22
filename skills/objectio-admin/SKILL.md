@@ -248,7 +248,9 @@ obioctl upgrade finalize   # irreversible: the new formats start
 Take a meta backup before every finalize, and on a schedule: it is what a
 cluster that lost a meta majority is restored from (`objectio-meta restore`,
 run by whoever runs the deployment: `objectio-deploy`). A restore goes back
-to the backup's point: users and keys deleted since are valid again.
+to the backup's point: users and keys deleted since are valid again. The
+file holds every secret meta keeps (users' secret keys among them): keep it
+off the cluster and private.
 
 Rolling the binaries is `objectio-deploy`. `status` lists nodes heard from
 in the last 90 seconds: check every gateway you run is there.
