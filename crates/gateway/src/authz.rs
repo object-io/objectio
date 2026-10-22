@@ -187,6 +187,8 @@ fn classify_bucket(method: &Method, bucket: String, query: &str) -> Authz {
                 "s3:GetReplicationConfiguration"
             } else if has(query, "logging") {
                 "s3:GetBucketLogging"
+            } else if has(query, "location") {
+                "s3:GetBucketLocation"
             } else if has(query, "versions") {
                 "s3:ListBucketVersions"
             } else if has(query, "uploads") {
@@ -1229,6 +1231,11 @@ mod tests {
         assert_eq!(
             check_of(Method::GET, "/b", "uploads").0,
             "s3:ListBucketMultipartUploads"
+        );
+        // GetBucketLocation is its own action, not a listing.
+        assert_eq!(
+            check_of(Method::GET, "/b", "location").0,
+            "s3:GetBucketLocation"
         );
     }
 

@@ -60,6 +60,20 @@ fn with_a_domain_the_bucket_in_the_host_is_the_one_addressed() {
         );
     }
 
+    // GetBucketLocation on the bucket's host is the region (us-east-1: the
+    // empty constraint), not a listing; a sub-resource the gateway lacks is
+    // 501 there too.
+    let r = photos.request("GET", "/?location", &[]);
+    r.expect(200);
+    assert!(
+        r.text()
+            .ends_with("<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"),
+        "{}",
+        r.text()
+    );
+    let r = photos.request("GET", "/?website", &[]);
+    assert_eq!(r.status, 501, "{}", r.text());
+
     // A presigned URL signed for the bucket's host works there, and only
     // there: on the domain itself the same path is another object.
     let url = photos.presign("GET", "/a/b.txt", 300);

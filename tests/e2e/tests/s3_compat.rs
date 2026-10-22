@@ -1,12 +1,16 @@
 //! Requests ceph's s3-tests found handled wrongly: a DELETE naming a
 //! sub-resource the gateway doesn't handle, a request signed with `Date`
 //! instead of `X-Amz-Date`, non-ASCII metadata, `aws-chunked` combined with
-//! another content coding, `CreateBucket` of a taken name, bucket tagging.
+//! another content coding, `CreateBucket` of a taken name, bucket tagging;
+//! and a GET on a bucket naming a sub-resource (`?location`, `?website`)
+//! answered as the bucket's listing.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use base64::Engine as _;
 use objectio_e2e::Cluster;
+use objectio_e2e::ha::HaCluster;
 use serde_json::json;
 
 fn bucket(c: &Cluster, name: &str) {
@@ -440,5 +444,103 @@ fn listed_versions_name_their_owner() {
             .and_then(|rest| rest.split(close).next())
             .unwrap_or_else(|| panic!("no {open}: {xml}"));
         assert!(entry.contains("<Owner><ID>"), "{open} has no owner: {xml}");
+    }
+}
+
+const NO_CONSTRAINT: &str =
+    "<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>";
+
+/// `GetBucketLocation` was answered with the bucket's listing. It is the
+/// gateway's region; us-east-1, the default, is the empty constraint, as
+/// S3 answers it (SDKs read it as us-east-1).
+#[test]
+fn get_bucket_location_is_the_region_not_a_listing() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    bucket(&c, "where");
+    c.request("PUT", "/where/k", b"x").expect(200);
+    for path in ["/where?location", "/where?location=", "/where/?location"] {
+        let r = c.request("GET", path, &[]);
+        assert_eq!(r.status, 200, "{path}: {}", r.text());
+        let xml = r.text();
+        assert!(xml.ends_with(NO_CONSTRAINT), "{path}: {xml}");
+        assert!(!xml.contains("ListBucketResult"), "{path}: {xml}");
+    }
+    let r = c.request("GET", "/nowhere?location", &[]);
+    assert_eq!(r.status, 404, "{}", r.text());
+    assert_eq!(code(&r), "NoSuchBucket");
+}
+
+/// A gateway started in another region (`--region`) names it.
+#[test]
+fn get_bucket_location_names_the_gateways_region() {
+    let mut ha = HaCluster::start(1, 6, 1);
+    let _ = ha.await_leader(Duration::from_secs(30));
+    // Unsigned: the harness signs for us-east-1, which this one refuses.
+    let eu = ha.add_gateway_with_args(None, &["--region", "eu-west-1", "--no-auth"]);
+    ha.await_default_pool();
+    let r = ha.clients[0].request("PUT", "/abroad", &[]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = ha.clients[eu].request("GET", "/abroad?location", &[]);
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(
+        r.text().ends_with(
+            "<LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             eu-west-1</LocationConstraint>"
+        ),
+        "{}",
+        r.text()
+    );
+    // The default gateway is still us-east-1.
+    let r = ha.clients[0].request("GET", "/abroad?location", &[]);
+    assert!(r.text().ends_with(NO_CONSTRAINT), "{}", r.text());
+}
+
+/// A GET on a bucket naming a sub-resource the gateway doesn't implement,
+/// or one S3 doesn't have, is `501 NotImplemented`: it was answered with
+/// the bucket's listing, a success that wasn't one. A listing's own
+/// parameters, ones an SDK adds with a value, and the sub-resources that
+/// are implemented answer as before.
+#[test]
+fn a_bucket_get_naming_a_sub_resource_it_lacks_is_not_a_listing() {
+    let c = Cluster::start_with_ec(6, 4, 2);
+    bucket(&c, "subs");
+    c.request("PUT", "/subs/k", b"x").expect(200);
+    for sub in [
+        "website",
+        "notification",
+        "requestPayment",
+        "accelerate",
+        "analytics",
+        "inventory",
+        "metrics",
+        "intelligent-tiering",
+        "session",
+        "made-up",
+        "made-up=",
+    ] {
+        let r = c.request("GET", &format!("/subs?{sub}"), &[]);
+        assert_eq!(r.status, 501, "?{sub}: {}", r.text());
+        assert_eq!(code(&r), "NotImplemented", "?{sub}");
+    }
+    for query in [
+        "",
+        "?list-type=2&prefix=&delimiter=%2F",
+        "?prefix",
+        "?x-id=ListObjects",
+        "?max-keys=5&encoding-type=url",
+    ] {
+        let r = c.request("GET", &format!("/subs{query}"), &[]);
+        assert_eq!(r.status, 200, "{query}: {}", r.text());
+        assert!(r.text().contains("<Key>k</Key>"), "{query}: {}", r.text());
+    }
+    for (sub, answer) in [
+        ("versioning", "VersioningConfiguration"),
+        ("acl", "AccessControlPolicy"),
+        ("uploads", "ListMultipartUploadsResult"),
+        ("versions", "ListVersionsResult"),
+    ] {
+        let r = c.request("GET", &format!("/subs?{sub}"), &[]);
+        assert_eq!(r.status, 200, "?{sub}: {}", r.text());
+        assert!(r.text().contains(answer), "?{sub}: {}", r.text());
     }
 }
