@@ -73,6 +73,9 @@ every other binary is in the image. macOS runs aio only.
 6. **Auth and addresses.** `gateway.noAuth` defaults to `true`: set
    `false`. `gateway.externalUrl` is the address handed out in Iceberg
    vended credentials, Delta Sharing URLs and the OIDC callback;
+   `gateway.s3Domains` (`--s3-domain`) the domains clients may address
+   buckets under by host name (`bucket.s3.example.com`), each with
+   wildcard DNS, an ingress host and a TLS certificate for `*.<domain>`;
    `gateway.region` the SigV4 region clients sign with. OIDC:
    `gateway.oidc.issuerUrl`, `clientId`, `clientSecret` (a plain value:
    keep the values file private), `adminRoles`. `gateway.trustedProxies`:

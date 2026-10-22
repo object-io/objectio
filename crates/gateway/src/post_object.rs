@@ -936,15 +936,26 @@ async fn upload(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
-    let location = format!(
-        "{}://{host}/{}/{}",
-        if https { "https" } else { "http" },
-        urlencoding::encode(bucket),
-        key.split('/')
-            .map(|s| urlencoding::encode(s).into_owned())
-            .collect::<Vec<_>>()
-            .join("/")
-    );
+    let encoded_key = key
+        .split('/')
+        .map(|s| urlencoding::encode(s).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let scheme = if https { "https" } else { "http" };
+    // Where the object is, addressed as the form was: a host that names the
+    // bucket takes the key alone.
+    let location = if parts
+        .extensions
+        .get::<crate::addressing::VirtualHost>()
+        .is_some()
+    {
+        format!("{scheme}://{host}/{encoded_key}")
+    } else {
+        format!(
+            "{scheme}://{host}/{}/{encoded_key}",
+            urlencoding::encode(bucket)
+        )
+    };
     Ok(respond(&fields, bucket, &key, &location, &put))
 }
 

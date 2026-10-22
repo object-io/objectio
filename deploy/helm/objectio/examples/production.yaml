@@ -24,6 +24,9 @@ gateway:
   replicas: 3
   # The public URL (Iceberg vended credentials, Delta Sharing, the console).
   externalUrl: https://s3.example.com            # change
+  # Virtual-hosted addressing (bucket.s3.example.com): uncomment, and add
+  # the wildcard to the ingress hosts and the TLS certificate below.
+  # s3Domains: [s3.example.com]
   # Auth stays on (gateway.noAuth defaults to false).
   sse:
     enabled: true
@@ -41,9 +44,13 @@ gateway:
         paths:
           - path: /
             pathType: Prefix
+      # - host: "*.s3.example.com"
+      #   paths:
+      #     - path: /
+      #       pathType: Prefix
     tls:
       - secretName: s3-example-com-tls           # change
-        hosts: [s3.example.com]
+        hosts: [s3.example.com]                  # and "*.s3.example.com"
   podDisruptionBudget:
     enabled: true
     minAvailable: 2

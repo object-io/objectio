@@ -173,6 +173,8 @@ pub struct HostSpec {
     pub no_auth: bool,
     pub region: String,
     pub external_endpoint: Option<String>,
+    /// The gateway's S3 domains, for virtual-hosted addressing.
+    pub s3_domains: Vec<String>,
     pub ports: Ports,
     pub bin_dir: PathBuf,
 }
@@ -319,6 +321,9 @@ pub fn plan(spec: &HostSpec, layout: &Layout) -> Result<Plan> {
         if let Some(url) = &spec.external_endpoint {
             argv.extend(strings(&["--external-endpoint", url]));
         }
+        if !spec.s3_domains.is_empty() {
+            argv.extend(strings(&["--s3-domain", &spec.s3_domains.join(",")]));
+        }
         if spec.no_auth {
             argv.push("--no-auth".into());
         }
@@ -393,6 +398,7 @@ mod tests {
             no_auth: false,
             region: "us-east-1".into(),
             external_endpoint: None,
+            s3_domains: Vec::new(),
             ports: Ports {
                 meta: 9100,
                 meta_admin: 9102,

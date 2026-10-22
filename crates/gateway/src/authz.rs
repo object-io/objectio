@@ -12,9 +12,9 @@
 //! query onto an S3 action and a resource ARN, then evaluates the target
 //! bucket's policy against them.
 //!
-//! Only path-style addressing (`/{bucket}/{key…}`) is handled — the gateway
-//! has no virtual-hosted-style rewrite, so there is no host-derived bucket to
-//! consider.
+//! Only the path-style form (`/{bucket}/{key…}`) is read here: a request
+//! that named its bucket in the host was rewritten to it before routing
+//! (`crate::addressing`).
 //!
 //! ## Semantics
 //!

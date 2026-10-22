@@ -30,18 +30,12 @@ pub struct IcebergAuthState {
     pub required: bool,
 }
 
-/// The URI a request arrived with, before the warehouse prefix rewrite
-/// (`/iceberg/v1/ws/{wh}/...` → `/iceberg/v1/...?warehouse={wh}`) changed
-/// it: the one its client signed.
-#[derive(Clone)]
-pub struct ClientUri(pub axum::http::Uri);
-
 /// The URI the client signed: as it arrived, before the prefix rewrite and
 /// before the router stripped its nesting prefix.
 fn signed_uri(request: &Request<Body>) -> axum::http::Uri {
     request
         .extensions()
-        .get::<ClientUri>()
+        .get::<crate::origin::ClientUri>()
         .map(|u| u.0.clone())
         .or_else(|| {
             request
