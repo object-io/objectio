@@ -173,9 +173,11 @@ impl DiskManager {
     }
 
     /// `r`, a write or flush of this disk: a failure counts as a write
-    /// error.
+    /// error, unless the filesystem under a file-backed disk is out of
+    /// room. That disk is not failing, and counted, the OSD would report it
+    /// unhealthy for as long as it runs.
     fn counted_write<T>(&self, r: Result<T>) -> Result<T> {
-        if r.is_err() {
+        if r.as_ref().is_err_and(|e| !e.is_out_of_space()) {
             self.stats.write_errors.fetch_add(1, Ordering::Relaxed);
         }
         r
@@ -984,6 +986,74 @@ mod tests {
         assert_eq!(errors(&disk), (1, 1));
         // A checksum mismatch is not an I/O error: it has its own count.
         assert_eq!(disk.stats().checksum_errors.load(Ordering::Relaxed), 0);
+    }
+
+    /// A backend on a filesystem with no room left: every write fails with
+    /// ENOSPC; reads work.
+    #[derive(Debug)]
+    struct NoRoom(Arc<dyn IoBackend>);
+
+    #[async_trait::async_trait]
+    impl IoBackend for NoRoom {
+        fn kind(&self) -> crate::io_backend::BackendKind {
+            self.0.kind()
+        }
+        fn size(&self) -> u64 {
+            self.0.size()
+        }
+        async fn read_at_owned(
+            &self,
+            buf: crate::io_backend::OwnedBuf,
+            offset: u64,
+        ) -> Result<crate::io_backend::OwnedBuf> {
+            self.0.read_at_owned(buf, offset).await
+        }
+        async fn write_at_owned(
+            &self,
+            _: crate::io_backend::OwnedBuf,
+            offset: u64,
+        ) -> Result<crate::io_backend::OwnedBuf> {
+            Err(Error::io(
+                format_args!("write @ {offset}"),
+                &std::io::Error::from_raw_os_error(libc::ENOSPC),
+            ))
+        }
+        async fn sync(&self) -> Result<()> {
+            self.0.sync().await
+        }
+        async fn sync_data(&self) -> Result<()> {
+            self.0.sync_data().await
+        }
+    }
+
+    /// The filesystem under a file-backed disk filling is a write that
+    /// fails as out of space, not an error of the disk: the OSD keeps
+    /// reporting it healthy, reads go on, and writes work again once there
+    /// is room.
+    #[tokio::test]
+    async fn a_full_filesystem_fails_the_write_but_is_no_disk_error() {
+        let dir = tempdir().unwrap();
+        let mut disk =
+            DiskManager::init(dir.path().join("full.disk"), MIN_TEST_DISK, None).unwrap();
+        disk.write_block_async(0, [1; 16], 0, b"before")
+            .await
+            .unwrap();
+        let room = Arc::clone(&disk.disk_io);
+        disk.disk_io = Arc::new(NoRoom(Arc::clone(&room)));
+
+        let err = disk
+            .write_block_async(1, [2; 16], 0, b"x")
+            .await
+            .unwrap_err();
+        assert!(err.is_out_of_space(), "{err}");
+        assert_eq!(disk.stats().write_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(disk.read_block_async(0).await.unwrap().1, b"before");
+
+        disk.disk_io = room;
+        disk.write_block_async(1, [2; 16], 0, b"after")
+            .await
+            .unwrap();
+        assert_eq!(disk.read_block_async(1).await.unwrap().1, b"after");
     }
 
     #[test]

@@ -133,12 +133,22 @@ pub async fn write_stripe(
 }
 
 /// How S3 hears of stripe `stripe_id` short of its quorum: 507 when OSDs
-/// refused it for lack of room; 503 marked to be placed again when they
-/// knew a newer epoch of its placement group (nothing was stored under the
-/// one it was placed by); otherwise 503.
+/// refusing it for lack of room kept it short (the others failing too
+/// could not have made the quorum); 503 marked to be placed again when
+/// they knew a newer epoch of its placement group (nothing was stored
+/// under the one it was placed by); otherwise 503, which a client retries:
+/// some OSDs full and others unreachable is that, while the unreachable
+/// ones could still make the quorum. (Failures are counted by shard, the
+/// quorum by distinct OSD: with fewer OSDs than shards that leans to 503.)
 #[must_use]
 pub fn refused(short: &Short<OsdPoolError>, stripe_id: u64) -> Response {
-    if short.any(OsdPoolError::is_full) {
+    if OsdPoolError::full_kept_it_short(
+        short.stored,
+        short.quorum,
+        short.failed.iter().map(|(_, e)| e),
+    )
+    .is_some()
+    {
         return S3Error::storage_full();
     }
     if short.any(OsdPoolError::is_stale_epoch) {
@@ -197,11 +207,20 @@ mod tests {
     #[test]
     fn a_short_write_is_answered_by_why() {
         let down = || OsdPoolError::ConnectionFailed("down".into());
-        let full = refused(
-            &short(vec![down(), OsdPoolError::Full("no room".into())]),
-            0,
-        );
+        let no_room = || OsdPoolError::Full("no room".into());
+        let full = refused(&short(vec![no_room(), no_room()]), 0);
         assert_eq!(full.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        // One OSD full, one down: the down one back, the write makes its
+        // quorum, so a retry may succeed.
+        let mixed = refused(&short(vec![down(), no_room()]), 0);
+        assert_eq!(mixed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Two of three full, one down: back, it alone is short of the
+        // quorum of two.
+        let mut most_full = short(vec![no_room(), no_room(), down()]);
+        most_full.stored = 0;
+        let most_full = refused(&most_full, 0);
+        assert_eq!(most_full.status(), StatusCode::INSUFFICIENT_STORAGE);
 
         let stale = refused(
             &short(vec![OsdPoolError::StaleEpoch("5".into()), down()]),

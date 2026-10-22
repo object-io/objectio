@@ -251,7 +251,7 @@ impl RawFile {
         {
             self.file
                 .write_all_at(buf, offset)
-                .map_err(|e| Error::Storage(format!("write failed on {}: {}", self.path, e)))?;
+                .map_err(|e| Error::io(format_args!("write failed on {}", self.path), &e))?;
             Ok(buf.len())
         }
         #[cfg(not(unix))]
@@ -269,14 +269,14 @@ impl RawFile {
     pub fn sync(&self) -> Result<()> {
         self.file
             .sync_all()
-            .map_err(|e| Error::Storage(format!("sync failed on {}: {}", self.path, e)))
+            .map_err(|e| Error::io(format_args!("sync failed on {}", self.path), &e))
     }
 
     /// Sync data only (not metadata) to disk
     pub fn sync_data(&self) -> Result<()> {
         self.file
             .sync_data()
-            .map_err(|e| Error::Storage(format!("sync_data failed on {}: {}", self.path, e)))
+            .map_err(|e| Error::io(format_args!("sync_data failed on {}", self.path), &e))
     }
 
     /// Check alignment requirements

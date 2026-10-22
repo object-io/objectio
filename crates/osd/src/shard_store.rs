@@ -196,14 +196,54 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 thread_local! {
     /// Tests: make recording (or forgetting) a shard's location fail, as an
-    /// unwritable or full metadata log would. Per thread, so a test's
-    /// failures stay in that test.
+    /// unwritable metadata log would. Per thread, so a test's failures stay
+    /// in that test.
     pub(crate) static LOCATION_RECORDS_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the same, as a metadata log on a filesystem with no room
+    /// left would.
+    pub(crate) static LOCATION_RECORDS_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: make a shard's disk write fail as on a filesystem with no
+    /// room left.
+    pub(crate) static DISK_WRITES_FULL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An injected "no room" (ENOSPC), as the storage engine reports one.
+#[cfg(test)]
+fn injected_no_room(what: &str) -> objectio_common::Error {
+    objectio_common::Error::io(
+        format_args!("injected: {what}"),
+        &std::io::Error::from(std::io::ErrorKind::StorageFull),
+    )
 }
 
 #[cfg(test)]
-fn location_records_fail() -> bool {
-    LOCATION_RECORDS_FAIL.with(std::cell::Cell::get)
+fn location_records_fail() -> objectio_common::Result<()> {
+    if LOCATION_RECORDS_FAIL.with(std::cell::Cell::get) {
+        return Err(objectio_common::Error::storage(
+            "injected: the metadata log is unwritable",
+        ));
+    }
+    if LOCATION_RECORDS_FULL.with(std::cell::Cell::get) {
+        return Err(injected_no_room("the metadata log"));
+    }
+    Ok(())
+}
+
+/// A write to this OSD's disks or metadata store that failed, `what`, as
+/// the RPC answers it: ResourceExhausted when the filesystem had no room
+/// for it (ENOSPC, EDQUOT), as a disk refused at its full ratio is, so the
+/// gateway answers 507 rather than taking this OSD for unreachable;
+/// otherwise `otherwise`.
+pub(crate) fn write_failed(
+    what: &str,
+    e: &objectio_common::Error,
+    otherwise: tonic::Code,
+) -> Status {
+    if e.is_out_of_space() {
+        Status::resource_exhausted(format!("{what}: no room: {e}"))
+    } else {
+        Status::new(otherwise, format!("{what}: {e}"))
+    }
 }
 
 /// Shard location stored in memory. Mirrored to the persistent
@@ -521,14 +561,10 @@ pub(crate) fn persist_shard_location(
     shard_key: &str,
     loc: &ShardLocation,
     old: Option<&ShardLocation>,
-) -> std::result::Result<(), String> {
+) -> objectio_common::Result<()> {
     #[cfg(test)]
-    if location_records_fail() {
-        return Err("injected: the metadata log is unwritable".into());
-    }
-    meta_store
-        .write(location_ops(shard_key, loc, old))
-        .map_err(|e| e.to_string())
+    location_records_fail()?;
+    meta_store.write(location_ops(shard_key, loc, old))
 }
 
 /// Remove a persisted ShardLocation, `old` (delete_shard path), with a
@@ -537,11 +573,9 @@ fn forget_shard_location(
     meta_store: &dyn MetaIndex,
     shard_key: &str,
     old: &ShardLocation,
-) -> std::result::Result<(), String> {
+) -> objectio_common::Result<()> {
     #[cfg(test)]
-    if location_records_fail() {
-        return Err("injected: the metadata log is unwritable".into());
-    }
+    location_records_fail()?;
     let mut ops = vec![MetadataOp::Delete {
         key: shard_loc_meta_key(shard_key),
     }];
@@ -550,7 +584,7 @@ fn forget_shard_location(
             key: small_data_key(shard_key),
         });
     }
-    meta_store.write(ops).map_err(|e| e.to_string())
+    meta_store.write(ops)
 }
 
 /// Where each shard on this OSD is: its persisted `SHARD_LOC` entry, read
@@ -635,7 +669,11 @@ impl ShardIndex {
     }
 
     /// Record `loc` for `key` durably; what it replaced, if anything.
-    fn record(&self, key: &str, loc: &ShardLocation) -> Result<Option<ShardLocation>, String> {
+    fn record(
+        &self,
+        key: &str,
+        loc: &ShardLocation,
+    ) -> objectio_common::Result<Option<ShardLocation>> {
         let _key = self.lock(key);
         let old = self.get(key);
         persist_shard_location(&*self.store, key, loc, old.as_ref())?;
@@ -651,28 +689,24 @@ impl ShardIndex {
         key: &str,
         loc: &ShardLocation,
         extra: Vec<(MetadataKey, Vec<u8>)>,
-    ) -> Result<Option<ShardLocation>, String> {
+    ) -> objectio_common::Result<Option<ShardLocation>> {
         let _key = self.lock(key);
         let old = self.get(key);
         #[cfg(test)]
-        if location_records_fail() {
-            return Err("injected: the metadata log is unwritable".into());
-        }
+        location_records_fail()?;
         let mut ops: Vec<MetadataOp> = extra
             .into_iter()
             .map(|(key, value)| MetadataOp::Put { key, value })
             .collect();
         ops.extend(location_ops(key, loc, old.as_ref()));
-        self.store
-            .write(ops)
-            .map_err(|e| format!("record shard {key} with its metadata: {e}"))?;
+        self.store.write(ops)?;
         self.counted(old.as_ref(), Some(loc));
         Ok(old)
     }
 
     /// Forget `key` durably; where the shard was, if it was here. Its
     /// blocks may be freed only after this returns.
-    fn forget(&self, key: &str) -> Result<Option<ShardLocation>, String> {
+    fn forget(&self, key: &str) -> objectio_common::Result<Option<ShardLocation>> {
         let _key = self.lock(key);
         let Some(old) = self.get(key) else {
             return Ok(None);
@@ -1399,13 +1433,13 @@ impl BlockStore {
         let started = Instant::now();
         if let Err(e) = disk.write_block(block_num, object_id, id.stripe_id, data) {
             let _ = disk.free_extent(block_num, blocks);
-            return Err(Status::internal(format!("write failed: {e}")));
+            return Err(write_failed("write failed", &e, tonic::Code::Internal));
         }
         DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
         let started = Instant::now();
         if let Err(e) = disk.sync() {
             let _ = disk.free_extent(block_num, blocks);
-            return Err(Status::internal(format!("sync failed: {e}")));
+            return Err(write_failed("sync failed", &e, tonic::Code::Internal));
         }
         DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
         Ok(ShardLocation {
@@ -1463,19 +1497,29 @@ impl ShardStore for BlockStore {
         // Nothing records this extent until the location below, so if the
         // write or the sync fails the extent goes straight back.
         let started = Instant::now();
-        if let Err(e) = disk
+        #[cfg(test)]
+        let written = if DISK_WRITES_FULL.with(std::cell::Cell::get) {
+            Err(injected_no_room("the disk's filesystem"))
+        } else {
+            disk.write_block_async(block_num, object_id, id.stripe_id, data)
+                .await
+        };
+        #[cfg(not(test))]
+        let written = disk
             .write_block_async(block_num, object_id, id.stripe_id, data)
-            .await
-        {
+            .await;
+        if let Err(e) = written {
             let _ = disk.free_extent(block_num, blocks);
-            return Err(Status::internal(format!("write failed: {e}")));
+            return Err(write_failed("write failed", &e, tonic::Code::Internal));
         }
         DISK_SECONDS.observe_duration("op=\"write\"", started.elapsed());
 
+        // A failed sync is a failed write, whatever the error: the shard
+        // is refused, its extent freed, and nothing records it.
         let started = Instant::now();
         if let Err(e) = disk.sync() {
             let _ = disk.free_extent(block_num, blocks);
-            return Err(Status::internal(format!("sync failed: {e}")));
+            return Err(write_failed("sync failed", &e, tonic::Code::Internal));
         }
         DISK_SECONDS.observe_duration("op=\"sync\"", started.elapsed());
 
@@ -1499,6 +1543,12 @@ impl ShardStore for BlockStore {
         // record didn't survive (the bitmap is rebuilt from the index).
         let replaced = match self.index.record(&key, &loc) {
             Ok(replaced) => replaced,
+            Err(e) if e.is_out_of_space() => {
+                warn!("Shard {key} written but no room to record its location: {e}; write refused");
+                return Err(Status::resource_exhausted(format!(
+                    "the shard's location could not be recorded: no room ({e}); not stored"
+                )));
+            }
             Err(e) => {
                 error!("Shard {key} written but its location not recorded: {e}; write refused");
                 return Err(Status::unavailable(format!(
@@ -1562,10 +1612,13 @@ impl ShardStore for BlockStore {
                 small: Some(shard.data.clone()),
             }
         };
-        let replaced = self
-            .index
-            .record_with(&key, &loc, writes)
-            .map_err(|e| Status::internal(format!("failed to store object metadata: {e}")))?;
+        let replaced = self.index.record_with(&key, &loc, writes).map_err(|e| {
+            write_failed(
+                &format!("failed to store object metadata with shard {key}"),
+                &e,
+                tonic::Code::Internal,
+            )
+        })?;
         if let Some(old) = replaced {
             self.free_location(&old);
         }
@@ -1657,9 +1710,11 @@ impl ShardStore for BlockStore {
             Ok(removed) => removed,
             Err(e) => {
                 error!("Shard {key}: its removal could not be recorded: {e}; delete refused");
-                return Err(Status::unavailable(format!(
-                    "the shard's removal could not be recorded durably ({e}); retry"
-                )));
+                return Err(write_failed(
+                    "the shard's removal could not be recorded durably; retry",
+                    &e,
+                    tonic::Code::Unavailable,
+                ));
             }
         };
 
@@ -1934,6 +1989,12 @@ pub(crate) mod conformance {
         /// Make writes of the metadata index fail (or not), as an
         /// unwritable log would.
         pub fail_records: fn(bool),
+        /// Make writes of the metadata index fail (or not) as on a
+        /// filesystem with no room left (ENOSPC).
+        pub fill_records: fn(bool),
+        /// Make writes of shards to disk fail (or not) as on a filesystem
+        /// with no room left.
+        pub fill_disks: fn(bool),
     }
 
     fn id(object: u8, position: u32) -> ShardId {
@@ -1978,6 +2039,55 @@ pub(crate) mod conformance {
         a_shard_with_metadata_is_all_or_nothing(engine).await;
         shards_page_in_key_order(engine).await;
         client_writes_stop_at_the_full_ratio(engine).await;
+        a_full_filesystem_refuses_writes_as_full(engine).await;
+    }
+
+    /// A filesystem with no room left under the disks or the metadata
+    /// index: a write is refused as full (ResourceExhausted, what the
+    /// gateway answers 507 for), not as failed; nothing of it is kept;
+    /// what was stored reads as before; and writes work again once there
+    /// is room.
+    async fn a_full_filesystem_refuses_writes_as_full(engine: &Engine) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, meta) = (engine.open)(dir.path());
+        let kept = data(15, 30_000);
+        put(&*store, &id(15, 0), &kept).await;
+        let before = free(&*store);
+        let bytes = data(16, 40_000);
+        let entry = || vec![(MetadataKey::object_meta("b", "full"), b"meta".to_vec())];
+
+        for fill in [engine.fill_disks, engine.fill_records] {
+            fill(true);
+            let err = store
+                .write(&id(15, 1), &bytes, crc32c::crc32c(&bytes), false)
+                .await
+                .unwrap_err();
+            fill(false);
+            assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+            assert_eq!(store.state(&id(15, 1)), ShardState::Missing);
+            assert_eq!(store.read(&id(15, 0)).await.unwrap().0, kept);
+        }
+        // The disk's extent goes back when the block write failed; one
+        // whose record failed is held until a restart (the record may
+        // have reached the log).
+        assert!(free(&*store) <= before);
+
+        (engine.fill_records)(true);
+        let err = store
+            .write_with_metadata(small(&id(15, 2), &bytes[..3000]), entry())
+            .unwrap_err();
+        (engine.fill_records)(false);
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted, "{err}");
+        assert_eq!(meta.get(&MetadataKey::object_meta("b", "full")), None);
+        assert_eq!(store.state(&id(15, 2)), ShardState::Missing);
+
+        put(&*store, &id(15, 1), &bytes).await;
+        assert_eq!(store.read(&id(15, 1)).await.unwrap().0, bytes);
+        store
+            .write_with_metadata(small(&id(15, 2), &bytes[..3000]), entry())
+            .unwrap();
+        assert_eq!(store.read(&id(15, 2)).await.unwrap().0, &bytes[..3000]);
+        assert_eq!(store.read(&id(15, 0)).await.unwrap().0, kept);
     }
 
     async fn reads_its_writes(engine: &Engine) {
@@ -2261,6 +2371,8 @@ mod tests {
                 rot_block(&dir.join("disk.raw"), BLOCK, store, id, needle);
             },
             fail_records: |on| LOCATION_RECORDS_FAIL.with(|f| f.set(on)),
+            fill_records: |on| LOCATION_RECORDS_FULL.with(|f| f.set(on)),
+            fill_disks: |on| DISK_WRITES_FULL.with(|f| f.set(on)),
         })
         .await;
     }

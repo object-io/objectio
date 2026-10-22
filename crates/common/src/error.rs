@@ -134,7 +134,39 @@ pub enum Error {
     Deserialization(String),
 }
 
+/// Whether `e` is the filesystem out of room: ENOSPC, or EDQUOT (a quota).
+/// Not a failing disk: the write can succeed once space is freed.
+#[must_use]
+pub fn is_out_of_space(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
+}
+
 impl Error {
+    /// An I/O failure while doing `what`. One for lack of room
+    /// ([`is_out_of_space`]) keeps its kind, so a caller can answer "full"
+    /// rather than "failed"; any other is a storage error.
+    pub fn io(what: impl std::fmt::Display, e: &std::io::Error) -> Self {
+        if is_out_of_space(e) {
+            Self::DiskIo(std::io::Error::new(e.kind(), format!("{what}: {e}")))
+        } else {
+            Self::Storage(format!("{what}: {e}"))
+        }
+    }
+
+    /// Whether this is storage out of room: a disk with no free block, or
+    /// a filesystem that refused a write with ENOSPC or EDQUOT.
+    #[must_use]
+    pub fn is_out_of_space(&self) -> bool {
+        match self {
+            Self::DiskFull | Self::InsufficientSpace { .. } => true,
+            Self::DiskIo(e) => is_out_of_space(e),
+            _ => false,
+        }
+    }
+
     /// Create a new internal error
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -176,6 +208,9 @@ impl Error {
     /// Get HTTP status code for S3 API compatibility
     #[must_use]
     pub fn http_status_code(&self) -> u16 {
+        if self.is_out_of_space() {
+            return 507;
+        }
         match self {
             // 400 Bad Request
             Self::InvalidRequest(_)
@@ -264,5 +299,36 @@ mod tests {
         assert_eq!(Error::AccessDenied.http_status_code(), 403);
         assert_eq!(Error::BucketNotFound("test".into()).http_status_code(), 404);
         assert_eq!(Error::Internal("test".into()).http_status_code(), 500);
+    }
+
+    /// ENOSPC and EDQUOT are the filesystem out of room, whatever wraps
+    /// them; EIO is a failing disk.
+    #[test]
+    fn a_full_filesystem_is_out_of_space_not_a_failure() {
+        let os = std::io::Error::from_raw_os_error;
+        for errno in [libc::ENOSPC, libc::EDQUOT] {
+            let e = Error::io("write disk.raw @ 4096", &os(errno));
+            assert!(e.is_out_of_space(), "{e}");
+            assert_eq!(e.http_status_code(), 507);
+            assert!(e.to_string().contains("disk.raw"), "{e}");
+        }
+        let eio = Error::io("write disk.raw @ 4096", &os(libc::EIO));
+        assert!(!eio.is_out_of_space(), "{eio}");
+        assert!(matches!(eio, Error::Storage(_)), "{eio}");
+        assert!(Error::DiskFull.is_out_of_space());
+        assert!(!Error::Storage("No space left on device".into()).is_out_of_space());
+    }
+
+    /// What the kernel answers a write with no room for, as std reports it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_to_a_full_device_is_out_of_space() {
+        use std::io::Write as _;
+        let e = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .and_then(|mut f| f.write_all(b"x"))
+            .unwrap_err();
+        assert!(is_out_of_space(&e), "{e:?}");
     }
 }

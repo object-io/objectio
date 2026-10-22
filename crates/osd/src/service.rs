@@ -1,6 +1,6 @@
 //! OSD gRPC service implementation
 
-use crate::shard_store::{BlockStore, Disks, ShardInfo, ShardStore};
+use crate::shard_store::{BlockStore, Disks, ShardInfo, ShardStore, write_failed};
 use futures::stream::Stream;
 use objectio_proto::metadata::ObjectMeta;
 use objectio_proto::storage::{
@@ -835,9 +835,9 @@ impl OsdService {
             now_current = newest;
         }
         if !ops.is_empty() {
-            self.meta_store
-                .write(ops)
-                .map_err(|e| Status::internal(format!("failed to withdraw the write: {e}")))?;
+            self.meta_store.write(ops).map_err(|e| {
+                write_failed("failed to withdraw the write", &e, tonic::Code::Internal)
+            })?;
             for (entry, kind, before, after) in &usage {
                 self.usage
                     .apply(bucket, entry, *kind, before.as_ref(), after.as_ref());
@@ -896,7 +896,11 @@ impl OsdService {
             self.meta_store
                 .put(key.clone(), stored.encode_to_vec())
                 .map_err(|e| {
-                    Status::internal(format!("failed to store replication status: {e}"))
+                    write_failed(
+                        "failed to store replication status",
+                        &e,
+                        tonic::Code::Internal,
+                    )
                 })?;
             self.usage
                 .apply(bucket, &key, kind, Some(&before), Some(&stored));
@@ -949,7 +953,7 @@ impl OsdService {
                 ),
             )
             .map(drop)
-            .map_err(|e| Status::internal(format!("failed to record the delete: {e}")))
+            .map_err(|e| write_failed("failed to record the delete", &e, tonic::Code::Internal))
     }
 
     /// Whether this copy saw a delete of the key (or version) newer than
@@ -1262,7 +1266,7 @@ impl StorageService for OsdService {
         // One WAL record for the whole call.
         self.meta_store
             .batch_put(writes)
-            .map_err(|e| Status::internal(format!("recording chunk notes: {e}")))?;
+            .map_err(|e| write_failed("recording chunk notes", &e, tonic::Code::Internal))?;
         Ok(Response::new(NoteChunksResponse { seen }))
     }
 
@@ -1287,7 +1291,7 @@ impl StorageService for OsdService {
                 match self.meta_store.delete(&key) {
                     Ok(_) => entries += 1,
                     Err(e) => {
-                        return Err(Status::internal(format!("purge: {e}")));
+                        return Err(write_failed("purge", &e, tonic::Code::Internal));
                     }
                 }
             }
@@ -1319,7 +1323,7 @@ impl StorageService for OsdService {
             }
             self.meta_store
                 .batch_delete(&batch)
-                .map_err(|e| Status::internal(format!("forgetting chunk notes: {e}")))?;
+                .map_err(|e| write_failed("forgetting chunk notes", &e, tonic::Code::Internal))?;
             forgotten += batch.len() as u64;
         }
         info!("dedup dry-run: forgot {forgotten} chunk notes");
@@ -1860,7 +1864,11 @@ impl StorageService for OsdService {
                         self.meta_store
                             .put(version_key.clone(), value)
                             .map_err(|e| {
-                                Status::internal(format!("failed to store version entry: {e}"))
+                                write_failed(
+                                    "failed to store version entry",
+                                    &e,
+                                    tonic::Code::Internal,
+                                )
                             })?;
                     }
                 }
@@ -1945,7 +1953,7 @@ impl StorageService for OsdService {
                 // This OSD's small shard of the object, with it (B21).
                 Some(shard) => self.shards.write_with_metadata(shard, writes)?,
                 None => self.meta_store.batch_put(writes).map(|_| ()).map_err(|e| {
-                    Status::internal(format!("failed to store object metadata: {e}"))
+                    write_failed("failed to store object metadata", &e, tonic::Code::Internal)
                 })?,
             }
             for (entry, kind, before, after) in &usage {
@@ -2074,7 +2082,11 @@ impl StorageService for OsdService {
                 let old = self.stored_meta(&key);
                 removed = old.clone();
                 self.meta_store.delete(&key).map_err(|e| {
-                    Status::internal(format!("failed to delete object metadata: {}", e))
+                    write_failed(
+                        "failed to delete object metadata",
+                        &e,
+                        tonic::Code::Internal,
+                    )
                 })?;
                 self.usage
                     .apply(&req.bucket, &key, EntryKind::Current, old.as_ref(), None);
@@ -2086,7 +2098,7 @@ impl StorageService for OsdService {
                 let old = self.stored_meta(&version_key);
                 removed = old.clone();
                 self.meta_store.delete(&version_key).map_err(|e| {
-                    Status::internal(format!("failed to delete version entry: {}", e))
+                    write_failed("failed to delete version entry", &e, tonic::Code::Internal)
                 })?;
                 self.usage.apply(
                     &req.bucket,
@@ -2119,7 +2131,11 @@ impl StorageService for OsdService {
                         None => self.meta_store.delete(&current_key),
                     }
                     .map_err(|e| {
-                        Status::internal(format!("failed to replace the current version: {e}"))
+                        write_failed(
+                            "failed to replace the current version",
+                            &e,
+                            tonic::Code::Internal,
+                        )
                     })?;
                     self.usage.apply(
                         &req.bucket,

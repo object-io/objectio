@@ -17,6 +17,9 @@
 //! Fail-stop: a write or sync that fails leaves the log refusing every
 //! write after it until it is opened again, and an open refuses a log
 //! damaged anywhere but at its end (objectio-docs `core/storage-engine.md`).
+//! The one exception is a write the filesystem had no room for (ENOSPC,
+//! EDQUOT): what it left is cut off, that append fails alone, and the log
+//! takes appends again once there is room.
 
 use super::types::{MetadataEntry, MetadataOp};
 use objectio_common::log_tail::whole_record_after;
@@ -160,11 +163,29 @@ struct LogFile {
 impl LogFile {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(test)]
-        if let Some(after) = self.faults.write.lock().take() {
+        if let Some((after, kind)) = self.faults.write.lock().take() {
             self.file.write_all(&bytes[..after.min(bytes.len())])?;
-            return Err(std::io::Error::other("injected write failure"));
+            return Err(std::io::Error::new(kind, "injected write failure"));
         }
         self.file.write_all(bytes)
+    }
+
+    /// Cut the file back to `end`, where the append that failed began, and
+    /// write on from there. `end` must be where the file ended before it:
+    /// a file shorter than that is not the one the log counted, and is not
+    /// cut.
+    fn cut_back(&mut self, end: u64) -> std::io::Result<()> {
+        let len = self.file.metadata()?.len();
+        if len < end {
+            return Err(std::io::Error::other(format!(
+                "the file is {len} bytes, shorter than the {end} the log wrote"
+            )));
+        }
+        self.file.set_len(end)?;
+        // A log that compaction replaced is not opened to append: its next
+        // write would go where this one stopped, past a hole.
+        self.file.seek(SeekFrom::Start(end))?;
+        Ok(())
     }
 }
 
@@ -172,10 +193,11 @@ impl LogFile {
 #[cfg(test)]
 #[derive(Default)]
 struct Faults {
-    /// The next write fails after writing this many bytes.
-    write: Mutex<Option<usize>>,
-    /// The next sync fails.
-    sync: std::sync::atomic::AtomicBool,
+    /// The next write fails after writing this many bytes, as this kind of
+    /// error.
+    write: Mutex<Option<(usize, std::io::ErrorKind)>>,
+    /// The next sync fails, as this kind of error.
+    sync: Mutex<Option<std::io::ErrorKind>>,
 }
 
 pub struct MetadataWal {
@@ -512,6 +534,24 @@ impl MetadataWal {
     /// The error for a write or sync that failed, which from now on fails
     /// every write: see `failed`.
     fn fail(&self, what: &str, e: impl std::fmt::Display) -> Error {
+        let cause = self.failed_with(what, &e);
+        Error::Storage(format!("metadata log {}: {cause}", self.path.display()))
+    }
+
+    /// [`Self::fail`] for an I/O error, which keeps its kind: a sync the
+    /// filesystem had no room for is out of space to the caller. The log
+    /// fails all the same: after a failed sync, nothing it holds can be
+    /// taken as durable.
+    fn fail_io(&self, what: &str, e: &std::io::Error) -> Error {
+        self.failed_with(what, e);
+        Error::io(
+            format_args!("metadata log {}: {what} failed", self.path.display()),
+            e,
+        )
+    }
+
+    /// Record the log's first failure, `what` failing with `e`; its cause.
+    fn failed_with(&self, what: &str, e: &dyn std::fmt::Display) -> String {
         let cause = format!("{what} failed: {e}");
         if self.failed.set(cause.clone()).is_ok() {
             tracing::error!(
@@ -519,7 +559,37 @@ impl MetadataWal {
                 self.path.display()
             );
         }
-        Error::Storage(format!("metadata log {}: {cause}", self.path.display()))
+        cause
+    }
+
+    /// The error for an append whose write failed, `writer` held. One the
+    /// filesystem had no room for is cut off where it began, at `start`:
+    /// the record is then not in the log and nothing before it was
+    /// touched, so that append fails alone, out of space, and the log goes
+    /// on. Nothing is synced for the cut: the next record is written over
+    /// it, and that record's sync makes the file's new end durable with
+    /// it; a crash before then finds at most a torn tail, which the open
+    /// cuts off. Any other failure, or a cut that fails, fails the log.
+    fn append_failed(&self, writer: &mut LogFile, start: u64, e: &std::io::Error) -> Error {
+        if !objectio_common::error::is_out_of_space(e) {
+            return self.fail_io("write", e);
+        }
+        match writer.cut_back(start) {
+            Ok(()) => {
+                tracing::warn!(
+                    "metadata log {}: no room for a record ({e}); it is not in the log",
+                    self.path.display()
+                );
+                Error::io(
+                    format_args!("metadata log {}: write failed", self.path.display()),
+                    e,
+                )
+            }
+            Err(cut) => self.fail(
+                "write",
+                format_args!("{e}, and what it left could not be cut off ({cut})"),
+            ),
+        }
     }
 
     /// Refuse if a write or sync has failed.
@@ -569,9 +639,10 @@ impl MetadataWal {
             // leaves no number behind.
             let lsn = self.next_lsn.load(Ordering::SeqCst);
             let bytes = WalRecord { lsn, data }.to_bytes();
-            writer
-                .write_all(&bytes)
-                .map_err(|e| self.fail("write", e))?;
+            let start = self.size.load(Ordering::SeqCst);
+            if let Err(e) = writer.write_all(&bytes) {
+                return Err(self.append_failed(&mut writer, start, &e));
+            }
             self.next_lsn.store(lsn + 1, Ordering::SeqCst);
             self.size.fetch_add(bytes.len() as u64, Ordering::SeqCst);
             self.written_lsn.store(lsn, Ordering::SeqCst);
@@ -611,10 +682,10 @@ impl MetadataWal {
         let covered = self.written_lsn.load(Ordering::SeqCst);
         let started = std::time::Instant::now();
         #[cfg(test)]
-        if self.faults.sync.swap(false, Ordering::SeqCst) {
-            return Err(self.fail("sync", "injected sync failure"));
+        if let Some(kind) = self.faults.sync.lock().take() {
+            return Err(self.fail_io("sync", &std::io::Error::new(kind, "injected sync failure")));
         }
-        handle.sync_data().map_err(|e| self.fail("sync", e))?;
+        handle.sync_data().map_err(|e| self.fail_io("sync", &e))?;
         self.sync_stats.seconds.observe_duration(started.elapsed());
         let previous = self.synced_lsn.fetch_max(covered, Ordering::SeqCst);
         self.sync_stats.syncs.fetch_add(1, Ordering::Relaxed);
@@ -821,13 +892,26 @@ impl MetadataWal {
     /// Make the next write fail after writing `after` bytes of it.
     #[cfg(test)]
     fn fail_next_write(&self, after: usize) {
-        *self.faults.write.lock() = Some(after);
+        self.fail_next_write_as(after, std::io::ErrorKind::Other);
+    }
+
+    /// Make the next write fail after writing `after` bytes of it, as
+    /// `kind`.
+    #[cfg(test)]
+    fn fail_next_write_as(&self, after: usize, kind: std::io::ErrorKind) {
+        *self.faults.write.lock() = Some((after, kind));
     }
 
     /// Make the next sync fail.
     #[cfg(test)]
     fn fail_next_sync(&self) {
-        self.faults.sync.store(true, Ordering::SeqCst);
+        self.fail_next_sync_as(std::io::ErrorKind::Other);
+    }
+
+    /// Make the next sync fail, as `kind`.
+    #[cfg(test)]
+    fn fail_next_sync_as(&self, kind: std::io::ErrorKind) {
+        *self.faults.sync.lock() = Some(kind);
     }
 }
 
@@ -1669,5 +1753,67 @@ mod fail_stop_tests {
         for lsn in &acked {
             assert!(held.contains(lsn), "acknowledged {lsn} lost: {held:?}");
         }
+    }
+
+    /// A write the filesystem had no room for (ENOSPC, EDQUOT), part of the
+    /// record written: that append fails, as out of space, and the log
+    /// goes on: the next append takes the number it didn't, in a log
+    /// opened to append and in one compaction replaced alike. Reopened, it
+    /// holds every record acknowledged, whole, and nothing of the one that
+    /// failed.
+    #[test]
+    fn an_append_with_no_room_fails_alone_and_the_log_goes_on() {
+        use std::io::ErrorKind::{QuotaExceeded, StorageFull};
+        for kind in [StorageFull, QuotaExceeded] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("m.wal");
+            MetadataWal::create(&path, WalConfig::default())
+                .unwrap()
+                .append(&put(1))
+                .unwrap();
+            {
+                let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+                wal.fail_next_write_as(7, kind);
+                let err = wal.append(&put(100)).unwrap_err();
+                assert!(err.is_out_of_space(), "{kind:?}: {err}");
+                assert_eq!(wal.append(&put(2)).unwrap(), 2, "{kind:?}");
+                wal.sync().unwrap();
+
+                // Compaction's file is written from where its copy ended.
+                let mark = wal.mark().unwrap();
+                wal.append(&put(3)).unwrap();
+                wal.truncate_through(mark).unwrap();
+                wal.fail_next_write_as(30, kind);
+                assert!(wal.append(&put(100)).unwrap_err().is_out_of_space());
+                assert_eq!(wal.append(&put(4)).unwrap(), 4, "{kind:?}");
+                assert_eq!(wal.size(), std::fs::metadata(&path).unwrap().len());
+            }
+            assert_eq!(lsns(&path), vec![3, 4], "{kind:?}");
+            let wal = MetadataWal::open(&path, WalConfig::default()).unwrap();
+            let mut values = Vec::new();
+            wal.replay(0, |_, op| {
+                values.push(op.to_bytes());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(values, vec![put(3).to_bytes(), put(4).to_bytes()]);
+        }
+    }
+
+    /// A sync the filesystem had no room for: the append fails as out of
+    /// space, and the log is failed as after any failed sync (what it
+    /// holds can't be taken as durable): it is not retried.
+    #[test]
+    fn a_sync_with_no_room_fails_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = MetadataWal::create(dir.path().join("m.wal"), WalConfig::default()).unwrap();
+        wal.append(&put(1)).unwrap();
+        wal.fail_next_sync_as(std::io::ErrorKind::StorageFull);
+        let err = wal.append(&put(2)).unwrap_err();
+        assert!(err.is_out_of_space(), "{err}");
+        assert!(
+            wal.append(&put(3)).is_err(),
+            "an append after a failed sync"
+        );
     }
 }
