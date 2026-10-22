@@ -410,11 +410,10 @@ impl MetaService {
         // object was stored, a completion that then failed freed parts the
         // client had been told were uploaded, and its retry found no upload.
         let now = Self::current_timestamp();
-        // Recorded only once every node reads the mark: one of the release
-        // before would take the upload for open, and an abort there would
-        // free the parts of a stored object.
-        let two_phase = req.settle_after_commit
-            && objectio_common::version::allows(objectio_common::version::COMPLETED_UPLOADS_LEVEL);
+        // A gateway asks for one phase only while it hasn't heard the
+        // cluster's level yet (0.1.0-rc.2, just started); from this release
+        // on, never.
+        let two_phase = req.settle_after_commit;
         let (object, unused_stripes, settling) = self
             .update_multipart(&req.upload_id, "complete-multipart", |upload| {
                 let mut upload = upload.ok_or_else(|| {

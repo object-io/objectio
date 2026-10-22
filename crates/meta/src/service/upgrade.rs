@@ -220,11 +220,6 @@ impl MetaService {
                         "upgrade finalized by {requested_by}: active format level {} -> {}",
                         plan.active, plan.target
                     );
-                    // New keys are placed through the default pool from
-                    // here (level 7): made before finalize answers, not at
-                    // the upkeep's next round, so writes don't meet a pool
-                    // not made yet.
-                    self.await_default_pool().await;
                     Ok(plan.target)
                 }
                 MetaResponse::MultiCasConflict { .. } => Err(Status::aborted(

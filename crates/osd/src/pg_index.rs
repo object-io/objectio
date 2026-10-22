@@ -24,8 +24,7 @@
 //! never stored, so it can't be stale.
 //!
 //! A key whose PG is known neither from its ObjectMeta (`pg_pool`,
-//! `pg_id`, set by the gateway from level 7) nor from its tombstone is not
-//! indexed: keys placed per key, written before placement groups.
+//! `pg_id`, set by the gateway) nor from its tombstone is not indexed.
 
 use std::collections::HashMap;
 use std::sync::Arc;

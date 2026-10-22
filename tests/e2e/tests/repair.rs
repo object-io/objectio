@@ -325,10 +325,9 @@ fn shard_count(c: &Cluster, index: usize) -> u64 {
 /// An OSD set out with no other to stand in for it (six OSDs, 4+2): its
 /// placement groups are undersized, and objects written meanwhile go to the
 /// other five, one shard each, short one and recorded so (B31): nothing is
-/// put on the OSD that is out, and nothing doubles up on another (it did,
-/// before placement groups: two shards of every such object on one OSD,
-/// spread again by repair later). Once the OSD is back in, repair puts the
-/// missing shard there, and the objects survive any two losses.
+/// put on the OSD that is out, and nothing doubles up on another. Once the
+/// OSD is back in, repair puts the missing shard there, and the objects
+/// survive any two losses.
 #[test]
 fn objects_written_while_an_osd_is_out_get_their_missing_shard_when_it_is_back() {
     let mut c = Cluster::start_with_ec_and_args(6, 4, 2, &["--repair-interval-secs", "1"]);
@@ -612,7 +611,6 @@ fn a_write_short_of_shards_is_repaired_from_its_record() {
 fn a_write_whose_owner_missed_it_is_repaired_without_a_heal() {
     use objectio_e2e::ha::HaCluster;
     let mut ha = HaCluster::start_with_meta_args(1, 6, 1, &["--repair-interval-secs", "3600"]);
-    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
     let _ = ha.await_leader(Duration::from_secs(30));
     assert_eq!(ha.clients[0].request("PUT", "/owner", &[]).status, 200);
     ha.stop_osd(0);

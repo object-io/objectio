@@ -11,8 +11,8 @@
 //! a listing peering compares every member's entries and brings meta's
 //! listing index in line with them.
 //!
-//! The walk (`repair.rs`) no longer looks at keys in placement groups: it
-//! checks block chunks, packs, and keys written before placement groups.
+//! The walk (`repair.rs`) checks what no placement group holds: block
+//! chunks and packs.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 
 use objectio_proto::metadata::PgScrub;
 use objectio_proto::storage::{ScrubPgRequest, storage_service_client::StorageServiceClient};
-
-use super::pgs::pg_placement;
 
 /// Raft table of each placement group's scrub.
 pub(crate) const SCRUB_TABLE: &str = "pg_scrub";
@@ -271,11 +269,11 @@ impl MetaService {
         Err(Status::aborted("the scrub record kept changing; retry"))
     }
 
-    /// One step (leader, level 7): choose the PGs to scrub now (asked for,
+    /// One step (leader): choose the PGs to scrub now (asked for,
     /// under way, then due, no OSD in two), and have each of their members
     /// read a second's worth.
     pub(crate) async fn scrub_round(&self) {
-        if !self.is_raft_leader() || !pg_placement() || !self.config_parsed("scrub/enabled", true) {
+        if !self.is_raft_leader() || !self.config_parsed("scrub/enabled", true) {
             return;
         }
         let every = self.config_parsed("scrub/every_seconds", EVERY_SECS);

@@ -34,8 +34,6 @@ use objectio_proto::storage::{
     storage_service_client::StorageServiceClient,
 };
 
-use super::pgs::pg_placement;
-
 /// The Raft table peering's results are kept in.
 pub(crate) const PG_STATE_TABLE: &str = "pg_state";
 
@@ -505,13 +503,13 @@ impl MetaService {
         states
     }
 
-    /// One look (leader, level 7): peer the placement groups that need it
+    /// One look (leader): peer the placement groups that need it
     /// (a degraded report, an epoch peering hasn't seen, or not peered for
     /// [`PEER_EVERY_SECS`]: longest first), at most [`PER_LOOK`],
     /// [`AT_ONCE`] at a time.
     pub(crate) async fn peer_round(&self) {
         use futures::StreamExt;
-        if !self.is_raft_leader() || !pg_placement() {
+        if !self.is_raft_leader() {
             return;
         }
         let every =

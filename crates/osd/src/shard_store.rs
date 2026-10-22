@@ -1579,10 +1579,6 @@ impl ShardStore for BlockStore {
         shard: SmallShard,
         writes: Vec<(MetadataKey, Vec<u8>)>,
     ) -> Result<(), Status> {
-        // No level check here: a gateway sends a shard with the metadata
-        // only once the cluster is finalized at SMALL_SHARDS_LEVEL, which
-        // every node then reads (levels only rise). This OSD may not have
-        // heard yet; it doesn't need to.
         let id = shard
             .shard_id
             .ok_or_else(|| Status::invalid_argument("small shard without an id"))?;

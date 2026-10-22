@@ -43,9 +43,9 @@ fn cluster() -> HaCluster {
 /// As [`cluster`], the gateway also given `gateway_args`.
 fn cluster_with(gateway_args: &[&str]) -> HaCluster {
     let mut ha = HaCluster::start(3, 6, 1);
-    let mut args = vec!["--heal-interval-secs", "3600"];
-    args.extend_from_slice(gateway_args);
-    ha.restart_gateway_with_args(0, &args);
+    if !gateway_args.is_empty() {
+        ha.restart_gateway_with_args(0, gateway_args);
+    }
     let _ = ha.await_leader(Duration::from_secs(30));
     for (key, v) in [
         ("pg/peer_every_seconds", 2),
@@ -445,8 +445,7 @@ fn deleting_after_a_restore_never_frees_bytes_another_object_still_reads() {
 /// restore's new era every write to those PGs was refused, for good.
 #[test]
 fn writes_go_on_to_placement_groups_whose_epoch_moved_after_the_backup() {
-    let mut ha = HaCluster::start(3, 7, 1);
-    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let ha = HaCluster::start(3, 7, 1);
     let _ = ha.await_leader(Duration::from_secs(30));
     let c = &ha.clients[0];
     bucket(c, "e");
@@ -550,8 +549,7 @@ fn osd_state(c: &Cluster, address: &str) -> (String, String) {
 #[test]
 fn an_osd_draining_in_the_backup_is_left_alone_until_its_state_is_set() {
     // The drain observer's default pace: a sweep every 30 s.
-    let mut ha = HaCluster::start(3, 7, 1);
-    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let ha = HaCluster::start(3, 7, 1);
     let _ = ha.await_leader(Duration::from_secs(30));
     let rt = tokio::runtime::Runtime::new().unwrap();
     let c = &ha.clients[0];

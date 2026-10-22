@@ -55,7 +55,7 @@ use objectio_proto::storage::{
 };
 
 use super::peering::{list_of, needs, order, split_entry_name};
-use super::pgs::{pg_placement, set_filling};
+use super::pgs::set_filling;
 
 /// How often the leader looks for placement groups to recover.
 const TICK: Duration = Duration::from_secs(2);
@@ -588,14 +588,11 @@ pub fn spawn(meta: Arc<MetaService>) {
 }
 
 impl MetaService {
-    /// One look (leader, level 7): start recovering the placement groups
+    /// One look (leader): start recovering the placement groups
     /// that need it, those with the fewest copies to spare first, up to
     /// `pg/recover_at_once` at a time.
     pub(crate) async fn recovery_round(self: &Arc<Self>) {
-        if !self.is_raft_leader()
-            || !pg_placement()
-            || !self.config_parsed("pg/recovery_enabled", true)
-        {
+        if !self.is_raft_leader() || !self.config_parsed("pg/recovery_enabled", true) {
             return;
         }
         let at_once = self.config_parsed("pg/recover_at_once", PGS_AT_ONCE).max(1);

@@ -262,8 +262,7 @@ pub struct Args {
 
     /// An erasure-coded object of one stripe whose shards are at most this
     /// many bytes is written with its shards in its metadata copies: one
-    /// call and one flush per OSD (B21), once the cluster is finalized at
-    /// format level 5. At most 16384; 0 turns it off.
+    /// call and one flush per OSD (B21). At most 16384; 0 turns it off.
     #[arg(long, default_value_t = objectio_common::version::SMALL_SHARD_MAX)]
     pub small_shard_max: usize,
 
@@ -423,11 +422,6 @@ pub struct Args {
     /// Objects written more recently than this many seconds aren't packed.
     #[arg(long, default_value_t = 3600)]
     pub pack_min_age_secs: u64,
-
-    /// How often this gateway works the heal queue: keys a write or delete
-    /// left behind on some metadata copies (seconds; 0 turns it off).
-    #[arg(long, default_value_t = 10)]
-    pub heal_interval_secs: u64,
 
     /// How often the replication scanner looks for versions not yet sent
     /// to their targets (seconds).
@@ -1175,13 +1169,6 @@ pub async fn run(
             scan_every: std::time::Duration::from_secs(args.replication_scan_secs.max(1)),
             fast_path: args.replication_fast_path,
         },
-    );
-
-    // Healing: every gateway works the heal queue; a claim in meta keeps two
-    // off one key.
-    heal::spawn(
-        Arc::clone(&state),
-        std::time::Duration::from_secs(args.heal_interval_secs),
     );
 
     // Packing: off unless asked for; a lease in meta lets one gateway pack.

@@ -28,7 +28,6 @@ static SHARD_CHECKSUM_MISMATCHES: LazyLock<CounterVec> = LazyLock::new(CounterVe
 static PHASE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| HistogramVec::new(LATENCY_BUCKETS));
 static SHARDS_RECLAIMED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static HEAL_QUEUED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
-static HEALED: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static QUOTA_REFUSALS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static STALE_PLACEMENTS: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
 static RECLAIM_FAILURES: LazyLock<CounterVec> = LazyLock::new(CounterVec::new);
@@ -221,12 +220,6 @@ pub fn record_heal_queued(ok: bool) {
     });
 }
 
-/// A heal queue entry handled: `healed` (copies agree now), `retry` (a copy
-/// unreachable), or `requeued` (written again meanwhile).
-pub fn record_heal(result: &str) {
-    HEALED.inc(&format!("result=\"{result}\""));
-}
-
 /// A PUT placed again: an OSD refused it as placed under an older epoch of
 /// its placement group than it knew (B31).
 pub fn record_stale_placement() {
@@ -357,11 +350,6 @@ pub fn render() -> String {
         &mut out,
         "objectio_gateway_heal_queued_total",
         "Keys a write or delete left behind on some metadata copies, queued for healing",
-    );
-    HEALED.render(
-        &mut out,
-        "objectio_gateway_heal_total",
-        "Heal queue entries handled, by result",
     );
     QUOTA_REFUSALS.render(
         &mut out,

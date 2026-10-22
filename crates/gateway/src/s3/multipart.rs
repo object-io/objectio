@@ -1193,11 +1193,7 @@ pub(crate) async fn complete_multipart_upload_internal(
             upload_id: upload_id.clone(),
             parts,
             version_id: version_id.clone(),
-            // Two-phase once every node reads the mark (format level 6);
-            // before that, as the release before: the upload goes at once.
-            settle_after_commit: objectio_common::version::allows(
-                objectio_common::version::COMPLETED_UPLOADS_LEVEL,
-            ),
+            settle_after_commit: true,
         })
         .await;
     // A lost answer, for --test-hooks (as a leader change or timeout loses
@@ -1242,9 +1238,8 @@ pub(crate) async fn complete_multipart_upload_internal(
 
                 // A new version, as a single-part PUT makes: meta keeps the
                 // one asked for with the completion, so one sent again
-                // makes the same version (a meta of the release before
-                // returns none). Or a replica's, which keeps its source's
-                // version id and ETag.
+                // makes the same version. Or a replica's, which keeps its
+                // source's version id and ETag.
                 if object.version_id.is_empty() {
                     object.version_id.clone_from(&version_id);
                 }
@@ -1479,8 +1474,6 @@ pub(crate) async fn settle_upload(
         .await;
     match first {
         Ok(_) => return,
-        // A meta of the release before: it dropped the upload already.
-        Err(e) if e.code() == tonic::Code::Unimplemented => return,
         Err(e) => warn!("{bucket}/{key} upload {upload_id}: not settled yet ({e}); retrying"),
     }
     let state = Arc::clone(state);

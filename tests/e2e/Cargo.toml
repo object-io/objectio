@@ -36,6 +36,9 @@ crc32fast = "1.4"
 # meta_reopen grows a stopped meta node's database to a size worth timing a
 # crash at (B25): through S3 it would take hours.
 redb = { workspace = true }
+# upgrade.rs writes a stopped meta node's config record (a ConfigEntry) the
+# way meta does, to give it a cluster below the baseline.
+prost = { workspace = true }
 
 [lints]
 workspace = true

@@ -255,9 +255,9 @@ pub(crate) async fn delete_version(
 /// A read that fails changes nothing: "unreadable" is not "deleted" (taken
 /// as deleted, it dropped existing objects from listings). An update that
 /// fails, as while meta elects a leader, is retried in the background and
-/// then left to the heal queue, whose healing ends with this: a delete
-/// that reached its quorum while meta was down left the key listed for
-/// good (the B2 soak).
+/// then left to the key's placement group, whose listing peering brings the
+/// listing in line: a delete that reached its quorum while meta was down
+/// left the key listed for good (the B2 soak).
 pub(crate) async fn sync_listing(
     state: &Arc<AppState>,
     nodes: &[objectio_proto::metadata::NodePlacement],
@@ -282,7 +282,7 @@ pub(crate) async fn sync_listing(
                     }
                     wait = (wait * 2).min(std::time::Duration::from_secs(16));
                 }
-                warn!("{bucket}/{key}: listing still not updated; left to the heal queue");
+                warn!("{bucket}/{key}: listing still not updated; left to its placement group");
                 state.osd_pool.queue_heal(&bucket, &key, "").await;
             });
             None

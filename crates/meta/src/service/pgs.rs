@@ -1,22 +1,18 @@
 //! Placement groups as the unit of placement (B31, objectio-docs
 //! `core/pg-recovery.md`, phase 1).
 //!
-//! From format level 7 every key is placed through a placement group: the
+//! Every key is placed through a placement group: the
 //! default pool is a pool like any other, with PGs, and a key's copies are
 //! its PG's acting set. An acting set changes only by a Raft commit that
 //! raises the PG's epoch, made before any write uses it: a member that
 //! can't take writes is stood in for here, by the leader, never per
 //! request. OSDs learn the epochs and refuse a request placed under an
 //! older one, so a write lands only where the record says its copies are.
-//!
-//! Keys written before level 7 keep the placement they were written with
-//! (per-key CRUSH): their listing entry names no pool.
 
 use super::*;
 use std::time::Duration;
 
 use objectio_common::FailureDomain;
-use objectio_common::version::{self, PG_PLACEMENT_LEVEL};
 use objectio_placement::PlacementRule;
 use objectio_placement::copyset::{domain_name, unit_name};
 use objectio_placement::topology::NodeInfo;
@@ -68,11 +64,6 @@ const PG_CHUNK: usize = 64;
 
 /// How long a push of epochs to one OSD may take.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Whether keys are placed through placement groups (format level 7).
-pub(crate) fn pg_placement() -> bool {
-    version::allows(PG_PLACEMENT_LEVEL)
-}
 
 /// The failure-domain level a pool's `failure_domain` names. Empty is a
 /// host.
@@ -268,8 +259,8 @@ pub(crate) fn tolerates_domain_loss(pool: &PoolConfig, rule: &PlacementRule) -> 
 }
 
 impl MetaService {
-    /// The pool `bucket`'s keys are placed in: its own, or (from level 7)
-    /// the default pool. Empty below level 7 for a bucket that names none.
+    /// The pool `bucket`'s keys are placed in: its own, or the default
+    /// pool for a bucket that names none.
     pub(crate) fn bucket_pool_name(&self, bucket: &str) -> String {
         let named = self
             .buckets
@@ -277,32 +268,19 @@ impl MetaService {
             .get(bucket)
             .map(|b| b.pool.clone())
             .unwrap_or_default();
-        if named.is_empty() && pg_placement() {
+        if named.is_empty() {
             DEFAULT_POOL.to_string()
         } else {
             named
         }
     }
 
-    /// Whether `bucket/key` was written before placement groups and stays
-    /// where it was placed: its listing entry names no pool.
-    pub(crate) fn key_is_legacy(&self, bucket: &str, key: &str) -> bool {
-        self.store
-            .as_ref()
-            .and_then(|s| s.read_object_listing(&format!("{bucket}\0{key}\0")))
-            .and_then(|b| ObjectListingEntry::decode(b.as_slice()).ok())
-            .is_some_and(|e| e.pool.is_empty())
-    }
-
-    /// The placement group holding `bucket/key`'s copies, when it is
-    /// placed through one with a committed acting set (level 7).
+    /// The placement group holding `bucket/key`'s copies: None until its
+    /// pool and the PG are made.
     pub(crate) fn key_pg(&self, bucket: &str, key: &str) -> Option<PlacementGroup> {
-        if !pg_placement() {
-            return None;
-        }
         let pool_name = self.bucket_pool_name(bucket);
         let pg_count = self.pools.read().get(&pool_name).map(|p| p.pg_count)?;
-        if pg_count == 0 || self.key_is_legacy(bucket, key) {
+        if pg_count == 0 {
             return None;
         }
         self.placement_group(&pool_name, pg_of_key(bucket, key, pg_count))
@@ -310,11 +288,8 @@ impl MetaService {
 
     /// The placement group and pool a listing entry for `bucket/key` names
     /// when meta itself lists the key (repair restoring an entry): the PG
-    /// it is placed through from level 7, none below.
+    /// it is placed through (none while its pool isn't made).
     pub(crate) fn listing_pg(&self, bucket: &str, key: &str) -> (u32, String) {
-        if !pg_placement() {
-            return (0, String::new());
-        }
         let pool = self.bucket_pool_name(bucket);
         match self.pools.read().get(&pool).map(|p| p.pg_count) {
             Some(n) if n > 0 => (pg_of_key(bucket, key, n), pool),
@@ -348,9 +323,6 @@ impl MetaService {
     /// or the member a stand-in is being filled from. An OSD being emptied
     /// is done only when there are none.
     pub(crate) fn pgs_holding(&self, node: &[u8]) -> usize {
-        if !pg_placement() {
-            return 0; // nothing stands in for members below level 7
-        }
         self.placement_groups
             .read()
             .values()
@@ -402,7 +374,7 @@ impl MetaService {
         }
     }
 
-    /// Make the default pool and its placement groups (leader, level 7),
+    /// Make the default pool and its placement groups (leader),
     /// once there are OSDs enough to spread them, and every OSD registered
     /// is up (or `ready_since` is [`SETTLE`] ago): at the widest
     /// failure-domain level with enough domains, so a one-host cluster
@@ -413,7 +385,7 @@ impl MetaService {
     /// can move its data (B31 phase 3), so an OSD that joins after the pool
     /// is made holds none of it.
     pub(crate) async fn ensure_default_pool(&self, ready_since: &mut Option<std::time::Instant>) {
-        if !self.is_raft_leader() || !pg_placement() {
+        if !self.is_raft_leader() {
             return;
         }
         let existing = self.pools.read().get(DEFAULT_POOL).cloned();
@@ -466,30 +438,6 @@ impl MetaService {
         }
     }
 
-    /// Make the default pool at finalize (level 7) and wait until it and
-    /// every one of its placement groups are committed, so the first
-    /// write after finalize finds them: as long as making it may wait for
-    /// OSDs registered but not up ([`SETTLE`]), and a little more. Past
-    /// that, finalize answers anyway and the upkeep goes on making it.
-    pub(crate) async fn await_default_pool(&self) {
-        let deadline = std::time::Instant::now() + SETTLE + Duration::from_secs(10);
-        let mut ready_since = None;
-        loop {
-            self.ensure_default_pool(&mut ready_since).await;
-            let made = self.pools.read().get(DEFAULT_POOL).is_some_and(|pool| {
-                self.placement_groups_for_pool(DEFAULT_POOL).len() >= pool.pg_count as usize
-            });
-            if made {
-                return;
-            }
-            if std::time::Instant::now() >= deadline || !self.is_raft_leader() {
-                warn!("finalize: the default pool isn't made yet; writes wait for it");
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
     /// Whether OSD `id` can be an acting member: registered, `In`, with an
     /// address, and not down past the grace (`down_since`).
     fn acting_usable(
@@ -512,7 +460,7 @@ impl MetaService {
                 .is_none_or(|since| since.elapsed() < grace)
     }
 
-    /// Keep every placement group's acting set usable (leader, level 7). A
+    /// Keep every placement group's acting set usable (leader). A
     /// member that can't take writes (gone, set out or draining, with no
     /// address, or down past the grace) is replaced by an OSD that can,
     /// preferably in a failure domain the PG doesn't use yet, chosen the
@@ -528,7 +476,7 @@ impl MetaService {
         &self,
         down_since: &mut HashMap<[u8; 16], std::time::Instant>,
     ) {
-        if !self.is_raft_leader() || !pg_placement() {
+        if !self.is_raft_leader() {
             return;
         }
         let grace = Duration::from_secs(self.config_parsed("pg/down_out_seconds", DOWN_OUT_SECS));
@@ -622,11 +570,10 @@ impl MetaService {
     /// for a placement about to be handed out: a write then never goes to a
     /// member that can't take it, the way Ceph holds a PG's I/O until its
     /// new interval is recorded. Members merely down are left to the grace
-    /// ([`Self::keep_acting_sets`]). Leader, level 7.
+    /// ([`Self::keep_acting_sets`]). Leader.
     pub(crate) async fn with_usable_acting(&self, pg: PlacementGroup) -> PlacementGroup {
         let none = HashMap::new();
         if !self.is_raft_leader()
-            || !pg_placement()
             || pg
                 .acting
                 .iter()
@@ -868,11 +815,8 @@ impl MetaService {
         }
     }
 
-    /// Every placement group's epoch, for an OSD registering (level 7).
+    /// Every placement group's epoch, for an OSD registering.
     pub(crate) fn pg_epochs(&self) -> Vec<PgEpoch> {
-        if !pg_placement() {
-            return Vec::new();
-        }
         self.placement_groups
             .read()
             .values()

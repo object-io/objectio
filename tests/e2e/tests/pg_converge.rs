@@ -1,8 +1,7 @@
 //! Metadata copies and meta's listing index brought to agree by placement
 //! group peering and recovery alone (B31 phase 4): what the gateways' heal
-//! queue did for keys in placement groups. A heal request for such a key
-//! marks its PG instead of queuing it, and the gateway's heal pass is off
-//! here (`--heal-interval-secs 3600`), so nothing else could do it.
+//! queue did before. A heal request for a key marks its PG, and nothing
+//! else heals metadata copies.
 //!
 //! Each case leaves one copy behind (its OSD down while the key changes)
 //! or one listing entry wrong, and waits for it to come right.
@@ -32,11 +31,10 @@ fn payload(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-/// A cluster of one meta, six OSDs and a gateway whose heal pass is off,
-/// peering often, and the bucket `conv`.
+/// A cluster of one meta, six OSDs and a gateway, peering often, and the
+/// bucket `conv`.
 fn cluster() -> HaCluster {
-    let mut ha = HaCluster::start(1, 6, 1);
-    ha.restart_gateway_with_args(0, &["--heal-interval-secs", "3600"]);
+    let ha = HaCluster::start(1, 6, 1);
     let _ = ha.await_leader(Duration::from_secs(30));
     let c = &ha.clients[0];
     for (key, v) in [

@@ -16,9 +16,6 @@
 //! nothing is acknowledged sooner. A write that finds nothing in flight
 //! goes at once, alone, as it always did.
 //!
-//! An older meta node can't decode a batch, so writes are batched only once
-//! the cluster is finalized at [`version::BATCHED_WRITES_LEVEL`].
-//!
 //! A command that could never apply ([`MetaCommand::refusal`]: too many
 //! operations, a table it may not write) is refused here, before it is
 //! proposed, and so never joins a batch: it fails its own caller alone.
@@ -29,7 +26,6 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use objectio_common::version;
 use objectio_meta_store::{MetaCommand, MetaResponse, MetaTypeConfig};
 use openraft::BasicNode;
 use openraft::error::{ClientWriteError, Fatal, RaftError};
@@ -108,8 +104,7 @@ impl MetaRaft {
     }
 
     /// Propose `cmd`, answered once it is committed and applied, as
-    /// `Raft::client_write`; with others that arrive meanwhile in one entry
-    /// once the cluster allows it.
+    /// `Raft::client_write`; with others that arrive meanwhile in one entry.
     ///
     /// # Errors
     /// [`WriteError::Refused`] for a command that can never apply (checked
@@ -124,16 +119,13 @@ impl MetaRaft {
         if let Some(reason) = cmd.refusal() {
             return Err(WriteError::Refused(reason));
         }
-        let answer = if version::allows(version::BATCHED_WRITES_LEVEL) {
-            let (tx, rx) = oneshot::channel();
-            if self.tx.send((cmd, tx)).is_err() {
-                return Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped)));
-            }
-            rx.await
-                .unwrap_or(Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped))))
-        } else {
-            self.raft.client_write(cmd).await.map_err(WriteError::Raft)
-        };
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send((cmd, tx)).is_err() {
+            return Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped)));
+        }
+        let answer = rx
+            .await
+            .unwrap_or(Err(WriteError::Raft(RaftError::Fatal(Fatal::Stopped))));
         match answer {
             Ok(r) => match r.data {
                 MetaResponse::Rejected { reason } => Err(WriteError::Refused(reason)),
@@ -287,7 +279,6 @@ mod tests {
     /// create of a key another caller created first conflicts, alone.
     #[tokio::test]
     async fn concurrent_writes_share_entries_and_keep_their_own_answers() {
-        version::set_active_level(version::BATCHED_WRITES_LEVEL);
         let dir = tempfile::TempDir::new().unwrap();
         let raft = single_node(dir.path()).await;
         let before = raft.metrics().borrow().last_log_index.unwrap_or(0);
@@ -367,7 +358,6 @@ mod tests {
     /// joins the batch.
     #[tokio::test]
     async fn a_refused_command_fails_only_its_own_caller() {
-        version::set_active_level(version::BATCHED_WRITES_LEVEL);
         let dir = tempfile::TempDir::new().unwrap();
         let raft = single_node_with(dir.path(), |db| {
             let txn = db.begin_write().unwrap();

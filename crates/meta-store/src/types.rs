@@ -257,8 +257,7 @@ pub struct StoredUser {
     pub email: String,
     #[prost(string, tag = "7")]
     pub tenant: String,
-    /// IAM path (`/` or `/a/b/`; empty means `/`). Written from format
-    /// level 3.
+    /// IAM path (`/` or `/a/b/`; empty means `/`).
     #[prost(string, tag = "8")]
     pub path: String,
     /// The OIDC issuer and subject a single sign-on created this user for;
@@ -306,8 +305,7 @@ pub struct StoredGroup {
     pub member_user_ids: Vec<String>,
     #[prost(uint64, tag = "5")]
     pub created_at: u64,
-    /// IAM path (`/` or `/a/b/`; empty means `/`). Written from format
-    /// level 3.
+    /// IAM path (`/` or `/a/b/`; empty means `/`).
     #[prost(string, tag = "6")]
     pub path: String,
 }
