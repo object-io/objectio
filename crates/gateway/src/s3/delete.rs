@@ -69,17 +69,19 @@ pub(crate) async fn newest_object(
         let Ok(mut client) = pool.get_client_for_placement(node).await else {
             continue;
         };
-        if let Ok(resp) = client
-            .list_object_versions_meta(ListObjectVersionsMetaRequest {
-                bucket: bucket.to_string(),
-                prefix: key.to_string(),
-                // The key itself, first: its versions come in one page.
-                key_marker: key.to_string(),
-                version_id_marker: "-".to_string(),
-                max_keys: 1,
-            })
-            .await
-        {
+        let call = client.list_object_versions_meta(ListObjectVersionsMetaRequest {
+            bucket: bucket.to_string(),
+            prefix: key.to_string(),
+            // The key itself, first: its versions come in one page.
+            key_marker: key.to_string(),
+            version_id_marker: "-".to_string(),
+            max_keys: 1,
+        });
+        let answer = pool.watched(&node.node_address, call).await;
+        if let Err(e) = &answer {
+            pool.call_failed(&node.node_address, e);
+        }
+        if let Ok(resp) = answer {
             return resp
                 .into_inner()
                 .versions

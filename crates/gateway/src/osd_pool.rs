@@ -110,13 +110,18 @@ pub struct OsdNode {
 /// other shards (the write quorum) and repair rebuilds the missing one.
 const FAIL_FAST: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long the probe after a transport failure waits for a connection:
-/// an OSD that restarted accepts at once; one that is gone does not.
+/// How long a probe of an OSD ([`answers`]) waits for its answer, the
+/// connection included: an OSD that restarted answers at once; one that is
+/// gone, or frozen, does not.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long an OSD call runs before the gateway checks, in the
-/// background, whether the OSD still accepts connections ([`OsdPool::watched`]).
+/// background, whether the OSD still answers ([`OsdPool::watched`]).
 const SUSPECT_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a call the gateway has begun to suspect looks whether its OSD
+/// has been found not to answer, to be abandoned then.
+const CONDEMNED_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long a failed-fast address is kept failed fast by its probe while
 /// it stays gone.
@@ -267,54 +272,11 @@ impl OsdPool {
             return; // already being probed
         }
         let (unreachable, probing) = (Arc::clone(&self.unreachable), Arc::clone(&self.probing));
-        let address = address.to_string();
-        // Probed until it answers or the mark runs out: an OSD that was
-        // stopped when it failed and restarted within the window is used
-        // again as soon as it is up, not when the mark expires (the A6
-        // check stopped the next two OSDs inside that window, and four
-        // looked down).
-        runtime.spawn(async move {
-            let started = std::time::Instant::now();
-            let marked = || {
-                unreachable
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&address)
-                    .is_some_and(|at| at.elapsed() < FAIL_FAST)
-            };
-            while marked() {
-                let answers = match objectio_proto::transport::endpoint(&address) {
-                    Ok(ep) => {
-                        objectio_proto::transport::connect(&ep.connect_timeout(PROBE_TIMEOUT))
-                            .await
-                            .is_ok()
-                    }
-                    Err(_) => false,
-                };
-                {
-                    let mut marks = unreachable
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if answers {
-                        marks.remove(&address);
-                        debug!("{address} answers again; no longer failed fast");
-                        break;
-                    }
-                    // Still gone: kept failed fast, so requests don't each
-                    // wait out a connect timeout every time the mark would
-                    // run out (every 8 s, writes stalled for 3). Until
-                    // PROBE_FOR, after which the next failure starts over.
-                    if started.elapsed() < PROBE_FOR {
-                        marks.insert(address.clone(), std::time::Instant::now());
-                    }
-                }
-                tokio::time::sleep(PROBE_EVERY).await;
-            }
-            probing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&address);
-        });
+        runtime.spawn(probe_while_marked(
+            unreachable,
+            probing,
+            address.to_string(),
+        ));
     }
 
     /// A call to the OSD at `address` failed with `e`: fail the OSD fast if
@@ -335,27 +297,50 @@ impl OsdPool {
 
     /// Await `call`, an RPC to the OSD at `address`. One still running after
     /// [`SUSPECT_AFTER`] makes the gateway check, in the background, whether
-    /// the OSD still accepts a connection, and fail it fast if not.
+    /// the OSD still answers ([`answers`]), and fail it fast if not; the
+    /// call is then abandoned (`Unavailable`), as is any other call to it
+    /// that has run that long.
     ///
-    /// A call on a connection to a host that vanished without a reset hangs
-    /// until HTTP/2 keepalive gives up (about 5 s). By then the client has
-    /// often given up too, the request is dropped, and the failure is never
-    /// seen: the next request takes the same dead connection. In the A6
-    /// chaos test that held every write through one gateway for the whole
-    /// 60 s partition. A busy OSD still accepts connections, so a slow call
-    /// alone never fails one fast.
-    pub async fn watched<F: std::future::Future>(&self, address: &str, call: F) -> F::Output {
+    /// A call on a connection to a host that vanished without a reset, or
+    /// to a process that stopped (frozen, swapped out, a hung kernel),
+    /// hangs until HTTP/2 keepalive gives up (about 5 s) or its own timeout.
+    /// By then the client has often given up too, the request is dropped,
+    /// and the failure is never seen: the next request takes the same dead
+    /// connection. In the A6 chaos test that held every write through one
+    /// gateway for the whole 60 s partition. A write or a read waits for its
+    /// calls to every copy, so each such call held the whole request though
+    /// the others had made its quorum. A busy OSD still answers the probe,
+    /// so a slow call alone never fails one fast, and is let run.
+    pub async fn watched<T, F>(&self, address: &str, call: F) -> Result<T, tonic::Status>
+    where
+        F: std::future::Future<Output = Result<T, tonic::Status>>,
+    {
         let mut call = std::pin::pin!(call);
         tokio::select! {
             out = &mut call => return out,
             () = tokio::time::sleep(SUSPECT_AFTER) => {}
         }
         self.suspect(address);
-        call.await
+        tokio::select! {
+            out = &mut call => out,
+            () = self.condemned(address) => {
+                warn!("{address} does not answer; a call to it is abandoned");
+                Err(tonic::Status::unavailable(format!(
+                    "{address} does not answer; call abandoned"
+                )))
+            }
+        }
     }
 
-    /// Check whether `address` accepts a fresh connection, in the
-    /// background; fail it fast if it doesn't.
+    /// Returns once `address` is failed fast: found not to answer.
+    async fn condemned(&self, address: &str) {
+        while !self.is_unreachable(address) {
+            tokio::time::sleep(CONDEMNED_POLL).await;
+        }
+    }
+
+    /// Check whether `address` still answers, in the background; fail it
+    /// fast if it doesn't.
     fn suspect(&self, address: &str) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
@@ -376,27 +361,26 @@ impl OsdPool {
         );
         let address = address.to_string();
         runtime.spawn(async move {
-            let answers = match objectio_proto::transport::endpoint(&address) {
-                Ok(ep) => objectio_proto::transport::connect(&ep.connect_timeout(PROBE_TIMEOUT))
-                    .await
-                    .is_ok(),
-                Err(_) => false,
-            };
-            if !answers {
-                warn!("{address}: a call hangs and a new connection fails; failing it fast");
-                unreachable
+            if answers(&address).await {
+                probing
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(address.clone(), std::time::Instant::now());
-                stale
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(address.clone());
+                    .remove(&address);
+                return;
             }
-            probing
+            warn!("{address}: a call hangs and the OSD does not answer; failing it fast");
+            unreachable
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&address);
+                .insert(address.clone(), std::time::Instant::now());
+            stale
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(address.clone());
+            // Kept failed fast while it stays silent, as after a transport
+            // failure: with the mark left to run out, the requests after it
+            // took a new connection to the OSD and hung on that in turn.
+            probe_while_marked(unreachable, probing, address).await;
         });
     }
 
@@ -496,21 +480,10 @@ impl OsdPool {
         Ok(())
     }
 
-    /// Get a client for a specific node
-    #[allow(dead_code)]
-    pub async fn get_client(
-        &self,
-        node_id: &[u8],
-    ) -> Result<StorageServiceClient<Channel>, OsdPoolError> {
-        let id = NodeId::from_bytes(node_id)
-            .ok_or_else(|| OsdPoolError::NodeNotFound("invalid node ID".to_string()))?;
-
-        self.nodes
-            .read()
-            .await
-            .get(&id)
-            .map(|n| n.client.clone())
-            .ok_or_else(|| OsdPoolError::NodeNotFound(id.to_hex()))
+    /// The address of a node already connected to, if it is.
+    pub async fn connected_address(&self, node_id: &[u8]) -> Option<String> {
+        let id = NodeId::from_bytes(node_id)?;
+        self.nodes.read().await.get(&id).map(|n| n.address.clone())
     }
 
     /// Get a client for a node by address, connecting if necessary
@@ -580,6 +553,87 @@ impl Default for OsdPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Probe `address` while it is failed fast: lift the mark as soon as it
+/// answers, renew it while it doesn't. An OSD that was stopped when it
+/// failed and restarted within the window is used again as soon as it is
+/// up, not when the mark expires (the A6 check stopped the next two OSDs
+/// inside that window, and four looked down). Ends with `address` taken
+/// out of `probing`.
+async fn probe_while_marked(
+    unreachable: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    probing: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    address: String,
+) {
+    let started = std::time::Instant::now();
+    let marked = || {
+        unreachable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+            .is_some_and(|at| at.elapsed() < FAIL_FAST)
+    };
+    while marked() {
+        let answers = answers(&address).await;
+        {
+            let mut marks = unreachable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if answers {
+                marks.remove(&address);
+                debug!("{address} answers again; no longer failed fast");
+                break;
+            }
+            // Still gone: kept failed fast, so requests don't each wait
+            // out a connect timeout every time the mark would run out
+            // (every 8 s, writes stalled for 3). Until PROBE_FOR, after
+            // which the next failure starts over.
+            if started.elapsed() < PROBE_FOR {
+                marks.insert(address.clone(), std::time::Instant::now());
+            }
+        }
+        tokio::time::sleep(PROBE_EVERY).await;
+    }
+    probing
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&address);
+}
+
+/// Whether the OSD at `address` answers: a call it serves from memory
+/// (`GetStatus`) on a new connection, within [`PROBE_TIMEOUT`]. Any answer
+/// counts, a refusal included; silence, or no connection, doesn't.
+///
+/// A connection alone proves nothing: the kernel of a stopped process (a
+/// frozen container, a host hung or cut off without a reset) still accepts
+/// one, and plain gRPC needs nothing more from the process. Under mTLS the
+/// handshake did, so only without it (the chart's default) was a frozen OSD
+/// taken as up at every probe: each request then opened a new connection to
+/// it and waited on it for the HTTP/2 keepalive, 5 s, for as long as it
+/// stayed frozen.
+async fn answers(address: &str) -> bool {
+    use objectio_proto::storage::GetStatusRequest;
+    let attempt = async {
+        let endpoint = objectio_proto::transport::endpoint(address)
+            .ok()?
+            .connect_timeout(PROBE_TIMEOUT);
+        let channel = objectio_proto::transport::connect(&endpoint).await.ok()?;
+        let answer = StorageServiceClient::new(channel)
+            .get_status(GetStatusRequest {
+                answer_while_counting: true,
+                ..Default::default()
+            })
+            .await;
+        match answer {
+            Err(e) if is_transport_failure(&e) => None,
+            _ => Some(()),
+        }
+    };
+    matches!(
+        tokio::time::timeout(PROBE_TIMEOUT, attempt).await,
+        Ok(Some(()))
+    )
 }
 
 /// Client for a shard call, counting a failure to connect as `refused`.
@@ -2140,6 +2194,7 @@ pub async fn get_object_version_meta_from_osd(
                 "Failed to get object metadata from OSD {}: {}",
                 primary_placement.node_address, e
             );
+            pool.call_failed(&primary_placement.node_address, &e);
             OsdPoolError::ConnectionFailed(e.to_string())
         })?;
 
@@ -2939,7 +2994,7 @@ async fn reclaim_round(
     // One client per OSD: connected already, at an address the caller gave,
     // or — after a restart, or for a node outside this request's placement —
     // at the address meta has registered for it, asked once.
-    let mut clients: HashMap<Vec<u8>, StorageServiceClient<Channel>> = HashMap::new();
+    let mut clients: HashMap<Vec<u8>, (StorageServiceClient<Channel>, String)> = HashMap::new();
     let mut addresses: HashMap<Vec<u8>, String> = delete
         .iter()
         .filter(|t| !t.address.is_empty())
@@ -2949,9 +3004,11 @@ async fn reclaim_round(
     let node_ids: std::collections::HashSet<Vec<u8>> =
         delete.iter().map(|t| t.node_id.clone()).collect();
     for node_id in node_ids {
-        if let Ok(client) = pool.get_client(&node_id).await {
-            clients.insert(node_id, client);
-            continue;
+        // Connected already: that address, through `get_or_connect` all the
+        // same, which fails an OSD found not to answer at once rather than
+        // hand out its channel.
+        if let Some(addr) = pool.connected_address(&node_id).await {
+            addresses.insert(node_id.clone(), addr);
         }
         if !addresses.contains_key(&node_id) && !asked_meta {
             asked_meta = true;
@@ -2973,7 +3030,7 @@ async fn reclaim_round(
         match addresses.get(&node_id) {
             Some(addr) => match pool.get_or_connect(&node_id, addr).await {
                 Ok(client) => {
-                    clients.insert(node_id, client);
+                    clients.insert(node_id, (client, addr.clone()));
                 }
                 Err(e) => warn!("reclaim: cannot reach OSD {addr}: {e}"),
             },
@@ -2986,7 +3043,7 @@ async fn reclaim_round(
             let client = clients.get(&t.node_id).cloned();
             async move {
                 let result = async {
-                    let mut client = client
+                    let (mut client, address) = client
                         .ok_or_else(|| OsdPoolError::NodeNotFound(hex::encode(&t.node_id)))?;
                     let req = DeleteShardRequest {
                         shard_id: Some(ShardId {
@@ -2997,11 +3054,14 @@ async fn reclaim_round(
                     };
                     let resp = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        client.delete_shard(req),
+                        pool.watched(&address, client.delete_shard(req)),
                     )
                     .await
                     .map_err(|_| OsdPoolError::ConnectionFailed("delete_shard timeout".into()))?
-                    .map_err(|e| OsdPoolError::ConnectionFailed(e.to_string()))?;
+                    .map_err(|e| {
+                        pool.call_failed(&address, &e);
+                        OsdPoolError::ConnectionFailed(e.to_string())
+                    })?;
                     Ok(resp.into_inner().success)
                 }
                 .await;
@@ -3495,8 +3555,10 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}", l.local_addr().unwrap())
         };
-        let hang =
-            || tokio::time::sleep(super::SUSPECT_AFTER + std::time::Duration::from_millis(500));
+        let hang = || async {
+            tokio::time::sleep(super::SUSPECT_AFTER + std::time::Duration::from_millis(500)).await;
+            Ok::<_, tonic::Status>(())
+        };
 
         let pool = super::OsdPool::new();
         // Dropped before it would be suspected: nothing checked.
@@ -3507,7 +3569,11 @@ mod tests {
         .await;
         assert!(!pool.is_unreachable(&gone));
 
-        tokio::join!(pool.watched(&gone, hang()), pool.watched(&busy, hang()));
+        let (_, slow) = tokio::join!(pool.watched(&gone, hang()), pool.watched(&busy, hang()));
+        assert!(
+            slow.is_ok(),
+            "a slow call to an OSD that answers was abandoned"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !pool.is_unreachable(&gone) {
             assert!(
@@ -3520,6 +3586,47 @@ mod tests {
             !pool.is_unreachable(&busy),
             "a slow OSD that answers was failed fast"
         );
+    }
+
+    /// An OSD whose process is stopped (its kernel still accepts
+    /// connections; nothing answers on them) is failed fast, and kept so,
+    /// and a call to it is abandoned once it is found silent, not left to
+    /// wait out keepalive or its own timeout. A connection alone used to
+    /// count as an answer: without TLS, a frozen OSD was taken as up at
+    /// every probe, and every request waited on it.
+    #[tokio::test]
+    async fn a_call_to_a_frozen_osd_is_abandoned_and_the_osd_failed_fast() {
+        // Bound and never accepted from: the kernel completes connections
+        // into its backlog, as for a stopped process.
+        let frozen_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let frozen = format!("http://{}", frozen_listener.local_addr().unwrap());
+
+        let pool = super::OsdPool::new();
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            super::SUSPECT_AFTER + super::PROBE_TIMEOUT + std::time::Duration::from_secs(1),
+            pool.watched(&frozen, std::future::pending::<Result<(), tonic::Status>>()),
+        )
+        .await
+        .expect("a call to a frozen OSD was not abandoned");
+        let e = answer.expect_err("a call that never ends ended");
+        assert_eq!(e.code(), tonic::Code::Unavailable, "{e:?}");
+        assert!(
+            started.elapsed() >= super::SUSPECT_AFTER,
+            "abandoned too soon"
+        );
+        assert!(pool.is_unreachable(&frozen));
+
+        // Marked after a failure, it stays marked: its probes get no answer.
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = format!("http://{}", other.local_addr().unwrap());
+        pool.mark_unreachable(&silent);
+        tokio::time::sleep(super::PROBE_TIMEOUT + std::time::Duration::from_millis(500)).await;
+        assert!(
+            pool.is_unreachable(&silent),
+            "a frozen OSD was taken as up because it accepted a connection"
+        );
+        drop(frozen_listener);
     }
 
     /// A connection cut under a call is a failure to retry (503), not a
