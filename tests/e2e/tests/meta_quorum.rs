@@ -338,6 +338,15 @@ fn a_refused_delete_that_reached_some_copies_is_healed() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    // Its space is freed by the heal. Waited for before any OSD stops: a
+    // shard free that meets a stopping OSD is not retried (#83), so
+    // stopping one while recovery frees would leak a shard here.
+    let c = &ha.clients[0];
+    assert_eq!(
+        c.await_total_used_bytes(empty),
+        empty,
+        "its space was never freed"
+    );
     // The copies that took the delete down: the rest agree with them now.
     for i in 0..3 {
         ha.stop_osd(i);
@@ -348,12 +357,6 @@ fn a_refused_delete_that_reached_some_copies_is_healed() {
     for i in 0..3 {
         ha.start_osd(i, None);
     }
-    let c = &ha.clients[0];
-    assert_eq!(
-        c.await_total_used_bytes(empty),
-        empty,
-        "its space was never freed"
-    );
 }
 
 /// Soak run 27's leak, as it ran: a drive lost under load. (What leaked
