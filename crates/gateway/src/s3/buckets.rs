@@ -775,6 +775,54 @@ pub(crate) async fn put_bucket_versioning_internal(
     }
 }
 
+/// GetBucketLocation (`GET /{bucket}?location`): the region this gateway
+/// signs in (`--region`), which every bucket is in.
+pub(crate) async fn get_bucket_location(state: &AppState, bucket: &str) -> Response {
+    let mut client = state.meta_client.clone();
+    let no_such_bucket = || {
+        S3Error::xml_response(
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            StatusCode::NOT_FOUND,
+        )
+    };
+    match client
+        .get_bucket(GetBucketRequest {
+            name: bucket.to_string(),
+        })
+        .await
+    {
+        Ok(resp) if resp.get_ref().bucket.is_some() => {}
+        Ok(_) => return no_such_bucket(),
+        Err(e) if e.code() == tonic::Code::NotFound => return no_such_bucket(),
+        Err(e) => {
+            error!("Failed to get bucket {bucket}: {e}");
+            return S3Error::from_status(&e);
+        }
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(location_xml(&state.auth_state.region)))
+        .unwrap()
+}
+
+/// GetBucketLocation's answer for `region`. S3 answers us-east-1 with an
+/// empty `LocationConstraint` (buckets made before regions had none), and
+/// SDKs read empty as us-east-1, so this does the same.
+fn location_xml(region: &str) -> String {
+    const HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"";
+    if region.is_empty() || region == "us-east-1" {
+        format!("{HEAD}/>")
+    } else {
+        format!(
+            "{HEAD}>{}</LocationConstraint>",
+            quick_xml::escape::escape(region)
+        )
+    }
+}
+
 pub(crate) async fn get_bucket_versioning_internal(
     state: Arc<AppState>,
     bucket: String,
@@ -1015,5 +1063,30 @@ pub(crate) async fn get_object_lock_config_internal(
             error!("Failed to get object lock config for {}: {}", bucket, e);
             S3Error::from_status(&e)
         }
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::location_xml;
+
+    /// us-east-1 is the empty constraint, as S3 answers it; any other
+    /// region is named.
+    #[test]
+    fn the_location_is_the_region_and_us_east_1_is_empty() {
+        let ns = "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"";
+        let east = location_xml("us-east-1");
+        assert!(
+            east.ends_with(&format!("<LocationConstraint {ns}/>")),
+            "{east}"
+        );
+        let west = location_xml("eu-west-1");
+        assert!(
+            west.ends_with(&format!(
+                "<LocationConstraint {ns}>eu-west-1</LocationConstraint>"
+            )),
+            "{west}"
+        );
+        assert!(location_xml("a<b").contains(">a&lt;b<"));
     }
 }

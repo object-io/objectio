@@ -305,7 +305,7 @@ fn add_metadata_headers(
 /// naming one fell through to the plain request: `GET /b?website` answered
 /// with the bucket's listing, `PUT /b?notification` tried to create the bucket.
 /// (`?select` is implemented for `POST` on an object only: S3 Select.)
-const UNSUPPORTED_SUBRESOURCES: [&str; 10] = [
+const UNSUPPORTED_SUBRESOURCES: [&str; 14] = [
     "website",
     "notification",
     "inventory",
@@ -316,7 +316,69 @@ const UNSUPPORTED_SUBRESOURCES: [&str; 10] = [
     "requestPayment",
     "restore",
     "torrent",
+    // S3 Express's CreateSession, which SDKs send for a directory bucket.
+    "session",
+    "metadataTable",
+    "metadataConfiguration",
+    "abac",
 ];
+
+/// What a `GET` on a bucket may name besides its listing's parameters: the
+/// sub-resources it answers (`s3::list_objects`).
+const BUCKET_GET_SUBRESOURCES: [&str; 16] = [
+    "location",
+    "tagging",
+    "acl",
+    "ownershipControls",
+    "publicAccessBlock",
+    "policyStatus",
+    "cors",
+    "replication",
+    "logging",
+    "policy",
+    "versioning",
+    "object-lock",
+    "lifecycle",
+    "encryption",
+    "uploads",
+    "versions",
+];
+
+/// The parameters of a bucket listing (ListObjects V1 and V2, versions,
+/// multipart uploads), which may come without a value (`?prefix`).
+const BUCKET_LISTING_PARAMS: [&str; 13] = [
+    "prefix",
+    "delimiter",
+    "max-keys",
+    "marker",
+    "continuation-token",
+    "start-after",
+    "list-type",
+    "encoding-type",
+    "fetch-owner",
+    "key-marker",
+    "version-id-marker",
+    "upload-id-marker",
+    "max-uploads",
+];
+
+/// A sub-resource a `GET` on a bucket names that it doesn't answer, which
+/// would otherwise be answered as the bucket's listing (`GET /b?location`
+/// was a ListBucketResult). S3 names sub-resources without a value
+/// (`?website`, `?location=`), so a parameter with none that is neither a
+/// sub-resource the bucket answers nor a listing parameter is one; a
+/// parameter with a value (an SDK's `x-id=ListObjects`, a presigned URL's
+/// `X-Amz-*`) is not, and is left to the listing, as S3 does.
+fn unanswered_bucket_subresource(query: &str) -> Option<&str> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (!name.is_empty()
+            && value.is_empty()
+            && !BUCKET_GET_SUBRESOURCES.contains(&name)
+            && !BUCKET_LISTING_PARAMS.contains(&name))
+        .then_some(name)
+    })
+}
 
 /// Refuse a request naming an unimplemented sub-resource: `501
 /// NotImplemented`, said plainly, rather than doing something else.
@@ -329,12 +391,8 @@ pub async fn unsupported_subresource_layer(
     {
         return refused;
     }
-    let on_object = request
-        .uri()
-        .path()
-        .trim_start_matches('/')
-        .split_once('/')
-        .is_some_and(|(_, key)| !key.is_empty());
+    let path = request.uri().path().trim_start_matches('/');
+    let on_object = path.split_once('/').is_some_and(|(_, key)| !key.is_empty());
     let named = request.uri().query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let name = pair.split('=').next().unwrap_or_default();
@@ -346,6 +404,22 @@ pub async fn unsupported_subresource_layer(
             (UNSUPPORTED_SUBRESOURCES.contains(&name) || object_logging || misplaced_select)
                 .then(|| name.to_string())
         })
+    });
+    // A bucket's GET (not `/health`, `/_ready`: no bucket name starts with
+    // `_`, and `/health` is routed before a bucket of that name).
+    let bucket = path.trim_end_matches('/');
+    let bucket_get = request.method() == Method::GET
+        && !on_object
+        && !bucket.is_empty()
+        && !bucket.starts_with('_')
+        && bucket != "health";
+    let named = named.or_else(|| {
+        request
+            .uri()
+            .query()
+            .filter(|_| bucket_get)
+            .and_then(unanswered_bucket_subresource)
+            .map(str::to_string)
     });
     match named {
         // `/health`, `/` and the like name no bucket and never get here with
@@ -1173,6 +1247,34 @@ mod s3_tests {
         })
         .expect("serialize");
         assert!(xml.contains("u-1") && xml.contains("alice"), "{xml}");
+    }
+}
+
+#[cfg(test)]
+mod subresource_tests {
+    use super::unanswered_bucket_subresource as unanswered;
+
+    /// A bucket GET naming a sub-resource it doesn't answer is found, so
+    /// it isn't answered as the listing; a listing's own parameters, the
+    /// sub-resources it answers, and parameters with a value are not.
+    #[test]
+    fn a_bucket_get_names_a_sub_resource_only_without_a_value() {
+        assert_eq!(unanswered("made-up"), Some("made-up"));
+        assert_eq!(unanswered("prefix=a&ownership="), Some("ownership"));
+        assert_eq!(unanswered("x-id=ListObjects&website"), Some("website"));
+        for answered in [
+            "location",
+            "location=",
+            "versions&prefix&key-marker=k",
+            "list-type=2&prefix=&delimiter=%2F&encoding-type=url&fetch-owner=true",
+            "uploads&max-uploads=10&upload-id-marker=",
+            "x-id=ListObjects",
+            "allow-unordered=true",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab",
+            "",
+        ] {
+            assert_eq!(unanswered(answered), None, "{answered}");
+        }
     }
 }
 

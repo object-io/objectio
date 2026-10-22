@@ -148,6 +148,9 @@ pub async fn list_objects(
         }
     };
     params.max_keys = max_keys.map(|m| m.to_string());
+    if params.location.is_some() {
+        return get_bucket_location(&state, &bucket).await;
+    }
     if params.tagging.is_some() {
         return get_bucket_tagging(&state, &bucket).await;
     }

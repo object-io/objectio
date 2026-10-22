@@ -33,6 +33,8 @@ pub struct ListObjectsParams {
     pub(crate) fetch_owner: Option<String>,
     /// If present, a GetBucketAcl request
     pub(crate) acl: Option<String>,
+    /// If present, a GetBucketLocation request
+    pub(crate) location: Option<String>,
     /// If present, a GetBucketOwnershipControls request
     #[serde(rename = "ownershipControls")]
     pub(crate) ownership_controls: Option<String>,
