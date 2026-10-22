@@ -204,13 +204,19 @@ fn ephemeral_floor() -> u16 {
 /// a cluster meanwhile still can; the harness's retries cover that
 /// ([`Cluster::boot`], `aio --strict-port`, and the `ha` harness's).
 ///
+/// Kubernetes' node-port range (30000-32767) is left out too: on a host
+/// running a cluster, kube-proxy redirects a node port on every local
+/// address, 127.0.0.1 included, whether or not anything listens there. A
+/// meta node given 30900 once had its OSDs reach an S3 gateway instead.
+///
 /// # Panics
 /// When the kernel's range starts too low to leave ports below it.
 #[must_use]
 pub fn free_ports(n: u16) -> u16 {
+    const NODE_PORT_FLOOR: u16 = 30_000;
     use std::hash::{BuildHasher, RandomState};
     static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
-    let ceiling = ephemeral_floor();
+    let ceiling = ephemeral_floor().min(NODE_PORT_FLOOR);
     let floor = if ceiling > 25_000 { 20_000 } else { 1_024 };
     let span = ceiling.saturating_sub(floor).saturating_sub(2 * n.max(1));
     assert!(
