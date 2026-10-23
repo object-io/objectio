@@ -523,6 +523,27 @@ jobs:
       - name: the binary links nothing exotic
         run: scripts/release/check-portable.sh --needed-only target/debug/objectio-aio
 
+  aio-macos:
+    name: aio (macOS)
+    if: github.event_name != 'pull_request'
+    runs-on: macos-14
+    # The release builds objectio-aio for macOS too, and nothing else here
+    # compiles for it: 0.1.0-rc.3's release stopped at that build, after
+    # its tag, images and chart were out, on a libc type that is u64 on
+    # Linux and u32 on macOS. A check is enough to catch that.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: build deps
+        timeout-minutes: 15
+        run: |
+          brew install protobuf autoconf automake libtool
+          echo "$(brew --prefix libtool)/libexec/gnubin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --bin objectio-aio
+
   perf:
     name: performance
     # The tree that lands against main, on the same runner: release builds
