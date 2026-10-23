@@ -436,6 +436,21 @@ impl S3Error {
         )
     }
 
+    /// A write meta refused because it has no room for it (the disk under
+    /// its leader's data, or a majority's, below meta's reserve): 507, as
+    /// for full OSDs, since a retry won't help until an operator makes
+    /// room. Reads go on meanwhile.
+    pub fn meta_full(e: &tonic::Status) -> Response {
+        Self::xml_response(
+            "StorageFull",
+            &format!(
+                "The cluster has no room for this write: its metadata disks are full ({})",
+                e.message()
+            ),
+            StatusCode::INSUFFICIENT_STORAGE,
+        )
+    }
+
     /// A failed ObjectMeta read or write, as S3 answers it: 507 when the
     /// OSDs are full, 503 (retry) when copies were unreachable or this
     /// gateway's clock may not stamp writes, otherwise 500. `what`
@@ -470,7 +485,9 @@ impl S3Error {
     }
 
     pub fn from_status(e: &tonic::Status) -> Response {
-        if Self::is_unavailable(e) {
+        if objectio_proto::is_no_room(e) {
+            Self::meta_full(e)
+        } else if Self::is_unavailable(e) {
             Self::xml_response(
                 "ServiceUnavailable",
                 e.message(),

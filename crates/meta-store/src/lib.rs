@@ -1,6 +1,7 @@
 //! ObjectIO Metadata Store — persistent metadata backed by redb.
 
 pub mod commit_metrics;
+pub mod disk_space;
 pub mod raft;
 pub mod raft_log;
 pub mod raft_network;
@@ -9,8 +10,9 @@ pub mod store;
 pub mod tables;
 pub mod types;
 
+pub use disk_space::{DiskSpace, NoRoom};
 pub use raft::{ApplyEvent, CasOp, CasTable, MAX_OPS, MetaCommand, MetaResponse, MetaTypeConfig};
-pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory};
+pub use raft_network::{MetaRaftNetwork, MetaRaftNetworkFactory, PeersWithoutRoom};
 pub use raft_storage::{BackupHeader, Edit, Forced, MetaRaftStorage, Voter, cas_table_name};
 pub use store::{MetaStore, MetaStoreError, MetaStoreResult};
 pub use types::record;

@@ -160,6 +160,22 @@ pub struct Args {
     #[arg(long, default_value_t = 1000)]
     pub raft_election_ms: u64,
 
+    /// Free space, in MiB, meta keeps on the filesystem of --data-dir.
+    /// Below it the leader refuses new writes (an S3 client gets 507
+    /// StorageFull) while reads go on, and a follower takes its leader's
+    /// entries down to half of it; writes resume by themselves once there
+    /// is room. A snapshot is built only with room for it above it. What
+    /// meta still writes below it (entries already proposed, their
+    /// applies, checkpoints, votes) is a few MiB.
+    #[arg(long, default_value_t = objectio_meta_store::disk_space::DEFAULT_RESERVE >> 20)]
+    pub min_free_mib: u64,
+
+    /// Tests only: the data directory's free space, in bytes, is read from
+    /// this file (relative to --data-dir) while it exists, instead of from
+    /// its filesystem, which a test can't fill without root.
+    #[arg(long, hide = true)]
+    pub test_free_bytes_file: Option<PathBuf>,
+
     /// Shards a drain sweep moves off each draining OSD, at most.
     #[arg(long, default_value_t = 64)]
     pub drain_batch: usize,
@@ -288,6 +304,39 @@ pub async fn run(
 
     let meta_service = MetaService::with_store(ec_config, store.clone());
 
+    // Room on the filesystem under the data: what meta keeps free, and
+    // what it may still write (`objectio_meta_store::disk_space`).
+    let reserve = args.min_free_mib.saturating_mul(1 << 20);
+    let space = Arc::new(match &args.test_free_bytes_file {
+        Some(file) => {
+            tracing::warn!(
+                "--test-free-bytes-file: free space is read from {} while it exists",
+                file.display()
+            );
+            objectio_meta_store::DiskSpace::with_free_bytes_file(
+                &args.data_dir,
+                reserve,
+                &args.data_dir.join(file),
+            )
+        }
+        None => objectio_meta_store::DiskSpace::new(&args.data_dir, reserve),
+    });
+    match space.free() {
+        Some(free) if free < reserve => tracing::warn!(
+            "{} has {free} bytes free, under the reserve of {reserve} (--min-free-mib): \
+             this node takes no writes until there is room",
+            args.data_dir.display()
+        ),
+        Some(free) => info!(
+            "{} has {free} bytes free; meta keeps {reserve} free",
+            args.data_dir.display()
+        ),
+        None => tracing::warn!(
+            "the free space of {} can't be told: no reserve is kept",
+            args.data_dir.display()
+        ),
+    }
+
     // Parse listen address
     let addr: std::net::SocketAddr = args
         .listen
@@ -301,6 +350,7 @@ pub async fn run(
     let metrics_state = Arc::new(MetaMetricsState {
         meta_service: meta_service.clone(),
         start_time: std::time::Instant::now(),
+        space: space.clone(),
     });
 
     {
@@ -367,7 +417,8 @@ pub async fn run(
             args.data_dir.join("raft-log").display()
         )
     })
-    .with_apply_listener(apply_tx);
+    .with_apply_listener(apply_tx)
+    .with_disk_space(space.clone());
     // The state machine is applied without a flush per batch; this makes
     // it durable every --raft-checkpoint-ms (B25).
     let checkpointer = raft_storage.clone();
@@ -384,7 +435,16 @@ pub async fn run(
                     .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::error!("raft checkpoint failed: {e}"),
+                    // redb refuses every read and write after one that
+                    // failed (a full filesystem among the causes) until it
+                    // is opened again: this node can't apply or serve, so it
+                    // stops, as one whose Raft stopped does, and is
+                    // restarted on its data (the log brings back what the
+                    // checkpoint didn't make durable).
+                    Ok(Err(e)) => {
+                        error!("raft checkpoint failed: {e}; exiting so this node is restarted");
+                        std::process::exit(1);
+                    }
                     Err(e) => tracing::error!("raft checkpoint task: {e}"),
                 }
             }
@@ -402,6 +462,7 @@ pub async fn run(
         .expect("raft config valid"),
     );
     let network = objectio_meta_store::MetaRaftNetworkFactory::new(node_id);
+    let peers_without_room = network.peers_without_room();
     let raft = openraft::Raft::<objectio_meta_store::MetaTypeConfig>::new(
         node_id,
         raft_config,
@@ -414,8 +475,15 @@ pub async fn run(
     let raft = Arc::new(raft);
     tokio::spawn(exit_when_raft_stops(raft.metrics()));
     // Hand the handle to MetaService so set_config / delete_config
-    // route through Raft (R1.5).
-    meta_service.set_raft(raft.clone());
+    // route through Raft (R1.5). As leader, it refuses writes it has no
+    // room for.
+    meta_service.set_raft(raft_batch::MetaRaft::with_room(
+        raft.clone(),
+        raft_batch::Room {
+            space: space.clone(),
+            peers: peers_without_room,
+        },
+    ));
 
     // Drain observer — every replica runs the task, only the leader
     // issues client_writes. Kick it off once the Raft handle is wired
@@ -465,6 +533,7 @@ pub async fn run(
         raft: raft.clone(),
         self_id: node_id,
         self_addr: self_addr.clone(),
+        space: space.clone(),
     });
     // Bound here, so a port that can't be had fails startup.
     let admin_addr = admin_address(args.admin_host.as_deref(), &args.listen, args.admin_port)?;
@@ -484,7 +553,8 @@ pub async fn run(
 
     // Start gRPC server with metadata, block, and Raft RPC services.
     let read_gate = read_gate::ReadGate::for_raft(raft.clone());
-    let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id, read_gate.clone());
+    let raft_rpc_svc = raft_rpc::RaftRpcService::new(raft.clone(), node_id, read_gate.clone())
+        .with_disk_space(space.clone());
     objectio_meta_store::commit_metrics::ready(process_started.elapsed());
     info!(
         "Serving {:.2} s after start (the database opened {})",
@@ -614,6 +684,7 @@ fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
 struct MetaMetricsState {
     meta_service: Arc<MetaService>,
     start_time: std::time::Instant,
+    space: Arc<objectio_meta_store::DiskSpace>,
 }
 
 /// Metrics HTTP handler
@@ -684,6 +755,7 @@ fn render_metrics(state: &MetaMetricsState) -> String {
     state.meta_service.render_block_metrics(&mut output);
     state.meta_service.render_restore_metrics(&mut output);
     op_metrics::render_raft(&state.meta_service, &mut output);
+    state.space.render_metrics(&mut output);
     objectio_erasure::metrics::render(&mut output);
 
     output.push_str(&op_metrics::render());
