@@ -125,8 +125,12 @@ impl DiskSpace {
             return free;
         }
         let free = match nix::sys::statvfs::statvfs(&self.dir) {
-            // Linux, the only target: both are u64.
-            Ok(st) => Some(st.blocks_available().saturating_mul(st.fragment_size())),
+            Ok(st) => {
+                // u64 on Linux; u32 on macOS, where the aio is built too.
+                #[allow(clippy::useless_conversion)]
+                let blocks = u64::from(st.blocks_available());
+                Some(blocks.saturating_mul(st.fragment_size()))
+            }
             Err(e) => {
                 tracing::warn!("free space of {}: {e}", self.dir.display());
                 None
